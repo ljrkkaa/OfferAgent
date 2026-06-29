@@ -75,6 +75,16 @@ from khoj.processor.conversation.anthropic.anthropic_chat import (
     anthropic_send_message_to_model,
     converse_anthropic,
 )
+from khoj.processor.conversation.codex.auth import (
+    get_codex_chat_model_options,
+    get_codex_model,
+    get_codex_model_option_id,
+)
+from khoj.processor.conversation.codex.gpt import (
+    codex_send_message_to_model,
+    converse_codex,
+)
+from khoj.processor.conversation.codex.utils import codex_chat_model_label, use_codex_runtime
 from khoj.processor.conversation.google.gemini_chat import (
     converse_gemini,
     gemini_send_message_to_model,
@@ -136,6 +146,9 @@ def is_query_empty(query: str) -> bool:
 
 
 def validate_chat_model(user: KhojUser):
+    if use_codex_runtime():
+        return
+
     default_chat_model = ConversationAdapters.get_default_chat_model(user)
 
     if default_chat_model is None:
@@ -180,6 +193,9 @@ def load_local_vault_references(max_files: int = 8, max_chars: int = 12000) -> L
 
 
 async def is_ready_to_chat(user: KhojUser):
+    if use_codex_runtime():
+        return True
+
     user_chat_model = await ConversationAdapters.aget_user_chat_model(user)
     if user_chat_model is None:
         user_chat_model = await ConversationAdapters.aget_default_chat_model(user)
@@ -1636,6 +1652,17 @@ def send_message_to_model(
     Call a specific chat model with the given parameters.
     This is a helper function used by send_message_to_model_wrapper for the fallback loop.
     """
+    if use_codex_runtime():
+        return codex_send_message_to_model(
+            messages=truncated_messages,
+            model=get_codex_model(),
+            response_type=response_type,
+            response_schema=response_schema,
+            tools=tools,
+            deepthought=deepthought,
+            tracer=tracer,
+        )
+
     model_type = chat_model.model_type
     chat_model_name = chat_model.name
     api_key = chat_model.ai_model_api.api_key
@@ -1718,11 +1745,14 @@ async def send_message_to_model_wrapper(
     if vision_available and query_images:
         logger.info(f"Using {primary_chat_model.name} model to understand {len(query_images)} images.")
 
-    # Get fallback models for the appropriate slot
-    slot = await ConversationAdapters.aget_chat_model_slot(user, fast=fast_model)
-    fallback_models = await ConversationAdapters.aget_chat_models_with_fallbacks(slot)
-    # Filter out the primary model from fallbacks to avoid duplicate attempts
-    fallback_models = [m for m in fallback_models if m.id != primary_chat_model.id]
+    if use_codex_runtime():
+        fallback_models = []
+    else:
+        # Get fallback models for the appropriate slot
+        slot = await ConversationAdapters.aget_chat_model_slot(user, fast=fast_model)
+        fallback_models = await ConversationAdapters.aget_chat_models_with_fallbacks(slot)
+        # Filter out the primary model from fallbacks to avoid duplicate attempts
+        fallback_models = [m for m in fallback_models if m.id != primary_chat_model.id]
 
     # Build list of models to try: primary first, then fallbacks
     models_to_try = [primary_chat_model] + fallback_models
@@ -1759,6 +1789,8 @@ async def send_message_to_model_wrapper(
                 tracer=tracer,
             )
         except Exception as e:
+            if use_codex_runtime():
+                raise
             last_exception = e
             if is_retryable_exception(e):
                 if is_last_model:
@@ -1794,11 +1826,9 @@ def send_message_to_model_wrapper_sync(
         raise HTTPException(status_code=500, detail="Contact the server administrator to set a default chat model.")
 
     max_tokens = ConversationAdapters.get_max_context_size(chat_model, user)
+    vision_available = chat_model.vision_enabled
     chat_model_name = chat_model.name
     model_type = chat_model.model_type
-    vision_available = chat_model.vision_enabled
-    api_key = chat_model.ai_model_api.api_key
-    api_base_url = chat_model.ai_model_api.api_base_url
 
     truncated_messages = generate_chatml_messages_with_context(
         user_message=message,
@@ -1811,6 +1841,18 @@ def send_message_to_model_wrapper_sync(
         max_prompt_size=max_tokens,
         vision_enabled=vision_available,
     )
+
+    if use_codex_runtime():
+        return codex_send_message_to_model(
+            messages=truncated_messages,
+            model=get_codex_model(),
+            response_type=response_type,
+            response_schema=response_schema,
+            tracer=tracer,
+        )
+
+    api_key = chat_model.ai_model_api.api_key
+    api_base_url = chat_model.ai_model_api.api_base_url
 
     if model_type == ChatModel.ModelType.OPENAI:
         return openai_send_message_to_model(
@@ -2041,7 +2083,17 @@ async def agenerate_chat_response(
             vision_available=vision_available,
         )
 
-        if chat_model.model_type == ChatModel.ModelType.OPENAI:
+        if use_codex_runtime():
+            codex_model = get_codex_model()
+            chat_response_generator = converse_codex(
+                messages,
+                model=codex_model,
+                deepthought=deepthought,
+                tracer=tracer,
+            )
+            metadata.update({"chat_model": codex_chat_model_label(codex_model)})
+
+        elif chat_model.model_type == ChatModel.ModelType.OPENAI:
             openai_chat_config = chat_model.ai_model_api
             api_key = openai_chat_config.api_key
             chat_model_name = chat_model.name
@@ -2083,7 +2135,8 @@ async def agenerate_chat_response(
                 tracer=tracer,
             )
 
-        metadata.update({"chat_model": chat_model.name})
+        if not use_codex_runtime():
+            metadata.update({"chat_model": chat_model.name})
 
     except Exception as e:
         logger.error(e, exc_info=True)
@@ -2976,9 +3029,6 @@ def get_user_config(user: KhojUser, request: Request, is_detailed: bool = False)
         "notion": False,
     }
 
-    selected_chat_model_config = ConversationAdapters.get_chat_model(
-        user
-    ) or ConversationAdapters.get_default_chat_model(user)
     server_chat_settings = ServerChatSettings.objects.first()
     server_memory_mode = (
         server_chat_settings.memory_mode
@@ -2986,18 +3036,25 @@ def get_user_config(user: KhojUser, request: Request, is_detailed: bool = False)
         else ServerChatSettings.MemoryMode.ENABLED_DEFAULT_ON.value  # type: ignore[attr-defined]
     )
     enable_memory = ConversationAdapters.is_memory_enabled(user)
-    chat_models = ConversationAdapters.get_conversation_processor_options().all()
-    chat_model_options = list()
-    for chat_model in chat_models:
-        chat_model_options.append(
-            {
-                "name": chat_model.friendly_name,
-                "id": chat_model.id,
-                "strengths": chat_model.strengths,
-                "description": chat_model.description,
-                "tier": chat_model.price_tier,
-            }
-        )
+    if use_codex_runtime():
+        chat_model_options = get_codex_chat_model_options()
+        selected_chat_model_config = get_codex_model_option_id()
+    else:
+        selected_chat_model_config = ConversationAdapters.get_chat_model(
+            user
+        ) or ConversationAdapters.get_default_chat_model(user)
+        chat_models = ConversationAdapters.get_conversation_processor_options().all()
+        chat_model_options = list()
+        for chat_model in chat_models:
+            chat_model_options.append(
+                {
+                    "name": chat_model.friendly_name,
+                    "id": chat_model.id,
+                    "strengths": chat_model.strengths,
+                    "description": chat_model.description,
+                    "tier": chat_model.price_tier,
+                }
+            )
 
     return {
         "request": request,
@@ -3016,7 +3073,11 @@ def get_user_config(user: KhojUser, request: Request, is_detailed: bool = False)
         "server_memory_mode": server_memory_mode,
         # user model settings
         "chat_model_options": chat_model_options,
-        "selected_chat_model_config": selected_chat_model_config.id if selected_chat_model_config else None,
+        "selected_chat_model_config": selected_chat_model_config
+        if use_codex_runtime()
+        else selected_chat_model_config.id
+        if selected_chat_model_config
+        else None,
         "paint_model_options": [],
         "selected_paint_model_config": None,
         "voice_model_options": [],

@@ -25,6 +25,7 @@ import {
     SidebarMenuItem,
 } from "@/components/ui/sidebar";
 import { Textarea } from "@/components/ui/textarea";
+import { Switch } from "@/components/ui/switch";
 import { ModelSelector } from "@/app/common/modelSelector";
 import { FilesMenu } from "../allConversations/allConversations";
 import { AgentConfigurationOptions } from "@/app/agents/page";
@@ -42,7 +43,7 @@ import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Tooltip, TooltipTrigger } from "@/components/ui/tooltip";
 import { TooltipContent } from "@radix-ui/react-tooltip";
-import { useAuthenticatedData } from "@/app/common/auth";
+import { ModelOptions, useAuthenticatedData } from "@/app/common/auth";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
     Dialog,
@@ -103,6 +104,11 @@ interface IAgentCreationProps {
 
 interface AgentError {
     detail: string;
+}
+
+interface FastModeData {
+    available: boolean;
+    enabled: boolean;
 }
 
 function AgentCreationForm(props: IAgentCreationProps) {
@@ -339,6 +345,7 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
         error: authenticationError,
         isLoading: authenticationLoading,
     } = useAuthenticatedData();
+    const { data: fastModeData } = useSWR<FastModeData>("/api/model/chat/fast", fetcher);
 
     const [customPrompt, setCustomPrompt] = useState<string | undefined>();
     const [selectedModel, setSelectedModel] = useState<string | undefined>();
@@ -401,7 +408,8 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
     useEffect(() => {
         if (!agentData || agentDataLoading) return; // Don't compare until data is loaded
 
-        const modelChanged = !!selectedModel && selectedModel !== agentData.chat_model;
+        const modelChanged =
+            !isDefaultAgent && !!selectedModel && selectedModel !== agentData.chat_model;
         const promptChanged = !!customPrompt && customPrompt !== agentData.persona;
 
         // Order independent check to ensure input tools or output modes haven't been changed.
@@ -415,7 +423,15 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
         setHasModified(modelChanged || promptChanged || toolsChanged || modesChanged);
 
         // Add agentDataLoading to dependencies to ensure it runs after loading finishes
-    }, [selectedModel, customPrompt, inputTools, outputModes, agentData, agentDataLoading]);
+    }, [
+        selectedModel,
+        customPrompt,
+        inputTools,
+        outputModes,
+        agentData,
+        agentDataLoading,
+        isDefaultAgent,
+    ]);
 
     function isValueChecked(value: string, existingSelections: string[]): boolean {
         return existingSelections.includes(value);
@@ -494,8 +510,35 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
         setHasModified(false);
     }
 
-    function handleModelSelect(model: string) {
-        setSelectedModel(model);
+    function handleModelSelect(model: ModelOptions) {
+        setSelectedModel(model.name);
+        if (!isDefaultAgent) return;
+
+        fetch(`/api/model/chat?id=${model.id}`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+        })
+            .then((response) => {
+                if (!response.ok) throw new Error(`Failed to switch chat model to ${model.name}`);
+                mutate("/api/settings?detailed=true");
+            })
+            .catch((error) => console.error(error));
+    }
+
+    function handleFastModeChange(enabled: boolean) {
+        fetch(`/api/model/chat/fast?enabled=${enabled}`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+        })
+            .then((response) => {
+                if (!response.ok) throw new Error("Failed to switch fast mode");
+                mutate("/api/model/chat/fast");
+            })
+            .catch((error) => console.error(error));
     }
 
     return (
@@ -580,13 +623,27 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
                                 <SidebarMenuItem key={"model"} className="list-none">
                                     <ModelSelector
                                         disabled={!isEditable}
-                                        onSelect={(model) => handleModelSelect(model.name)}
+                                        onSelect={handleModelSelect}
                                         initialModel={
                                             isDefaultAgent ? undefined : agentData?.chat_model
                                         }
                                         isActive={props.isActive}
                                     />
                                 </SidebarMenuItem>
+                                {isDefaultAgent && fastModeData?.available && (
+                                    <SidebarMenuItem key={"fast-mode"} className="list-none">
+                                        <div className="flex items-center justify-between gap-2 py-2">
+                                            <Label htmlFor="codex-fast-mode">Fast</Label>
+                                            <Switch
+                                                id="codex-fast-mode"
+                                                aria-label="Fast"
+                                                checked={fastModeData.enabled}
+                                                disabled={!isEditable}
+                                                onCheckedChange={handleFastModeChange}
+                                            />
+                                        </div>
+                                    </SidebarMenuItem>
+                                )}
                             </SidebarMenu>
                         </SidebarGroupContent>
                     </SidebarGroup>
