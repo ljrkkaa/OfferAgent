@@ -6,6 +6,7 @@ def test_load_local_vault_references_reads_agents_first(tmp_path, monkeypatch):
     (tmp_path / "agents.md").write_text("agent instructions", encoding="utf-8")
 
     monkeypatch.setenv("KHOJ_OBSIDIAN_VAULT_PATH", str(tmp_path))
+    monkeypatch.delenv("KHOJ_LOCAL_KB_PATH", raising=False)
     monkeypatch.delenv("KHOJ_LOCAL_VAULT_MAX_FILES", raising=False)
     monkeypatch.delenv("KHOJ_LOCAL_VAULT_MAX_CHARS", raising=False)
 

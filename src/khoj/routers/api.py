@@ -9,13 +9,14 @@ from starlette.authentication import has_required_scope, requires
 
 from khoj.configure import initialize_content
 from khoj.database import adapters
-from khoj.database.adapters import EntryAdapters, get_user_photo
+from khoj.database.adapters import get_user_photo
 from khoj.database.models import KhojUser, UserConversationConfig
 from khoj.routers.helpers import (
     CommonQueryParams,
     ConversationCommandRateLimiter,
     execute_search,
     get_user_config,
+    has_user_document_source,
     update_telemetry_state,
 )
 from khoj.utils import state
@@ -180,7 +181,7 @@ def user_info(request: Request) -> Response:
     user: KhojUser = request.user.object
     user_picture = get_user_photo(user=user)
     is_active = has_required_scope(request, ["premium"])
-    has_documents = EntryAdapters.user_has_entries(user=user)
+    has_documents = has_user_document_source(user)
 
     # Collect user information in a dictionary
     user_info = {

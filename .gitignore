@@ -59,5 +59,7 @@ src/interface/android/local.properties
 
 INTERVIEW_PERSONAL_KB_AGENT.md
 
-docs
+docs/
 demos
+reference/
+AGENTS.md

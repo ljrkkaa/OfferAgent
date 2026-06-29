@@ -5,12 +5,11 @@ import hashlib
 import json
 import logging
 import math
-import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from random import random
+from types import SimpleNamespace
 from typing import (
     Annotated,
     Any,
@@ -120,6 +119,7 @@ from khoj.utils.helpers import (
     get_file_type,
     in_debug_mode,
     is_code_sandbox_enabled,
+    is_env_var_true,
     is_none_or_empty,
     is_operator_enabled,
     is_valid_url,
@@ -128,6 +128,14 @@ from khoj.utils.helpers import (
     timer,
     tool_descriptions_for_llm,
     truncate_code_context,
+)
+from khoj.utils.local_kb import (
+    LocalKBError,
+    get_local_kb_root,
+    grep_local_kb_files,
+    list_local_kb_files,
+    load_local_kb_profile_references,
+    read_local_kb_file,
 )
 from khoj.utils.rawconfig import (
     ChatRequestBody,
@@ -139,6 +147,19 @@ from khoj.utils.state import SearchType
 from khoj.utils.yaml import yaml_dump
 
 logger = logging.getLogger(__name__)
+
+
+def _get_codex_formatting_chat_model():
+    return SimpleNamespace(
+        id=None,
+        name=get_codex_model(),
+        model_type=ChatModel.ModelType.OPENAI,
+        ai_model_api=None,
+        vision_enabled=False,
+        tokenizer=None,
+        max_prompt_size=None,
+        subscribed_max_prompt_size=None,
+    )
 
 
 def is_query_empty(query: str) -> bool:
@@ -158,38 +179,12 @@ def validate_chat_model(user: KhojUser):
         raise HTTPException(status_code=500, detail="Contact the server administrator to add a chat model.")
 
 
-def load_local_vault_references(max_files: int = 8, max_chars: int = 12000) -> List[Dict[str, str]]:
-    vault_path = os.getenv("KHOJ_OBSIDIAN_VAULT_PATH")
-    if not vault_path:
-        return []
+def load_local_vault_references(max_files: int = 24, max_chars: int = 12000) -> List[Dict[str, str]]:
+    return load_local_kb_profile_references(max_files=max_files, max_chars=max_chars)
 
-    root = Path(vault_path).expanduser().resolve()
-    if not root.is_dir():
-        logger.warning("KHOJ_OBSIDIAN_VAULT_PATH is not a directory: %s", root)
-        return []
 
-    max_files = int(os.getenv("KHOJ_LOCAL_VAULT_MAX_FILES", max_files))
-    max_chars = int(os.getenv("KHOJ_LOCAL_VAULT_MAX_CHARS", max_chars))
-    paths = [p for p in root.rglob("*.md") if not any(part.startswith(".") for part in p.relative_to(root).parts)]
-    paths.sort(key=lambda p: (p.name.lower() != "agents.md", p.relative_to(root).as_posix().lower()))
-
-    references = []
-    remaining_chars = max_chars
-    for path in paths[:max_files]:
-        resolved = path.resolve()
-        if not resolved.is_relative_to(root):
-            continue
-        text = resolved.read_text(encoding="utf-8", errors="replace").strip()
-        if not text:
-            continue
-        relpath = resolved.relative_to(root).as_posix()
-        compiled = f"# {relpath}\n\n{text[:remaining_chars].rstrip()}"
-        references.append({"query": "local vault", "compiled": compiled, "file": relpath, "uri": relpath})
-        remaining_chars -= len(compiled)
-        if remaining_chars <= 0:
-            break
-
-    return references
+def has_user_document_source(user: KhojUser) -> bool:
+    return EntryAdapters.user_has_entries(user=user) or get_local_kb_root() is not None
 
 
 async def is_ready_to_chat(user: KhojUser):
@@ -403,10 +398,11 @@ async def aget_data_sources_and_output_format(
 
     agent_sources = agent.input_tools if agent else []
     user_has_entries = await EntryAdapters.auser_has_entries(user)
+    has_document_source = user_has_entries or get_local_kb_root() is not None
 
     for source, description in tool_descriptions_for_llm.items():
-        # Skip showing Notes tool as an option if user has no entries
-        if source == ConversationCommand.Notes and not user_has_entries:
+        # Local KB reads do not require DB/RAG entries.
+        if source == ConversationCommand.Notes and not has_document_source:
             continue
         if source == ConversationCommand.Operator and not is_operator_enabled():
             continue
@@ -526,9 +522,7 @@ async def aget_data_sources_and_output_format(
 
     personal_terms = [" my ", " i ", " me ", " have i", " did i", "past ", "learn to", "diving experience"]
     has_person_name = bool(re.search(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b", query))
-    if not chat_history_only_query and (
-        has_person_name or any(term in f" {query_lower} " for term in personal_terms)
-    ):
+    if not chat_history_only_query and (has_person_name or any(term in f" {query_lower} " for term in personal_terms)):
         if heuristic_sources:
             if source_is_allowed(ConversationCommand.Notes) and ConversationCommand.Notes not in heuristic_sources:
                 heuristic_sources.append(ConversationCommand.Notes)
@@ -1097,7 +1091,7 @@ async def extract_facts_from_query(
             response_schema=MemoryUpdates,
             user=user,
             fast_model=False,
-            agent_chat_model=agent.chat_model,
+            agent_chat_model=agent.chat_model if agent else None,
             tracer=tracer,
         )
         response = response.text.strip()
@@ -1729,25 +1723,29 @@ async def send_message_to_model_wrapper(
     # Tracer
     tracer: dict = {},
 ):
+    codex_runtime = use_codex_runtime()
+
     # Get primary chat model
-    primary_chat_model: ChatModel = await ConversationAdapters.aget_default_chat_model(
-        user, agent_chat_model, fast=fast_model
-    )
-    vision_available = primary_chat_model.vision_enabled
-
-    # Handle vision model override if needed
-    if not vision_available and query_images:
-        logger.warning(f"Vision is not enabled for default model: {primary_chat_model.name}.")
-        vision_enabled_config = await ConversationAdapters.aget_vision_enabled_config()
-        if vision_enabled_config:
-            primary_chat_model = vision_enabled_config
-            vision_available = True
-    if vision_available and query_images:
-        logger.info(f"Using {primary_chat_model.name} model to understand {len(query_images)} images.")
-
-    if use_codex_runtime():
+    if codex_runtime:
+        primary_chat_model = _get_codex_formatting_chat_model()
+        vision_available = False
         fallback_models = []
     else:
+        primary_chat_model: ChatModel = await ConversationAdapters.aget_default_chat_model(
+            user, agent_chat_model, fast=fast_model
+        )
+        vision_available = primary_chat_model.vision_enabled
+
+        # Handle vision model override if needed
+        if not vision_available and query_images:
+            logger.warning(f"Vision is not enabled for default model: {primary_chat_model.name}.")
+            vision_enabled_config = await ConversationAdapters.aget_vision_enabled_config()
+            if vision_enabled_config:
+                primary_chat_model = vision_enabled_config
+                vision_available = True
+        if vision_available and query_images:
+            logger.info(f"Using {primary_chat_model.name} model to understand {len(query_images)} images.")
+
         # Get fallback models for the appropriate slot
         slot = await ConversationAdapters.aget_chat_model_slot(user, fast=fast_model)
         fallback_models = await ConversationAdapters.aget_chat_models_with_fallbacks(slot)
@@ -1762,7 +1760,11 @@ async def send_message_to_model_wrapper(
         is_last_model = i == len(models_to_try) - 1
 
         # Prepare messages for this specific model
-        max_tokens = await ConversationAdapters.aget_max_context_size(chat_model, user)
+        max_tokens = (
+            chat_model.max_prompt_size
+            if codex_runtime
+            else await ConversationAdapters.aget_max_context_size(chat_model, user)
+        )
         truncated_messages = generate_chatml_messages_with_context(
             user_message=query,
             query_files=query_files,
@@ -1789,7 +1791,7 @@ async def send_message_to_model_wrapper(
                 tracer=tracer,
             )
         except Exception as e:
-            if use_codex_runtime():
+            if codex_runtime:
                 raise
             last_exception = e
             if is_retryable_exception(e):
@@ -1820,12 +1822,17 @@ def send_message_to_model_wrapper_sync(
     chat_history: List[ChatMessageModel] = [],
     tracer: dict = {},
 ):
-    chat_model: ChatModel = ConversationAdapters.get_default_chat_model(user)
+    codex_runtime = use_codex_runtime()
+    chat_model = (
+        _get_codex_formatting_chat_model() if codex_runtime else ConversationAdapters.get_default_chat_model(user)
+    )
 
     if chat_model is None:
         raise HTTPException(status_code=500, detail="Contact the server administrator to set a default chat model.")
 
-    max_tokens = ConversationAdapters.get_max_context_size(chat_model, user)
+    max_tokens = (
+        chat_model.max_prompt_size if codex_runtime else ConversationAdapters.get_max_context_size(chat_model, user)
+    )
     vision_available = chat_model.vision_enabled
     chat_model_name = chat_model.name
     model_type = chat_model.model_type
@@ -2039,6 +2046,7 @@ async def agenerate_chat_response(
     agent = await AgentAdapters.aget_conversation_agent_by_id(conversation.agent.id) if conversation.agent else None
 
     try:
+        codex_runtime = use_codex_runtime()
         query_to_run = q
         deepthought = False
         if research_results:
@@ -2051,14 +2059,19 @@ async def agenerate_chat_response(
             operator_results = []
             deepthought = True
 
-        chat_model = await ConversationAdapters.aget_valid_chat_model(user, conversation, is_subscribed)
-        max_prompt_size = await ConversationAdapters.aget_max_context_size(chat_model, user)
-        vision_available = chat_model.vision_enabled
-        if not vision_available and query_images:
-            vision_enabled_config = await ConversationAdapters.aget_vision_enabled_config()
-            if vision_enabled_config:
-                chat_model = vision_enabled_config
-                vision_available = True
+        if codex_runtime:
+            chat_model = _get_codex_formatting_chat_model()
+            max_prompt_size = chat_model.max_prompt_size
+            vision_available = False
+        else:
+            chat_model = await ConversationAdapters.aget_valid_chat_model(user, conversation, is_subscribed)
+            max_prompt_size = await ConversationAdapters.aget_max_context_size(chat_model, user)
+            vision_available = chat_model.vision_enabled
+            if not vision_available and query_images:
+                vision_enabled_config = await ConversationAdapters.aget_vision_enabled_config()
+                if vision_enabled_config:
+                    chat_model = vision_enabled_config
+                    vision_available = True
 
         # Build shared conversation context and generate chatml messages
         messages = build_conversation_context(
@@ -2083,7 +2096,7 @@ async def agenerate_chat_response(
             vision_available=vision_available,
         )
 
-        if use_codex_runtime():
+        if codex_runtime:
             codex_model = get_codex_model()
             chat_response_generator = converse_codex(
                 messages,
@@ -2135,7 +2148,7 @@ async def agenerate_chat_response(
                 tracer=tracer,
             )
 
-        if not use_codex_runtime():
+        if not codex_runtime:
             metadata.update({"chat_model": chat_model.name})
 
     except Exception as e:
@@ -3008,7 +3021,7 @@ def get_message_from_queue(queue: asyncio.Queue) -> Optional[str]:
 def get_user_config(user: KhojUser, request: Request, is_detailed: bool = False):
     user_picture = request.session.get("user", {}).get("picture")
     is_active = has_required_scope(request, ["premium"])
-    has_documents = EntryAdapters.user_has_entries(user=user)
+    has_documents = has_user_document_source(user)
 
     if not is_detailed:
         return {
@@ -3198,6 +3211,7 @@ def configure_content(
 
     return success
 
+
 async def view_file_content(
     path: str,
     start_line: Optional[int] = None,
@@ -3212,6 +3226,19 @@ async def view_file_content(
         query += f" (lines {start_line}-{end_line})"
 
     try:
+        local_kb_root = get_local_kb_root()
+        rag_fallback = is_env_var_true("KHOJ_ENABLE_RAG_FALLBACK")
+        if local_kb_root:
+            try:
+                local_file = read_local_kb_file(path, start_line=start_line, end_line=end_line)
+                yield [{"query": query, "file": local_file.path, "uri": local_file.path, "compiled": local_file.text}]
+                return
+            except LocalKBError as e:
+                if e.kind != "not_found" or not rag_fallback:
+                    logger.warning("Local KB file read blocked: %s", e)
+                    yield [{"query": query, "file": path, "uri": path, "compiled": str(e)}]
+                    return
+
         # Get the file object from the database by name
         file_objects = await FileObjectAdapters.aget_file_objects_by_name(user, path)
 
@@ -3322,6 +3349,48 @@ async def grep_files(
         return
 
     try:
+        local_kb_root = get_local_kb_root()
+        rag_fallback = is_env_var_true("KHOJ_ENABLE_RAG_FALLBACK")
+        if local_kb_root:
+            try:
+                local_result = grep_local_kb_files(
+                    regex,
+                    path_prefix=path_prefix,
+                    lines_before=lines_before,
+                    lines_after=lines_after,
+                    max_results=1000,
+                )
+                if local_result.lines:
+                    query = _generate_query(
+                        local_result.line_count,
+                        local_result.document_count,
+                        path_prefix,
+                        regex_pattern,
+                        lines_before,
+                        lines_after,
+                    )
+                    yield {
+                        "query": query,
+                        "file": path_prefix,
+                        "uri": path_prefix,
+                        "compiled": "\n".join(local_result.lines),
+                    }
+                    return
+                if not rag_fallback:
+                    query = _generate_query(0, 0, path_prefix, regex_pattern, lines_before, lines_after)
+                    yield {"query": query, "file": path_prefix, "uri": path_prefix, "compiled": "No matches found."}
+                    return
+            except LocalKBError as e:
+                if e.kind != "not_found" or not rag_fallback:
+                    logger.warning("Local KB grep blocked: %s", e)
+                    yield {
+                        "query": _generate_query(0, 0, path_prefix, regex_pattern, lines_before, lines_after),
+                        "file": path_prefix,
+                        "uri": path_prefix,
+                        "compiled": str(e),
+                    }
+                    return
+
         # Make db pushdown filters more permissive by removing line anchors
         # The precise line-anchored matching will be done in Python stage
         db_pattern = regex_pattern
@@ -3428,6 +3497,34 @@ async def list_files(
         return query
 
     try:
+        local_kb_root = get_local_kb_root()
+        rag_fallback = is_env_var_true("KHOJ_ENABLE_RAG_FALLBACK")
+        if local_kb_root:
+            try:
+                files, total_count = list_local_kb_files(path, pattern, limit=100)
+                if files:
+                    display_files = files
+                    if total_count > len(files):
+                        display_files = files + [
+                            f"... {total_count - len(files)} more files found. Use glob pattern to narrow down results."
+                        ]
+                    query = _generate_query(total_count, path, pattern)
+                    yield {"query": query, "file": path, "uri": path, "compiled": "\n- ".join(display_files)}
+                    return
+                if not rag_fallback:
+                    yield {
+                        "query": _generate_query(0, path, pattern),
+                        "file": path,
+                        "uri": path,
+                        "compiled": "No files found.",
+                    }
+                    return
+            except LocalKBError as e:
+                if e.kind != "not_found" or not rag_fallback:
+                    logger.warning("Local KB list blocked: %s", e)
+                    yield {"query": _generate_query(0, path, pattern), "file": path, "uri": path, "compiled": str(e)}
+                    return
+
         # Get user files by path prefix when specified
         path = path or ""
         if path in ["", "/", ".", "./", "~", "~/"]:

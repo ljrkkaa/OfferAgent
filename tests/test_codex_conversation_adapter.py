@@ -321,28 +321,21 @@ async def test_codex_runtime_is_ready_without_configured_api_key(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_chat_response_generator_uses_codex_runtime(monkeypatch):
-    chat_model = SimpleNamespace(
-        model_type=ChatModel.ModelType.OPENAI,
-        name="configured-api-model",
-        vision_enabled=False,
-        tokenizer=None,
-        max_prompt_size=6000,
-        subscribed_max_prompt_size=None,
-    )
-
-    async def fake_valid_chat_model(*_args, **_kwargs):
-        return chat_model
-
-    async def fake_max_context_size(*_args, **_kwargs):
-        return 6000
-
     async def fake_converse_codex(_messages, model=None, deepthought=False, tracer=None):
         yield ResponseWithThought(text=f"model={model}, deepthought={deepthought}")
 
     monkeypatch.setenv("KHOJ_CONVERSATION_RUNTIME", "codex")
     monkeypatch.setenv("KHOJ_CODEX_MODEL", "gpt-test-codex")
-    monkeypatch.setattr(router_helpers.ConversationAdapters, "aget_valid_chat_model", fake_valid_chat_model)
-    monkeypatch.setattr(router_helpers.ConversationAdapters, "aget_max_context_size", fake_max_context_size)
+    monkeypatch.setattr(
+        router_helpers.ConversationAdapters,
+        "aget_valid_chat_model",
+        lambda *_args, **_kwargs: pytest.fail("database chat model should not be read"),
+    )
+    monkeypatch.setattr(
+        router_helpers.ConversationAdapters,
+        "aget_max_context_size",
+        lambda *_args, **_kwargs: pytest.fail("database chat model context should not be read"),
+    )
     monkeypatch.setattr(router_helpers, "converse_codex", fake_converse_codex)
 
     generator, metadata = await router_helpers.agenerate_chat_response("hello", [], SimpleNamespace(agent=None))
@@ -350,6 +343,46 @@ async def test_chat_response_generator_uses_codex_runtime(monkeypatch):
 
     assert metadata == {"chat_model": "codex:gpt-test-codex"}
     assert chunks[0].text == "model=gpt-test-codex, deepthought=False"
+
+
+@pytest.mark.asyncio
+async def test_codex_message_wrapper_skips_database_chat_models(monkeypatch):
+    monkeypatch.setenv("KHOJ_CONVERSATION_RUNTIME", "codex")
+    monkeypatch.setenv("KHOJ_CODEX_MODEL", "gpt-test-codex")
+    monkeypatch.setattr(
+        router_helpers.ConversationAdapters,
+        "aget_default_chat_model",
+        lambda *_args, **_kwargs: pytest.fail("database default chat model should not be read"),
+    )
+    monkeypatch.setattr(
+        router_helpers.ConversationAdapters,
+        "aget_chat_model_slot",
+        lambda *_args, **_kwargs: pytest.fail("database fallback slot should not be read"),
+    )
+    monkeypatch.setattr(
+        router_helpers.ConversationAdapters,
+        "aget_max_context_size",
+        lambda *_args, **_kwargs: pytest.fail("database chat model context should not be read"),
+    )
+    monkeypatch.setattr(router_helpers, "codex_send_message_to_model", lambda **kwargs: kwargs)
+
+    result = await router_helpers.send_message_to_model_wrapper(query="hello")
+
+    assert result["model"] == "gpt-test-codex"
+
+
+@pytest.mark.asyncio
+async def test_extract_facts_allows_missing_agent(monkeypatch):
+    async def fake_send_message_to_model_wrapper(*_args, **kwargs):
+        assert kwargs["agent_chat_model"] is None
+        return ResponseWithThought(text='{"create": [], "delete": []}')
+
+    monkeypatch.setattr(router_helpers, "send_message_to_model_wrapper", fake_send_message_to_model_wrapper)
+
+    result = await router_helpers.extract_facts_from_query(user=None, conversation_history=[], agent=None)
+
+    assert result.create == []
+    assert result.delete == []
 
 
 def test_cloudflare_challenge_is_classified():

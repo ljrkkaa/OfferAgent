@@ -1,12 +1,19 @@
 # System Packages
-import pytest
 import logging
+
+import pytest
 
 from khoj.database.adapters import FileObjectAdapters
 from khoj.database.models import KhojUser
 from khoj.routers.helpers import grep_files
 
 logger = logging.getLogger(__name__)
+
+
+@pytest.fixture(autouse=True)
+def clear_local_kb_env(monkeypatch):
+    monkeypatch.delenv("KHOJ_LOCAL_KB_PATH", raising=False)
+    monkeypatch.delenv("KHOJ_OBSIDIAN_VAULT_PATH", raising=False)
 
 
 @pytest.fixture

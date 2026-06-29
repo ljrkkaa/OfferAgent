@@ -45,7 +45,7 @@ export interface KhojSetting {
 
 export const DEFAULT_SETTINGS: KhojSetting = {
     resultsCount: 15,
-    khojUrl: 'https://app.khoj.dev',
+    khojUrl: 'http://127.0.0.1:42110',
     khojApiKey: '',
     connectedToBackend: false,
     autoConfigure: true,
@@ -139,7 +139,7 @@ export class KhojSettingTab extends PluginSettingTab {
 
         // Add API key setting description with link to get API key
         apiKeySetting.descEl.createEl('span', {
-            text: 'Connect your Khoj Cloud account. ',
+            text: 'Optional for anonymous local Khoj. Required for authenticated servers. ',
         });
         apiKeySetting.descEl.createEl('a', {
             text: 'Get your API Key',

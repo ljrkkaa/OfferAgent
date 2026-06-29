@@ -36,6 +36,7 @@ from khoj.utils.helpers import (
     ToolDefinition,
     dict_to_tuple,
     is_code_sandbox_enabled,
+    is_env_var_true,
     is_none_or_empty,
     is_operator_enabled,
     is_web_search_enabled,
@@ -43,9 +44,21 @@ from khoj.utils.helpers import (
     tools_for_research_llm,
     truncate_code_context,
 )
+from khoj.utils.local_kb import get_local_kb_root
 from khoj.utils.rawconfig import LocationData
 
 logger = logging.getLogger(__name__)
+
+
+def _document_research_tools() -> List[ConversationCommand]:
+    tools = [
+        ConversationCommand.RegexSearchFiles,
+        ConversationCommand.ViewFile,
+        ConversationCommand.ListFiles,
+    ]
+    if is_env_var_true("KHOJ_ENABLE_RAG_FALLBACK"):
+        tools.insert(0, ConversationCommand.SemanticSearchFiles)
+    return tools
 
 
 class ToolExecutionResult:
@@ -321,12 +334,7 @@ async def apick_next_tool(
     agent_tools = []
 
     # Map agent user facing tools to research tools to include in agents toolbox
-    document_research_tools = [
-        ConversationCommand.SemanticSearchFiles,
-        ConversationCommand.RegexSearchFiles,
-        ConversationCommand.ViewFile,
-        ConversationCommand.ListFiles,
-    ]
+    document_research_tools = _document_research_tools()
     web_research_tools = [ConversationCommand.SearchWeb, ConversationCommand.ReadWebpage]
     input_tools_to_research_tools = {
         ConversationCommand.Notes.value: [tool.value for tool in document_research_tools],
@@ -340,12 +348,15 @@ async def apick_next_tool(
             agent_tools += research_tools
 
     user_has_entries = await EntryAdapters.auser_has_entries(user)
+    has_document_source = user_has_entries or get_local_kb_root() is not None
     for tool, tool_data in tools_for_research_llm.items():
         # Skip showing operator tool as an option if not enabled
         if tool == ConversationCommand.OperateComputer and not is_operator_enabled():
             continue
-        # Skip showing document related tools if user has no documents
-        if tool in document_research_tools and not user_has_entries:
+        # Semantic search is DB/RAG-only. Local list/read/grep can work directly from disk.
+        if tool == ConversationCommand.SemanticSearchFiles and not user_has_entries:
+            continue
+        if tool in document_research_tools and not has_document_source:
             continue
         # Skip showing web search tool if agent has no access to internet
         if tool in web_research_tools and not is_web_search_enabled():
