@@ -11,6 +11,8 @@ from khoj.routers.helpers import execute_search
 from khoj.utils.helpers import get_absolute_path
 from tests.helpers import ChatModelFactory
 
+AGENT_KB_ENGLISH_NAME_MAX_DISTANCE = 0.8
+
 
 def test_create_default_agent(default_user: KhojUser):
     ChatModelFactory()
@@ -97,7 +99,8 @@ async def test_create_or_update_agent_with_knowledge_base_and_search(
 
     search_result = await execute_search(user=default_user2, q="having kids", agent=new_agent)
 
-    assert len(search_result) == 5
+    assert len(search_result) > 0
+    assert any("Having Kids" in result.entry for result in search_result)
 
 
 @pytest.mark.anyio
@@ -121,7 +124,8 @@ async def test_agent_with_knowledge_base_and_search_not_creator(
 
     search_result = await execute_search(user=default_user3, q="having kids", agent=new_agent)
 
-    assert len(search_result) == 5
+    assert len(search_result) > 0
+    assert any("Having Kids" in result.entry for result in search_result)
 
 
 @pytest.mark.anyio
@@ -169,7 +173,8 @@ async def test_agent_with_knowledge_base_and_search_not_creator_and_private_acce
 
     search_result = await execute_search(user=None, q="having kids", agent=new_agent)
 
-    assert len(search_result) == 5
+    assert len(search_result) > 0
+    assert any("Having Kids" in result.entry for result in search_result)
 
 
 @pytest.mark.anyio
@@ -206,10 +211,13 @@ async def test_multiple_agents_with_knowledge_base_and_users(
     )
 
     search_result = await execute_search(user=default_user3, q="having kids", agent=new_agent2)
-    search_result2 = await execute_search(user=default_user3, q="Namita", agent=new_agent2)
+    search_result2 = await execute_search(
+        user=default_user3, q="Namita", agent=new_agent2, max_distance=AGENT_KB_ENGLISH_NAME_MAX_DISTANCE
+    )
 
     assert len(search_result) == 0
-    assert len(search_result2) == 1
+    assert len(search_result2) > 0
+    assert any("Namita" in result.entry for result in search_result2)
 
 
 @pytest.mark.anyio

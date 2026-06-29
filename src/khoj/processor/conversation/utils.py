@@ -511,6 +511,20 @@ def message_to_log(
     user_message_metadata = {k: v for k, v in user_message_metadata.items() if v is not None}
     khoj_message_metadata = {k: v for k, v in khoj_message_metadata.items() if v is not None}
 
+    def normalize_context(metadata: dict):
+        if "context" not in metadata or is_none_or_empty(metadata["context"]):
+            return
+        normalized_context = []
+        for item in metadata["context"]:
+            if isinstance(item, str):
+                normalized_context.append({"compiled": item, "file": ""})
+            else:
+                normalized_context.append(item)
+        metadata["context"] = normalized_context
+
+    normalize_context(user_message_metadata)
+    normalize_context(khoj_message_metadata)
+
     # Create json log from Human's message
     human_log = merge_dicts({"message": user_message, "by": "you"}, user_message_metadata)
 
@@ -743,13 +757,17 @@ def generate_chatml_messages_with_context(
             ]
 
         if not is_none_or_empty(chat.context):
-            references = "\n\n".join(
-                {
-                    f"# URI: {item.uri or item.file}\n## {item.compiled}\n"
-                    for item in chat.context or []
-                    if isinstance(item, dict)
-                }
-            )
+            references = []
+            for item in chat.context or []:
+                if isinstance(item, dict):
+                    uri = item.get("uri") or item.get("file")
+                    compiled = item.get("compiled")
+                else:
+                    uri = item.uri or item.file
+                    compiled = item.compiled
+                if compiled:
+                    references.append(f"# URI: {uri}\n## {compiled}\n")
+            references = "\n\n".join(references)
             message_context += [{"type": "text", "text": f"{prompts.notes_conversation.format(references=references)}"}]
 
         if not is_none_or_empty(message_context):

@@ -88,6 +88,7 @@ def test_encode_docs_memory_leak():
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.getenv("KHOJ_RUN_LIVE_NETWORK_TESTS") != "1", reason="live network test disabled")
 async def test_reading_webpage():
     # Arrange
     website = "https://en.wikipedia.org/wiki/Great_Chicago_Fire"

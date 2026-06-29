@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 class EmbeddingsModel:
     def __init__(
         self,
-        model_name: str = "thenlper/gte-small",
+        model_name: str = "BAAI/bge-small-zh-v1.5",
         embeddings_inference_endpoint: str = None,
         embeddings_inference_endpoint_api_key: str = None,
         embeddings_inference_endpoint_type=SearchModelConfig.ApiType.LOCAL,
@@ -117,7 +117,7 @@ class EmbeddingsModel:
 class CrossEncoderModel:
     def __init__(
         self,
-        model_name: str = "mixedbread-ai/mxbai-rerank-xsmall-v1",
+        model_name: str = "BAAI/bge-reranker-v2-m3",
         cross_encoder_inference_endpoint: str = None,
         cross_encoder_inference_endpoint_api_key: str = None,
         model_kwargs: dict = {},

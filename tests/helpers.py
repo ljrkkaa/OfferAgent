@@ -43,8 +43,16 @@ def get_chat_provider(default: ChatModel.ModelType | None = ChatModel.ModelType.
         return default
 
 
-def get_chat_api_key(provider: ChatModel.ModelType = None):
+def normalize_chat_provider(provider: ChatModel.ModelType | str | None = None):
     provider = provider or get_chat_provider()
+    try:
+        return ChatModel.ModelType(provider)
+    except ValueError:
+        return provider
+
+
+def get_chat_api_key(provider: ChatModel.ModelType = None):
+    provider = normalize_chat_provider(provider)
     if provider == ChatModel.ModelType.OPENAI:
         return os.getenv("OPENAI_API_KEY")
     elif provider == ChatModel.ModelType.GOOGLE:
@@ -53,6 +61,24 @@ def get_chat_api_key(provider: ChatModel.ModelType = None):
         return os.getenv("ANTHROPIC_API_KEY")
     else:
         return os.getenv("OPENAI_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+
+
+def get_chat_api_base_url(provider: ChatModel.ModelType | str | None = None):
+    provider = normalize_chat_provider(provider)
+    if provider == ChatModel.ModelType.OPENAI:
+        return os.getenv("OPENAI_BASE_URL")
+    return None
+
+
+def get_chat_model_name(provider: ChatModel.ModelType | str | None = None):
+    provider = normalize_chat_provider(provider)
+    if provider == ChatModel.ModelType.OPENAI:
+        return os.getenv("KHOJ_DEFAULT_CHAT_MODEL") or "gpt-4o-mini"
+    if provider == ChatModel.ModelType.GOOGLE:
+        return "gemini-2.5-flash"
+    if provider == ChatModel.ModelType.ANTHROPIC:
+        return "claude-haiku-4-5-20251001"
+    return "gemini-2.5-flash"
 
 
 def generate_chat_history(message_list):
@@ -237,9 +263,13 @@ class ChatModelFactory(factory.django.DjangoModelFactory):
 
     max_prompt_size = 20000
     tokenizer = None
-    name = "gemini-2.5-flash"
+    name = factory.LazyAttribute(lambda obj: get_chat_model_name(obj.model_type))
     model_type = get_chat_provider()
-    ai_model_api = factory.LazyAttribute(lambda obj: AiModelApiFactory() if get_chat_api_key() else None)
+    ai_model_api = factory.LazyAttribute(
+        lambda obj: AiModelApiFactory(api_base_url=get_chat_api_base_url(obj.model_type))
+        if get_chat_api_key(obj.model_type)
+        else None
+    )
 
 
 class UserConversationProcessorConfigFactory(factory.django.DjangoModelFactory):
@@ -263,8 +293,8 @@ class SearchModelFactory(factory.django.DjangoModelFactory):
 
     name = "default"
     model_type = "text"
-    bi_encoder = "thenlper/gte-small"
-    cross_encoder = "mixedbread-ai/mxbai-rerank-xsmall-v1"
+    bi_encoder = "BAAI/bge-small-zh-v1.5"
+    cross_encoder = "BAAI/bge-reranker-v2-m3"
 
 
 class SubscriptionFactory(factory.django.DjangoModelFactory):

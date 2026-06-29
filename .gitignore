@@ -58,3 +58,6 @@ src/interface/android/*.keystore
 src/interface/android/local.properties
 
 INTERVIEW_PERSONAL_KB_AGENT.md
+
+docs
+demos

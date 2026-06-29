@@ -13,6 +13,8 @@ from khoj.processor.content.org_mode.org_to_entries import OrgToEntries
 from khoj.search_type import text_search
 from khoj.utils import state
 
+BGE_TEST_MAX_DISTANCE = 0.36
+
 
 # Test
 # ----------------------------------------------------------------------------------------------------
@@ -301,7 +303,9 @@ def test_notes_search(client, search_config, sample_org_data, default_user: Khoj
     user_query = quote("How to git install application?")
 
     # Act
-    response = client.get(f"/api/search?q={user_query}&n=1&t=org&r=true&max_distance=0.22", headers=headers)
+    response = client.get(
+        f"/api/search?q={user_query}&n=1&t=org&r=true&max_distance={BGE_TEST_MAX_DISTANCE}", headers=headers
+    )
 
     # Assert
     assert response.status_code == 200
@@ -320,7 +324,9 @@ def test_notes_search_no_results(client, search_config, sample_org_data, default
     user_query = quote("How to find my goat?")
 
     # Act
-    response = client.get(f"/api/search?q={user_query}&n=1&t=org&r=true&max_distance=0.22", headers=headers)
+    response = client.get(
+        f"/api/search?q={user_query}&n=1&t=org&r=true&max_distance={BGE_TEST_MAX_DISTANCE}", headers=headers
+    )
 
     # Assert
     assert response.status_code == 200
@@ -400,7 +406,9 @@ def test_notes_search_requires_parent_context(client, search_config, sample_org_
     user_query = quote("Install Khoj on Emacs")
 
     # Act
-    response = client.get(f"/api/search?q={user_query}&n=1&t=org&r=true&max_distance=0.22", headers=headers)
+    response = client.get(
+        f"/api/search?q={user_query}&n=1&t=org&r=true&max_distance={BGE_TEST_MAX_DISTANCE}", headers=headers
+    )
 
     # Assert
     assert response.status_code == 200

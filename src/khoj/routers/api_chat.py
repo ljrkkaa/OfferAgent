@@ -64,8 +64,10 @@ from khoj.routers.helpers import (
     agenerate_chat_response,
     aget_data_sources_and_output_format,
     gather_raw_query_files,
+    generate_summary_from_files,
     generate_mermaidjs_diagram,
     get_conversation_command,
+    load_local_vault_references,
     get_message_from_queue,
     is_query_empty,
     is_ready_to_chat,
@@ -102,6 +104,21 @@ conversation_command_rate_limiter = ConversationCommandRateLimiter(
 )
 
 api_chat = APIRouter()
+
+
+def _hostname(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return URL(value if "://" in value else f"http://{value}").hostname
+    except Exception:
+        return None
+
+
+def is_allowed_websocket_origin(origin: str | None, host: str | None) -> bool:
+    origin_host = _hostname(origin)
+    host_name = _hostname(host)
+    return bool(origin_host and (origin_host in ALLOWED_HOSTS or origin_host == host_name))
 
 
 @api_chat.get("/stats", response_class=Response)
@@ -1001,6 +1018,31 @@ async def event_generator(
 
     defiltered_query = defilter_query(q)
 
+    if conversation_commands == [ConversationCommand.Summarize]:
+        no_files_selected = "No files selected for summarization. Please add files using the section on the left."
+        if is_none_or_empty(conversation.file_filters) and not attached_file_context:
+            async for result in send_llm_response(no_files_selected, tracer.get("usage")):
+                yield result
+            return
+
+        async for summary_result in generate_summary_from_files(
+            defiltered_query,
+            user,
+            conversation.file_filters,
+            chat_history,
+            query_images=uploaded_images,
+            query_files=attached_file_context,
+            agent=agent,
+            send_status_func=partial(send_event, ChatEvent.STATUS),
+            tracer=tracer,
+        ):
+            if isinstance(summary_result, dict) and ChatEvent.STATUS in summary_result:
+                yield summary_result[ChatEvent.STATUS]
+            else:
+                async for result in send_llm_response(str(summary_result), tracer.get("usage")):
+                    yield result
+                return
+
     if conversation_commands == [ConversationCommand.Research]:
         async for research_result in research(
             user=user,
@@ -1054,6 +1096,17 @@ async def event_generator(
 
     # Gather Context
     ## Gather Document References
+    local_vault_references = load_local_vault_references()
+    if local_vault_references:
+        compiled_references.extend(local_vault_references)
+        inferred_queries.append("local vault")
+        async for result in send_event(
+            ChatEvent.STATUS, f"**Loaded {len(local_vault_references)} Local Vault Files**"
+        ):
+            yield result
+        if not is_env_var_true("KHOJ_ENABLE_RAG_FALLBACK") and ConversationCommand.Notes in conversation_commands:
+            conversation_commands.remove(ConversationCommand.Notes)
+
     if ConversationCommand.Notes in conversation_commands:
         try:
             async for result in search_documents(
@@ -1419,7 +1472,7 @@ async def chat_ws(
 ):
     # Validate WebSocket Origin
     origin = websocket.headers.get("origin")
-    if not origin or URL(origin).hostname not in ALLOWED_HOSTS:
+    if not is_allowed_websocket_origin(origin, websocket.headers.get("host")):
         await websocket.close(code=1008, reason="Origin not allowed")
         return
 

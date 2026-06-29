@@ -15,6 +15,8 @@ from tests.helpers import get_index_files, get_sample_data
 
 logger = logging.getLogger(__name__)
 
+BGE_ENGLISH_TEST_MAX_DISTANCE = 0.55
+
 
 # Test
 # ----------------------------------------------------------------------------------------------------
@@ -118,7 +120,7 @@ async def test_text_search(search_config):
     query = "Load Khoj on Emacs?"
 
     # Act
-    hits = await text_search.query(query, default_user)
+    hits = await text_search.query(query, default_user, max_distance=BGE_ENGLISH_TEST_MAX_DISTANCE)
     results = text_search.collate_results(hits)
     results = sorted(results, key=lambda x: float(x.score))[:1]
 

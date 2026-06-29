@@ -22,6 +22,7 @@ from khoj.utils.state import SearchType
 logger = logging.getLogger(__name__)
 
 search_type_to_embeddings_type = {
+    SearchType.Org.value: DbEntry.EntryType.ORG,
     SearchType.Markdown.value: DbEntry.EntryType.MARKDOWN,
     SearchType.Plaintext.value: DbEntry.EntryType.PLAINTEXT,
     SearchType.Pdf.value: DbEntry.EntryType.PDF,

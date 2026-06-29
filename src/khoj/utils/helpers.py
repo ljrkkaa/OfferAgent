@@ -423,6 +423,7 @@ class ConversationCommand(str, Enum):
     Text = "text"
     AutomatedTask = "automated_task"
     Diagram = "diagram"
+    Summarize = "summarize"
     Research = "research"
     Operator = "operator"
     ViewFile = "view_file"
@@ -685,6 +686,7 @@ tools_for_research_llm = {
 
 mode_descriptions_for_llm = {
     ConversationCommand.Text: "Use this if a normal text response would be sufficient for accurately responding to the query or you don't feel strongly about the other modes.",
+    ConversationCommand.Image: "Use this if the user is requesting a painting, illustration, photo, or generated image.",
     ConversationCommand.Diagram: "Use this if the user is requesting a diagram or visual representation that requires primitives like lines, rectangles, and text. This does not work for charts, graphs, or quantitative data. It is for mind mapping, flowcharts, etc.",
 }
 

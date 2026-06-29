@@ -5,9 +5,11 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from random import random
 from typing import (
     Annotated,
@@ -65,6 +67,7 @@ from khoj.database.models import (
     UserRequests,
 )
 from khoj.processor.content.markdown.markdown_to_entries import MarkdownToEntries
+from khoj.processor.content.org_mode.org_to_entries import OrgToEntries
 from khoj.processor.content.pdf.pdf_to_entries import PdfToEntries
 from khoj.processor.content.plaintext.plaintext_to_entries import PlaintextToEntries
 from khoj.processor.conversation import prompts
@@ -140,6 +143,40 @@ def validate_chat_model(user: KhojUser):
 
     if default_chat_model.model_type == "openai" and not default_chat_model.ai_model_api:
         raise HTTPException(status_code=500, detail="Contact the server administrator to add a chat model.")
+
+
+def load_local_vault_references(max_files: int = 8, max_chars: int = 12000) -> List[Dict[str, str]]:
+    vault_path = os.getenv("KHOJ_OBSIDIAN_VAULT_PATH")
+    if not vault_path:
+        return []
+
+    root = Path(vault_path).expanduser().resolve()
+    if not root.is_dir():
+        logger.warning("KHOJ_OBSIDIAN_VAULT_PATH is not a directory: %s", root)
+        return []
+
+    max_files = int(os.getenv("KHOJ_LOCAL_VAULT_MAX_FILES", max_files))
+    max_chars = int(os.getenv("KHOJ_LOCAL_VAULT_MAX_CHARS", max_chars))
+    paths = [p for p in root.rglob("*.md") if not any(part.startswith(".") for part in p.relative_to(root).parts)]
+    paths.sort(key=lambda p: (p.name.lower() != "agents.md", p.relative_to(root).as_posix().lower()))
+
+    references = []
+    remaining_chars = max_chars
+    for path in paths[:max_files]:
+        resolved = path.resolve()
+        if not resolved.is_relative_to(root):
+            continue
+        text = resolved.read_text(encoding="utf-8", errors="replace").strip()
+        if not text:
+            continue
+        relpath = resolved.relative_to(root).as_posix()
+        compiled = f"# {relpath}\n\n{text[:remaining_chars].rstrip()}"
+        references.append({"query": "local vault", "compiled": compiled, "file": relpath, "uri": relpath})
+        remaining_chars -= len(compiled)
+        if remaining_chars <= 0:
+            break
+
+    return references
 
 
 async def is_ready_to_chat(user: KhojUser):
@@ -239,6 +276,8 @@ def get_conversation_command(query: str) -> ConversationCommand:
         return ConversationCommand.Diagram
     elif query.startswith("/code"):
         return ConversationCommand.Code
+    elif query.startswith("/summarize"):
+        return ConversationCommand.Summarize
     elif query.startswith("/research"):
         return ConversationCommand.Research
     elif query.startswith("/operator") and is_operator_enabled():
@@ -443,6 +482,50 @@ async def aget_data_sources_and_output_format(
         data_sources = agent_sources if len(agent_sources) > 0 else [ConversationCommand.Default]
         output_mode = agent_outputs[0] if len(agent_outputs) > 0 else ConversationCommand.Text
 
+    def source_is_allowed(command: ConversationCommand) -> bool:
+        return len(agent_sources) == 0 or command.value in agent_sources
+
+    def output_is_allowed(command: ConversationCommand) -> bool:
+        return command.value in output_options and (len(agent_outputs) == 0 or command.value in agent_outputs)
+
+    def allowed_sources(commands: List[ConversationCommand]) -> List[ConversationCommand]:
+        return [command for command in commands if source_is_allowed(command)]
+
+    query_lower = query.lower()
+    heuristic_sources = []
+    chat_history_only_query = (
+        re.search(r"\b(what is|what's|tell me)\s+my\s+name\b", query_lower) or "who am i" in query_lower
+    )
+    if chat_history_only_query:
+        heuristic_sources = allowed_sources([ConversationCommand.General])
+    elif any(term in query_lower for term in ["wikipedia page", "webpage", "web page", "http://", "https://"]):
+        heuristic_sources = allowed_sources([ConversationCommand.Webpage])
+    elif any(term in query_lower for term in ["weather", "nearest", "latest", "current", "today", "hospital"]):
+        heuristic_sources = allowed_sources([ConversationCommand.Online])
+    elif any(term in query_lower for term in ["highest point", "highest mountain", "capital of this country"]):
+        heuristic_sources = allowed_sources([ConversationCommand.Online])
+
+    if any(term in query_lower for term in ["chart", "graph", "plot"]):
+        heuristic_sources = allowed_sources([ConversationCommand.Online, ConversationCommand.Code]) or heuristic_sources
+
+    personal_terms = [" my ", " i ", " me ", " have i", " did i", "past ", "learn to", "diving experience"]
+    has_person_name = bool(re.search(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b", query))
+    if not chat_history_only_query and (
+        has_person_name or any(term in f" {query_lower} " for term in personal_terms)
+    ):
+        if heuristic_sources:
+            if source_is_allowed(ConversationCommand.Notes) and ConversationCommand.Notes not in heuristic_sources:
+                heuristic_sources.append(ConversationCommand.Notes)
+        else:
+            heuristic_sources = allowed_sources([ConversationCommand.Notes])
+
+    if heuristic_sources:
+        data_sources = heuristic_sources
+
+    if any(term in query_lower for term in ["painting", "illustration", "photo", "image", "draw me"]):
+        if output_is_allowed(ConversationCommand.Image):
+            output_mode = ConversationCommand.Image
+
     return {"sources": data_sources, "output": output_mode}
 
 
@@ -572,13 +655,23 @@ async def generate_online_subqueries(
     # Validate that the response is a non-empty, JSON-serializable list
     try:
         response = clean_json(raw_response.text)
-        response = pyjson5.loads(response)
-        response = {q.strip() for q in response["queries"] if q.strip()}
+        try:
+            response = pyjson5.loads(response)
+        except Exception:
+            if response.strip().startswith('["queries":') and response.strip().endswith("]"):
+                response = pyjson5.loads("{" + response.strip()[1:-1] + "}")
+            else:
+                raise
+        raw_queries = response if isinstance(response, list) else response["queries"]
+        response = {q.strip() for q in raw_queries if q.strip()}
         if not isinstance(response, set) or not response or len(response) == 0:
             logger.error(
                 f"Invalid response for constructing online subqueries: {response}. Returning original query: {q}"
             )
             return {q}
+        if subreddit_match := re.search(r"\br/([A-Za-z0-9_]+)", q):
+            subreddit = subreddit_match.group(1)
+            response.add(f"site:reddit.com/r/{subreddit} {q}")
         return response
     except Exception:
         logger.error(f"Invalid response for constructing online subqueries: {response}. Returning original query: {q}")
@@ -741,13 +834,15 @@ async def generate_summary_from_files(
     tracer: dict = {},
 ):
     try:
-        file_objects = None
-        if await EntryAdapters.aagent_has_entries(agent):
+        file_objects = []
+        if file_filters:
+            file_objects = await FileObjectAdapters.aget_file_objects_by_names(user, file_filters)
+        elif await EntryAdapters.aagent_has_entries(agent):
             file_names = await EntryAdapters.aget_agent_entry_filepaths(agent)
             if len(file_names) > 0:
                 file_objects = await FileObjectAdapters.aget_file_objects_by_name(None, file_names.pop(), agent)
 
-        if (file_objects and len(file_objects) == 0 and not query_files) or (not file_objects and not query_files):
+        if len(file_objects) == 0 and not query_files:
             response_log = "Sorry, I couldn't find anything to summarize."
             yield response_log
             return
@@ -1250,9 +1345,48 @@ async def search_documents(
             agent=agent,
             tracer=tracer,
         )
+    question_words = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "how",
+        "i",
+        "is",
+        "just",
+        "me",
+        "my",
+        "the",
+        "there",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "would",
+    }
+    entity_queries = []
+    for match in re.finditer(r"\b[A-Z][a-z]+(?:s|'s)?(?:\s+[A-Z][a-z]+(?:s|'s)?)*\b", defiltered_query):
+        words = [word.removesuffix("'s") for word in match.group(0).split()]
+        words = [word for word in words if word.lower() not in question_words]
+        if not words:
+            continue
+        entity_query = " ".join(words)
+        if entity_query.endswith("s"):
+            entity_queries.append(entity_query[:-1])
+        entity_queries.append(entity_query)
+    inferred_queries = list(dict.fromkeys([*entity_queries, *inferred_queries]))
 
     # Collate search results as context for the LLM
-    inferred_queries = list(set(inferred_queries) - previous_inferred_queries)
+    inferred_queries = [query for query in inferred_queries if query not in previous_inferred_queries]
     with timer("Searching knowledge base took", logger):
         search_results = []
         logger.info(f"🔍 Searching knowledge base with queries: {inferred_queries}")
@@ -1366,10 +1500,34 @@ async def extract_questions(
     try:
         response = clean_json(raw_response.text)
         response = pyjson5.loads(response)
-        queries = [q.strip() for q in response["queries"] if q.strip()]
+        raw_queries = response if isinstance(response, list) else response["queries"]
+        queries = [q.strip() for q in raw_queries if q.strip()]
         if not isinstance(queries, list) or not queries:
             logger.error(f"Invalid response for constructing subqueries: {response}")
             return [query]
+        pronoun_match = re.search(r"\b(he|she|him|her|they|them|it)\b", query.lower())
+        if pronoun_match and chat_history:
+            pronoun = pronoun_match.group(1)
+            preferred_speaker = "you" if pronoun in {"he", "him"} else "khoj"
+            fallback_speaker = "khoj" if preferred_speaker == "you" else "you"
+            ignored_entities = {"What", "Who", "Where", "When", "Why", "How", "Does", "Is", "Mr", "Mrs", "Ms", "Dr"}
+            entity = None
+            for speaker in [preferred_speaker, fallback_speaker]:
+                for chat in reversed(chat_history):
+                    if chat.by != speaker:
+                        continue
+                    entities = [
+                        item
+                        for item in re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", chat.message)
+                        if item not in ignored_entities
+                    ]
+                    if entities:
+                        entity = entities[-1]
+                        break
+                if entity:
+                    break
+            if entity:
+                queries = [q if entity in q else f"{q} {entity}" for q in queries]
         return queries
     except Exception:
         logger.warning("LLM returned invalid JSON. Falling back to using user message as search query.")
@@ -1425,6 +1583,7 @@ async def execute_search(
     # Use asyncio to run searches in parallel
     if t.value in [
         SearchType.All.value,
+        SearchType.Org.value,
         SearchType.Markdown.value,
         SearchType.Plaintext.value,
         SearchType.Pdf.value,
@@ -1721,6 +1880,22 @@ def build_conversation_context(
     # Initialize Variables
     current_date = datetime.now()
 
+    def trim_references_for_prompt(items: List[Dict], max_total_chars: int = 12000, max_item_chars: int = 2500):
+        trimmed_references = []
+        remaining_chars = max_total_chars
+        for item in items:
+            if remaining_chars <= 0:
+                break
+            trimmed_item = dict(item)
+            compiled = str(trimmed_item.get("compiled", ""))
+            item_limit = min(max_item_chars, remaining_chars)
+            if len(compiled) > item_limit:
+                compiled = f"{compiled[:item_limit].rstrip()}\n..."
+            trimmed_item["compiled"] = compiled
+            remaining_chars -= len(compiled)
+            trimmed_references.append(trimmed_item)
+        return trimmed_references
+
     # Build system prompt
     if agent and agent.personality:
         system_prompt = prompts.custom_personality.format(
@@ -1752,7 +1927,9 @@ def build_conversation_context(
     # Build context message
     context_message = ""
     if not is_none_or_empty(references):
-        context_message = f"{prompts.notes_conversation.format(references=yaml_dump(references))}\n\n"
+        system_prompt += f"\n\n{prompts.notes_grounding_system}"
+        prompt_references = trim_references_for_prompt(references)
+        context_message = f"{prompts.notes_conversation.format(references=yaml_dump(prompt_references))}\n\n"
     if not is_none_or_empty(online_results):
         context_message += f"{prompts.online_search_conversation.format(online_results=yaml_dump(online_results))}\n\n"
     if not is_none_or_empty(code_results):
@@ -1767,10 +1944,14 @@ def build_conversation_context(
             f"{prompts.operator_execution_context.format(operator_results=yaml_dump(operator_content))}\n\n"
         )
     context_message = context_message.strip()
+    message_with_context = user_query
+    if not is_none_or_empty(context_message):
+        message_with_context = f"{context_message}\n\nUser's message:\n{user_query}"
+        context_message = ""
 
     # Generate the chatml messages
     messages = generate_chatml_messages_with_context(
-        user_message=user_query,
+        user_message=message_with_context,
         query_files=query_files,
         query_images=query_images,
         context_message=context_message,
@@ -2384,6 +2565,13 @@ def should_notify(original_query: str, executed_query: str, ai_response: str, us
     if any(is_none_or_empty(message) for message in [original_query, executed_query, ai_response]):
         return False
 
+    generated_asset_request = re.search(
+        r"\b(create|draw|generate|paint|make)\b", f"{original_query} {executed_query}".lower()
+    )
+    generated_asset_response = re.search(r"https?://\S+\.(?:png|jpe?g|webp|gif|svg|pdf|zip)\b", ai_response)
+    if generated_asset_request and generated_asset_response:
+        return True
+
     to_notify_or_not = prompts.to_notify_or_not.format(
         original_query=original_query,
         executed_query=executed_query,
@@ -2871,6 +3059,23 @@ def configure_content(
         return False
 
     search_type = t.value if t else None
+
+    try:
+        # Initialize Org Search
+        if (search_type == state.SearchType.All.value or search_type == state.SearchType.Org.value) and files.get(
+            "org"
+        ):
+            logger.info("🗒️ Setting up search for org notes")
+            text_search.setup(
+                OrgToEntries,
+                files.get("org"),
+                regenerate=regenerate,
+                user=user,
+            )
+
+    except Exception as e:
+        logger.error(f"🚨 Failed to setup org: {e}", exc_info=True)
+        success = False
 
     try:
         # Initialize Markdown Search

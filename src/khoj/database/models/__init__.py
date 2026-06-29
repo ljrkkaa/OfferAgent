@@ -555,7 +555,7 @@ class SearchModelConfig(DbBaseModel):
     # Type of content the model can generate embeddings for
     model_type = models.CharField(max_length=200, choices=ModelType.choices, default=ModelType.TEXT)
     # Bi-encoder model of sentence-transformer type to load from HuggingFace
-    bi_encoder = models.CharField(max_length=200, default="thenlper/gte-small")
+    bi_encoder = models.CharField(max_length=200, default="BAAI/bge-small-zh-v1.5")
     # Config passed to the sentence-transformer model constructor. E.g. device="cuda:0", trust_remote_server=True etc.
     bi_encoder_model_config = models.JSONField(default=dict, blank=True)
     # Query encode configs like prompt, precision, normalize_embeddings, etc. for sentence-transformer models
@@ -563,7 +563,7 @@ class SearchModelConfig(DbBaseModel):
     # Docs encode configs like prompt, precision, normalize_embeddings, etc. for sentence-transformer models
     bi_encoder_docs_encode_config = models.JSONField(default=dict, blank=True)
     # Cross-encoder model of sentence-transformer type to load from HuggingFace
-    cross_encoder = models.CharField(max_length=200, default="mixedbread-ai/mxbai-rerank-xsmall-v1")
+    cross_encoder = models.CharField(max_length=200, default="BAAI/bge-reranker-v2-m3")
     # Config passed to the cross-encoder model constructor. E.g. device="cuda:0", trust_remote_server=True etc.
     cross_encoder_model_config = models.JSONField(default=dict, blank=True)
     # Inference server API endpoint to use for embeddings inference. Bi-encoder model should be hosted on this server
@@ -579,7 +579,7 @@ class SearchModelConfig(DbBaseModel):
     # Inference server API Key to use for embeddings inference. Cross-encoder model should be hosted on this server
     cross_encoder_inference_endpoint_api_key = models.CharField(max_length=200, default=None, null=True, blank=True)
     # The confidence threshold of the bi_encoder model to consider the embeddings as relevant
-    bi_encoder_confidence_threshold = models.FloatField(default=0.18)
+    bi_encoder_confidence_threshold = models.FloatField(default=0.55)
 
     def __str__(self):
         return self.name
@@ -669,7 +669,19 @@ class Conversation(DbBaseModel):
     file_filters = models.JSONField(default=list)
     id = models.UUIDField(default=uuid.uuid4, editable=False, unique=True, primary_key=True, db_index=True)
 
+    def normalize_conversation_log(self):
+        if isinstance(self.conversation_log, list):
+            self.conversation_log = {"chat": self.conversation_log}
+        elif self.conversation_log is None:
+            self.conversation_log = {"chat": []}
+        if isinstance(self.conversation_log, dict):
+            self.conversation_log["chat"] = [
+                msg.model_dump(mode="json") if hasattr(msg, "model_dump") else msg
+                for msg in self.conversation_log.get("chat", [])
+            ]
+
     def clean(self):
+        self.normalize_conversation_log()
         # Validate conversation_log structure
         try:
             messages = self.conversation_log.get("chat", [])

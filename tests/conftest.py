@@ -33,6 +33,8 @@ from tests.helpers import (
     UserConversationProcessorConfigFactory,
     UserFactory,
     get_chat_api_key,
+    get_chat_api_base_url,
+    get_chat_model_name,
     get_chat_provider,
     get_index_files,
     get_sample_data,
@@ -169,13 +171,13 @@ def api_user4(default_user4):
 
 @pytest.fixture
 def default_openai_chat_model_option():
-    chat_model = ChatModelFactory(name="gpt-4o-mini", model_type="openai")
+    chat_model = ChatModelFactory(name=get_chat_model_name(ChatModel.ModelType.OPENAI), model_type="openai")
     return chat_model
 
 
 @pytest.fixture
 def openai_agent():
-    chat_model = ChatModelFactory(name="gpt-4o-mini", model_type="openai")
+    chat_model = ChatModelFactory(name=get_chat_model_name(ChatModel.ModelType.OPENAI), model_type="openai")
     return Agent.objects.create(
         name="Accountant",
         chat_model=chat_model,
@@ -233,13 +235,16 @@ def chat_client_builder(search_config, user, index_content=True, require_auth=Fa
     chat_provider = get_chat_provider()
     online_chat_model: ChatModelFactory = None
     if chat_provider == ChatModel.ModelType.OPENAI:
-        online_chat_model = ChatModelFactory(name="gpt-4o-mini", model_type="openai")
+        online_chat_model = ChatModelFactory(name=get_chat_model_name(chat_provider), model_type="openai")
     elif chat_provider == ChatModel.ModelType.GOOGLE:
         online_chat_model = ChatModelFactory(name="gemini-2.5-flash", model_type="google")
     elif chat_provider == ChatModel.ModelType.ANTHROPIC:
         online_chat_model = ChatModelFactory(name="claude-haiku-4-5-20251001", model_type="anthropic")
     if online_chat_model:
-        online_chat_model.ai_model_api = AiModelApiFactory(api_key=get_chat_api_key(chat_provider))
+        online_chat_model.ai_model_api = AiModelApiFactory(
+            api_key=get_chat_api_key(chat_provider),
+            api_base_url=get_chat_api_base_url(chat_provider),
+        )
         UserConversationProcessorConfigFactory(user=user, setting=online_chat_model)
 
     state.anonymous_mode = not require_auth
@@ -342,14 +347,17 @@ End of file {i}.
     chat_provider = get_chat_provider()
     online_chat_model = None
     if chat_provider == ChatModel.ModelType.OPENAI:
-        online_chat_model = ChatModelFactory(name="gpt-4o-mini", model_type="openai")
+        online_chat_model = ChatModelFactory(name=get_chat_model_name(chat_provider), model_type="openai")
     elif chat_provider == ChatModel.ModelType.GOOGLE:
         online_chat_model = ChatModelFactory(name="gemini-2.5-flash", model_type="google")
     elif chat_provider == ChatModel.ModelType.ANTHROPIC:
         online_chat_model = ChatModelFactory(name="claude-3-5-haiku-20241022", model_type="anthropic")
 
     if online_chat_model:
-        online_chat_model.ai_model_api = AiModelApiFactory(api_key=get_chat_api_key(chat_provider))
+        online_chat_model.ai_model_api = AiModelApiFactory(
+            api_key=get_chat_api_key(chat_provider),
+            api_base_url=get_chat_api_base_url(chat_provider),
+        )
         UserConversationProcessorConfigFactory(user=user, setting=online_chat_model)
 
     state.anonymous_mode = False

@@ -60,6 +60,19 @@ openai_async_clients: Dict[str, openai.AsyncOpenAI] = {}
 MAX_COMPLETION_TOKENS = 16000
 
 
+def is_deepseek_style_model(model_name: str) -> bool:
+    return (
+        model_name.startswith("deepseek-chat")
+        or model_name.startswith("deepseek-reasoner")
+        or model_name.startswith("deepseek-v4")
+        or "deepseek-r1" in model_name.lower()
+    )
+
+
+def get_effective_openai_api_base_url(api_base_url: str | None = None) -> str | None:
+    return api_base_url if api_base_url is not None else os.getenv("OPENAI_BASE_URL")
+
+
 def _extract_text_for_instructions(content: Union[str, List, Dict, None]) -> str:
     """Extract plain text from a message content suitable for Responses API instructions."""
     if content is None:
@@ -102,6 +115,7 @@ def completion_with_backoff(
     model_kwargs: dict = {},
     tracer: dict = {},
 ) -> ResponseWithThought:
+    api_base_url = get_effective_openai_api_base_url(api_base_url)
     client_key = f"{openai_api_key}--{api_base_url}"
     client = openai_clients.get(client_key)
     if not client:
@@ -134,7 +148,7 @@ def completion_with_backoff(
         if model_name.startswith("grok-4"):
             # Grok-4 models do not support reasoning_effort parameter
             model_kwargs.pop("reasoning_effort", None)
-    elif model_name.startswith("deepseek-reasoner") or model_name.startswith("deepseek-chat"):
+    elif is_deepseek_style_model(model_name):
         stream_processor = in_stream_thought_processor
         # Two successive messages cannot be from the same role. Should merge any back-to-back messages from the same role.
         # The first message should always be a user message (except system message).
@@ -293,6 +307,7 @@ async def chat_completion_with_backoff(
     deepthought=False,
     tracer: dict = {},
 ) -> AsyncGenerator[ResponseWithThought, None]:
+    api_base_url = get_effective_openai_api_base_url(api_base_url)
     client_key = f"{openai_api_key}--{api_base_url}"
     client = openai_async_clients.get(client_key)
     if not client:
@@ -325,11 +340,7 @@ async def chat_completion_with_backoff(
         # Grok-4 models do not support reasoning_effort parameter
         if not model_name.startswith("grok-4"):
             model_kwargs["reasoning_effort"] = reasoning_effort
-    elif (
-        model_name.startswith("deepseek-chat")
-        or model_name.startswith("deepseek-reasoner")
-        or "deepseek-r1" in model_name.lower()
-    ):
+    elif is_deepseek_style_model(model_name):
         # Official Deepseek models and some inference APIs like vLLM return structured thinking output.
         # Others like DeepInfra return it in response stream.
         # Using the instream thought processor handles both cases, structured thoughts and in response thoughts.
@@ -462,6 +473,7 @@ def responses_completion_with_backoff(
     Synchronous helper using the OpenAI Responses API in streaming mode under the hood.
     Aggregates streamed deltas and returns a ResponseWithThought.
     """
+    api_base_url = get_effective_openai_api_base_url(api_base_url)
     client_key = f"{openai_api_key}--{api_base_url}"
     client = openai_clients.get(client_key)
     if not client:
@@ -580,6 +592,7 @@ async def responses_chat_completion_with_backoff(
     Async streaming helper using the OpenAI Responses API.
     Yields ResponseWithThought chunks as text/think deltas arrive.
     """
+    api_base_url = get_effective_openai_api_base_url(api_base_url)
     client_key = f"{openai_api_key}--{api_base_url}"
     client = openai_async_clients.get(client_key)
     if not client:
@@ -724,7 +737,8 @@ async def responses_chat_completion_with_backoff(
 
 
 def get_structured_output_support(model_name: str, api_base_url: str = None) -> StructuredOutputSupport:
-    if model_name.startswith("deepseek-reasoner"):
+    api_base_url = get_effective_openai_api_base_url(api_base_url)
+    if model_name.startswith("deepseek-reasoner") or model_name.startswith("deepseek-v4"):
         return StructuredOutputSupport.NONE
     if api_base_url:
         host = urlparse(api_base_url).hostname
@@ -739,6 +753,7 @@ def format_message_for_api(raw_messages: List[ChatMessage], model_name: str, api
     """
     Format messages to send to chat model served over OpenAI (compatible) API.
     """
+    api_base_url = get_effective_openai_api_base_url(api_base_url)
     formatted_messages = []
     messages = deepcopy(raw_messages)
     for message in reversed(messages):  # Process in reverse to not mess up iterator when drop invalid messages
@@ -860,6 +875,7 @@ def is_openai_api(api_base_url: str = None) -> bool:
     """
     Check if the model is served over the official OpenAI API
     """
+    api_base_url = get_effective_openai_api_base_url(api_base_url)
     return api_base_url is None or api_base_url.startswith("https://api.openai.com/v1")
 
 

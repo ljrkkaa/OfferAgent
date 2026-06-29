@@ -572,7 +572,7 @@ async def aget_default_search_model() -> SearchModelConfig:
 
     if default_search_model:
         return default_search_model
-    elif await SearchModelConfig.objects.count() == 0:
+    elif await SearchModelConfig.objects.acount() == 0:
         await SearchModelConfig.objects.acreate()
     return await SearchModelConfig.objects.afirst()
 

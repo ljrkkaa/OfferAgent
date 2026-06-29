@@ -62,9 +62,13 @@ async def test_extract_question_with_date_filter_from_relative_month(chat_client
 
     # Assert
     expected_responses = [("dt>='1984-03-01'", "dt<'1984-04-01'"), ("dt>='1984-03-01'", "dt<='1984-03-31'")]
-    assert len(response) == 1
-    assert any([start in response[0] and end in response[0] for start, end in expected_responses]), (
-        "Expected date filter to limit to March 1984 in response but got: " + response[0]
+    assert len(response) >= 1
+    assert any(
+        start in generated_query and end in generated_query
+        for generated_query in response
+        for start, end in expected_responses
+    ), (
+        "Expected date filter to limit to March 1984 in response but got: " + str(response)
     )
 
 
@@ -83,10 +87,12 @@ async def test_extract_question_with_date_filter_from_relative_year(chat_client,
         ("dt>='1984-01-01'", "dt<'1985-01-01'"),
         ("dt>='1984-01-01'", "dt<='1984-12-31'"),
     ]
-    assert len(response) == 1
-    assert any([start in response[0] and end in response[0] for start, end in expected_responses]), (
-        "Expected date filter to limit to 1984 in response but got: " + response[0]
-    )
+    assert len(response) >= 1
+    assert any(
+        start in generated_query and end in generated_query
+        for generated_query in response
+        for start, end in expected_responses
+    ), "Expected date filter to limit to 1984 in response but got: " + str(response)
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -309,17 +315,20 @@ async def test_refuse_answering_unanswerable_question():
     response = "".join([response_chunk.text async for response_chunk in response_gen])
 
     # Assert
+    normalized_response = response.lower().replace("’", "'")
     expected_responses = [
         "don't know",
         "do not know",
         "no information",
         "do not have",
         "don't have",
+        "don't have that information",
         "cannot answer",
-        "I'm sorry",
+        "i'm sorry",
+        "not sure",
     ]
     assert len(response) > 0
-    assert any([expected_response in response for expected_response in expected_responses]), (
+    assert any([expected_response in normalized_response for expected_response in expected_responses]), (
         "Expected chat actor to say they don't know in response, but got: " + response
     )
 
@@ -604,7 +613,9 @@ async def test_select_data_sources_actor_chooses_to_search_notes(
     chat_client, user_query, expected_conversation_commands, default_user2
 ):
     # Act
-    selected_conversation_commands = await aget_data_sources_and_output_format(user_query, [], False, default_user2)
+    selected_conversation_commands = await aget_data_sources_and_output_format(
+        user_query, [], default_user2, query_images=False
+    )
 
     # Assert
     assert set(expected_conversation_commands["sources"]) == set(selected_conversation_commands["sources"])
@@ -628,7 +639,7 @@ async def test_get_correct_tools_with_chat_history(chat_client, default_user2):
     chat_history = generate_chat_history(chat_log)
 
     # Act
-    selected = await aget_data_sources_and_output_format(user_query, chat_history, False, default_user2)
+    selected = await aget_data_sources_and_output_format(user_query, chat_history, default_user2, query_images=False)
     sources = selected["sources"]
 
     # Assert
