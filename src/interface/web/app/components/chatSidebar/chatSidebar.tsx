@@ -33,7 +33,7 @@ import useSWR from "swr";
 import { mutate } from "swr";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { AgentData } from "../agentCard/agentCard";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
     getAvailableIcons,
     getIconForSlashCommand,
@@ -75,7 +75,11 @@ interface ChatSideBarProps {
     isActive?: boolean;
 }
 
-const fetcher = (url: string) => fetch(url).then((res) => res.json());
+const fetcher = async (url: string) => {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status}`);
+    return response.json();
+};
 
 export function ChatSidebar({ ...props }: ChatSideBarProps) {
     if (props.isMobileWidth) {
@@ -103,7 +107,8 @@ interface IAgentCreationProps {
 }
 
 interface AgentError {
-    detail: string;
+    detail?: string;
+    error?: string;
 }
 
 interface FastModeData {
@@ -152,21 +157,33 @@ function AgentCreationForm(props: IAgentCreationProps) {
             },
             body: JSON.stringify(data),
         })
-            .then((res) => res.json())
-            .then((data: AgentData | AgentError) => {
-                console.log("Success:", data);
-                if ("detail" in data) {
-                    setError(`Error creating agent: ${data.detail}`);
-                    setIsCreating(false);
-                    return;
+            .then(async (res) => {
+                const data = (await res.json().catch(() => ({}))) as AgentData | AgentError;
+                if (!res.ok) {
+                    throw new Error(
+                        "detail" in data && data.detail
+                            ? data.detail
+                            : "error" in data && data.error
+                              ? data.error
+                              : "Failed to create agent",
+                    );
                 }
+                return data as AgentData;
+            })
+            .then((data: AgentData) => {
+                console.log("Success:", data);
                 setDoneCreating(true);
                 setCreatedSlug(data.slug);
-                setIsCreating(false);
             })
             .catch((error) => {
                 console.error("Error:", error);
-                setError(`Error creating agent: ${error}`);
+                setError(
+                    error instanceof Error
+                        ? `Error creating agent: ${error.message}`
+                        : `Error creating agent: ${error}`,
+                );
+            })
+            .finally(() => {
                 setIsCreating(false);
             });
     }
@@ -226,7 +243,7 @@ function AgentCreationForm(props: IAgentCreationProps) {
                                 animate={{ opacity: 1, y: 0 }}
                                 transition={{ delay: 0.4 }}
                             >
-                                <Link href={`/agents?agent=${createdSlug}`}>
+                                <Link href={`/agents?agent=${encodeURIComponent(createdSlug)}`}>
                                     <Button variant="secondary" className="mt-2">
                                         Manage Agent
                                     </Button>
@@ -337,7 +354,7 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
         isLoading: agentDataLoading,
         error: agentDataError,
     } = useSWR<AgentData>(
-        `/api/agents/conversation?conversation_id=${props.conversationId}`,
+        `/api/agents/conversation?conversation_id=${encodeURIComponent(props.conversationId)}`,
         fetcher,
     );
     const {
@@ -362,7 +379,7 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
 
     const isSubscribed = authenticatedData?.is_active ?? false;
 
-    function setupAgentData() {
+    const setupAgentData = useCallback(() => {
         if (agentData) {
             setInputTools(agentData.input_tools);
             setDisplayInputTools(agentData.input_tools);
@@ -397,12 +414,12 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
                 setSelectedModel(agentData.chat_model);
             }
         }
-    }
+    }, [agentConfigurationOptions, agentData]);
 
     useEffect(() => {
         setupAgentData();
         setHasModified(false);
-    }, [agentData]);
+    }, [setupAgentData]);
 
     // Track changes to the model, prompt, input tools and output modes fields
     useEffect(() => {
@@ -414,11 +431,11 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
 
         // Order independent check to ensure input tools or output modes haven't been changed.
         const toolsChanged =
-            JSON.stringify(inputTools?.sort() || []) !==
-            JSON.stringify(agentData.input_tools?.sort());
+            JSON.stringify([...(inputTools || [])].sort()) !==
+            JSON.stringify([...(agentData.input_tools || [])].sort());
         const modesChanged =
-            JSON.stringify(outputModes?.sort() || []) !==
-            JSON.stringify(agentData.output_modes?.sort());
+            JSON.stringify([...(outputModes || [])].sort()) !==
+            JSON.stringify([...(agentData.output_modes || [])].sort());
 
         setHasModified(modelChanged || promptChanged || toolsChanged || modesChanged);
 
@@ -476,7 +493,7 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
 
             const url = !isDefaultAgent
                 ? `/api/agents/hidden`
-                : `/api/agents/hidden?conversation_id=${props.conversationId}`;
+                : `/api/agents/hidden?conversation_id=${encodeURIComponent(props.conversationId)}`;
 
             // There are four scenarios here.
             // 1. If the agent is a default agent, then we need to create a new agent just to associate with this conversation.
@@ -490,16 +507,33 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
                 },
                 body: JSON.stringify(data),
             })
-                .then((res) => {
-                    setIsSaving(false);
-                    res.json();
+                .then(async (res) => {
+                    const responseBody = (await res.json().catch(() => ({}))) as {
+                        detail?: string;
+                        error?: string;
+                    };
+
+                    if (!res.ok) {
+                        throw new Error(
+                            responseBody.detail ||
+                                responseBody.error ||
+                                "Failed to save chat options",
+                        );
+                    }
+
+                    return responseBody;
                 })
-                .then((data) => {
-                    mutate(`/api/agents/conversation?conversation_id=${props.conversationId}`);
+                .then(() => {
+                    mutate(
+                        `/api/agents/conversation?conversation_id=${encodeURIComponent(props.conversationId)}`,
+                    );
                     setHasModified(false);
                 })
                 .catch((error) => {
                     console.error("Error:", error);
+                    alert(error instanceof Error ? error.message : "Failed to save chat options");
+                })
+                .finally(() => {
                     setIsSaving(false);
                 });
         }
@@ -510,21 +544,28 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
         setHasModified(false);
     }
 
-    function handleModelSelect(model: ModelOptions) {
-        setSelectedModel(model.name);
-        if (!isDefaultAgent) return;
+    async function handleModelSelect(model: ModelOptions) {
+        if (!isDefaultAgent) {
+            setSelectedModel(model.name);
+            return true;
+        }
 
-        fetch(`/api/model/chat?id=${model.id}`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
-        })
-            .then((response) => {
-                if (!response.ok) throw new Error(`Failed to switch chat model to ${model.name}`);
-                mutate("/api/settings?detailed=true");
-            })
-            .catch((error) => console.error(error));
+        try {
+            const response = await fetch(`/api/model/chat?id=${model.id}`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+            });
+            if (!response.ok) throw new Error(`Failed to switch chat model to ${model.name}`);
+            setSelectedModel(model.name);
+            mutate("/api/settings?detailed=true");
+            return true;
+        } catch (error) {
+            console.error(error);
+            alert(error instanceof Error ? error.message : "Failed to switch chat model");
+            return false;
+        }
     }
 
     function handleFastModeChange(enabled: boolean) {
@@ -538,7 +579,10 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
                 if (!response.ok) throw new Error("Failed to switch fast mode");
                 mutate("/api/model/chat/fast");
             })
-            .catch((error) => console.error(error));
+            .catch((error) => {
+                console.error(error);
+                alert(error instanceof Error ? error.message : "Failed to switch fast mode");
+            });
     }
 
     return (
@@ -559,7 +603,7 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
                         <div className="flex items-center relative text-sm">
                             <a
                                 className="text-lg font-bold flex flex-row items-center"
-                                href={`/agents?agent=${agentData.slug}`}
+                                href={`/agents?agent=${encodeURIComponent(agentData.slug)}`}
                             >
                                 {getIconFromIconName(agentData.icon, agentData.color)}
                                 {agentData.name}
@@ -571,6 +615,15 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
                         </div>
                     )}
                 </SidebarHeader>
+                {agentDataError && (
+                    <SidebarGroup key={"agent-error"} className="border-b last:border-none">
+                        <SidebarGroupContent>
+                            <div className="text-sm text-destructive">
+                                Failed to load chat options.
+                            </div>
+                        </SidebarGroupContent>
+                    </SidebarGroup>
+                )}
                 <SidebarGroup key={"knowledge"} className="border-b last:border-none">
                     <SidebarGroupContent className="gap-0">
                         <SidebarMenu className="p-0 m-0">
@@ -800,7 +853,7 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
                                         className="w-full"
                                         variant={"ghost"}
                                         onClick={() =>
-                                            (window.location.href = `/agents?agent=${agentData?.slug}`)
+                                            (window.location.href = `/agents?agent=${encodeURIComponent(agentData.slug)}`)
                                         }
                                     >
                                         Manage

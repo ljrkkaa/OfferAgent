@@ -1,7 +1,7 @@
 "use client";
 
 import styles from "./chatHistory.module.css";
-import { useRef, useEffect, useState } from "react";
+import { useRef, useEffect, useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 
 import ChatMessage, {
@@ -31,6 +31,19 @@ interface ChatResponse {
     response: ChatHistoryData;
 }
 
+function isChatHistoryData(data: unknown): data is ChatHistoryData {
+    return (
+        typeof data === "object" &&
+        data !== null &&
+        Array.isArray((data as ChatHistoryData).chat) &&
+        ((data as ChatHistoryData).agent === null ||
+            typeof (data as ChatHistoryData).agent === "object") &&
+        typeof (data as ChatHistoryData).conversation_id === "string" &&
+        typeof (data as ChatHistoryData).slug === "string" &&
+        typeof (data as ChatHistoryData).is_owner === "boolean"
+    );
+}
+
 interface ChatHistoryProps {
     conversationId: string;
     setTitle: (title: string) => void;
@@ -42,7 +55,7 @@ interface ChatHistoryProps {
     customClassName?: string;
     setIsChatSideBarOpen?: (isOpen: boolean) => void;
     setIsOwner?: (isOwner: boolean) => void;
-    onRetryMessage?: (query: string, turnId?: string) => void;
+    onRetryMessage?: (query: string, turnId?: string) => Promise<boolean> | boolean | void;
 }
 
 interface TrainOfThoughtFrame {
@@ -264,6 +277,15 @@ function TrainOfThoughtComponent(props: TrainOfThoughtComponentProps) {
 }
 
 export default function ChatHistory(props: ChatHistoryProps) {
+    const {
+        conversationId,
+        incomingMessages,
+        publicConversationSlug,
+        setAgent,
+        setIsChatSideBarOpen,
+        setIsOwner,
+        setTitle,
+    } = props;
     const [data, setData] = useState<ChatHistoryData | null>(null);
     const [currentPage, setCurrentPage] = useState(0);
     const [hasMoreMessages, setHasMoreMessages] = useState(true);
@@ -284,6 +306,138 @@ export default function ChatHistory(props: ChatHistoryProps) {
     const fetchMessageCount = 10;
     const hasStartingMessage = localStorage.getItem("message");
 
+    const scrollToBottom = useCallback(
+        (instant: boolean = false) => {
+            const scrollAreaEl =
+                scrollAreaRef.current?.querySelector<HTMLElement>(scrollAreaSelector);
+            requestAnimationFrame(() => {
+                scrollAreaEl?.scrollTo({
+                    top: scrollAreaEl.scrollHeight,
+                    behavior: instant ? "auto" : "smooth",
+                });
+            });
+            // Optimistically set, the scroll listener will verify
+            if (
+                instant ||
+                (scrollAreaEl &&
+                    scrollAreaEl.scrollHeight -
+                        (scrollAreaEl.scrollTop + scrollAreaEl.clientHeight) <
+                        5)
+            ) {
+                setIsNearBottom(true);
+            }
+        },
+        [scrollAreaSelector],
+    );
+
+    const adjustScrollPosition = useCallback(() => {
+        const scrollAreaEl = scrollAreaRef.current?.querySelector<HTMLElement>(scrollAreaSelector);
+        requestAnimationFrame(() => {
+            // Snap scroll position to the latest fetched message ref
+            latestFetchedMessageRef.current?.scrollIntoView({ behavior: "auto", block: "start" });
+            // Now scroll up smoothly to render user scroll action
+            scrollAreaEl?.scrollBy({ behavior: "smooth", top: -150 });
+        });
+    }, [scrollAreaSelector]);
+
+    const fetchMoreMessages = useCallback(
+        (currentPage: number) => {
+            if (!hasMoreMessages || fetchingData) return;
+            const nextPage = currentPage + 1;
+            const maxMessagesToFetch = nextPage * fetchMessageCount;
+            let conversationFetchURL = "";
+
+            if (conversationId) {
+                conversationFetchURL = `/api/chat/history?client=web&conversation_id=${encodeURIComponent(conversationId)}&n=${maxMessagesToFetch}`;
+            } else if (publicConversationSlug) {
+                conversationFetchURL = `/api/chat/share/history?client=web&public_conversation_slug=${encodeURIComponent(publicConversationSlug)}&n=${maxMessagesToFetch}`;
+            } else {
+                return;
+            }
+
+            fetch(conversationFetchURL)
+                .then((response) => {
+                    if (!response.ok) {
+                        throw new Error(
+                            `Failed to fetch chat history with status ${response.status}`,
+                        );
+                    }
+                    return response.json();
+                })
+                .then((chatData: ChatResponse) => {
+                    if (chatData.status !== "ok" || !isChatHistoryData(chatData.response)) {
+                        throw new Error("Invalid chat history response");
+                    }
+                    setTitle(chatData.response.slug);
+                    setIsOwner && setIsOwner(chatData?.response?.is_owner);
+                    if (
+                        chatData &&
+                        chatData.response &&
+                        chatData.response.chat &&
+                        chatData.response.chat.length > 0
+                    ) {
+                        setCurrentPage(
+                            Math.ceil(chatData.response.chat.length / fetchMessageCount),
+                        );
+                        if (chatData.response.chat.length === data?.chat.length) {
+                            setHasMoreMessages(false);
+                            setFetchingData(false);
+                            return;
+                        }
+                        if (chatData.response.agent) {
+                            setAgent(chatData.response.agent);
+                        }
+                        setData(chatData.response);
+                        setFetchingData(false);
+                        if (currentPage === 0) {
+                            scrollToBottom(true);
+                        } else {
+                            adjustScrollPosition();
+                        }
+                    } else {
+                        if (chatData.response.agent && chatData.response.conversation_id) {
+                            const chatMetadata = {
+                                chat: [],
+                                agent: chatData.response.agent,
+                                conversation_id: chatData.response.conversation_id,
+                                slug: chatData.response.slug,
+                                is_owner: chatData.response.is_owner,
+                            };
+                            if (chatData.response.agent) {
+                                setAgent(chatData.response.agent);
+                            }
+                            setData(chatMetadata);
+                            if (setIsChatSideBarOpen && !hasStartingMessage) {
+                                setIsChatSideBarOpen(true);
+                            }
+                        }
+
+                        setHasMoreMessages(false);
+                        setFetchingData(false);
+                    }
+                })
+                .catch((err) => {
+                    console.error(err);
+                    window.location.href = "/";
+                });
+        },
+        [
+            adjustScrollPosition,
+            conversationId,
+            data?.chat.length,
+            fetchMessageCount,
+            fetchingData,
+            hasMoreMessages,
+            hasStartingMessage,
+            publicConversationSlug,
+            scrollToBottom,
+            setAgent,
+            setIsChatSideBarOpen,
+            setIsOwner,
+            setTitle,
+        ],
+    );
+
     useEffect(() => {
         const scrollAreaEl = scrollAreaRef.current?.querySelector<HTMLElement>(scrollAreaSelector);
         if (!scrollAreaEl) return;
@@ -303,10 +457,10 @@ export default function ChatHistory(props: ChatHistoryProps) {
 
     // Auto scroll while incoming message is streamed
     useEffect(() => {
-        if (props.incomingMessages && props.incomingMessages.length > 0 && isNearBottom) {
+        if (incomingMessages && incomingMessages.length > 0 && isNearBottom) {
             scrollToBottom(true);
         }
-    }, [props.incomingMessages, isNearBottom]);
+    }, [incomingMessages, isNearBottom, scrollToBottom]);
 
     // ResizeObserver to handle content height changes (e.g., images loading)
     useEffect(() => {
@@ -325,8 +479,8 @@ export default function ChatHistory(props: ChatHistoryProps) {
 
             if (currentlyNearBottom) {
                 // Only auto-scroll if there are incoming messages being processed
-                if (props.incomingMessages && props.incomingMessages.length > 0) {
-                    const lastMessage = props.incomingMessages[props.incomingMessages.length - 1];
+                if (incomingMessages && incomingMessages.length > 0) {
+                    const lastMessage = incomingMessages[incomingMessages.length - 1];
                     // If the last message is not completed, or it just completed (indicated by incompleteIncomingMessageIndex still being set)
                     if (
                         !lastMessage.completed ||
@@ -340,7 +494,7 @@ export default function ChatHistory(props: ChatHistoryProps) {
 
         observer.observe(contentWrapper);
         return () => observer.disconnect();
-    }, [props.incomingMessages, incompleteIncomingMessageIndex, scrollAreaRef]); // Dependencies
+    }, [incomingMessages, incompleteIncomingMessageIndex, scrollAreaRef, scrollToBottom]); // Dependencies
 
     // Scroll to most recent user message after the first page of chat messages is loaded.
     useEffect(() => {
@@ -370,7 +524,7 @@ export default function ChatHistory(props: ChatHistoryProps) {
         }
 
         return () => observer.disconnect();
-    }, [hasMoreMessages, currentPage, fetchingData]);
+    }, [hasMoreMessages, currentPage, fetchingData, fetchMoreMessages]);
 
     useEffect(() => {
         setHasMoreMessages(true);
@@ -380,118 +534,22 @@ export default function ChatHistory(props: ChatHistoryProps) {
     }, [props.conversationId]);
 
     useEffect(() => {
-        if (props.incomingMessages) {
-            const lastMessage = props.incomingMessages[props.incomingMessages.length - 1];
+        if (incomingMessages) {
+            const lastMessage = incomingMessages[incomingMessages.length - 1];
             if (lastMessage && !lastMessage.completed) {
-                setIncompleteIncomingMessageIndex(props.incomingMessages.length - 1);
-                props.setTitle(lastMessage.rawQuery);
+                setIncompleteIncomingMessageIndex(incomingMessages.length - 1);
+                setTitle(lastMessage.rawQuery);
                 // Store the turnId when we get it
                 if (lastMessage.turnId) {
                     setCurrentTurnId(lastMessage.turnId);
                 }
             }
         }
-    }, [props.incomingMessages]);
-
-    const adjustScrollPosition = () => {
-        const scrollAreaEl = scrollAreaRef.current?.querySelector<HTMLElement>(scrollAreaSelector);
-        requestAnimationFrame(() => {
-            // Snap scroll position to the latest fetched message ref
-            latestFetchedMessageRef.current?.scrollIntoView({ behavior: "auto", block: "start" });
-            // Now scroll up smoothly to render user scroll action
-            scrollAreaEl?.scrollBy({ behavior: "smooth", top: -150 });
-        });
-    };
-
-    function fetchMoreMessages(currentPage: number) {
-        if (!hasMoreMessages || fetchingData) return;
-        const nextPage = currentPage + 1;
-        const maxMessagesToFetch = nextPage * fetchMessageCount;
-        let conversationFetchURL = "";
-
-        if (props.conversationId) {
-            conversationFetchURL = `/api/chat/history?client=web&conversation_id=${encodeURIComponent(props.conversationId)}&n=${maxMessagesToFetch}`;
-        } else if (props.publicConversationSlug) {
-            conversationFetchURL = `/api/chat/share/history?client=web&public_conversation_slug=${props.publicConversationSlug}&n=${maxMessagesToFetch}`;
-        } else {
-            return;
-        }
-
-        fetch(conversationFetchURL)
-            .then((response) => response.json())
-            .then((chatData: ChatResponse) => {
-                props.setTitle(chatData.response.slug);
-                props.setIsOwner && props.setIsOwner(chatData?.response?.is_owner);
-                if (
-                    chatData &&
-                    chatData.response &&
-                    chatData.response.chat &&
-                    chatData.response.chat.length > 0
-                ) {
-                    setCurrentPage(Math.ceil(chatData.response.chat.length / fetchMessageCount));
-                    if (chatData.response.chat.length === data?.chat.length) {
-                        setHasMoreMessages(false);
-                        setFetchingData(false);
-                        return;
-                    }
-                    props.setAgent(chatData.response.agent);
-                    setData(chatData.response);
-                    setFetchingData(false);
-                    if (currentPage === 0) {
-                        scrollToBottom(true);
-                    } else {
-                        adjustScrollPosition();
-                    }
-                } else {
-                    if (chatData.response.agent && chatData.response.conversation_id) {
-                        const chatMetadata = {
-                            chat: [],
-                            agent: chatData.response.agent,
-                            conversation_id: chatData.response.conversation_id,
-                            slug: chatData.response.slug,
-                            is_owner: chatData.response.is_owner,
-                        };
-                        props.setAgent(chatData.response.agent);
-                        setData(chatMetadata);
-                        if (props.setIsChatSideBarOpen) {
-                            if (!hasStartingMessage) {
-                                props.setIsChatSideBarOpen(true);
-                            }
-                        }
-                    }
-
-                    setHasMoreMessages(false);
-                    setFetchingData(false);
-                }
-            })
-            .catch((err) => {
-                console.error(err);
-                window.location.href = "/";
-            });
-    }
-
-    const scrollToBottom = (instant: boolean = false) => {
-        const scrollAreaEl = scrollAreaRef.current?.querySelector<HTMLElement>(scrollAreaSelector);
-        requestAnimationFrame(() => {
-            scrollAreaEl?.scrollTo({
-                top: scrollAreaEl.scrollHeight,
-                behavior: instant ? "auto" : "smooth",
-            });
-        });
-        // Optimistically set, the scroll listener will verify
-        if (
-            instant ||
-            (scrollAreaEl &&
-                scrollAreaEl.scrollHeight - (scrollAreaEl.scrollTop + scrollAreaEl.clientHeight) <
-                    5)
-        ) {
-            setIsNearBottom(true);
-        }
-    };
+    }, [incomingMessages, setTitle]);
 
     function constructAgentLink() {
         if (!data || !data.agent || !data.agent?.slug) return `/agents`;
-        return `/agents?agent=${data.agent?.slug}`;
+        return `/agents?agent=${encodeURIComponent(data.agent.slug)}`;
     }
 
     function constructAgentName() {
@@ -531,16 +589,14 @@ export default function ChatHistory(props: ChatHistoryProps) {
         }
     };
 
-    const handleRetryMessage = (query: string, turnId?: string) => {
-        if (!query) return;
+    const handleRetryMessage = async (query: string, turnId?: string) => {
+        if (!query) return false;
 
-        // Delete the message from local state first
-        if (turnId) {
+        const retryStarted = await props.onRetryMessage?.(query, turnId);
+        if (retryStarted !== false && turnId) {
             handleDeleteMessage(turnId);
         }
-
-        // Then trigger the retry
-        props.onRetryMessage?.(query, turnId);
+        return retryStarted !== false;
     };
 
     if (!props.conversationId && !props.publicConversationSlug) {
@@ -714,7 +770,7 @@ export default function ChatHistory(props: ChatHistoryProps) {
                             onDeleteMessage={handleDeleteMessage}
                             onRetryMessage={handleRetryMessage}
                             customClassName="fullHistory"
-                            borderLeftColor={`${data?.agent?.color}-500`}
+                            borderLeftColor={`${data?.agent?.color ?? "orange"}-500`}
                             isLastMessage={true}
                         />
                     )}
@@ -726,8 +782,8 @@ export default function ChatHistory(props: ChatHistoryProps) {
                                     link={constructAgentLink()}
                                     avatar={
                                         getIconFromIconName(
-                                            data.agent?.icon,
-                                            data.agent?.color,
+                                            data.agent?.icon ?? "Lightbulb",
+                                            data.agent?.color ?? "orange",
                                         ) || <Lightbulb />
                                     }
                                     description={constructAgentPersona()}

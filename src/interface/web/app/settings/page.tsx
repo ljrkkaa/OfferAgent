@@ -38,7 +38,7 @@ import {
     DialogContent,
     DialogHeader,
     DialogTitle,
-    DialogTrigger
+    DialogTrigger,
 } from "@/components/ui/dialog";
 
 import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table";
@@ -78,7 +78,7 @@ interface DropdownComponentProps {
     items: ModelOptions[];
     selected: number;
     isActive?: boolean;
-    callbackFunc: (value: string) => Promise<void>;
+    callbackFunc: (value: string) => Promise<boolean>;
 }
 
 const DropdownComponent: React.FC<DropdownComponentProps> = ({
@@ -109,8 +109,14 @@ const DropdownComponent: React.FC<DropdownComponentProps> = ({
                         <DropdownMenuRadioGroup
                             value={position}
                             onValueChange={async (value) => {
+                                const previousPosition = position;
                                 setPosition(value);
-                                await callbackFunc(value);
+                                try {
+                                    if (await callbackFunc(value)) return;
+                                } catch (error) {
+                                    console.error("Dropdown callback failed:", error);
+                                }
+                                setPosition(previousPosition);
                             }}
                         >
                             {items.map((item) => (
@@ -138,6 +144,30 @@ interface TokenObject {
     name: string;
 }
 
+function isUserMemory(memory: unknown): memory is UserMemorySchema {
+    return (
+        typeof memory === "object" &&
+        memory !== null &&
+        typeof (memory as UserMemorySchema).id === "number" &&
+        typeof (memory as UserMemorySchema).raw === "string" &&
+        typeof (memory as UserMemorySchema).created_at === "string"
+    );
+}
+
+function isExportedConversation(conversation: unknown) {
+    return (
+        typeof conversation === "object" &&
+        conversation !== null &&
+        ((conversation as { title?: unknown }).title === null ||
+            typeof (conversation as { title?: unknown }).title === "string") &&
+        typeof (conversation as { agent?: unknown }).agent === "string" &&
+        typeof (conversation as { created_at?: unknown }).created_at === "string" &&
+        typeof (conversation as { updated_at?: unknown }).updated_at === "string" &&
+        typeof (conversation as { conversation_log?: unknown }).conversation_log === "object" &&
+        Array.isArray((conversation as { file_filters?: unknown }).file_filters)
+    );
+}
+
 const useApiKeys = () => {
     const [apiKeys, setApiKeys] = useState<TokenObject[]>([]);
     const { toast } = useToast();
@@ -150,10 +180,19 @@ const useApiKeys = () => {
                     "Content-Type": "application/json",
                 },
             });
+            if (!response.ok) throw new Error("Failed to generate API key");
             const tokenObj = await response.json();
+            if (typeof tokenObj?.token !== "string" || typeof tokenObj?.name !== "string") {
+                throw new Error("Invalid API key response");
+            }
             setApiKeys((prevKeys) => [...prevKeys, tokenObj]);
         } catch (error) {
             console.error("Error generating API key:", error);
+            toast({
+                title: "API Key",
+                description: "Failed to generate API key. Please try again.",
+                variant: "destructive",
+            });
         }
     };
 
@@ -166,35 +205,65 @@ const useApiKeys = () => {
             });
         } catch (error) {
             console.error("Error copying API key:", error);
+            toast({
+                title: "API Key",
+                description: "Failed to copy API key.",
+                variant: "destructive",
+            });
         }
     };
 
     const deleteAPIKey = async (token: string) => {
         try {
-            const response = await fetch(`/auth/token?token=${token}`, { method: "DELETE" });
-            if (response.ok) {
-                setApiKeys((prevKeys) => prevKeys.filter((key) => key.token !== token));
+            const response = await fetch(`/auth/token?token=${encodeURIComponent(token)}`, {
+                method: "DELETE",
+            });
+            if (!response.ok) {
+                throw new Error("Failed to delete API key");
             }
+            setApiKeys((prevKeys) => prevKeys.filter((key) => key.token !== token));
+            toast({
+                title: "API Key",
+                description: "Deleted API key",
+            });
         } catch (error) {
             console.error("Error deleting API key:", error);
-        }
-    };
-
-    const listApiKeys = async () => {
-        try {
-            const response = await fetch(`/auth/token`);
-            const tokens = await response.json();
-            if (tokens?.length > 0) {
-                setApiKeys(tokens);
-            }
-        } catch (error) {
-            console.error("Error listing API keys:", error);
+            toast({
+                title: "API Key",
+                description: "Failed to delete API key. Please try again.",
+                variant: "destructive",
+            });
         }
     };
 
     useEffect(() => {
+        const listApiKeys = async () => {
+            try {
+                const response = await fetch(`/auth/token`);
+                if (!response.ok) throw new Error("Failed to list API keys");
+                const tokens = await response.json();
+                if (
+                    !Array.isArray(tokens) ||
+                    !tokens.every(
+                        (token) =>
+                            typeof token?.token === "string" && typeof token?.name === "string",
+                    )
+                ) {
+                    throw new Error("Invalid API key list response");
+                }
+                setApiKeys(tokens);
+            } catch (error) {
+                console.error("Error listing API keys:", error);
+                toast({
+                    title: "API Key",
+                    description: "Failed to load API keys.",
+                    variant: "destructive",
+                });
+            }
+        };
+
         listApiKeys();
-    }, []);
+    }, [toast]);
 
     return {
         apiKeys,
@@ -264,10 +333,6 @@ function ApiKeyCard() {
                                             weight="bold"
                                             className="h-4 w-4 mr-2 hover:bg-primary/40"
                                             onClick={() => {
-                                                toast({
-                                                    title: `🔑 Copied API Key: ${key.name}`,
-                                                    description: `Set this API key in the Khoj apps you want to connect to this Khoj account`,
-                                                });
                                                 copyAPIKey(key.token);
                                             }}
                                         />
@@ -275,10 +340,6 @@ function ApiKeyCard() {
                                             weight="bold"
                                             className="h-4 w-4 mr-2 md:ml-4 text-red-400 hover:bg-primary/40"
                                             onClick={() => {
-                                                toast({
-                                                    title: `🔑 Deleted API Key: ${key.name}`,
-                                                    description: `Apps using this API key will no longer connect to this Khoj account`,
-                                                });
                                                 deleteAPIKey(key.token);
                                             }}
                                         />
@@ -323,7 +384,7 @@ export default function SettingsView() {
     const saveName = async () => {
         if (!name) return;
         try {
-            const response = await fetch(`/api/user/name?name=${name}`, {
+            const response = await fetch(`/api/user/name?name=${encodeURIComponent(name)}`, {
                 method: "PATCH",
                 headers: {
                     "Content-Type": "application/json",
@@ -331,12 +392,9 @@ export default function SettingsView() {
             });
             if (!response.ok) throw new Error("Failed to update name");
 
-            // Set updated user settings
-            if (userConfig) {
-                let newUserConfig = userConfig;
-                newUserConfig.given_name = name;
-                setUserConfig(newUserConfig);
-            }
+            setUserConfig((currentUserConfig) =>
+                currentUserConfig ? { ...currentUserConfig, given_name: name } : currentUserConfig,
+            );
 
             // Notify user of name change
             toast({
@@ -366,29 +424,40 @@ export default function SettingsView() {
                 description: `This account cannot switch ${modelType} model to ${modelName}.`,
                 variant: "destructive",
             });
-            return;
+            return false;
         }
 
         try {
-            const response = await fetch(`/api/model/${modelType}?id=` + id, {
+            const response = await fetch(`/api/model/${modelType}?id=${encodeURIComponent(id)}`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
                 },
             });
+            const data = await response.json().catch(() => ({}));
 
-            if (!response.ok)
+            if (!response.ok || data.status === "error")
                 throw new Error(`Failed to switch ${modelType} model to ${modelName}`);
+
+            if (modelType === "chat") {
+                setUserConfig((currentUserConfig) =>
+                    currentUserConfig
+                        ? { ...currentUserConfig, selected_chat_model_config: Number(id) }
+                        : currentUserConfig,
+                );
+            }
 
             toast({
                 title: `✅ Switched ${modelType} model to ${modelName}`,
             });
+            return true;
         } catch (error) {
             console.error(`Failed to update ${modelType} model to ${modelName}:`, error);
             toast({
                 description: `❌ Failed to switch ${modelType} model to ${modelName}. Try again.`,
                 variant: "destructive",
             });
+            return false;
         }
     };
 
@@ -398,8 +467,12 @@ export default function SettingsView() {
 
             // Get total conversation count
             const statsResponse = await fetch("/api/chat/stats");
+            if (!statsResponse.ok) throw new Error("Failed to fetch chat export stats");
             const stats = await statsResponse.json();
             const total = stats.num_conversations;
+            if (!Number.isInteger(total) || total < 0) {
+                throw new Error("Invalid chat export stats response");
+            }
             setTotalConversations(total);
 
             // Create zip file
@@ -409,11 +482,16 @@ export default function SettingsView() {
             // Fetch all conversations in batches of 10
             for (let page = 0; page * 10 < total; page++) {
                 const response = await fetch(`/api/chat/export?page=${page}`);
+                if (!response.ok) throw new Error(`Failed to export chat page ${page}`);
                 const data = await response.json();
+                if (!Array.isArray(data) || !data.every(isExportedConversation)) {
+                    throw new Error(`Invalid chat export page ${page}`);
+                }
                 conversations.push(...data);
 
-                setExportedConversations((page + 1) * 10);
-                setExportProgress((((page + 1) * 10) / total) * 100);
+                const exportedCount = Math.min(conversations.length, total);
+                setExportedConversations(exportedCount);
+                setExportProgress((exportedCount / total) * 100);
             }
 
             // Add conversations to zip
@@ -445,16 +523,20 @@ export default function SettingsView() {
     const fetchMemories = async () => {
         try {
             console.log("Fetching memories...");
-            const response = await fetch('/api/memories');
-            if (!response.ok) throw new Error('Failed to fetch memories');
+            const response = await fetch("/api/memories");
+            if (!response.ok) throw new Error("Failed to fetch memories");
             const data = await response.json();
+            if (!Array.isArray(data) || !data.every(isUserMemory)) {
+                throw new Error("Invalid memories response");
+            }
             setMemories(data);
         } catch (error) {
-            console.error('Error fetching memories:', error);
+            console.error("Error fetching memories:", error);
+            setMemories([]);
             toast({
                 title: "Error",
                 description: "Failed to fetch memories. Please try again.",
-                variant: "destructive"
+                variant: "destructive",
             });
         }
     };
@@ -462,50 +544,57 @@ export default function SettingsView() {
     const handleDeleteMemory = async (id: number) => {
         try {
             const response = await fetch(`/api/memories/${id}`, {
-                method: 'DELETE'
+                method: "DELETE",
             });
-            if (!response.ok) throw new Error('Failed to delete memory');
-            setMemories(memories.filter(memory => memory.id !== id));
+            if (!response.ok) throw new Error("Failed to delete memory");
+            setMemories((currentMemories) => currentMemories.filter((memory) => memory.id !== id));
+            return true;
         } catch (error) {
-            console.error('Error deleting memory:', error);
+            console.error("Error deleting memory:", error);
             toast({
                 title: "Error",
                 description: "Failed to delete memory. Please try again.",
-                variant: "destructive"
+                variant: "destructive",
             });
+            return false;
         }
     };
 
     const handleUpdateMemory = async (id: number, raw: string) => {
         try {
             const response = await fetch(`/api/memories/${id}`, {
-                method: 'PUT',
+                method: "PUT",
                 headers: {
-                    'Content-Type': 'application/json',
+                    "Content-Type": "application/json",
                 },
                 body: JSON.stringify({ raw, memory_id: id }),
             });
-            if (!response.ok) throw new Error('Failed to update memory');
+            if (!response.ok) throw new Error("Failed to update memory");
             const updatedMemory: UserMemorySchema = await response.json();
-            setMemories(memories.map(memory =>
-                memory.id === id ? updatedMemory : memory
-            ));
+            if (!isUserMemory(updatedMemory)) {
+                throw new Error("Invalid memory update response");
+            }
+            setMemories((currentMemories) =>
+                currentMemories.map((memory) => (memory.id === id ? updatedMemory : memory)),
+            );
+            return true;
         } catch (error) {
-            console.error('Error updating memory:', error);
+            console.error("Error updating memory:", error);
             toast({
                 title: "Error",
                 description: "Failed to update memory. Please try again.",
-                variant: "destructive"
+                variant: "destructive",
             });
+            return false;
         }
     };
 
     const handleToggleMemory = async (enabled: boolean) => {
         try {
             const response = await fetch(`/api/user/memory?enable_memory=${enabled}`, {
-                method: 'PATCH',
+                method: "PATCH",
             });
-            if (!response.ok) throw new Error('Failed to update memory setting');
+            if (!response.ok) throw new Error("Failed to update memory setting");
             setEnableMemory(enabled);
             toast({
                 title: enabled ? "Memory enabled" : "Memory disabled",
@@ -514,15 +603,14 @@ export default function SettingsView() {
                     : "Khoj will no longer learn or remember from your conversations.",
             });
         } catch (error) {
-            console.error('Error toggling memory:', error);
+            console.error("Error toggling memory:", error);
             toast({
                 title: "Error",
                 description: "Failed to update memory setting. Please try again.",
-                variant: "destructive"
+                variant: "destructive",
             });
         }
     };
-
 
     const syncContent = async (type: string) => {
         try {
@@ -557,13 +645,18 @@ export default function SettingsView() {
             });
             if (!response.ok) throw new Error(`Failed to disconnect ${source}`);
 
-            // Set updated user settings
-            if (userConfig) {
-                let newUserConfig = userConfig;
-                if (source === "computer") {
-                    newUserConfig.enabled_content_source.computer = false;
-                }
-                setUserConfig(newUserConfig);
+            if (source === "computer") {
+                setUserConfig((currentUserConfig) =>
+                    currentUserConfig
+                        ? {
+                              ...currentUserConfig,
+                              enabled_content_source: {
+                                  ...currentUserConfig.enabled_content_source,
+                                  computer: false,
+                              },
+                          }
+                        : currentUserConfig,
+                );
             }
 
             // Notify user about disconnecting content source
@@ -796,18 +889,27 @@ export default function SettingsView() {
                                                         <Switch
                                                             id="enable-memory"
                                                             checked={enableMemory}
-                                                            onCheckedChange={(checked) => handleToggleMemory(checked)}
-                                                            disabled={serverMemoryMode === "disabled"}
+                                                            onCheckedChange={(checked) =>
+                                                                handleToggleMemory(checked)
+                                                            }
+                                                            disabled={
+                                                                serverMemoryMode === "disabled"
+                                                            }
                                                         />
                                                     </div>
                                                     {serverMemoryMode === "disabled" && (
                                                         <p className="text-xs text-gray-400 mt-2">
-                                                            Memory has been disabled by the server administrator.
+                                                            Memory has been disabled by the server
+                                                            administrator.
                                                         </p>
                                                     )}
                                                 </CardContent>
                                                 <CardFooter className="flex flex-wrap gap-4">
-                                                    <Dialog onOpenChange={(open) => open && fetchMemories()}>
+                                                    <Dialog
+                                                        onOpenChange={(open) =>
+                                                            open && fetchMemories()
+                                                        }
+                                                    >
                                                         <DialogTrigger asChild>
                                                             <Button variant="outline">
                                                                 <Brain className="h-5 w-5 mr-2" />
@@ -816,19 +918,27 @@ export default function SettingsView() {
                                                         </DialogTrigger>
                                                         <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
                                                             <DialogHeader>
-                                                                <DialogTitle>Your Memories</DialogTitle>
+                                                                <DialogTitle>
+                                                                    Your Memories
+                                                                </DialogTitle>
                                                             </DialogHeader>
                                                             <div className="grid gap-4 py-4">
                                                                 {memories.map((memory) => (
                                                                     <UserMemory
                                                                         key={memory.id}
                                                                         memory={memory}
-                                                                        onDelete={handleDeleteMemory}
-                                                                        onUpdate={handleUpdateMemory}
+                                                                        onDelete={
+                                                                            handleDeleteMemory
+                                                                        }
+                                                                        onUpdate={
+                                                                            handleUpdateMemory
+                                                                        }
                                                                     />
                                                                 ))}
                                                                 {memories.length === 0 && (
-                                                                    <p className="text-center text-gray-500">No memories found</p>
+                                                                    <p className="text-center text-gray-500">
+                                                                        No memories found
+                                                                    </p>
                                                                 )}
                                                             </div>
                                                         </DialogContent>

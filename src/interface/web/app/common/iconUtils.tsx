@@ -20,7 +20,7 @@ import {
     Confetti,
     House,
     Translate,
-    Image,
+    Image as ImageIcon,
     BowlFood,
     Lectern,
     Wallet,
@@ -169,7 +169,7 @@ const iconMap: IconMap = {
         <Broadcast className={`${width} ${height} ${color} mr-2`} />
     ),
     Image: (color: string, width: string, height: string) => (
-        <Image className={`${width} ${height} ${color} mr-2`} />
+        <ImageIcon className={`${width} ${height} ${color} mr-2`} />
     ),
     File: (color: string, width: string, height: string) => (
         <File className={`${width} ${height} ${color} mr-2`} />
@@ -199,7 +199,7 @@ export function getIconForSlashCommand(command: string, customClassName: string 
     }
 
     if (command.includes("image")) {
-        return <Image className={className} />;
+        return <ImageIcon className={className} />;
     }
 
     if (command.includes("default")) {
@@ -272,7 +272,7 @@ function getIconFromFilename(
         case "jpeg":
         case "png":
         case "webp":
-            return <Image className={className} weight="fill" />;
+            return <ImageIcon className={className} weight="fill" />;
         default:
             return <File className={className} weight="fill" />;
     }

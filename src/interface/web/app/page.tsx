@@ -37,7 +37,7 @@ import {
 import { convertColorToBorderClass } from "@/app/common/colorUtils";
 import { getIconFromIconName } from "@/app/common/iconUtils";
 import { AgentData } from "@/app/components/agentCard/agentCard";
-import { createNewConversation } from "./common/chatFunctions";
+import { createNewConversation, fetchChatOptions } from "./common/chatFunctions";
 import { useDebounce, useIsMobileWidth } from "./common/utils";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
@@ -57,10 +57,17 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Button } from "@/components/ui/button";
 
-const fetcher = (url: string) =>
-    fetch(url)
-        .then((res) => res.json())
-        .catch((err) => console.warn(err));
+const agentsFetcher = async (url: string) => {
+    const response = await fetch(url);
+    if (!response.ok) {
+        throw new Error(`Failed to fetch agents: ${response.status}`);
+    }
+    const data = await response.json();
+    if (!Array.isArray(data)) {
+        throw new Error("Invalid agents response");
+    }
+    return data;
+};
 
 interface ChatBodyDataProps {
     chatOptionsData: ChatOptions | null;
@@ -71,6 +78,11 @@ interface ChatBodyDataProps {
     userConfig: UserConfig | null;
     isLoadingUserConfig: boolean;
 }
+
+type ChatSubmission = {
+    message: string;
+    images: string[];
+};
 
 function AgentCards({
     agents,
@@ -171,7 +183,7 @@ function AgentCards({
 }
 
 function ChatBodyData(props: ChatBodyDataProps) {
-    const [message, setMessage] = useState("");
+    const [submission, setSubmission] = useState<ChatSubmission | null>(null);
     const [prefillMessage, setPrefillMessage] = useState("");
     const [chatInputFocus, setChatInputFocus] = useState<ChatInputFocus>(ChatInputFocus.MESSAGE);
     const [images, setImages] = useState<string[]>([]);
@@ -199,7 +211,7 @@ function ChatBodyData(props: ChatBodyDataProps) {
 
     useEffect(() => {
         if (queryParam) {
-            setMessage(decodeURIComponent(queryParam));
+            setSubmission({ message: queryParam, images: [] });
         }
     }, [queryParam]);
 
@@ -211,12 +223,12 @@ function ChatBodyData(props: ChatBodyDataProps) {
 
     const onConversationIdChange = props.onConversationIdChange;
 
-    const { data: agentsData, error } = useSWR<AgentData[]>("/api/agents", fetcher, {
+    const { data: agentsData } = useSWR<AgentData[]>("/api/agents", agentsFetcher, {
         revalidateOnFocus: false,
     });
 
     const openAgentEditCard = (agentSlug: string) => {
-        router.push(`/agents?agent=${agentSlug}`);
+        router.push(`/agents?agent=${encodeURIComponent(agentSlug)}`);
     };
 
     useEffect(() => {
@@ -258,32 +270,41 @@ function ChatBodyData(props: ChatBodyDataProps) {
         setStepOneSuggestionOptions(stepOneSuggestions);
     }
 
-    useEffect(() => {
-        const processMessage = async () => {
-            if (message && !processingMessage) {
-                setProcessingMessage(true);
-                try {
-                    const newConversationId = await createNewConversation(selectedAgent || "khoj");
-                    onConversationIdChange?.(newConversationId);
-                    localStorage.setItem("message", message);
-                    if (images.length > 0) {
-                        localStorage.setItem("images", JSON.stringify(images));
-                    }
+    const queueSubmission = (message: string, messageImages: string[] = []) => {
+        setSubmission({
+            message,
+            images: messageImages.length > 0 ? messageImages : images,
+        });
+    };
 
-                    window.location.href = `/chat?conversationId=${newConversationId}`;
-                } catch (error) {
-                    console.error("Error creating new conversation:", error);
-                    setProcessingMessage(false);
-                }
-                setMessage("");
-                setImages([]);
+    useEffect(() => {
+        const processSubmission = async () => {
+            if (!submission?.message || processingMessage) {
+                return;
             }
+
+            setProcessingMessage(true);
+            try {
+                const newConversationId = await createNewConversation(selectedAgent || "khoj");
+                onConversationIdChange?.(newConversationId);
+                localStorage.setItem("message", submission.message);
+                if (submission.images.length > 0) {
+                    localStorage.setItem("images", JSON.stringify(submission.images));
+                }
+
+                window.location.href = `/chat?conversationId=${newConversationId}`;
+            } catch (error) {
+                console.error("Error creating new conversation:", error);
+                setProcessingMessage(false);
+            }
+            setSubmission(null);
+            setImages([]);
         };
-        processMessage();
-        if (message || images.length > 0) {
+        processSubmission();
+        if (submission) {
             setProcessingMessage(true);
         }
-    }, [selectedAgent, message, processingMessage, onConversationIdChange]);
+    }, [selectedAgent, submission, processingMessage, onConversationIdChange]);
 
     // Close the agent detail hover card when scroll on agent pane
     useEffect(() => {
@@ -352,7 +373,7 @@ function ChatBodyData(props: ChatBodyDataProps) {
                             isLoggedIn={props.isLoggedIn}
                             prefillMessage={prefillMessage}
                             focus={chatInputFocus}
-                            sendMessage={(message) => setMessage(message)}
+                            sendMessage={queueSubmission}
                             sendImage={(image) => setImages((prevImages) => [...prevImages, image])}
                             sendDisabled={processingMessage}
                             chatOptionsData={props.chatOptionsData}
@@ -425,7 +446,7 @@ function ChatBodyData(props: ChatBodyDataProps) {
                                 key={`${suggestion.prompt} ${index}`}
                                 className={`w-full cursor-pointer animate-fade-in-up`}
                                 onClick={(event) => {
-                                    setMessage(suggestion.prompt);
+                                    queueSubmission(suggestion.prompt, []);
                                 }}
                             >
                                 <StepTwoSuggestionCard
@@ -491,7 +512,7 @@ function ChatBodyData(props: ChatBodyDataProps) {
                         >
                             <ChatInputArea
                                 isLoggedIn={props.isLoggedIn}
-                                sendMessage={(message) => setMessage(message)}
+                                sendMessage={queueSubmission}
                                 sendImage={(image) =>
                                     setImages((prevImages) => [...prevImages, image])
                                 }
@@ -545,18 +566,26 @@ export default function Home() {
     }, [uploadedFiles]);
 
     useEffect(() => {
-        fetch("/api/chat/options")
-            .then((response) => response.json())
-            .then((data: ChatOptions) => {
-                setLoading(false);
-                if (data) {
+        let cancelled = false;
+        async function loadChatOptions() {
+            try {
+                const data = await fetchChatOptions();
+                if (!cancelled) {
                     setChatOptionsData(data);
                 }
-            })
-            .catch((err) => {
+            } catch (err) {
                 console.error(err);
-                return;
-            });
+            } finally {
+                if (!cancelled) {
+                    setLoading(false);
+                }
+            }
+        }
+
+        loadChatOptions();
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
     if (isLoading) {

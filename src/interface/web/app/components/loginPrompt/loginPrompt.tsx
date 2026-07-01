@@ -14,7 +14,8 @@ import {
     Spinner,
 } from "@phosphor-icons/react";
 import Link from "next/link";
-import { useEffect, useRef, useState } from "react";
+import Image from "next/image";
+import { useCallback, useEffect, useRef, useState } from "react";
 import useSWR from "swr";
 import { GoogleSignIn } from "./GoogleSignIn";
 import { Drawer, DrawerContent } from "@/components/ui/drawer";
@@ -34,8 +35,6 @@ export interface LoginPromptProps {
     isMobileWidth?: boolean;
 }
 
-const fetcher = (url: string) => fetch(url).then((res) => res.json());
-
 const ALLOWED_OTP_ATTEMPTS = 5;
 
 interface Provider {
@@ -47,12 +46,69 @@ interface CredentialsData {
     [provider: string]: Provider;
 }
 
+const fetcher = async (url: string): Promise<CredentialsData> => {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Failed to load login metadata: ${res.status}`);
+    const data = await res.json();
+    if (
+        typeof data?.google?.client_id !== "string" ||
+        typeof data?.google?.redirect_uri !== "string"
+    ) {
+        throw new Error("Invalid login metadata response");
+    }
+    return data;
+};
+
 export default function LoginPrompt(props: LoginPromptProps) {
-    const { data, error, isLoading } = useSWR<CredentialsData>("/auth/oauth/metadata", fetcher);
+    const { data, isLoading } = useSWR<CredentialsData>("/auth/oauth/metadata", fetcher);
 
     const [useEmailSignIn, setUseEmailSignIn] = useState(false);
 
+    const handleGoogleSignIn = useCallback(() => {
+        if (!data?.google?.client_id || !data?.google?.redirect_uri) return;
+
+        // Create full redirect URL using current origin
+        const fullRedirectUri = `${window.location.origin}${data.google.redirect_uri}`;
+
+        const params = new URLSearchParams({
+            client_id: data.google.client_id,
+            redirect_uri: fullRedirectUri,
+            response_type: "code",
+            scope: "email profile openid",
+            state: window.location.pathname,
+            access_type: "offline",
+            prompt: "consent select_account",
+            include_granted_scopes: "true",
+        });
+
+        window.location.href = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+    }, [data?.google?.client_id, data?.google?.redirect_uri]);
+
     useEffect(() => {
+        const google = (window as any).google;
+
+        if (!google) return;
+        if (!data?.google?.client_id || !data?.google?.redirect_uri) return;
+
+        // Initialize Google Sign In after script loads
+        google.accounts.id.initialize({
+            client_id: data?.google?.client_id,
+            callback: handleGoogleSignIn,
+            auto_select: false,
+            login_uri: data?.google?.redirect_uri,
+        });
+
+        // Render the button
+        google.accounts.id.renderButton(document.getElementById("g_id_signin")!, {
+            theme: "outline",
+            size: "large",
+            width: "100%",
+        });
+    }, [data?.google?.client_id, data?.google?.redirect_uri, handleGoogleSignIn]);
+
+    const handleGoogleScriptLoad = useCallback(() => {
+        if (!data?.google?.client_id || !data?.google?.redirect_uri) return;
+
         const google = (window as any).google;
 
         if (!google) return;
@@ -71,48 +127,7 @@ export default function LoginPrompt(props: LoginPromptProps) {
             size: "large",
             width: "100%",
         });
-    }, [data]);
-
-    const handleGoogleSignIn = () => {
-        if (!data?.google?.client_id || !data?.google?.redirect_uri) return;
-
-        // Create full redirect URL using current origin
-        const fullRedirectUri = `${window.location.origin}${data.google.redirect_uri}`;
-
-        const params = new URLSearchParams({
-            client_id: data.google.client_id,
-            redirect_uri: fullRedirectUri,
-            response_type: "code",
-            scope: "email profile openid",
-            state: window.location.pathname,
-            access_type: "offline",
-            prompt: "consent select_account",
-            include_granted_scopes: "true",
-        });
-
-        window.location.href = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
-    };
-
-    const handleGoogleScriptLoad = () => {
-        const google = (window as any).google;
-
-        if (!data?.google?.client_id || !data?.google?.redirect_uri) return;
-
-        // Initialize Google Sign In after script loads
-        google.accounts.id.initialize({
-            client_id: data?.google?.client_id,
-            callback: handleGoogleSignIn,
-            auto_select: false,
-            login_uri: data?.google?.redirect_uri,
-        });
-
-        // Render the button
-        google.accounts.id.renderButton(document.getElementById("g_id_signin")!, {
-            theme: "outline",
-            size: "large",
-            width: "100%",
-        });
-    };
+    }, [data?.google?.client_id, data?.google?.redirect_uri, handleGoogleSignIn]);
 
     if (props.isMobileWidth) {
         return (
@@ -177,7 +192,7 @@ function EmailSignInContext({
     const [recheckEmail, setRecheckEmail] = useState(false);
     const [sendEmailError, setSendEmailError] = useState("");
 
-    function checkOTPAndRedirect() {
+    async function checkOTPAndRedirect() {
         const verifyUrl = `/auth/magic?code=${encodeURIComponent(otp)}&email=${encodeURIComponent(email)}`;
 
         if (numFailures >= ALLOWED_OTP_ATTEMPTS) {
@@ -185,69 +200,63 @@ function EmailSignInContext({
             return;
         }
 
-        fetch(verifyUrl, {
-            method: "GET",
-            headers: {
-                "Content-Type": "application/json",
-            },
-        })
-            .then((res) => {
-                if (res.ok) {
-                    // Check if the response is a redirect
-                    if (res.redirected) {
-                        window.location.href = res.url;
-                    }
-                } else if (res.status === 401) {
-                    setOTPError("Invalid OTP.");
-                    setNumFailures(numFailures + 1);
-                    if (numFailures + 1 >= ALLOWED_OTP_ATTEMPTS) {
-                        setOTPError("Too many failed attempts. Please try again tomorrow.");
-                    }
-                } else if (res.status === 429) {
-                    setOTPError("Too many failed attempts. Please try again tomorrow.");
-                    setNumFailures(ALLOWED_OTP_ATTEMPTS);
-                } else if (res.status === 403) {
-                    setOTPError("OTP expired. Please request a new one.");
-                } else {
-                    throw new Error("Failed to verify OTP");
-                }
-            })
-            .catch((err) => {
-                console.error(err);
+        try {
+            const res = await fetch(verifyUrl, {
+                method: "GET",
+                headers: {
+                    "Content-Type": "application/json",
+                },
             });
+            if (res.ok) {
+                if (res.redirected) {
+                    window.location.href = res.url;
+                }
+            } else if (res.status === 401) {
+                setOTPError("Invalid OTP.");
+                setNumFailures(numFailures + 1);
+                if (numFailures + 1 >= ALLOWED_OTP_ATTEMPTS) {
+                    setOTPError("Too many failed attempts. Please try again tomorrow.");
+                }
+            } else if (res.status === 429) {
+                setOTPError("Too many failed attempts. Please try again tomorrow.");
+                setNumFailures(ALLOWED_OTP_ATTEMPTS);
+            } else if (res.status === 403) {
+                setOTPError("OTP expired. Please request a new one.");
+            } else {
+                throw new Error("Failed to verify OTP");
+            }
+        } catch (err) {
+            console.error(err);
+            setOTPError("Failed to verify OTP. Please try again.");
+        }
     }
 
-    function handleMagicLinkSignIn() {
-        fetch("/auth/magic", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ email: email }),
-        })
-            .then((res) => {
-                if (res.ok) {
-                    setCheckEmail(true);
-                    if (checkEmail) {
-                        setRecheckEmail(true);
-                    }
-                    return res.json();
-                } else if (res.status === 429 || res.status === 404) {
-                    res.json().then((data) => {
-                        setSendEmailError(data.detail);
-                        throw new Error(data.detail);
-                    });
-                } else {
-                    setSendEmailError("Failed to send email. Contact developers for assistance.");
-                    throw new Error("Failed to send magic link via email.");
-                }
-            })
-            .then((data) => {
-                console.log(data);
-            })
-            .catch((err) => {
-                console.error(err);
+    async function handleMagicLinkSignIn() {
+        try {
+            const res = await fetch("/auth/magic", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ email: email }),
             });
+            if (res.ok) {
+                setCheckEmail(true);
+                setSendEmailError("");
+                if (checkEmail) {
+                    setRecheckEmail(true);
+                }
+                return;
+            }
+            if (res.status === 429 || res.status === 404) {
+                const data = await res.json().catch(() => ({}));
+                throw new Error(data.detail || "Failed to send email.");
+            }
+            throw new Error("Failed to send email. Contact developers for assistance.");
+        } catch (err) {
+            console.error(err);
+            setSendEmailError(err instanceof Error ? err.message : "Failed to send email.");
+        }
     }
 
     return (
@@ -416,9 +425,12 @@ function MainSignInContext({
                                 <div className="relative p-0">
                                     <Card>
                                         <CardContent className="flex flex-col items-center justify-center rounded-b-none rounded-t-lg p-0">
-                                            <img
+                                            <Image
                                                 src={tip.src}
                                                 alt={tip.alt}
+                                                width={640}
+                                                height={360}
+                                                unoptimized
                                                 className="w-full h-auto rounded-b-none rounded-t-lg"
                                             />
                                             <div className="absolute bottom-0 flex items-center justify-center text-white bg-gradient-to-t from-black to-transparent text-center w-full p-4 py-6">

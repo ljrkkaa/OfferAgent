@@ -1,5 +1,7 @@
 "use client";
 
+/* eslint-disable @next/next/no-img-element -- ponytail: dynamic base64 previews and favicons are not Next Image assets. */
+
 import { useEffect, useState } from "react";
 
 import { ArrowCircleDown, ArrowRight, Code, Note, Clipboard, Check } from "@phosphor-icons/react";
@@ -679,11 +681,7 @@ export default function ReferencePanel(props: ReferencePanelDataProps) {
                 <SheetHeader>
                     <SheetTitle>References</SheetTitle>
                     <SheetDescription>View all references for this response</SheetDescription>
-                    <Button
-                        variant="outline"
-                        onClick={copyReferencesToClipboard}
-                        className="mt-4"
-                    >
+                    <Button variant="outline" onClick={copyReferencesToClipboard} className="mt-4">
                         {copyReferencesSuccess ? (
                             <>
                                 <Check className="mr-2 text-green-500" />

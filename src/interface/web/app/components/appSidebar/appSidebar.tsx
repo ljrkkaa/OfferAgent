@@ -28,6 +28,7 @@ import { useAuthenticatedData, UserProfile } from "@/app/common/auth";
 import LoginPrompt from "../loginPrompt/loginPrompt";
 import { usePathname } from "next/navigation";
 import Link from "next/link";
+import { createNewConversation } from "@/app/common/chatFunctions";
 
 async function openChat(userData: UserProfile | null | undefined) {
     const unauthenticatedRedirectUrl = `/login?redirect=${encodeURIComponent(window.location.pathname)}`;
@@ -36,16 +37,15 @@ async function openChat(userData: UserProfile | null | undefined) {
         return;
     }
 
-    const response = await fetch(`/api/chat/sessions`, {
-        method: "POST",
-    });
-
-    const data = await response.json();
-    if (response.status == 200) {
-        window.location.href = `/chat?conversationId=${data.conversation_id}`;
-    } else if (response.status == 403 || response.status == 401) {
-        window.location.href = unauthenticatedRedirectUrl;
-    } else {
+    try {
+        const conversationId = await createNewConversation();
+        window.location.href = `/chat?conversationId=${conversationId}`;
+    } catch (error) {
+        if (error instanceof Error && /status: (401|403)/.test(error.message)) {
+            window.location.href = unauthenticatedRedirectUrl;
+            return;
+        }
+        console.error("Failed to start chat session:", error);
         alert("Failed to start chat session");
     }
 }

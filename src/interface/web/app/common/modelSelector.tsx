@@ -24,13 +24,19 @@ import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/h
 import { Skeleton } from "@/components/ui/skeleton";
 
 interface ModelSelectorProps extends PopoverProps {
-    onSelect: (model: ModelOptions) => void;
+    onSelect: (model: ModelOptions) => Promise<boolean | void> | boolean | void;
     disabled?: boolean;
     isActive?: boolean;
     initialModel?: string;
 }
 
-export function ModelSelector({ ...props }: ModelSelectorProps) {
+export function ModelSelector({
+    onSelect,
+    disabled,
+    isActive,
+    initialModel,
+    ...popoverProps
+}: ModelSelectorProps) {
     const [open, setOpen] = React.useState(false);
     const [peekedModel, setPeekedModel] = useState<ModelOptions | undefined>(undefined);
     const [selectedModel, setSelectedModel] = useState<ModelOptions | undefined>(undefined);
@@ -43,7 +49,7 @@ export function ModelSelector({ ...props }: ModelSelectorProps) {
 
         if (userConfig) {
             setModels(userConfig.chat_model_options);
-            if (!props.initialModel) {
+            if (!initialModel) {
                 const selectedChatModelOption = userConfig.chat_model_options.find(
                     (model) => model.id === userConfig.selected_chat_model_config,
                 );
@@ -54,18 +60,12 @@ export function ModelSelector({ ...props }: ModelSelectorProps) {
                 }
             } else {
                 const model = userConfig.chat_model_options.find(
-                    (model) => model.name === props.initialModel,
+                    (model) => model.name === initialModel,
                 );
                 setSelectedModel(model);
             }
         }
-    }, [userConfig, props.initialModel, isLoadingUserConfig]);
-
-    useEffect(() => {
-        if (selectedModel && userConfig) {
-            props.onSelect(selectedModel);
-        }
-    }, [selectedModel, userConfig, props.onSelect]);
+    }, [userConfig, initialModel, isLoadingUserConfig]);
 
     if (isLoadingUserConfig) {
         return <Skeleton className="w-full h-10" />;
@@ -75,9 +75,15 @@ export function ModelSelector({ ...props }: ModelSelectorProps) {
         return <div className="text-sm text-error">{error.message}</div>;
     }
 
+    const handleSelect = async (model: ModelOptions) => {
+        if ((await onSelect(model)) === false) return;
+        setSelectedModel(model);
+        setOpen(false);
+    };
+
     return (
         <div className="grid gap-2 w-[250px]">
-            <Popover open={open} onOpenChange={setOpen} {...props}>
+            <Popover open={open} onOpenChange={setOpen} {...popoverProps}>
                 <PopoverTrigger asChild>
                     <Button
                         variant="outline"
@@ -85,7 +91,7 @@ export function ModelSelector({ ...props }: ModelSelectorProps) {
                         aria-expanded={open}
                         aria-label="Select a model"
                         className="w-full justify-between text-left"
-                        disabled={props.disabled ?? false}
+                        disabled={disabled ?? false}
                     >
                         <p className="truncate">
                             {selectedModel
@@ -111,11 +117,8 @@ export function ModelSelector({ ...props }: ModelSelectorProps) {
                                                     model={model}
                                                     isSelected={selectedModel?.id === model.id}
                                                     onPeek={(model) => setPeekedModel(model)}
-                                                    onSelect={() => {
-                                                        setSelectedModel(model);
-                                                        setOpen(false);
-                                                    }}
-                                                    isActive={props.isActive}
+                                                    onSelect={() => handleSelect(model)}
+                                                    isActive={isActive}
                                                 />
                                             ))}
                                     </CommandGroup>
@@ -164,11 +167,8 @@ export function ModelSelector({ ...props }: ModelSelectorProps) {
                                                         model={model}
                                                         isSelected={selectedModel?.id === model.id}
                                                         onPeek={(model) => setPeekedModel(model)}
-                                                        onSelect={() => {
-                                                            setSelectedModel(model);
-                                                            setOpen(false);
-                                                        }}
-                                                        isActive={props.isActive}
+                                                        onSelect={() => handleSelect(model)}
+                                                        isActive={isActive}
                                                     />
                                                 ))}
                                         </CommandGroup>

@@ -37,14 +37,43 @@ import { KhojLogoType } from "../components/logo/khojLogo";
 import { DialogTitle } from "@radix-ui/react-dialog";
 import Link from "next/link";
 
-const agentsFetcher = () =>
-    window
-        .fetch("/api/agents")
-        .then((res) => res.json())
-        .catch((err) => console.log(err));
+const fetcher = async (url: string) => {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status}`);
+    return response.json();
+};
 
-// A generic fetcher function that uses the fetch API to make a request to a given URL and returns the response as JSON.
-const fetcher = (url: string) => fetch(url).then((res) => res.json());
+const agentDataSchema = z.object({
+    slug: z.string(),
+    name: z.string(),
+    persona: z.string(),
+    color: z.string(),
+    icon: z.string(),
+    privacy_level: z.string(),
+    files: z.array(z.string()).optional(),
+    creator: z.string().optional(),
+    is_creator: z.boolean().optional(),
+    managed_by_admin: z.boolean(),
+    chat_model: z.string(),
+    input_tools: z.array(z.string()),
+    output_modes: z.array(z.string()),
+    is_hidden: z.boolean(),
+    has_files: z.boolean().optional(),
+});
+
+const agentsFetcher = async () => {
+    const data = await fetcher("/api/agents");
+    const agents = z.array(agentDataSchema).safeParse(data);
+    if (!agents.success) throw new Error("Invalid agents response");
+    return agents.data;
+};
+
+const agentFetcher = async (slug: string) => {
+    const data = await fetcher(`/api/agents/${encodeURIComponent(slug)}`);
+    const agent = agentDataSchema.safeParse(data);
+    if (!agent.success) throw new Error("Invalid agent response");
+    return agent.data;
+};
 
 interface CreateAgentCardProps {
     data: AgentData;
@@ -87,7 +116,7 @@ function CreateAgentCard(props: CreateAgentCardProps) {
             chat_model: props.selectedChatModelOption,
             files: [],
         });
-    }, [props.selectedChatModelOption, props.data]);
+    }, [form, props.selectedChatModelOption, props.data]);
 
     const onSubmit = (values: z.infer<typeof EditAgentSchema>) => {
         let agentsApiUrl = `/api/agents`;
@@ -99,24 +128,21 @@ function CreateAgentCard(props: CreateAgentCardProps) {
             },
             body: JSON.stringify(values),
         })
-            .then((response) => {
-                if (response.status === 200) {
+            .then(async (response) => {
+                const data = await response.json().catch(() => ({}));
+                if (response.ok) {
                     form.reset();
                     setShowModal(false);
                     setErrors(null);
                     props.setAgentChangeTriggered(true);
                 } else {
-                    response.json().then((data) => {
-                        console.error(data);
-                        if (data.error) {
-                            setErrors(data.error);
-                        }
-                    });
+                    console.error(data);
+                    setErrors(data.error || data.detail || "Failed to create agent");
                 }
             })
             .catch((error) => {
                 console.error("Error:", error);
-                setErrors(error);
+                setErrors(error instanceof Error ? error.message : String(error));
             });
     };
 
@@ -196,7 +222,7 @@ export default function Agents() {
             mutate();
             setAgentChangeTriggered(false);
         }
-    }, [agentChangeTriggered]);
+    }, [agentChangeTriggered, mutate]);
 
     useEffect(() => {
         if (data) {
@@ -229,17 +255,14 @@ export default function Agents() {
 
                     if (!selectedAgent) {
                         // See if the agent is accessible as a protected agent.
-                        fetch(`/api/agents/${agentSlug}`)
-                            .then((res) => {
-                                if (res.status === 404) {
-                                    throw new Error("Agent not found");
-                                }
-                                return res.json();
-                            })
-                            .then((agent: AgentData) => {
+                        agentFetcher(agentSlug)
+                            .then((agent) => {
                                 if (agent.privacy_level === "protected") {
                                     setPublicAgents((prev) => [...prev, agent]);
                                 }
+                            })
+                            .catch((error) => {
+                                console.error("Failed to load linked agent:", error);
                             });
                     }
                 }

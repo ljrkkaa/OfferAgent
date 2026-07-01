@@ -12,11 +12,16 @@ export interface UserProfile {
     khoj_version: string;
 }
 
-const fetcher = (url: string) =>
-    window
-        .fetch(url)
-        .then((res) => res.json())
-        .catch((err) => console.warn(err));
+const fetcher = async (url: string) => {
+    const response = await window.fetch(url);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok && !(response.status === 403 && data?.detail === "Forbidden")) {
+        throw new Error(
+            data?.detail || data?.error || `Failed to fetch ${url}: ${response.status}`,
+        );
+    }
+    return data;
+};
 
 export function useAuthenticatedData() {
     const { data, error, isLoading } = useSWR<UserProfile>("/api/v1/user", fetcher, {
@@ -66,8 +71,6 @@ export interface UserConfig {
     enable_memory: boolean;
     server_memory_mode: "disabled" | "enabled_default_off" | "enabled_default_on";
     // user model settings
-    search_model_options: ModelOptions[];
-    selected_search_model_config: number;
     chat_model_options: ModelOptions[];
     selected_chat_model_config: number;
     paint_model_options: ModelOptions[];

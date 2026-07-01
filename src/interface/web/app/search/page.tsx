@@ -100,6 +100,27 @@ interface FileObject {
     updated_at: string;
 }
 
+function isFileObject(file: unknown): file is FileObject {
+    return (
+        typeof file === "object" &&
+        file !== null &&
+        typeof (file as FileObject).file_name === "string" &&
+        typeof (file as FileObject).raw_text === "string" &&
+        typeof (file as FileObject).updated_at === "string"
+    );
+}
+
+function isFilesResponse(data: unknown): data is { files: FileObject[]; num_pages: number } {
+    return (
+        typeof data === "object" &&
+        data !== null &&
+        Array.isArray((data as { files?: unknown }).files) &&
+        (data as { files: unknown[] }).files.every(isFileObject) &&
+        Number.isInteger((data as { num_pages?: unknown }).num_pages) &&
+        (data as { num_pages: number }).num_pages >= 0
+    );
+}
+
 function getNoteTypeIcon(source: string) {
     if (source === "notion") {
         return <NotionLogo className="text-muted-foreground" />;
@@ -329,7 +350,7 @@ const UploadFiles: React.FC<{
             }, 800);
             return () => clearInterval(interval);
         }
-    }, [uploading]);
+    }, [uploading, warning, error]);
 
     function handleDragOver(event: React.DragEvent<HTMLDivElement>) {
         event.preventDefault();
@@ -467,29 +488,30 @@ interface FileFilterComboBoxProps {
 }
 
 function FileFilterComboBox(props: FileFilterComboBoxProps) {
+    const { allFiles, inputText: initialInputText, onClose } = props;
     const [open, setOpen] = useState(false);
-    const [value, setValue] = useState(props.inputText || "");
+    const [value, setValue] = useState(initialInputText || "");
     const [noMatchingFiles, setNoMatchingFiles] = useState(false);
     const [inputText, setInputText] = useState("");
 
     useEffect(() => {
-        if (props.inputText) {
-            if (props.inputText === "INITIALIZE") {
+        if (initialInputText) {
+            if (initialInputText === "INITIALIZE") {
                 setOpen(true);
                 setInputText("");
             } else {
-                setInputText(props.inputText);
-                if (props.allFiles.includes(props.inputText)) {
-                    setValue(props.inputText);
+                setInputText(initialInputText);
+                if (allFiles.includes(initialInputText)) {
+                    setValue(initialInputText);
                 }
             }
         } else {
             setInputText("");
         }
-    }, [props.inputText]);
+    }, [initialInputText, allFiles]);
 
     useEffect(() => {
-        if (inputText && !props.allFiles.includes(inputText)) {
+        if (inputText && !allFiles.includes(inputText)) {
             setNoMatchingFiles(true);
             setValue("");
         } else if (!inputText) {
@@ -499,13 +521,13 @@ function FileFilterComboBox(props: FileFilterComboBoxProps) {
             setNoMatchingFiles(false);
             setValue(inputText);
         }
-    }, [inputText, props.allFiles]);
+    }, [inputText, allFiles]);
 
     useEffect(() => {
         if (!open) {
-            props.onClose();
+            onClose();
         }
-    }, [open]);
+    }, [open, onClose]);
 
     return (
         <Popover open={open || (noMatchingFiles && !!inputText)} onOpenChange={setOpen}>
@@ -594,12 +616,18 @@ export default function Search() {
                 "Content-Type": "application/json",
             },
         })
-            .then((response) => response.json())
+            .then(async (response) => {
+                if (!response.ok) throw new Error("Failed to load files");
+                const data = await response.json();
+                if (!Array.isArray(data)) throw new Error("Invalid files response");
+                return data;
+            })
             .then((data) => {
                 setAllFiles(data);
             })
             .catch((error) => {
                 console.error("Error loading files:", error);
+                setAllFiles([]);
             });
     }, []);
 
@@ -636,7 +664,7 @@ export default function Search() {
         // Debounce search
         if (value.trim()) {
             searchTimeoutRef.current = setTimeout(() => {
-                search();
+                search(value);
             }, 750);
         }
     }
@@ -650,46 +678,52 @@ export default function Search() {
         const newQuery = `file:"${suggestion}" ${searchQueryWithoutFileFilter}`;
         setSearchQuery(newQuery);
         searchInputRef.current?.focus();
-        search();
+        search(newQuery);
     }
 
-    function search() {
-        if (searchResultsLoading || !searchQuery.trim()) return;
+    function search(query = searchQuery) {
+        if (searchResultsLoading || !query.trim()) return;
 
         setSearchResultsLoading(true);
 
-        const apiUrl = `/api/search?q=${encodeURIComponent(searchQuery)}&client=web`;
+        const apiUrl = `/api/search?q=${encodeURIComponent(query)}&client=web`;
         fetch(apiUrl, {
             method: "GET",
             headers: {
                 "Content-Type": "application/json",
             },
         })
-            .then((response) => response.json())
+            .then(async (response) => {
+                if (!response.ok) throw new Error("Failed to search");
+                const data = await response.json();
+                if (!Array.isArray(data)) throw new Error("Invalid search response");
+                return data;
+            })
             .then((data) => {
                 setSearchResults(data);
-                setSearchResultsLoading(false);
             })
             .catch((error) => {
                 console.error("Error:", error);
+                setSearchResults(null);
+            })
+            .finally(() => {
+                setSearchResultsLoading(false);
             });
     }
 
     const fetchFiles = async (currentPageNumber: number) => {
         try {
-            const url = `api/content/files?page=${currentPageNumber}`;
+            const url = `/api/content/files?page=${currentPageNumber}`;
             const response = await fetch(url);
             if (!response.ok) throw new Error("Failed to fetch files");
 
             const filesData = await response.json();
+            if (!isFilesResponse(filesData)) throw new Error("Invalid files response");
             const filesList = filesData.files;
             const totalPages = filesData.num_pages;
 
             setNumPages(totalPages);
-
-            if (Array.isArray(filesList)) {
-                setFiles(filesList.toSorted());
-            }
+            setFiles(filesList.toSorted());
         } catch (error) {
             setError("Failed to load files");
             console.error("Error fetching files:", error);
@@ -704,10 +738,19 @@ export default function Search() {
 
     const fetchSpecificFile = async (fileName: string) => {
         try {
-            const response = await fetch(`/api/content/file?file_name=${fileName}`);
+            const response = await fetch(
+                `/api/content/file?file_name=${encodeURIComponent(fileName)}`,
+            );
             if (!response.ok) throw new Error("Failed to fetch file");
 
             const file = await response.json();
+            if (
+                typeof file !== "object" ||
+                file === null ||
+                typeof (file as { raw_text?: unknown }).raw_text !== "string"
+            ) {
+                throw new Error("Invalid file response");
+            }
             setSelectedFileFullText(file.raw_text);
         } catch (error) {
             setError("Failed to load file");
@@ -734,10 +777,6 @@ export default function Search() {
     }, [selectedFile]);
 
     useEffect(() => {
-        fetchFiles(pageNumber);
-    }, []);
-
-    useEffect(() => {
         if (uploadedFiles.length > 0) {
             setPageNumber(0);
             fetchFiles(0);
@@ -747,9 +786,12 @@ export default function Search() {
     const handleDelete = async (fileName: string) => {
         setIsDeleting(true);
         try {
-            const response = await fetch(`/api/content/file?filename=${fileName}`, {
-                method: "DELETE",
-            });
+            const response = await fetch(
+                `/api/content/file?filename=${encodeURIComponent(fileName)}`,
+                {
+                    method: "DELETE",
+                },
+            );
             if (!response.ok) throw new Error("Failed to delete file");
             toast({
                 title: "File deleted",
@@ -799,7 +841,7 @@ export default function Search() {
                                             }
                                             onKeyDown={(e) => {
                                                 if (e.key === "Enter") {
-                                                    search();
+                                                    search(e.currentTarget.value);
                                                 }
                                             }}
                                             ref={searchInputRef}

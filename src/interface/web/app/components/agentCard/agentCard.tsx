@@ -1,6 +1,6 @@
 import styles from "./agentCard.module.css";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 
 import { UserProfile, ModelOptions, UserConfig } from "@/app/common/auth";
@@ -43,6 +43,7 @@ import {
     getIconFromIconName,
 } from "@/app/common/iconUtils";
 import { convertColorToTextClass, tailwindColors } from "@/app/common/colorUtils";
+import { createNewConversation } from "@/app/common/chatFunctions";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 
 import {
@@ -114,21 +115,23 @@ export interface AgentData {
 }
 
 async function openChat(slug: string, userData: UserProfile | null) {
-    const unauthenticatedRedirectUrl = `/login?next=/agents?agent=${slug}`;
+    const unauthenticatedRedirectUrl = `/login?next=${encodeURIComponent(
+        `/agents?agent=${encodeURIComponent(slug)}`,
+    )}`;
     if (!userData) {
         window.location.href = unauthenticatedRedirectUrl;
         return;
     }
 
-    const response = await fetch(`/api/chat/sessions?agent_slug=${encodeURIComponent(slug)}`, {
-        method: "POST",
-    });
-    const data = await response.json();
-    if (response.status == 200) {
-        window.location.href = `/chat?conversationId=${data.conversation_id}`;
-    } else if (response.status == 403 || response.status == 401) {
-        window.location.href = unauthenticatedRedirectUrl;
-    } else {
+    try {
+        const conversationId = await createNewConversation(slug);
+        window.location.href = `/chat?conversationId=${conversationId}`;
+    } catch (error) {
+        if (error instanceof Error && /status: (401|403)/.test(error.message)) {
+            window.location.href = unauthenticatedRedirectUrl;
+            return;
+        }
+        console.error("Failed to start chat session:", error);
         alert("Failed to start chat session");
     }
 }
@@ -235,54 +238,49 @@ export function AgentCard(props: AgentCardProps) {
             input_tools: props.data.input_tools,
             output_modes: props.data.output_modes,
         });
-    }, [props.data]);
+    }, [form, props.data]);
 
     if (showModal) {
         window.history.pushState(
             {},
             `Khoj AI - Agent ${props.data.slug}`,
-            `/agents?agent=${props.data.slug}`,
+            `/agents?agent=${encodeURIComponent(props.data.slug)}`,
         );
     }
 
-    const onSubmit = (values: z.infer<typeof EditAgentSchema>) => {
-        let agentsApiUrl = `/api/agents`;
-        let method = props.editCard ? "PATCH" : "POST";
+    const onSubmit = async (values: z.infer<typeof EditAgentSchema>) => {
+        const agentsApiUrl = `/api/agents`;
+        const method = props.editCard ? "PATCH" : "POST";
 
-        let valuesToSend: any = values;
+        let valuesToSend: z.infer<typeof EditAgentSchema> & { slug?: string } = values;
 
         if (props.editCard) {
             valuesToSend = { ...values, slug: props.data.slug };
         }
 
-        fetch(agentsApiUrl, {
-            method: method,
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify(valuesToSend),
-        })
-            .then((response) => {
-                if (response.status === 200) {
-                    form.reset();
-                    setShowModal(false);
-                    setErrors(null);
-                    props.setAgentChangeTriggered(true);
-                } else {
-                    response.json().then((data) => {
-                        console.error(data);
-                        form.clearErrors();
-                        if (data.error) {
-                            setErrors(data.error);
-                        }
-                    });
-                }
-            })
-            .catch((error) => {
-                console.error("Error:", error);
-                setErrors(error);
-                form.clearErrors();
+        try {
+            const response = await fetch(agentsApiUrl, {
+                method: method,
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(valuesToSend),
             });
+
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.error || data.detail || "Failed to save agent");
+            }
+
+            form.reset();
+            setShowModal(false);
+            setErrors(null);
+            props.setAgentChangeTriggered(true);
+        } catch (error) {
+            console.error("Error:", error);
+            setErrors(error instanceof Error ? error.message : String(error));
+            form.clearErrors();
+        }
     };
 
     const stylingString = convertColorToTextClass(props.data.color);
@@ -384,7 +382,7 @@ export function AgentCard(props: AgentCardProps) {
                                                         description="Share a link to this agent with others. They'll be able to chat with it, and ask questions to all of its knowledge base."
                                                         buttonVariant={"ghost" as const}
                                                         includeIcon={true}
-                                                        url={`${window.location.origin}/agents?agent=${props.data.slug}`}
+                                                        url={`${window.location.origin}/agents?agent=${encodeURIComponent(props.data.slug)}`}
                                                     />
                                                 )}
                                             {props.data.creator === userData?.username && (
@@ -392,11 +390,29 @@ export function AgentCard(props: AgentCardProps) {
                                                     className="items-center justify-start"
                                                     variant={"destructive"}
                                                     onClick={() => {
-                                                        fetch(`/api/agents/${props.data.slug}`, {
-                                                            method: "DELETE",
-                                                        }).then(() => {
-                                                            props.setAgentChangeTriggered(true);
-                                                        });
+                                                        fetch(
+                                                            `/api/agents/${encodeURIComponent(props.data.slug)}`,
+                                                            { method: "DELETE" },
+                                                        )
+                                                            .then(async (response) => {
+                                                                if (!response.ok) {
+                                                                    const data = await response
+                                                                        .json()
+                                                                        .catch(() => ({}));
+                                                                    throw new Error(
+                                                                        data.error ||
+                                                                            "Failed to delete agent",
+                                                                    );
+                                                                }
+                                                                props.setAgentChangeTriggered(true);
+                                                            })
+                                                            .catch((error) => {
+                                                                alert(
+                                                                    error instanceof Error
+                                                                        ? error.message
+                                                                        : "Failed to delete agent",
+                                                                );
+                                                            });
                                                     }}
                                                 >
                                                     <Trash className="w-4 h-4 mr-2" />
@@ -585,21 +601,32 @@ export function AgentModificationForm(props: AgentModificationFormProps) {
         }
     }, [uploading]);
 
+    const handleAgentFileChange = useCallback(
+        (files: string[]) => {
+            for (const file of files) {
+                const currentFiles = props.form.getValues("files") || [];
+                const newFiles = currentFiles.includes(file)
+                    ? currentFiles.filter((item) => item !== file)
+                    : [...currentFiles, file];
+                props.form.setValue("files", newFiles);
+            }
+        },
+        [props.form],
+    );
+
     useEffect(() => {
         const currentFiles = props.form.getValues("files") || [];
         const fileOptions = props.filesOptions || [];
         const concatenatedFiles = [...currentFiles, ...fileOptions];
-        const fullAllFileOptions = [...allFileOptions, ...concatenatedFiles];
-        const dedupedAllFileOptions = Array.from(new Set(fullAllFileOptions));
-        setAllFileOptions(dedupedAllFileOptions);
-    }, []);
+        setAllFileOptions((prev) => Array.from(new Set([...prev, ...concatenatedFiles])));
+    }, [props.filesOptions, props.form]);
 
     useEffect(() => {
         if (uploadedFiles.length > 0) {
             handleAgentFileChange(uploadedFiles);
             setAllFileOptions((prev) => [...prev, ...uploadedFiles]);
         }
-    }, [uploadedFiles]);
+    }, [uploadedFiles, handleAgentFileChange]);
 
     useEffect(() => {
         if (props.errors) {
@@ -660,16 +687,6 @@ export function AgentModificationForm(props: AgentModificationFormProps) {
         console.log("Submitting", values);
         props.onSubmit(values);
         setIsSaving(true);
-    };
-
-    const handleAgentFileChange = (files: string[]) => {
-        for (const file of files) {
-            const currentFiles = props.form.getValues("files") || [];
-            const newFiles = currentFiles.includes(file)
-                ? currentFiles.filter((item) => item !== file)
-                : [...currentFiles, file];
-            props.form.setValue("files", newFiles);
-        }
     };
 
     const areRequiredFieldsCompletedForCurrentStep = (formGroup: {
@@ -768,8 +785,9 @@ export function AgentModificationForm(props: AgentModificationFormProps) {
                                 <FormDescription>
                                     {!props.isSubscribed ? (
                                         <p className="text-secondary-foreground">
-                                            Upgrade to the <Link href="/settings">Futurist plan</Link> to
-                                            access all models.
+                                            Upgrade to the{" "}
+                                            <Link href="/settings">Futurist plan</Link> to access
+                                            all models.
                                         </p>
                                     ) : (
                                         <p>Which chat model would you like to use?</p>

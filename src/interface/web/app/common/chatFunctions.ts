@@ -1,4 +1,4 @@
-import { AttachedFileText } from "../components/chatInputArea/chatInputArea";
+import type { AttachedFileText, ChatOptions } from "../components/chatInputArea/chatInputArea";
 import {
     CodeContext,
     Context,
@@ -158,7 +158,7 @@ export function processMessageChunk(
                 currentMessage.intentType = responseWithIntent.intentType;
                 currentMessage.inferredQueries = responseWithIntent.inferredQueries;
             } catch (e) {
-                currentMessage.rawResponse += JSON.stringify(chunkData);
+                currentMessage.rawResponse += chunkData;
             }
         } else {
             currentMessage.rawResponse += chunkData;
@@ -253,6 +253,9 @@ export function modifyFileFilterForConversation(
             return res.json();
         })
         .then((data) => {
+            if (!Array.isArray(data) || data.some((file) => typeof file !== "string")) {
+                throw new Error("Invalid file filter response");
+            }
             setAddedFiles(data);
         })
         .catch((err) => {
@@ -261,21 +264,31 @@ export function modifyFileFilterForConversation(
         });
 }
 
-export async function createNewConversation(slug: string) {
+export async function createNewConversation(slug?: string) {
     try {
-        const response = await fetch(`/api/chat/sessions?client=web&agent_slug=${slug}`, {
+        const agentParam = slug ? `&agent_slug=${encodeURIComponent(slug)}` : "";
+        const response = await fetch(`/api/chat/sessions?client=web${agentParam}`, {
             method: "POST",
         });
         if (!response.ok)
             throw new Error(`Failed to fetch chat sessions with status: ${response.status}`);
         const data = await response.json();
         const conversationID = data.conversation_id;
-        if (!conversationID) throw new Error("Conversation ID not found in response");
+        if (typeof conversationID !== "string")
+            throw new Error("Conversation ID not found in response");
         return conversationID;
     } catch (error) {
         console.error("Error creating new conversation:", error);
         throw error;
     }
+}
+
+export async function fetchChatOptions(): Promise<ChatOptions> {
+    const response = await fetch("/api/chat/options");
+    if (!response.ok) {
+        throw new Error(`Failed to fetch chat options: ${response.status}`);
+    }
+    return response.json();
 }
 
 export async function packageFilesForUpload(files: FileList): Promise<FormData> {
@@ -342,7 +355,7 @@ export async function packageFilesForUpload(files: FileList): Promise<FormData> 
 }
 
 export function generateNewTitle(conversationId: string, setTitle: (title: string) => void) {
-    fetch(`/api/chat/title?conversation_id=${conversationId}`, {
+    fetch(`/api/chat/title?conversation_id=${encodeURIComponent(conversationId)}`, {
         method: "POST",
     })
         .then((res) => {
@@ -406,6 +419,7 @@ export function uploadDataForIndexing(
     }
 
     const formData = new FormData();
+    const indexedFiles: string[] = [];
 
     // Create an array of Promises for file reading
     const fileReadPromises = Array.from(goodFiles).map((file) => {
@@ -432,6 +446,9 @@ export function uploadDataForIndexing(
                         fileType = "text/html";
                     } else if (fileExtension === "pdf") {
                         fileType = "application/pdf";
+                    } else if (fileExtension === "docx") {
+                        fileType =
+                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
                     } else {
                         // Skip this file if its type is not supported
                         resolve();
@@ -446,6 +463,7 @@ export function uploadDataForIndexing(
 
                 let fileObj = new Blob([fileContents], { type: fileType });
                 formData.append("files", fileObj, file.name);
+                indexedFiles.push(file.name);
                 resolve();
             };
             reader.onerror = reject;
@@ -458,18 +476,20 @@ export function uploadDataForIndexing(
     // Wait for all files to be read before making the fetch request
     Promise.all(fileReadPromises)
         .then(() => {
+            if (indexedFiles.length === 0) throw new Error("No supported files found");
             return fetch("/api/content?client=web", {
                 method: "PATCH",
                 body: formData,
             });
         })
-        .then((data) => {
-            for (let file of goodFiles) {
-                uploadedFiles.push(file.name);
+        .then((response) => {
+            if (!response.ok) throw new Error(`Failed to upload files: ${response.status}`);
+            for (let fileName of indexedFiles) {
+                uploadedFiles.push(fileName);
                 if (conversationId && setUploadedFiles) {
                     modifyFileFilterForConversation(
                         conversationId,
-                        [file.name],
+                        [fileName],
                         setUploadedFiles,
                         "add",
                     );

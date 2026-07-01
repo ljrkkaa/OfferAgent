@@ -25,6 +25,7 @@ import { Separator } from "@/components/ui/separator";
 import { KhojLogoType } from "@/app/components/logo/khojLogo";
 import { Button } from "@/components/ui/button";
 import { Trash } from "@phosphor-icons/react";
+import { fetchChatOptions } from "@/app/common/chatFunctions";
 
 interface ChatBodyDataProps {
     chatOptionsData: ChatOptions | null;
@@ -35,17 +36,29 @@ interface ChatBodyDataProps {
     streamedMessages: StreamMessage[];
     isLoggedIn: boolean;
     conversationId?: string;
-    setQueryToProcess: (query: string) => void;
+    setQueryToProcess: (query: string, attachments?: SharedQueryAttachments) => void;
     setImages: (images: string[]) => void;
     setIsOwner: (isOwner: boolean) => void;
 }
 
+type SharedQueryAttachments = {
+    images?: string[];
+};
+
+type PendingSharedFork = {
+    query: string;
+    images: string[];
+};
+
 function UnshareButton({ slug, className }: { slug: string; className?: string }) {
     const handleUnshare = async () => {
         try {
-            const response = await fetch(`/api/chat/share?public_conversation_slug=${slug}`, {
-                method: "DELETE",
-            });
+            const response = await fetch(
+                `/api/chat/share?public_conversation_slug=${encodeURIComponent(slug)}`,
+                {
+                    method: "DELETE",
+                },
+            );
 
             if (response.redirected) {
                 window.location.reload();
@@ -80,22 +93,22 @@ function ChatBodyData(props: ChatBodyDataProps) {
 
     const setQueryToProcess = props.setQueryToProcess;
     const streamedMessages = props.streamedMessages;
+    const setParentImages = props.setImages;
 
     const chatHistoryCustomClassName = props.isMobileWidth ? "w-full" : "w-4/6";
 
     useEffect(() => {
         if (images.length > 0) {
-            const encodedImages = images.map((image) => encodeURIComponent(image));
-            props.setImages(encodedImages);
+            setParentImages(images);
         }
-    }, [images, props.setImages]);
+    }, [images, setParentImages]);
 
-    useEffect(() => {
-        if (message) {
-            setProcessingMessage(true);
-            setQueryToProcess(message);
-        }
-    }, [message, setQueryToProcess]);
+    const queueMessage = (nextMessage: string, nextImages: string[] = []) => {
+        const imagesForMessage = nextImages.length > 0 ? nextImages : images;
+        setMessage(nextMessage);
+        setProcessingMessage(true);
+        setQueryToProcess(nextMessage, { images: imagesForMessage });
+    };
 
     useEffect(() => {
         if (
@@ -133,7 +146,7 @@ function ChatBodyData(props: ChatBodyDataProps) {
                 >
                     <ChatInputArea
                         isLoggedIn={props.isLoggedIn}
-                        sendMessage={(message) => setMessage(message)}
+                        sendMessage={queueMessage}
                         sendImage={(image) => setImages((prevImages) => [...prevImages, image])}
                         sendDisabled={processingMessage}
                         chatOptionsData={props.chatOptionsData}
@@ -156,8 +169,8 @@ export default function SharedChat() {
     const [title, setTitle] = useState("Khoj AI - Chat");
     const [conversationId, setConversationID] = useState<string | undefined>(undefined);
     const [messages, setMessages] = useState<StreamMessage[]>([]);
-    const [queryToProcess, setQueryToProcess] = useState<string>("");
     const [uploadedFiles, setUploadedFiles] = useState<AttachedFileText[] | null>(null);
+    const [pendingFork, setPendingFork] = useState<PendingSharedFork | null>(null);
     const [paramSlug, setParamSlug] = useState<string | undefined>(undefined);
     const [images, setImages] = useState<string[]>([]);
     const [isOwner, setIsOwner] = useState(false);
@@ -170,23 +183,30 @@ export default function SharedChat() {
     const isMobileWidth = useIsMobileWidth();
 
     useEffect(() => {
-        fetch("/api/chat/options")
-            .then((response) => response.json())
-            .then((data: ChatOptions) => {
-                setLoading(false);
-                // Render chat options, if any
-                if (data) {
+        let cancelled = false;
+        async function loadChatOptions() {
+            try {
+                const data = await fetchChatOptions();
+                if (!cancelled) {
                     setChatOptionsData(data);
                 }
-            })
-            .catch((err) => {
+            } catch (err) {
                 console.error(err);
-                return;
-            });
+            } finally {
+                if (!cancelled) {
+                    setLoading(false);
+                }
+            }
+        }
+
+        loadChatOptions();
 
         welcomeConsole();
 
         setParamSlug(window.location.pathname.split("/").pop() || "");
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
     useEffect(() => {
@@ -195,21 +215,49 @@ export default function SharedChat() {
         }
     }, [uploadedFiles]);
 
+    const queueQueryToProcess = (query: string, attachments?: SharedQueryAttachments) => {
+        setPendingFork(
+            query
+                ? {
+                      query,
+                      images: attachments?.images ?? images,
+                  }
+                : null,
+        );
+    };
+
     useEffect(() => {
-        if (queryToProcess && !conversationId) {
+        if (pendingFork && !conversationId) {
+            if (!paramSlug) {
+                console.error("Missing shared chat slug");
+                return;
+            }
             // If the user has not yet started conversing in the chat, create a new conversation
-            fetch(`/api/chat/share/fork?public_conversation_slug=${paramSlug}`, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
+            fetch(
+                `/api/chat/share/fork?public_conversation_slug=${encodeURIComponent(paramSlug)}`,
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
                 },
-            })
-                .then((response) => response.json())
+            )
+                .then((response) => {
+                    if (!response.ok) {
+                        throw new Error(
+                            `Failed to fork shared chat with status ${response.status}`,
+                        );
+                    }
+                    return response.json();
+                })
                 .then((data) => {
+                    if (!data.conversation_id) {
+                        throw new Error("Conversation ID not found in fork response");
+                    }
                     setConversationID(data.conversation_id);
-                    localStorage.setItem("message", queryToProcess);
-                    if (images.length > 0) {
-                        localStorage.setItem("images", JSON.stringify(images));
+                    localStorage.setItem("message", pendingFork.query);
+                    if (pendingFork.images.length > 0) {
+                        localStorage.setItem("images", JSON.stringify(pendingFork.images));
                     }
                     window.location.href = `/chat?conversationId=${data.conversation_id}`;
                 })
@@ -219,7 +267,7 @@ export default function SharedChat() {
                 });
             return;
         }
-    }, [queryToProcess, conversationId, paramSlug]);
+    }, [pendingFork, conversationId, paramSlug]);
 
     if (isLoading) {
         return <Loading />;
@@ -272,7 +320,7 @@ export default function SharedChat() {
                                 <ChatBodyData
                                     conversationId={conversationId}
                                     streamedMessages={messages}
-                                    setQueryToProcess={setQueryToProcess}
+                                    setQueryToProcess={queueQueryToProcess}
                                     isLoggedIn={authenticatedData ? true : false}
                                     publicConversationSlug={paramSlug}
                                     chatOptionsData={chatOptionsData}

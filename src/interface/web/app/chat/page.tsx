@@ -9,7 +9,7 @@ import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import Loading from "../components/loading/loading";
 
-import { generateNewTitle, processMessageChunk } from "../common/chatFunctions";
+import { fetchChatOptions, generateNewTitle, processMessageChunk } from "../common/chatFunctions";
 
 import "katex/dist/katex.min.css";
 
@@ -41,7 +41,7 @@ interface ChatBodyDataProps {
     chatOptionsData: ChatOptions | null;
     setTitle: (title: string) => void;
     onConversationIdChange?: (conversationId: string) => void;
-    setQueryToProcess: (query: string) => void;
+    setQueryToProcess: (query: string, attachments?: QueuedQueryAttachments) => void;
     streamedMessages: StreamMessage[];
     setStreamedMessages: (messages: StreamMessage[]) => void;
     setUploadedFiles: (files: AttachedFileText[] | undefined) => void;
@@ -56,6 +56,17 @@ interface ChatBodyDataProps {
     onRetryMessage?: (query: string, turnId?: string) => void;
 }
 
+type QueuedQueryAttachments = {
+    images?: string[];
+    uploadedFiles?: AttachedFileText[];
+};
+
+type PendingChatRequest = {
+    query: string;
+    images: string[];
+    uploadedFiles?: AttachedFileText[];
+};
+
 function ChatBodyData(props: ChatBodyDataProps) {
     const searchParams = useSearchParams();
     const conversationId = searchParams.get("conversationId");
@@ -68,41 +79,37 @@ function ChatBodyData(props: ChatBodyDataProps) {
 
     const setQueryToProcess = props.setQueryToProcess;
     const onConversationIdChange = props.onConversationIdChange;
+    const setParentImages = props.setImages;
+    const setUploadedFiles = props.setUploadedFiles;
+    const streamedMessages = props.streamedMessages;
 
     const chatHistoryCustomClassName = props.isMobileWidth ? "w-full" : "w-4/6";
 
     useEffect(() => {
         if (images.length > 0) {
             const encodedImages = images.map((image) => encodeURIComponent(image));
-            props.setImages(encodedImages);
+            setParentImages(encodedImages);
         }
-    }, [images, props.setImages]);
+    }, [images, setParentImages]);
 
     useEffect(() => {
+        let encodedImages: string[] = [];
+        let uploadedFiles: AttachedFileText[] | undefined;
+
         const storedImages = localStorage.getItem("images");
         if (storedImages) {
             const parsedImages: string[] = JSON.parse(storedImages);
             setImages(parsedImages);
-            const encodedImages = parsedImages.map((img: string) => encodeURIComponent(img));
-            props.setImages(encodedImages);
+            encodedImages = parsedImages.map((img: string) => encodeURIComponent(img));
+            setParentImages(encodedImages);
             localStorage.removeItem("images");
-        }
-
-        const storedMessage = localStorage.getItem("message");
-        if (storedMessage) {
-            setProcessingMessage(true);
-            setQueryToProcess(storedMessage);
-
-            if (storedMessage.trim().startsWith("/research")) {
-                setIsInResearchMode(true);
-            }
         }
 
         const storedUploadedFiles = localStorage.getItem("uploadedFiles");
 
         if (storedUploadedFiles) {
             const parsedFiles = storedUploadedFiles ? JSON.parse(storedUploadedFiles) : [];
-            const uploadedFiles: AttachedFileText[] = [];
+            uploadedFiles = [];
             for (const file of parsedFiles) {
                 uploadedFiles.push({
                     name: file.name,
@@ -112,16 +119,29 @@ function ChatBodyData(props: ChatBodyDataProps) {
                 });
             }
             localStorage.removeItem("uploadedFiles");
-            props.setUploadedFiles(uploadedFiles);
+            setUploadedFiles(uploadedFiles);
         }
-    }, [setQueryToProcess, props.setImages, conversationId]);
 
-    useEffect(() => {
-        if (message) {
+        const storedMessage = localStorage.getItem("message");
+        if (storedMessage) {
+            localStorage.removeItem("message");
             setProcessingMessage(true);
-            setQueryToProcess(message);
+            setQueryToProcess(storedMessage, { images: encodedImages, uploadedFiles });
+
+            if (storedMessage.trim().startsWith("/research")) {
+                setIsInResearchMode(true);
+            }
         }
-    }, [message, setQueryToProcess]);
+    }, [setQueryToProcess, setParentImages, setUploadedFiles, conversationId]);
+
+    const queueMessage = (nextMessage: string, nextImages: string[] = []) => {
+        const imagesForMessage = nextImages.length > 0 ? nextImages : images;
+        setMessage(nextMessage);
+        setProcessingMessage(true);
+        setQueryToProcess(nextMessage, {
+            images: imagesForMessage.map((image) => encodeURIComponent(image)),
+        });
+    };
 
     useEffect(() => {
         if (conversationId) {
@@ -131,17 +151,17 @@ function ChatBodyData(props: ChatBodyDataProps) {
 
     useEffect(() => {
         if (
-            props.streamedMessages &&
-            props.streamedMessages.length > 0 &&
-            props.streamedMessages[props.streamedMessages.length - 1].completed
+            streamedMessages &&
+            streamedMessages.length > 0 &&
+            streamedMessages[streamedMessages.length - 1].completed
         ) {
             setProcessingMessage(false);
             setImages([]); // Reset images after processing
-            props.setUploadedFiles(undefined); // Reset uploaded files after processing
+            setUploadedFiles(undefined); // Reset uploaded files after processing
         } else {
             setMessage("");
         }
-    }, [props.streamedMessages]);
+    }, [streamedMessages, setUploadedFiles]);
 
     if (!conversationId) {
         window.location.href = "/";
@@ -170,13 +190,13 @@ function ChatBodyData(props: ChatBodyDataProps) {
                     <ChatInputArea
                         agentColor={agentMetadata?.color}
                         isLoggedIn={props.isLoggedIn}
-                        sendMessage={(message) => setMessage(message)}
+                        sendMessage={queueMessage}
                         sendImage={(image) => setImages((prevImages) => [...prevImages, image])}
                         sendDisabled={props.isParentProcessing || false}
                         chatOptionsData={props.chatOptionsData}
                         conversationId={conversationId}
                         isMobileWidth={props.isMobileWidth}
-                        setUploadedFiles={props.setUploadedFiles}
+                        setUploadedFiles={setUploadedFiles}
                         ref={chatInputRef}
                         isResearchModeEnabled={isInResearchMode}
                         setTriggeredAbort={props.setTriggeredAbort}
@@ -207,11 +227,13 @@ export default function Chat() {
     const [processQuerySignal, setProcessQuerySignal] = useState(false);
     const [uploadedFiles, setUploadedFiles] = useState<AttachedFileText[] | undefined>(undefined);
     const [images, setImages] = useState<string[]>([]);
+    const [pendingRequest, setPendingRequest] = useState<PendingChatRequest | null>(null);
 
     const [triggeredAbort, setTriggeredAbort] = useState(false);
     const [interruptMessage, setInterruptMessage] = useState<string>("");
     const bufferRef = useRef("");
     const idleTimerRef = useRef<NodeJS.Timeout | null>(null);
+    const sentRequestRef = useRef<PendingChatRequest | null>(null);
 
     const { locationData, locationDataError, locationDataLoading } = useIPLocationData() || {
         locationData: {
@@ -307,6 +329,8 @@ export default function Chat() {
             // Reset processing state so ChatInputArea send button reappears
             setProcessQuerySignal(false);
             setQueryToProcess("");
+            setPendingRequest(null);
+            sentRequestRef.current = null;
         },
         onError: (event) => {
             console.error("WebSocket error", event);
@@ -322,6 +346,8 @@ export default function Chat() {
             });
             setProcessQuerySignal(false);
             setQueryToProcess("");
+            setPendingRequest(null);
+            sentRequestRef.current = null;
             if (!intentionalCloseRef.current && !disconnectToastShownRef.current) {
                 toast({
                     title: "Network error",
@@ -334,6 +360,22 @@ export default function Chat() {
             }
         },
     });
+
+    const queueQueryToProcess = useCallback(
+        (query: string, attachments?: QueuedQueryAttachments) => {
+            setQueryToProcess(query);
+            setPendingRequest(
+                query
+                    ? {
+                          query,
+                          images: attachments?.images ?? images,
+                          uploadedFiles: attachments?.uploadedFiles ?? uploadedFiles,
+                      }
+                    : null,
+            );
+        },
+        [images, uploadedFiles],
+    );
 
     // Handle page unload / refresh: mark intentional so we don't show a toast
     useEffect(() => {
@@ -397,6 +439,8 @@ export default function Chat() {
 
                         if (currentMessage.completed) {
                             setQueryToProcess("");
+                            setPendingRequest(null);
+                            sentRequestRef.current = null;
                             setProcessQuerySignal(false);
                             setImages([]);
                             if (conversationId) generateNewTitle(conversationId, setTitle);
@@ -407,24 +451,31 @@ export default function Chat() {
                 }
             }
         }
-    }, [lastMessage, setMessages]);
+    }, [lastMessage, setMessages, conversationId, resetIdleTimer]);
 
     useEffect(() => {
-        fetch("/api/chat/options")
-            .then((response) => response.json())
-            .then((data: ChatOptions) => {
-                setLoading(false);
-                // Render chat options, if any
-                if (data) {
+        let cancelled = false;
+        async function loadChatOptions() {
+            try {
+                const data = await fetchChatOptions();
+                if (!cancelled) {
                     setChatOptionsData(data);
                 }
-            })
-            .catch((err) => {
+            } catch (err) {
                 console.error(err);
-                return;
-            });
+            } finally {
+                if (!cancelled) {
+                    setLoading(false);
+                }
+            }
+        }
+
+        loadChatOptions();
 
         welcomeConsole();
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
     const handleTriggeredAbort = (value: boolean, newMessage?: string) => {
@@ -453,14 +504,14 @@ export default function Chat() {
             });
 
             // Set the interrupt message as the new query being processed
-            setQueryToProcess(interruptMessage);
+            queueQueryToProcess(interruptMessage, { images: [], uploadedFiles: undefined });
             setTriggeredAbort(false); // Always set to false after processing
             setInterruptMessage("");
         }
-    }, [triggeredAbort, sendMessage]);
+    }, [triggeredAbort, sendMessage, interruptMessage, queueQueryToProcess]);
 
     useEffect(() => {
-        if (queryToProcess) {
+        if (pendingRequest) {
             const newStreamMessage: StreamMessage = {
                 rawResponse: "",
                 trainOfThought: [],
@@ -469,14 +520,14 @@ export default function Chat() {
                 codeContext: {},
                 completed: false,
                 timestamp: new Date().toISOString(),
-                rawQuery: queryToProcess || "",
-                images: images,
-                queryFiles: uploadedFiles,
+                rawQuery: pendingRequest.query,
+                images: pendingRequest.images,
+                queryFiles: pendingRequest.uploadedFiles,
             };
             setMessages((prevMessages) => [...prevMessages, newStreamMessage]);
             setProcessQuerySignal(true);
         }
-    }, [queryToProcess]);
+    }, [pendingRequest]);
 
     useEffect(() => {
         if (processQuerySignal) {
@@ -484,9 +535,53 @@ export default function Chat() {
                 return;
             }
 
-            chat();
+            if (!pendingRequest || !conversationId) {
+                setProcessQuerySignal(false);
+                return;
+            }
+
+            if (sentRequestRef.current === pendingRequest) {
+                return;
+            }
+            sentRequestRef.current = pendingRequest;
+
+            localStorage.removeItem("message");
+
+            // Re-establish WebSocket connection if disconnected
+            resetIdleTimer();
+            if (!socketUrl) {
+                const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+                const wsUrl = `${protocol}//${window.location.host}/api/chat/ws?client=web`;
+                setSocketUrl(wsUrl);
+            }
+
+            const chatAPIBody = {
+                q: pendingRequest.query,
+                conversation_id: conversationId,
+                stream: true,
+                ...(locationData && {
+                    city: locationData.city,
+                    region: locationData.region,
+                    country: locationData.country,
+                    country_code: locationData.countryCode,
+                    timezone: locationData.timezone,
+                }),
+                ...(pendingRequest.images.length > 0 && { images: pendingRequest.images }),
+                ...(pendingRequest.uploadedFiles && { files: pendingRequest.uploadedFiles }),
+            };
+
+            sendMessage(JSON.stringify(chatAPIBody));
         }
-    }, [processQuerySignal, locationDataLoading]);
+    }, [
+        processQuerySignal,
+        locationDataLoading,
+        pendingRequest,
+        conversationId,
+        resetIdleTimer,
+        socketUrl,
+        locationData,
+        sendMessage,
+    ]);
 
     useEffect(() => {
         if (!conversationId) return;
@@ -502,71 +597,44 @@ export default function Chat() {
         };
     }, [conversationId]);
 
-    async function chat() {
-        localStorage.removeItem("message");
-        if (!queryToProcess || !conversationId) {
-            setProcessQuerySignal(false);
-            return;
-        }
-
-        // Re-establish WebSocket connection if disconnected
-        resetIdleTimer();
-        if (!socketUrl) {
-            const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-            const wsUrl = `${protocol}//${window.location.host}/api/chat/ws?client=web`;
-            setSocketUrl(wsUrl);
-        }
-
-        const chatAPIBody = {
-            q: queryToProcess,
-            conversation_id: conversationId,
-            stream: true,
-            ...(locationData && {
-                city: locationData.city,
-                region: locationData.region,
-                country: locationData.country,
-                country_code: locationData.countryCode,
-                timezone: locationData.timezone,
-            }),
-            ...(images.length > 0 && { images: images }),
-            ...(uploadedFiles && { files: uploadedFiles }),
-        };
-
-        sendMessage(JSON.stringify(chatAPIBody));
-    }
-
     const handleConversationIdChange = (newConversationId: string) => {
         setConversationID(newConversationId);
     };
 
-    const handleRetryMessage = (query: string, turnId?: string) => {
+    const handleRetryMessage = async (query: string, turnId?: string) => {
         if (!query) {
             console.warn("No query provided for retry");
-            return;
+            return false;
         }
 
         // If we have a turnId, delete the old turn first
         if (turnId) {
-            // Delete from streaming messages if present
-            setMessages((prevMessages) => prevMessages.filter((msg) => msg.turnId !== turnId));
-
-            // Also call the delete API to remove from conversation history
-            fetch("/api/chat/conversation/message", {
-                method: "DELETE",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                    conversation_id: conversationId,
-                    turn_id: turnId,
-                }),
-            }).catch((error) => {
+            try {
+                const response = await fetch("/api/chat/conversation/message", {
+                    method: "DELETE",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify({
+                        conversation_id: conversationId,
+                        turn_id: turnId,
+                    }),
+                });
+                if (!response.ok) {
+                    throw new Error(
+                        (await response.text()) || "Failed to delete message for retry",
+                    );
+                }
+                setMessages((prevMessages) => prevMessages.filter((msg) => msg.turnId !== turnId));
+            } catch (error) {
                 console.error("Failed to delete message for retry:", error);
-            });
+                return false;
+            }
         }
 
         // Re-send the original query
-        setQueryToProcess(query);
+        queueQueryToProcess(query);
+        return true;
     };
 
     if (isLoading) return <Loading />;
@@ -630,7 +698,7 @@ export default function Chat() {
                                     setStreamedMessages={setMessages}
                                     chatOptionsData={chatOptionsData}
                                     setTitle={setTitle}
-                                    setQueryToProcess={setQueryToProcess}
+                                    setQueryToProcess={queueQueryToProcess}
                                     setUploadedFiles={setUploadedFiles}
                                     isMobileWidth={isMobileWidth}
                                     onConversationIdChange={handleConversationIdChange}

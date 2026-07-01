@@ -203,20 +203,23 @@ export interface StreamMessage {
 
 export interface ChatHistoryData {
     chat: SingleChatMessage[];
-    agent: AgentData;
+    agent: AgentData | null;
     conversation_id: string;
     slug: string;
     is_owner: boolean;
 }
 
-function sendFeedback(uquery: string, kquery: string, sentiment: string) {
-    fetch("/api/chat/feedback", {
+async function sendFeedback(uquery: string, kquery: string, sentiment: string) {
+    const response = await fetch("/api/chat/feedback", {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
         },
         body: JSON.stringify({ uquery: uquery, kquery: kquery, sentiment: sentiment }),
     });
+    if (!response.ok) {
+        throw new Error((await response.text()) || "Failed to send feedback");
+    }
 }
 
 function FeedbackButtons({ uquery, kquery }: { uquery: string; kquery: string }) {
@@ -238,9 +241,14 @@ function FeedbackButtons({ uquery, kquery }: { uquery: string; kquery: string })
                 title="Like"
                 className={styles.thumbsUpButton}
                 disabled={feedbackState !== null}
-                onClick={() => {
-                    sendFeedback(uquery, kquery, "positive");
-                    setFeedbackState(true);
+                onClick={async () => {
+                    try {
+                        await sendFeedback(uquery, kquery, "positive");
+                        setFeedbackState(true);
+                    } catch (error) {
+                        console.error("Failed to send feedback:", error);
+                        window.alert("Failed to send feedback");
+                    }
                 }}
             >
                 {feedbackState === true ? (
@@ -256,9 +264,14 @@ function FeedbackButtons({ uquery, kquery }: { uquery: string; kquery: string })
                 title="Dislike"
                 className={styles.thumbsDownButton}
                 disabled={feedbackState !== null}
-                onClick={() => {
-                    sendFeedback(uquery, kquery, "negative");
-                    setFeedbackState(false);
+                onClick={async () => {
+                    try {
+                        await sendFeedback(uquery, kquery, "negative");
+                        setFeedbackState(false);
+                    } catch (error) {
+                        console.error("Failed to send feedback:", error);
+                        window.alert("Failed to send feedback");
+                    }
                 }}
             >
                 {feedbackState === false ? (
@@ -282,7 +295,7 @@ interface ChatMessageProps {
     isLastMessage?: boolean;
     agent?: AgentData;
     onDeleteMessage: (turnId?: string) => void;
-    onRetryMessage?: (query: string, turnId?: string) => void;
+    onRetryMessage?: (query: string, turnId?: string) => Promise<boolean> | boolean | void;
     conversationId: string;
     turnId?: string;
     generatedImage?: string;
@@ -412,7 +425,10 @@ function cleanMermaidChart(chart: string): string {
 }
 
 // Extract mermaid code blocks from markdown content
-function extractMermaidBlocks(content: string): { cleanedContent: string; mermaidBlocks: string[] } {
+function extractMermaidBlocks(content: string): {
+    cleanedContent: string;
+    mermaidBlocks: string[];
+} {
     const mermaidBlocks: string[] = [];
     // Match ```mermaid ... ``` code blocks
     // Allow optional whitespace before/after delimiters and handle various line endings
@@ -487,7 +503,7 @@ const ChatMessage = forwardRef<HTMLDivElement, ChatMessageProps>((props, ref) =>
 
         // Clean up the observer on component unmount
         return () => observer.disconnect();
-    }, [messageRef.current]);
+    }, []);
 
     useEffect(() => {
         // Prepare initial message for rendering
@@ -585,7 +601,14 @@ const ChatMessage = forwardRef<HTMLDivElement, ChatMessageProps>((props, ref) =>
         });
 
         setMarkdownRendered(cleanMarkdown);
-    }, [props.chatMessage.message, props.chatMessage.images, props.chatMessage.intent]);
+    }, [
+        props.chatMessage.message,
+        props.chatMessage.images,
+        props.chatMessage.intent,
+        props.chatMessage.codeContext,
+        props.chatMessage.excalidrawDiagram,
+        props.chatMessage.mermaidjsDiagram,
+    ]);
 
     useEffect(() => {
         if (copySuccess) {
@@ -840,22 +863,25 @@ const ChatMessage = forwardRef<HTMLDivElement, ChatMessageProps>((props, ref) =>
 
     const deleteMessage = async (message: SingleChatMessage) => {
         const turnId = message.turnId || props.turnId;
-        const response = await fetch("/api/chat/conversation/message", {
-            method: "DELETE",
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-                conversation_id: props.conversationId,
-                turn_id: turnId,
-            }),
-        });
-
-        if (response.ok) {
+        try {
+            const response = await fetch("/api/chat/conversation/message", {
+                method: "DELETE",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    conversation_id: props.conversationId,
+                    turn_id: turnId,
+                }),
+            });
+            if (!response.ok) {
+                throw new Error((await response.text()) || "Failed to delete message");
+            }
             // Update the UI after successful deletion
             props.onDeleteMessage(turnId);
-        } else {
-            console.error("Failed to delete message");
+        } catch (error) {
+            console.error("Failed to delete message:", error);
+            window.alert("Failed to delete message");
         }
     };
 

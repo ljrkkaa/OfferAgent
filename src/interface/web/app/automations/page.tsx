@@ -73,11 +73,17 @@ import { AppSidebar } from "../components/appSidebar/appSidebar";
 import { Separator } from "@/components/ui/separator";
 import { KhojLogoType } from "../components/logo/khojLogo";
 
-const automationsFetcher = () =>
-    window
-        .fetch("/api/automation")
-        .then((res) => res.json())
-        .catch((err) => console.log(err));
+const automationsFetcher = async () => {
+    const response = await window.fetch("/api/automation");
+    if (!response.ok) {
+        throw new Error(`Failed to fetch automations: ${response.status}`);
+    }
+    const data = await response.json();
+    if (!Array.isArray(data)) {
+        throw new Error("Invalid automations response");
+    }
+    return data;
+};
 
 // Standard cron format: minute hour dayOfMonth month dayOfWeek
 
@@ -237,16 +243,30 @@ function createShareLink(automation: AutomationsData) {
     return shareLink;
 }
 
-function deleteAutomation(automationId: string, setIsDeleted: (isDeleted: boolean) => void) {
-    fetch(`/api/automation?automation_id=${automationId}`, { method: "DELETE" })
-        .then((response) => response.json())
-        .then((data) => {
-            setIsDeleted(true);
-        });
+async function deleteAutomation(
+    automationId: string,
+    setIsDeleted: (isDeleted: boolean) => void,
+    setToastMessage: (toastMessage: string) => void,
+) {
+    try {
+        const response = await fetch(
+            `/api/automation?automation_id=${encodeURIComponent(automationId)}`,
+            { method: "DELETE" },
+        );
+        if (!response.ok) {
+            throw new Error((await response.text()) || "Failed to delete automation");
+        }
+        setIsDeleted(true);
+    } catch (error) {
+        console.error("Error deleting automation:", error);
+        setToastMessage("Sorry, something went wrong. Try again later.");
+    }
 }
 
 function sendAPreview(automationId: string, setToastMessage: (toastMessage: string) => void) {
-    fetch(`/api/automation/trigger?automation_id=${automationId}`, { method: "POST" })
+    fetch(`/api/automation/trigger?automation_id=${encodeURIComponent(automationId)}`, {
+        method: "POST",
+    })
         .then((response) => {
             if (!response.ok) {
                 throw new Error("Network response was not ok");
@@ -372,7 +392,11 @@ function AutomationsCard(props: AutomationsCardProps) {
                                         setIsDeleted(true);
                                         return;
                                     }
-                                    deleteAutomation(automation.id.toString(), setIsDeleted);
+                                    deleteAutomation(
+                                        automation.id.toString(),
+                                        setIsDeleted,
+                                        props.setToastMessage,
+                                    );
                                 }}
                             >
                                 <Trash className="h-4 w-4 mr-2" />
@@ -444,11 +468,11 @@ function SharedAutomationCard(props: SharedAutomationCardProps) {
 
     const automation: AutomationsData = {
         id: 0,
-        subject: decodeURIComponent(subject),
-        scheduling_request: decodeURIComponent(query),
+        subject,
+        scheduling_request: query,
         query_to_run: "",
-        schedule: cronToHumanReadableString(decodeURIComponent(crontime)),
-        crontime: decodeURIComponent(crontime),
+        schedule: cronToHumanReadableString(crontime),
+        crontime,
         next: "",
     };
 
@@ -507,7 +531,7 @@ function EditCard(props: EditCardProps) {
         },
     });
 
-    const onSubmit = (values: z.infer<typeof EditAutomationSchema>) => {
+    const onSubmit = async (values: z.infer<typeof EditAutomationSchema>) => {
         const cronFrequency = convertFrequencyToCron(
             values.everyBlah,
             values.timeRecurrence,
@@ -535,29 +559,29 @@ function EditCard(props: EditCardProps) {
 
         let method = props.createNew ? "POST" : "PUT";
 
-        fetch(updateQueryUrl, { method: method })
-            .then((response) => response.json())
-            .then((data: AutomationsData) => {
-                props.setIsEditing(false);
-                props.setUpdatedAutomationData({
-                    id: data.id,
-                    subject: data.subject || "",
-                    query_to_run: data.query_to_run,
-                    scheduling_request: data.scheduling_request,
-                    schedule: cronToHumanReadableString(data.crontime),
-                    crontime: data.crontime,
-                    next: data.next,
-                });
-            })
-            .catch((error) => {
-                console.error("Error saving automation:", error);
-                // Reset saving state
-                props.setIsEditing(false);
-                // Show error message
-                props.setToastMessage(
-                    "Sorry, something went wrong. Try again or contact team@khoj.dev.",
-                );
+        try {
+            const response = await fetch(updateQueryUrl, { method: method });
+            const responseText = await response.text();
+            if (!response.ok) {
+                throw new Error(responseText || "Failed to save automation");
+            }
+            const data: AutomationsData = JSON.parse(responseText);
+            props.setIsEditing(false);
+            props.setUpdatedAutomationData({
+                id: data.id,
+                subject: data.subject || "",
+                query_to_run: data.query_to_run,
+                scheduling_request: data.scheduling_request,
+                schedule: cronToHumanReadableString(data.crontime),
+                crontime: data.crontime,
+                next: data.next,
             });
+        } catch (error) {
+            console.error("Error saving automation:", error);
+            props.setToastMessage(
+                "Sorry, something went wrong. Try again or contact team@khoj.dev.",
+            );
+        }
     };
 
     function convertFrequencyToCron(
@@ -609,7 +633,7 @@ function EditCard(props: EditCardProps) {
 
 interface AutomationModificationFormProps {
     form: UseFormReturn<z.infer<typeof EditAutomationSchema>>;
-    onSubmit: (values: z.infer<typeof EditAutomationSchema>) => void;
+    onSubmit: (values: z.infer<typeof EditAutomationSchema>) => Promise<void>;
     create?: boolean;
     isLoggedIn: boolean;
     setShowLoginPrompt: (showLoginPrompt: boolean) => void;
@@ -650,9 +674,13 @@ function AutomationModificationForm(props: AutomationModificationFormProps) {
     return (
         <Form {...props.form}>
             <form
-                onSubmit={props.form.handleSubmit((values) => {
-                    props.onSubmit(values);
+                onSubmit={props.form.handleSubmit(async (values) => {
                     setIsSaving(true);
+                    try {
+                        await props.onSubmit(values);
+                    } finally {
+                        setIsSaving(false);
+                    }
                 })}
                 className="space-y-6"
             >
@@ -886,7 +914,14 @@ function AutomationModificationForm(props: AutomationModificationFormProps) {
     );
 }
 
+function locationLabel(locationData: LocationData | null | undefined) {
+    if (!locationData?.city && !locationData?.country) return null;
+    return [locationData.city, locationData.country].filter(Boolean).join(", ");
+}
+
 function metadataMap(ipLocationData: LocationData, authenticatedData: UserProfile | null) {
+    const location = locationLabel(ipLocationData);
+
     return (
         <div className="flex flex-wrap gap-2 items-center justify-start">
             {authenticatedData ? (
@@ -895,12 +930,10 @@ function metadataMap(ipLocationData: LocationData, authenticatedData: UserProfil
                     {authenticatedData.email}
                 </span>
             ) : null}
-            {ipLocationData && (
+            {location && (
                 <span className="rounded-lg text-sm border-secondary border p-1 flex items-center shadow-sm dark:bg-muted">
                     <MapPinSimple className="h-4 w-4 mr-2 inline text-purple-500" />
-                    {ipLocationData
-                        ? `${ipLocationData.city}, ${ipLocationData.country}`
-                        : "Unknown"}
+                    {location}
                 </span>
             )}
             {ipLocationData && (
@@ -1008,6 +1041,7 @@ export default function Automations() {
     const [showLoginPrompt, setShowLoginPrompt] = useState(false);
     const isMobileWidth = useIsMobileWidth();
     const { locationData, locationDataError, locationDataLoading } = useIPLocationData();
+    const location = locationLabel(locationData);
     const [toastMessage, setToastMessage] = useState("");
     const { toast } = useToast();
 
@@ -1047,7 +1081,7 @@ export default function Automations() {
             });
             setToastMessage("");
         }
-    }, [toastMessage]);
+    }, [toast, toastMessage]);
 
     if (error)
         return <InlineLoading message="Oops, something went wrong. Please refresh the page." />;
@@ -1079,12 +1113,10 @@ export default function Automations() {
                                             {authenticatedData.email}
                                         </span>
                                     ) : null}
-                                    {locationData && (
+                                    {location && (
                                         <span className="rounded-lg text-sm border-secondary border p-1 flex items-center shadow-sm dark:bg-muted">
                                             <MapPinSimple className="h-4 w-4 mr-2 inline text-purple-500" />
-                                            {locationData
-                                                ? `${locationData.city}, ${locationData.country}`
-                                                : "Unknown"}
+                                            {location}
                                         </span>
                                     )}
                                     {locationData && (

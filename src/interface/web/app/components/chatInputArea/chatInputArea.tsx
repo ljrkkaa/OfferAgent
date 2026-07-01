@@ -3,14 +3,7 @@ import React, { useEffect, useRef, useState, forwardRef } from "react";
 
 import DOMPurify from "dompurify";
 import "katex/dist/katex.min.css";
-import {
-    ArrowUp,
-    Paperclip,
-    X,
-    Stop,
-    ToggleLeft,
-    ToggleRight,
-} from "@phosphor-icons/react";
+import { ArrowUp, Paperclip, X, Stop, ToggleLeft, ToggleRight } from "@phosphor-icons/react";
 
 import {
     Command,
@@ -63,6 +56,17 @@ export interface AttachedFileText {
     size: number;
 }
 
+function isAttachedFileText(file: unknown): file is AttachedFileText {
+    return (
+        typeof file === "object" &&
+        file !== null &&
+        typeof (file as AttachedFileText).name === "string" &&
+        typeof (file as AttachedFileText).content === "string" &&
+        typeof (file as AttachedFileText).file_type === "string" &&
+        typeof (file as AttachedFileText).size === "number"
+    );
+}
+
 export enum ChatInputFocus {
     MESSAGE = "message",
     FILE = "file",
@@ -70,7 +74,7 @@ export enum ChatInputFocus {
 }
 
 interface ChatInputProps {
-    sendMessage: (message: string) => void;
+    sendMessage: (message: string, images?: string[]) => void;
     sendImage: (image: string) => void;
     sendDisabled: boolean;
     setUploadedFiles: (files: AttachedFileText[]) => void;
@@ -134,7 +138,7 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
         if (props.prefillMessage === undefined) return;
         setMessage(props.prefillMessage);
         chatInputRef?.current?.focus();
-    }, [props.prefillMessage]);
+    }, [props.prefillMessage, chatInputRef]);
 
     useEffect(() => {
         if (props.focus === ChatInputFocus.MESSAGE) {
@@ -144,7 +148,7 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
         } else if (props.focus === ChatInputFocus.RESEARCH) {
             researchModeRef.current?.focus();
         }
-    }, [props.focus]);
+    }, [props.focus, chatInputRef]);
 
     useEffect(() => {
         async function fetchImageData() {
@@ -191,10 +195,11 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
             return; // Don't continue with regular message sending
         }
 
+        const imagesToSend = imageUploaded ? imageData : [];
         if (imageUploaded) {
             setImageUploaded(false);
             setImagePaths([]);
-            imageData.forEach((data) => props.sendImage(data));
+            imagesToSend.forEach((data) => props.sendImage(data));
         }
 
         let messageToSend = message.trim();
@@ -207,7 +212,7 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
             messageToSend = `/research ${messageToSend}`;
         }
 
-        props.sendMessage(messageToSend);
+        props.sendMessage(messageToSend, imagesToSend);
         setAttachedFiles(null);
         setConvertedAttachedFiles([]);
         setMessage("");
@@ -306,13 +311,16 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
                 method: "POST",
                 body: formData,
             });
-            setUploading(false);
 
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
             }
 
-            return await response.json();
+            const data = await response.json();
+            if (!Array.isArray(data) || !data.every(isAttachedFileText)) {
+                throw new Error("Invalid converted files response");
+            }
+            return data;
         } catch (error) {
             setError(
                 "Error converting files. " +
@@ -321,6 +329,8 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
             );
             console.error("Error converting files:", error);
             return [];
+        } finally {
+            setUploading(false);
         }
     }
 
@@ -335,7 +345,7 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
         } else {
             setShowCommandList(false);
         }
-    }, [message]);
+    }, [message, chatInputRef]);
 
     function handleDragOver(event: React.DragEvent<HTMLDivElement>) {
         event.preventDefault();
@@ -478,6 +488,7 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
                     {imageUploaded &&
                         imagePaths.map((path, index) => (
                             <div key={index} className="relative flex-shrink-0 pb-3 pt-2 group">
+                                {/* eslint-disable-next-line @next/next/no-img-element -- local object URL preview should not go through Next image optimization. */}
                                 <img
                                     src={path}
                                     alt={`img-${index}`}
@@ -638,7 +649,9 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
                                             <Stop weight="fill" className="w-6 h-6" />
                                         </Button>
                                     </TooltipTrigger>
-                                    <TooltipContent>Click here to stop the streaming.</TooltipContent>
+                                    <TooltipContent>
+                                        Click here to stop the streaming.
+                                    </TooltipContent>
                                 </Tooltip>
                             </TooltipProvider>
                         )}

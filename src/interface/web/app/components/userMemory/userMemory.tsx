@@ -12,8 +12,8 @@ export interface UserMemorySchema {
 
 interface UserMemoryProps {
     memory: UserMemorySchema;
-    onDelete: (id: number) => void;
-    onUpdate: (id: number, raw: string) => void;
+    onDelete: (id: number) => Promise<boolean>;
+    onUpdate: (id: number, raw: string) => Promise<boolean>;
 }
 
 export function UserMemory({ memory, onDelete, onUpdate }: UserMemoryProps) {
@@ -21,8 +21,9 @@ export function UserMemory({ memory, onDelete, onUpdate }: UserMemoryProps) {
     const [content, setContent] = useState(memory.raw);
     const { toast } = useToast();
 
-    const handleUpdate = () => {
-        onUpdate(memory.id, content);
+    const handleUpdate = async () => {
+        if (!(await onUpdate(memory.id, content))) return;
+
         setIsEditing(false);
         toast({
             title: "Memory Updated",
@@ -30,8 +31,9 @@ export function UserMemory({ memory, onDelete, onUpdate }: UserMemoryProps) {
         });
     };
 
-    const handleDelete = () => {
-        onDelete(memory.id);
+    const handleDelete = async () => {
+        if (!(await onDelete(memory.id))) return;
+
         toast({
             title: "Memory Deleted",
             description: "Your memory has been successfully deleted.",
@@ -47,12 +49,7 @@ export function UserMemory({ memory, onDelete, onUpdate }: UserMemoryProps) {
                         onChange={(e) => setContent(e.target.value)}
                         className="flex-1"
                     />
-                    <Button
-                        variant="ghost"
-                        size="icon"
-                        onClick={handleUpdate}
-                        title="Save"
-                    >
+                    <Button variant="ghost" size="icon" onClick={handleUpdate} title="Save">
                         <FloppyDisk className="h-4 w-4" />
                     </Button>
                     <Button
@@ -75,12 +72,7 @@ export function UserMemory({ memory, onDelete, onUpdate }: UserMemoryProps) {
                     >
                         <Pencil className="h-4 w-4" />
                     </Button>
-                    <Button
-                        variant="ghost"
-                        size="icon"
-                        onClick={handleDelete}
-                        title="Delete"
-                    >
+                    <Button variant="ghost" size="icon" onClick={handleDelete} title="Delete">
                         <TrashSimple className="h-4 w-4" />
                     </Button>
                 </>

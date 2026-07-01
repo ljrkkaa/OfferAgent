@@ -1,5 +1,7 @@
 "use client";
 
+/* eslint-disable @next/next/no-img-element -- ponytail: frames may be dynamic data URLs from tool output. */
+
 import React, { useState, useRef, useEffect } from "react";
 import { Play, Pause, FastForward, Rewind } from "@phosphor-icons/react";
 import styles from "./trainOfThoughtVideoPlayer.module.css";

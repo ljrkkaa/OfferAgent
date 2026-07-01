@@ -26,6 +26,7 @@ interface ExcalidrawWrapperProps {
 }
 
 export default function ExcalidrawWrapper(props: ExcalidrawWrapperProps) {
+    const { data } = props;
     const [excalidrawElements, setExcalidrawElements] = useState<ExcalidrawElement[]>([]);
     const [expanded, setExpanded] = useState<boolean>(false);
 
@@ -39,24 +40,24 @@ export default function ExcalidrawWrapper(props: ExcalidrawWrapperProps) {
     };
 
     useEffect(() => {
-        if (expanded) {
-            onkeydown = (e) => {
-                if (e.key === "Escape") {
-                    setExpanded(false);
-                    // Trigger a resize event to make Excalidraw adjust its size
-                    window.dispatchEvent(new Event("resize"));
-                }
-            };
-        } else {
-            onkeydown = null;
-        }
+        if (!expanded) return;
+
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key !== "Escape") return;
+            setExpanded(false);
+            // Trigger a resize event to make Excalidraw adjust its size
+            window.dispatchEvent(new Event("resize"));
+        };
+
+        window.addEventListener("keydown", onKeyDown);
+        return () => window.removeEventListener("keydown", onKeyDown);
     }, [expanded]);
 
     useEffect(() => {
         // Do some basic validation
         const basicValidSkeletons: ExcalidrawElementSkeleton[] = [];
 
-        for (const element of props.data) {
+        for (const element of data) {
             if (isValidExcalidrawElement(element as ExcalidrawElementSkeleton)) {
                 basicValidSkeletons.push(element);
             }
@@ -112,7 +113,7 @@ export default function ExcalidrawWrapper(props: ExcalidrawWrapperProps) {
 
         const elements = convertToExcalidrawElements(validSkeletons);
         setExcalidrawElements(elements);
-    }, []);
+    }, [data]);
 
     return (
         <div className="relative">

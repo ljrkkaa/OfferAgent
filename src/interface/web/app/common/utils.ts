@@ -10,11 +10,17 @@ export interface LocationData {
     timezone: string;
 }
 
-const locationFetcher = () =>
+const browserTimezone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+
+const locationFetcher = (url: string) =>
     window
-        .fetch("https://ipapi.co/json")
-        .then((res) => res.json())
-        .catch((err) => console.log(err));
+        .fetch(url)
+        .then((res) => (res.ok ? res.json() : Promise.resolve({} as Partial<LocationData>)))
+        .then((data: Partial<LocationData>) => ({
+            ...data,
+            timezone: data.timezone || browserTimezone(),
+        }))
+        .catch(() => ({ timezone: browserTimezone() }));
 
 export const toTitleCase = (str: string) =>
     str.replace(/\w\S*/g, (txt) => txt.charAt(0).toUpperCase() + txt.slice(1).toLowerCase());

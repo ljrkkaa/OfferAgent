@@ -106,76 +106,75 @@ import {
     SidebarMenuSkeleton,
 } from "@/components/ui/sidebar";
 
-// Define a fetcher function
-const fetcher = (url: string) =>
-    fetch(url).then((res) => {
-        if (!res.ok) throw new Error(`Failed to call API at ${url} with error ${res.statusText}`);
-        return res.json();
-    });
+const fetcher = async (url: string) => {
+    const response = await fetch(url);
+    if (!response.ok) {
+        throw new Error(`Failed to call API at ${url} with error ${response.statusText}`);
+    }
+    const data = await response.json();
+    if (!Array.isArray(data)) {
+        throw new Error(`Invalid list response from ${url}`);
+    }
+    return data;
+};
 
 interface GroupedChatHistory {
     [key: string]: ChatHistory[];
 }
 
-function renameConversation(conversationId: string, newTitle: string) {
-    const editUrl = `/api/chat/title?client=web&conversation_id=${conversationId}&title=${newTitle}`;
+async function renameConversation(conversationId: string, newTitle: string) {
+    const editUrl = `/api/chat/title?client=web&conversation_id=${encodeURIComponent(
+        conversationId,
+    )}&title=${encodeURIComponent(newTitle)}`;
 
-    fetch(editUrl, {
+    const response = await fetch(editUrl, {
         method: "PATCH",
         headers: {
             "Content-Type": "application/json",
         },
-    })
-        .then((response) => response.json())
-        .then((data) => {})
-        .catch((err) => {
-            console.error(err);
-            return;
-        });
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.success === false) {
+        throw new Error(data.message || data.detail || "Failed to rename conversation");
+    }
 }
 
-function shareConversation(conversationId: string, setShareUrl: (url: string) => void) {
-    const shareUrl = `/api/chat/share?client=web&conversation_id=${conversationId}`;
+async function shareConversation(conversationId: string, setShareUrl: (url: string) => void) {
+    const shareUrl = `/api/chat/share?client=web&conversation_id=${encodeURIComponent(conversationId)}`;
 
-    fetch(shareUrl, {
+    const response = await fetch(shareUrl, {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
         },
-    })
-        .then((response) => response.json())
-        .then((data) => {
-            setShareUrl(data.url);
-        })
-        .catch((err) => {
-            console.error(err);
-            return;
-        });
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.url) {
+        throw new Error(data.message || data.detail || "Failed to share conversation");
+    }
+    setShareUrl(data.url);
 }
 
-function deleteConversation(conversationId: string) {
-    const deleteUrl = `/api/chat/history?client=web&conversation_id=${conversationId}`;
+async function deleteConversation(conversationId: string) {
+    const deleteUrl = `/api/chat/history?client=web&conversation_id=${encodeURIComponent(conversationId)}`;
 
-    fetch(deleteUrl, {
+    const response = await fetch(deleteUrl, {
         method: "DELETE",
         headers: {
             "Content-Type": "application/json",
         },
-    })
-        .then((response) => {
-            response.json();
-            // If currently viewing the conversation, redirect to the home page
-            if (window.location.search.includes(`conversationId=${conversationId}`)) {
-                window.location.href = "/";
-            } else {
-                mutate("/api/chat/sessions");
-            }
-        })
-        .then((data) => {})
-        .catch((err) => {
-            console.error(err);
-            return;
-        });
+    });
+    if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.message || data.detail || "Failed to delete conversation");
+    }
+
+    // If currently viewing the conversation, redirect to the home page
+    if (window.location.search.includes(`conversationId=${encodeURIComponent(conversationId)}`)) {
+        window.location.href = "/";
+    } else {
+        mutate("/api/chat/sessions");
+    }
 }
 
 interface FilesMenuProps {
@@ -502,9 +501,19 @@ export function ChatSessionActionMenu(props: ChatSessionActionMenuProps) {
 
     useEffect(() => {
         if (isSharing) {
-            shareConversation(props.conversationId, setShareUrl);
-            setShowShareUrl(true);
-            setIsSharing(false);
+            shareConversation(props.conversationId, setShareUrl)
+                .then(() => {
+                    setShowShareUrl(true);
+                })
+                .catch((error) => {
+                    console.error(error);
+                    window.alert(
+                        error instanceof Error ? error.message : "Failed to share conversation",
+                    );
+                })
+                .finally(() => {
+                    setIsSharing(false);
+                });
         }
     }, [isSharing, props.conversationId]);
 
@@ -525,10 +534,19 @@ export function ChatSessionActionMenu(props: ChatSessionActionMenuProps) {
                     </DialogHeader>
                     <DialogFooter>
                         <Button
-                            onClick={() => {
-                                renameConversation(props.conversationId, renamedTitle);
-                                props.setTitle(renamedTitle);
-                                setIsRenaming(false);
+                            onClick={async () => {
+                                try {
+                                    await renameConversation(props.conversationId, renamedTitle);
+                                    props.setTitle(renamedTitle);
+                                    setIsRenaming(false);
+                                } catch (error) {
+                                    console.error(error);
+                                    window.alert(
+                                        error instanceof Error
+                                            ? error.message
+                                            : "Failed to rename conversation",
+                                    );
+                                }
                             }}
                             type="submit"
                         >
@@ -609,9 +627,18 @@ export function ChatSessionActionMenu(props: ChatSessionActionMenuProps) {
                     <AlertDialogFooter>
                         <AlertDialogCancel>Cancel</AlertDialogCancel>
                         <AlertDialogAction
-                            onClick={() => {
-                                deleteConversation(props.conversationId);
-                                setIsDeleting(false);
+                            onClick={async () => {
+                                try {
+                                    await deleteConversation(props.conversationId);
+                                    setIsDeleting(false);
+                                } catch (error) {
+                                    console.error(error);
+                                    window.alert(
+                                        error instanceof Error
+                                            ? error.message
+                                            : "Failed to delete conversation",
+                                    );
+                                }
                             }}
                             className="bg-rose-500 hover:bg-rose-600"
                         >
@@ -899,15 +926,7 @@ function ChatSessionsModal({ data, sideBarOpen }: ChatSessionsModalProps) {
     );
 }
 
-const fetchChatHistory = async (url: string) => {
-    const response = await fetch(url, {
-        method: "GET",
-        headers: {
-            "Content-Type": "application/json",
-        },
-    });
-    return response.json();
-};
+const fetchChatHistory = fetcher;
 
 export const useChatSessionsFetchRequest = (url: string) => {
     const { data, isLoading, error } = useSWR<ChatHistory[]>(url, fetchChatHistory);
@@ -932,9 +951,11 @@ export default function AllConversations(props: SidePanelProps) {
         error: authenticationError,
         isLoading: authenticationLoading,
     } = useAuthenticatedData();
-    const { data: chatSessions, isLoading } = useChatSessionsFetchRequest(
-        authenticatedData ? `/api/chat/sessions` : "",
-    );
+    const {
+        data: chatSessions,
+        isLoading,
+        error,
+    } = useChatSessionsFetchRequest(authenticatedData ? `/api/chat/sessions` : "");
 
     useEffect(() => {
         if (chatSessions) {
@@ -982,6 +1003,15 @@ export default function AllConversations(props: SidePanelProps) {
                         <SidebarMenuSkeleton showIcon />
                     </SidebarMenuItem>
                 ))}
+            </SidebarGroup>
+        );
+    }
+
+    if (error) {
+        return (
+            <SidebarGroup className="p-0 m-0">
+                <SidebarGroupLabel className="!p-0 m-0 px-0">Conversations</SidebarGroupLabel>
+                <p className="text-xs text-muted-foreground">Failed to load conversations</p>
             </SidebarGroup>
         );
     }

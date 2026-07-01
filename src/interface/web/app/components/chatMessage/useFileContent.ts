@@ -25,7 +25,10 @@ export function useFileContent(path: string | undefined, enabled: boolean): UseF
                     throw new Error(`Failed to fetch file content (${resp.status})`);
                 }
                 const data = await resp.json();
-                if (!cancelled) setContent(data.raw_text || "");
+                if (typeof data?.raw_text !== "string") {
+                    throw new Error("Invalid file content response");
+                }
+                if (!cancelled) setContent(data.raw_text);
             } catch (err) {
                 if (!cancelled)
                     setError(err instanceof Error ? err.message : "Failed to load file content");
