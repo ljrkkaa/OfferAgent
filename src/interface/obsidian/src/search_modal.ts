@@ -7,6 +7,26 @@ export interface SearchResult {
     file: string;
 }
 
+interface SearchApiResult {
+    entry: string;
+    additional: {
+        file: string;
+    };
+}
+
+function isSearchApiResult(value: unknown): value is SearchApiResult {
+    if (typeof value !== "object" || value === null) return false;
+    const result = value as { entry?: unknown; additional?: { file?: unknown } };
+    return typeof result.entry === "string" && typeof result.additional?.file === "string";
+}
+
+function parseSearchResults(value: unknown): SearchApiResult[] {
+    if (!Array.isArray(value) || !value.every(isSearchApiResult)) {
+        throw new Error("Invalid search response");
+    }
+    return value;
+}
+
 export class KhojSearchModal extends SuggestModal<SearchResult> {
     setting: KhojSetting;
     rerank: boolean = false;
@@ -203,14 +223,15 @@ export class KhojSearchModal extends SuggestModal<SearchResult> {
                 throw new Error(`HTTP error! status: ${response.status}`);
             }
 
-            const data = await response.json();
+            const data = parseSearchResults(await response.json());
+            const activePath = this.app.workspace.getActiveFile()?.path;
 
             // Parse search results and update allFiles with any new non-vault files
             let results = data
-                .filter((result: any) =>
-                    !this.find_similar_notes || !result.additional.file.endsWith(this.app.workspace.getActiveFile()?.path)
+                .filter((result) =>
+                    !this.find_similar_notes || !activePath || !result.additional.file.endsWith(activePath)
                 )
-                .map((result: any) => {
+                .map((result) => {
                     const isInVault = this.isFileInVault(result.additional.file);
 
                     // Add new non-vault files to allFiles if they don't exist

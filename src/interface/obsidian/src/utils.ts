@@ -52,6 +52,26 @@ function filenameToMimeType(filename: TFile): string {
     }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null;
+}
+
+function isChatModelResponse(value: unknown): value is { id: string | number; name: string } {
+    return (
+        isRecord(value) &&
+        (typeof value.id === "string" || typeof value.id === "number") &&
+        typeof value.name === "string"
+    );
+}
+
+function parseServerUserConfig(value: unknown): ServerUserConfig | null {
+    if (!isRecord(value)) return null;
+    const selectedModel = value.selected_chat_model_config;
+    if (selectedModel === undefined || selectedModel === null) return {};
+    if (typeof selectedModel !== "number") return null;
+    return { selected_chat_model_config: selectedModel };
+}
+
 export const fileTypeToExtension = {
     'pdf': ['pdf'],
     'image': ['png', 'jpg', 'jpeg', 'webp'],
@@ -224,9 +244,11 @@ export async function updateContentIndex(
         }
     }
 
+    const indexedPaths = new Set(responses.flatMap(response => response.split(",").filter(path => path.length > 0)));
+
     // Update last sync time for each successfully indexed file
     files
-        .filter(file => responses.find(response => response.includes(file.path)))
+        .filter(file => indexedPaths.has(file.path))
         .reduce((newSync, file) => {
             newSync.set(file, new Date().getTime());
             return newSync;
@@ -234,7 +256,7 @@ export async function updateContentIndex(
 
     // Remove files that were deleted from last sync
     filesToDelete
-        .filter(file => responses.find(response => response.includes(file.path)))
+        .filter(file => indexedPaths.has(file.path))
         .forEach(file => lastSync.delete(file));
 
     if (error_message) {
@@ -663,12 +685,13 @@ export async function fetchChatModels(settings: KhojSetting): Promise<ModelOptio
         });
         if (response.ok) {
             const modelsData = await response.json();
-            if (Array.isArray(modelsData)) {
-                return modelsData.map((model: any) => ({
-                    id: model.id.toString(),
-                    name: model.name,
-                }));
+            if (!Array.isArray(modelsData) || !modelsData.every(isChatModelResponse)) {
+                throw new Error("Invalid chat models response");
             }
+            return modelsData.map((model) => ({
+                id: model.id.toString(),
+                name: model.name,
+            }));
         } else {
             console.warn("Khoj: Failed to fetch chat models:", response.statusText);
         }
@@ -688,7 +711,11 @@ export async function fetchUserServerSettings(settings: KhojSetting): Promise<Se
             headers: settings.khojApiKey ? { 'Authorization': `Bearer ${settings.khojApiKey}` } : {},
         });
         if (response.ok) {
-            return await response.json() as ServerUserConfig;
+            const config = parseServerUserConfig(await response.json());
+            if (!config) {
+                throw new Error("Invalid server settings response");
+            }
+            return config;
         } else {
             console.warn("Khoj: Failed to fetch user server settings:", response.statusText);
         }
@@ -705,7 +732,7 @@ export async function updateServerChatModel(modelId: string, settings: KhojSetti
     }
 
     try {
-        const response = await fetch(`${settings.khojUrl}/api/model/chat?id=${modelId}`, {
+        const response = await fetch(`${settings.khojUrl}/api/model/chat?id=${encodeURIComponent(modelId)}`, {
             method: 'POST', // As per web app's updateModel function
             headers: settings.khojApiKey ? { 'Authorization': `Bearer ${settings.khojApiKey}` } : {},
         });

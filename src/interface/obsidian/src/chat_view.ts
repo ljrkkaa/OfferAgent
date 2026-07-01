@@ -1,4 +1,4 @@
-import { ItemView, MarkdownRenderer, Scope, WorkspaceLeaf, request, setIcon, Platform, TFile } from 'obsidian';
+import { ItemView, MarkdownRenderer, Scope, WorkspaceLeaf, request, setIcon, Platform, TFile, TFolder } from 'obsidian';
 import * as DOMPurify from 'isomorphic-dompurify';
 import { KhojPaneView } from 'src/pane_view';
 import { KhojView, createCopyParentText, getLinkToEntry, pasteTextAtCursor } from 'src/utils';
@@ -62,7 +62,82 @@ interface ChatMode {
 interface Agent {
     name: string;
     slug: string;
-    description: string;
+    description?: string;
+}
+
+interface ConversationSession {
+    conversation_id: string;
+    slug: string;
+}
+
+interface ChatHistoryLog {
+    by: string;
+    message: string;
+    turnId?: string;
+    context?: string[];
+    onlineContext?: object;
+    created?: string | number;
+    intent?: {
+        type?: string;
+        "inferred-queries"?: string[];
+    };
+    images?: string[];
+    excalidrawDiagram?: string;
+    mermaidjsDiagram?: string;
+}
+
+interface ChatHistoryResponse {
+    conversation_id: string;
+    slug?: string;
+    agent?: unknown;
+    chat: ChatHistoryLog[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null;
+}
+
+function getConversationId(value: unknown): string | null {
+    return isRecord(value) && typeof value.conversation_id === "string" ? value.conversation_id : null;
+}
+
+function isConversationSession(value: unknown): value is ConversationSession {
+    return isRecord(value) && typeof value.conversation_id === "string" && typeof value.slug === "string";
+}
+
+function isAgent(value: unknown): value is Agent {
+    return isRecord(value) && typeof value.name === "string" && typeof value.slug === "string";
+}
+
+function isStringArray(value: unknown): value is string[] {
+    return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isChatHistoryLog(value: unknown): value is ChatHistoryLog {
+    if (!isRecord(value) || typeof value.by !== "string" || typeof value.message !== "string") {
+        return false;
+    }
+    if (value.context !== undefined && !isStringArray(value.context)) return false;
+    if (value.images !== undefined && !isStringArray(value.images)) return false;
+    if (value.intent !== undefined && !isRecord(value.intent)) return false;
+    return true;
+}
+
+function parseChatHistoryResponse(value: unknown): ChatHistoryResponse | null {
+    if (!isRecord(value) || value.status !== "ok" || !isRecord(value.response)) return null;
+    const response = value.response;
+    if (typeof response.conversation_id !== "string") return null;
+    if (response.chat !== undefined && !Array.isArray(response.chat)) return null;
+
+    const chat = response.chat ?? [];
+    if (!Array.isArray(chat) || !chat.every(isChatHistoryLog)) return null;
+
+    return {
+        conversation_id: response.conversation_id,
+        slug: typeof response.slug === "string" ? response.slug : undefined,
+        agent: response.agent,
+        chat,
+    };
 }
 
 export class KhojChatView extends KhojPaneView {
@@ -768,6 +843,25 @@ export class KhojChatView extends KhojPaneView {
 
                     // Store reference to messages that need to be deleted from backend
                     const messagesToDelete = allMessages.slice(currentIndex);
+                    const turnIdsToDelete = Array.from(new Set(
+                        messagesToDelete
+                            .map(message => message.getAttribute('data-turnid'))
+                            .filter((turnId): turnId is string => !!turnId)
+                    ));
+
+                    for (const turnId of turnIdsToDelete) {
+                        if (!(await this.deleteTurnFromBackend(turnId))) {
+                            return;
+                        }
+                    }
+
+                    messagesToDelete.forEach(message => message.classList.add('deleting'));
+
+                    // Wait for animation to complete
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                    for (let i = messagesToDelete.length - 1; i >= 0; i--) {
+                        messagesToDelete[i].remove();
+                    }
 
                     // Get the message content without the emoji if it exists
                     let messageContent = message;
@@ -780,18 +874,6 @@ export class KhojChatView extends KhojPaneView {
                         chatInput.value = messageContent;
                         chatInput.focus();
                     }
-
-                    // Remove all messages from UI immediately for better UX
-                    for (let i = messagesToDelete.length - 1; i >= 0; i--) {
-                        messagesToDelete[i].remove();
-                    }
-
-                    // Then delete messages from backend in background
-                    (async () => {
-                        for (const msgToDelete of messagesToDelete) {
-                            await this.deleteMessage(msgToDelete as HTMLElement, true, false);
-                        }
-                    })();
                 }
             });
         }
@@ -861,7 +943,7 @@ export class KhojChatView extends KhojPaneView {
         try {
             // Create a new conversation with or without an agent
             let endpoint = `${this.setting.khojUrl}/api/chat/sessions`;
-			agentSlug = agentSlug || this.currentAgent;
+            agentSlug = agentSlug || this.currentAgent;
             if (agentSlug) {
                 endpoint += `?agent_slug=${encodeURIComponent(agentSlug)}`;
             }
@@ -875,21 +957,27 @@ export class KhojChatView extends KhojPaneView {
                 body: JSON.stringify({}) // Empty body as agent_slug is in the URL
             });
 
-            if (response.ok) {
-                const sessionInfo = await response.json();
-                chatBodyEl.dataset.conversationId = sessionInfo.conversation_id;
-                this.currentAgent = agentSlug || null;
+            if (!response.ok) {
+                throw new Error(`Failed to create session: ${response.status}`);
+            }
 
-                // Update agent selector to reflect current agent
-                const agentSelect = this.contentEl.querySelector('.khoj-header-agent-select') as HTMLSelectElement;
-                if (agentSelect) {
-                    agentSelect.value = this.currentAgent || '';
-                }
-            } else {
-                console.error("Failed to create session:", response.statusText);
+            const sessionInfo = await response.json();
+            const conversationId = getConversationId(sessionInfo);
+            if (!conversationId) {
+                throw new Error("Invalid session response");
+            }
+            chatBodyEl.dataset.conversationId = conversationId;
+            this.currentAgent = agentSlug || null;
+
+            // Update agent selector to reflect current agent
+            const agentSelect = this.contentEl.querySelector('.khoj-header-agent-select') as HTMLSelectElement;
+            if (agentSelect) {
+                agentSelect.value = this.currentAgent || '';
             }
         } catch (error) {
             console.error("Error creating session:", error);
+            this.renderMessage({ chatBodyEl, message: "Failed to create conversation.", sender: "khoj", isSystemMessage: true });
+            return;
         }
 
         this.renderMessage({ chatBodyEl, message: "Hey, what's up?", sender: "khoj", isSystemMessage: true });
@@ -925,20 +1013,25 @@ export class KhojChatView extends KhojPaneView {
         const headers = { 'Authorization': `Bearer ${this.setting.khojApiKey}` };
         try {
             let response = await fetch(chatSessionsUrl, { method: "GET", headers: headers });
-            let responseJson: any = await response.json();
+            if (!response.ok) {
+                throw new Error(`Failed to fetch chat sessions: ${response.status}`);
+            }
+            let responseJson: unknown = await response.json();
+            if (!Array.isArray(responseJson) || !responseJson.every(isConversationSession)) {
+                throw new Error("Invalid chat sessions response");
+            }
             let conversationId = chatBodyEl.dataset.conversationId;
 
             if (responseJson.length > 0) {
                 conversationListBodyHeaderEl.style.display = "block";
-                for (let key in responseJson) {
-                    let conversation = responseJson[key];
+                for (let conversation of responseJson) {
                     let conversationSessionEl = this.contentEl.createEl('div');
-                    let incomingConversationId = conversation["conversation_id"];
+                    let incomingConversationId = conversation.conversation_id;
                     conversationSessionEl.classList.add("conversation-session");
                     if (incomingConversationId == conversationId) {
                         conversationSessionEl.classList.add("selected-conversation");
                     }
-                    const conversationTitle = conversation["slug"].split("<SYSTEM>")[0].trim() || `New conversation 🌱`;
+                    const conversationTitle = conversation.slug.split("<SYSTEM>")[0].trim() || `New conversation 🌱`;
                     const conversationSessionTitleEl = conversationSessionEl.createDiv("conversation-session-title");
                     conversationSessionTitleEl.textContent = conversationTitle;
                     conversationSessionTitleEl.addEventListener('click', () => {
@@ -964,6 +1057,7 @@ export class KhojChatView extends KhojPaneView {
                 }
             }
         } catch (err) {
+            console.error("Error fetching chat sessions:", err);
             return false;
         }
         return true;
@@ -1015,25 +1109,28 @@ export class KhojChatView extends KhojPaneView {
             editConversationTitleSaveButtonEl.innerHTML = "Save";
             editConversationTitleSaveButtonEl.classList.add("three-dot-menu-button-item", "clickable-icon");
             if (selectedConversation) editConversationTitleSaveButtonEl.classList.add("selected-conversation");
-            editConversationTitleSaveButtonEl.addEventListener('click', (event) => {
+            editConversationTitleSaveButtonEl.addEventListener('click', async (event) => {
                 event.stopPropagation();
                 let newTitle = editConversationTitleInputEl.value;
                 if (newTitle != null) {
-                    let editURL = `/api/chat/title?client=web&conversation_id=${incomingConversationId}&title=${newTitle}`;
-                    fetch(`${this.setting.khojUrl}${editURL}`, { method: "PATCH", headers })
-                        .then(response => response.ok ? response.json() : Promise.reject(response))
-                        .then(data => {
-                            conversationSessionTitleEl.textContent = newTitle;
-                        })
-                        .catch(err => {
-                            return;
-                        });
-                    const conversationSessionTitleEl = conversationSessionEl.createDiv("conversation-session-title");
-                    conversationSessionTitleEl.textContent = newTitle;
-                    conversationSessionTitleEl.addEventListener('click', () => {
+                    try {
+                        let editURL = `/api/chat/title?client=web&conversation_id=${encodeURIComponent(incomingConversationId)}&title=${encodeURIComponent(newTitle)}`;
+                        const response = await fetch(`${this.setting.khojUrl}${editURL}`, { method: "PATCH", headers });
+                        if (!response.ok) {
+                            throw new Error(await response.text());
+                        }
+                    } catch (error) {
+                        console.error("Failed to rename conversation:", error);
+                        this.flashStatusInChatInput("Failed to rename conversation");
+                        return;
+                    }
+
+                    const newConversationSessionTitleEl = conversationSessionEl.createDiv("conversation-session-title");
+                    newConversationSessionTitleEl.textContent = newTitle;
+                    newConversationSessionTitleEl.addEventListener('click', () => {
                         chatBodyEl.innerHTML = "";
                         chatBodyEl.dataset.conversationId = incomingConversationId;
-                        chatBodyEl.dataset.conversationTitle = conversationTitle;
+                        chatBodyEl.dataset.conversationTitle = newTitle;
                         this.getChatHistory(chatBodyEl);
                     });
 
@@ -1042,14 +1139,14 @@ export class KhojChatView extends KhojPaneView {
                         newConversationMenuEl,
                         conversationSessionEl,
                         newTitle,
-                        conversationSessionTitleEl,
+                        newConversationSessionTitleEl,
                         chatBodyEl,
                         incomingConversationId,
                         selectedConversation,
                     );
 
                     conversationMenuEl.replaceWith(newConversationMenuEl);
-                    editConversationTitleInputEl.replaceWith(conversationSessionTitleEl);
+                    editConversationTitleInputEl.replaceWith(newConversationSessionTitleEl);
                 }
             });
             conversationMenuEl.appendChild(editConversationTitleSaveButtonEl);
@@ -1062,22 +1159,28 @@ export class KhojChatView extends KhojPaneView {
         deleteConversationButtonEl.title = "Delete";
         deleteConversationButtonEl.classList.add("delete-conversation-button", "three-dot-menu-button-item", "clickable-icon");
         if (selectedConversation) deleteConversationButtonEl.classList.add("selected-conversation");
-        deleteConversationButtonEl.addEventListener('click', () => {
+        deleteConversationButtonEl.addEventListener('click', async () => {
             // Ask for confirmation before deleting chat session
             let confirmation = confirm('Are you sure you want to delete this chat session?');
             if (!confirmation) return;
-            let deleteURL = `/api/chat/history?client=obsidian&conversation_id=${incomingConversationId}`;
-            fetch(`${this.setting.khojUrl}${deleteURL}`, { method: "DELETE", headers })
-                .then(response => response.ok ? response.json() : Promise.reject(response))
-                .then(data => {
+
+            try {
+                let deleteURL = `/api/chat/history?client=obsidian&conversation_id=${encodeURIComponent(incomingConversationId)}`;
+                const response = await fetch(`${this.setting.khojUrl}${deleteURL}`, { method: "DELETE", headers });
+                if (!response.ok) {
+                    throw new Error(await response.text());
+                }
+
+                if (selectedConversation || chatBodyEl.dataset.conversationId === incomingConversationId) {
                     chatBodyEl.innerHTML = "";
                     chatBodyEl.dataset.conversationId = "";
                     chatBodyEl.dataset.conversationTitle = "";
-                    this.toggleChatSessions(true);
-                })
-                .catch(err => {
-                    return;
-                });
+                }
+                await this.toggleChatSessions(true);
+            } catch (error) {
+                console.error("Failed to delete conversation:", error);
+                this.flashStatusInChatInput("Failed to delete conversation");
+            }
         });
 
         conversationMenuEl.appendChild(deleteConversationButtonEl);
@@ -1088,7 +1191,7 @@ export class KhojChatView extends KhojPaneView {
         // Get chat history from Khoj backend
         let chatUrl = `${this.setting.khojUrl}/api/chat/history?client=obsidian`;
         if (chatBodyEl.dataset.conversationId) {
-            chatUrl += `&conversation_id=${chatBodyEl.dataset.conversationId}`;
+            chatUrl += `&conversation_id=${encodeURIComponent(chatBodyEl.dataset.conversationId)}`;
         }
 
         console.debug("Fetching chat history from:", chatUrl);
@@ -1099,80 +1202,73 @@ export class KhojChatView extends KhojPaneView {
                 headers: { "Authorization": `Bearer ${this.setting.khojApiKey}` },
             });
 
-            let responseJson: any = await response.json();
+            if (!response.ok) {
+                throw new Error(`Failed to fetch chat history: ${response.status}`);
+            }
+
+            let responseJson: unknown = await response.json();
             console.debug("Chat history response:", responseJson);
 
-            chatBodyEl.dataset.conversationId = responseJson.conversation_id;
+            const chatHistory = parseChatHistoryResponse(responseJson);
+            if (!chatHistory) {
+                throw new Error("Invalid chat history response");
+            }
 
-            if (responseJson.detail) {
-                // If the server returns error details in response, render a setup hint.
-                let setupMsg = "Hi 👋🏾, to start chatting add available chat models options via [the Django Admin panel](/server/admin) on the Server";
-                this.renderMessage({
+            // Render conversation history, if any
+            chatBodyEl.dataset.conversationId = chatHistory.conversation_id;
+            chatBodyEl.dataset.conversationTitle = chatHistory.slug || `New conversation 🌱`;
+
+            // Update current agent from conversation history
+            if (isRecord(chatHistory.agent) && typeof chatHistory.agent.slug === "string") {
+                console.debug("Found agent in conversation history:", chatHistory.agent);
+                this.currentAgent = chatHistory.agent.slug;
+                // Update the agent selector if it exists
+                const agentSelect = this.contentEl.querySelector('.khoj-header-agent-select') as HTMLSelectElement;
+                if (agentSelect && this.currentAgent) {
+                    agentSelect.value = this.currentAgent;
+                    console.log("Updated agent selector to:", this.currentAgent);
+                }
+            }
+
+            chatHistory.chat.forEach((chatLog) => {
+                // Convert commands to emojis for user messages
+                if (chatLog.by === "you") {
+                    chatLog.message = this.convertCommandsToEmojis(chatLog.message);
+                }
+
+                // Transform khoj-edit blocks into accordions
+                if (chatLog.by === "khoj") {
+                    chatLog.message = this.transformEditBlocks(chatLog.message);
+                }
+
+                this.renderMessageWithReferences(
                     chatBodyEl,
-                    message: setupMsg,
-                    sender: "khoj",
-                    isSystemMessage: true
-                });
-
-                return false;
-            } else if (responseJson.response) {
-                // Render conversation history, if any
-                chatBodyEl.dataset.conversationId = responseJson.response.conversation_id;
-                chatBodyEl.dataset.conversationTitle = responseJson.response.slug || `New conversation 🌱`;
-
-                // Update current agent from conversation history
-                if (responseJson.response.agent?.slug) {
-                    console.debug("Found agent in conversation history:", responseJson.response.agent);
-                    this.currentAgent = responseJson.response.agent.slug;
-                    // Update the agent selector if it exists
-                    const agentSelect = this.contentEl.querySelector('.khoj-header-agent-select') as HTMLSelectElement;
-                    if (agentSelect && this.currentAgent) {
-                        agentSelect.value = this.currentAgent;
-                        console.log("Updated agent selector to:", this.currentAgent);
-                    }
+                    chatLog.message,
+                    chatLog.by,
+                    chatLog.turnId ?? "",
+                    chatLog.context,
+                    chatLog.onlineContext,
+                    chatLog.created ? new Date(chatLog.created) : undefined,
+                    chatLog.intent?.type,
+                    chatLog.intent?.["inferred-queries"],
+                    chatBodyEl.dataset.conversationId ?? "",
+                    chatLog.images,
+                    chatLog.excalidrawDiagram,
+                    chatLog.mermaidjsDiagram,
+                );
+                // push the user messages to the chat history
+                if (chatLog.by === "you") {
+                    this.userMessages.push(chatLog.message);
                 }
+            });
 
-                let chatLogs = responseJson.response?.conversation_id ? responseJson.response.chat ?? [] : responseJson.response;
-                chatLogs.forEach((chatLog: any) => {
-                    // Convert commands to emojis for user messages
-                    if (chatLog.by === "you") {
-                        chatLog.message = this.convertCommandsToEmojis(chatLog.message);
-                    }
+            // Update starting message after loading history
+            this.startingMessage = this.getLearningMoment();
 
-                    // Transform khoj-edit blocks into accordions
-                    if (chatLog.by === "khoj") {
-                        chatLog.message = this.transformEditBlocks(chatLog.message);
-                    }
-
-                    this.renderMessageWithReferences(
-                        chatBodyEl,
-                        chatLog.message,
-                        chatLog.by,
-                        chatLog.turnId,
-                        chatLog.context,
-                        chatLog.onlineContext,
-                        new Date(chatLog.created),
-                        chatLog.intent?.type,
-                        chatLog.intent?.["inferred-queries"],
-                        chatBodyEl.dataset.conversationId ?? "",
-                        chatLog.images,
-                        chatLog.excalidrawDiagram,
-                        chatLog.mermaidjsDiagram,
-                    );
-                    // push the user messages to the chat history
-                    if (chatLog.by === "you") {
-                        this.userMessages.push(chatLog.message);
-                    }
-                });
-
-                // Update starting message after loading history
-                this.startingMessage = this.getLearningMoment();
-
-                // Update the placeholder of the chat input
-                const chatInput = this.contentEl.querySelector('.khoj-chat-input') as HTMLTextAreaElement;
-                if (chatInput) {
-                    chatInput.placeholder = this.startingMessage;
-                }
+            // Update the placeholder of the chat input
+            const chatInput = this.contentEl.querySelector('.khoj-chat-input') as HTMLTextAreaElement;
+            if (chatInput) {
+                chatInput.placeholder = this.startingMessage;
             }
         } catch (err) {
             let errorMsg = "Unable to get response from Khoj server ❤️‍🩹. Ensure server is running or contact developers for help at [team@khoj.dev](mailto:team@khoj.dev) or in [Discord](https://discord.gg/BDgyabRM6e)";
@@ -1349,7 +1445,7 @@ export class KhojChatView extends KhojPaneView {
             const { value, done } = await reader.read();
 
             if (done) {
-                this.processMessageChunk(buffer);
+                await this.processMessageChunk(buffer);
                 buffer = '';
                 // Break if the stream is done
                 break;
@@ -1368,7 +1464,7 @@ export class KhojChatView extends KhojPaneView {
                 buffer = buffer.slice(newEventIndex + eventDelimiter.length);
 
                 // Process the event
-                if (event) this.processMessageChunk(event);
+                if (event) await this.processMessageChunk(event);
             }
         }
     }
@@ -1403,14 +1499,20 @@ export class KhojChatView extends KhojPaneView {
                 });
                 if (response.ok) {
                     const data = await response.json();
-                    conversationId = data.conversation_id;
+                    const newConversationId = getConversationId(data);
+                    if (!newConversationId) {
+                        throw new Error("Invalid session response");
+                    }
+                    conversationId = newConversationId;
                     chatBodyEl.dataset.conversationId = conversationId;
                 } else {
                     console.error("Failed to create session:", response.statusText);
+                    this.flashStatusInChatInput("Failed to create session");
                     return;
                 }
             } catch (error) {
                 console.error("Error creating session:", error);
+                this.flashStatusInChatInput("Failed to create session");
                 return;
             }
         }
@@ -1464,16 +1566,21 @@ export class KhojChatView extends KhojPaneView {
             editRetryCount: 0
         };
 
-        let response = await fetch(chatUrl, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${this.setting.khojApiKey}`,
-            },
-            body: JSON.stringify(body),
-        })
-
         try {
+            let response = await fetch(chatUrl, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${this.setting.khojApiKey}`,
+                },
+                body: JSON.stringify(body),
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text().catch(() => "");
+                throw new Error(`Chat request failed: ${response.status} ${errorText}`);
+            }
+
             if (response.body === null) throw new Error("Response body is null");
 
             // Stream and render chat response
@@ -1874,11 +1981,47 @@ export class KhojChatView extends KhojPaneView {
         }
     }
 
+    private async deleteTurnFromBackend(turnId: string): Promise<boolean> {
+        const chatBodyEl = this.contentEl.getElementsByClassName("khoj-chat-body")[0] as HTMLElement;
+        const conversationId = chatBodyEl.dataset.conversationId;
+
+        if (!conversationId) {
+            this.flashStatusInChatInput("Failed to delete message");
+            return false;
+        }
+
+        try {
+            const response = await fetch(`${this.setting.khojUrl}/api/chat/conversation/message`, {
+                method: 'DELETE',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${this.setting.khojApiKey}`
+                },
+                body: JSON.stringify({
+                    conversation_id: conversationId,
+                    turn_id: turnId
+                }),
+            });
+
+            if (!response.ok) {
+                console.error('Failed to delete message from backend:', await response.text());
+                this.flashStatusInChatInput("Failed to delete message");
+                return false;
+            }
+        } catch (error) {
+            console.error('Error deleting message:', error);
+            this.flashStatusInChatInput("Error deleting message");
+            return false;
+        }
+
+        return true;
+    }
+
     // Add this new method to handle message deletion
-    async deleteMessage(messageEl: HTMLElement, skipPaired: boolean = false, skipBackend: boolean = false) {
+    async deleteMessage(messageEl: HTMLElement, skipPaired: boolean = false, skipBackend: boolean = false): Promise<boolean> {
         // Find parent message container
         const messageContainer = messageEl.closest('.khoj-chat-message');
-        if (!messageContainer) return;
+        if (!messageContainer) return false;
 
         // Get paired message to delete if needed
         let pairedMessageContainer: Element | null = null;
@@ -1902,48 +2045,22 @@ export class KhojChatView extends KhojPaneView {
             pairedMessageContainer.classList.add('deleting');
         }
 
+        const turnId = messageContainer.getAttribute('data-turnid');
+        if (!skipBackend && turnId) {
+            if (!(await this.deleteTurnFromBackend(turnId))) {
+                messageContainer.classList.remove('deleting');
+                pairedMessageContainer?.classList.remove('deleting');
+                return false;
+            }
+        }
+
         // Wait for animation to complete
-        setTimeout(async () => {
-            // Get turn ID for message
-            const turnId = messageContainer.getAttribute('data-turnid');
-
-            // Remove message(s) from DOM
+        setTimeout(() => {
             messageContainer.remove();
-            if (pairedMessageContainer) {
-                pairedMessageContainer.remove();
-            }
-
-            // Only delete in backend if not skipped
-            if (!skipBackend && turnId) {
-                const chatBodyEl = this.contentEl.getElementsByClassName("khoj-chat-body")[0] as HTMLElement;
-                const conversationId = chatBodyEl.dataset.conversationId;
-
-                if (!conversationId) return;
-
-                try {
-                    // Delete from backend
-                    const response = await fetch(`${this.setting.khojUrl}/api/chat/conversation/message`, {
-                        method: 'DELETE',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${this.setting.khojApiKey}`
-                        },
-                        body: JSON.stringify({
-                            conversation_id: conversationId,
-                            turn_id: turnId
-                        }),
-                    });
-
-                    if (!response.ok) {
-                        console.error('Failed to delete message from backend:', await response.text());
-                        this.flashStatusInChatInput("Failed to delete message");
-                    }
-                } catch (error) {
-                    console.error('Error deleting message:', error);
-                    this.flashStatusInChatInput("Error deleting message");
-                }
-            }
+            pairedMessageContainer?.remove();
         }, 300); // Matches the animation duration
+
+        return true;
     }
 
     async fetchAgents() {
@@ -1954,13 +2071,18 @@ export class KhojChatView extends KhojPaneView {
                 }
             });
 
-            if (response.ok) {
-                this.agents = await response.json();
-            } else {
-                console.error("Failed to fetch agents:", response.statusText);
+            if (!response.ok) {
+                throw new Error(`Failed to fetch agents: ${response.status}`);
             }
+
+            const agents = await response.json();
+            if (!Array.isArray(agents) || !agents.every(isAgent)) {
+                throw new Error("Invalid agents response");
+            }
+            this.agents = agents;
         } catch (error) {
             console.error("Error fetching agents:", error);
+            this.agents = [];
         }
     }
 
@@ -1978,7 +2100,7 @@ export class KhojChatView extends KhojPaneView {
         if (editBlocks.length === 0) return;
 
         // Apply edits using the FileInteractions class
-        const { editResults, fileBackups } = await this.fileInteractions.applyEditBlocks(
+        const { editResults, fileBackups, createdFiles, createdFolders } = await this.fileInteractions.applyEditBlocks(
             editBlocks,
             (blockToRetry) => {
                 if (this.editRetryCount < this.maxEditRetries) {
@@ -2044,7 +2166,7 @@ export class KhojChatView extends KhojPaneView {
             buttonsContainer.scrollIntoView({ behavior: "smooth", block: "center" });
 
             // Handle Apply/Cancel clicks
-            this.setupConfirmationButtons(applyButton, cancelButton, fileBackups, lastMessage, buttonsContainer);
+            this.setupConfirmationButtons(applyButton, cancelButton, fileBackups, createdFiles, createdFolders, lastMessage, buttonsContainer);
         }
     }
 
@@ -2053,26 +2175,13 @@ export class KhojChatView extends KhojPaneView {
         applyButton: HTMLButtonElement,
         cancelButton: HTMLButtonElement,
         fileBackups: Map<string, string>,
+        createdFiles: string[],
+        createdFolders: string[],
         lastMessage: Element,
         buttonsContainer: HTMLDivElement
     ) {
         applyButton.addEventListener("click", async () => {
             try {
-                for (const [filePath, originalContent] of fileBackups) {
-                    const file = this.app.vault.getAbstractFileByPath(filePath);
-                    if (file && file instanceof TFile) {
-                        const currentContent = await this.app.vault.read(file);
-                        let finalContent = currentContent;
-
-                        // Remove diff markers
-                        finalContent = finalContent.replace(/~~[^~]*~~\n?(?=~~)/g, '');
-                        finalContent = finalContent.replace(/~~[^~]*~~/g, '');
-                        finalContent = finalContent.replace(/==/g, '');
-
-                        await this.app.vault.modify(file, finalContent);
-                    }
-                }
-
                 const successMessage = lastMessage.createDiv({ cls: "edit-status-message success" });
                 successMessage.textContent = "Changes applied successfully";
                 setTimeout(() => successMessage.remove(), 3000);
@@ -2088,6 +2197,18 @@ export class KhojChatView extends KhojPaneView {
 
         cancelButton.addEventListener("click", async () => {
             try {
+                for (const filePath of createdFiles) {
+                    const file = this.app.vault.getAbstractFileByPath(filePath);
+                    if (file && file instanceof TFile) {
+                        await this.app.vault.delete(file);
+                    }
+                }
+                for (const folderPath of [...createdFolders].reverse()) {
+                    const folder = this.app.vault.getAbstractFileByPath(folderPath);
+                    if (folder instanceof TFolder && folder.children.length === 0) {
+                        await this.app.vault.delete(folder);
+                    }
+                }
                 for (const [filePath, originalContent] of fileBackups) {
                     const file = this.app.vault.getAbstractFileByPath(filePath);
                     if (file && file instanceof TFile) {

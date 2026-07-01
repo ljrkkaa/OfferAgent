@@ -1,6 +1,6 @@
 export async function deleteContentByType(khojUrl: string, khojApiKey: string, contentType: string): Promise<void> {
     // Deletes all content of a given type on Khoj server for Obsidian client
-    const response = await fetch(`${khojUrl}/api/content/type/${contentType}?client=obsidian`, {
+    const response = await fetch(`${khojUrl}/api/content/type/${encodeURIComponent(contentType)}?client=obsidian`, {
         method: 'DELETE',
         headers: khojApiKey ? { 'Authorization': `Bearer ${khojApiKey}` } : {},
     });

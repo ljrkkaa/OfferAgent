@@ -1,4 +1,4 @@
-import { App, MarkdownView, TFile } from 'obsidian';
+import { App, MarkdownView, TFile, TFolder } from 'obsidian';
 import { diffWords } from 'diff';
 
 /**
@@ -146,14 +146,14 @@ Break large *SEARCH/REPLACE* blocks into a series of smaller blocks that each ch
 Include just the changing lines, and a few surrounding lines if needed for uniqueness.
 Do not include long runs of unchanging lines in *SEARCH/REPLACE* blocks.
 
-Only create *SEARCH/REPLACE* blocks for files that the user has added to the chat!
+Only create *SEARCH/REPLACE* blocks for files that the user has added to the chat, unless the user explicitly asks you to create a new markdown file.
 
 To move text within a file, use 2 *SEARCH/REPLACE* blocks: 1 to delete it from its current location, 1 to insert it in the new location.
 
 Pay attention to which filenames the user wants you to edit, especially if they are asking you to create a new file.
 
 If you want to put text in a new file, use a *SEARCH/REPLACE block* with:
-- A new file path, including dir name if needed
+- A safe relative new file path ending in .md, including dir name if needed
 - An empty \`SEARCH\` section
 - The new file's contents in the \`REPLACE\` section
 
@@ -174,8 +174,8 @@ from flask import Flask
 >>>>>>> REPLACE
 ${this.EDIT_BLOCK_END}
 
-⚠️ Important:
-- The target-filename parameter is required and must match an open file name.
+Important:
+- The target-filename parameter is required. It must be a full open-file path, or a safe relative new .md path when creating a file.
 - The XML format ${this.EDIT_BLOCK_START}...${this.EDIT_BLOCK_END} ensures reliable parsing.
 - The SEARCH block content must completely and uniquely identify the section to edit.
 - The REPLACE block content will replace the first SEARCH block match in the specified \`target-filename\`.
@@ -224,17 +224,17 @@ Meeting Notes.md
 =======
 - [HIGH] Review Q4 metrics (see "metrics.ts" and \`calculateQ4Metrics()\`)
 >>>>>>> REPLACE
-</${this.EDIT_BLOCK_END}>
+${this.EDIT_BLOCK_END}
 
 Add resource allocation to project timeline task
-<${this.EDIT_BLOCK_START}>
+${this.EDIT_BLOCK_START}
 Meeting Notes.md
 <<<<<<< SEARCH
 - Update project timeline and milestones for Q1 2024
 =======
 - Update project timeline and add resource allocation for Q1 2024
 >>>>>>> REPLACE
-</${this.EDIT_BLOCK_END}>
+${this.EDIT_BLOCK_END}
 
 3. Adding new content between sections:
 Insert a new section for discussion points after the action items section:
@@ -255,7 +255,7 @@ Discussion Points:
 - Budget review
 - Team feedback
 >>>>>>> REPLACE
-</${this.EDIT_BLOCK_END}>
+${this.EDIT_BLOCK_END}
 
 4. Completely replacing a file content (preserving frontmatter):
 Replace entire file content while keeping frontmatter metadata
@@ -305,7 +305,7 @@ For context, the user is currently working on the following files:
                 continue;
             }
 
-            openFilesContent += `<OPEN_FILE>\n# file: ${file.basename}.md\n\n${fileContent}\n</OPEN_FILE>\n\n`;
+            openFilesContent += `<OPEN_FILE>\n# file: ${file.path}\n\n${fileContent}\n</OPEN_FILE>\n\n`;
         }
 
         openFilesContent += "</WORKING_FILE_SET>\n";
@@ -322,60 +322,56 @@ For context, the user is currently working on the following files:
     }
 
     /**
-     * Calculates the Levenshtein distance between two strings
-     *
-     * @param a - First string
-     * @param b - Second string
-     * @returns The Levenshtein distance
-     */
-    public levenshteinDistance(a: string, b: string): number {
-        if (a.length === 0) return b.length;
-        if (b.length === 0) return a.length;
-
-        const matrix = Array(b.length + 1).fill(null).map(() =>
-            Array(a.length + 1).fill(null)
-        );
-
-        for (let i = 0; i <= a.length; i++) matrix[0][i] = i;
-        for (let j = 0; j <= b.length; j++) matrix[j][0] = j;
-
-        for (let j = 1; j <= b.length; j++) {
-            for (let i = 1; i <= a.length; i++) {
-                const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-                matrix[j][i] = Math.min(
-                    matrix[j][i - 1] + 1, // deletion
-                    matrix[j - 1][i] + 1, // insertion
-                    matrix[j - 1][i - 1] + cost // substitution
-                );
-            }
-        }
-
-        return matrix[b.length][a.length];
-    }
-
-    /**
-     * Finds the best matching file from a list of files based on the target name
+     * Finds the target file from a list of files based on an exact path or unambiguous file name.
      *
      * @param targetName - The name to match against
      * @param files - Array of TFile objects to search
-     * @returns The best matching TFile or null if no matches found
+     * @returns The matching TFile or null if no unique match is found
      */
     public findBestMatchingFile(targetName: string, files: TFile[]): TFile | null {
-        const MAX_DISTANCE = 10;
-        let bestMatch: { file: TFile, distance: number } | null = null;
+        const target = targetName.trim();
+        const pathMatch = files.find(file => file.path === target);
+        if (pathMatch) {
+            return pathMatch;
+        }
 
-        for (const file of files) {
-            // Try both with and without extension
-            const distanceWithExt = this.levenshteinDistance(targetName.toLowerCase(), file.name.toLowerCase());
-            const distanceWithoutExt = this.levenshteinDistance(targetName.toLowerCase(), file.basename.toLowerCase());
-            const distance = Math.min(distanceWithExt, distanceWithoutExt);
+        const nameMatches = files.filter(file => file.name === target || file.basename === target);
+        return nameMatches.length === 1 ? nameMatches[0] : null;
+    }
 
-            if (distance <= MAX_DISTANCE && (!bestMatch || distance < bestMatch.distance)) {
-                bestMatch = { file, distance };
+    private getSafeNewMarkdownPath(filePath: string): string | null {
+        const target = filePath.trim().replace(/\\/g, "/");
+        if (!target || target.startsWith("/") || target.endsWith("/") || !target.endsWith(".md")) return null;
+        if (target.split("/").some(part => !part || part === "." || part === "..")) return null;
+        return target;
+    }
+
+    private async ensureParentFolders(filePath: string): Promise<string[]> {
+        const folders = filePath.split("/").slice(0, -1);
+        const createdFolders: string[] = [];
+        let currentPath = "";
+
+        for (const folder of folders) {
+            currentPath = currentPath ? `${currentPath}/${folder}` : folder;
+            const existingPath = this.app.vault.getAbstractFileByPath(currentPath);
+            if (!existingPath) {
+                await this.app.vault.createFolder(currentPath);
+                createdFolders.push(currentPath);
+            } else if (!(existingPath instanceof TFolder)) {
+                throw new Error(`Cannot create folder "${currentPath}" because a file already exists there`);
             }
         }
 
-        return bestMatch?.file || null;
+        return createdFolders;
+    }
+
+    private async deleteEmptyFolders(folderPaths: string[]): Promise<void> {
+        for (const path of [...folderPaths].reverse()) {
+            const folder = this.app.vault.getAbstractFileByPath(path);
+            if (folder instanceof TFolder && folder.children.length === 0) {
+                await this.app.vault.delete(folder);
+            }
+        }
     }
 
     /**
@@ -441,7 +437,7 @@ For context, the user is currently working on the following files:
             //   replacement_content     (group 3, can be empty => deletion)
             //   >>>>>>> REPLACE         end marker
             // Note: The trailing newline before the end marker is optional to allow zero-length replacement
-            const newFormatRegex = /^([^\n]+)\n<<<<<<< SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n?>>>>>>> REPLACE\s*$/;
+            const newFormatRegex = /^([^\n]+)\n<<<<<<< SEARCH\n([\s\S]*?)\n?=======\n([\s\S]*?)\n?>>>>>>> REPLACE\s*$/;
             const newFormatMatch = newFormatRegex.exec(cleanContent);
 
             let editData: EditBlock | null = null;
@@ -622,18 +618,6 @@ For context, the user is currently working on the following files:
         return restoreFormatting(diffPreview);
     }
 
-    private textNormalize(text: string): string {
-        // Normalize whitespace and special characters
-        return text
-            .replace(/\u00A0/g, " ")         // Replace non-breaking spaces with regular spaces
-            .replace(/[\u2002\u2003\u2007\u2008\u2009\u200A\u205F\u3000]/g, " ") // Replace various other Unicode spaces with regular spaces
-            .replace(/[\u2013\u2014]/g, '-') // Replace en-dash and em-dash with hyphen
-            .replace(/[\u2018\u2019]/g, "'") // Replace smart quotes with regular quotes
-            .replace(/[\u201C\u201D]/g, '"') // Replace smart double quotes with regular quotes
-            .replace(/\u2026/g, '...')       // Replace ellipsis with three dots
-            .normalize('NFC')                // Normalize to NFC form
-    }
-
     private processSingleEdit(
         rawFindText: string,
         replaceText: string,
@@ -642,9 +626,8 @@ For context, the user is currently working on the following files:
     ): ProcessedEditResult {
         let startIndex = -1;
         let endIndex = -1;
-        // Normalize special characters before searching
-        const findText = this.textNormalize(rawFindText);
-        const currentFileContent = this.textNormalize(rawCurrentFileContent);
+        const findText = rawFindText;
+        const currentFileContent = rawCurrentFileContent;
 
         if (findText === "") {
             // Empty search means replace entire content after frontmatter
@@ -667,11 +650,11 @@ For context, the user is currently working on the following files:
         }
 
         const textToReplace = currentFileContent.substring(startIndex, endIndex);
-        const newText = replaceText.trim();
+        const newText = replaceText;
         const preview = this.createPreviewWithDiff(textToReplace, newText);
         const newContent =
             currentFileContent.substring(0, startIndex) +
-            preview +
+            newText +
             currentFileContent.substring(endIndex);
 
         return { preview, newContent };
@@ -690,14 +673,18 @@ For context, the user is currently working on the following files:
     ): Promise<{
         editResults: { block: EditBlock, success: boolean, error?: string }[],
         fileBackups: Map<string, string>,
+        createdFiles: string[],
+        createdFolders: string[],
     }> {
         // Check for parsing errors first
         if (editBlocks.length === 0) {
-            return { editResults: [], fileBackups: new Map() };
+            return { editResults: [], fileBackups: new Map(), createdFiles: [], createdFolders: [] };
         }
 
         // Store original content for each file in case we need to cancel
         const fileBackups = new Map<string, string>();
+        const createdFiles: string[] = [];
+        const createdFolders: string[] = [];
 
         // Track current content for each file as we apply edits
         const currentFileContents = new Map<string, string>();
@@ -710,7 +697,14 @@ For context, the user is currently working on the following files:
         const blocksNeedingRetry: EditBlock[] = [];
 
         // PHASE 1: Validation - Check all blocks before applying any changes
-        const validationResults: { block: EditBlock, valid: boolean, error?: string, targetFile?: TFile }[] = [];
+        const validationResults: {
+            block: EditBlock,
+            valid: boolean,
+            error?: string,
+            targetFile?: TFile,
+            targetPath?: string,
+            isNewFile?: boolean,
+        }[] = [];
 
         for (const block of editBlocks) {
             try {
@@ -725,7 +719,36 @@ For context, the user is currently working on the following files:
                 }
 
                 const targetFile = this.findBestMatchingFile(block.file, files);
+                let targetPath = targetFile?.path;
+                let isNewFile = false;
+
                 if (!targetFile) {
+                    const newFilePath = this.getSafeNewMarkdownPath(block.file);
+                    const existingFile = newFilePath ? this.app.vault.getAbstractFileByPath(newFilePath) : null;
+
+                    if (!newFilePath || existingFile) {
+                        validationResults.push({
+                            block,
+                            valid: false,
+                            error: `No matching open file found for "${block.file}"`
+                        });
+                        continue;
+                    }
+                    if (block.find !== "" && !currentFileContents.has(newFilePath)) {
+                        validationResults.push({
+                            block,
+                            valid: false,
+                            error: `New file "${block.file}" requires an empty SEARCH block`
+                        });
+                        continue;
+                    }
+
+                    targetPath = newFilePath;
+                    isNewFile = true;
+                    currentFileContents.set(targetPath, currentFileContents.get(targetPath) ?? "");
+                }
+
+                if (!targetPath) {
                     validationResults.push({
                         block,
                         valid: false,
@@ -735,14 +758,14 @@ For context, the user is currently working on the following files:
                 }
 
                 // Read the file content if not already backed up
-                if (!fileBackups.has(targetFile.path)) {
+                if (targetFile && !fileBackups.has(targetFile.path)) {
                     const content = await this.app.vault.read(targetFile);
                     fileBackups.set(targetFile.path, content);
                     currentFileContents.set(targetFile.path, content);
                 }
 
                 // Use current content (which may have been modified by previous validations)
-                const currentContent = currentFileContents.get(targetFile.path)!;
+                const currentContent = currentFileContents.get(targetPath)!;
 
                 // Find frontmatter boundaries
                 const frontmatterMatch = currentContent.match(/^---\n[\s\S]*?\n---\n/);
@@ -756,10 +779,10 @@ For context, the user is currently working on the following files:
                 }
 
                 // Validation passed
-                validationResults.push({ block, valid: true, targetFile });
+                validationResults.push({ block, valid: true, targetFile: targetFile ?? undefined, targetPath, isNewFile });
 
                 // Update the current content for this file for subsequent validations
-                currentFileContents.set(targetFile.path, processedEdit.newContent);
+                currentFileContents.set(targetPath, processedEdit.newContent);
 
             } catch (error) {
                 validationResults.push({ block, valid: false, error: error.message });
@@ -807,7 +830,7 @@ For context, the user is currently working on the following files:
                 onRetryNeeded(blocksNeedingRetry[0]);
             }
 
-            return { editResults, fileBackups };
+            return { editResults, fileBackups, createdFiles, createdFolders };
         }
 
         // PHASE 2: Application - Apply all changes since all blocks are valid
@@ -821,10 +844,10 @@ For context, the user is currently working on the following files:
             // Apply all edits
             for (const result of validationResults) {
                 const block = result.block;
-                const targetFile = result.targetFile!;
+                const targetPath = result.targetPath!;
 
                 // Use current content (which may have been modified by previous edits)
-                const content = currentFileContents.get(targetFile.path)!;
+                const content = currentFileContents.get(targetPath) ?? "";
 
                 // Find frontmatter boundaries
                 const frontmatterMatch = content.match(/^---\n[\s\S]*?\n---\n/);
@@ -835,14 +858,30 @@ For context, the user is currently working on the following files:
                 const processedEdit = this.processSingleEdit(block.find, block.replace, content, frontmatterEndIndex);
 
                 if (processedEdit.error) {
-                     throw new Error(`Failed to re-locate edit markers for file "${targetFile.basename}" during application. Content may have shifted.`);
+                     throw new Error(`Failed to re-locate edit markers for file "${targetPath}" during application. Content may have shifted.`);
                 }
 
-                // Apply the changes to the file
-                await this.app.vault.modify(targetFile, processedEdit.newContent);
+                const existingTarget = this.app.vault.getAbstractFileByPath(targetPath);
+                if (result.isNewFile) {
+                    if (!existingTarget) {
+                        createdFolders.push(...await this.ensureParentFolders(targetPath));
+                        await this.app.vault.create(targetPath, processedEdit.newContent);
+                        createdFiles.push(targetPath);
+                    } else if (createdFiles.includes(targetPath) && existingTarget instanceof TFile) {
+                        await this.app.vault.modify(existingTarget, processedEdit.newContent);
+                    } else {
+                        throw new Error(`File already exists for new file edit "${targetPath}"`);
+                    }
+                } else {
+                    const targetFile = result.targetFile || existingTarget;
+                    if (!(targetFile instanceof TFile)) {
+                        throw new Error(`No editable file found for "${targetPath}"`);
+                    }
+                    await this.app.vault.modify(targetFile, processedEdit.newContent);
+                }
 
                 // Update the current content for this file for subsequent edits
-                currentFileContents.set(targetFile.path, processedEdit.newContent);
+                currentFileContents.set(targetPath, processedEdit.newContent);
 
                 editResults.push({ block: {...block, replace: processedEdit.preview}, success: true });
             }
@@ -856,8 +895,16 @@ For context, the user is currently working on the following files:
                     await this.app.vault.modify(file, content);
                 }
             }
+            for (const path of createdFiles) {
+                const file = this.app.vault.getAbstractFileByPath(path);
+                if (file && file instanceof TFile) {
+                    await this.app.vault.delete(file);
+                }
+            }
+            await this.deleteEmptyFolders(createdFolders);
 
             // Mark all blocks as failed
+            editResults.length = 0;
             for (const block of editBlocks) {
                 blocksNeedingRetry.push(block);
                 editResults.push({
@@ -873,7 +920,7 @@ For context, the user is currently working on the following files:
             }
         }
 
-        return { editResults, fileBackups };
+        return { editResults, fileBackups, createdFiles, createdFolders };
     }
 
     /**

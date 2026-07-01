@@ -9,6 +9,26 @@ export interface SimilarResult {
     inVault: boolean;
 }
 
+interface SearchApiResult {
+    entry: string;
+    additional: {
+        file: string;
+    };
+}
+
+function isSearchApiResult(value: unknown): value is SearchApiResult {
+    if (typeof value !== "object" || value === null) return false;
+    const result = value as { entry?: unknown; additional?: { file?: unknown } };
+    return typeof result.entry === "string" && typeof result.additional?.file === "string";
+}
+
+function parseSearchResults(value: unknown): SearchApiResult[] {
+    if (!Array.isArray(value) || !value.every(isSearchApiResult)) {
+        throw new Error("Invalid search response");
+    }
+    return value;
+}
+
 export class KhojSimilarView extends KhojPaneView {
     static iconName: string = "search";
     currentController: AbortController | null = null;
@@ -187,18 +207,18 @@ export class KhojSimilarView extends KhojPaneView {
                 throw new Error(`HTTP error! status: ${response.status}`);
             }
 
-            const data = await response.json();
+            const data = parseSearchResults(await response.json());
 
             // Parse search results
             let results = data
-                .filter((result: any) => {
+                .filter((result) => {
                     // Filter out the current file if it's in the results
                     if (this.currentFile && result.additional.file.endsWith(this.currentFile.path)) {
                         return false;
                     }
                     return true;
                 })
-                .map((result: any) => {
+                .map((result) => {
                     return {
                         entry: result.entry,
                         file: result.additional.file,
