@@ -126,6 +126,7 @@ class ChatMessageModel(PydanticBaseModel):
     created: Optional[str] = None
     images: Optional[List[str]] = None
     queryFiles: Optional[List[Dict]] = None
+    artifacts: Optional[List[Dict]] = None
     excalidrawDiagram: Optional[List[Dict]] = None
     mermaidjsDiagram: Optional[str] = None
     turnId: Optional[str] = None

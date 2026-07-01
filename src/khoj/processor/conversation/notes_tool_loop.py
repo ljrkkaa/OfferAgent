@@ -1,5 +1,6 @@
 import inspect
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -29,6 +30,7 @@ class NotesToolLoopResult:
     inferred_queries: list[str] = field(default_factory=list)
     searched: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    tool_transcript: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -42,8 +44,8 @@ NOTES_TOOL_SYSTEM_PROMPT = """
 You collect evidence from the user's personal knowledge base for the main chat answer.
 
 For Notes requests, your first response should normally be a JSON tool call, not prose.
-重要：如果用户用中文要求“写入 / 新建 / 追加 / 修改 / 更新 / 加到索引 / 不要只口头说”，必须返回 JSON 工具调用；
-不要直接用自然语言回答做不到，除非工具已经返回错误。
+If the user asks for a knowledge-base file operation, return a JSON tool call instead of plain prose.
+Do not claim an operation cannot be done until the relevant tool has returned an error.
 
 Use tools instead of guessing. Prefer this workflow:
 1. list_files or regex_search_files to find candidate notes.
@@ -54,6 +56,12 @@ Use tools instead of guessing. Prefer this workflow:
 Only exact view_file or OpenKB evidence becomes final references. Use append_note only when the
 user clearly asks to create or append note content. append_note can create a new .md/.txt file under an
 existing folder. Use propose_edit for replace/delete/overwrite-style requests.
+For append_note, include source_refs and write_intent whenever content is derived from prior chat,
+files, tool results, or any source other than text explicitly provided in the current user request.
+When the needed content exists in Recent conversation artifacts, prefer artifact_id or
+source_refs=[{"type":"artifact","id":"..."}] over re-copying from raw chat history.
+If append_note says source_refs_required or source_mismatch, retry with concrete source_refs and
+content grounded in those sources instead of summarizing unrelated conversation history.
 For requests like "add X to section Y in file Z", read or inspect file Z, then call append_note with
 path=Z and heading=Y. Do not stop with plain text before trying an available tool.
 If project instructions or a matching skill covers the task, follow them before writing.
@@ -73,10 +81,38 @@ APPEND_NOTE_TOOL = ToolDefinition(
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Target local KB file path."},
-            "content": {"type": "string", "description": "Content to append."},
+            "artifact_id": {
+                "type": "string",
+                "description": "Conversation artifact id to append or adapt, e.g. assistant:<turnId>.",
+            },
+            "content": {"type": "string", "description": "Content to append. Optional when artifact_id is provided."},
             "heading": {"type": "string", "description": "Optional Markdown heading to append under."},
+            "write_intent": {
+                "type": "string",
+                "description": "How content transforms source_refs, e.g. preserve, summarize, adapt_to_template, merge.",
+            },
+            "source_refs": {
+                "type": "array",
+                "description": (
+                    "Concrete sources used to write content when content is not explicitly provided by the current user request. "
+                    "Examples: {type:'artifact', id:'assistant:<turnId>'}, {type:'assistant_message', turn:-1}, {type:'user_message', turn:-1}, "
+                    "{type:'file', path:'templates/daily-template.md'}."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string"},
+                        "id": {"type": "string"},
+                        "artifact_id": {"type": "string"},
+                        "turn": {"type": "integer"},
+                        "path": {"type": "string"},
+                        "start_line": {"type": "integer"},
+                        "end_line": {"type": "integer"},
+                    },
+                },
+            },
         },
-        "required": ["path", "content"],
+        "required": ["path"],
     },
 )
 
@@ -270,10 +306,12 @@ def _local_read_reference(item, reason: str, remaining_chars: int) -> dict[str, 
     text = item.text[:remaining_chars].rstrip()
     if not item.lines or not text:
         return None
+    local_root = get_local_kb_root()
     return {
         "query": reason,
         "file": item.path,
         "uri": f"local-kb://{item.path}#L{item.start_line}-L{item.end_line}",
+        "kb_root": str(local_root) if local_root else None,
         "compiled": f"# {item.path} L{item.start_line}-L{item.end_line}\n{text}",
         "start_line": item.start_line,
         "end_line": item.end_line,
@@ -285,6 +323,7 @@ def _local_read_reference(item, reason: str, remaining_chars: int) -> dict[str, 
 
 def _write_reference(result: LocalKBWriteResult) -> dict[str, Any]:
     compiled = result.message
+    local_root = get_local_kb_root()
     if result.diff:
         compiled += f"\n\n```diff\n{result.diff.rstrip()}\n```"
     if result.start_line and result.end_line:
@@ -293,6 +332,7 @@ def _write_reference(result: LocalKBWriteResult) -> dict[str, Any]:
         "query": result.action,
         "file": result.path,
         "uri": f"local-kb://{result.path}",
+        "kb_root": str(local_root) if local_root else None,
         "compiled": compiled,
         "action": result.action,
         "status": result.status,
@@ -343,6 +383,193 @@ def _tool_specs(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
     return [{"name": tool.name, "description": tool.description, "schema": tool.schema} for tool in tools]
 
 
+_FILE_REF_RE = re.compile(r"[\w./-]+\.(?:md|txt|pdf|png|jpe?g|webp|json|ya?ml)", re.I)
+
+
+def _plain_message_text(message: Any) -> str:
+    value = (
+        (message.get("message") or message.get("content"))
+        if isinstance(message, dict)
+        else (getattr(message, "message", None) or getattr(message, "content", ""))
+    )
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        chunks = []
+        for item in value:
+            if isinstance(item, dict):
+                chunks.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                chunks.append(str(item))
+        return "\n".join(chunk for chunk in chunks if chunk)
+    return str(value or "")
+
+
+def _message_by(message: Any) -> str:
+    value = (message.get("by") or message.get("role")) if isinstance(message, dict) else (getattr(message, "by", None) or getattr(message, "role", ""))
+    return str(value).lower()
+
+
+def _message_artifacts(message: Any) -> list[dict[str, Any]]:
+    artifacts = message.get("artifacts") if isinstance(message, dict) else getattr(message, "artifacts", None)
+    if not isinstance(artifacts, list):
+        return []
+    return [item for item in artifacts if isinstance(item, dict) and item.get("id")]
+
+
+def _find_artifact(chat_history: list[Any], artifact_id: str) -> dict[str, Any] | None:
+    if not artifact_id:
+        return None
+    for message in reversed(chat_history):
+        for artifact in _message_artifacts(message):
+            if str(artifact.get("id") or "") == artifact_id:
+                return artifact
+    return None
+
+
+def _recent_artifact_catalog(chat_history: list[Any], limit: int = 6, preview_chars: int = 600) -> list[dict[str, Any]]:
+    artifacts = [artifact for message in chat_history for artifact in _message_artifacts(message)]
+    catalog = []
+    for artifact in artifacts[-limit:]:
+        source_files = []
+        for ref in artifact.get("source_refs") or []:
+            if isinstance(ref, dict):
+                source = ref.get("file") or ref.get("uri")
+                if source:
+                    source_files.append(source)
+        catalog.append(
+            {
+                "id": artifact.get("id"),
+                "type": artifact.get("type"),
+                "preview": str(artifact.get("content") or "")[:preview_chars],
+                "source_files": source_files[:6],
+            }
+        )
+    return catalog
+
+
+def _select_turn(messages: list[Any], turn: Any) -> Any | None:
+    if not messages:
+        return None
+    idx = _as_int(turn, -1, -len(messages), len(messages))
+    if idx < 0:
+        idx = len(messages) + idx
+    elif idx > 0:
+        idx -= 1
+    if 0 <= idx < len(messages):
+        return messages[idx]
+    return None
+
+
+def _source_ref_text(ref: dict[str, Any], chat_history: list, tool_transcript: list[dict[str, Any]]) -> str:
+    ref_type = str(ref.get("type") or ref.get("kind") or "").lower()
+    if ref_type == "artifact":
+        artifact = _find_artifact(chat_history, str(ref.get("id") or ref.get("artifact_id") or ""))
+        return str(artifact.get("content") or "") if artifact else ""
+    if ref_type in {"assistant_message", "assistant"}:
+        messages = [item for item in chat_history if _message_by(item) not in {"you", "user"}]
+        selected = _select_turn(messages, ref.get("turn", -1))
+        return _plain_message_text(selected) if selected is not None else ""
+    if ref_type in {"user_message", "user"}:
+        messages = [item for item in chat_history if _message_by(item) in {"you", "user"}]
+        selected = _select_turn(messages, ref.get("turn", -1))
+        return _plain_message_text(selected) if selected is not None else ""
+    if ref_type in {"file", "view_file"} and ref.get("path"):
+        item = kb_read(ref.get("path") or "", start_line=ref.get("start_line"), end_line=ref.get("end_line"), max_lines=200)
+        return item.text
+    if ref_type in {"tool_result", "tool"}:
+        tool_name = str(ref.get("tool") or ref.get("name") or "")
+        for item in reversed(tool_transcript):
+            if tool_name and item.get("tool") != tool_name:
+                continue
+            return str(item.get("result") or "")
+    return ""
+
+
+def _compact_text(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
+def _source_refs_required_error(query: str, args: dict[str, Any]) -> str:
+    if args.get("source_refs"):
+        return ""
+    content = str(args.get("content") or "").strip()
+    if content and _compact_text(content) in _compact_text(query):
+        return ""
+    return (
+        "source_refs_required: append content was not explicitly provided in the current user request. "
+        "Retry append_note with concrete source_refs such as assistant_message, user_message, file, or tool_result."
+    )
+
+
+def _json_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "ok", "grounded"}
+    return False
+
+
+async def _source_bound_append_error(
+    query: str,
+    args: dict[str, Any],
+    chat_history: list,
+    tool_transcript: list[dict[str, Any]],
+    send_message: Callable[..., Awaitable[Any]],
+) -> str:
+    refs = args.get("source_refs")
+    if not refs:
+        return ""
+    if not isinstance(refs, list):
+        return "source_refs must be an array of concrete source objects."
+    source_texts = [_source_ref_text(ref, chat_history, tool_transcript) for ref in refs if isinstance(ref, dict)]
+    source_text = "\n\n".join(text for text in source_texts if text.strip())
+    if not source_text.strip():
+        return "Could not resolve source_refs. Retry with concrete assistant_message, user_message, file, or tool_result refs."
+
+    content = str(args.get("content") or "")
+    if content.strip() and any(content.strip() == text.strip() for text in source_texts):
+        return ""
+
+    # Keep execution deterministic: code checks protocol/safety; the verifier owns semantic grounding.
+    content_file_refs = {ref.lower() for ref in _FILE_REF_RE.findall(content)}
+    source_file_refs = {ref.lower() for ref in _FILE_REF_RE.findall(source_text)}
+    new_file_refs = content_file_refs - source_file_refs
+    if new_file_refs:
+        return f"source_mismatch: append content mentions file refs not present in source_refs: {', '.join(sorted(new_file_refs))}."
+
+    if not content.strip():
+        return ""
+
+    prompt = (
+        "Check whether this append_note content is grounded in the declared sources.\n"
+        "Return only JSON: {\"grounded\": true|false, \"reason\": \"short reason\"}.\n"
+        "Accept summaries, rewording, and template formatting. Reject unrelated conversation topics, "
+        "unsupported facts, or content that appears to come from another source.\n\n"
+        f"User request:\n{query[:4000]}\n\n"
+        f"Write intent:\n{str(args.get('write_intent') or '')[:200]}\n\n"
+        f"Declared source text:\n{source_text[:12000]}\n\n"
+        f"Candidate append content:\n{content[:8000]}"
+    )
+    response = await send_message(
+        query=prompt,
+        system_message="You are a strict write-grounding verifier for a local notes agent.",
+        chat_history=[],
+        tools=[],
+        response_type="json_object",
+        deepthought=False,
+        fast_model=False,
+    )
+    try:
+        verdict = load_complex_json(getattr(response, "text", "") or "")
+    except Exception:
+        verdict = {}
+    if not isinstance(verdict, dict) or not _json_bool(verdict.get("grounded")):
+        reason = verdict.get("reason") if isinstance(verdict, dict) else ""
+        return f"source_mismatch: grounding verifier rejected append content. {str(reason or '').strip()}"
+    return ""
+
+
 def _notes_tools(*, allow_local_kb: bool, allow_openkb: bool, allow_skills: bool) -> list[ToolDefinition]:
     tools: list[ToolDefinition] = []
     if allow_local_kb:
@@ -378,6 +605,7 @@ async def collect_notes_evidence_with_tools(
     conversation_id: str = "notes-tool-loop",
     max_iterations: int = 4,
     max_evidence_chars: int = 16000,
+    initial_tool_transcript: Optional[list[dict[str, Any]]] = None,
 ) -> NotesToolLoopResult:
     result = NotesToolLoopResult()
     references: list[dict[str, Any]] = []
@@ -399,8 +627,9 @@ async def collect_notes_evidence_with_tools(
     system_message = NOTES_TOOL_SYSTEM_PROMPT + _local_profile_prompt(local_root if local_kb_allowed else None)
     system_message += _skill_prompt(local_skills)
 
-    tool_transcript: list[dict[str, Any]] = []
+    tool_transcript: list[dict[str, Any]] = list(initial_tool_transcript or [])
     exact_evidence_retry_sent = False
+    artifact_catalog = _recent_artifact_catalog(chat_history)
     await _send_status(send_status, "Planning Notes evidence with the main agent")
 
     async def execute_tool(call: ToolCall) -> Any:
@@ -486,6 +715,64 @@ async def collect_notes_evidence_with_tools(
                     )
                     references.append(_write_reference(blocked))
                     return blocked.__dict__
+                args = dict(args)
+                artifact_id = str(args.get("artifact_id") or "").strip()
+                if artifact_id:
+                    artifact = _find_artifact(chat_history, artifact_id)
+                    if artifact is None:
+                        blocked = LocalKBWriteResult(
+                            action="append_note",
+                            path=str(args.get("path") or "").strip(),
+                            status="artifact_not_found",
+                            changed=False,
+                            message=f"Conversation artifact not found: {artifact_id}",
+                        )
+                        references.append(_write_reference(blocked))
+                        return blocked.__dict__
+                    if not str(args.get("content") or "").strip():
+                        args["content"] = str(artifact.get("content") or "")
+                    source_refs = args.get("source_refs") if isinstance(args.get("source_refs"), list) else []
+                    artifact_ref = {"type": "artifact", "id": artifact_id}
+                    if not any(
+                        isinstance(ref, dict)
+                        and str(ref.get("type") or "") == "artifact"
+                        and str(ref.get("id") or ref.get("artifact_id") or "") == artifact_id
+                        for ref in source_refs
+                    ):
+                        args["source_refs"] = [*source_refs, artifact_ref]
+                call.args = args
+                if not str(args.get("content") or "").strip():
+                    blocked = LocalKBWriteResult(
+                        action="append_note",
+                        path=str(args.get("path") or "").strip(),
+                        status="missing_content",
+                        changed=False,
+                        message="append_note requires content or a resolvable artifact_id.",
+                    )
+                    references.append(_write_reference(blocked))
+                    return blocked.__dict__
+                source_refs_error = _source_refs_required_error(query, args)
+                if source_refs_error:
+                    blocked = LocalKBWriteResult(
+                        action="append_note",
+                        path=str(args.get("path") or "").strip(),
+                        status="source_refs_required",
+                        changed=False,
+                        message=source_refs_error,
+                    )
+                    references.append(_write_reference(blocked))
+                    return blocked.__dict__
+                source_error = await _source_bound_append_error(query, args, chat_history, tool_transcript, send_message)
+                if source_error:
+                    blocked = LocalKBWriteResult(
+                        action="append_note",
+                        path=str(args.get("path") or "").strip(),
+                        status="source_mismatch",
+                        changed=False,
+                        message=source_error,
+                    )
+                    references.append(_write_reference(blocked))
+                    return blocked.__dict__
                 write = append_local_kb_note(args.get("path") or "", args.get("content") or "", args.get("heading"))
                 references.append(_write_reference(write))
                 return write.__dict__
@@ -540,6 +827,7 @@ async def collect_notes_evidence_with_tools(
     for _ in range(max(1, max_iterations)):
         prompt = (
             f"User question:\n{query}\n\n"
+            f"Recent conversation artifacts:\n{json.dumps(artifact_catalog, ensure_ascii=False, default=str)[:6000]}\n\n"
             "Return a json object with a calls array. Use an empty calls array when no more tools are needed.\n\n"
             f"Available tools:\n{json.dumps(_tool_specs(tools), ensure_ascii=False, default=str)[:8000]}\n\n"
             f"Tool results so far:\n{json.dumps(tool_transcript, ensure_ascii=False, default=str)[:12000]}"
@@ -600,6 +888,7 @@ async def collect_notes_evidence_with_tools(
             tool_transcript.append({"tool": call.name, "args": call.args, "result": _tool_result_text(tool_output)})
 
     result.references = references
+    result.tool_transcript = tool_transcript
     result.inferred_queries = list(
         dict.fromkeys(result.inferred_queries + [ref.get("query", "") for ref in references] + result.searched)
     )

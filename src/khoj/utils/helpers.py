@@ -454,15 +454,6 @@ terrarium_tool_description = dedent(
     """
 ).strip()
 
-tool_descriptions_for_llm = {
-    ConversationCommand.General: "To use when you can answer the question without any outside information or personal knowledge",
-    ConversationCommand.Notes: "To search the user's personal knowledge base. Especially helpful if the question expects context from the user's notes or documents.",
-    ConversationCommand.Online: "To search for the latest, up-to-date information from the internet. Note: **Questions about Khoj should always use this data source**",
-    ConversationCommand.Webpage: "To use if the user has directly provided the webpage urls or you are certain of the webpage urls to read.",
-    ConversationCommand.Code: e2b_tool_description if is_e2b_code_sandbox_enabled() else terrarium_tool_description,
-    ConversationCommand.Operator: "To use when you need to operate a computer to complete the task.",
-}
-
 tools_for_research_llm = {
     ConversationCommand.SearchWeb: ToolDefinition(
         name="search_web",
@@ -678,12 +669,6 @@ tools_for_research_llm = {
             "required": ["regex_pattern"],
         },
     ),
-}
-
-mode_descriptions_for_llm = {
-    ConversationCommand.Text: "Use this if a normal text response would be sufficient for accurately responding to the query or you don't feel strongly about the other modes.",
-    ConversationCommand.Image: "Use this if the user is requesting a painting, illustration, photo, or generated image.",
-    ConversationCommand.Diagram: "Use this if the user is requesting a diagram or visual representation that requires primitives like lines, rectangles, and text. This does not work for charts, graphs, or quantitative data. It is for mind mapping, flowcharts, etc.",
 }
 
 mode_descriptions_for_agent = {

@@ -235,6 +235,31 @@ class ResearchIteration:
         return data
 
 
+_ARTIFACT_SOURCE_KEYS = ("query", "file", "uri", "action", "status", "start_line", "end_line", "kb_root")
+
+
+def _assistant_response_artifact(
+    chat_response: str,
+    turn_id: str,
+    compiled_references: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not turn_id or not str(chat_response or "").strip():
+        return None
+    source_refs = []
+    for item in compiled_references or []:
+        if not isinstance(item, dict):
+            continue
+        ref = {key: item[key] for key in _ARTIFACT_SOURCE_KEYS if item.get(key) not in (None, "", [])}
+        if ref:
+            source_refs.append(ref)
+    return {
+        "id": f"assistant:{turn_id}",
+        "type": "assistant_response",
+        "content": chat_response,
+        "source_refs": source_refs,
+    }
+
+
 def construct_iteration_history(
     previous_iterations: List[ResearchIteration],
     query: str = None,
@@ -594,6 +619,10 @@ async def save_to_conversation_log(
         "turnId": turn_id,
         "images": generated_images,
     }
+
+    artifact = _assistant_response_artifact(chat_response, turn_id, compiled_references)
+    if artifact:
+        khoj_message_metadata["artifacts"] = [artifact]
 
     if generated_mermaidjs_diagram:
         khoj_message_metadata["mermaidjsDiagram"] = generated_mermaidjs_diagram

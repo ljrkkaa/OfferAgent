@@ -16,10 +16,17 @@ from khoj.processor.conversation.utils import ResponseWithThought, ToolCall
 from khoj.utils.helpers import ToolDefinition, is_none_or_empty
 
 RESPONSES_FORMAT_BASE_URL = "https://api.openai.com/v1"
+JSON_OBJECT_SENTINEL = "Return a JSON object."
 
 
 def use_codex_runtime() -> bool:
     return os.getenv("KHOJ_CONVERSATION_RUNTIME", "codex").lower() == "codex"
+
+
+def _ensure_json_object_hint(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if "json" in json.dumps(messages).lower():
+        return messages
+    return [{"role": "user", "content": JSON_OBJECT_SENTINEL}, *messages]
 
 
 def build_codex_response_kwargs(
@@ -63,6 +70,7 @@ def build_codex_response_kwargs(
             }
         }
     elif response_type == "json_object":
+        kwargs["input"] = _ensure_json_object_hint(kwargs["input"])
         kwargs["text"] = {"format": {"type": "json_object"}}
 
     return kwargs

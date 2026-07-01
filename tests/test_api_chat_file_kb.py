@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 from starlette.datastructures import Headers
 
+from khoj.processor.conversation.agent_tool_loop import AgentToolLoopResult
 from khoj.processor.conversation.utils import ResponseWithThought
 from khoj.routers import api_chat
 from khoj.routers.helpers import CommonQueryParamsClass
@@ -95,6 +96,147 @@ def fake_notes_model(*responses):
         return ResponseWithThought(text="done")
 
     return send_message_to_model_wrapper
+
+
+@pytest.mark.asyncio
+async def test_default_chat_uses_unified_agent_runtime(monkeypatch):
+    captured = {}
+
+    async def fake_agent_runtime(*args, **kwargs):
+        captured["runtime_kwargs"] = kwargs
+        return AgentToolLoopResult(
+            references=[{"query": "append_note", "status": "written", "file": "agent.md", "action": "append_note"}],
+            inferred_queries=["agent evaluation"],
+            online_results={"agent evaluation": {"organic": [{"title": "source"}]}},
+            program_context=["Notes write tool result: written"],
+        )
+
+    async def fake_generate_response(
+        q,
+        chat_history,
+        conversation,
+        compiled_references,
+        online_results,
+        code_results,
+        operator_results,
+        research_results,
+        user,
+        location,
+        user_name,
+        uploaded_images,
+        attached_file_context,
+        relevant_memories,
+        program_execution_context,
+        *args,
+        **kwargs,
+    ):
+        captured["compiled_references"] = compiled_references
+        captured["online_results"] = online_results
+        captured["program_execution_context"] = program_execution_context
+
+        async def stream():
+            yield ResponseWithThought(text="ok")
+
+        return stream(), {}
+
+    events = await run_chat(
+        monkeypatch,
+        "根据网络资料补充 agent 评估八股并补充到项目里",
+        collect_agent_context_and_actions=fake_agent_runtime,
+        is_web_search_enabled=lambda: True,
+        generate_response=fake_generate_response,
+    )
+
+    assert captured["runtime_kwargs"]["allow_web"] is True
+    assert captured["compiled_references"][-1]["query"] == "append_note"
+    assert "agent evaluation" in captured["online_results"]
+    assert "Notes write tool result" in "\n".join(captured["program_execution_context"])
+    assert events_of_type(events, "references")[0]["data"]["inferredQueries"] == ["agent evaluation"]
+
+
+@pytest.mark.asyncio
+async def test_default_chat_can_search_web_then_write_to_local_kb(tmp_path, monkeypatch):
+    target = tmp_path / "agent-eval.md"
+    target.write_text("# Agent Eval\n", encoding="utf-8")
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+    monkeypatch.setenv("KHOJ_ALLOW_VAULT_WRITE", "true")
+
+    async def fake_search_online(**kwargs):
+        yield {
+            "agent evaluation": {
+                "organic": [
+                    {
+                        "title": "WebArena",
+                        "link": "https://example.com/webarena",
+                        "snippet": "WebArena evaluates autonomous agents on realistic web tasks.",
+                    }
+                ]
+            }
+        }
+
+    monkeypatch.setattr("khoj.processor.conversation.agent_tool_loop.search_online", fake_search_online)
+    captured = {}
+
+    async def fake_generate_response(
+        q,
+        chat_history,
+        conversation,
+        compiled_references,
+        online_results,
+        code_results,
+        operator_results,
+        research_results,
+        user,
+        location,
+        user_name,
+        uploaded_images,
+        attached_file_context,
+        relevant_memories,
+        program_execution_context,
+        *args,
+        **kwargs,
+    ):
+        captured["compiled_references"] = compiled_references
+        captured["online_results"] = online_results
+        captured["program_execution_context"] = program_execution_context
+
+        async def stream():
+            yield ResponseWithThought(text="ok")
+
+        return stream(), {}
+
+    await run_chat(
+        monkeypatch,
+        "根据网络资料补充 agent 评估八股并补充到项目里",
+        is_web_search_enabled=lambda: True,
+        send_message_to_model_wrapper=fake_notes_model(
+            json.dumps({"calls": [{"name": "web_search", "args": {"query": "agent evaluation"}, "id": "1"}]}),
+            json.dumps(
+                {
+                    "calls": [
+                        {
+                            "name": "append_note",
+                            "args": {
+                                "path": "agent-eval.md",
+                                "content": "- WebArena：评估 autonomous agents 在真实网页任务上的表现。",
+                                "source_refs": [{"type": "tool_result", "tool": "web_search"}],
+                                "write_intent": "summarize",
+                            },
+                            "id": "2",
+                        }
+                    ]
+                }
+            ),
+            json.dumps({"grounded": True, "reason": "grounded in web result"}),
+            json.dumps({"calls": []}),
+        ),
+        generate_response=fake_generate_response,
+    )
+
+    assert "WebArena" in target.read_text(encoding="utf-8")
+    assert captured["compiled_references"][-1]["status"] == "written"
+    assert "agent evaluation" in captured["online_results"]
+    assert "Do not say writing is unavailable" in "\n".join(captured["program_execution_context"])
 
 
 @pytest.mark.asyncio

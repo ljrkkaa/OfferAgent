@@ -142,6 +142,21 @@ def test_payload_omits_service_tier_when_fast_disabled(monkeypatch):
     assert "service_tier" not in kwargs
 
 
+def test_json_object_payload_keeps_json_hint_in_input_when_system_prompt_is_extracted():
+    kwargs = build_codex_response_kwargs(
+        [
+            ChatMessage(role="system", content="Return a machine readable object."),
+            ChatMessage(role="user", content="plan the tool call"),
+        ],
+        model="gpt-test",
+        response_type="json_object",
+    )
+
+    assert kwargs["text"] == {"format": {"type": "json_object"}}
+    assert kwargs["instructions"] == "Return a machine readable object."
+    assert "json" in json.dumps(kwargs["input"]).lower()
+
+
 def test_refresh_writes_back_current_auth_shape(tmp_path, monkeypatch):
     old_access = _jwt({"exp": int(time.time()) - 10})
     auth_file = tmp_path / "auth.json"

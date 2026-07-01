@@ -36,6 +36,7 @@ from khoj.database.adapters import (
 )
 from khoj.database.models import Agent, KhojUser
 from khoj.processor.conversation import prompts
+from khoj.processor.conversation.agent_tool_loop import collect_agent_context_and_actions
 from khoj.processor.conversation.notes_tool_loop import collect_notes_evidence_with_tools
 from khoj.processor.conversation.openai.utils import is_local_api
 from khoj.processor.conversation.prompts import no_entries_found
@@ -65,7 +66,6 @@ from khoj.routers.helpers import (
     WebSocketConnectionManager,
     acreate_title_from_history,
     agenerate_chat_response,
-    aget_data_sources_and_output_format,
     gather_raw_query_files,
     generate_mermaidjs_diagram,
     generate_summary_from_files,
@@ -1032,6 +1032,11 @@ async def event_generator(
         # Create a de-duped set of memories
         relevant_memories = list({m.id: m for m in recent_memories + long_term_memories}.values())
 
+    local_kb_root = get_local_kb_root()
+    kb_engine = get_kb_engine()
+    notes_local_source_available = local_kb_root is not None and kb_engine in {"file_first", "hybrid"}
+    notes_openkb_source_available = kb_engine in {"openkb", "hybrid"} and openkb_is_ready()
+
     # If interrupted message in DB
     if last_message := await conversation.pop_message(interrupted=True):
         # Populate context from interrupted message
@@ -1049,25 +1054,69 @@ async def event_generator(
 
     if conversation_commands == [ConversationCommand.Default]:
         try:
-            chosen_io = await aget_data_sources_and_output_format(
+            status_messages = []
+            agent_chat_model = (
+                AgentAdapters.get_agent_chat_model(agent, user)
+                if agent and hasattr(agent, "slug") and hasattr(agent, "chat_model")
+                else None
+            )
+
+            async def agent_runtime_send_message(**kwargs):
+                return await send_message_to_model_wrapper(
+                    user=user,
+                    query_files=attached_file_context,
+                    query_images=uploaded_images,
+                    relevant_memories=relevant_memories,
+                    agent_chat_model=agent_chat_model,
+                    tracer=tracer,
+                    **kwargs,
+                )
+
+            async def check_agent_tool_rate_limit(command: ConversationCommand) -> None:
+                await conversation_command_rate_limiter.update_and_check_if_valid(request_obj, command)
+
+            agent_result = await collect_agent_context_and_actions(
                 q,
                 chat_history,
                 user=user,
-                query_images=uploaded_images,
                 agent=agent,
+                send_message=agent_runtime_send_message,
+                send_status=status_messages.append,
+                before_tool_call=check_agent_tool_rate_limit,
+                client_app=user_scope.client_app,
+                allow_local_kb=notes_local_source_available,
+                allow_openkb=notes_openkb_source_available,
+                allow_web=is_web_search_enabled(),
+                conversation_id=conversation_id,
+                location=location,
+                query_images=uploaded_images,
                 query_files=attached_file_context,
                 relevant_memories=relevant_memories,
                 tracer=tracer,
             )
-        except ValueError as e:
-            logger.error(f"Error getting data sources and output format: {e}. Falling back to default.")
-            chosen_io = {"sources": [ConversationCommand.General], "output": ConversationCommand.Text}
+            compiled_references.extend(agent_result.references)
+            inferred_queries.extend(agent_result.inferred_queries)
+            online_results.update(agent_result.online_results)
+            program_execution_context.extend(agent_result.program_context)
+            if agent_result.errors:
+                program_execution_context.append(
+                    "Unified agent runtime tool errors: " + "; ".join(agent_result.errors[:8])
+                )
+            for message in status_messages:
+                async for result in send_event(ChatEvent.STATUS, message):
+                    yield result
+        except HTTPException as e:
+            async for result in send_llm_response(str(e.detail), tracer.get("usage")):
+                yield result
+            return
+        except Exception as e:
+            logger.error(f"Error running unified agent runtime: {e}. Falling back to general response.", exc_info=True)
+            async for result in send_event(
+                ChatEvent.STATUS, "Unified agent runtime failed. I'll answer without tool results."
+            ):
+                yield result
 
-        conversation_commands = chosen_io.get("sources") + [chosen_io.get("output")]
-
-        # If we're doing research, we don't want to do anything else
-        if ConversationCommand.Research in conversation_commands:
-            conversation_commands = [ConversationCommand.Research]
+        conversation_commands = [ConversationCommand.General]
 
         conversation_commands_str = ", ".join([cmd.value for cmd in conversation_commands])
         async for result in send_event(ChatEvent.STATUS, f"**Selected Tools:** {conversation_commands_str}"):
@@ -1163,10 +1212,6 @@ async def event_generator(
 
     # Gather Context
     ## Gather Document References
-    local_kb_root = get_local_kb_root()
-    kb_engine = get_kb_engine()
-    notes_local_source_available = local_kb_root is not None and kb_engine in {"file_first", "hybrid"}
-    notes_openkb_source_available = kb_engine in {"openkb", "hybrid"} and openkb_is_ready()
     used_notes_tool_loop = False
     notes_tool_loop_has_evidence = False
     notes_tool_loop_failed = False

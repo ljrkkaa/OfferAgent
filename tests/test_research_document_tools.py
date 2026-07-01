@@ -63,30 +63,6 @@ async def test_local_kb_headings_and_resolve_link_helpers(tmp_path, monkeypatch)
     assert resolved[0]["compiled"] == "Resolved to interview/java.md"
 
 
-@pytest.mark.asyncio
-async def test_local_kb_makes_notes_source_available_without_entries(tmp_path, monkeypatch):
-    (tmp_path / "notes.md").write_text("local notes", encoding="utf-8")
-    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
-
-    async def no_entries(user):
-        return False
-
-    monkeypatch.setattr(helpers.EntryAdapters, "auser_has_entries", no_entries)
-    monkeypatch.setattr(helpers.AgentAdapters, "get_agent_chat_model", lambda agent, user: None)
-    captured = {}
-
-    async def fake_send_message_to_model_wrapper(query, **kwargs):
-        captured["prompt"] = query
-        return SimpleNamespace(text='{"source":["notes"],"output":"text"}')
-
-    monkeypatch.setattr(helpers, "send_message_to_model_wrapper", fake_send_message_to_model_wrapper)
-
-    selected = await helpers.aget_data_sources_and_output_format("read my notes", [], user=object())
-
-    assert '- "notes":' in captured["prompt"]
-    assert selected["sources"] == [ConversationCommand.Notes]
-
-
 def test_local_kb_counts_as_user_document_source(tmp_path, monkeypatch):
     (tmp_path / "notes.md").write_text("local notes", encoding="utf-8")
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))

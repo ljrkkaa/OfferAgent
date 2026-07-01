@@ -9,15 +9,13 @@ from khoj.database.models import ChatMessageModel
 from khoj.processor.conversation.openai.gpt import converse_openai
 from khoj.processor.conversation.utils import message_to_log
 from khoj.routers.helpers import (
-    aget_data_sources_and_output_format,
     extract_questions,
     generate_online_subqueries,
     infer_webpage_urls,
     schedule_query,
     should_notify,
 )
-from khoj.utils.helpers import ConversationCommand
-from tests.helpers import generate_chat_history, get_chat_api_key
+from tests.helpers import get_chat_api_key
 
 # Initialize variables for tests
 api_key = get_chat_api_key()
@@ -569,79 +567,6 @@ async def test_websearch_khoj_website_for_info_about_khoj(chat_client, default_u
     assert any(["site:khoj.dev" in response for response in responses]), (
         "Expected search query to include site:khoj.dev but got: " + str(responses)
     )
-
-
-# ----------------------------------------------------------------------------------------------------
-@pytest.mark.anyio
-@pytest.mark.django_db(transaction=True)
-@pytest.mark.parametrize(
-    "user_query, expected_conversation_commands",
-    [
-        (
-            "Where did I learn to swim?",
-            {"sources": [ConversationCommand.Notes], "output": ConversationCommand.Text},
-        ),
-        (
-            "Where is the nearest hospital?",
-            {"sources": [ConversationCommand.Online], "output": ConversationCommand.Text},
-        ),
-        (
-            "Summarize the wikipedia page on the history of the internet",
-            {"sources": [ConversationCommand.Webpage], "output": ConversationCommand.Text},
-        ),
-        (
-            "How many noble gases are there?",
-            {"sources": [ConversationCommand.General], "output": ConversationCommand.Text},
-        ),
-        (
-            "Make a painting incorporating my past diving experiences",
-            {"sources": [ConversationCommand.Notes], "output": ConversationCommand.Image},
-        ),
-        (
-            "Create a chart of the weather over the next 7 days in Timbuktu",
-            {"sources": [ConversationCommand.Online, ConversationCommand.Code], "output": ConversationCommand.Text},
-        ),
-        (
-            "What's the highest point in this country and have I been there?",
-            {"sources": [ConversationCommand.Online, ConversationCommand.Notes], "output": ConversationCommand.Text},
-        ),
-    ],
-)
-async def test_select_data_sources_actor_chooses_to_search_notes(
-    chat_client, user_query, expected_conversation_commands, default_user2
-):
-    # Act
-    selected_conversation_commands = await aget_data_sources_and_output_format(
-        user_query, [], default_user2, query_images=False
-    )
-
-    # Assert
-    assert set(expected_conversation_commands["sources"]) == set(selected_conversation_commands["sources"])
-    assert expected_conversation_commands["output"] == selected_conversation_commands["output"]
-
-
-# ----------------------------------------------------------------------------------------------------
-@pytest.mark.anyio
-@pytest.mark.django_db(transaction=True)
-async def test_get_correct_tools_with_chat_history(chat_client, default_user2):
-    # Arrange
-    user_query = "What's the latest in the Israel/Palestine conflict?"
-    chat_log = [
-        (
-            "Let's talk about the current events around the world.",
-            "Sure, let's discuss the current events. What would you like to know?",
-            [],
-        ),
-        ("What's up in New York City?", "A Pride parade has recently been held in New York City, on July 31st.", []),
-    ]
-    chat_history = generate_chat_history(chat_log)
-
-    # Act
-    selected = await aget_data_sources_and_output_format(user_query, chat_history, default_user2, query_images=False)
-    sources = selected["sources"]
-
-    # Assert
-    assert sources == [ConversationCommand.Online]
 
 
 # ----------------------------------------------------------------------------------------------------

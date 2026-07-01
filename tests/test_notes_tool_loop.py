@@ -1,7 +1,10 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from khoj.database.models import ChatMessageModel
+from khoj.processor.conversation import utils as convo_utils
 from khoj.processor.conversation.notes_tool_loop import collect_notes_evidence_with_tools
 from khoj.processor.conversation.utils import ResponseWithThought
 
@@ -15,6 +18,55 @@ def fake_model(*responses):
         return ResponseWithThought(text="done")
 
     return send_message
+
+
+def test_chat_message_model_preserves_artifacts():
+    message = ChatMessageModel(
+        by="khoj",
+        message="answer",
+        artifacts=[{"id": "assistant:turn-1", "type": "assistant_response", "content": "answer"}],
+    )
+
+    assert message.model_dump()["artifacts"][0]["id"] == "assistant:turn-1"
+
+
+@pytest.mark.asyncio
+async def test_save_to_conversation_log_adds_assistant_artifact(monkeypatch):
+    captured = {}
+
+    async def fake_save_conversation(*args, **kwargs):
+        captured["messages"] = args[1]
+        return SimpleNamespace(id="conv-1", agent=None)
+
+    monkeypatch.setattr(convo_utils.ConversationAdapters, "save_conversation", fake_save_conversation)
+
+    await convo_utils.save_to_conversation_log(
+        "根据 experiences/a.md 规划",
+        "## 今日计划\n- [ ] 复习 RAG",
+        user=SimpleNamespace(username="tester"),
+        compiled_references=[
+            {
+                "query": "view_file:experiences/a.md",
+                "file": "experiences/a.md",
+                "uri": "local-kb://experiences/a.md#L1-L3",
+                "compiled": "large source text should not be duplicated",
+            }
+        ],
+        automation_id="skip-memory",
+        tracer={"mid": "turn-1"},
+    )
+
+    khoj_message = captured["messages"][1]
+    artifact = khoj_message.artifacts[0]
+    assert artifact["id"] == "assistant:turn-1"
+    assert artifact["content"] == "## 今日计划\n- [ ] 复习 RAG"
+    assert artifact["source_refs"] == [
+        {
+            "query": "view_file:experiences/a.md",
+            "file": "experiences/a.md",
+            "uri": "local-kb://experiences/a.md#L1-L3",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -47,7 +99,7 @@ async def test_notes_tool_loop_appends_only_when_model_calls_write_tool(tmp_path
     monkeypatch.setenv("KHOJ_ALLOW_VAULT_WRITE", "true")
 
     result = await collect_notes_evidence_with_tools(
-        "写进 notes.md",
+        "写进 notes.md：HashMap 扩容要讲清楚。",
         [],
         user=object(),
         agent=None,
@@ -63,6 +115,7 @@ async def test_notes_tool_loop_appends_only_when_model_calls_write_tool(tmp_path
                     ]
                 }
             ),
+            json.dumps({"grounded": True, "reason": "matches the previous assistant plan"}),
             "done",
         ),
     )
@@ -70,6 +123,429 @@ async def test_notes_tool_loop_appends_only_when_model_calls_write_tool(tmp_path
     assert "HashMap 扩容要讲清楚。" in (tmp_path / "notes.md").read_text(encoding="utf-8")
     assert result.references[-1]["query"] == "append_note"
     assert result.references[-1]["status"] == "written"
+
+
+@pytest.mark.asyncio
+async def test_notes_tool_loop_retries_source_bound_append_when_content_drifts(tmp_path, monkeypatch):
+    daily = tmp_path / "daily" / "2026-07-01.md"
+    daily.parent.mkdir()
+    daily.write_text("# 2026-07-01 每日计划\n\n## 今日计划\n", encoding="utf-8")
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+    monkeypatch.setenv("KHOJ_ALLOW_VAULT_WRITE", "true")
+    chat_history = [
+        SimpleNamespace(by="you", message="根据 experiences/面经-携程-AI应用开发-截图.md 给我规划下今日的学习日记"),
+        SimpleNamespace(
+            by="khoj",
+            message=(
+                "## 今日打卡\n"
+                "- [ ] 携程 AI 应用开发面经\n\n"
+                "## 今日计划\n"
+                "- [ ] 复习携程 AI 应用开发面经\n"
+                "- [ ] 梳理 RAG 项目回答\n"
+                "- [ ] 准备 Agent 工程化追问\n"
+            ),
+        ),
+    ]
+
+    result = await collect_notes_evidence_with_tools(
+        "把这个写进学习日记中",
+        chat_history,
+        user=object(),
+        agent=None,
+        send_message=fake_model(
+            json.dumps(
+                {
+                    "calls": [
+                        {
+                            "name": "append_note",
+                            "args": {
+                                "path": "daily/2026-07-01.md",
+                                "heading": "今日计划",
+                                "content": "- 处理 raw/agent-e2e-2026-06-30.md 和 Windows 同步问题\n- 复习携程 AI 应用开发",
+                                "source_refs": [{"type": "assistant_message", "turn": -1}],
+                                "write_intent": "adapt_to_template",
+                            },
+                            "id": "1",
+                        }
+                    ]
+                }
+            ),
+            json.dumps(
+                {
+                    "calls": [
+                        {
+                            "name": "append_note",
+                            "args": {
+                                "path": "daily/2026-07-01.md",
+                                "heading": "今日计划",
+                                "content": (
+                                    "- [ ] 复习携程 AI 应用开发面经\n"
+                                    "- [ ] 梳理 RAG 项目回答\n"
+                                    "- [ ] 准备 Agent 工程化追问"
+                                ),
+                                "source_refs": [{"type": "assistant_message", "turn": -1}],
+                                "write_intent": "adapt_to_template",
+                            },
+                            "id": "2",
+                        }
+                    ]
+                }
+            ),
+            json.dumps({"grounded": True, "reason": "same plan"}),
+            "done",
+        ),
+    )
+
+    text = daily.read_text(encoding="utf-8")
+    assert "raw/agent-e2e-2026-06-30.md" not in text
+    assert "Windows 同步问题" not in text
+    assert "携程 AI 应用开发面经" in text
+    assert [ref["status"] for ref in result.references if ref["query"] == "append_note"] == ["source_mismatch", "written"]
+
+
+@pytest.mark.asyncio
+async def test_notes_tool_loop_uses_verifier_for_non_file_drift(tmp_path, monkeypatch):
+    (tmp_path / "daily").mkdir()
+    (tmp_path / "daily" / "2026-07-01.md").write_text("# 2026-07-01 每日计划\n", encoding="utf-8")
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+    monkeypatch.setenv("KHOJ_ALLOW_VAULT_WRITE", "true")
+    chat_history = [SimpleNamespace(by="khoj", message="- [ ] 复习携程 AI 应用开发面经\n- [ ] 梳理 RAG 项目回答")]
+
+    result = await collect_notes_evidence_with_tools(
+        "把这个写进学习日记中",
+        chat_history,
+        user=object(),
+        agent=None,
+        send_message=fake_model(
+            json.dumps(
+                {
+                    "calls": [
+                        {
+                            "name": "append_note",
+                            "args": {
+                                "path": "daily/2026-07-01.md",
+                                "content": "- [ ] 处理 Windows 同步问题\n- [ ] 复习携程 AI 应用开发面经",
+                                "source_refs": [{"type": "assistant_message", "turn": -1}],
+                                "write_intent": "adapt_to_template",
+                            },
+                            "id": "1",
+                        }
+                    ]
+                }
+            ),
+            json.dumps({"grounded": False, "reason": "Windows sync is not in the source"}),
+            json.dumps(
+                {
+                    "calls": [
+                        {
+                            "name": "append_note",
+                            "args": {
+                                "path": "daily/2026-07-01.md",
+                                "content": "- [ ] 复习携程 AI 应用开发面经\n- [ ] 梳理 RAG 项目回答",
+                                "source_refs": [{"type": "assistant_message", "turn": -1}],
+                                "write_intent": "adapt_to_template",
+                            },
+                            "id": "2",
+                        }
+                    ]
+                }
+            ),
+            json.dumps({"grounded": True, "reason": "matches the source"}),
+            "done",
+        ),
+    )
+
+    text = (tmp_path / "daily" / "2026-07-01.md").read_text(encoding="utf-8")
+    assert "Windows 同步问题" not in text
+    assert "梳理 RAG 项目回答" in text
+    assert [ref["status"] for ref in result.references if ref["query"] == "append_note"] == ["source_mismatch", "written"]
+
+
+@pytest.mark.asyncio
+async def test_notes_tool_loop_requires_source_refs_for_generated_append_content(tmp_path, monkeypatch):
+    (tmp_path / "notes.md").write_text("# 计划\n", encoding="utf-8")
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+    monkeypatch.setenv("KHOJ_ALLOW_VAULT_WRITE", "true")
+    chat_history = [SimpleNamespace(by="khoj", message="- [ ] 复习携程 AI 应用开发面经")]
+
+    result = await collect_notes_evidence_with_tools(
+        "把这个写进 notes.md",
+        chat_history,
+        user=object(),
+        agent=None,
+        send_message=fake_model(
+            json.dumps(
+                {"calls": [{"name": "append_note", "args": {"path": "notes.md", "content": "- [ ] 复习携程 AI 应用开发面经"}, "id": "1"}]}
+            ),
+            json.dumps(
+                {
+                    "calls": [
+                        {
+                            "name": "append_note",
+                            "args": {
+                                "path": "notes.md",
+                                "content": "- [ ] 复习携程 AI 应用开发面经",
+                                "source_refs": [{"type": "assistant_message", "turn": -1}],
+                                "write_intent": "preserve",
+                            },
+                            "id": "2",
+                        }
+                    ]
+                }
+            ),
+            json.dumps({"grounded": True, "reason": "template adaptation from interview note"}),
+            "done",
+        ),
+    )
+
+    assert (tmp_path / "notes.md").read_text(encoding="utf-8").count("复习携程 AI 应用开发面经") == 1
+    assert [ref["status"] for ref in result.references if ref["query"] == "append_note"] == ["source_refs_required", "written"]
+
+
+@pytest.mark.asyncio
+async def test_notes_tool_loop_appends_artifact_content_without_recopied_chat(tmp_path, monkeypatch):
+    (tmp_path / "daily").mkdir()
+    target = tmp_path / "daily" / "2026-07-01.md"
+    target.write_text("# 2026-07-01\n\n## 今日计划\n", encoding="utf-8")
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+    monkeypatch.setenv("KHOJ_ALLOW_VAULT_WRITE", "true")
+    chat_history = [
+        SimpleNamespace(
+            by="khoj",
+            message="上一轮展示文本",
+            artifacts=[
+                {
+                    "id": "assistant:plan",
+                    "type": "assistant_response",
+                    "content": "- [ ] 复习携程 AI 应用开发面经\n- [ ] 梳理 RAG 项目回答",
+                    "source_refs": [{"file": "experiences/面经-携程-AI应用开发-截图.md"}],
+                }
+            ],
+        ),
+        SimpleNamespace(by="you", message="raw/agent-e2e-2026-06-30.md 在哪"),
+        SimpleNamespace(
+            by="khoj",
+            message="Windows 同步问题说明",
+            artifacts=[
+                {
+                    "id": "assistant:sync",
+                    "type": "assistant_response",
+                    "content": "- [ ] 处理 Windows 同步问题",
+                    "source_refs": [],
+                }
+            ],
+        ),
+    ]
+
+    result = await collect_notes_evidence_with_tools(
+        "把刚才规划写进学习日记",
+        chat_history,
+        user=object(),
+        agent=None,
+        send_message=fake_model(
+            json.dumps(
+                {
+                    "calls": [
+                        {
+                            "name": "append_note",
+                            "args": {
+                                "path": "daily/2026-07-01.md",
+                                "heading": "今日计划",
+                                "artifact_id": "assistant:plan",
+                            },
+                            "id": "1",
+                        }
+                    ]
+                }
+            ),
+            "done",
+        ),
+    )
+
+    text = target.read_text(encoding="utf-8")
+    assert "携程 AI 应用开发面经" in text
+    assert "Windows 同步问题" not in text
+    assert "raw/agent-e2e-2026-06-30.md" not in text
+    assert [ref["status"] for ref in result.references if ref["query"] == "append_note"] == ["written"]
+
+
+@pytest.mark.asyncio
+async def test_notes_tool_loop_verifies_content_adapted_from_artifact(tmp_path, monkeypatch):
+    (tmp_path / "daily.md").write_text("# Daily\n", encoding="utf-8")
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+    monkeypatch.setenv("KHOJ_ALLOW_VAULT_WRITE", "true")
+    chat_history = [
+        SimpleNamespace(
+            by="khoj",
+            message="plan",
+            artifacts=[
+                {
+                    "id": "assistant:plan",
+                    "type": "assistant_response",
+                    "content": "- [ ] 复习携程 AI 应用开发面经\n- [ ] 梳理 RAG 项目回答",
+                    "source_refs": [],
+                }
+            ],
+        )
+    ]
+
+    result = await collect_notes_evidence_with_tools(
+        "把这个整理成日记格式写入 daily.md",
+        chat_history,
+        user=object(),
+        agent=None,
+        send_message=fake_model(
+            json.dumps(
+                {
+                    "calls": [
+                        {
+                            "name": "append_note",
+                            "args": {
+                                "path": "daily.md",
+                                "artifact_id": "assistant:plan",
+                                "content": "## 今日计划\n- [ ] 复习携程 AI 应用开发面经\n- [ ] 梳理 RAG 项目回答",
+                                "source_refs": [{"type": "artifact", "id": "assistant:plan"}],
+                                "write_intent": "adapt_to_template",
+                            },
+                            "id": "1",
+                        }
+                    ]
+                }
+            ),
+            json.dumps({"grounded": True, "reason": "adapted from artifact"}),
+            "done",
+        ),
+    )
+
+    assert "## 今日计划" in (tmp_path / "daily.md").read_text(encoding="utf-8")
+    assert [ref["status"] for ref in result.references if ref["query"] == "append_note"] == ["written"]
+
+
+@pytest.mark.asyncio
+async def test_notes_tool_loop_rejects_missing_artifact_id(tmp_path, monkeypatch):
+    (tmp_path / "daily.md").write_text("# Daily\n", encoding="utf-8")
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+    monkeypatch.setenv("KHOJ_ALLOW_VAULT_WRITE", "true")
+
+    result = await collect_notes_evidence_with_tools(
+        "把 artifact 写入 daily.md",
+        [],
+        user=object(),
+        agent=None,
+        send_message=fake_model(
+            json.dumps(
+                {
+                    "calls": [
+                        {
+                            "name": "append_note",
+                            "args": {"path": "daily.md", "artifact_id": "assistant:missing"},
+                            "id": "1",
+                        }
+                    ]
+                }
+            ),
+            "done",
+        ),
+    )
+
+    assert (tmp_path / "daily.md").read_text(encoding="utf-8") == "# Daily\n"
+    assert [ref["status"] for ref in result.references if ref["query"] == "append_note"] == ["artifact_not_found"]
+
+
+@pytest.mark.asyncio
+async def test_notes_tool_loop_includes_recent_artifact_catalog(tmp_path, monkeypatch):
+    (tmp_path / "daily.md").write_text("# Daily\n", encoding="utf-8")
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+    calls = []
+
+    async def send_message(**kwargs):
+        calls.append(kwargs)
+        return ResponseWithThought(text=json.dumps({"calls": []}))
+
+    await collect_notes_evidence_with_tools(
+        "把这个写入 daily.md",
+        [
+            SimpleNamespace(
+                by="khoj",
+                message="plan",
+                artifacts=[
+                    {
+                        "id": "assistant:plan",
+                        "type": "assistant_response",
+                        "content": "- [ ] 复习携程 AI 应用开发面经",
+                        "source_refs": [{"file": "experiences/面经.md"}],
+                    }
+                ],
+            )
+        ],
+        user=object(),
+        agent=None,
+        send_message=send_message,
+        max_iterations=1,
+    )
+
+    assert "Recent conversation artifacts" in calls[0]["query"]
+    assert "assistant:plan" in calls[0]["query"]
+    assert '"artifact_id"' in calls[0]["query"]
+
+
+@pytest.mark.asyncio
+async def test_notes_tool_loop_allows_template_adapted_file_append(tmp_path, monkeypatch):
+    (tmp_path / "experiences").mkdir()
+    (tmp_path / "daily").mkdir()
+    (tmp_path / "experiences" / "面经-携程-AI应用开发-截图.md").write_text(
+        "- RAG 重点追问 chunking、检索、embedding 选型、召回排序和评估。\n"
+        "- lost in middle 可以从上下文排序、摘要压缩、rerank 和长上下文评估角度准备。\n"
+        "- Skills 要讲清 description、触发边界、失败处理和可观测性。\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "daily" / "2026-07-01.md").write_text("# 2026-07-01 每日计划\n", encoding="utf-8")
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+    monkeypatch.setenv("KHOJ_ALLOW_VAULT_WRITE", "true")
+
+    content = (
+        "## 今日学习计划：携程 AI 应用开发面经复习\n\n"
+        "### 今日目标\n\n"
+        "今天围绕携程 AI 应用开发面经复习，把高频问题整理成面试时可以自然表达的工程化回答。\n\n"
+        "### 今日重点\n\n"
+        "- [ ] 复习 RAG chunking、检索、embedding 选型、召回排序和评估。\n"
+        "- [ ] 整理 lost in middle 的上下文排序、摘要压缩、rerank 和长上下文评估。\n"
+        "- [ ] 准备 Skills description、触发边界、失败处理和可观测性。\n\n"
+        "### 今日产出\n\n"
+        "- [ ] 输出一版 1 分钟口述答案。"
+    )
+
+    result = await collect_notes_evidence_with_tools(
+        "根据 experiences/面经-携程-AI应用开发-截图.md 写入学习日记",
+        [],
+        user=object(),
+        agent=None,
+        send_message=fake_model(
+            json.dumps(
+                {
+                    "calls": [
+                        {
+                            "name": "append_note",
+                            "args": {
+                                "path": "daily/2026-07-01.md",
+                                "content": content,
+                                "source_refs": [{"type": "file", "path": "experiences/面经-携程-AI应用开发-截图.md"}],
+                                "write_intent": "adapt_to_template",
+                            },
+                            "id": "1",
+                        }
+                    ]
+                }
+            ),
+            json.dumps({"grounded": True, "reason": "template adaptation from interview note"}),
+            "done",
+        ),
+    )
+
+    assert "今日学习计划：携程 AI 应用开发面经复习" in (tmp_path / "daily" / "2026-07-01.md").read_text(
+        encoding="utf-8"
+    )
+    assert [ref["status"] for ref in result.references if ref["query"] == "append_note"] == ["written"]
 
 
 @pytest.mark.asyncio
@@ -235,7 +711,7 @@ async def test_notes_tool_loop_can_create_note_with_append_tool(tmp_path, monkey
     monkeypatch.setenv("KHOJ_ALLOW_VAULT_WRITE", "true")
 
     result = await collect_notes_evidence_with_tools(
-        "新建 raw/test.md",
+        "新建 raw/test.md，内容是 # Test",
         [],
         user=object(),
         agent=None,
@@ -305,6 +781,7 @@ async def test_notes_tool_loop_requires_exact_view_after_discovery_tool(tmp_path
 
     assert len(calls) == 4
     assert result.references[0]["uri"] == "local-kb://notes.md#L1-L3"
+    assert result.references[0]["kb_root"] == str(tmp_path)
 
 
 @pytest.mark.asyncio
@@ -405,6 +882,8 @@ async def test_notes_tool_loop_loads_nested_official_obsidian_skill(tmp_path, mo
     assert calls[0]["response_type"] == "json_object"
     assert calls[0]["tools"] == []
     assert '"append_note"' in calls[0]["query"]
+    assert '"source_refs"' in calls[0]["query"]
+    assert '"write_intent"' in calls[0]["query"]
     assert '"read_skill"' in calls[0]["query"]
     assert '"view_file"' in calls[0]["query"]
 

@@ -106,6 +106,8 @@ User's Notes:
 notes_grounding_system = """
 When the message includes personal notes, treat those notes as the highest-priority source for private facts.
 Use the note content, file path, and file title to resolve people and entities mentioned by the user.
+Treat local-kb:// paths as relative to the Khoj server's configured knowledge-base root, not necessarily the user's Windows or Obsidian client folder.
+If the user asks why they cannot see a note or whether it exists locally, distinguish server-side KB files from files synced into the user's visible client folder.
 If a note-backed private entity resembles a public figure or common name, answer from the provided notes instead of public knowledge.
 For first-person questions about "I", "me", or "my", only use notes that are about the user as identified by the conversation. Do not answer from notes about a different named person.
 If the notes do not contain enough information, say so rather than substituting public facts.
@@ -696,76 +698,6 @@ Assuming you can search the user's files and the internet.
 You decide which of the tool AIs listed below would you use to accomplish the user assigned task. You **only** have access to the following tool AIs:
 
 {tools}
-""".strip()
-)
-
-pick_relevant_tools = PromptTemplate.from_template(
-    """
-You are Khoj, an extremely smart and helpful search assistant.
-{personality_context}
-- You have access to a variety of data sources to help you answer the user's question.
-- You can use any subset of data sources listed below to collect more relevant information.
-- You can select the most appropriate output format from the options listed below to respond to the user's question.
-- Both the data sources and output format should be selected based on the user's query and relevant context provided in the chat history.
-
-Which of the data sources, output format listed below would you use to answer the user's question? You **only** have access to the following:
-
-Data Sources:
-{sources}
-
-Output Formats:
-{outputs}
-
-Here are some examples:
-
-Example:
-Chat History:
-User: I'm thinking of moving to a new city. I'm trying to decide between New York and San Francisco
-AI: Moving to a new city can be challenging. Both New York and San Francisco are great cities to live in. New York is known for its diverse culture and San Francisco is known for its tech scene.
-
-Q: Chart the population growth of each of those cities in the last decade
-Khoj: {{"source": ["online", "code"], "output": "text"}}
-
-Example:
-Chat History:
-User: I'm thinking of my next vacation idea. Ideally, I want to see something new and exciting
-AI: Excellent! Taking a vacation is a great way to relax and recharge.
-
-Q: Where did Grandma grow up?
-Khoj: {{"source": ["notes"], "output": "text"}}
-
-Example:
-Chat History:
-User: Good morning
-AI: Good morning! How can I help you today?
-
-Q: How can I share my files with Khoj?
-Khoj: {{"source": ["notes", "online"], "output": "text"}}
-
-Example:
-Chat History:
-User: What is the first element in the periodic table?
-AI: The first element in the periodic table is Hydrogen.
-
-Q: Summarize this article https://en.wikipedia.org/wiki/Hydrogen
-Khoj: {{"source": ["webpage"], "output": "text"}}
-
-Example:
-Chat History:
-User: I'm learning to play the guitar, so I can make a band with my friends
-AI: Learning to play the guitar is a great hobby. It can be a fun way to socialize and express yourself.
-
-Q: Create a painting of my recent jamming sessions
-Khoj: {{"source": ["notes"], "output": "image"}}
-
-Now it's your turn to pick the appropriate data sources and output format to answer the user's query. Respond with a JSON object, including both `source` and `output` in the following format. Do not say anything else.
-{{"source": list[str], "output': str}}
-
-Chat History:
-{chat_history}
-
-Q: {query}
-Khoj:
 """.strip()
 )
 
