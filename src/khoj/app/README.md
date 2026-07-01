@@ -17,7 +17,7 @@ docker-compose up
 
 ## Setup (Local)
 
-### Install Postgres (with PgVector)
+### Install Postgres
 
 #### MacOS
 - Install the [Postgres.app](https://postgresapp.com/).
@@ -28,23 +28,14 @@ From [official instructions](https://wiki.postgresql.org/wiki/Apt)
 ```bash
 sudo apt install -y postgresql-common
 sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
-sudo apt install postgres-16 postgresql-16-pgvector
+sudo apt install postgres-16
 ```
 
 #### Windows
 - Use the [recommended installer](https://www.postgresql.org/download/windows/)
 
 #### From Source
-1. Follow instructions to [Install Postgres](https://www.postgresql.org/download/)
-2. Follow instructions to [Install PgVector](https://github.com/pgvector/pgvector#installation) in case you need to manually install it. Reproduced instructions below for convenience.
-
-```bash
-cd /tmp
-git clone --branch v0.5.1 https://github.com/pgvector/pgvector.git
-cd pgvector
-make
-make install # may need sudo
-```
+Follow instructions to [Install Postgres](https://www.postgresql.org/download/).
 
 ### Create the Khoj database
 

@@ -1,6 +1,6 @@
 services:
   database:
-    image: docker.io/pgvector/pgvector:pg15
+    image: docker.io/postgres:16
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -57,7 +57,6 @@ services:
     working_dir: /app
     volumes:
       - khoj_config:/root/.khoj/
-      - khoj_models:/root/.cache/torch/sentence_transformers
       - khoj_models:/root/.cache/huggingface
       # uncomment line below to mount docker socket to allow khoj to use its computer.
       # - /var/run/docker.sock:/var/run/docker.sock
