@@ -15,18 +15,10 @@ default_openai_chat_models = ["gpt-4o-mini", "gpt-4.1", "o3", "o4-mini"]
 default_gemini_chat_models = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"]
 default_anthropic_chat_models = ["claude-sonnet-4-0", "claude-3-5-haiku-latest"]
 
-empty_config = {
-    "search-type": {
-        "image": {"encoder": "sentence-transformers/clip-ViT-B-32", "model_directory": "~/.khoj/search/image/"},
-    },
-}
+empty_config = {"search-type": {}}
 
 # default app config to use
-default_config = {
-    "search-type": {
-        "image": {"encoder": "sentence-transformers/clip-ViT-B-32", "model_directory": "~/.khoj/search/image/"},
-    },
-}
+default_config = {"search-type": {}}
 
 model_to_cost: Dict[str, Dict[str, float]] = {
     # OpenAI Pricing: https://openai.com/api/pricing/

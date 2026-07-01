@@ -47,7 +47,6 @@ from khoj.database.adapters import (
     UserMemoryAdapters,
     aget_user_by_email,
     create_khoj_token,
-    get_default_search_model,
     get_khoj_tokens,
     get_user_name,
     require_valid_user,
@@ -102,7 +101,6 @@ from khoj.processor.conversation.utils import (
     clean_mermaidjs,
     construct_chat_history,
     construct_question_history,
-    defilter_query,
     generate_chatml_messages_with_context,
     is_retryable_exception,
 )
@@ -119,7 +117,6 @@ from khoj.utils.helpers import (
     get_file_type,
     in_debug_mode,
     is_code_sandbox_enabled,
-    is_env_var_true,
     is_none_or_empty,
     is_operator_enabled,
     is_valid_url,
@@ -132,10 +129,11 @@ from khoj.utils.helpers import (
 from khoj.utils.local_kb import (
     LocalKBError,
     get_local_kb_root,
-    grep_local_kb_files,
-    list_local_kb_files,
-    load_local_kb_profile_references,
-    read_local_kb_file,
+    kb_grep,
+    kb_headings,
+    kb_list,
+    kb_read,
+    kb_resolve_link,
 )
 from khoj.utils.rawconfig import (
     ChatRequestBody,
@@ -177,10 +175,6 @@ def validate_chat_model(user: KhojUser):
 
     if default_chat_model.model_type == "openai" and not default_chat_model.ai_model_api:
         raise HTTPException(status_code=500, detail="Contact the server administrator to add a chat model.")
-
-
-def load_local_vault_references(max_files: int = 24, max_chars: int = 12000) -> List[Dict[str, str]]:
-    return load_local_kb_profile_references(max_files=max_files, max_chars=max_chars)
 
 
 def has_user_document_source(user: KhojUser) -> bool:
@@ -401,7 +395,7 @@ async def aget_data_sources_and_output_format(
     has_document_source = user_has_entries or get_local_kb_root() is not None
 
     for source, description in tool_descriptions_for_llm.items():
-        # Local KB reads do not require DB/RAG entries.
+        # Local KB reads do not require DB entries.
         if source == ConversationCommand.Notes and not has_document_source:
             continue
         if source == ConversationCommand.Operator and not is_operator_enabled():
@@ -845,19 +839,34 @@ async def generate_summary_from_files(
 ):
     try:
         file_objects = []
+        local_file_names = []
+        local_context = []
         if file_filters:
-            file_objects = await FileObjectAdapters.aget_file_objects_by_names(user, file_filters)
+            if get_local_kb_root():
+                for file_filter in file_filters:
+                    try:
+                        local_file = kb_read(file_filter, max_lines=200)
+                        local_file_names.append(local_file.path)
+                        local_context.append(f"File: {local_file.path}\n\n{local_file.text}")
+                    except LocalKBError as e:
+                        yield str(e)
+                        return
+                file_filters = []
+            if file_filters:
+                file_objects = await FileObjectAdapters.aget_file_objects_by_names(user, file_filters)
         elif await EntryAdapters.aagent_has_entries(agent):
             file_names = await EntryAdapters.aget_agent_entry_filepaths(agent)
             if len(file_names) > 0:
                 file_objects = await FileObjectAdapters.aget_file_objects_by_name(None, file_names.pop(), agent)
 
-        if len(file_objects) == 0 and not query_files:
+        if len(file_objects) == 0 and not local_context and not query_files:
             response_log = "Sorry, I couldn't find anything to summarize."
             yield response_log
             return
 
-        contextual_data = " ".join([f"File: {file.file_name}\n\n{file.raw_text}" for file in file_objects])
+        contextual_data = " ".join(
+            local_context + [f"File: {file.file_name}\n\n{file.raw_text}" for file in file_objects]
+        )
 
         if query_files:
             contextual_data += f"\n\n{query_files}"
@@ -865,7 +874,7 @@ async def generate_summary_from_files(
         if not q:
             q = "Create a general summary of the file"
 
-        file_names = [file.file_name for file in file_objects]
+        file_names = local_file_names + [file.file_name for file in file_objects]
         file_names.extend(file_filters)
 
         all_file_names = ""
@@ -1284,156 +1293,6 @@ async def generate_mermaidjs_diagram_from_description(
         return clean_mermaidjs(raw_response.text.strip())
 
 
-async def search_documents(
-    q: str,
-    n: int,
-    d: float,
-    user: KhojUser,
-    chat_history: list[ChatMessageModel],
-    conversation_id: str,
-    conversation_commands: List[ConversationCommand] = [ConversationCommand.Notes],
-    location_data: LocationData = None,
-    send_status_func: Optional[Callable] = None,
-    query_images: Optional[List[str]] = None,
-    query_files: str = None,
-    relevant_memories: List[UserMemory] = None,
-    previous_inferred_queries: Set = set(),
-    fast_model: bool = True,
-    agent: Agent = None,
-    tracer: dict = {},
-):
-    # Initialize Variables
-    compiled_references: List[dict[str, str]] = []
-    inferred_queries: List[str] = []
-
-    agent_has_entries = False
-
-    if agent:
-        agent_has_entries = await sync_to_async(EntryAdapters.agent_has_entries)(agent=agent)
-
-    if ConversationCommand.Notes not in conversation_commands and not agent_has_entries:
-        yield compiled_references, inferred_queries, q
-        return
-
-    # If Notes is not in the conversation command, then the search should be restricted to the agent's knowledge base
-    should_limit_to_agent_knowledge = ConversationCommand.Notes not in conversation_commands
-
-    if not await sync_to_async(EntryAdapters.user_has_entries)(user=user):
-        if not agent_has_entries:
-            logger.debug("No documents in knowledge base. Use a Khoj client to sync and chat with your docs.")
-            yield compiled_references, inferred_queries, q
-            return
-
-    # Extract filter terms from user message
-    defiltered_query = defilter_query(q)
-    filters_in_query = q.replace(defiltered_query, "").strip()
-    conversation = await sync_to_async(ConversationAdapters.get_conversation_by_id)(conversation_id)
-
-    if not conversation:
-        logger.error(f"Conversation with id {conversation_id} not found when extracting references.")
-        yield compiled_references, inferred_queries, defiltered_query
-        return
-
-    filters_in_query += " ".join([f'file:"{filter}"' for filter in conversation.file_filters])
-    if is_none_or_empty(filters_in_query):
-        logger.debug(f"Filters in query: {filters_in_query}")
-
-    personality_context = prompts.personality_context.format(personality=agent.personality) if agent else ""
-
-    # Infer search queries from user message
-    with timer("Extracting search queries took", logger):
-        inferred_queries = await extract_questions(
-            query=defiltered_query,
-            user=user,
-            query_files=query_files,
-            query_images=query_images,
-            relevant_memories=relevant_memories,
-            personality_context=personality_context,
-            location_data=location_data,
-            chat_history=chat_history,
-            fast_model=fast_model,
-            agent=agent,
-            tracer=tracer,
-        )
-    question_words = {
-        "a",
-        "an",
-        "and",
-        "are",
-        "can",
-        "could",
-        "did",
-        "do",
-        "does",
-        "how",
-        "i",
-        "is",
-        "just",
-        "me",
-        "my",
-        "the",
-        "there",
-        "was",
-        "were",
-        "what",
-        "when",
-        "where",
-        "which",
-        "who",
-        "why",
-        "would",
-    }
-    entity_queries = []
-    for match in re.finditer(r"\b[A-Z][a-z]+(?:s|'s)?(?:\s+[A-Z][a-z]+(?:s|'s)?)*\b", defiltered_query):
-        words = [word.removesuffix("'s") for word in match.group(0).split()]
-        words = [word for word in words if word.lower() not in question_words]
-        if not words:
-            continue
-        entity_query = " ".join(words)
-        if entity_query.endswith("s"):
-            entity_queries.append(entity_query[:-1])
-        entity_queries.append(entity_query)
-    inferred_queries = list(dict.fromkeys([*entity_queries, *inferred_queries]))
-
-    # Collate search results as context for the LLM
-    inferred_queries = [query for query in inferred_queries if query not in previous_inferred_queries]
-    with timer("Searching knowledge base took", logger):
-        search_results = []
-        logger.info(f"🔍 Searching knowledge base with queries: {inferred_queries}")
-        if send_status_func:
-            inferred_queries_str = "\n- " + "\n- ".join(inferred_queries)
-            async for event in send_status_func(f"**Searching Documents for:** {inferred_queries_str}"):
-                yield {ChatEvent.STATUS: event}
-        for query in inferred_queries:
-            results = await execute_search(
-                user if not should_limit_to_agent_knowledge else None,
-                f"{query} {filters_in_query}",
-                n=n,
-                t=SearchType.All,
-                r=True,
-                max_distance=d,
-                dedupe=False,
-                agent=agent,
-            )
-            # Attach associated query to each search result
-            for item in results:
-                item.additional["query"] = query
-                search_results.append(item)
-
-        search_results = text_search.deduplicated_search_responses(search_results)
-        compiled_references = [
-            {
-                "query": item.additional["query"],
-                "compiled": item["entry"],
-                "file": item.additional["file"],
-                "uri": item.additional["uri"],
-            }
-            for item in search_results
-        ]
-
-    yield compiled_references, inferred_queries, defiltered_query
-
-
 async def extract_questions(
     query: str,
     user: KhojUser,
@@ -1481,13 +1340,13 @@ async def extract_questions(
     prompt = prompts.extract_questions_user_message.format(text=query, chat_history=chat_history_str)
 
     class DocumentQueries(BaseModel):
-        """Choose semantic search queries to run on user documents."""
+        """Choose evidence queries to run on user documents."""
 
         queries: List[str] = Field(
             ...,
             min_length=1,
             max_length=max_queries,
-            description="List of semantic search queries to run on user documents.",
+            description="List of evidence queries to run on user documents.",
         )
 
     agent_chat_model = AgentAdapters.get_agent_chat_model(agent, user) if agent else None
@@ -1554,76 +1413,55 @@ async def execute_search(
     dedupe: Optional[bool] = True,
     agent: Optional[Agent] = None,
 ):
-    # Run validation checks
-    results: List[SearchResponse] = []
-
     start_time = time.time()
 
-    # Ensure the agent, if present, is accessible by the user
     if user and agent and not await AgentAdapters.ais_agent_accessible(agent, user):
         logger.error(f"Agent {agent.slug} is not accessible by user {user}")
-        return results
+        return []
 
     if q is None or q == "":
         logger.warning("No query param (q) passed in API call to initiate search")
-        return results
+        return []
 
-    # initialize variables
     user_query = q.strip()
     results_count = n or 5
     t = t or state.SearchType.All
-    search_tasks = []
-
-    # return cached results, if available
     if user:
         query_cache_key = f"{user_query}-{n}-{t}-{r}-{max_distance}-{dedupe}"
         if query_cache_key in state.query_cache[user.uuid]:
             logger.debug("Return response from query cache")
             return state.query_cache[user.uuid][query_cache_key]
 
-    # Encode query with filter terms removed
     defiltered_query = user_query
     for filter in [DateFilter(), WordFilter(), FileFilter()]:
         defiltered_query = filter.defilter(defiltered_query)
+    file_type_filter = None if t.value == SearchType.All.value else t.value
+    query = await sync_to_async(EntryAdapters.apply_filters)(user, user_query, file_type_filter, agent)
+    entries = await sync_to_async(list)(query[: max(results_count * 20, 50)])
+    terms = [term.lower() for term in re.findall(r"[A-Za-z0-9_+#.-]+|[\u4e00-\u9fff]{2,}", defiltered_query)]
 
-    with timer("Encoding query took", logger=logger):
-        search_model = await sync_to_async(get_default_search_model)()
-        encoded_asymmetric_query = state.embeddings_model[search_model.name].embed_query(defiltered_query)
+    def rank(entry) -> tuple[int, str]:
+        haystack = f"{entry.heading or ''}\n{entry.compiled or ''}\n{entry.raw or ''}".lower()
+        hits = sum(1 for term in terms if term and term in haystack)
+        return (-hits, entry.file_path or entry.file_name or "")
 
-    # Use asyncio to run searches in parallel
-    if t.value in [
-        SearchType.All.value,
-        SearchType.Org.value,
-        SearchType.Markdown.value,
-        SearchType.Plaintext.value,
-        SearchType.Pdf.value,
-    ]:
-        # query markdown notes
-        search_tasks.append(
-            text_search.query(
-                user_query,
-                user,
-                t,
-                question_embedding=encoded_asymmetric_query,
-                max_distance=max_distance,
-                agent=agent,
-            )
+    if terms:
+        entries = [entry for entry in entries if -rank(entry)[0] > 0]
+    entries = sorted(entries, key=rank)[:results_count]
+    results = [
+        SearchResponse(
+            entry=entry.compiled,
+            score=float(index),
+            additional={
+                "file": entry.file_path or entry.file_name,
+                "uri": entry.url or entry.file_path or entry.file_name,
+                "query": defiltered_query,
+            },
+            corpus_id=str(entry.corpus_id),
         )
+        for index, entry in enumerate(entries)
+    ]
 
-    # Query across each requested content types in parallel
-    with timer("Query took", logger):
-        if search_tasks:
-            hits_list = await asyncio.gather(*search_tasks)
-            for hits in hits_list:
-                # Collate results
-                results += text_search.collate_results(hits, dedupe=dedupe)
-
-                # Sort results across all content types and take top results
-                results = text_search.rerank_and_sort_results(
-                    results, query=defiltered_query, rank_results=r, search_model_name=search_model.name
-                )[:results_count]
-
-    # Cache results
     if user:
         state.query_cache[user.uuid][query_cache_key] = results
 
@@ -2698,7 +2536,12 @@ def scheduled_chat(
     query_dict.pop("stream", None)
 
     # Replace the original scheduling query with the scheduled query
-    query_dict["q"] = [query_to_run]
+    automated_context = (
+        "\n\nAutomation context: This scheduled automation has already triggered. "
+        f"Original scheduling request: {scheduling_request}. "
+        "Perform the task now; do not ask when to schedule it or create another reminder."
+    )
+    query_dict["q"] = [f"{query_to_run}{automated_context}"]
 
     # Replace the original conversation_id with the conversation_id
     if conversation_id:
@@ -2795,15 +2638,10 @@ def schedule_automation(
         # Run automation at some random minute (to distribute request load) instead of running every X minutes
         crontime = " ".join([str(math.floor(random() * 60))] + crontime.split(" ")[1:])
 
-    # Convert timezone string to timezone object
-    try:
-        user_timezone = pytz.timezone(timezone)
-    except pytz.UnknownTimeZoneError:
-        logger.warning(f"Invalid timezone: {timezone}. Fallback to use UTC to schedule automation.")
-        user_timezone = pytz.utc
-
+    user_timezone = get_automation_timezone(timezone)
     trigger = CronTrigger.from_crontab(crontime, user_timezone)
     trigger.jitter = 60
+
     # Generate id and metadata used by task scheduler and process locks for the task runs
     job_metadata = json.dumps(
         {
@@ -2839,6 +2677,14 @@ def schedule_automation(
     return job
 
 
+def get_automation_timezone(timezone: str | None):
+    try:
+        return pytz.timezone(timezone)
+    except pytz.UnknownTimeZoneError:
+        logger.warning(f"Invalid timezone: {timezone}. Fallback to use UTC to schedule automation.")
+        return pytz.utc
+
+
 async def aschedule_automation(
     query_to_run: str,
     subject: str,
@@ -2855,7 +2701,7 @@ async def aschedule_automation(
         # Run automation at some random minute (to distribute request load) instead of running every X minutes
         crontime = " ".join([str(math.floor(random() * 60))] + crontime.split(" ")[1:])
 
-    user_timezone = pytz.timezone(timezone)
+    user_timezone = get_automation_timezone(timezone)
     trigger = CronTrigger.from_crontab(crontime, user_timezone)
     trigger.jitter = 60
     # Generate id and metadata used by task scheduler and process locks for the task runs
@@ -3157,7 +3003,7 @@ def configure_content(
             "markdown"
         ):
             logger.info("💎 Setting up search for markdown notes")
-            # Extract Entries, Generate Markdown Embeddings
+            # Extract Markdown entries
             text_search.setup(
                 MarkdownToEntries,
                 files.get("markdown"),
@@ -3175,7 +3021,7 @@ def configure_content(
             "pdf"
         ):
             logger.info("🖨️ Setting up search for pdf")
-            # Extract Entries, Generate PDF Embeddings
+            # Extract PDF entries
             text_search.setup(
                 PdfToEntries,
                 files.get("pdf"),
@@ -3193,7 +3039,7 @@ def configure_content(
             "plaintext"
         ):
             logger.info("📄 Setting up search for plaintext")
-            # Extract Entries, Generate Plaintext Embeddings
+            # Extract plaintext entries
             text_search.setup(
                 PlaintextToEntries,
                 files.get("plaintext"),
@@ -3227,17 +3073,15 @@ async def view_file_content(
 
     try:
         local_kb_root = get_local_kb_root()
-        rag_fallback = is_env_var_true("KHOJ_ENABLE_RAG_FALLBACK")
         if local_kb_root:
             try:
-                local_file = read_local_kb_file(path, start_line=start_line, end_line=end_line)
+                local_file = kb_read(path, start_line=start_line, end_line=end_line, max_lines=80)
                 yield [{"query": query, "file": local_file.path, "uri": local_file.path, "compiled": local_file.text}]
                 return
             except LocalKBError as e:
-                if e.kind != "not_found" or not rag_fallback:
-                    logger.warning("Local KB file read blocked: %s", e)
-                    yield [{"query": query, "file": path, "uri": path, "compiled": str(e)}]
-                    return
+                logger.warning("Local KB file read blocked: %s", e)
+                yield [{"query": query, "file": path, "uri": path, "compiled": str(e)}]
+                return
 
         # Get the file object from the database by name
         file_objects = await FileObjectAdapters.aget_file_objects_by_name(user, path)
@@ -3350,14 +3194,14 @@ async def grep_files(
 
     try:
         local_kb_root = get_local_kb_root()
-        rag_fallback = is_env_var_true("KHOJ_ENABLE_RAG_FALLBACK")
         if local_kb_root:
             try:
-                local_result = grep_local_kb_files(
-                    regex,
+                local_result = kb_grep(
+                    regex_pattern,
                     path_prefix=path_prefix,
-                    lines_before=lines_before,
-                    lines_after=lines_after,
+                    mode="regex",
+                    before=lines_before,
+                    after=lines_after,
                     max_results=1000,
                 )
                 if local_result.lines:
@@ -3376,20 +3220,18 @@ async def grep_files(
                         "compiled": "\n".join(local_result.lines),
                     }
                     return
-                if not rag_fallback:
-                    query = _generate_query(0, 0, path_prefix, regex_pattern, lines_before, lines_after)
-                    yield {"query": query, "file": path_prefix, "uri": path_prefix, "compiled": "No matches found."}
-                    return
+                query = _generate_query(0, 0, path_prefix, regex_pattern, lines_before, lines_after)
+                yield {"query": query, "file": path_prefix, "uri": path_prefix, "compiled": "No matches found."}
+                return
             except LocalKBError as e:
-                if e.kind != "not_found" or not rag_fallback:
-                    logger.warning("Local KB grep blocked: %s", e)
-                    yield {
-                        "query": _generate_query(0, 0, path_prefix, regex_pattern, lines_before, lines_after),
-                        "file": path_prefix,
-                        "uri": path_prefix,
-                        "compiled": str(e),
-                    }
-                    return
+                logger.warning("Local KB grep blocked: %s", e)
+                yield {
+                    "query": _generate_query(0, 0, path_prefix, regex_pattern, lines_before, lines_after),
+                    "file": path_prefix,
+                    "uri": path_prefix,
+                    "compiled": str(e),
+                }
+                return
 
         # Make db pushdown filters more permissive by removing line anchors
         # The precise line-anchored matching will be done in Python stage
@@ -3498,32 +3340,31 @@ async def list_files(
 
     try:
         local_kb_root = get_local_kb_root()
-        rag_fallback = is_env_var_true("KHOJ_ENABLE_RAG_FALLBACK")
         if local_kb_root:
             try:
-                files, total_count = list_local_kb_files(path, pattern, limit=100)
-                if files:
-                    display_files = files
-                    if total_count > len(files):
-                        display_files = files + [
-                            f"... {total_count - len(files)} more files found. Use glob pattern to narrow down results."
-                        ]
-                    query = _generate_query(total_count, path, pattern)
-                    yield {"query": query, "file": path, "uri": path, "compiled": "\n- ".join(display_files)}
+                local_list = kb_list(path, pattern, limit=100)
+                if local_list.items:
+                    display_items = [
+                        f"{item['path']}/" if item["type"] == "directory" else item["path"] for item in local_list.items
+                    ]
+                    if local_list.truncated:
+                        display_items.append(
+                            f"... {local_list.total - len(local_list.items)} more files found. Use glob pattern to narrow down results."
+                        )
+                    query = _generate_query(local_list.total, path, pattern)
+                    yield {"query": query, "file": path, "uri": path, "compiled": "\n- ".join(display_items)}
                     return
-                if not rag_fallback:
-                    yield {
-                        "query": _generate_query(0, path, pattern),
-                        "file": path,
-                        "uri": path,
-                        "compiled": "No files found.",
-                    }
-                    return
+                yield {
+                    "query": _generate_query(0, path, pattern),
+                    "file": path,
+                    "uri": path,
+                    "compiled": "No files found.",
+                }
+                return
             except LocalKBError as e:
-                if e.kind != "not_found" or not rag_fallback:
-                    logger.warning("Local KB list blocked: %s", e)
-                    yield {"query": _generate_query(0, path, pattern), "file": path, "uri": path, "compiled": str(e)}
-                    return
+                logger.warning("Local KB list blocked: %s", e)
+                yield {"query": _generate_query(0, path, pattern), "file": path, "uri": path, "compiled": str(e)}
+                return
 
         # Get user files by path prefix when specified
         path = path or ""
@@ -3564,3 +3405,59 @@ async def list_files(
         error_msg = f"Error listing files in {path}: {str(e)}"
         logger.error(error_msg, exc_info=True)
         yield {"query": query, "file": path, "uri": path, "compiled": error_msg}
+
+
+async def view_kb_headings(path: str, user: KhojUser = None):
+    query = f"View headings: {path}"
+    try:
+        if not get_local_kb_root():
+            yield {"query": query, "file": path, "uri": path, "compiled": "Local knowledge base is not configured."}
+            return
+        result = kb_headings(path)
+        if not result.headings:
+            yield {"query": query, "file": result.path, "uri": result.path, "compiled": "No Markdown headings found."}
+            return
+        compiled = "\n".join(
+            f"{'#' * heading['level']} {heading['title']} (L{heading['start_line']}-L{heading['end_line']})"
+            for heading in result.headings
+        )
+        yield {"query": query, "file": result.path, "uri": result.path, "compiled": compiled}
+    except LocalKBError as e:
+        logger.warning("Local KB headings blocked: %s", e)
+        yield {"query": query, "file": path, "uri": path, "compiled": str(e)}
+    except Exception as e:
+        error_msg = f"Error viewing headings for {path}: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        yield {"query": query, "file": path, "uri": path, "compiled": error_msg}
+
+
+async def resolve_kb_link(from_path: str, link: str, user: KhojUser = None):
+    query = f"Resolve link: {link} from {from_path}"
+    try:
+        if not get_local_kb_root():
+            yield {
+                "query": query,
+                "file": from_path,
+                "uri": from_path,
+                "compiled": "Local knowledge base is not configured.",
+            }
+            return
+        result = kb_resolve_link(from_path, link)
+        if result.status == "resolved":
+            compiled = f"Resolved to {result.resolved}"
+            if result.anchor:
+                compiled += f"#{result.anchor}"
+        elif result.status == "ambiguous":
+            compiled = "Ambiguous link candidates:\n- " + "\n- ".join(result.candidates)
+        else:
+            compiled = f"Link {result.status}."
+        yield {
+            "query": query,
+            "file": result.resolved or from_path,
+            "uri": result.resolved or from_path,
+            "compiled": compiled,
+        }
+    except Exception as e:
+        error_msg = f"Error resolving link {link}: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        yield {"query": query, "file": from_path, "uri": from_path, "compiled": error_msg}

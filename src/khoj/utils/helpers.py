@@ -406,7 +406,6 @@ class ConversationCommand(str, Enum):
     KbHeadings = "kb_headings"
     KbResolveLink = "kb_resolve_link"
     RegexSearchFiles = "regex_search_files"
-    SemanticSearchFiles = "semantic_search_files"
     SearchWeb = "search_web"
     ReadWebpage = "read_webpage"
     PythonCoder = "run_code"
@@ -590,28 +589,6 @@ tools_for_research_llm = {
                     "description": "Optional glob pattern to filter files (e.g., '*.md').",
                 },
             },
-        },
-    ),
-    ConversationCommand.SemanticSearchFiles: ToolDefinition(
-        name="semantic_search_files",
-        description=dedent(
-            """
-            To have the tool AI search through the user's indexed knowledge base.
-            Helpful to answer questions for which finding some relevant notes or documents can be useful. Example: "When was Tom born?"
-            This tool AI cannot find all relevant notes or documents, only a subset of them.
-            It is a good starting point to find keywords, discover similar topics or related concepts and some relevant notes or documents.
-            For a given query, the tool AI can perform a maximum of {max_search_queries} search subqueries per iteration.
-            """
-        ).strip(),
-        schema={
-            "type": "object",
-            "properties": {
-                "q": {
-                    "type": "string",
-                    "description": "Your natural language query for the tool to search in the user's knowledge base.",
-                },
-            },
-            "required": ["q"],
         },
     ),
     ConversationCommand.KbHeadings: ToolDefinition(

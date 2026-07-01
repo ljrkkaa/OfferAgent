@@ -428,9 +428,6 @@ def construct_tool_chat_history(
         return []
 
     extract_inferred_query_map: Dict[ConversationCommand, Callable[[ResearchIteration], List[str]]] = {
-        ConversationCommand.SemanticSearchFiles: (
-            lambda iteration: [c["query"] for c in iteration.context] if iteration.context else []
-        ),
         ConversationCommand.SearchWeb: (
             lambda iteration: list(iteration.onlineContext.keys()) if iteration.onlineContext else []
         ),

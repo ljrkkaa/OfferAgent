@@ -67,9 +67,7 @@ async def test_extract_question_with_date_filter_from_relative_month(chat_client
         start in generated_query and end in generated_query
         for generated_query in response
         for start, end in expected_responses
-    ), (
-        "Expected date filter to limit to March 1984 in response but got: " + str(response)
-    )
+    ), "Expected date filter to limit to March 1984 in response but got: " + str(response)
 
 
 # ----------------------------------------------------------------------------------------------------

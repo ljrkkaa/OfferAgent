@@ -13,6 +13,8 @@ from starlette.authentication import has_required_scope, requires
 
 from khoj.database.adapters import AgentAdapters, ConversationAdapters
 from khoj.database.models import Agent, Conversation, KhojUser, PriceTier
+from khoj.processor.conversation.codex.auth import get_codex_model
+from khoj.processor.conversation.codex.utils import use_codex_runtime
 from khoj.routers.helpers import CommonQueryParams, acheck_if_safe_prompt
 from khoj.utils.helpers import (
     ConversationCommand,
@@ -28,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 
 api_agents = APIRouter()
+
+
+def _recent_conversation_cutoff():
+    return datetime.now(timezone.utc) - timedelta(weeks=2)
 
 
 class ModifyAgentBody(BaseModel):
@@ -52,6 +58,72 @@ class ModifyHiddenAgentBody(BaseModel):
     output_modes: Optional[List[str]] = []
 
 
+def _validate_agent_choices(body: BaseModel) -> Optional[Response]:
+    checks = {
+        "privacy_level": {choice.value for choice in Agent.PrivacyLevel},
+        "icon": {choice.value for choice in Agent.StyleIconTypes},
+        "color": {choice.value for choice in Agent.StyleColorTypes},
+        "input_tools": {choice.value for choice in Agent.InputToolOptions},
+        "output_modes": {choice.value for choice in Agent.OutputModeOptions},
+    }
+    for field, allowed in checks.items():
+        value = getattr(body, field, None)
+        if value is None:
+            continue
+        invalid = [item for item in value if item not in allowed] if isinstance(value, list) else []
+        if invalid:
+            return Response(
+                content=json.dumps({"error": f"Invalid {field}: {invalid[0]}"}),
+                media_type="application/json",
+                status_code=400,
+            )
+        if not isinstance(value, list) and value not in allowed:
+            return Response(
+                content=json.dumps({"error": f"Invalid {field}: {value}"}),
+                media_type="application/json",
+                status_code=400,
+            )
+    return None
+
+
+async def _resolve_agent_chat_model(
+    request: Request, chat_model_name: Optional[str]
+) -> tuple[Optional[str], Optional[Response]]:
+    if not chat_model_name:
+        if use_codex_runtime():
+            return None, Response(
+                content=json.dumps({"error": "Agent editing requires a configured database chat model."}),
+                media_type="application/json",
+                status_code=400,
+            )
+        return None, None
+
+    chat_model = await ConversationAdapters.aget_chat_model_by_friendly_name(chat_model_name)
+    if not chat_model:
+        return None, Response(
+            content=json.dumps({"error": f"Unknown chat model: {chat_model_name}"}),
+            media_type="application/json",
+            status_code=400,
+        )
+
+    if has_required_scope(request, ["premium"]) or chat_model.price_tier == PriceTier.FREE:
+        return chat_model.name, None
+    return None, Response(
+        content=json.dumps({"error": f"Chat model {chat_model_name} is not available for this account."}),
+        media_type="application/json",
+        status_code=403,
+    )
+
+
+async def _agent_chat_model_name(agent: Agent, user: Optional[KhojUser]) -> Optional[str]:
+    chat_model = await AgentAdapters.aget_agent_chat_model(agent, user)
+    if chat_model:
+        return chat_model.friendly_name
+    if use_codex_runtime():
+        return get_codex_model()
+    return None
+
+
 @api_agents.get("", response_class=Response)
 async def all_agents(
     request: Request,
@@ -65,7 +137,6 @@ async def all_agents(
     for agent in agents:
         files = agent.fileobject_set.all()
         file_names = [file.file_name for file in files]
-        agent_chat_model = await AgentAdapters.aget_agent_chat_model(agent, user)
         agent_packet = {
             "slug": agent.slug,
             "name": agent.name,
@@ -75,19 +146,19 @@ async def all_agents(
             "color": agent.style_color,
             "icon": agent.style_icon,
             "privacy_level": agent.privacy_level,
-            "chat_model": agent_chat_model.friendly_name,
+            "chat_model": await _agent_chat_model_name(agent, user),
             "files": file_names,
             "input_tools": agent.input_tools,
             "output_modes": agent.output_modes,
         }
-        if agent.slug == default_agent.slug:
+        if default_agent and agent.slug == default_agent.slug:
             default_agent_packet = agent_packet
         else:
             agents_packet.append(agent_packet)
 
     # Load recent conversation sessions
     min_date = datetime.min.replace(tzinfo=timezone.utc)
-    two_weeks_ago = datetime.today() - timedelta(weeks=2)
+    two_weeks_ago = _recent_conversation_cutoff()
     conversations = []
     if user:
         conversations = await sync_to_async(list[Conversation])(
@@ -129,6 +200,24 @@ async def get_agent_by_conversation(
         agent = await AgentAdapters.aget_default_agent()
 
     if agent is None:
+        if use_codex_runtime():
+            agents_packet = {
+                "slug": AgentAdapters.DEFAULT_AGENT_SLUG,
+                "name": AgentAdapters.DEFAULT_AGENT_NAME,
+                "persona": "",
+                "creator": None,
+                "managed_by_admin": True,
+                "color": Agent.StyleColorTypes.ORANGE,
+                "icon": Agent.StyleIconTypes.LIGHTBULB,
+                "privacy_level": Agent.PrivacyLevel.PUBLIC,
+                "chat_model": get_codex_model(),
+                "has_files": False,
+                "input_tools": [],
+                "output_modes": [],
+                "is_creator": False,
+                "is_hidden": False,
+            }
+            return Response(content=json.dumps(agents_packet), media_type="application/json", status_code=200)
         return Response(
             content=json.dumps({"error": f"Agent for conversation id {conversation_id} not found for user {user}."}),
             media_type="application/json",
@@ -176,7 +265,10 @@ async def get_agent_configuration_options(
         conversation_command = ConversationCommand(key)
         if conversation_command == ConversationCommand.Operator and not is_operator_enabled():
             continue
-        if conversation_command in [ConversationCommand.Online, ConversationCommand.Webpage] and not is_web_search_enabled():
+        if (
+            conversation_command in [ConversationCommand.Online, ConversationCommand.Webpage]
+            and not is_web_search_enabled()
+        ):
             continue
         if conversation_command == ConversationCommand.Code and not is_code_sandbox_enabled():
             continue
@@ -218,7 +310,6 @@ async def get_agent(
 
     files = agent.fileobject_set.all()
     file_names = [file.file_name for file in files]
-    agent.chat_model = await AgentAdapters.aget_agent_chat_model(agent, user)
 
     agents_packet = {
         "slug": agent.slug,
@@ -229,7 +320,7 @@ async def get_agent(
         "color": agent.style_color,
         "icon": agent.style_icon,
         "privacy_level": agent.privacy_level,
-        "chat_model": agent.chat_model.friendly_name,
+        "chat_model": await _agent_chat_model_name(agent, user),
         "files": file_names,
         "input_tools": agent.input_tools,
         "output_modes": agent.output_modes,
@@ -249,7 +340,7 @@ async def delete_agent(
 
     agent = await AgentAdapters.aget_agent_by_slug(agent_slug, user)
 
-    if not agent:
+    if not agent or agent.creator_id != user.id:
         return Response(
             content=json.dumps({"error": f"Agent with name {agent_slug} not found."}),
             media_type="application/json",
@@ -270,20 +361,28 @@ async def update_hidden_agent(
 ) -> Response:
     user: KhojUser = request.user.object
 
-    subscribed = has_required_scope(request, ["premium"])
-    chat_model = await ConversationAdapters.aget_chat_model_by_friendly_name(body.chat_model)
-    if subscribed or chat_model.price_tier == PriceTier.FREE:
-        agent_chat_model = chat_model.name
-    else:
-        agent_chat_model = None
+    validation_error = _validate_agent_choices(body)
+    if validation_error:
+        return validation_error
+
+    agent_chat_model, error_response = await _resolve_agent_chat_model(request, body.chat_model)
+    if error_response:
+        return error_response
 
     selected_agent = await AgentAdapters.aget_agent_by_slug(body.slug, user)
 
-    if not selected_agent:
+    if not selected_agent or selected_agent.creator_id != user.id:
         return Response(
             content=json.dumps({"error": f"Agent with name {body.slug} not found."}),
             media_type="application/json",
             status_code=404,
+        )
+
+    if not selected_agent.is_hidden:
+        return Response(
+            content=json.dumps({"error": f"Agent with name {body.slug} is not hidden."}),
+            media_type="application/json",
+            status_code=400,
         )
 
     agent = await AgentAdapters.aupdate_hidden_agent(
@@ -295,14 +394,13 @@ async def update_hidden_agent(
         output_modes=body.output_modes,
         existing_agent=selected_agent,
     )
-    agent.chat_model = await AgentAdapters.aget_agent_chat_model(agent, user)
 
     agents_packet = {
         "slug": agent.slug,
         "name": agent.name,
         "persona": agent.personality,
         "creator": agent.creator.username if agent.creator else None,
-        "chat_model": agent.chat_model.friendly_name,
+        "chat_model": await _agent_chat_model_name(agent, user),
         "input_tools": agent.input_tools,
         "output_modes": agent.output_modes,
     }
@@ -320,12 +418,13 @@ async def create_hidden_agent(
 ) -> Response:
     user: KhojUser = request.user.object
 
-    subscribed = has_required_scope(request, ["premium"])
-    chat_model = await ConversationAdapters.aget_chat_model_by_friendly_name(body.chat_model)
-    if subscribed or chat_model.price_tier == PriceTier.FREE:
-        agent_chat_model = chat_model.name
-    else:
-        agent_chat_model = None
+    validation_error = _validate_agent_choices(body)
+    if validation_error:
+        return validation_error
+
+    agent_chat_model, error_response = await _resolve_agent_chat_model(request, body.chat_model)
+    if error_response:
+        return error_response
 
     conversation = await ConversationAdapters.aget_conversation_by_user(user=user, conversation_id=conversation_id)
     if not conversation:
@@ -355,7 +454,6 @@ async def create_hidden_agent(
         output_modes=body.output_modes,
         existing_agent=None,
     )
-    agent.chat_model = await AgentAdapters.aget_agent_chat_model(agent, user)
 
     conversation.agent = agent
     await conversation.asave()
@@ -365,7 +463,7 @@ async def create_hidden_agent(
         "name": agent.name,
         "persona": agent.personality,
         "creator": agent.creator.username if agent.creator else None,
-        "chat_model": agent.chat_model.friendly_name,
+        "chat_model": await _agent_chat_model_name(agent, user),
         "input_tools": agent.input_tools,
         "output_modes": agent.output_modes,
     }
@@ -382,6 +480,10 @@ async def create_agent(
 ) -> Response:
     user: KhojUser = request.user.object
 
+    validation_error = _validate_agent_choices(body)
+    if validation_error:
+        return validation_error
+
     is_safe_prompt, reason = await acheck_if_safe_prompt(
         body.persona, user, lax=body.privacy_level == Agent.PrivacyLevel.PRIVATE
     )
@@ -393,12 +495,9 @@ async def create_agent(
             status_code=400,
         )
 
-    subscribed = has_required_scope(request, ["premium"])
-    chat_model = await ConversationAdapters.aget_chat_model_by_friendly_name(body.chat_model)
-    if subscribed or chat_model.price_tier == PriceTier.FREE:
-        agent_chat_model = chat_model.name
-    else:
-        agent_chat_model = None
+    agent_chat_model, error_response = await _resolve_agent_chat_model(request, body.chat_model)
+    if error_response:
+        return error_response
 
     try:
         agent = await AgentAdapters.aupdate_agent(
@@ -422,7 +521,6 @@ async def create_agent(
             status_code=400,
         )
 
-    agent.chat_model = await AgentAdapters.aget_agent_chat_model(agent, user)
     agents_packet = {
         "slug": agent.slug,
         "name": agent.name,
@@ -432,7 +530,7 @@ async def create_agent(
         "color": agent.style_color,
         "icon": agent.style_icon,
         "privacy_level": agent.privacy_level,
-        "chat_model": agent.chat_model.friendly_name,
+        "chat_model": await _agent_chat_model_name(agent, user),
         "files": body.files,
         "input_tools": agent.input_tools,
         "output_modes": agent.output_modes,
@@ -451,9 +549,13 @@ async def update_agent(
 ) -> Response:
     user: KhojUser = request.user.object
 
+    validation_error = _validate_agent_choices(body)
+    if validation_error:
+        return validation_error
+
     selected_agent = await AgentAdapters.aget_agent_by_slug(body.slug, user)
 
-    if not selected_agent:
+    if not selected_agent or selected_agent.creator_id != user.id:
         return Response(
             content=json.dumps({"error": f"Agent with name {body.name} not found."}),
             media_type="application/json",
@@ -473,12 +575,9 @@ async def update_agent(
                 status_code=400,
             )
 
-    subscribed = has_required_scope(request, ["premium"])
-    chat_model = await ConversationAdapters.aget_chat_model_by_friendly_name(body.chat_model)
-    if subscribed or chat_model.price_tier == PriceTier.FREE:
-        agent_chat_model = chat_model.name
-    else:
-        agent_chat_model = None
+    agent_chat_model, error_response = await _resolve_agent_chat_model(request, body.chat_model)
+    if error_response:
+        return error_response
 
     try:
         agent = await AgentAdapters.aupdate_agent(
@@ -501,7 +600,6 @@ async def update_agent(
             status_code=400,
         )
 
-    agent.chat_model = await AgentAdapters.aget_agent_chat_model(agent, user)
     agents_packet = {
         "slug": agent.slug,
         "name": agent.name,
@@ -511,7 +609,7 @@ async def update_agent(
         "color": agent.style_color,
         "icon": agent.style_icon,
         "privacy_level": agent.privacy_level,
-        "chat_model": agent.chat_model.friendly_name,
+        "chat_model": await _agent_chat_model_name(agent, user),
         "files": body.files,
         "input_tools": agent.input_tools,
         "output_modes": agent.output_modes,

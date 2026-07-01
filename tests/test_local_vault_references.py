@@ -1,7 +1,7 @@
-from khoj.routers.helpers import load_local_vault_references
+from khoj.utils.local_kb import load_local_kb_profile_references
 
 
-def test_load_local_vault_references_reads_agents_first(tmp_path, monkeypatch):
+def test_load_local_kb_profile_references_reads_agents_first(tmp_path, monkeypatch):
     (tmp_path / "java.md").write_text("hashmap notes", encoding="utf-8")
     (tmp_path / "agents.md").write_text("agent instructions", encoding="utf-8")
 
@@ -10,7 +10,7 @@ def test_load_local_vault_references_reads_agents_first(tmp_path, monkeypatch):
     monkeypatch.delenv("KHOJ_LOCAL_VAULT_MAX_FILES", raising=False)
     monkeypatch.delenv("KHOJ_LOCAL_VAULT_MAX_CHARS", raising=False)
 
-    references = load_local_vault_references()
+    references = load_local_kb_profile_references()
 
     assert [item["file"] for item in references] == ["agents.md", "java.md"]
     assert references[0]["compiled"].startswith("# agents.md")

@@ -2,13 +2,15 @@ import asyncio
 import json
 import logging
 import math
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 from asgiref.sync import sync_to_async
 from fastapi import (
     APIRouter,
     Depends,
     Header,
+    HTTPException,
+    Query,
     Request,
     Response,
     UploadFile,
@@ -36,10 +38,34 @@ logger = logging.getLogger(__name__)
 api_content = APIRouter()
 
 
+def _decode_text_upload(content: bytes, encoding: Optional[str]) -> str:
+    try:
+        return content.decode(encoding or "utf-8", errors="replace")
+    except LookupError:
+        return content.decode("utf-8", errors="replace")
+
+
 class IndexerInput(BaseModel):
     markdown: Optional[dict[str, str]] = None
     pdf: Optional[dict[str, bytes]] = None
     plaintext: Optional[dict[str, str]] = None
+
+
+class FileObjectResponse(BaseModel):
+    file_name: str
+    raw_text: str
+    updated_at: str
+
+
+class FilesResponse(BaseModel):
+    files: list[FileObjectResponse]
+    num_pages: int
+
+
+class FileDetailResponse(BaseModel):
+    id: int
+    file_name: str
+    raw_text: str
 
 
 @api_content.put("")
@@ -47,7 +73,7 @@ class IndexerInput(BaseModel):
 async def put_content(
     request: Request,
     files: List[UploadFile] = [],
-    t: Optional[Union[state.SearchType, str]] = state.SearchType.All,
+    t: Optional[state.SearchType] = state.SearchType.All,
     client: Optional[str] = None,
     user_agent: Optional[str] = Header(None),
     referer: Optional[str] = Header(None),
@@ -69,7 +95,7 @@ async def put_content(
 async def patch_content(
     request: Request,
     files: List[UploadFile] = [],
-    t: Optional[Union[state.SearchType, str]] = state.SearchType.All,
+    t: Optional[state.SearchType] = state.SearchType.All,
     client: Optional[str] = None,
     user_agent: Optional[str] = Header(None),
     referer: Optional[str] = Header(None),
@@ -159,10 +185,10 @@ def get_content_types(request: Request, client: Optional[str] = None):
     return list(configured_content_types & all_content_types)
 
 
-@api_content.get("/files", response_model=Dict[str, str])
+@api_content.get("/files", response_model=FilesResponse)
 @requires(["authenticated"])
 async def get_all_files(
-    request: Request, client: Optional[str] = None, truncated: Optional[bool] = True, page: int = 0
+    request: Request, client: Optional[str] = None, truncated: Optional[bool] = True, page: int = Query(0, ge=0)
 ):
     user = request.user.object
 
@@ -197,7 +223,7 @@ async def get_all_files(
     return Response(content=json.dumps(data_packet), media_type="application/json", status_code=200)
 
 
-@api_content.get("/file", response_model=Dict[str, str])
+@api_content.get("/file", response_model=FileDetailResponse)
 @requires(["authenticated"])
 async def get_file_object(
     request: Request,
@@ -206,13 +232,15 @@ async def get_file_object(
 ):
     user = request.user.object
 
-    file_object = (await FileObjectAdapters.aget_file_objects_by_name(user, file_name))[0]
-    if not file_object:
+    file_objects = await FileObjectAdapters.aget_file_objects_by_name(user, file_name)
+    if not file_objects:
         return Response(
             content=json.dumps({"error": "File not found"}),
             media_type="application/json",
             status_code=404,
         )
+
+    file_object = file_objects[0]
 
     update_telemetry_state(
         request=request,
@@ -230,6 +258,16 @@ async def get_file_object(
     )
 
 
+@api_content.get("/{content_source}", response_model=List[str])
+@requires(["authenticated"])
+async def get_content_source_files(request: Request, content_source: str, client: Optional[str] = None):
+    if content_source != "computer":
+        return Response(content=json.dumps([]), media_type="application/json", status_code=404)
+
+    file_list = await sync_to_async(list)(EntryAdapters.get_all_filenames_by_source(request.user.object, "computer"))
+    return Response(content=json.dumps(file_list), media_type="application/json", status_code=200)
+
+
 @api_content.delete("/type/{content_type}", status_code=200)
 @requires(["authenticated"])
 async def delete_content_type(
@@ -239,8 +277,9 @@ async def delete_content_type(
 ):
     user = request.user.object
     if content_type not in {s.value for s in SearchType}:
-        raise ValueError(f"Unsupported content type: {content_type}")
+        raise HTTPException(status_code=400, detail=f"Unsupported content type: {content_type}")
     if content_type == "all":
+        await FileObjectAdapters.adelete_all_file_objects(user)
         await EntryAdapters.adelete_all_entries(user)
     else:
         # Delete file objects of the given type
@@ -270,7 +309,7 @@ async def delete_content_source(
     user = request.user.object
 
     if content_source != "computer":
-        raise ValueError(f"Invalid content source: {content_source}")
+        raise HTTPException(status_code=400, detail=f"Invalid content source: {content_source}")
 
     file_list = await sync_to_async(list)(EntryAdapters.get_all_filenames_by_source(user, content_source))  # type: ignore[call-arg]
     await FileObjectAdapters.adelete_file_objects_by_names(user, file_list)
@@ -316,18 +355,14 @@ async def convert_documents(
 
         file_data = get_file_content(file)
         if file_data.file_type in supported_files:
-            extracted_content = (
-                file_data.content.decode(file_data.encoding) if file_data.encoding else file_data.content
-            )
-
             if file_data.file_type == "pdf":
                 entries_per_page = PdfToEntries.extract_text(file_data.content)
                 annotated_pages = [
                     f"Page {index} of {file_data.name}:\n\n{entry}" for index, entry in enumerate(entries_per_page)
                 ]
                 extracted_content = "\n".join(annotated_pages)
-            elif isinstance(extracted_content, bytes):
-                extracted_content = extracted_content.decode("utf-8")
+            else:
+                extracted_content = _decode_text_upload(file_data.content, file_data.encoding)
 
             # Calculate size in bytes. Some of the content might be in bytes, some in str.
             if isinstance(extracted_content, str):
@@ -362,7 +397,7 @@ async def convert_documents(
 async def indexer(
     request: Request,
     files: list[UploadFile],
-    t: Optional[Union[state.SearchType, str]] = state.SearchType.All,
+    t: Optional[state.SearchType] = state.SearchType.All,
     regenerate: bool = False,
     client: Optional[str] = None,
     user_agent: Optional[str] = Header(None),
@@ -382,7 +417,9 @@ async def indexer(
             file_data = get_file_content(file)
             if file_data.file_type in index_files:
                 index_files[file_data.file_type][file_data.name] = (
-                    file_data.content.decode(file_data.encoding) if file_data.encoding else file_data.content
+                    file_data.content
+                    if file_data.file_type == "pdf"
+                    else _decode_text_upload(file_data.content, file_data.encoding)
                 )
             else:
                 logger.debug(f"Skipped indexing unsupported file type sent by {client} client: {file_data.name}")

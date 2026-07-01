@@ -1,9 +1,10 @@
 import json
 import logging
-from typing import Dict, Optional, Union
+from typing import Optional
 
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
+from pydantic import BaseModel
 from starlette.authentication import has_required_scope, requires
 
 from khoj.database.adapters import ConversationAdapters
@@ -27,7 +28,15 @@ api_model = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-@api_model.get("/chat/options", response_model=Dict[str, Union[str, int]])
+class ChatModelOptionResponse(BaseModel):
+    name: str
+    id: int
+    strengths: Optional[str] = None
+    description: Optional[str] = None
+    tier: Optional[str] = None
+
+
+@api_model.get("/chat/options", response_model=list[ChatModelOptionResponse])
 def get_chat_model_options(
     request: Request,
     client: Optional[str] = None,
@@ -72,6 +81,9 @@ def get_user_chat_model(
 
     if chat_model is None:
         chat_model = ConversationAdapters.get_default_chat_model(user)
+
+    if chat_model is None:
+        return Response(status_code=404, content=json.dumps({"status": "error", "message": "Chat model not found"}))
 
     return Response(status_code=200, content=json.dumps({"id": chat_model.id, "chat_model": chat_model.friendly_name}))
 
@@ -119,7 +131,9 @@ async def update_chat_model(
     if use_codex_runtime():
         model = get_codex_model_by_option_id(id)
         if model is None:
-            return Response(status_code=404, content=json.dumps({"status": "error", "message": "Codex model not found"}))
+            return Response(
+                status_code=404, content=json.dumps({"status": "error", "message": "Codex model not found"})
+            )
         set_codex_model(model)
         update_telemetry_state(
             request=request,
@@ -130,8 +144,13 @@ async def update_chat_model(
         )
         return {"status": "ok"}
 
+    try:
+        chat_model_id = int(id)
+    except ValueError:
+        return Response(status_code=400, content=json.dumps({"status": "error", "message": "Invalid chat model id"}))
+
     # Validate if model can be switched
-    chat_model = await ChatModel.objects.filter(id=int(id)).afirst()
+    chat_model = await ChatModel.objects.filter(id=chat_model_id).afirst()
     if chat_model is None:
         return Response(status_code=404, content=json.dumps({"status": "error", "message": "Chat model not found"}))
     if not subscribed and chat_model.price_tier != PriceTier.FREE:
@@ -140,7 +159,7 @@ async def update_chat_model(
             content=json.dumps({"status": "error", "message": "Subscribe to switch to this chat model"}),
         )
 
-    new_config = await ConversationAdapters.aset_user_conversation_processor(user, int(id))
+    new_config = await ConversationAdapters.aset_user_conversation_processor(user, chat_model_id)
 
     update_telemetry_state(
         request=request,
@@ -151,6 +170,6 @@ async def update_chat_model(
     )
 
     if new_config is None:
-        return {"status": "error", "message": "Model not found"}
+        return Response(status_code=404, content=json.dumps({"status": "error", "message": "Model not found"}))
 
     return {"status": "ok"}

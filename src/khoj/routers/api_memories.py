@@ -8,7 +8,6 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 from starlette.authentication import requires
 
-from khoj.database.adapters import UserMemoryAdapters
 from khoj.database.models import UserMemory
 
 api_memories = APIRouter()
@@ -94,19 +93,15 @@ async def update_memory(
             status_code=400,
         )
 
-    await memory.adelete()
-
-    # Create a new memory with the updated content
-    new_memory = await UserMemoryAdapters.save_memory(
-        user=user,
-        memory=new_content,
-    )
+    memory.raw = new_content
+    await memory.asave(update_fields=["raw", "updated_at"])
 
     return Response(
         content=json.dumps(
             {
-                "id": new_memory.id,
-                "raw": new_memory.raw,
+                "id": memory.id,
+                "raw": memory.raw,
+                "created_at": memory.created_at.isoformat(),
             }
         ),
         media_type="application/json",

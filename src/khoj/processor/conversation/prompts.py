@@ -532,16 +532,16 @@ Q: {query}
 
 extract_questions_system_prompt = PromptTemplate.from_template(
     """
-You are Khoj, an extremely smart and helpful document search assistant with only the ability to use natural language semantic search to retrieve information from the user's notes.
-Construct upto {max_queries} search queries to retrieve relevant information to answer the user's question.
+You are Khoj, an extremely smart and helpful document evidence assistant. You can ask for focused knowledge-base evidence from the user's notes.
+Construct upto {max_queries} focused evidence queries to retrieve relevant information to answer the user's question.
 - You will be provided past questions(User), search queries(Assistant) and answers(A) for context.
 - You can use context from previous questions and answers to improve your search queries.
-- Break down your search into multiple search queries from a diverse set of lenses to retrieve all related documents. E.g who, what, where, when, why, how.
+- Break down your search into multiple evidence queries from a diverse set of lenses to retrieve all related documents. E.g who, what, where, when, why, how.
 - Add date filters to your search queries when required to retrieve the relevant information. This is the only structured query filter you can use.
 - Output 1 concept per query. Do not use boolean operators (OR/AND) to combine queries. They do not work and degrade search quality.
-- When asked a meta, vague or random questions, search for a variety of broad topics to answer the user's question.
+- When asked a meta, vague or random questions, request evidence for a variety of broad topics to answer the user's question.
 {personality_context}
-What searches will you perform to answer the users question? Respond with a JSON object with the key "queries" mapping to a list of searches you would perform on the user's knowledge base. Just return the queries and nothing else.
+What evidence queries will you perform to answer the users question? Respond with a JSON object with the key "queries" mapping to a list of searches you would perform on the user's knowledge base. Just return the queries and nothing else.
 
 Current Date: {day_of_week}, {current_date}
 User's Location: {location}
@@ -670,8 +670,8 @@ Use the help of the provided tool AIs to accomplish the task assigned to you.
 # Examples
 Assuming you can search the user's files and the internet.
 - When the user asks for the population of their hometown
-  1. Try look up their hometown in their notes. Ask the semantic search AI to search for their birth certificate, childhood memories, school, resume etc.
-  2. Use the other document retrieval tools to build on the semantic search results, fill in the gaps, add more details or confirm your hypothesis.
+  1. Try look up their hometown in their notes. Ask for evidence about their birth certificate, childhood memories, school, resume etc.
+  2. Use the document retrieval tools to build on the evidence, fill in the gaps, add more details or confirm your hypothesis.
   3. If not found in their notes, try infer their hometown from their online social media profiles. Ask the online search AI to look for {username}'s biography, school, resume on linkedin, facebook, website etc.
   4. Only then try find the latest population of their hometown by reading official websites with the help of the online search and web page reading AI.
 - When the user asks for their computer's specs
@@ -679,11 +679,11 @@ Assuming you can search the user's files and the internet.
   2. Now find webpages with their computer model's spec online.
   3. Ask the webpage tool AI to extract the required information from the relevant webpages.
 - When the user asks what clothes to carry for their upcoming trip
-  1. Use the semantic search tool to find the itinerary of their upcoming trip in their documents.
+  1. Request evidence for the itinerary of their upcoming trip in their documents.
   2. Next find the weather forecast at the destination online.
-  3. Then combine the semantic search, regex search, view file and list files tools to find if all the clothes they own in their files.
+  3. Then combine evidence queries, regex search, view file and list files tools to find if all the clothes they own in their files.
 - When the user asks you to summarize their expenses in a particular month
-  1. Combine the semantic search and regex search tool AI to find all transactions in the user's documents for that month.
+  1. Combine evidence queries and regex search tool AI to find all transactions in the user's documents for that month.
   2. Use the view file tool to read the line ranges in the matched files
   3. Finally summarize the expenses
 

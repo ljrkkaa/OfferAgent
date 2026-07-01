@@ -12,22 +12,24 @@ These tests verify:
    - Non-default agents only see their own memories
 """
 
-import pytest
 from unittest.mock import MagicMock
 
+import pytest
+from asgiref.sync import async_to_sync
+
 from khoj.database.adapters import ConversationAdapters, UserMemoryAdapters
-from khoj.database.models import ServerChatSettings, UserConversationConfig
+from khoj.database.models import ServerChatSettings, UserConversationConfig, UserMemory
 from khoj.routers.helpers import get_user_config
 from tests.helpers import (
-    acreate_user,
-    acreate_subscription,
-    acreate_chat_model,
-    acreate_default_agent,
-    acreate_agent,
-    acreate_test_memory,
     ServerChatSettingsFactory,
     SubscriptionFactory,
     UserFactory,
+    acreate_agent,
+    acreate_chat_model,
+    acreate_default_agent,
+    acreate_subscription,
+    acreate_test_memory,
+    acreate_user,
 )
 
 
@@ -50,7 +52,7 @@ def test_memory_enabled_no_server_config_user_enabled():
     """When no server config but user has explicitly enabled memory."""
     user = UserFactory()
     SubscriptionFactory(user=user)
-    user_config = UserConversationConfig.objects.create(user=user, enable_memory=True)
+    UserConversationConfig.objects.create(user=user, enable_memory=True)
 
     result = ConversationAdapters.is_memory_enabled(user)
 
@@ -62,7 +64,7 @@ def test_memory_enabled_no_server_config_user_disabled():
     """When no server config but user has explicitly disabled memory."""
     user = UserFactory()
     SubscriptionFactory(user=user)
-    user_config = UserConversationConfig.objects.create(user=user, enable_memory=False)
+    UserConversationConfig.objects.create(user=user, enable_memory=False)
 
     result = ConversationAdapters.is_memory_enabled(user)
 
@@ -384,7 +386,7 @@ async def test_save_memory_with_custom_agent_scopes_to_agent():
     # Create custom agent
     custom_agent = await acreate_agent("Custom Agent", chat_model, "A custom agent")
 
-    # Create memory with custom agent (directly in DB to avoid embeddings)
+    # Create memory with custom agent directly in DB.
     memory = await acreate_test_memory(user, agent=custom_agent, raw_text="custom agent memory")
 
     # Assert: Memory is scoped to the custom agent
@@ -417,6 +419,39 @@ async def test_save_memory_with_default_agent_has_no_agent_scope():
     # Assert: Memory has no agent (global scope)
     assert memory.agent is None
     assert memory.user == user
+
+
+@pytest.mark.anyio
+@pytest.mark.django_db(transaction=True)
+async def test_memory_save_and_search_uses_lexical_lookup():
+    """Memory lookup should work without the removed document search stack."""
+    user = await acreate_user()
+    await acreate_subscription(user)
+    chat_model = await acreate_chat_model()
+    await acreate_default_agent()
+    custom_agent = await acreate_agent("Interview Coach", chat_model, "Interview prep")
+
+    await UserMemoryAdapters.save_memory(user, "prefers Redis interview drills", agent=custom_agent)
+    await UserMemoryAdapters.save_memory(user, "likes weekly planning")
+
+    custom_hits = await UserMemoryAdapters.search_memories("Redis drills", user=user, agent=custom_agent)
+    global_hits = await UserMemoryAdapters.search_memories("weekly planning", user=user)
+
+    assert [memory.raw for memory in custom_hits] == ["prefers Redis interview drills"]
+    assert "likes weekly planning" in [memory.raw for memory in global_hits]
+
+
+@pytest.mark.anyio
+@pytest.mark.django_db(transaction=True)
+async def test_memory_search_empty_query_returns_no_hits():
+    user = await acreate_user()
+    await acreate_subscription(user)
+    await acreate_default_agent()
+    await UserMemoryAdapters.save_memory(user, "prefers Redis interview drills")
+
+    hits = await UserMemoryAdapters.search_memories("   ", user=user)
+
+    assert hits == []
 
 
 @pytest.mark.anyio
@@ -477,3 +512,45 @@ async def test_custom_agent_cannot_see_other_custom_agent_memories():
     chef_memories = await UserMemoryAdapters.pull_memories(user=user, agent=agent_chef)
     assert len(chef_memories) == 1
     assert chef_memories[0].raw == "user likes Italian food"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_memories_api_list_update_delete_preserves_memory_identity(client, api_user):
+    user = api_user.user
+    chat_model = async_to_sync(acreate_chat_model)()
+    agent = async_to_sync(acreate_agent)("memory-api-agent", chat_model, "remember carefully")
+    memory = async_to_sync(acreate_test_memory)(
+        user=user,
+        agent=agent,
+        raw_text="prefers Java interview drills",
+    )
+    headers = {"Authorization": f"Bearer {api_user.token}"}
+
+    response = client.get("/api/memories", headers=headers)
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "id": memory.id,
+            "raw": "prefers Java interview drills",
+            "created_at": memory.created_at.isoformat(),
+        }
+    ]
+
+    response = client.put(
+        f"/api/memories/{memory.id}",
+        headers=headers,
+        json={"raw": "prefers Redis interview drills"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": memory.id,
+        "raw": "prefers Redis interview drills",
+        "created_at": memory.created_at.isoformat(),
+    }
+    memory.refresh_from_db()
+    assert memory.raw == "prefers Redis interview drills"
+    assert memory.agent_id == agent.id
+
+    response = client.delete(f"/api/memories/{memory.id}", headers=headers)
+    assert response.status_code == 204
+    assert not UserMemory.objects.filter(id=memory.id).exists()

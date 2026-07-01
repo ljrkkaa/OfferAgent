@@ -27,16 +27,16 @@ from khoj.routers.helpers import (
     get_message_from_queue,
     grep_files,
     list_files,
-    search_documents,
+    resolve_kb_link,
     send_message_to_model_wrapper,
     view_file_content,
+    view_kb_headings,
 )
 from khoj.utils.helpers import (
     ConversationCommand,
     ToolDefinition,
     dict_to_tuple,
     is_code_sandbox_enabled,
-    is_env_var_true,
     is_none_or_empty,
     is_operator_enabled,
     is_web_search_enabled,
@@ -51,14 +51,13 @@ logger = logging.getLogger(__name__)
 
 
 def _document_research_tools() -> List[ConversationCommand]:
-    tools = [
+    return [
         ConversationCommand.RegexSearchFiles,
         ConversationCommand.ViewFile,
         ConversationCommand.ListFiles,
+        ConversationCommand.KbHeadings,
+        ConversationCommand.KbResolveLink,
     ]
-    if is_env_var_true("KHOJ_ENABLE_RAG_FALLBACK"):
-        tools.insert(0, ConversationCommand.SemanticSearchFiles)
-    return tools
 
 
 class ToolExecutionResult:
@@ -111,50 +110,7 @@ async def execute_tool(
         yield message  # Yield to satisfy async generator protocol expected by tool functions
 
     try:
-        if iteration.query.name == ConversationCommand.SemanticSearchFiles:
-            iteration.context = []
-            previous_inferred_queries = {
-                c["query"] for iter in previous_iterations if iter.context for c in iter.context
-            }
-            async for res in search_documents(
-                **iteration.query.args,
-                n=max_document_searches,
-                d=None,
-                user=user,
-                chat_history=construct_tool_chat_history(previous_iterations, ConversationCommand.SemanticSearchFiles),
-                conversation_id=conversation_id,
-                conversation_commands=[ConversationCommand.Notes],
-                location_data=location,
-                send_status_func=status_collector,
-                query_images=query_images,
-                query_files=query_files,
-                previous_inferred_queries=previous_inferred_queries,
-                agent=agent,
-                tracer=tracer,
-            ):
-                # Status messages are collected by status_collector, skip ChatEvent.STATUS here
-                if isinstance(res, tuple):
-                    result.document_results = res[0]
-                    iteration.context += result.document_results
-
-            if not is_none_or_empty(result.document_results):
-                try:
-                    distinct_files = {d["file"] for d in result.document_results}
-                    distinct_headings = set(
-                        [d["compiled"].split("\n")[0] for d in result.document_results if "compiled" in d]
-                    )
-                    headings_str = "\n- " + "\n- ".join(distinct_headings).replace("#", "")
-                    async for _ in status_collector(
-                        f"**Found {len(distinct_headings)} Notes Across {len(distinct_files)} Files**: {headings_str}"
-                    ):
-                        pass
-                except Exception as e:
-                    iteration.warning = f"Error extracting document references: {e}"
-                    logger.error(iteration.warning, exc_info=True)
-            else:
-                iteration.warning = "No matching document references found"
-
-        elif iteration.query.name == ConversationCommand.SearchWeb:
+        if iteration.query.name == ConversationCommand.SearchWeb:
             previous_subqueries = {
                 subquery for iter in previous_iterations if iter.onlineContext for subquery in iter.onlineContext.keys()
             }
@@ -246,6 +202,34 @@ async def execute_tool(
                     iteration.context += result.document_results
             if result.document_results:
                 async for _ in status_collector(result.document_results[-1].get("query", "Listed files")):
+                    pass
+
+        elif iteration.query.name == ConversationCommand.KbHeadings:
+            async for res in view_kb_headings(
+                **iteration.query.args,
+                user=user,
+            ):
+                if res and isinstance(res, dict):
+                    if iteration.context is None:
+                        iteration.context = []
+                    result.document_results = [res]
+                    iteration.context += result.document_results
+            if result.document_results:
+                async for _ in status_collector(result.document_results[-1].get("query", "Viewed headings")):
+                    pass
+
+        elif iteration.query.name == ConversationCommand.KbResolveLink:
+            async for res in resolve_kb_link(
+                **iteration.query.args,
+                user=user,
+            ):
+                if res and isinstance(res, dict):
+                    if iteration.context is None:
+                        iteration.context = []
+                    result.document_results = [res]
+                    iteration.context += result.document_results
+            if result.document_results:
+                async for _ in status_collector(result.document_results[-1].get("query", "Resolved link")):
                     pass
 
         elif iteration.query.name == ConversationCommand.RegexSearchFiles:
@@ -353,9 +337,6 @@ async def apick_next_tool(
         # Skip showing operator tool as an option if not enabled
         if tool == ConversationCommand.OperateComputer and not is_operator_enabled():
             continue
-        # Semantic search is DB/RAG-only. Local list/read/grep can work directly from disk.
-        if tool == ConversationCommand.SemanticSearchFiles and not user_has_entries:
-            continue
         if tool in document_research_tools and not has_document_source:
             continue
         # Skip showing web search tool if agent has no access to internet
@@ -365,9 +346,7 @@ async def apick_next_tool(
         if tool == ConversationCommand.PythonCoder and not is_code_sandbox_enabled():
             continue
         # Format description with relevant usage limits
-        if tool == ConversationCommand.SemanticSearchFiles:
-            description = tool_data.description.format(max_search_queries=max_document_searches)
-        elif tool == ConversationCommand.ReadWebpage:
+        if tool == ConversationCommand.ReadWebpage:
             description = tool_data.description.format(max_webpages_to_read=max_webpages_to_read)
         elif tool == ConversationCommand.SearchWeb:
             description = tool_data.description.format(max_search_queries=max_online_searches)

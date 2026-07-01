@@ -12,8 +12,10 @@ from urllib.parse import unquote
 
 from fastapi import (
     APIRouter,
+    Body,
     Depends,
     HTTPException,
+    Query,
     Request,
     WebSocket,
     WebSocketDisconnect,
@@ -34,6 +36,7 @@ from khoj.database.adapters import (
 )
 from khoj.database.models import Agent, KhojUser
 from khoj.processor.conversation import prompts
+from khoj.processor.conversation.notes_tool_loop import collect_notes_evidence_with_tools
 from khoj.processor.conversation.openai.utils import is_local_api
 from khoj.processor.conversation.prompts import no_entries_found
 from khoj.processor.conversation.utils import (
@@ -64,15 +67,14 @@ from khoj.routers.helpers import (
     agenerate_chat_response,
     aget_data_sources_and_output_format,
     gather_raw_query_files,
-    generate_summary_from_files,
     generate_mermaidjs_diagram,
+    generate_summary_from_files,
     get_conversation_command,
-    load_local_vault_references,
     get_message_from_queue,
     is_query_empty,
     is_ready_to_chat,
     read_chat_stream,
-    search_documents,
+    send_message_to_model_wrapper,
     update_telemetry_state,
     validate_chat_model,
 )
@@ -91,6 +93,15 @@ from khoj.utils.helpers import (
     is_operator_enabled,
     is_web_search_enabled,
 )
+from khoj.utils.local_kb import get_local_kb_root
+from khoj.utils.openkb import (
+    OpenKBError,
+    dedupe_references,
+    get_kb_engine,
+    openkb_is_ready,
+    save_exploration,
+    wants_openkb_exploration_save,
+)
 from khoj.utils.rawconfig import (
     FileFilterRequest,
     FilesFilterRequest,
@@ -104,6 +115,17 @@ conversation_command_rate_limiter = ConversationCommandRateLimiter(
 )
 
 api_chat = APIRouter()
+
+NON_STREAM_STRUCTURED_EVENTS = {
+    ChatEvent.REFERENCES,
+    ChatEvent.GENERATED_ASSETS,
+    ChatEvent.METADATA,
+    ChatEvent.USAGE,
+}
+
+
+def _should_emit_structured_event(event_type: ChatEvent, stream: bool) -> bool:
+    return stream or event_type in NON_STREAM_STRUCTURED_EVENTS
 
 
 def _hostname(value: str | None) -> str | None:
@@ -132,7 +154,7 @@ def chat_stats(request: Request, common: CommonQueryParams) -> Response:
 
 @api_chat.get("/export", response_class=Response)
 @requires(["authenticated"])
-def export_conversation(request: Request, common: CommonQueryParams, page: Optional[int] = 1) -> Response:
+def export_conversation(request: Request, common: CommonQueryParams, page: int = Query(0, ge=0)) -> Response:
     all_conversations = ConversationAdapters.get_all_conversations_for_export(request.user.object, page=page)
     return Response(content=json.dumps(all_conversations), media_type="application/json", status_code=200)
 
@@ -159,6 +181,8 @@ def remove_files_filter(request: Request, filter: FilesFilterRequest) -> Respons
     conversation_id = filter.conversation_id
     files_filter = filter.filenames
     file_filters = ConversationAdapters.remove_files_from_filter(request.user.object, conversation_id, files_filter)
+    if file_filters is None:
+        return Response(content=json.dumps({"status": "error", "message": "Conversation not found"}), status_code=404)
     return Response(content=json.dumps(file_filters), media_type="application/json", status_code=200)
 
 
@@ -169,6 +193,10 @@ def add_files_filter(request: Request, filter: FilesFilterRequest):
         conversation_id = filter.conversation_id
         files_filter = filter.filenames
         file_filters = ConversationAdapters.add_files_to_filter(request.user.object, conversation_id, files_filter)
+        if file_filters is None:
+            return Response(
+                content=json.dumps({"status": "error", "message": "Conversation not found"}), status_code=404
+            )
         return Response(content=json.dumps(file_filters), media_type="application/json", status_code=200)
     except Exception as e:
         logger.error(f"Error adding file filter {filter.filenames}: {e}", exc_info=True)
@@ -182,6 +210,10 @@ def add_file_filter(request: Request, filter: FileFilterRequest):
         conversation_id = filter.conversation_id
         files_filter = [filter.filename]
         file_filters = ConversationAdapters.add_files_to_filter(request.user.object, conversation_id, files_filter)
+        if file_filters is None:
+            return Response(
+                content=json.dumps({"status": "error", "message": "Conversation not found"}), status_code=404
+            )
         return Response(content=json.dumps(file_filters), media_type="application/json", status_code=200)
     except Exception as e:
         logger.error(f"Error adding file filter {filter.filename}: {e}", exc_info=True)
@@ -194,6 +226,8 @@ def remove_file_filter(request: Request, filter: FileFilterRequest) -> Response:
     conversation_id = filter.conversation_id
     files_filter = [filter.filename]
     file_filters = ConversationAdapters.remove_files_from_filter(request.user.object, conversation_id, files_filter)
+    if file_filters is None:
+        return Response(content=json.dumps({"status": "error", "message": "Conversation not found"}), status_code=404)
     return Response(content=json.dumps(file_filters), media_type="application/json", status_code=200)
 
 
@@ -366,9 +400,24 @@ async def clear_chat_history(
     conversation_id: Optional[str] = None,
 ):
     user = request.user.object
+    target_conversation_id = conversation_id.strip() if conversation_id is not None else None
+    if conversation_id is not None and not target_conversation_id:
+        return Response(
+            content=json.dumps({"status": "error", "message": "Conversation not found"}),
+            media_type="application/json",
+            status_code=404,
+        )
 
     # Clear Conversation History
-    await ConversationAdapters.adelete_conversation_by_user(user, request.user.client_app, conversation_id)
+    deleted_count, _ = await ConversationAdapters.adelete_conversation_by_user(
+        user, request.user.client_app, target_conversation_id
+    )
+    if target_conversation_id and deleted_count == 0:
+        return Response(
+            content=json.dumps({"status": "error", "message": "Conversation not found"}),
+            media_type="application/json",
+            status_code=404,
+        )
 
     update_telemetry_state(
         request=request,
@@ -391,6 +440,11 @@ def fork_public_conversation(
 
     # Load Conversation History
     public_conversation = PublicConversationAdapters.get_public_conversation_by_slug(public_conversation_slug)
+    if public_conversation is None:
+        return Response(
+            content=json.dumps({"status": "error", "message": "Conversation not found"}),
+            status_code=404,
+        )
 
     # Duplicate Public Conversation to User's Private Conversation
     new_conversation = ConversationAdapters.create_conversation_from_public_conversation(
@@ -442,6 +496,11 @@ def duplicate_chat_history_public_conversation(
 
     # Duplicate Conversation History to Public Conversation
     conversation = ConversationAdapters.get_conversation_by_user(user, request.user.client_app, conversation_id)
+    if conversation is None:
+        return Response(
+            content=json.dumps({"status": "error", "message": "Conversation not found"}),
+            status_code=404,
+        )
     public_conversation = ConversationAdapters.make_public_conversation_copy(conversation)
     public_conversation_url = PublicConversationAdapters.get_public_conversation_url(public_conversation)
 
@@ -467,7 +526,12 @@ def delete_public_conversation(
     user = request.user.object
 
     # Delete Public Conversation
-    PublicConversationAdapters.delete_public_conversation_by_slug(user=user, slug=public_conversation_slug)
+    deleted = PublicConversationAdapters.delete_public_conversation_by_slug(user=user, slug=public_conversation_slug)
+    if not deleted:
+        return Response(
+            content=json.dumps({"status": "error", "message": "Conversation not found"}),
+            status_code=404,
+        )
 
     update_telemetry_state(
         request=request,
@@ -541,17 +605,21 @@ async def create_chat_session(
     request: Request,
     common: CommonQueryParams,
     agent_slug: Optional[str] = None,
+    body: Optional[Dict[str, Any]] = Body(default=None),
     # Add parameters here to create a custom hidden agent on the fly
 ):
     user = request.user.object
+    requested_agent_slug = agent_slug or str((body or {}).get("agent_slug") or "").strip() or None
 
     # Create new Conversation Session
-    conversation = await ConversationAdapters.acreate_conversation_session(user, request.user.client_app, agent_slug)
+    conversation = await ConversationAdapters.acreate_conversation_session(
+        user, request.user.client_app, requested_agent_slug
+    )
 
     response = {"conversation_id": str(conversation.id)}
 
     conversation_metadata = {
-        "agent": agent_slug,
+        "agent": requested_agent_slug,
     }
 
     update_telemetry_state(
@@ -630,12 +698,12 @@ async def generate_chat_title(
     user: KhojUser = request.user.object
     conversation = await ConversationAdapters.aget_conversation_by_user(user=user, conversation_id=conversation_id)
 
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
     # Conversation.title is explicitly set by the user. Do not override.
     if conversation.title:
         return {"status": "ok", "title": conversation.title}
-
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Conversation not found")
 
     new_title = await acreate_title_from_history(request.user.object, conversation=conversation)
     conversation.slug = clean_text_for_db(new_title[:200])
@@ -668,8 +736,6 @@ async def event_generator(
 ):
     # Access the parameters from the body
     q = body.q
-    n = body.n
-    d = body.d
     stream = body.stream
     title = body.title
     conversation_id = body.conversation_id
@@ -727,6 +793,7 @@ async def event_generator(
     generated_images: List[str] = []
     generated_mermaidjs_diagram: str = None
     generated_asset_results: Dict = dict()
+    conversation_commands: List[ConversationCommand] = []
     program_execution_context: List[str] = []
     user_message_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -848,7 +915,7 @@ async def event_generator(
 
             if event_type == ChatEvent.MESSAGE:
                 yield data
-            elif event_type == ChatEvent.REFERENCES or ChatEvent.METADATA or stream:
+            elif _should_emit_structured_event(event_type, stream):
                 yield json.dumps({"type": event_type.value, "data": data}, ensure_ascii=False)
         except Exception as e:
             if not cancellation_event.is_set():
@@ -1096,66 +1163,125 @@ async def event_generator(
 
     # Gather Context
     ## Gather Document References
-    local_vault_references = load_local_vault_references()
-    if local_vault_references:
-        compiled_references.extend(local_vault_references)
-        inferred_queries.append("local vault")
-        async for result in send_event(
-            ChatEvent.STATUS, f"**Loaded {len(local_vault_references)} Local Vault Files**"
+    local_kb_root = get_local_kb_root()
+    kb_engine = get_kb_engine()
+    notes_local_source_available = local_kb_root is not None and kb_engine in {"file_first", "hybrid"}
+    notes_openkb_source_available = kb_engine in {"openkb", "hybrid"} and openkb_is_ready()
+    used_notes_tool_loop = False
+    notes_tool_loop_has_evidence = False
+    notes_tool_loop_failed = False
+    notes_requested = ConversationCommand.Notes in conversation_commands
+
+    async def collect_notes_evidence():
+        nonlocal used_notes_tool_loop, notes_tool_loop_has_evidence, notes_tool_loop_failed
+        allow_local_kb = notes_local_source_available
+        allow_openkb = notes_openkb_source_available
+        if used_notes_tool_loop or not (allow_local_kb or allow_openkb):
+            return
+        status_messages = []
+
+        used_notes_tool_loop = True
+        try:
+            agent_chat_model = (
+                AgentAdapters.get_agent_chat_model(agent, user)
+                if agent and hasattr(agent, "slug") and hasattr(agent, "chat_model")
+                else None
+            )
+
+            async def notes_send_message(**kwargs):
+                return await send_message_to_model_wrapper(
+                    user=user,
+                    query_files=attached_file_context,
+                    query_images=uploaded_images,
+                    relevant_memories=relevant_memories,
+                    agent_chat_model=agent_chat_model,
+                    tracer=tracer,
+                    **kwargs,
+                )
+
+            notes_result = await collect_notes_evidence_with_tools(
+                q,
+                chat_history,
+                user,
+                agent,
+                send_message=notes_send_message,
+                send_status=status_messages.append,
+                client_app=user_scope.client_app,
+                allow_local_kb=allow_local_kb,
+                allow_openkb=allow_openkb,
+                conversation_id=conversation_id,
+            )
+            compiled_references.extend(notes_result.references)
+            inferred_queries.extend(notes_result.inferred_queries)
+            notes_tool_loop_has_evidence = not is_none_or_empty(notes_result.references)
+            for reference in notes_result.references:
+                if reference.get("action") in {"append_note", "propose_edit"}:
+                    write_result = {
+                        "action": reference.get("action"),
+                        "status": reference.get("status"),
+                        "file": reference.get("file"),
+                        "changed": reference.get("changed"),
+                        "result": reference.get("compiled", ""),
+                    }
+                    write_instruction = "Final answer must report this exact Notes write tool result."
+                    if reference.get("status") == "written":
+                        write_instruction += " Do not say writing is unavailable."
+                    program_execution_context.append(
+                        "Notes write tool result: "
+                        f"{json.dumps(write_result, ensure_ascii=False, default=str)}. "
+                        f"{write_instruction}"
+                    )
+            for message in status_messages:
+                async for result in send_event(ChatEvent.STATUS, message):
+                    yield result
+            if not notes_tool_loop_has_evidence and notes_result.searched:
+                program_execution_context.append(
+                    "No Notes evidence found. Tools used: " + ", ".join(notes_result.searched[:8])
+                )
+        except Exception as e:
+            notes_tool_loop_failed = True
+            logger.error(f"Error using Notes evidence tools: {e}", exc_info=True)
+            async for result in send_event(
+                ChatEvent.STATUS, "Notes evidence tools failed. I did not read or modify the local knowledge base"
+            ):
+                yield result
+
+    if notes_requested:
+        async for result in collect_notes_evidence():
+            yield result
+
+        compiled_references[:] = dedupe_references(compiled_references)
+
+    if notes_requested and notes_tool_loop_failed:
+        async for result in send_llm_response(
+            "Notes evidence tools failed, so I did not read or modify the local knowledge base.",
+            tracer.get("usage"),
         ):
             yield result
-        if not is_env_var_true("KHOJ_ENABLE_RAG_FALLBACK") and ConversationCommand.Notes in conversation_commands:
-            conversation_commands.remove(ConversationCommand.Notes)
+        return
 
-    if ConversationCommand.Notes in conversation_commands:
-        try:
-            async for result in search_documents(
-                q,
-                (n or 7),
-                d,
-                user,
-                chat_history,
-                conversation_id,
-                conversation_commands,
-                location,
-                partial(send_event, ChatEvent.STATUS),
-                query_images=uploaded_images,
-                query_files=attached_file_context,
-                relevant_memories=relevant_memories,
-                agent=agent,
-                tracer=tracer,
-            ):
-                if isinstance(result, dict) and ChatEvent.STATUS in result:
-                    yield result[ChatEvent.STATUS]
-                else:
-                    compiled_references.extend(result[0])
-                    inferred_queries.extend(result[1])
-                    defiltered_query = result[2]
-        except Exception as e:
-            error_message = f"Error searching knowledge base: {e}. Attempting to respond without document references."
-            logger.error(error_message, exc_info=True)
-            async for result in send_event(
-                ChatEvent.STATUS, "Document search failed. I'll try respond without document references"
-            ):
-                yield result
+    if (
+        notes_requested
+        and is_none_or_empty(compiled_references)
+        and conversation_commands == [ConversationCommand.Notes]
+        and (used_notes_tool_loop or not (notes_local_source_available or notes_openkb_source_available))
+    ):
+        message = (
+            "I couldn't find enough local knowledge base evidence to answer that."
+            if used_notes_tool_loop
+            else f"{no_entries_found.format()}"
+        )
+        async for result in send_llm_response(message, tracer.get("usage")):
+            yield result
+        return
 
-        if not is_none_or_empty(compiled_references):
-            distinct_headings = set([d.get("compiled").split("\n")[0] for d in compiled_references if "compiled" in d])
-            distinct_files = set([d["file"] for d in compiled_references])
-            # Strip only leading # from headings
-            headings_str = "\n- " + "\n- ".join(distinct_headings).replace("#", "")
-            async for result in send_event(
-                ChatEvent.STATUS,
-                f"**Found {len(distinct_headings)} Notes Across {len(distinct_files)} Files**: {headings_str}",
-            ):
-                yield result
+    compiled_references[:] = dedupe_references(compiled_references)
 
-        if conversation_commands == [ConversationCommand.Notes] and not await EntryAdapters.auser_has_entries(user):
-            async for result in send_llm_response(f"{no_entries_found.format()}", tracer.get("usage")):
-                yield result
-            return
-
-    if ConversationCommand.Notes in conversation_commands and is_none_or_empty(compiled_references):
+    if (
+        ConversationCommand.Notes in conversation_commands
+        and is_none_or_empty(compiled_references)
+        and not used_notes_tool_loop
+    ):
         conversation_commands.remove(ConversationCommand.Notes)
 
     ## Gather Online References
@@ -1424,6 +1550,27 @@ async def event_generator(
         await cancel_disconnect_monitor()
         return
 
+    if wants_openkb_exploration_save(q):
+        try:
+            save_result = save_exploration(
+                q,
+                full_response,
+                compiled_references,
+                conversation_id=str(conversation.id),
+                client_app=user_scope.client_app,
+            )
+        except OpenKBError as e:
+            save_message = f"Could not save exploration: {e}"
+            program_execution_context.append(save_message)
+        else:
+            save_message = save_result.message
+            if save_result.path:
+                compiled_references.append(save_result.to_reference(q))
+                compiled_references[:] = dedupe_references(compiled_references)
+            program_execution_context.append(f"Exploration save result: {save_result.status}. {save_message}")
+        async for result in send_event(ChatEvent.STATUS, save_message):
+            yield result
+
     # Save conversation once finish streaming
     asyncio.create_task(
         save_to_conversation_log(
@@ -1634,9 +1781,14 @@ async def process_chat_request(
             elif event.startswith("{") and event.endswith("}"):
                 evt_json = json.loads(event)
                 if evt_json["type"] == ChatEvent.END_LLM_RESPONSE.value:
+                    thought_event = "".join([chunk async for chunk in flush_thought_buffer()])
+                    if thought_event:
+                        await websocket.send_text(thought_event)
+                        await websocket.send_text(ChatEvent.END_EVENT.value)
                     # Flush remaining buffer content on end llm response event
                     chunks = "".join([chunk async for chunk in flush_message_buffer()])
-                    await websocket.send_text(chunks)
+                    if chunks:
+                        await websocket.send_text(chunks)
                     await websocket.send_text(ChatEvent.END_EVENT.value)
                 elif evt_json["type"] == ChatEvent.THOUGHT.value:
                     # Buffer THOUGHT events for better streaming performance
@@ -1660,9 +1812,8 @@ async def process_chat_request(
                             """Flush thought buffer if no new messages arrive within debounce interval."""
                             await asyncio.sleep(BUFFER_FLUSH_INTERVAL)
                             # Check if there's still content to flush
-                            thought_chunks = "".join([chunk async for chunk in flush_thought_buffer()])
-                            if thought_chunks:
-                                thought_event = "".join([chunk async for chunk in flush_thought_buffer()])
+                            thought_event = "".join([chunk async for chunk in flush_thought_buffer()])
+                            if thought_event:
                                 await websocket.send_text(thought_event)
                                 await websocket.send_text(ChatEvent.END_EVENT.value)
 
@@ -1694,8 +1845,9 @@ async def process_chat_request(
                         await asyncio.sleep(BUFFER_FLUSH_INTERVAL)
                         # Check if there's still content to flush
                         chunks = "".join([chunk async for chunk in flush_message_buffer()])
-                        await websocket.send_text(chunks)
-                        await websocket.send_text(ChatEvent.END_EVENT.value)
+                        if chunks:
+                            await websocket.send_text(chunks)
+                            await websocket.send_text(ChatEvent.END_EVENT.value)
 
                     # Flush buffer if no new messages arrive within debounce interval
                     message_buffer.timeout = asyncio.create_task(delayed_flush())
@@ -1722,6 +1874,23 @@ async def chat(
     ),
     image_rate_limiter=Depends(ApiImageRateLimiter(max_images=10, max_combined_size_mb=20)),
 ):
+    if body.conversation_id is not None and not body.create_new:
+        conversation = await ConversationAdapters.aget_conversation_by_user(
+            request.user.object,
+            request.user.client_app,
+            body.conversation_id,
+        )
+        if conversation is None:
+            response_data = {
+                "response": f"Conversation {body.conversation_id} not found",
+                "references": {},
+                "usage": {},
+                "images": [],
+                "files": [],
+                "mermaidjsDiagram": [],
+            }
+            return Response(content=json.dumps(response_data), media_type="application/json", status_code=404)
+
     response_iterator = event_generator(
         body,
         request.user,
@@ -1736,4 +1905,10 @@ async def chat(
     # Non-Streaming Text Response
     else:
         response_data = await read_chat_stream(response_iterator)
-        return Response(content=json.dumps(response_data), media_type="application/json", status_code=200)
+        status_code = 200
+        if (
+            body.conversation_id is not None
+            and response_data.get("response") == f"Conversation {body.conversation_id} not found"
+        ):
+            status_code = 404
+        return Response(content=json.dumps(response_data), media_type="application/json", status_code=status_code)

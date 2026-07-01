@@ -41,8 +41,12 @@ def home_page(request: Request):
 @web_client.get("/home/{file_path:path}", response_class=FileResponse)
 def home_static_files(file_path: str):
     """Serve static files from the home landing page directory"""
-    resolved = (constants.home_directory / file_path).resolve()
-    if not resolved.is_relative_to(constants.home_directory.resolve()):
+    try:
+        home_directory = constants.home_directory.resolve()
+        resolved = (constants.home_directory / file_path).resolve()
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=404) from None
+    if not resolved.is_relative_to(home_directory) or not resolved.is_file():
         raise HTTPException(status_code=404)
     return FileResponse(resolved)
 
@@ -87,6 +91,7 @@ def view_public_conversation(request: Request):
 
 
 @web_client.get("/automations", response_class=HTMLResponse)
+@requires(["authenticated"], redirect="login_page")
 def automations_config_page(
     request: Request,
 ):
@@ -101,3 +106,28 @@ def assetlinks(request: Request):
 @web_client.get("/server/error", response_class=HTMLResponse)
 def server_error_page(request: Request):
     return templates.TemplateResponse(request, name="error.html")
+
+
+def _next_export_text_file(file_path: str):
+    built_dir = constants.next_js_directory.resolve()
+    stem = file_path.removesuffix(".txt")
+    candidates = [
+        (built_dir / file_path).resolve(),
+        (built_dir / stem / "index.txt").resolve(),
+    ]
+
+    for candidate in candidates:
+        if candidate.is_file() and candidate.is_relative_to(built_dir):
+            return FileResponse(candidate, media_type="text/plain")
+
+    raise HTTPException(status_code=404)
+
+
+@web_client.get("/index.txt", response_class=FileResponse)
+def next_export_index_text_file():
+    return _next_export_text_file("index.txt")
+
+
+@web_client.get("/{page_name}.txt", response_class=FileResponse)
+def next_export_page_text_file(page_name: str):
+    return _next_export_text_file(f"{page_name}.txt")

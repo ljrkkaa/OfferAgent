@@ -7,32 +7,22 @@ from khoj.routers.research import _document_research_tools
 from khoj.utils.helpers import ConversationCommand
 
 
-def test_semantic_search_files_hidden_without_rag_fallback(monkeypatch):
-    monkeypatch.delenv("KHOJ_ENABLE_RAG_FALLBACK", raising=False)
-
+def test_document_tools_are_file_first():
     tools = _document_research_tools()
 
-    assert ConversationCommand.SemanticSearchFiles not in tools
     assert tools == [
         ConversationCommand.RegexSearchFiles,
         ConversationCommand.ViewFile,
         ConversationCommand.ListFiles,
+        ConversationCommand.KbHeadings,
+        ConversationCommand.KbResolveLink,
     ]
-
-
-def test_semantic_search_files_visible_with_rag_fallback(monkeypatch):
-    monkeypatch.setenv("KHOJ_ENABLE_RAG_FALLBACK", "true")
-
-    tools = _document_research_tools()
-
-    assert tools[0] == ConversationCommand.SemanticSearchFiles
 
 
 @pytest.mark.asyncio
 async def test_local_kb_exposes_disk_document_tools_without_entries(tmp_path, monkeypatch):
     (tmp_path / "notes.md").write_text("local notes", encoding="utf-8")
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
-    monkeypatch.delenv("KHOJ_ENABLE_RAG_FALLBACK", raising=False)
 
     async def no_entries(user):
         return False
@@ -53,7 +43,24 @@ async def test_local_kb_exposes_disk_document_tools_without_entries(tmp_path, mo
     assert "list_files" in tool_names
     assert "view_file" in tool_names
     assert "regex_search_files" in tool_names
-    assert "semantic_search_files" not in tool_names
+    assert "kb_headings" in tool_names
+    assert "kb_resolve_link" in tool_names
+
+
+@pytest.mark.asyncio
+async def test_local_kb_headings_and_resolve_link_helpers(tmp_path, monkeypatch):
+    (tmp_path / "index.md").write_text("[Java](interview/java.md)", encoding="utf-8")
+    interview = tmp_path / "interview"
+    interview.mkdir()
+    (interview / "java.md").write_text("# Java\nbody\n## HashMap\nnotes\n", encoding="utf-8")
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+
+    headings = [item async for item in helpers.view_kb_headings("interview/java.md")]
+    resolved = [item async for item in helpers.resolve_kb_link("index.md", "[Java](interview/java.md)")]
+
+    assert "# Java (L1-L4)" in headings[0]["compiled"]
+    assert "## HashMap (L3-L4)" in headings[0]["compiled"]
+    assert resolved[0]["compiled"] == "Resolved to interview/java.md"
 
 
 @pytest.mark.asyncio

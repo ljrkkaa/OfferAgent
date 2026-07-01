@@ -225,6 +225,8 @@ def initialization(interactive: bool = True):
         logger.info("🗣️ Chat model options updated")
 
     # Update the default chat model if it doesn't match
+    if os.getenv("KHOJ_CONVERSATION_RUNTIME", "codex").lower() == "codex":
+        return
     chat_config = ConversationAdapters.get_default_chat_model()
     env_default_chat_model = os.getenv("KHOJ_DEFAULT_CHAT_MODEL")
     if not chat_config or not env_default_chat_model:

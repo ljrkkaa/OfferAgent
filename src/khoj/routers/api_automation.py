@@ -13,13 +13,31 @@ from starlette.authentication import requires
 
 from khoj.database.adapters import AutomationAdapters, ConversationAdapters
 from khoj.database.models import KhojUser
-from khoj.processor.conversation.utils import clean_json
-from khoj.routers.helpers import schedule_automation, schedule_query
+from khoj.routers.helpers import get_automation_timezone, schedule_automation, schedule_query
 from khoj.utils.helpers import is_none_or_empty
 
 # Initialize Router
 api_automation = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _normalize_crontime(crontime: str, minute_level_error: str) -> tuple[str | None, Response | None]:
+    crontime = crontime.strip()
+    if len(crontime.split()) > 5:
+        crontime = " ".join(crontime.split()[:5])
+    crontime = crontime.replace("?", "*")
+
+    try:
+        cron_descriptor.get_description(crontime)
+        CronTrigger.from_crontab(crontime, pytz.utc)
+    except Exception:
+        return None, Response(content="Invalid crontime", status_code=400)
+
+    minute_value = crontime.split()[0]
+    if not minute_value.isdigit():
+        return None, Response(content=minute_level_error, status_code=400)
+
+    return crontime, None
 
 
 @api_automation.get("", response_class=Response)
@@ -65,8 +83,12 @@ def post_automation(
     # Perform validation checks
     if is_none_or_empty(q) or is_none_or_empty(crontime):
         return Response(content="A query and crontime is required", status_code=400)
-    if not cron_descriptor.get_description(crontime):
-        return Response(content="Invalid crontime", status_code=400)
+    crontime, error = _normalize_crontime(
+        crontime,
+        "Minute level recurrence is unsupported. Please create a less frequent schedule.",
+    )
+    if error:
+        return error
 
     # Infer subject, query to run
     _, query_to_run, generated_subject = schedule_query(q, chat_history=[], user=user)
@@ -77,23 +99,6 @@ def post_automation(
     query_to_run = query_to_run.strip()
     if not query_to_run.startswith("/automated_task"):
         query_to_run = f"/automated_task {query_to_run}"
-
-    # Normalize crontime for AP Scheduler CronTrigger
-    crontime = crontime.strip()
-    if len(crontime.split(" ")) > 5:
-        # Truncate crontime to 5 fields
-        crontime = " ".join(crontime.split(" ")[:5])
-
-    # Convert crontime to standard unix crontime
-    crontime = crontime.replace("?", "*")
-
-    # Disallow minute level automation recurrence
-    minute_value = crontime.split(" ")[0]
-    if not minute_value.isdigit():
-        return Response(
-            content="Minute level recurrence is unsupported. Please create a less frequent schedule.",
-            status_code=400,
-        )
 
     # Create new Conversation Session associated with this new task
     title = f"Automation: {subject}"
@@ -107,6 +112,7 @@ def post_automation(
             query_to_run, subject, crontime, timezone, q, user, calling_url, str(conversation.id)
         )
     except Exception as e:
+        conversation.delete()
         logger.error(f"Error creating automation {q} for {user.email}: {e}", exc_info=True)
         return Response(
             content="Unable to create automation. Ensure the automation doesn't already exist.",
@@ -136,6 +142,11 @@ def trigger_manual_job(
         logger.error(f"Error triggering automation {automation_id} for {user.email}: {e}", exc_info=True)
         return Response(content="Invalid automation", status_code=403)
 
+    conversation_id = AutomationAdapters.parse_automation_metadata(automation).get("conversation_id")
+    if conversation_id and not ConversationAdapters.get_conversation_by_id(conversation_id):
+        AutomationAdapters.delete_automation(user, automation_id)
+        return Response(content="Automation conversation not found", status_code=404)
+
     # Trigger the job without waiting for the result.
     scheduled_chat_func = automation.func
 
@@ -164,8 +175,12 @@ def edit_job(
     # Perform validation checks
     if is_none_or_empty(q) or is_none_or_empty(subject) or is_none_or_empty(crontime):
         return Response(content="A query, subject and crontime is required", status_code=400)
-    if not cron_descriptor.get_description(crontime):
-        return Response(content="Invalid crontime", status_code=400)
+    crontime, error = _normalize_crontime(
+        crontime,
+        "Recurrence of every X minutes is unsupported. Please create a less frequent schedule.",
+    )
+    if error:
+        return error
 
     # Check, get automation to edit
     try:
@@ -183,57 +198,48 @@ def edit_job(
     query_to_run = query_to_run.strip()
     if not query_to_run.startswith("/automated_task"):
         query_to_run = f"/automated_task {query_to_run}"
-    # Normalize crontime for AP Scheduler CronTrigger
-    crontime = crontime.strip()
-    if len(crontime.split(" ")) > 5:
-        # Truncate crontime to 5 fields
-        crontime = " ".join(crontime.split(" ")[:5])
-    # Convert crontime to standard unix crontime
-    crontime = crontime.replace("?", "*")
-
-    # Disallow minute level automation recurrence
-    minute_value = crontime.split(" ")[0]
-    if not minute_value.isdigit():
-        return Response(
-            content="Recurrence of every X minutes is unsupported. Please create a less frequent schedule.",
-            status_code=400,
-        )
-
     # Construct updated automation metadata
-    automation_metadata: dict[str, str] = json.loads(clean_json(automation.name))
+    automation_metadata = AutomationAdapters.parse_automation_metadata(automation)
     automation_metadata["scheduling_request"] = q
     automation_metadata["query_to_run"] = query_to_run
     automation_metadata["subject"] = subject.strip()
     automation_metadata["crontime"] = crontime
     conversation_id = automation_metadata.get("conversation_id")
+    created_conversation = None
 
     if not conversation_id:
         title = f"Automation: {subject}"
 
         # Create new Conversation Session associated with this new task
-        conversation = ConversationAdapters.create_conversation_session(user, request.user.client_app, title=title)
+        created_conversation = ConversationAdapters.create_conversation_session(user, request.user.client_app, title=title)
 
-        conversation_id = str(conversation.id)
+        conversation_id = str(created_conversation.id)
         automation_metadata["conversation_id"] = conversation_id
 
     # Modify automation with updated query, subject
-    automation.modify(
-        name=json.dumps(automation_metadata),
-        kwargs={
-            "query_to_run": query_to_run,
-            "subject": subject,
-            "scheduling_request": q,
-            "user": user,
-            "calling_url": str(request.url),
-            "conversation_id": conversation_id,
-        },
-    )
+    try:
+        automation.modify(
+            name=json.dumps(automation_metadata),
+            kwargs={
+                "query_to_run": query_to_run,
+                "subject": subject,
+                "scheduling_request": q,
+                "user": user,
+                "calling_url": str(request.url),
+                "conversation_id": conversation_id,
+            },
+        )
 
-    # Reschedule automation if crontime updated
-    user_timezone = pytz.timezone(timezone)
-    trigger = CronTrigger.from_crontab(crontime, user_timezone)
-    if automation.trigger != trigger:
-        automation.reschedule(trigger=trigger)
+        # Reschedule automation if crontime updated
+        user_timezone = get_automation_timezone(timezone)
+        trigger = CronTrigger.from_crontab(crontime, user_timezone)
+        if automation.trigger != trigger:
+            automation.reschedule(trigger=trigger)
+    except Exception as e:
+        if created_conversation:
+            created_conversation.delete()
+        logger.error(f"Error editing automation {automation_id} for {user.email}: {e}", exc_info=True)
+        return Response(content="Unable to edit automation.", media_type="text/plain", status_code=500)
 
     # Collate info about the updated user automation
     automation = AutomationAdapters.get_automation(user, automation.id)
