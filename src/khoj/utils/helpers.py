@@ -24,7 +24,7 @@ from os import path
 from pathlib import Path
 from textwrap import dedent
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Tuple, Type, Union
+from typing import Any, NamedTuple, Optional, Tuple, Type, Union
 from urllib.parse import ParseResult, urlparse
 
 import anthropic
@@ -46,11 +46,6 @@ from pytz import country_names, country_timezones
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from khoj.utils import constants
-
-if TYPE_CHECKING:
-    from sentence_transformers import CrossEncoder, SentenceTransformer
-
-    from khoj.utils.models import BaseEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -126,8 +121,10 @@ def fix_json_dict(json_dict: dict) -> dict:
     return json_dict
 
 
-def get_file_type(file_type: str, file_content: bytes) -> tuple[str, str]:
+def get_file_type(file_type: Optional[str], file_content: bytes) -> tuple[str, Optional[str]]:
     "Get file type from file mime type"
+
+    file_type = file_type or ""
 
     # Extract encoding from file_type
     encoding = file_type.split("=")[1].strip().lower() if ";" in file_type else None
@@ -144,6 +141,8 @@ def get_file_type(file_type: str, file_content: bytes) -> tuple[str, str]:
         return "markdown", encoding
     elif file_type in ["text/org"]:
         return "org", encoding
+    elif file_type in ["text/plain"]:
+        return "plaintext", encoding
     elif file_type in ["application/pdf"]:
         return "pdf", encoding
     elif file_type in ["application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
@@ -158,30 +157,6 @@ def get_file_type(file_type: str, file_content: bytes) -> tuple[str, str]:
         return "plaintext", encoding
     else:
         return "other", encoding
-
-
-def load_model(
-    model_name: str, model_type, model_dir=None, device: str = None
-) -> Union[BaseEncoder, SentenceTransformer, CrossEncoder]:
-    "Load model from disk or huggingface"
-    # Construct model path
-    logger = logging.getLogger(__name__)
-    model_path = path.join(model_dir, model_name.replace("/", "_")) if model_dir is not None else None
-
-    # Load model from model_path if it exists there
-    model_type_class = get_class_by_name(model_type) if isinstance(model_type, str) else model_type
-    if model_path is not None and resolve_absolute_path(model_path).exists():
-        logger.debug(f"Loading {model_name} model from disk")
-        model = model_type_class(get_absolute_path(model_path), device=device)
-    # Else load the model from the model_name
-    else:
-        logger.info(f"🤖 Downloading {model_name} model from web")
-        model = model_type_class(model_name, device=device)
-        if model_path is not None:
-            logger.info(f"📩 Saved {model_name} model to disk")
-            model.save(model_path)
-
-    return model
 
 
 def get_class_by_name(name: str) -> object:
@@ -428,6 +403,8 @@ class ConversationCommand(str, Enum):
     Operator = "operator"
     ViewFile = "view_file"
     ListFiles = "list_files"
+    KbHeadings = "kb_headings"
+    KbResolveLink = "kb_resolve_link"
     RegexSearchFiles = "regex_search_files"
     SemanticSearchFiles = "semantic_search_files"
     SearchWeb = "search_web"
@@ -619,11 +596,11 @@ tools_for_research_llm = {
         name="semantic_search_files",
         description=dedent(
             """
-            To have the tool AI semantic search through the user's knowledge base.
+            To have the tool AI search through the user's indexed knowledge base.
             Helpful to answer questions for which finding some relevant notes or documents can be useful. Example: "When was Tom born?"
             This tool AI cannot find all relevant notes or documents, only a subset of them.
             It is a good starting point to find keywords, discover similar topics or related concepts and some relevant notes or documents.
-            For a given query, the tool AI can perform a maximum of {max_search_queries} semantic search subqueries per iteration.
+            For a given query, the tool AI can perform a maximum of {max_search_queries} search subqueries per iteration.
             """
         ).strip(),
         schema={
@@ -635,6 +612,48 @@ tools_for_research_llm = {
                 },
             },
             "required": ["q"],
+        },
+    ),
+    ConversationCommand.KbHeadings: ToolDefinition(
+        name="kb_headings",
+        description=dedent(
+            """
+            To inspect the Markdown heading structure of a specific note before reading exact lines.
+            Use this for large local knowledge base files to find the right section, then view_file to read the lines.
+            """
+        ).strip(),
+        schema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The local knowledge base file path to inspect.",
+                },
+            },
+            "required": ["path"],
+        },
+    ),
+    ConversationCommand.KbResolveLink: ToolDefinition(
+        name="kb_resolve_link",
+        description=dedent(
+            """
+            To resolve an Obsidian wiki link or Markdown link from one local knowledge base file to another.
+            Use this after reading an index file that points to related notes.
+            """
+        ).strip(),
+        schema={
+            "type": "object",
+            "properties": {
+                "from_path": {
+                    "type": "string",
+                    "description": "The file path containing the link.",
+                },
+                "link": {
+                    "type": "string",
+                    "description": "The Obsidian wiki link or Markdown link to resolve.",
+                },
+            },
+            "required": ["from_path", "link"],
         },
     ),
     ConversationCommand.RegexSearchFiles: ToolDefinition(
