@@ -102,7 +102,7 @@ class GithubToEntries(TextToEntries):
     def update_entries_with_ids(self, current_entries, user: KhojUser = None):
         # Identify, mark and merge any new entries with previous entries
         with timer("Identify new or updated entries", logger):
-            num_new_embeddings, num_deleted_embeddings = self.update_embeddings(
+            num_new_entries, num_deleted_entries = self.update_entries(
                 user,
                 current_entries,
                 DbEntry.EntryType.GITHUB,
@@ -111,7 +111,7 @@ class GithubToEntries(TextToEntries):
                 logger=logger,
             )
 
-        return num_new_embeddings, num_deleted_embeddings
+        return num_new_entries, num_deleted_entries
 
     def get_files(self, repo_url: str, repo: GithubRepoConfig):
         # Get the contents of the repository

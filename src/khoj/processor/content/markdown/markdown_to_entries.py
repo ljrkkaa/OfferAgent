@@ -35,7 +35,7 @@ class MarkdownToEntries(TextToEntries):
 
         # Identify, mark and merge any new entries with previous entries
         with timer("Identify new or updated entries", logger):
-            num_new_embeddings, num_deleted_embeddings = self.update_embeddings(
+            num_new_entries, num_deleted_entries = self.update_entries(
                 user,
                 current_entries,
                 DbEntry.EntryType.MARKDOWN,
@@ -47,7 +47,7 @@ class MarkdownToEntries(TextToEntries):
                 file_to_text_map=file_to_text_map,
             )
 
-        return num_new_embeddings, num_deleted_embeddings
+        return num_new_entries, num_deleted_entries
 
     @staticmethod
     def extract_markdown_entries(markdown_files: Dict[str, str], max_tokens=256) -> Tuple[Dict[str, str], List[Entry]]:

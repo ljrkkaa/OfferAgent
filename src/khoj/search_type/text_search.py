@@ -1,27 +1,22 @@
 import logging
-import math
-from pathlib import Path
-from typing import List, Optional, Tuple, Type, Union
+from typing import List, Optional, Tuple, Type
 
-import requests
-import torch
 from asgiref.sync import sync_to_async
-from sentence_transformers import util
 
-from khoj.database.adapters import EntryAdapters, get_default_search_model
+from khoj.database.adapters import EntryAdapters
 from khoj.database.models import Agent, KhojUser
 from khoj.database.models import Entry as DbEntry
 from khoj.processor.content.text_to_entries import TextToEntries
 from khoj.utils import state
-from khoj.utils.helpers import get_absolute_path, timer
+from khoj.utils.helpers import timer
 from khoj.utils.jsonl import load_jsonl
-from khoj.utils.models import BaseEncoder
+from khoj.utils.lexical import query_terms
 from khoj.utils.rawconfig import Entry, SearchResponse
 from khoj.utils.state import SearchType
 
 logger = logging.getLogger(__name__)
 
-search_type_to_embeddings_type = {
+search_type_to_entry_type = {
     SearchType.Org.value: DbEntry.EntryType.ORG,
     SearchType.Markdown.value: DbEntry.EntryType.MARKDOWN,
     SearchType.Plaintext.value: DbEntry.EntryType.PLAINTEXT,
@@ -29,111 +24,65 @@ search_type_to_embeddings_type = {
     SearchType.All.value: None,
 }
 
+LEXICAL_TOP_K = 10
+
+
+def _lexical_distance(entry: DbEntry, raw_query: str, terms: list[str]) -> float | None:
+    heading = (entry.heading or "").lower()
+    compiled = (entry.compiled or "").lower()
+    raw = (entry.raw or "").lower()
+    file_path = (entry.file_path or "").lower()
+    haystack = "\n".join([heading, compiled, raw, file_path])
+
+    if not terms:
+        return None
+
+    term_hits = sum(1 for term in terms if term in haystack)
+    if term_hits == 0:
+        return None
+
+    score = term_hits / len(terms)
+    score += 0.25 * sum(1 for term in terms if term in heading)
+    score += 0.1 * sum(1 for term in terms if term in file_path)
+
+    normalized_query = raw_query.lower().strip()
+    if normalized_query and normalized_query in haystack:
+        score += 1.0
+
+    return 1 / (1 + score)
+
 
 def extract_entries(jsonl_file) -> List[Entry]:
     "Load entries from compressed jsonl"
     return list(map(Entry.from_dict, load_jsonl(jsonl_file)))
 
 
-def compute_embeddings(
-    entries_with_ids: List[Tuple[int, Entry]],
-    bi_encoder: BaseEncoder,
-    embeddings_file: Path,
-    regenerate=False,
-    normalize=True,
-):
-    "Compute (and Save) Embeddings or Load Pre-Computed Embeddings"
-    new_embeddings = torch.tensor([], device=state.device)
-    existing_embeddings = torch.tensor([], device=state.device)
-    create_index_msg = ""
-    # Load pre-computed embeddings from file if exists and update them if required
-    if embeddings_file.exists() and not regenerate:
-        corpus_embeddings: torch.Tensor = torch.load(get_absolute_path(embeddings_file), map_location=state.device)
-        logger.debug(f"Loaded {len(corpus_embeddings)} text embeddings from {embeddings_file}")
-    else:
-        corpus_embeddings = torch.tensor([], device=state.device)
-        create_index_msg = " Creating index from scratch."
-
-    # Encode any new entries in the corpus and update corpus embeddings
-    new_entries = [entry.compiled for id, entry in entries_with_ids if id == -1]
-    if new_entries:
-        logger.info(f"📩 Indexing {len(new_entries)} text entries.{create_index_msg}")
-        new_embeddings = bi_encoder.encode(
-            new_entries, convert_to_tensor=True, device=state.device, show_progress_bar=True
-        )
-
-    # Extract existing embeddings from previous corpus embeddings
-    existing_entry_ids = [id for id, _ in entries_with_ids if id != -1]
-    if existing_entry_ids:
-        existing_embeddings = torch.index_select(
-            corpus_embeddings, 0, torch.tensor(existing_entry_ids, device=state.device)
-        )
-
-    # Set corpus embeddings to merger of existing and new embeddings
-    corpus_embeddings = torch.cat([existing_embeddings, new_embeddings], dim=0)
-    if normalize:
-        # Normalize embeddings for faster lookup via dot product when querying
-        corpus_embeddings = util.normalize_embeddings(corpus_embeddings)
-
-    # Save regenerated or updated embeddings to file
-    torch.save(corpus_embeddings, embeddings_file)
-    logger.info(f"📩 Saved computed text embeddings to {embeddings_file}")
-
-    return corpus_embeddings
-
-
-def load_embeddings(
-    embeddings_file: Path,
-):
-    "Load pre-computed embeddings from file if exists and update them if required"
-    if embeddings_file.exists():
-        corpus_embeddings: torch.Tensor = torch.load(get_absolute_path(embeddings_file), map_location=state.device)
-        logger.debug(f"Loaded {len(corpus_embeddings)} text embeddings from {embeddings_file}")
-        return util.normalize_embeddings(corpus_embeddings)
-
-    return None
-
-
 async def query(
     raw_query: str,
     user: KhojUser,
     type: SearchType = SearchType.All,
-    question_embedding: Union[torch.Tensor, None] = None,
     max_distance: float = None,
     agent: Optional[Agent] = None,
 ) -> Tuple[List[dict], List[Entry]]:
     "Search for entries that answer the query"
 
-    file_type = search_type_to_embeddings_type[type.value]
+    file_type = search_type_to_entry_type[type.value]
+    terms = query_terms(raw_query, ignore_prefixes=("file:", "dt:"))
 
-    query = raw_query
-    search_model = await sync_to_async(get_default_search_model)()
-    if not max_distance:
-        if search_model.bi_encoder_confidence_threshold:
-            max_distance = search_model.bi_encoder_confidence_threshold
-        else:
-            max_distance = math.inf
+    def lexical_lookup():
+        filtered_entries = EntryAdapters.apply_filters(user, raw_query, file_type_filter=file_type, agent=agent)
+        scored_hits = []
+        for entry in filtered_entries:
+            distance = _lexical_distance(entry, raw_query, terms)
+            if distance is None:
+                continue
+            entry.distance = distance
+            scored_hits.append(entry)
+        scored_hits.sort(key=lambda hit: (hit.distance, hit.file_path or "", hit.id))
+        return scored_hits[:LEXICAL_TOP_K]
 
-    # Encode the query using the bi-encoder
-    if question_embedding is None:
-        with timer("Query Encode Time", logger, state.device):
-            question_embedding = state.embeddings_model[search_model.name].embed_query(query)
-
-    # Find relevant entries for the query
-    top_k = 10
-    with timer("Search Time", logger, state.device):
-        hits = EntryAdapters.search_with_embeddings(
-            raw_query=raw_query,
-            embeddings=question_embedding,
-            max_results=top_k,
-            file_type_filter=file_type,
-            max_distance=max_distance,
-            user=user,
-            agent=agent,
-        ).all()
-        hits = await sync_to_async(list)(hits)  # type: ignore[call-arg]
-
-    return hits
+    with timer("Lexical Search Time", logger, state.device):
+        return await sync_to_async(lexical_lookup)()
 
 
 def collate_results(hits, dedupe=True):
@@ -187,23 +136,6 @@ def deduplicated_search_responses(hits: List[SearchResponse]):
             )
 
 
-def rerank_and_sort_results(hits, query, rank_results, search_model_name):
-    # Rerank results if explicitly requested, if can use inference server
-    # AND if we have more than one result
-    rank_results = (rank_results or state.cross_encoder_model[search_model_name].inference_server_enabled()) and len(
-        list(hits)
-    ) > 1
-
-    # Score all retrieved entries using the cross-encoder
-    if rank_results:
-        hits = cross_encoder_score(query, hits, search_model_name)
-
-    # Sort results by cross-encoder score followed by bi-encoder score
-    hits = sort_results(rank_results=rank_results, hits=hits)
-
-    return hits
-
-
 def setup(
     text_to_entries: Type[TextToEntries],
     files: dict[str, str],
@@ -212,44 +144,17 @@ def setup(
     config=None,
 ) -> Tuple[int, int]:
     if config:
-        num_new_embeddings, num_deleted_embeddings = text_to_entries(config).process(
+        num_new_entries, num_deleted_entries = text_to_entries(config).process(
             files=files, user=user, regenerate=regenerate
         )
     else:
-        num_new_embeddings, num_deleted_embeddings = text_to_entries().process(
-            files=files, user=user, regenerate=regenerate
-        )
+        num_new_entries, num_deleted_entries = text_to_entries().process(files=files, user=user, regenerate=regenerate)
 
     if files:
         file_names = [file_name for file_name in files]
 
         logger.info(
-            f"Deleted {num_deleted_embeddings} entries. Created {num_new_embeddings} new entries for user {user} from files {file_names[:10]} ..."
+            f"Deleted {num_deleted_entries} entries. Created {num_new_entries} new entries for user {user} from files {file_names[:10]} ..."
         )
 
-    return num_new_embeddings, num_deleted_embeddings
-
-
-def cross_encoder_score(query: str, hits: List[SearchResponse], search_model_name: str) -> List[SearchResponse]:
-    """Score all retrieved entries using the cross-encoder"""
-    try:
-        with timer("Cross-Encoder Predict Time", logger, state.device):
-            cross_scores = state.cross_encoder_model[search_model_name].predict(query, hits)
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"Failed to rerank documents using the inference endpoint. Error: {e}.", exc_info=True)
-        cross_scores = [0.0] * len(hits)
-
-    # Convert cross-encoder scores to distances and pass in hits for reranking
-    for idx in range(len(cross_scores)):
-        hits[idx]["cross_score"] = 1 - cross_scores[idx]
-
-    return hits
-
-
-def sort_results(rank_results: bool, hits: List[dict]) -> List[dict]:
-    """Order results by cross-encoder score followed by bi-encoder score"""
-    with timer("Rank Time", logger, state.device):
-        hits.sort(key=lambda x: x["score"])  # sort by bi-encoder score
-        if rank_results:
-            hits.sort(key=lambda x: x["cross_score"])  # sort by cross-encoder score
-    return hits
+    return num_new_entries, num_deleted_entries

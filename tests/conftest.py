@@ -8,19 +8,15 @@ from khoj.configure import (
     configure_routes,
     configure_search_types,
 )
-from khoj.database.adapters import get_default_search_model
 from khoj.database.models import (
     Agent,
     ChatModel,
     FileObject,
-    GithubConfig,
-    GithubRepoConfig,
     KhojApiUser,
     KhojUser,
 )
 from khoj.processor.content.org_mode.org_to_entries import OrgToEntries
 from khoj.processor.content.plaintext.plaintext_to_entries import PlaintextToEntries
-from khoj.processor.embeddings import CrossEncoderModel, EmbeddingsModel
 from khoj.routers.api_content import configure_content
 from khoj.search_type import text_search
 from khoj.utils import state
@@ -32,8 +28,8 @@ from tests.helpers import (
     SubscriptionFactory,
     UserConversationProcessorConfigFactory,
     UserFactory,
-    get_chat_api_key,
     get_chat_api_base_url,
+    get_chat_api_key,
     get_chat_model_name,
     get_chat_provider,
     get_index_files,
@@ -46,6 +42,19 @@ def enable_db_access_for_all_tests(db):
     pass
 
 
+@pytest.fixture(autouse=True)
+def isolate_file_kb_env(monkeypatch):
+    for env_var in (
+        "KHOJ_LOCAL_KB_PATH",
+        "KHOJ_OBSIDIAN_VAULT_PATH",
+        "KHOJ_ENABLE_OPENKB",
+        "KHOJ_OPENKB_ROOT",
+        "KHOJ_KB_ENGINE",
+        "KHOJ_ALLOW_VAULT_WRITE",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def django_db_setup(django_db_setup, django_db_blocker):
     """Ensure proper database setup and teardown for all tests."""
@@ -53,17 +62,9 @@ def django_db_setup(django_db_setup, django_db_blocker):
         yield
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 def search_config():
-    search_model = get_default_search_model()
-    state.embeddings_model = dict()
-    state.embeddings_model["default"] = EmbeddingsModel(
-        model_name=search_model.bi_encoder, model_kwargs=search_model.bi_encoder_model_config
-    )
-    state.cross_encoder_model = dict()
-    state.cross_encoder_model["default"] = CrossEncoderModel(
-        model_name=search_model.cross_encoder, model_kwargs=search_model.cross_encoder_model_config
-    )
+    state.SearchType = configure_search_types()
 
 
 @pytest.fixture
@@ -241,10 +242,12 @@ def chat_client_builder(search_config, user, index_content=True, require_auth=Fa
     elif chat_provider == ChatModel.ModelType.ANTHROPIC:
         online_chat_model = ChatModelFactory(name="claude-haiku-4-5-20251001", model_type="anthropic")
     if online_chat_model:
-        online_chat_model.ai_model_api = AiModelApiFactory(
-            api_key=get_chat_api_key(chat_provider),
-            api_base_url=get_chat_api_base_url(chat_provider),
-        )
+        chat_api_key = get_chat_api_key(chat_provider)
+        if chat_api_key:
+            online_chat_model.ai_model_api = AiModelApiFactory(
+                api_key=chat_api_key,
+                api_base_url=get_chat_api_base_url(chat_provider),
+            )
         UserConversationProcessorConfigFactory(user=user, setting=online_chat_model)
 
     state.anonymous_mode = not require_auth
@@ -286,7 +289,7 @@ This is test file {i} with substantial content for stress testing agent knowledg
 
 ## Section 1: Introduction
 This section introduces the topic of file {i}. It contains enough text to create meaningful
-embeddings and entries in the database for realistic testing.
+entries in the database for realistic testing.
 
 ## Section 2: Technical Details
 Technical content for file {i}:
@@ -354,10 +357,12 @@ End of file {i}.
         online_chat_model = ChatModelFactory(name="claude-3-5-haiku-20241022", model_type="anthropic")
 
     if online_chat_model:
-        online_chat_model.ai_model_api = AiModelApiFactory(
-            api_key=get_chat_api_key(chat_provider),
-            api_base_url=get_chat_api_base_url(chat_provider),
-        )
+        chat_api_key = get_chat_api_key(chat_provider)
+        if chat_api_key:
+            online_chat_model.ai_model_api = AiModelApiFactory(
+                api_key=chat_api_key,
+                api_base_url=get_chat_api_base_url(chat_provider),
+            )
         UserConversationProcessorConfigFactory(user=user, setting=online_chat_model)
 
     state.anonymous_mode = False
@@ -386,14 +391,11 @@ def fastapi_app():
 @pytest.fixture(scope="function")
 def client(
     api_user: KhojApiUser,
+    search_config,
 ):
     state.SearchType = configure_search_types()
-    state.embeddings_model = dict()
-    state.embeddings_model["default"] = EmbeddingsModel()
-    state.cross_encoder_model = dict()
-    state.cross_encoder_model["default"] = CrossEncoderModel()
 
-    # These lines help us Mock the Search models for these search types
+    # Seed legacy Entry rows for API tests that still exercise uploaded content.
     text_search.setup(
         OrgToEntries,
         get_sample_data("org"),

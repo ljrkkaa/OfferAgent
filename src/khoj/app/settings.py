@@ -147,9 +147,6 @@ if USE_EMBEDDED_DB:
         # Start server
         PGSERVER_INSTANCE = pgserver.get_server(PGSERVER_DATA_DIR)
 
-        # Create pgvector extension, if not already exists
-        PGSERVER_INSTANCE.psql("CREATE EXTENSION IF NOT EXISTS vector;")
-
         # Create database, if not already exists
         db_exists_result = PGSERVER_INSTANCE.psql(f"SELECT 1 FROM pg_database WHERE datname = '{DB_NAME}';")
         db_exists = "(1 row)" in db_exists_result  # Check for actual row in result

@@ -7,13 +7,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from openai import OpenAI
 
 from khoj.database.models import ProcessLock
-from khoj.processor.embeddings import CrossEncoderModel, EmbeddingsModel
 from khoj.utils import config as utils_config
 from khoj.utils.helpers import LRU, get_device
 
 # Application Global State
-embeddings_model: Dict[str, EmbeddingsModel] = None
-cross_encoder_model: Dict[str, CrossEncoderModel] = None
 openai_client: OpenAI = None
 log_file: Path = None
 verbose: int = 0

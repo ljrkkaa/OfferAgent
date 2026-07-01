@@ -19,6 +19,7 @@ from typing import (
     ParamSpec,
     TypeVar,
 )
+from uuid import UUID
 
 import cron_descriptor
 from apscheduler.job import Job
@@ -32,8 +33,6 @@ from django.utils import timezone as django_timezone
 from django_apscheduler import util
 from django_apscheduler.models import DjangoJob, DjangoJobExecution
 from fastapi import HTTPException
-from pgvector.django import CosineDistance
-from torch import Tensor
 
 from khoj.database.models import (
     Agent,
@@ -56,7 +55,6 @@ from khoj.database.models import (
     PublicConversation,
     RateLimitRecord,
     ReflectiveQuestion,
-    SearchModelConfig,
     ServerChatSettings,
     SpeechToTextModelOptions,
     Subscription,
@@ -84,6 +82,7 @@ from khoj.utils.helpers import (
     normalize_email,
     timer,
 )
+from khoj.utils.lexical import query_terms
 
 logger = logging.getLogger(__name__)
 
@@ -557,35 +556,6 @@ async def set_user_github_config(user: KhojUser, pat_token: str, repos: list):
     return config
 
 
-def get_default_search_model() -> SearchModelConfig:
-    default_search_model = SearchModelConfig.objects.filter(name="default").first()
-
-    if default_search_model:
-        return default_search_model
-    elif SearchModelConfig.objects.count() == 0:
-        SearchModelConfig.objects.create()
-    return SearchModelConfig.objects.first()
-
-
-async def aget_default_search_model() -> SearchModelConfig:
-    default_search_model = await SearchModelConfig.objects.filter(name="default").afirst()
-
-    if default_search_model:
-        return default_search_model
-    elif await SearchModelConfig.objects.acount() == 0:
-        await SearchModelConfig.objects.acreate()
-    return await SearchModelConfig.objects.afirst()
-
-
-def get_or_create_search_models():
-    search_models = SearchModelConfig.objects.all()
-    if search_models.count() == 0:
-        SearchModelConfig.objects.create()
-        search_models = SearchModelConfig.objects.all()
-
-    return search_models
-
-
 class ProcessLockAdapters:
     @staticmethod
     def get_process_lock(process_name: str):
@@ -674,16 +644,23 @@ class AgentAdapters:
     DEFAULT_AGENT_SLUG = "khoj"
 
     @staticmethod
-    async def aget_readonly_agent_by_slug(agent_slug: str, user: KhojUser):
+    def get_readonly_agent_by_slug(agent_slug: str, user: KhojUser):
+        access_filter = Q(privacy_level=Agent.PrivacyLevel.PUBLIC) | Q(privacy_level=Agent.PrivacyLevel.PROTECTED)
+        if user:
+            access_filter |= Q(creator=user)
         return (
-            await Agent.objects.filter(
-                (Q(slug__iexact=agent_slug.lower()))
-                & (
-                    Q(privacy_level=Agent.PrivacyLevel.PUBLIC)
-                    | Q(privacy_level=Agent.PrivacyLevel.PROTECTED)
-                    | Q(creator=user)
-                )
-            )
+            Agent.objects.filter((Q(slug__iexact=agent_slug.lower())) & access_filter)
+            .prefetch_related("creator", "chat_model", "fileobject_set")
+            .first()
+        )
+
+    @staticmethod
+    async def aget_readonly_agent_by_slug(agent_slug: str, user: KhojUser):
+        access_filter = Q(privacy_level=Agent.PrivacyLevel.PUBLIC) | Q(privacy_level=Agent.PrivacyLevel.PROTECTED)
+        if user:
+            access_filter |= Q(creator=user)
+        return (
+            await Agent.objects.filter((Q(slug__iexact=agent_slug.lower())) & access_filter)
             .prefetch_related("creator", "chat_model", "fileobject_set")
             .afirst()
         )
@@ -692,7 +669,7 @@ class AgentAdapters:
     @arequire_valid_user
     async def adelete_agent_by_slug(agent_slug: str, user: KhojUser):
         agent = await AgentAdapters.aget_agent_by_slug(agent_slug, user)
-        if agent.creator != user:
+        if not agent or agent.creator != user:
             return False
 
         await Entry.objects.filter(agent=agent).adelete()
@@ -704,20 +681,22 @@ class AgentAdapters:
 
     @staticmethod
     async def aget_agent_by_slug(agent_slug: str, user: KhojUser):
+        access_filter = Q(privacy_level=Agent.PrivacyLevel.PUBLIC)
+        if user:
+            access_filter |= Q(creator=user)
         return (
-            await Agent.objects.filter(
-                (Q(slug__iexact=agent_slug.lower())) & (Q(privacy_level=Agent.PrivacyLevel.PUBLIC) | Q(creator=user))
-            )
+            await Agent.objects.filter((Q(slug__iexact=agent_slug.lower())) & access_filter)
             .prefetch_related("creator", "chat_model", "fileobject_set")
             .afirst()
         )
 
     @staticmethod
     async def aget_agent_by_name(agent_name: str, user: KhojUser):
+        access_filter = Q(privacy_level=Agent.PrivacyLevel.PUBLIC)
+        if user:
+            access_filter |= Q(creator=user)
         return (
-            await Agent.objects.filter(
-                (Q(name__iexact=agent_name.lower())) & (Q(privacy_level=Agent.PrivacyLevel.PUBLIC) | Q(creator=user))
-            )
+            await Agent.objects.filter((Q(name__iexact=agent_name.lower())) & access_filter)
             .prefetch_related("creator", "chat_model", "fileobject_set")
             .afirst()
         )
@@ -891,7 +870,6 @@ class AgentAdapters:
             entries_to_create.append(
                 Entry(
                     agent=agent,
-                    embeddings=entry.embeddings,
                     raw=entry.raw,
                     compiled=entry.compiled,
                     heading=entry.heading,
@@ -925,9 +903,10 @@ class AgentAdapters:
         slug: Optional[str] = None,
         is_hidden: Optional[bool] = False,
     ):
-        if not chat_model:
-            chat_model = await ConversationAdapters.aget_default_chat_model(user)
-        chat_model_option = await ChatModel.objects.filter(name=chat_model).afirst()
+        if chat_model:
+            chat_model_option = await ChatModel.objects.filter(name=chat_model).afirst()
+        else:
+            chat_model_option = await ConversationAdapters.aget_default_chat_model(user)
 
         try:
             return await sync_to_async(AgentAdapters.atomic_update_agent, thread_sensitive=True)(
@@ -991,7 +970,11 @@ class PublicConversationAdapters:
 
     @staticmethod
     def delete_public_conversation_by_slug(user: KhojUser, slug: str):
-        return PublicConversation.objects.filter(source_owner=user, slug=slug).first().delete()
+        public_conversation = PublicConversation.objects.filter(source_owner=user, slug=slug).first()
+        if not public_conversation:
+            return False
+        public_conversation.delete()
+        return True
 
 
 class ConversationAdapters:
@@ -1010,7 +993,11 @@ class ConversationAdapters:
     def get_conversation_by_user(
         user: KhojUser, client_application: ClientApplication = None, conversation_id: str = None
     ) -> Optional[Conversation]:
-        if conversation_id:
+        if conversation_id is not None:
+            try:
+                UUID(str(conversation_id))
+            except ValueError:
+                return None
             conversation = (
                 Conversation.objects.filter(user=user, client=client_application, id=conversation_id)
                 .order_by("-updated_at")
@@ -1026,8 +1013,11 @@ class ConversationAdapters:
 
     @staticmethod
     @require_valid_user
-    def get_all_conversations_for_export(user: KhojUser, page: Optional[int] = 0):
-        all_conversations = Conversation.objects.filter(user=user).prefetch_related("agent")[page : page + 10]
+    def get_all_conversations_for_export(user: KhojUser, page: int = 0):
+        start = page * 10
+        all_conversations = Conversation.objects.filter(user=user).order_by("created_at", "id").prefetch_related(
+            "agent"
+        )[start : start + 10]
         histories = []
         for conversation in all_conversations:
             history = {
@@ -1060,6 +1050,11 @@ class ConversationAdapters:
     async def aset_conversation_title(
         user: KhojUser, client_application: ClientApplication, conversation_id: str, title: str
     ):
+        if conversation_id is not None:
+            try:
+                UUID(str(conversation_id))
+            except ValueError:
+                return None
         conversation = await Conversation.objects.filter(
             user=user, client=client_application, id=conversation_id
         ).afirst()
@@ -1071,6 +1066,12 @@ class ConversationAdapters:
 
     @staticmethod
     def get_conversation_by_id(conversation_id: str):
+        if conversation_id is None:
+            return None
+        try:
+            UUID(str(conversation_id))
+        except ValueError:
+            return None
         return Conversation.objects.filter(id=conversation_id).first()
 
     @staticmethod
@@ -1096,7 +1097,7 @@ class ConversationAdapters:
         user: KhojUser, client_application: ClientApplication = None, agent_slug: str = None, title: str = None
     ):
         if agent_slug:
-            agent = AgentAdapters.aget_readonly_agent_by_slug(agent_slug, user)
+            agent = AgentAdapters.get_readonly_agent_by_slug(agent_slug, user)
             if agent is None:
                 raise HTTPException(status_code=400, detail="No such agent currently exists.")
             return Conversation.objects.create(user=user, client=client_application, agent=agent, title=title)
@@ -1119,7 +1120,11 @@ class ConversationAdapters:
             "agent", "agent__chat_model"
         )
 
-        if conversation_id:
+        if conversation_id is not None:
+            try:
+                UUID(str(conversation_id))
+            except ValueError:
+                return None
             return await query.filter(id=conversation_id).afirst()
         elif title:
             return await query.filter(title=title).afirst()
@@ -1135,7 +1140,11 @@ class ConversationAdapters:
     async def adelete_conversation_by_user(
         user: KhojUser, client_application: ClientApplication = None, conversation_id: str = None
     ):
-        if conversation_id:
+        if conversation_id is not None:
+            try:
+                UUID(str(conversation_id))
+            except ValueError:
+                return 0, {}
             return await Conversation.objects.filter(user=user, client=client_application, id=conversation_id).adelete()
         return await Conversation.objects.filter(user=user, client=client_application).adelete()
 
@@ -1566,7 +1575,11 @@ class ConversationAdapters:
         user_message: str = None,
     ):
         slug = user_message.strip()[:200] if user_message else None
-        if conversation_id:
+        if conversation_id is not None:
+            try:
+                UUID(str(conversation_id))
+            except ValueError:
+                return None
             conversation = (
                 await Conversation.objects.filter(user=user, client=client_application, id=conversation_id)
                 .prefetch_related("agent", "agent__chat_model")
@@ -1797,7 +1810,7 @@ class ConversationAdapters:
         conversation = ConversationAdapters.get_conversation_by_user(user, conversation_id=conversation_id)
         file_list = EntryAdapters.get_all_filenames_by_source(user, "computer")
         if not conversation:
-            return []
+            return None
         for filename in files:
             if filename in file_list and filename not in conversation.file_filters:
                 conversation.file_filters.append(filename)
@@ -1812,7 +1825,7 @@ class ConversationAdapters:
     def remove_files_from_filter(user: KhojUser, conversation_id: str, files: List[str]):
         conversation = ConversationAdapters.get_conversation_by_user(user, conversation_id=conversation_id)
         if not conversation:
-            return []
+            return None
         for filename in files:
             if filename in conversation.file_filters:
                 conversation.file_filters.remove(filename)
@@ -1832,6 +1845,8 @@ class ConversationAdapters:
             return False
         conversation_log = conversation.conversation_log
         updated_log = [msg for msg in conversation_log["chat"] if msg.get("turnId") != turn_id]
+        if len(updated_log) == len(conversation_log["chat"]):
+            return False
         conversation.conversation_log["chat"] = updated_log
         conversation.conversation_log = clean_object_for_db(conversation.conversation_log)
         conversation.save()
@@ -2007,8 +2022,8 @@ class EntryAdapters:
     @staticmethod
     def get_entries_by_date_filter(entry: BaseManager[Entry], start_date: date, end_date: date):
         return entry.filter(
-            entrydates__date__gte=start_date,
-            entrydates__date__lte=end_date,
+            created_at__date__gte=start_date,
+            created_at__date__lte=end_date,
         )
 
     @staticmethod
@@ -2129,47 +2144,16 @@ class EntryAdapters:
             if min_date is not None:
                 # Convert the min_date timestamp to yyyy-mm-dd format
                 formatted_min_date = date.fromtimestamp(min_date).strftime("%Y-%m-%d")
-                q_filter_terms &= Q(embeddings_dates__date__gte=formatted_min_date)
+                q_filter_terms &= Q(created_at__date__gte=formatted_min_date)
             if max_date is not None:
                 # Convert the max_date timestamp to yyyy-mm-dd format
                 formatted_max_date = date.fromtimestamp(max_date).strftime("%Y-%m-%d")
-                q_filter_terms &= Q(embeddings_dates__date__lte=formatted_max_date)
+                q_filter_terms &= Q(created_at__date__lte=formatted_max_date)
 
         relevant_entries = Entry.objects.filter(owner_filter).filter(q_filter_terms)
         if file_type_filter:
             relevant_entries = relevant_entries.filter(file_type=file_type_filter)
         return relevant_entries
-
-    @staticmethod
-    def search_with_embeddings(
-        raw_query: str,
-        embeddings: Tensor,
-        user: KhojUser,
-        max_results: int = 10,
-        file_type_filter: str = None,
-        max_distance: float = math.inf,
-        agent: Agent = None,
-    ):
-        owner_filter = Q()
-
-        if user is not None:
-            owner_filter = Q(user=user)
-        if agent is not None:
-            owner_filter |= Q(agent=agent)
-
-        if owner_filter == Q():
-            return Entry.objects.none()
-
-        relevant_entries = EntryAdapters.apply_filters(user, raw_query, file_type_filter, agent)
-        relevant_entries = relevant_entries.filter(owner_filter).annotate(
-            distance=CosineDistance("embeddings", embeddings)
-        )
-        relevant_entries = relevant_entries.filter(distance__lte=max_distance)
-
-        if file_type_filter:
-            relevant_entries = relevant_entries.filter(file_type=file_type_filter)
-        relevant_entries = relevant_entries.order_by("distance")
-        return relevant_entries[:max_results]
 
     @staticmethod
     @require_valid_user
@@ -2184,6 +2168,27 @@ class EntryAdapters:
 
 class AutomationAdapters:
     @staticmethod
+    def parse_automation_metadata(automation: Job) -> dict[str, str]:
+        try:
+            raw_metadata = json.loads(automation.name or "")
+        except (TypeError, json.JSONDecodeError):
+            raw_metadata = {}
+        if not isinstance(raw_metadata, dict):
+            raw_metadata = {}
+
+        fallback = str(automation.name or automation.id)
+        kwargs = automation.kwargs or {}
+        return {
+            "subject": str(raw_metadata.get("subject") or kwargs.get("subject") or fallback),
+            "query_to_run": str(raw_metadata.get("query_to_run") or kwargs.get("query_to_run") or fallback),
+            "scheduling_request": str(
+                raw_metadata.get("scheduling_request") or kwargs.get("scheduling_request") or fallback
+            ),
+            "crontime": str(raw_metadata.get("crontime") or ""),
+            "conversation_id": str(raw_metadata.get("conversation_id") or kwargs.get("conversation_id") or ""),
+        }
+
+    @staticmethod
     def get_automations(user: KhojUser) -> Iterable[Job]:
         all_automations: Iterable[Job] = state.scheduler.get_jobs()
         for automation in all_automations:
@@ -2197,10 +2202,14 @@ class AutomationAdapters:
         if not automation.id.startswith(f"automation_{user.uuid}_"):
             raise ValueError(f"Invalid automation id: {automation.id}")
 
-        automation_metadata = json.loads(automation.name)
+        automation_metadata = AutomationAdapters.parse_automation_metadata(automation)
         crontime = automation_metadata["crontime"]
-        timezone = automation.next_run_time.strftime("%Z")
-        schedule = f"{cron_descriptor.get_description(crontime)} {timezone}"
+        next_run_time = automation.next_run_time
+        timezone = next_run_time.strftime("%Z") if next_run_time else ""
+        try:
+            schedule = f"{cron_descriptor.get_description(crontime)} {timezone}".strip() if crontime else str(automation.trigger)
+        except Exception:
+            schedule = str(automation.trigger)
         return {
             "id": automation.id,
             "subject": automation_metadata["subject"],
@@ -2208,7 +2217,7 @@ class AutomationAdapters:
             "scheduling_request": automation_metadata["scheduling_request"],
             "schedule": schedule,
             "crontime": crontime,
-            "next": automation.next_run_time.strftime("%Y-%m-%d %I:%M %p %Z"),
+            "next": next_run_time.strftime("%Y-%m-%d %I:%M %p %Z") if next_run_time else "",
         }
 
     @staticmethod
@@ -2285,6 +2294,22 @@ class McpServerAdapters:
 
 class UserMemoryAdapters:
     @staticmethod
+    def _lexical_distance(memory: UserMemory, terms: list[str], query: str) -> float | None:
+        raw = (memory.raw or "").lower()
+        if not terms:
+            return None
+
+        term_hits = sum(1 for term in terms if term in raw)
+        if term_hits == 0:
+            return None
+
+        score = term_hits / len(terms)
+        normalized_query = query.lower().strip()
+        if normalized_query and normalized_query in raw:
+            score += 1.0
+        return 1 / (1 + score)
+
+    @staticmethod
     @require_valid_user
     async def pull_memories(user: KhojUser, agent: Agent = None, limit=10, window=7) -> list[UserMemory]:
         """
@@ -2306,18 +2331,11 @@ class UserMemoryAdapters:
         """
         Saves a memory to the database for a given user.
         """
-        embeddings_model = state.embeddings_model
-        model = await aget_default_search_model()
-        embeddings = await sync_to_async(embeddings_model[model.name].embed_query)(memory)
         default_agent = await AgentAdapters.aget_default_agent()
         if agent and agent != default_agent:
-            memory_instance = await UserMemory.objects.acreate(
-                user=user, embeddings=embeddings, raw=memory, search_model=model, agent=agent
-            )
+            memory_instance = await UserMemory.objects.acreate(user=user, raw=memory, agent=agent)
         else:
-            memory_instance = await UserMemory.objects.acreate(
-                user=user, embeddings=embeddings, raw=memory, search_model=model
-            )
+            memory_instance = await UserMemory.objects.acreate(user=user, raw=memory)
 
         return memory_instance
 
@@ -2327,10 +2345,6 @@ class UserMemoryAdapters:
         """
         Searches for memories in the database for a given user. Long term memory.
         """
-        embeddings_model = state.embeddings_model
-        model = await aget_default_search_model()
-        max_distance = model.bi_encoder_confidence_threshold or math.inf
-        embedded_query = await sync_to_async(embeddings_model[model.name].embed_query)(query)
         default_agent = await AgentAdapters.aget_default_agent()
 
         if agent and agent != default_agent:
@@ -2338,13 +2352,20 @@ class UserMemoryAdapters:
         else:
             relevant_memories = UserMemory.objects.filter(user=user)
 
-        relevant_memories = (
-            relevant_memories.annotate(distance=CosineDistance("embeddings", embedded_query))
-            .order_by("distance")
-            .filter(distance__lte=max_distance)
-        )
+        terms = query_terms(query)
 
-        return await sync_to_async(list)(relevant_memories[:limit])
+        def lexical_lookup():
+            hits = []
+            for memory in relevant_memories:
+                distance = UserMemoryAdapters._lexical_distance(memory, terms, query)
+                if distance is None:
+                    continue
+                memory.distance = distance
+                hits.append(memory)
+            hits.sort(key=lambda hit: (hit.distance, -hit.updated_at.timestamp(), hit.id))
+            return hits[:limit]
+
+        return await sync_to_async(lexical_lookup)()
 
     @staticmethod
     @require_valid_user

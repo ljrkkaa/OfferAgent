@@ -33,7 +33,7 @@ def test_text_search_setup_with_empty_file_creates_no_entries(search_config, def
     final_data = {"new_file.org": ""}
 
     # Act
-    # Generate notes embeddings during asymmetric setup
+    # Index notes entries.
     text_search.setup(OrgToEntries, final_data, regenerate=True, user=default_user)
 
     # Assert
@@ -41,12 +41,12 @@ def test_text_search_setup_with_empty_file_creates_no_entries(search_config, def
 
     assert existing_entries == 2
     assert updated_entries == 0
-    verify_embeddings(0, default_user)
+    verify_entries(0, default_user)
 
 
 # ----------------------------------------------------------------------------------------------------
 @pytest.mark.django_db
-def test_text_indexer_deletes_embedding_before_regenerate(search_config, default_user: KhojUser, caplog):
+def test_text_indexer_deletes_entries_before_regenerate(search_config, default_user: KhojUser, caplog):
     # Arrange
     data = {
         "test1.org": "* Test heading\nTest content",
@@ -56,7 +56,7 @@ def test_text_indexer_deletes_embedding_before_regenerate(search_config, default
     existing_entries = Entry.objects.filter(user=default_user).count()
 
     # Act
-    # Generate notes embeddings during asymmetric setup
+    # Rebuild notes entries.
     with caplog.at_level(logging.DEBUG):
         text_search.setup(OrgToEntries, data, regenerate=True, user=default_user)
 
@@ -76,7 +76,7 @@ def test_text_index_same_if_content_unchanged(search_config, default_user: KhojU
     data = {"test.org": "* Test heading\nTest content"}
 
     # Act
-    # Generate initial notes embeddings during asymmetric setup
+    # Generate initial notes entries during setup.
     with caplog.at_level(logging.DEBUG):
         text_search.setup(OrgToEntries, data, regenerate=True, user=default_user)
     initial_logs = caplog.text
@@ -129,6 +129,24 @@ async def test_text_search(search_config):
     assert "Emacs load path" in search_result, 'Expected "Emacs load path" in entry'
 
 
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.asyncio
+async def test_text_search_empty_query_returns_no_hits(search_config, default_user: KhojUser):
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None,
+        text_search.setup,
+        OrgToEntries,
+        get_sample_data("org"),
+        True,
+        default_user,
+    )
+
+    hits = await text_search.query("   ", default_user)
+
+    assert hits == []
+
+
 # ----------------------------------------------------------------------------------------------------
 @pytest.mark.django_db
 def test_entry_chunking_by_max_tokens(tmp_path, search_config, default_user: KhojUser, caplog):
@@ -142,7 +160,7 @@ def test_entry_chunking_by_max_tokens(tmp_path, search_config, default_user: Kho
     data = {str(new_file_to_index): content}
 
     # Act
-    # reload embeddings, entries, notes model after adding new org-mode file
+    # Reload entries after adding a new org-mode file.
     with caplog.at_level(logging.INFO):
         text_search.setup(OrgToEntries, data, regenerate=False, user=default_user)
 
@@ -190,7 +208,7 @@ conda activate khoj
     data = {str(new_file_to_index): content}
 
     # Act
-    # reload embeddings, entries, notes model after adding new org-mode file
+    # Reload entries after adding a new org-mode file.
     with caplog.at_level(logging.INFO):
         text_search.setup(
             OrgToEntries,
@@ -224,7 +242,7 @@ def test_regenerate_index_with_new_entry(search_config, default_user: KhojUser):
     new_entry = "\n* A Chihuahua doing Tango\n- Saw a super cute video of a chihuahua doing the Tango on Youtube\n"
     files_to_index[new_file] = new_entry
 
-    # regenerate notes jsonl, model embeddings and model to include entry from new file
+    # Regenerate indexed notes to include entry from new file.
     text_search.setup(OrgToEntries, files_to_index, regenerate=True, user=default_user)
     updated_entries2 = list(Entry.objects.filter(user=default_user).values_list("compiled", flat=True))
 
@@ -239,7 +257,7 @@ def test_regenerate_index_with_new_entry(search_config, default_user: KhojUser):
     assert any(
         ["Saw a super cute video of a chihuahua doing the Tango on Youtube" in entry for entry in updated_entries2]
     )
-    verify_embeddings(3, default_user)
+    verify_entries(3, default_user)
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -257,7 +275,7 @@ def test_update_index_with_duplicate_entries_in_stable_order(tmp_path, search_co
     data = {str(new_file_to_index): f"{new_entry}{new_entry}"}
 
     # Act
-    # generate embeddings, entries, notes model from scratch after adding new org-mode file
+    # Generate entries from scratch after adding new org-mode file.
     text_search.setup(OrgToEntries, data, regenerate=True, user=default_user)
     updated_entries1 = list(Entry.objects.filter(user=default_user).values_list("compiled", flat=True))
 
@@ -276,7 +294,7 @@ def test_update_index_with_duplicate_entries_in_stable_order(tmp_path, search_co
 
     assert len(existing_entries) == 2
     assert len(updated_entries1) == len(updated_entries2)
-    verify_embeddings(1, default_user)
+    verify_entries(1, default_user)
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -294,7 +312,7 @@ def test_update_index_with_deleted_entry(tmp_path, search_config, default_user: 
     final_data = {str(new_file_to_index): f"{new_entry}"}
 
     # Act
-    # load embeddings, entries, notes model after adding new org file with 2 entries
+    # Load entries after adding new org file with 2 entries.
     text_search.setup(OrgToEntries, initial_data, regenerate=True, user=default_user)
     updated_entries1 = list(Entry.objects.filter(user=default_user).values_list("compiled", flat=True))
 
@@ -312,7 +330,7 @@ def test_update_index_with_deleted_entry(tmp_path, search_config, default_user: 
     for entry in updated_entries2:
         assert entry in updated_entries1[0]
 
-    verify_embeddings(1, default_user)
+    verify_entries(1, default_user)
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -340,7 +358,7 @@ def test_update_index_with_new_entry(search_config, default_user: KhojUser):
     for old_entry in old_entries:
         assert old_entry not in updated_new_entries
     assert len(updated_new_entries) == len(new_entries) + 1
-    verify_embeddings(3, default_user)
+    verify_entries(3, default_user)
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -378,7 +396,7 @@ def test_update_index_with_deleted_file(text_to_entries: TextToEntries, search_c
     assert final_added_entries == 0, "Entries were unexpectedly added in delete entries pass"
     assert final_deleted_entries == initial_added_entries, "All added entries were not deleted"
 
-    verify_embeddings(0, default_user), "Embeddings still exist for user"
+    verify_entries(0, default_user), "Entries still exist for user"
 
     # Clean up
     EntryAdapters.delete_all_entries(default_user)
@@ -391,7 +409,7 @@ def test_text_search_setup_github(search_config, default_user: KhojUser):
     github_config = GithubConfig.objects.filter(user=default_user).first()
 
     # Act
-    # Regenerate github embeddings to test asymmetric setup without caching
+    # Regenerate github entries to test setup without caching.
     text_search.setup(
         GithubToEntries,
         {},
@@ -401,10 +419,10 @@ def test_text_search_setup_github(search_config, default_user: KhojUser):
     )
 
     # Assert
-    embeddings = Entry.objects.filter(user=default_user, file_type="github").count()
-    assert embeddings > 1
+    entries = Entry.objects.filter(user=default_user, file_type="github").count()
+    assert entries > 1
 
 
-def verify_embeddings(expected_count, user):
-    embeddings = Entry.objects.filter(user=user, file_type="org").count()
-    assert embeddings == expected_count
+def verify_entries(expected_count, user):
+    entries = Entry.objects.filter(user=user, file_type="org").count()
+    assert entries == expected_count

@@ -28,7 +28,6 @@ from khoj.database.models import (
     ProcessLock,
     RateLimitRecord,
     ReflectiveQuestion,
-    SearchModelConfig,
     ServerChatSettings,
     SpeechToTextModelOptions,
     Subscription,
@@ -224,7 +223,6 @@ class EntryAdmin(unfold_admin.ModelAdmin):
     list_filter = (
         "file_type",
         "user__email",
-        "search_model__name",
     )
     ordering = ("-created_at",)
 
@@ -273,17 +271,6 @@ class AiModelApiAdmin(unfold_admin.ModelAdmin):
         "api_key",
     )
     search_fields = ("id", "name", "api_base_url", "api_key")
-
-
-@admin.register(SearchModelConfig)
-class SearchModelConfigAdmin(unfold_admin.ModelAdmin):
-    list_display = (
-        "id",
-        "name",
-        "bi_encoder",
-        "cross_encoder",
-    )
-    search_fields = ("id", "name", "bi_encoder", "cross_encoder")
 
 
 @admin.register(ServerChatSettings)

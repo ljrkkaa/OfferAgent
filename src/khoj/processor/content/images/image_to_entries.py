@@ -33,7 +33,7 @@ class ImageToEntries(TextToEntries):
 
         # Identify, mark and merge any new entries with previous entries
         with timer("Identify new or updated entries", logger):
-            num_new_embeddings, num_deleted_embeddings = self.update_embeddings(
+            num_new_entries, num_deleted_entries = self.update_entries(
                 user,
                 current_entries,
                 DbEntry.EntryType.IMAGE,
@@ -45,7 +45,7 @@ class ImageToEntries(TextToEntries):
                 file_to_text_map=file_to_text_map,
             )
 
-        return num_new_embeddings, num_deleted_embeddings
+        return num_new_entries, num_deleted_entries
 
     @staticmethod
     def extract_image_entries(image_files) -> Tuple[Dict, List[Entry]]:  # important function

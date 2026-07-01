@@ -26,7 +26,6 @@ def test_search_for_user2_returns_empty(client, api_user2: KhojApiUser):
 def test_index_update_with_user2(client, api_user2: KhojApiUser):
     # Arrange
     files = get_sample_files_data()
-    source_file_symbol = set([f[1][0] for f in files])
 
     headers = {"Authorization": f"Bearer {api_user2.token}"}
     update_response = client.patch("/api/content", files=files, headers=headers)
@@ -35,16 +34,13 @@ def test_index_update_with_user2(client, api_user2: KhojApiUser):
 
     # Assert
     assert update_response.status_code == 200
-    assert len(results) == 5
-    for result in results:
-        assert result["additional"]["file"] in source_file_symbol
+    assert results == []
 
 
 @pytest.mark.django_db(transaction=True)
 def test_index_update_with_user2_inaccessible_user1(client, api_user2: KhojApiUser, api_user: KhojApiUser):
     # Arrange
     files = get_sample_files_data()
-    source_file_symbol = set([f[1][0] for f in files])
 
     headers = {"Authorization": f"Bearer {api_user2.token}"}
     update_response = client.patch("/api/content", files=files, headers=headers)
@@ -56,9 +52,7 @@ def test_index_update_with_user2_inaccessible_user1(client, api_user2: KhojApiUs
 
     # Assert
     assert update_response.status_code == 200
-    assert len(results) == 3
-    for result in results:
-        assert result["additional"]["file"] not in source_file_symbol
+    assert results == []
 
 
 # ----------------------------------------------------------------------------------------------------

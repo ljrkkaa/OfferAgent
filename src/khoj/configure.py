@@ -41,10 +41,8 @@ from khoj.database.adapters import (
     delete_ratelimit_records,
     delete_user_requests,
     get_all_users,
-    get_or_create_search_models,
 )
 from khoj.database.models import ClientApplication, KhojUser, ProcessLock, Subscription
-from khoj.processor.embeddings import CrossEncoderModel, EmbeddingsModel
 from khoj.routers.api_content import configure_content
 from khoj.utils import state
 from khoj.utils.config import SearchType
@@ -199,37 +197,8 @@ def initialize_server():
         ai_model_api = ConversationAdapters.get_ai_model_api()
         state.openai_client = openai.OpenAI(api_key=ai_model_api.api_key, base_url=ai_model_api.api_base_url)
 
-    # Initialize Search Models from Config and initialize content
+    # Initialize lightweight search routing.
     try:
-        search_models = get_or_create_search_models()
-        state.embeddings_model = dict()
-        state.cross_encoder_model = dict()
-
-        for model in search_models:
-            state.embeddings_model.update(
-                {
-                    model.name: EmbeddingsModel(
-                        model.bi_encoder,
-                        model.embeddings_inference_endpoint,
-                        model.embeddings_inference_endpoint_api_key,
-                        model.embeddings_inference_endpoint_type,
-                        query_encode_kwargs=model.bi_encoder_query_encode_config,
-                        docs_encode_kwargs=model.bi_encoder_docs_encode_config,
-                        model_kwargs=model.bi_encoder_model_config,
-                    )
-                }
-            )
-            state.cross_encoder_model.update(
-                {
-                    model.name: CrossEncoderModel(
-                        model.cross_encoder,
-                        model.cross_encoder_inference_endpoint,
-                        model.cross_encoder_inference_endpoint_api_key,
-                        model_kwargs=model.cross_encoder_model_config,
-                    )
-                }
-            )
-
         state.SearchType = configure_search_types()
         setup_default_agent()
 

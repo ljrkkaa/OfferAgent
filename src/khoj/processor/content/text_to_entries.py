@@ -3,7 +3,6 @@ import logging
 import re
 import uuid
 from abc import ABC, abstractmethod
-from itertools import repeat
 from typing import Any, Callable, List, Set, Tuple
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -12,12 +11,9 @@ from tqdm import tqdm
 from khoj.database.adapters import (
     EntryAdapters,
     FileObjectAdapters,
-    get_default_search_model,
 )
 from khoj.database.models import Entry as DbEntry
-from khoj.database.models import EntryDates, KhojUser
-from khoj.search_filter.date_filter import DateFilter
-from khoj.utils import state
+from khoj.database.models import KhojUser
 from khoj.utils.helpers import batcher, is_none_or_empty, timer
 from khoj.utils.rawconfig import Entry
 
@@ -26,8 +22,7 @@ logger = logging.getLogger(__name__)
 
 class TextToEntries(ABC):
     def __init__(self, config: Any = None):
-        self.embeddings_model = state.embeddings_model
-        self.date_filter = DateFilter()
+        pass
 
     @abstractmethod
     def process(self, files: dict[str, str], user: KhojUser, regenerate: bool = False) -> Tuple[int, int]: ...
@@ -139,7 +134,7 @@ class TextToEntries(ABC):
 
         return chunked_entries
 
-    def update_embeddings(
+    def update_entries(
         self,
         user: KhojUser,
         current_entries: List[Entry],
@@ -174,13 +169,9 @@ class TextToEntries(ABC):
                 existing_entry_hashes = set([entry.hashed_value for entry in existing_entries])
                 hashes_to_process |= hashes_for_file - existing_entry_hashes
 
-        embeddings = []
-        model = get_default_search_model()
-        with timer("Generated embeddings for entries to add to database in", logger):
+        with timer("Prepared lexical entries to add to database in", logger):
             entries_to_process = [hash_to_current_entries[hashed_val] for hashed_val in hashes_to_process]
-            data_to_embed = [getattr(entry, key) for entry in entries_to_process]
             modified_files = {entry.file for entry in entries_to_process}
-            embeddings += self.embeddings_model[model.name].embed_documents(data_to_embed)
 
         file_to_file_object_map = {}
         if file_to_text_map and modified_files:
@@ -198,19 +189,16 @@ class TextToEntries(ABC):
         added_entries: list[DbEntry] = []
         with timer("Added entries to database in", logger):
             num_items = len(hashes_to_process)
-            assert num_items == len(embeddings)
             batch_size = min(200, num_items)
-            entry_batches = zip(hashes_to_process, embeddings)
 
-            for entry_batch in tqdm(batcher(entry_batches, batch_size), desc="Add entries to database"):
-                batch_embeddings_to_create: List[DbEntry] = []
-                for entry_hash, new_entry in entry_batch:
+            for entry_batch in tqdm(batcher(hashes_to_process, batch_size), desc="Add entries to database"):
+                batch_entries_to_create: List[DbEntry] = []
+                for entry_hash in entry_batch:
                     entry = hash_to_current_entries[entry_hash]
                     file_object = file_to_file_object_map.get(entry.file, None)
-                    batch_embeddings_to_create.append(
+                    batch_entries_to_create.append(
                         DbEntry(
                             user=user,
-                            embeddings=new_entry,
                             raw=entry.raw,
                             compiled=entry.compiled,
                             heading=entry.heading[:1000],  # Truncate to max chars of field allowed
@@ -220,31 +208,18 @@ class TextToEntries(ABC):
                             hashed_value=entry_hash,
                             corpus_id=entry.corpus_id,
                             url=entry.uri,
-                            search_model=model,
                             file_object=file_object,
                         )
                     )
                 try:
-                    added_entries += DbEntry.objects.bulk_create(batch_embeddings_to_create)
+                    added_entries += DbEntry.objects.bulk_create(batch_entries_to_create)
                 except Exception as e:
                     batch_indexing_error = "\n\n".join(
                         f"file: {entry.file_path}\nheading: {entry.heading}\ncompiled: {entry.compiled[:100]}\nraw: {entry.raw[:100]}"
-                        for entry in batch_embeddings_to_create
+                        for entry in batch_entries_to_create
                     )
                     logger.error(f"Error adding entries to database:\n{batch_indexing_error}\n---\n{e}", exc_info=True)
             logger.debug(f"Added {len(added_entries)} {file_type} entries to database")
-
-        new_dates = []
-        with timer("Indexed dates from added entries in", logger):
-            for added_entry in added_entries:
-                dates_in_entries = zip(self.date_filter.extract_dates(added_entry.compiled), repeat(added_entry))
-                dates_to_create = [
-                    EntryDates(date=date, entry=added_entry)
-                    for date, added_entry in dates_in_entries
-                    if not is_none_or_empty(date)
-                ]
-                new_dates += EntryDates.objects.bulk_create(dates_to_create)
-            logger.debug(f"Indexed {len(new_dates)} dates from added {file_type} entries")
 
         with timer("Deleted entries identified by server from database in", logger):
             for file in hashes_by_file:
@@ -308,10 +283,10 @@ class TextToEntries(ABC):
                 for entry_hash in new_entry_hashes
             ]
             new_entries_sorted = sorted(new_entries, key=lambda e: e[0])
-            # Mark new entries with -1 id to flag for later embeddings generation
+            # Mark new entries with -1 id to flag for later indexing.
             new_entries_sorted = [(-1, entry[1]) for entry in new_entries_sorted]
 
-            # Set id of existing entries to their previous ids to reuse their existing encoded embeddings
+            # Set id of existing entries to their previous ids to reuse their existing DB rows.
             existing_entries = [
                 (previous_entry_hashes.index(entry_hash), hash_to_previous_entries[entry_hash])
                 for entry_hash in preserving_entry_hashes

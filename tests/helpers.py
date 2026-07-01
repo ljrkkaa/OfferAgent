@@ -17,7 +17,6 @@ from khoj.database.models import (
     KhojApiUser,
     KhojUser,
     ProcessLock,
-    SearchModelConfig,
     ServerChatSettings,
     Subscription,
     UserConversationConfig,
@@ -287,16 +286,6 @@ class ConversationFactory(factory.django.DjangoModelFactory):
     user = factory.SubFactory(UserFactory)
 
 
-class SearchModelFactory(factory.django.DjangoModelFactory):
-    class Meta:
-        model = SearchModelConfig
-
-    name = "default"
-    model_type = "text"
-    bi_encoder = "BAAI/bge-small-zh-v1.5"
-    cross_encoder = "BAAI/bge-reranker-v2-m3"
-
-
 class SubscriptionFactory(factory.django.DjangoModelFactory):
     class Meta:
         model = Subscription
@@ -347,10 +336,5 @@ async def acreate_agent(name, chat_model, personality):
 
 
 async def acreate_test_memory(user, agent=None, raw_text="test memory"):
-    """Create a memory directly in DB without embeddings for testing."""
-    return await sync_to_async(UserMemory.objects.create)(
-        user=user,
-        agent=agent,
-        raw=raw_text,
-        embeddings=[0.1] * 384,  # Dummy embeddings
-    )
+    """Create a memory directly in DB for testing."""
+    return await sync_to_async(UserMemory.objects.create)(user=user, agent=agent, raw=raw_text)
