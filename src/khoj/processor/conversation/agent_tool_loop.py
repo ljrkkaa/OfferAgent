@@ -1,5 +1,7 @@
+import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
@@ -15,6 +17,8 @@ from khoj.processor.conversation.utils import ResponseWithThought, ToolCall, loa
 from khoj.processor.tools.online_search import read_webpages, read_webpages_content, search_online
 from khoj.routers.helpers import ChatEvent
 from khoj.utils.helpers import ConversationCommand, ToolDefinition, tools_for_research_llm
+from khoj.utils.local_kb import is_local_kb_write_allowed
+from khoj.utils.openkb import get_kb_engine
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,17 @@ WEB_SEARCH_TOOL = ToolDefinition(
     schema=tools_for_research_llm[ConversationCommand.SearchWeb].schema,
 )
 
+CONCURRENCY_SAFE_TOOLS = {
+    "web_search",
+    ConversationCommand.ReadWebpage.value,
+    ConversationCommand.ViewFile.value,
+    ConversationCommand.ListFiles.value,
+    ConversationCommand.KbHeadings.value,
+    ConversationCommand.KbResolveLink.value,
+    ConversationCommand.RegexSearchFiles.value,
+    OPENKB_TOOL.name,
+}
+
 
 @dataclass
 class AgentToolLoopResult:
@@ -42,6 +57,13 @@ class AgentToolLoopResult:
     searched: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     tool_transcript: list[dict[str, Any]] = field(default_factory=list)
+    artifacts: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass
+class ToolBatch:
+    is_concurrency_safe: bool
+    calls: list[ToolCall]
 
 
 def parse_agent_tool_calls(raw: str) -> list[ToolCall]:
@@ -145,7 +167,7 @@ async def run_web_search_tool(
         result.online_results.update(response_dict)
     result.inferred_queries.append(query)
     result.searched.append(f"web_search: {query}")
-    result.tool_transcript.append({"tool": "web_search", "args": args, "result": _tool_result_text(response_dict)})
+    _record_tool_result(result, "web_search", args, response_dict)
 
 
 async def run_read_webpage_tool(
@@ -200,7 +222,7 @@ async def run_read_webpage_tool(
         result.online_results.update(response_dict)
     result.inferred_queries.append(query)
     result.searched.append(f"read_webpage: {query}")
-    result.tool_transcript.append({"tool": "read_webpage", "args": args, "result": _tool_result_text(response_dict)})
+    _record_tool_result(result, "read_webpage", args, response_dict)
 
 
 async def run_notes_tool_call(
@@ -307,15 +329,18 @@ async def collect_agent_context_and_actions(
 
     await _send_status(send_status, "Planning with unified agent runtime")
     for _ in range(max(1, max_iterations)):
-        response = await send_message(
-            query=_build_planner_query(query, chat_history, registry, result.tool_transcript),
-            system_message=AGENT_TOOL_SYSTEM_PROMPT,
-            chat_history=chat_history,
-            tools=[],
-            response_type="json_object",
-            deepthought=True,
-            fast_model=False,
+        planner_query = _build_planner_query(
+            query,
+            chat_history,
+            registry,
+            result.tool_transcript,
+            runtime_facts=_runtime_facts(
+                allow_local_kb=allow_local_kb,
+                allow_openkb=allow_openkb,
+                client_app=client_app,
+            ),
         )
+        response = await _send_planner_message(send_message, planner_query, chat_history)
         if response and getattr(response, "thought", None):
             await _send_status(send_status, response.thought)
         calls = parse_agent_tool_calls(getattr(response, "text", response) or "")
@@ -323,63 +348,257 @@ async def collect_agent_context_and_actions(
             break
         for call in calls:
             call.name = _normalize_tool_name(call.name)
-            if call.name not in registry:
-                _record_tool_error(result, call.name, call.args, f"Agent runtime tool is not available: {call.name}")
-                continue
-            command = _command_for_tool(call.name)
-            if before_tool_call and command:
-                await before_tool_call(command)
-            await _send_status(send_status, f"Using agent tool: {call.name}")
-            reference_start = len(result.references)
-            try:
-                if call.name == "web_search":
-                    await run_web_search_tool(
-                        call.args,
-                        result=result,
-                        user=user,
-                        conversation_history=chat_history,
-                        location=location,
-                        query_images=query_images,
-                        query_files=query_files,
-                        relevant_memories=relevant_memories,
-                        agent=agent,
-                        tracer=tracer,
-                    )
-                elif call.name == ConversationCommand.ReadWebpage.value:
-                    await run_read_webpage_tool(
-                        call.args,
-                        result=result,
-                        user=user,
-                        conversation_history=chat_history,
-                        location=location,
-                        query_images=query_images,
-                        query_files=query_files,
-                        relevant_memories=relevant_memories,
-                        agent=agent,
-                        tracer=tracer,
-                    )
-                else:
-                    await run_notes_tool_call(
-                        call,
-                        result=result,
-                        query=query,
-                        chat_history=chat_history,
-                        user=user,
-                        agent=agent,
-                        send_message=send_message,
-                        client_app=client_app,
-                        allow_local_kb=allow_local_kb,
-                        allow_openkb=allow_openkb,
-                        conversation_id=conversation_id,
-                    )
-            except Exception as exc:
-                logger.warning("Agent runtime tool failed: %s", call.name, exc_info=True)
-                _record_tool_error(result, call.name, call.args, str(exc))
-            for reference in result.references[reference_start:]:
-                add_write_reference_context(result, reference)
+        for batch in _partition_tool_calls(calls):
+            await _run_tool_batch(
+                batch,
+                result=result,
+                registry=registry,
+                query=query,
+                chat_history=chat_history,
+                user=user,
+                agent=agent,
+                send_message=send_message,
+                send_status=send_status,
+                before_tool_call=before_tool_call,
+                client_app=client_app,
+                allow_local_kb=allow_local_kb,
+                allow_openkb=allow_openkb,
+                conversation_id=conversation_id,
+                location=location,
+                query_images=query_images,
+                query_files=query_files,
+                relevant_memories=relevant_memories,
+                tracer=tracer,
+            )
 
     result.inferred_queries = list(dict.fromkeys(item for item in result.inferred_queries if item))
     return result
+
+
+def _is_concurrency_safe_call(call: ToolCall) -> bool:
+    return _normalize_tool_name(call.name) in CONCURRENCY_SAFE_TOOLS
+
+
+def _partition_tool_calls(calls: list[ToolCall]) -> list[ToolBatch]:
+    batches: list[ToolBatch] = []
+    for call in calls:
+        is_safe = _is_concurrency_safe_call(call)
+        if is_safe and batches and batches[-1].is_concurrency_safe:
+            batches[-1].calls.append(call)
+        else:
+            batches.append(ToolBatch(is_concurrency_safe=is_safe, calls=[call]))
+    return batches
+
+
+async def _run_tool_batch(
+    batch: ToolBatch,
+    *,
+    result: AgentToolLoopResult,
+    registry: dict[str, ToolDefinition],
+    query: str,
+    chat_history: list,
+    user: Any,
+    agent: Any,
+    send_message: Callable[..., Awaitable[Any]],
+    send_status: Optional[Callable[[str], Any]],
+    before_tool_call: Optional[Callable[[ConversationCommand], Awaitable[None]]],
+    client_app: Any,
+    allow_local_kb: bool,
+    allow_openkb: bool,
+    conversation_id: str,
+    location: Any = None,
+    query_images: list[str] | None = None,
+    query_files: str | None = None,
+    relevant_memories: list | None = None,
+    tracer: dict | None = None,
+) -> None:
+    if batch.is_concurrency_safe and len(batch.calls) > 1:
+        await _send_status(send_status, f"Using agent tools: {', '.join(call.name for call in batch.calls)}")
+        for call in batch.calls:
+            command = _command_for_tool(call.name)
+            if call.name in registry and before_tool_call and command:
+                await before_tool_call(command)
+
+        semaphore = asyncio.Semaphore(_max_tool_concurrency())
+
+        async def run_one(call: ToolCall) -> AgentToolLoopResult:
+            local_result = AgentToolLoopResult()
+            async with semaphore:
+                await _run_tool_call(
+                    call,
+                    result=local_result,
+                    registry=registry,
+                    query=query,
+                    chat_history=chat_history,
+                    user=user,
+                    agent=agent,
+                    send_message=send_message,
+                    send_status=None,
+                    before_tool_call=None,
+                    client_app=client_app,
+                    allow_local_kb=allow_local_kb,
+                    allow_openkb=allow_openkb,
+                    conversation_id=conversation_id,
+                    location=location,
+                    query_images=query_images,
+                    query_files=query_files,
+                    relevant_memories=relevant_memories,
+                    tracer=tracer,
+                )
+            return local_result
+
+        local_results = await asyncio.gather(*(run_one(call) for call in batch.calls))
+        for local_result in local_results:
+            _merge_tool_result(result, local_result)
+        return
+
+    for call in batch.calls:
+        await _run_tool_call(
+            call,
+            result=result,
+            registry=registry,
+            query=query,
+            chat_history=chat_history,
+            user=user,
+            agent=agent,
+            send_message=send_message,
+            send_status=send_status,
+            before_tool_call=before_tool_call,
+            client_app=client_app,
+            allow_local_kb=allow_local_kb,
+            allow_openkb=allow_openkb,
+            conversation_id=conversation_id,
+            location=location,
+            query_images=query_images,
+            query_files=query_files,
+            relevant_memories=relevant_memories,
+            tracer=tracer,
+        )
+
+
+async def _run_tool_call(
+    call: ToolCall,
+    *,
+    result: AgentToolLoopResult,
+    registry: dict[str, ToolDefinition],
+    query: str,
+    chat_history: list,
+    user: Any,
+    agent: Any,
+    send_message: Callable[..., Awaitable[Any]],
+    send_status: Optional[Callable[[str], Any]],
+    before_tool_call: Optional[Callable[[ConversationCommand], Awaitable[None]]],
+    client_app: Any,
+    allow_local_kb: bool,
+    allow_openkb: bool,
+    conversation_id: str,
+    location: Any = None,
+    query_images: list[str] | None = None,
+    query_files: str | None = None,
+    relevant_memories: list | None = None,
+    tracer: dict | None = None,
+) -> None:
+    call.name = _normalize_tool_name(call.name)
+    if call.name not in registry:
+        _record_tool_error(result, call.name, call.args, f"Agent runtime tool is not available: {call.name}")
+        return
+    command = _command_for_tool(call.name)
+    if before_tool_call and command:
+        await before_tool_call(command)
+    await _send_status(send_status, f"Using agent tool: {call.name}")
+    reference_start = len(result.references)
+    try:
+        if call.name == "web_search":
+            await run_web_search_tool(
+                call.args,
+                result=result,
+                user=user,
+                conversation_history=chat_history,
+                location=location,
+                query_images=query_images,
+                query_files=query_files,
+                relevant_memories=relevant_memories,
+                agent=agent,
+                tracer=tracer,
+            )
+        elif call.name == ConversationCommand.ReadWebpage.value:
+            await run_read_webpage_tool(
+                call.args,
+                result=result,
+                user=user,
+                conversation_history=chat_history,
+                location=location,
+                query_images=query_images,
+                query_files=query_files,
+                relevant_memories=relevant_memories,
+                agent=agent,
+                tracer=tracer,
+            )
+        else:
+            await run_notes_tool_call(
+                call,
+                result=result,
+                query=query,
+                chat_history=chat_history,
+                user=user,
+                agent=agent,
+                send_message=send_message,
+                client_app=client_app,
+                allow_local_kb=allow_local_kb,
+                allow_openkb=allow_openkb,
+                conversation_id=conversation_id,
+            )
+    except Exception as exc:
+        logger.warning("Agent runtime tool failed: %s", call.name, exc_info=True)
+        _record_tool_error(result, call.name, call.args, str(exc))
+    for reference in result.references[reference_start:]:
+        add_write_reference_context(result, reference)
+
+
+def _merge_tool_result(parent: AgentToolLoopResult, child: AgentToolLoopResult) -> None:
+    artifact_ids = _merge_artifacts(parent, child)
+    parent.references.extend(_remap_artifact_ids(ref, artifact_ids) for ref in child.references)
+    parent.inferred_queries.extend(child.inferred_queries)
+    parent.online_results.update(child.online_results)
+    for context in child.program_context:
+        if context not in parent.program_context:
+            parent.program_context.append(context)
+    parent.searched.extend(child.searched)
+    parent.errors.extend(child.errors)
+    parent.tool_transcript.extend(_remap_artifact_ids(item, artifact_ids) for item in child.tool_transcript)
+
+
+def _merge_artifacts(parent: AgentToolLoopResult, child: AgentToolLoopResult) -> dict[str, str]:
+    artifact_ids: dict[str, str] = {}
+    for old_id, artifact in child.artifacts.items():
+        new_id = f"tool-result:{len(parent.artifacts) + 1}"
+        artifact_ids[old_id] = new_id
+        new_artifact = dict(artifact)
+        new_artifact["id"] = new_id
+        parent.artifacts[new_id] = new_artifact
+    return artifact_ids
+
+
+def _remap_artifact_ids(value: Any, artifact_ids: dict[str, str]) -> Any:
+    if not artifact_ids:
+        return value
+    if isinstance(value, dict):
+        remapped = {key: _remap_artifact_ids(item, artifact_ids) for key, item in value.items()}
+        artifact_id = remapped.get("artifact_id")
+        if isinstance(artifact_id, str) and artifact_id in artifact_ids:
+            remapped["artifact_id"] = artifact_ids[artifact_id]
+        return remapped
+    if isinstance(value, list):
+        return [_remap_artifact_ids(item, artifact_ids) for item in value]
+    return value
+
+
+def _max_tool_concurrency() -> int:
+    try:
+        value = int(os.getenv("KHOJ_AGENT_TOOL_CONCURRENCY", "4"))
+    except ValueError:
+        value = 4
+    return max(1, min(value, 8))
 
 
 def _build_planner_query(
@@ -387,14 +606,50 @@ def _build_planner_query(
     chat_history: list,
     registry: dict[str, ToolDefinition],
     tool_transcript: list[dict[str, Any]],
+    runtime_facts: dict[str, Any] | None = None,
 ) -> str:
     return (
         f"User question:\n{query}\n\n"
         f"Recent conversation artifacts:\n{json.dumps(_recent_artifact_catalog(chat_history), ensure_ascii=False, default=str)[:6000]}\n\n"
+        f"Runtime facts:\n{json.dumps(runtime_facts or {}, ensure_ascii=False, default=str)}\n\n"
         "Return a json object with a calls array. Use an empty calls array when no more tools are needed.\n\n"
         f"Available tools:\n{json.dumps(_tool_specs(list(registry.values())), ensure_ascii=False, default=str)[:10000]}\n\n"
         f"Tool results so far:\n{json.dumps(tool_transcript, ensure_ascii=False, default=str)[:16000]}"
     )
+
+
+async def _send_planner_message(send_message: Callable[..., Awaitable[Any]], query: str, chat_history: list) -> Any:
+    kwargs = {
+        "query": query,
+        "system_message": AGENT_TOOL_SYSTEM_PROMPT,
+        "chat_history": chat_history,
+        "tools": [],
+        "response_type": "json_object",
+        "deepthought": True,
+        "fast_model": False,
+    }
+    try:
+        return await send_message(**kwargs)
+    except Exception:
+        logger.warning("Unified agent planner failed once; retrying", exc_info=True)
+        return await send_message(**kwargs)
+
+
+def _runtime_facts(*, allow_local_kb: bool, allow_openkb: bool, client_app: Any = None) -> dict[str, Any]:
+    return {
+        "kb_engine": get_kb_engine(),
+        "local_kb_available": bool(allow_local_kb),
+        "openkb_available": bool(allow_openkb),
+        "vault_write_enabled": is_local_kb_write_allowed(),
+        "client_app": _client_app_name(client_app),
+        "write_boundary": "append allowed when enabled; replace/delete/overwrite require propose_edit",
+    }
+
+
+def _client_app_name(client_app: Any) -> str:
+    if client_app is None:
+        return ""
+    return str(getattr(client_app, "value", None) or getattr(client_app, "name", None) or client_app).lower()
 
 
 def _normalize_tool_name(name: str) -> str:
@@ -430,6 +685,34 @@ def _tool_specs(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
 def _tool_result_text(value: Any, limit: int = 8000) -> str:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
     return text[:limit]
+
+
+def _record_tool_result(result: AgentToolLoopResult, tool: str, args: dict[str, Any], value: Any, limit: int = 8000) -> None:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    if len(text) <= limit:
+        result.tool_transcript.append({"tool": tool, "args": args, "result": text})
+        return
+    artifact_id = f"tool-result:{len(result.artifacts) + 1}"
+    result.artifacts[artifact_id] = {
+        "id": artifact_id,
+        "tool": tool,
+        "args": args,
+        "content": text,
+    }
+    preview_chars = min(1000, max(1, (limit - 100) // 2))
+    result.tool_transcript.append(
+        {
+            "tool": tool,
+            "args": args,
+            "result": {
+                "artifact_id": artifact_id,
+                "tool": tool,
+                "chars": len(text),
+                "preview": f"{text[:preview_chars]}\n...\n{text[-preview_chars:]}",
+                "truncated": True,
+            },
+        }
+    )
 
 
 def _record_tool_error(result: AgentToolLoopResult, tool: str, args: dict[str, Any], message: str) -> None:
