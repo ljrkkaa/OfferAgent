@@ -126,6 +126,7 @@ PROPOSE_EDIT_TOOL = ToolDefinition(
             "find": {"type": "string", "description": "Existing text to replace."},
             "replace": {"type": "string", "description": "Replacement text."},
             "reason": {"type": "string", "description": "Optional edit reason."},
+            "source_refs": APPEND_NOTE_TOOL.schema["properties"]["source_refs"],
         },
         "required": ["path", "find", "replace"],
     },
@@ -490,6 +491,44 @@ def _compact_text(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
 
 
+def _tool_result_value(item: dict[str, Any]) -> Any:
+    value = item.get("result")
+    if isinstance(value, str):
+        try:
+            return load_complex_json(value)
+        except Exception:
+            return value
+    return value
+
+
+def _edit_source_error(args: dict[str, Any], chat_history: list, tool_transcript: list[dict[str, Any]]) -> str:
+    find = str(args.get("find") or "").strip()
+    path = str(args.get("path") or "").strip()
+    if not find:
+        return ""
+
+    refs = args.get("source_refs")
+    if isinstance(refs, list) and refs:
+        source_text = "\n\n".join(
+            _source_ref_text(ref, chat_history, tool_transcript) for ref in refs if isinstance(ref, dict)
+        )
+        if find in source_text:
+            return ""
+        return "edit_source_required: Could not find the proposed edit text in source_refs. Read the target file and retry."
+
+    for item in reversed(tool_transcript):
+        if item.get("tool") != ConversationCommand.ViewFile.value:
+            continue
+        item_args = item.get("args") if isinstance(item.get("args"), dict) else {}
+        if path and str(item_args.get("path") or "").strip() != path:
+            continue
+        result = _tool_result_value(item)
+        text = result.get("text") if isinstance(result, dict) else str(result or "")
+        if find in str(text or ""):
+            return ""
+    return "edit_source_required: Read the target file with view_file before calling propose_edit."
+
+
 def _source_refs_required_error(query: str, args: dict[str, Any]) -> str:
     if args.get("source_refs"):
         return ""
@@ -777,6 +816,17 @@ async def collect_notes_evidence_with_tools(
                 references.append(_write_reference(write))
                 return write.__dict__
             if call.name == "propose_edit":
+                edit_source_error = _edit_source_error(args, chat_history, tool_transcript)
+                if edit_source_error:
+                    blocked = LocalKBWriteResult(
+                        action="propose_edit",
+                        path=str(args.get("path") or "").strip(),
+                        status="edit_source_required",
+                        changed=False,
+                        message=edit_source_error,
+                    )
+                    references.append(_write_reference(blocked))
+                    return blocked.__dict__
                 edit = propose_local_kb_edit(
                     args.get("path") or "",
                     args.get("find") or "",

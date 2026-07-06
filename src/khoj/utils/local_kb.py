@@ -442,13 +442,25 @@ def propose_local_kb_edit(path: str, find: str, replace: str, reason: Optional[s
         raise LocalKBError("Edit proposal find text cannot be empty.")
 
     existing = target.read_text(encoding="utf-8", errors="replace")
-    if find not in existing:
+    match_count = existing.count(find)
+    if match_count == 0:
         return LocalKBWriteResult(
             action="propose_edit",
             path=relpath,
             status="find_not_found",
             changed=False,
             message=f"Could not find the requested text in {relpath}; no file was modified.",
+        )
+    if match_count > 1:
+        return LocalKBWriteResult(
+            action="propose_edit",
+            path=relpath,
+            status="ambiguous_match",
+            changed=False,
+            message=(
+                f"Requested edit text matched {match_count} times in {relpath}; no file was modified. "
+                "Retry with a longer find block that uniquely identifies the target."
+            ),
         )
 
     proposed = existing.replace(find, replace, 1)

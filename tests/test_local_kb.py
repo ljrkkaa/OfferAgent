@@ -359,6 +359,19 @@ class LocalKBTest(unittest.TestCase):
         self.assertIn("+new answer", result.diff)
         self.assertEqual((self.root / "notes.md").read_text(encoding="utf-8"), "old answer\n")
 
+    def test_propose_edit_rejects_ambiguous_find_text(self):
+        original = "## Redis 穿透\n解决方案：布隆过滤器。\n\n## Redis 击穿\n解决方案：布隆过滤器。\n"
+        self.write("notes.md", original)
+
+        with self.env(KHOJ_LOCAL_KB_PATH=str(self.root), KHOJ_ALLOW_VAULT_WRITE="true"):
+            result = propose_local_kb_edit("notes.md", "解决方案：布隆过滤器。", "解决方案：布隆过滤器 + 空值缓存。")
+
+        self.assertFalse(result.changed)
+        self.assertEqual(result.status, "ambiguous_match")
+        self.assertEqual(result.diff, "")
+        self.assertIn("matched 2 times", result.message)
+        self.assertEqual((self.root / "notes.md").read_text(encoding="utf-8"), original)
+
 
 if __name__ == "__main__":
     unittest.main()

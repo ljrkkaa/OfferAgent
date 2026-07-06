@@ -422,6 +422,106 @@ async def test_notes_tool_loop_verifies_content_adapted_from_artifact(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_notes_tool_loop_requires_read_before_propose_edit(tmp_path, monkeypatch):
+    (tmp_path / "notes.md").write_text("Redis answer\n", encoding="utf-8")
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+
+    result = await collect_notes_evidence_with_tools(
+        "把 notes.md 里的 Redis answer 改成 Redis final answer",
+        [],
+        user=object(),
+        agent=None,
+        send_message=fake_model(
+            json.dumps(
+                {
+                    "calls": [
+                        {
+                            "name": "propose_edit",
+                            "args": {"path": "notes.md", "find": "Redis answer", "replace": "Redis final answer"},
+                            "id": "1",
+                        }
+                    ]
+                }
+            ),
+            "done",
+        ),
+    )
+
+    assert [ref["status"] for ref in result.references if ref["query"] == "propose_edit"] == [
+        "edit_source_required"
+    ]
+    assert (tmp_path / "notes.md").read_text(encoding="utf-8") == "Redis answer\n"
+
+
+@pytest.mark.asyncio
+async def test_notes_tool_loop_allows_propose_edit_after_view_file(tmp_path, monkeypatch):
+    (tmp_path / "notes.md").write_text("Redis answer\n", encoding="utf-8")
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+
+    result = await collect_notes_evidence_with_tools(
+        "把 notes.md 里的 Redis answer 改成 Redis final answer",
+        [],
+        user=object(),
+        agent=None,
+        send_message=fake_model(
+            json.dumps(
+                {
+                    "calls": [
+                        {"name": "view_file", "args": {"path": "notes.md"}, "id": "1"},
+                        {
+                            "name": "propose_edit",
+                            "args": {"path": "notes.md", "find": "Redis answer", "replace": "Redis final answer"},
+                            "id": "2",
+                        },
+                    ]
+                }
+            ),
+            "done",
+        ),
+    )
+
+    statuses = [ref["status"] for ref in result.references if ref["query"] == "propose_edit"]
+    assert statuses == ["proposed"]
+    assert "-Redis answer" in result.references[-1]["compiled"]
+    assert "+Redis final answer" in result.references[-1]["compiled"]
+    assert (tmp_path / "notes.md").read_text(encoding="utf-8") == "Redis answer\n"
+
+
+@pytest.mark.asyncio
+async def test_notes_tool_loop_allows_propose_edit_with_file_source_ref(tmp_path, monkeypatch):
+    (tmp_path / "notes.md").write_text("Redis answer\n", encoding="utf-8")
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+
+    result = await collect_notes_evidence_with_tools(
+        "把 notes.md 里的 Redis answer 改成 Redis final answer",
+        [],
+        user=object(),
+        agent=None,
+        send_message=fake_model(
+            json.dumps(
+                {
+                    "calls": [
+                        {
+                            "name": "propose_edit",
+                            "args": {
+                                "path": "notes.md",
+                                "find": "Redis answer",
+                                "replace": "Redis final answer",
+                                "source_refs": [{"type": "file", "path": "notes.md", "start_line": 1, "end_line": 1}],
+                            },
+                            "id": "1",
+                        }
+                    ]
+                }
+            ),
+            "done",
+        ),
+    )
+
+    assert [ref["status"] for ref in result.references if ref["query"] == "propose_edit"] == ["proposed"]
+
+
+@pytest.mark.asyncio
 async def test_notes_tool_loop_rejects_missing_artifact_id(tmp_path, monkeypatch):
     (tmp_path / "daily.md").write_text("# Daily\n", encoding="utf-8")
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
