@@ -25,7 +25,7 @@ export default function Loading(props: LoadingProps) {
                     <Separator orientation="vertical" className="mr-2 h-4" />
                     {isMobileWidth ? (
                         <Link className="p-0 no-underline" href="/">
-                            <KhojLogoType className="h-auto w-16" />
+                            <KhojLogoType className="h-auto w-32 max-w-full" />
                         </Link>
                     ) : (
                         <h2 className="text-lg">Ask Anything</h2>

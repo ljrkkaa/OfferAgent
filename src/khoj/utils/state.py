@@ -26,4 +26,3 @@ schedule_leader_process_lock: ProcessLock = None
 khoj_version: str = None
 device = get_device()
 anonymous_mode: bool = False
-billing_enabled: bool = False

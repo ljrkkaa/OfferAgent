@@ -1,6 +1,5 @@
 import logging
 import os
-from datetime import datetime
 from enum import Enum
 from functools import wraps
 from typing import Optional
@@ -15,7 +14,6 @@ from django.db import (
     close_old_connections,
     connections,
 )
-from django.utils.timezone import make_aware
 from fastapi import HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from starlette.authentication import (
@@ -37,12 +35,11 @@ from khoj.database.adapters import (
     AgentAdapters,
     ConversationAdapters,
     ProcessLockAdapters,
-    ais_user_subscribed,
     delete_ratelimit_records,
     delete_user_requests,
     get_all_users,
 )
-from khoj.database.models import ClientApplication, KhojUser, ProcessLock, Subscription
+from khoj.database.models import ClientApplication, KhojUser, ProcessLock
 from khoj.routers.api_content import configure_content
 from khoj.utils import state
 from khoj.utils.config import SearchType
@@ -99,39 +96,13 @@ class UserAuthenticationBackend(AuthenticationBackend):
 
     def _initialize_default_user(self):
         if not self.khojuser_manager.filter(username="default").exists():
-            default_user = self.khojuser_manager.create_user(
+            self.khojuser_manager.create_user(
                 username="default",
                 email="default@example.com",
                 password="default",
             )
-            renewal_date = make_aware(datetime.strptime("2100-04-01", "%Y-%m-%d"))
-            Subscription.objects.create(user=default_user, type=Subscription.Type.STANDARD, renewal_date=renewal_date)
 
     async def authenticate(self, request: HTTPConnection):
-        # Skip authentication for error pages to avoid infinite recursion
-        if request.url.path == "/server/error":
-            return AuthCredentials(), UnauthenticatedUser()
-
-        current_user = request.session.get("user")
-        if current_user and current_user.get("email"):
-            try:
-                user = (
-                    await self.khojuser_manager.filter(email=current_user.get("email"))
-                    .prefetch_related("subscription")
-                    .afirst()
-                )
-            except (DatabaseError, OperationalError):
-                logger.error("DB Exception: Failed to authenticate user", exc_info=True)
-                raise HTTPException(
-                    status_code=503,
-                    detail="Please report this issue on Github, Discord or email team@khoj.dev and try again later.",
-                )
-            if user:
-                subscribed = await ais_user_subscribed(user)
-                if subscribed:
-                    return AuthCredentials(["authenticated", "premium"]), AuthenticatedKhojUser(user)
-                return AuthCredentials(["authenticated"]), AuthenticatedKhojUser(user)
-
         # Request from Obsidian or local API clients
         if len(request.headers.get("Authorization", "").split("Bearer ")) == 2:
             # Get bearer token from header
@@ -139,10 +110,7 @@ class UserAuthenticationBackend(AuthenticationBackend):
             # Get user owning token
             try:
                 user_with_token = (
-                    await self.khojapiuser_manager.filter(token=bearer_token)
-                    .select_related("user")
-                    .prefetch_related("user__subscription")
-                    .afirst()
+                    await self.khojapiuser_manager.filter(token=bearer_token).select_related("user").afirst()
                 )
             except (DatabaseError, OperationalError):
                 logger.error("DB Exception: Failed to authenticate user applications", exc_info=True)
@@ -151,23 +119,19 @@ class UserAuthenticationBackend(AuthenticationBackend):
                     detail="Please report this issue on Github, Discord or email team@khoj.dev and try again later.",
                 )
             if user_with_token:
-                subscribed = await ais_user_subscribed(user_with_token.user)
-                if subscribed:
-                    return AuthCredentials(["authenticated", "premium"]), AuthenticatedKhojUser(user_with_token.user)
                 return AuthCredentials(["authenticated"]), AuthenticatedKhojUser(user_with_token.user)
+            return AuthCredentials(), UnauthenticatedUser()
 
-        # No auth required if server in anonymous mode
-        if state.anonymous_mode:
-            try:
-                user = await self.khojuser_manager.filter(username="default").prefetch_related("subscription").afirst()
-            except (DatabaseError, OperationalError):
-                logger.error("DB Exception: Failed to fetch default user from DB", exc_info=True)
-                raise HTTPException(
-                    status_code=503,
-                    detail="Please report this issue on Github, Discord or email team@khoj.dev and try again later.",
-                )
-            if user:
-                return AuthCredentials(["authenticated", "premium"]), AuthenticatedKhojUser(user)
+        try:
+            user = await self.khojuser_manager.filter(username="default").afirst()
+        except (DatabaseError, OperationalError):
+            logger.error("DB Exception: Failed to fetch default user from DB", exc_info=True)
+            raise HTTPException(
+                status_code=503,
+                detail="Please report this issue on Github, Discord or email team@khoj.dev and try again later.",
+            )
+        if user:
+            return AuthCredentials(["authenticated"]), AuthenticatedKhojUser(user)
 
         return AuthCredentials(), UnauthenticatedUser()
 
@@ -237,6 +201,7 @@ def configure_routes(app):
     from khoj.routers.api_content import api_content
     from khoj.routers.api_memories import api_memories
     from khoj.routers.api_model import api_model
+    from khoj.routers.auth import auth_router
     from khoj.routers.web_client import web_client
 
     app.include_router(api, prefix="/api")
@@ -246,13 +211,8 @@ def configure_routes(app):
     app.include_router(api_model, prefix="/api/model")
     app.include_router(api_memories, prefix="/api/memories")
     app.include_router(api_content, prefix="/api/content")
+    app.include_router(auth_router, prefix="/auth")
     app.include_router(web_client)
-
-    if not state.anonymous_mode:
-        from khoj.routers.auth import auth_router
-
-        app.include_router(auth_router, prefix="/auth")
-        logger.info("🔑 Enabled Authentication")
 
 
 def configure_middleware(app, ssl_enabled: bool = False):

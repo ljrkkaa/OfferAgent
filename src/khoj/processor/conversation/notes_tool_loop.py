@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable, Optional
 import yaml
 
 from khoj.processor.conversation.utils import ToolCall, load_complex_json
+from khoj.processor.conversation.vault_policy import compact_policy_for_prompt
 from khoj.utils.helpers import ConversationCommand, ToolDefinition, tools_for_research_llm
 from khoj.utils.local_kb import (
     LocalKBError,
@@ -19,7 +20,9 @@ from khoj.utils.local_kb import (
     kb_list,
     kb_read,
     kb_resolve_link,
+    local_kb_relative_path,
     propose_local_kb_edit,
+    resolve_local_kb_path,
 )
 from khoj.utils.openkb import wiki_search_documents
 
@@ -64,7 +67,7 @@ If append_note says source_refs_required or source_mismatch, retry with concrete
 content grounded in those sources instead of summarizing unrelated conversation history.
 For requests like "add X to section Y in file Z", read or inspect file Z, then call append_note with
 path=Z and heading=Y. Do not stop with plain text before trying an available tool.
-If project instructions or a matching skill covers the task, follow them before writing.
+If project instructions, vault policy, or a matching skill covers the task, follow them before writing.
 To call tools, return only a json object like:
 {"calls":[{"name":"view_file","args":{"path":"notes.md"},"id":"1"}]}
 When enough evidence has been collected, return {"calls":[]}.
@@ -290,6 +293,12 @@ def _local_profile_prompt(root: Optional[Path]) -> str:
     return f"\n\n## Local knowledge base instructions\n\n{compiled[:6000]}"
 
 
+def _vault_policy_prompt(vault_policy: Optional[dict[str, Any]]) -> str:
+    if not vault_policy:
+        return ""
+    return f"\n\n## Vault policy\n\n{compact_policy_for_prompt(vault_policy)}"
+
+
 def _skill_prompt(skills: list[LocalSkill]) -> str:
     if not skills:
         return ""
@@ -341,6 +350,56 @@ def _write_reference(result: LocalKBWriteResult) -> dict[str, Any]:
         "start_line": result.start_line,
         "end_line": result.end_line,
         "checksum": result.checksum,
+    }
+
+
+def _validate_client_action_path(path: str) -> tuple[Path, str]:
+    root = get_local_kb_root()
+    if root is None:
+        raise LocalKBError("Local knowledge base is not configured.", kind="not_configured")
+    target = resolve_local_kb_path(path, root=root)
+    if target.suffix.lower() not in {".md", ".txt"}:
+        raise LocalKBError(f"File '{path}' is not a supported local knowledge base text file.")
+    relpath = local_kb_relative_path(target, root=root)
+    return target, relpath
+
+
+def _client_vault_action_reference(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    target, relpath = _validate_client_action_path(str(args.get("path") or ""))
+    if tool_name == "append_note":
+        content = str(args.get("content") or "")
+        op = "append_file" if target.exists() else "create_file"
+        vault_action = {
+            "op": op,
+            "path": relpath,
+            "content": content,
+            "heading": args.get("heading"),
+            "mode": "append" if op == "append_file" else "create_only",
+        }
+        message = f"Prepared client vault action {op} for {relpath}."
+    elif tool_name == "propose_edit":
+        vault_action = {
+            "op": "replace_text",
+            "path": relpath,
+            "find": str(args.get("find") or ""),
+            "replace": str(args.get("replace") or ""),
+            "reason": args.get("reason"),
+            "mode": "replace",
+        }
+        message = f"Prepared client vault action replace_text for {relpath}."
+    else:
+        raise LocalKBError(f"Unsupported client vault action: {tool_name}")
+
+    return {
+        "query": "vault_action",
+        "file": relpath,
+        "uri": f"local-kb://{relpath}",
+        "kb_root": str(get_local_kb_root()) if get_local_kb_root() else None,
+        "compiled": message,
+        "action": tool_name,
+        "status": "action_prepared",
+        "changed": False,
+        "vault_action": vault_action,
     }
 
 
@@ -645,6 +704,8 @@ async def collect_notes_evidence_with_tools(
     max_iterations: int = 4,
     max_evidence_chars: int = 16000,
     initial_tool_transcript: Optional[list[dict[str, Any]]] = None,
+    write_mode: str = "server",
+    vault_policy: Optional[dict[str, Any]] = None,
 ) -> NotesToolLoopResult:
     result = NotesToolLoopResult()
     references: list[dict[str, Any]] = []
@@ -663,7 +724,11 @@ async def collect_notes_evidence_with_tools(
         return result
     allowed_tool_names = {tool.name for tool in tools}
     skill_index = {skill.name: skill for skill in local_skills}
-    system_message = NOTES_TOOL_SYSTEM_PROMPT + _local_profile_prompt(local_root if local_kb_allowed else None)
+    system_message = (
+        NOTES_TOOL_SYSTEM_PROMPT
+        + _vault_policy_prompt(vault_policy)
+        + _local_profile_prompt(local_root if local_kb_allowed else None)
+    )
     system_message += _skill_prompt(local_skills)
 
     tool_transcript: list[dict[str, Any]] = list(initial_tool_transcript or [])
@@ -812,6 +877,10 @@ async def collect_notes_evidence_with_tools(
                     )
                     references.append(_write_reference(blocked))
                     return blocked.__dict__
+                if write_mode == "client_actions":
+                    action_ref = _client_vault_action_reference("append_note", args)
+                    references.append(action_ref)
+                    return {"status": "action_prepared", "vault_action": action_ref["vault_action"]}
                 write = append_local_kb_note(args.get("path") or "", args.get("content") or "", args.get("heading"))
                 references.append(_write_reference(write))
                 return write.__dict__
@@ -827,6 +896,10 @@ async def collect_notes_evidence_with_tools(
                     )
                     references.append(_write_reference(blocked))
                     return blocked.__dict__
+                if write_mode == "client_actions":
+                    action_ref = _client_vault_action_reference("propose_edit", args)
+                    references.append(action_ref)
+                    return {"status": "action_prepared", "vault_action": action_ref["vault_action"]}
                 edit = propose_local_kb_edit(
                     args.get("path") or "",
                     args.get("find") or "",

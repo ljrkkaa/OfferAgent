@@ -1,15 +1,18 @@
-import { Plugin, WorkspaceLeaf } from 'obsidian';
+import { Plugin, TAbstractFile, WorkspaceLeaf } from 'obsidian';
 import { KhojSetting, KhojSettingTab, DEFAULT_SETTINGS } from 'src/settings'
 import { KhojSearchModal } from 'src/search_modal'
 import { KhojChatView } from 'src/chat_view'
 import { KhojSimilarView } from 'src/similar_view'
-import { updateContentIndex, canConnectToBackend, KhojView } from 'src/utils';
+import { updateContentIndex, canConnectToBackend, KhojView, fileTypeToExtension } from 'src/utils';
 import { KhojPaneView } from 'src/pane_view';
 
 
 export default class Khoj extends Plugin {
     settings: KhojSetting;
     indexingTimer: NodeJS.Timeout;
+    syncDebounceTimer: NodeJS.Timeout | null = null;
+    syncInProgress = false;
+    syncRequested = false;
 
     async onload() {
         await this.loadSettings();
@@ -83,15 +86,7 @@ export default class Khoj extends Plugin {
         this.addCommand({
             id: 'sync',
             name: 'Sync new changes',
-            callback: async () => {
-                this.settings.lastSync = await updateContentIndex(
-                    this.app.vault,
-                    this.settings,
-                    this.settings.lastSync,
-                    false,
-                    true
-                );
-            }
+            callback: async () => this.syncNow("manual", true)
         });
 
         // Add edit confirmation commands
@@ -124,7 +119,7 @@ export default class Khoj extends Plugin {
         this.registerView(KhojView.SIMILAR, (leaf) => new KhojSimilarView(leaf, this));
 
         // Create an icon in the left ribbon.
-        this.addRibbonIcon('message-circle', 'Khoj', (_: MouseEvent) => {
+        this.addRibbonIcon('message-circle', 'OfferAgent', (_: MouseEvent) => {
             this.activateView(KhojView.CHAT);
         });
 
@@ -132,7 +127,9 @@ export default class Khoj extends Plugin {
         this.addSettingTab(new KhojSettingTab(this.app, this));
 
         // Start the sync timer
+        this.registerVaultSyncEvents();
         this.startSyncTimer();
+        this.syncNow("startup");
     }
 
     // Method to start the sync timer
@@ -143,15 +140,66 @@ export default class Khoj extends Plugin {
         }
 
         // Start a new timer with the configured interval
-        this.indexingTimer = setInterval(async () => {
-            if (this.settings.autoConfigure) {
+        this.indexingTimer = setInterval(() => this.syncNow("scheduled"), this.settings.syncInterval * 60 * 1000);
+    }
+
+    private registerVaultSyncEvents() {
+        const schedule = (file: TAbstractFile) => {
+            if (this.shouldSyncPath(file.path)) this.scheduleSync("vault change");
+        };
+
+        this.registerEvent(this.app.vault.on("create", schedule));
+        this.registerEvent(this.app.vault.on("modify", schedule));
+        this.registerEvent(this.app.vault.on("delete", schedule));
+        this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+            if (this.shouldSyncPath(file.path) || this.shouldSyncPath(oldPath)) this.scheduleSync("vault rename");
+        }));
+    }
+
+    private shouldSyncPath(path: string): boolean {
+        const extension = path.split(".").pop()?.toLowerCase() ?? "";
+        const syncable =
+            (this.settings.syncFileType.markdown && fileTypeToExtension.markdown.includes(extension)) ||
+            (this.settings.syncFileType.pdf && fileTypeToExtension.pdf.includes(extension));
+        if (!syncable) return false;
+        if (this.settings.syncFolders.length > 0 && !this.settings.syncFolders.some(folder => path.startsWith(folder + "/") || path === folder)) return false;
+        return !this.settings.excludeFolders.some(folder => path.startsWith(folder + "/") || path === folder);
+    }
+
+    private scheduleSync(reason: string) {
+        if (!this.settings.autoConfigure) return;
+        if (this.syncDebounceTimer) clearTimeout(this.syncDebounceTimer);
+        this.syncDebounceTimer = setTimeout(() => {
+            this.syncDebounceTimer = null;
+            this.syncNow(reason);
+        }, 5000);
+    }
+
+    private async syncNow(reason: string, userTriggered: boolean = false) {
+        if (!this.settings.autoConfigure) return;
+        if (this.syncInProgress) {
+            this.syncRequested = true;
+            return;
+        }
+
+        this.syncInProgress = true;
+        try {
+            do {
+                this.syncRequested = false;
                 this.settings.lastSync = await updateContentIndex(
                     this.app.vault,
                     this.settings,
-                    this.settings.lastSync
+                    this.settings.lastSync,
+                    false,
+                    userTriggered
                 );
-            }
-        }, this.settings.syncInterval * 60 * 1000); // Convert minutes to milliseconds
+                await this.saveSettings();
+            } while (this.syncRequested && this.settings.autoConfigure);
+        } catch (error) {
+            console.error(`OfferAgent: ${reason} sync failed`, error);
+        } finally {
+            this.syncInProgress = false;
+        }
     }
 
     // Public method to restart the timer (called from settings)
@@ -176,6 +224,8 @@ export default class Khoj extends Plugin {
         // Remove scheduled job to update index at regular cadence
         if (this.indexingTimer)
             clearInterval(this.indexingTimer);
+        if (this.syncDebounceTimer)
+            clearTimeout(this.syncDebounceTimer);
 
         this.unload();
     }
@@ -205,7 +255,7 @@ export default class Khoj extends Plugin {
                 if (leafToUse) {
                     await leafToUse.setViewState({ type: viewType, active: true });
                 } else {
-                    console.error("Khoj: Could not get a leaf to activate view.");
+                    console.error("OfferAgent: Could not get a leaf to activate view.");
                     return;
                 }
             }

@@ -585,7 +585,7 @@ async def responses_chat_completion_with_backoff(
     temperature,
     openai_api_key=None,
     api_base_url=None,
-    deepthought=False,  # Unused; parity with legacy signature
+    deepthought=False,
     tracer: dict = {},
 ) -> AsyncGenerator[ResponseWithThought, None]:
     """

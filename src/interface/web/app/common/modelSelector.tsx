@@ -26,14 +26,12 @@ import { Skeleton } from "@/components/ui/skeleton";
 interface ModelSelectorProps extends PopoverProps {
     onSelect: (model: ModelOptions) => Promise<boolean | void> | boolean | void;
     disabled?: boolean;
-    isActive?: boolean;
     initialModel?: string;
 }
 
 export function ModelSelector({
     onSelect,
     disabled,
-    isActive,
     initialModel,
     ...popoverProps
 }: ModelSelectorProps) {
@@ -118,7 +116,6 @@ export function ModelSelector({
                                                     isSelected={selectedModel?.id === model.id}
                                                     onPeek={(model) => setPeekedModel(model)}
                                                     onSelect={() => handleSelect(model)}
-                                                    isActive={isActive}
                                                 />
                                             ))}
                                     </CommandGroup>
@@ -168,7 +165,6 @@ export function ModelSelector({
                                                         isSelected={selectedModel?.id === model.id}
                                                         onPeek={(model) => setPeekedModel(model)}
                                                         onSelect={() => handleSelect(model)}
-                                                        isActive={isActive}
                                                     />
                                                 ))}
                                         </CommandGroup>
@@ -188,10 +184,9 @@ interface ModelItemProps {
     isSelected: boolean;
     onSelect: () => void;
     onPeek: (model: ModelOptions) => void;
-    isActive?: boolean;
 }
 
-function ModelItem({ model, isSelected, onSelect, onPeek, isActive }: ModelItemProps) {
+function ModelItem({ model, isSelected, onSelect, onPeek }: ModelItemProps) {
     const ref = React.useRef<HTMLDivElement>(null);
 
     useMutationObserver(ref, (mutations) => {
@@ -212,10 +207,8 @@ function ModelItem({ model, isSelected, onSelect, onPeek, isActive }: ModelItemP
             onSelect={onSelect}
             ref={ref}
             className="data-[selected=true]:bg-muted data-[selected=true]:text-secondary-foreground"
-            disabled={!isActive && model.tier !== "free"}
         >
-            {model.name}{" "}
-            {model.tier === "standard" && <span className="text-green-500 ml-2">(Futurist)</span>}
+            {model.name}
             <Check className={cn("ml-auto", isSelected ? "opacity-100" : "opacity-0")} />
         </CommandItem>
     );

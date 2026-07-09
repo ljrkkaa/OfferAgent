@@ -8,17 +8,15 @@ from typing import Callable, Dict, List, Optional
 import yaml
 
 from khoj.database.adapters import AgentAdapters, EntryAdapters, McpServerAdapters
-from khoj.database.models import Agent, ChatMessageModel, KhojUser, UserMemory
+from khoj.database.models import Agent, ChatMessageModel, KhojUser
 from khoj.processor.conversation import prompts
 from khoj.processor.conversation.utils import (
-    OperatorRun,
     ResearchIteration,
     ToolCall,
     construct_iteration_history,
     construct_tool_chat_history,
     load_complex_json,
 )
-from khoj.processor.operator import operate_environment
 from khoj.processor.tools.mcp import MCPClient
 from khoj.processor.tools.online_search import read_webpages_content, search_online
 from khoj.processor.tools.run_code import run_code
@@ -38,7 +36,6 @@ from khoj.utils.helpers import (
     dict_to_tuple,
     is_code_sandbox_enabled,
     is_none_or_empty,
-    is_operator_enabled,
     is_web_search_enabled,
     timer,
     tools_for_research_llm,
@@ -68,7 +65,6 @@ class ToolExecutionResult:
         self.document_results: List[Dict[str, str]] = []
         self.online_results: Dict = {}
         self.code_results: Dict = {}
-        self.operator_results: OperatorRun = None
         self.mcp_results: List = []
         self.should_terminate: bool = False
 
@@ -282,7 +278,7 @@ async def apick_next_tool(
     max_iterations: int = 5,
     query_images: List[str] = [],
     query_files: str = None,
-    relevant_memories: List[UserMemory] = [],
+    relevant_memories: list | None = None,
     max_document_searches: int = 7,
     max_online_searches: int = 3,
     max_webpages_to_read: int = 3,
@@ -291,25 +287,6 @@ async def apick_next_tool(
     tracer: dict = {},
 ):
     """Given a query, determine which of the available tools the agent should use in order to answer appropriately."""
-
-    # Continue with previous iteration if a multi-step tool use is in progress
-    if (
-        previous_iterations
-        and previous_iterations[-1].query
-        and isinstance(previous_iterations[-1].query, ToolCall)
-        and previous_iterations[-1].query.name == ConversationCommand.Operator
-        and not previous_iterations[-1].summarizedResult
-    ):
-        previous_iteration = previous_iterations[-1]
-        yield ResearchIteration(
-            query=ToolCall(name=previous_iteration.query.name, args={"query": query}, id=previous_iteration.query.id),  # type: ignore
-            context=previous_iteration.context,
-            onlineContext=previous_iteration.onlineContext,
-            codeContext=previous_iteration.codeContext,
-            operatorContext=previous_iteration.operatorContext,
-            warning=previous_iteration.warning,
-        )
-        return
 
     # Construct tool options for the agent to choose from
     tools = []
@@ -325,7 +302,6 @@ async def apick_next_tool(
         ConversationCommand.Webpage.value: [ConversationCommand.ReadWebpage.value],
         ConversationCommand.Online.value: [ConversationCommand.SearchWeb.value],
         ConversationCommand.Code.value: [ConversationCommand.PythonCoder.value],
-        ConversationCommand.Operator.value: [ConversationCommand.OperateComputer.value],
     }
     for input_tool, research_tools in input_tools_to_research_tools.items():
         if input_tool in agent_input_tools:
@@ -334,9 +310,6 @@ async def apick_next_tool(
     user_has_entries = await EntryAdapters.auser_has_entries(user)
     has_document_source = user_has_entries or get_local_kb_root() is not None
     for tool, tool_data in tools_for_research_llm.items():
-        # Skip showing operator tool as an option if not enabled
-        if tool == ConversationCommand.OperateComputer and not is_operator_enabled():
-            continue
         if tool in document_research_tools and not has_document_source:
             continue
         # Skip showing web search tool if agent has no access to internet
@@ -471,7 +444,7 @@ async def research(
     previous_iterations: List[ResearchIteration],
     query_images: List[str],
     query_files: str = None,
-    relevant_memories: List[UserMemory] = [],
+    relevant_memories: list | None = None,
     user_name: str = None,
     location: LocationData = None,
     send_status_func: Optional[Callable] = None,
@@ -551,66 +524,8 @@ async def research(
                 iterations_to_process.append(result)
                 yield result
 
-        # Multi-turn tools that stream their execution
-        streaming_tools = {ConversationCommand.OperateComputer}
         if iterations_to_process:
-            # Separate streaming tools that need real-time status updates
-            # from parallelizable tools that can batch their status messages
-            streaming_iterations: list[ResearchIteration] = []
-            parallel_iterations: list[ResearchIteration] = []
-            for iteration in iterations_to_process:
-                if isinstance(iteration.query, ToolCall) and iteration.query.name in streaming_tools:
-                    streaming_iterations.append(iteration)
-                else:
-                    parallel_iterations.append(iteration)
-
-            # Execute streaming tools sequentially for real-time status updates
-            streaming_results: list[tuple[ResearchIteration, ToolExecutionResult]] = []
-            for iteration in streaming_iterations:
-                result = ToolExecutionResult()
-                if (
-                    isinstance(iteration.query, ToolCall)
-                    and iteration.query.name == ConversationCommand.OperateComputer
-                ):
-                    try:
-                        # Execute OperateComputer
-                        async for res in operate_environment(
-                            **iteration.query.args,
-                            user=user,
-                            conversation_log=construct_tool_chat_history(
-                                previous_iterations, ConversationCommand.Operator
-                            ),
-                            location_data=location,
-                            previous_trajectory=previous_iterations[-1].operatorContext
-                            if previous_iterations
-                            else None,
-                            send_status_func=send_status_func,
-                            query_images=query_images,
-                            agent=agent,
-                            query_files=query_files,
-                            cancellation_event=cancellation_event,
-                            interrupt_queue=interrupt_queue,
-                            tracer=tracer,
-                        ):
-                            if isinstance(res, dict) and ChatEvent.STATUS in res:
-                                yield res[ChatEvent.STATUS]
-                            elif isinstance(res, OperatorRun):
-                                result.operator_results = res
-                                iteration.operatorContext = result.operator_results
-                                if res.webpages:
-                                    if not result.online_results.get(iteration.query):
-                                        result.online_results[iteration.query] = {"webpages": res.webpages}
-                                    elif not result.online_results[iteration.query].get("webpages"):
-                                        result.online_results[iteration.query]["webpages"] = res.webpages
-                                    else:
-                                        result.online_results[iteration.query]["webpages"] += res.webpages
-                                    iteration.onlineContext = result.online_results
-                    except Exception as e:
-                        iteration.warning = f"Error operating browser: {e}"
-                        logger.error(iteration.warning, exc_info=True)
-                streaming_results.append((iteration, result))
-
-            # Execute parallelizable tools in parallel
+            parallel_iterations = iterations_to_process
             parallel_results = []
             if parallel_iterations:
                 tasks = [
@@ -635,11 +550,8 @@ async def research(
                 tool_results = await asyncio.gather(*tasks, return_exceptions=True)
                 parallel_results = list(zip(parallel_iterations, tool_results))
 
-            # Combine results (streaming first, then parallel)
-            all_results = streaming_results + parallel_results
-
             # Process results and yield status messages
-            for this_iteration, tool_result in all_results:
+            for this_iteration, tool_result in parallel_results:
                 # Handle exceptions from asyncio.gather
                 if isinstance(tool_result, Exception):
                     this_iteration.warning = f"Error executing tool: {tool_result}"
@@ -663,7 +575,6 @@ async def research(
                     tool_result.document_results
                     or tool_result.online_results
                     or tool_result.code_results
-                    or tool_result.operator_results
                     or tool_result.mcp_results
                     or this_iteration.warning
                 ):
@@ -674,8 +585,6 @@ async def research(
                         results_data += f"\n<online_results>\n{yaml.dump(tool_result.online_results, allow_unicode=True, sort_keys=False, default_flow_style=False)}\n</online_results>"
                     if tool_result.code_results:
                         results_data += f"\n<code_results>\n{yaml.dump(truncate_code_context(tool_result.code_results), allow_unicode=True, sort_keys=False, default_flow_style=False)}\n</code_results>"
-                    if tool_result.operator_results:
-                        results_data += f"\n<browser_operator_results>\n{tool_result.operator_results.response}\n</browser_operator_results>"
                     if tool_result.mcp_results:
                         results_data += f"\n<mcp_tool_results>\n{yaml.dump(tool_result.mcp_results, allow_unicode=True, sort_keys=False, default_flow_style=False)}\n</mcp_tool_results>"
                     if this_iteration.warning:

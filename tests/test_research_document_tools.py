@@ -75,7 +75,6 @@ def test_user_config_has_documents_with_local_kb(tmp_path, monkeypatch):
     (tmp_path / "notes.md").write_text("local notes", encoding="utf-8")
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
     monkeypatch.setattr(helpers.EntryAdapters, "user_has_entries", lambda user: False)
-    monkeypatch.setattr(helpers, "has_required_scope", lambda *_args, **_kwargs: False)
     request = SimpleNamespace(session={})
     user = SimpleNamespace(username="test")
 

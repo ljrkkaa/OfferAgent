@@ -15,7 +15,7 @@ from khoj.database.models import (
     KhojApiUser,
     KhojUser,
 )
-from khoj.processor.content.org_mode.org_to_entries import OrgToEntries
+from khoj.processor.content.markdown.markdown_to_entries import MarkdownToEntries
 from khoj.processor.content.plaintext.plaintext_to_entries import PlaintextToEntries
 from khoj.routers.api_content import configure_content
 from khoj.search_type import text_search
@@ -25,7 +25,6 @@ from tests.helpers import (
     AiModelApiFactory,
     ChatModelFactory,
     ProcessLockFactory,
-    SubscriptionFactory,
     UserConversationProcessorConfigFactory,
     UserFactory,
     get_chat_api_base_url,
@@ -69,9 +68,7 @@ def search_config():
 
 @pytest.fixture
 def default_user():
-    user = UserFactory()
-    SubscriptionFactory(user=user)
-    return user
+    return UserFactory()
 
 
 @pytest.fixture
@@ -84,7 +81,6 @@ def default_user2():
         email="default@example.com",
         password="default",
     )
-    SubscriptionFactory(user=user)
     return user
 
 
@@ -101,15 +97,11 @@ def default_user3():
         email="default3@example.com",
         password="default3",
     )
-    SubscriptionFactory(user=user)
     return user
 
 
 @pytest.fixture
 def default_user4():
-    """
-    This user should not have a valid subscription
-    """
     if KhojUser.objects.filter(username="default4").exists():
         return KhojUser.objects.get(username="default4")
 
@@ -118,7 +110,6 @@ def default_user4():
         email="default4@example.com",
         password="default4",
     )
-    SubscriptionFactory(user=user, renewal_date=None)
     return user
 
 
@@ -395,10 +386,10 @@ def client(
 ):
     state.SearchType = configure_search_types()
 
-    # Seed legacy Entry rows for API tests that still exercise uploaded content.
+    # Seed Entry rows for API tests that still exercise uploaded content.
     text_search.setup(
-        OrgToEntries,
-        get_sample_data("org"),
+        MarkdownToEntries,
+        get_sample_data("markdown"),
         regenerate=False,
         user=api_user.user,
     )
@@ -431,5 +422,5 @@ def pdf_configured_user1(default_user: KhojUser):
 
 
 @pytest.fixture(scope="function")
-def sample_org_data():
-    return get_sample_data("org")
+def sample_markdown_data():
+    return get_sample_data("markdown")

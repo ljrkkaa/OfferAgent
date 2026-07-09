@@ -6,13 +6,7 @@ import useSWR from "swr";
 
 import { useEffect, useState } from "react";
 
-import {
-    useAuthenticatedData,
-    UserProfile,
-    ModelOptions,
-    useUserConfig,
-    isUserSubscribed,
-} from "../common/auth";
+import { useAuthenticatedData, UserProfile, ModelOptions, useUserConfig } from "../common/auth";
 
 import { Lightning, Plus } from "@phosphor-icons/react";
 import { z } from "zod";
@@ -49,7 +43,6 @@ const agentDataSchema = z.object({
     persona: z.string(),
     color: z.string(),
     icon: z.string(),
-    privacy_level: z.string(),
     files: z.array(z.string()).optional(),
     creator: z.string().optional(),
     is_creator: z.boolean().optional(),
@@ -68,13 +61,6 @@ const agentsFetcher = async () => {
     return agents.data;
 };
 
-const agentFetcher = async (slug: string) => {
-    const data = await fetcher(`/api/agents/${encodeURIComponent(slug)}`);
-    const agent = agentDataSchema.safeParse(data);
-    if (!agent.success) throw new Error("Invalid agent response");
-    return agent.data;
-};
-
 interface CreateAgentCardProps {
     data: AgentData;
     userProfile: UserProfile | null;
@@ -82,7 +68,6 @@ interface CreateAgentCardProps {
     filesOptions: string[];
     modelOptions: ModelOptions[];
     selectedChatModelOption: string;
-    isSubscribed: boolean;
     setAgentChangeTriggered: (value: boolean) => void;
     inputToolOptions: { [key: string]: string };
     outputModeOptions: { [key: string]: string };
@@ -100,7 +85,6 @@ function CreateAgentCard(props: CreateAgentCardProps) {
             persona: props.data.persona,
             color: props.data.color,
             icon: props.data.icon,
-            privacy_level: props.data.privacy_level,
             chat_model: props.selectedChatModelOption,
             files: [],
         },
@@ -112,7 +96,6 @@ function CreateAgentCard(props: CreateAgentCardProps) {
             persona: props.data.persona,
             color: props.data.color,
             icon: props.data.icon,
-            privacy_level: props.data.privacy_level,
             chat_model: props.selectedChatModelOption,
             files: [],
         });
@@ -177,7 +160,6 @@ function CreateAgentCard(props: CreateAgentCardProps) {
                     modelOptions={props.modelOptions}
                     inputToolOptions={props.inputToolOptions}
                     outputModeOptions={props.outputModeOptions}
-                    isSubscribed={props.isSubscribed}
                 />
             </DialogContent>
         </Dialog>
@@ -203,7 +185,6 @@ export default function Agents() {
     const isMobileWidth = useIsMobileWidth();
 
     const [personalAgents, setPersonalAgents] = useState<AgentData[]>([]);
-    const [publicAgents, setPublicAgents] = useState<AgentData[]>([]);
 
     const [agentSlug, setAgentSlug] = useState<string | null>(null);
 
@@ -231,14 +212,6 @@ export default function Agents() {
             );
             setPersonalAgents(personalAgents);
 
-            // Public agents are agents that are not private and not created by the user
-            const publicAgents = data.filter(
-                (agent) =>
-                    agent.privacy_level !== "private" &&
-                    agent.creator !== authenticatedData?.username,
-            );
-            setPublicAgents(publicAgents);
-
             if (typeof window !== "undefined") {
                 const searchParams = new URLSearchParams(window.location.search);
                 const agentSlug = searchParams.get("agent");
@@ -246,25 +219,6 @@ export default function Agents() {
                 // Search for the agent with the slug in the URL
                 if (agentSlug) {
                     setAgentSlug(agentSlug);
-                    let selectedAgent = data.find((agent) => agent.slug === agentSlug);
-
-                    // If the agent is not found in all the returned agents, check in the public agents. The code may be running 2x after either agent data or authenticated data is retrieved.
-                    if (!selectedAgent) {
-                        selectedAgent = publicAgents.find((agent) => agent.slug === agentSlug);
-                    }
-
-                    if (!selectedAgent) {
-                        // See if the agent is accessible as a protected agent.
-                        agentFetcher(agentSlug)
-                            .then((agent) => {
-                                if (agent.privacy_level === "protected") {
-                                    setPublicAgents((prev) => [...prev, agent]);
-                                }
-                            })
-                            .catch((error) => {
-                                console.error("Failed to load linked agent:", error);
-                            });
-                    }
                 }
             }
         }
@@ -291,7 +245,6 @@ export default function Agents() {
 
     const modelOptions: ModelOptions[] = userConfig?.chat_model_options || [];
     const selectedChatModelOption: number = userConfig?.selected_chat_model_config || 0;
-    const isSubscribed: boolean = userConfig?.is_active || false;
 
     // The default model option should map to the item in the modelOptions array that has the same id as the selectedChatModelOption
     const defaultModelOption = modelOptions.find(
@@ -307,7 +260,7 @@ export default function Agents() {
                     <Separator orientation="vertical" className="mr-2 h-4" />
                     {isMobileWidth ? (
                         <Link className="p-0 no-underline" href="/">
-                            <KhojLogoType className="h-auto w-16" />
+                            <KhojLogoType className="h-auto w-32 max-w-full" />
                         </Link>
                     ) : (
                         <h2 className="text-lg">Agents</h2>
@@ -326,7 +279,6 @@ export default function Agents() {
                                             persona: "",
                                             color: "",
                                             icon: "",
-                                            privacy_level: "private",
                                             managed_by_admin: false,
                                             chat_model: "",
                                             input_tools: [],
@@ -342,7 +294,6 @@ export default function Agents() {
                                         filesOptions={filesData || []}
                                         modelOptions={userConfig?.chat_model_options || []}
                                         selectedChatModelOption={defaultModelOption?.name || ""}
-                                        isSubscribed={isSubscribed}
                                         setAgentChangeTriggered={setAgentChangeTriggered}
                                         inputToolOptions={
                                             agentConfigurationOptions?.input_tools || {}
@@ -367,16 +318,6 @@ export default function Agents() {
                                     />
                                     <span className="font-bold">How it works</span> Use any of these
                                     specialized personas to tune your conversation to your needs.
-                                    {!isSubscribed && (
-                                        <span>
-                                            {" "}
-                                            <Link href="/settings" className="font-bold">
-                                                Upgrade your plan
-                                            </Link>{" "}
-                                            to leverage custom models. You will fallback to the
-                                            default model when chatting.
-                                        </span>
-                                    )}
                                 </AlertDescription>
                             </Alert>
                             <div className="pt-6 md:pt-8">
@@ -392,39 +333,9 @@ export default function Agents() {
                                                 selectedChatModelOption={
                                                     defaultModelOption?.name || ""
                                                 }
-                                                isSubscribed={isSubscribed}
                                                 setAgentChangeTriggered={setAgentChangeTriggered}
                                                 modelOptions={userConfig?.chat_model_options || []}
                                                 editCard={true}
-                                                agentSlug={agentSlug || ""}
-                                                inputToolOptions={
-                                                    agentConfigurationOptions?.input_tools || {}
-                                                }
-                                                outputModeOptions={
-                                                    agentConfigurationOptions?.output_modes || {}
-                                                }
-                                            />
-                                        ))}
-                                </div>
-                            </div>
-                            <div className="pt-6 md:pt-8">
-                                <h2 className="text-2xl">Explore</h2>
-                                <div className={`${styles.agentList}`}>
-                                    {!authenticationLoading &&
-                                        publicAgents.map((agent) => (
-                                            <AgentCard
-                                                key={agent.slug}
-                                                data={agent}
-                                                userProfile={authenticatedData || null}
-                                                isMobileWidth={isMobileWidth}
-                                                editCard={false}
-                                                filesOptions={filesData ?? []}
-                                                selectedChatModelOption={
-                                                    defaultModelOption?.name || ""
-                                                }
-                                                isSubscribed={isSubscribed}
-                                                setAgentChangeTriggered={setAgentChangeTriggered}
-                                                modelOptions={userConfig?.chat_model_options || []}
                                                 agentSlug={agentSlug || ""}
                                                 inputToolOptions={
                                                     agentConfigurationOptions?.input_tools || {}

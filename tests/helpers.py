@@ -1,11 +1,9 @@
 import glob
 import logging
 import os
-from datetime import datetime
 
 import factory
 from asgiref.sync import sync_to_async
-from django.utils.timezone import make_aware
 
 from khoj.database.adapters import AgentAdapters
 from khoj.database.models import (
@@ -18,9 +16,7 @@ from khoj.database.models import (
     KhojUser,
     ProcessLock,
     ServerChatSettings,
-    Subscription,
     UserConversationConfig,
-    UserMemory,
 )
 from khoj.processor.conversation.utils import message_to_log
 from khoj.utils.helpers import get_absolute_path, is_none_or_empty
@@ -98,63 +94,6 @@ def generate_chat_history(message_list):
 
 def get_sample_data(type):
     sample_data = {
-        "org": {
-            "elisp.org": """
-* Emacs Khoj
-  /An Emacs interface for [[https://github.com/khoj-ai/khoj][khoj]]/
-
-** Requirements
-   - Install and Run [[https://github.com/khoj-ai/khoj][khoj]]
-
-** Installation
-*** Direct
-     - Put ~khoj.el~ in your Emacs load path. For e.g. ~/.emacs.d/lisp
-     - Load via ~use-package~ in your ~/.emacs.d/init.el or .emacs file by adding below snippet
-       #+begin_src elisp
-         ;; Khoj Package
-         (use-package khoj
-           :load-path "~/.emacs.d/lisp/khoj.el"
-           :bind ("C-c s" . 'khoj))
-       #+end_src
-
-*** Using [[https://github.com/quelpa/quelpa#installation][Quelpa]]
-     - Ensure [[https://github.com/quelpa/quelpa#installation][Quelpa]], [[https://github.com/quelpa/quelpa-use-package#installation][quelpa-use-package]] are installed
-     - Add below snippet to your ~/.emacs.d/init.el or .emacs config file and execute it.
-       #+begin_src elisp
-         ;; Khoj Package
-         (use-package khoj
-           :quelpa (khoj :fetcher url :url "https://raw.githubusercontent.com/khoj-ai/khoj/master/interface/emacs/khoj.el")
-           :bind ("C-c s" . 'khoj))
-       #+end_src
-
-** Usage
-   1. Call ~khoj~ using keybinding ~C-c s~ or ~M-x khoj~
-   2. Enter Query in Natural Language
-      e.g. "What is the meaning of life?" "What are my life goals?"
-   3. Wait for results
-      *Note: It takes about 15s on a Mac M1 and a ~100K lines corpus of org-mode files*
-   4. (Optional) Narrow down results further
-      Include/Exclude specific words from results by adding to query
-      e.g. "What is the meaning of life? -god +none"
-
-""",
-            "readme.org": """
-* Khoj
-  /Allow natural language search on user content like notes, images using transformer based models/
-
-  All data is processed locally. User can interface with khoj app via [[./interface/emacs/khoj.el][Emacs]], API or Commandline
-
-** Dependencies
-   - Python3
-   - [[https://docs.conda.io/en/latest/miniconda.html#latest-miniconda-installer-links][Miniconda]]
-
-** Install
-   #+begin_src shell
-   git clone https://github.com/khoj-ai/khoj && cd khoj
-   conda env create -f environment.yml
-   conda activate khoj
-   #+end_src""",
-        },
         "markdown": {
             "readme.markdown": """
 # Khoj
@@ -197,7 +136,7 @@ conda activate khoj
 
 
 def get_index_files(
-    input_files: list[str] = None, input_filters: list[str] | None = ["tests/data/org/*.org"]
+    input_files: list[str] = None, input_filters: list[str] | None = ["tests/data/markdown/*.markdown"]
 ) -> dict[str, str]:
     # Input Validation
     if is_none_or_empty(input_files) and is_none_or_empty(input_filters):
@@ -286,16 +225,6 @@ class ConversationFactory(factory.django.DjangoModelFactory):
     user = factory.SubFactory(UserFactory)
 
 
-class SubscriptionFactory(factory.django.DjangoModelFactory):
-    class Meta:
-        model = Subscription
-
-    user = factory.SubFactory(UserFactory)
-    type = Subscription.Type.STANDARD
-    is_recurring = False
-    renewal_date = make_aware(datetime.strptime("2100-04-01", "%Y-%m-%d"))
-
-
 class ProcessLockFactory(factory.django.DjangoModelFactory):
     class Meta:
         model = ProcessLock
@@ -315,10 +244,6 @@ async def acreate_user():
     return await sync_to_async(UserFactory)()
 
 
-async def acreate_subscription(user):
-    return await sync_to_async(SubscriptionFactory)(user=user)
-
-
 async def acreate_chat_model():
     return await sync_to_async(ChatModelFactory)()
 
@@ -333,8 +258,3 @@ async def acreate_agent(name, chat_model, personality):
         chat_model=chat_model,
         personality=personality,
     )
-
-
-async def acreate_test_memory(user, agent=None, raw_text="test memory"):
-    """Create a memory directly in DB for testing."""
-    return await sync_to_async(UserMemory.objects.create)(user=user, agent=agent, raw=raw_text)

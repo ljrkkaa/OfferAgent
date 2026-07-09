@@ -211,18 +211,6 @@ wheels = [
 ]
 
 [[package]]
-name = "authlib"
-version = "1.6.12"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-dependencies = [
-    { name = "cryptography" },
-]
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/d3/30/6691fdc63b35f54a5a65e04fa1e59d827f4d4e8f4a39678ba7d3088ce0c8/authlib-1.6.12.tar.gz", hash = "sha256:0656d8482f28fc8221929d5f35b2bde5d13e10555ebc06b4561b0d622e83b1bd", size = 165368, upload-time = "2026-05-04T08:11:31.826Z" }
-wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/cd/51/9b0b5cd4cf683a02db937a6f9bbebcdc9c56558a7bb3763ce7d3512103c3/authlib-1.6.12-py2.py3-none-any.whl", hash = "sha256:e9229ad7fde610b139dd12f5edbe97eab9ee78bfb85691247e767727850b99ab", size = 244473, upload-time = "2026-05-04T08:11:30.354Z" },
-]
-
-[[package]]
 name = "beautifulsoup4"
 version = "4.12.3"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
@@ -561,18 +549,6 @@ wheels = [
 ]
 
 [[package]]
-name = "django-phonenumber-field"
-version = "7.3.0"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-dependencies = [
-    { name = "django" },
-]
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/5e/fd/a00c79db4eab7bdcfcb419a14c4879a8f92e92951140c2d84a256c2cd835/django-phonenumber-field-7.3.0.tar.gz", hash = "sha256:f9cdb3de085f99c249328293a3b93d4e5fa440c0c8e3b99eb0d0f54748629797", size = 43005, upload-time = "2023-12-29T14:33:40.937Z" }
-wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/3a/35/4f36dac859a1b9dbf9e737718d9b62e3502aca0eb74a10d659283b240992/django_phonenumber_field-7.3.0-py3-none-any.whl", hash = "sha256:bc6eaa49d1f9d870944f5280258db511e3a1ba5e2fbbed255488dceacae45d06", size = 66505, upload-time = "2023-12-29T14:33:36.859Z" },
-]
-
-[[package]]
 name = "django-unfold"
 version = "0.42.0"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
@@ -585,15 +561,6 @@ wheels = [
 ]
 
 [[package]]
-name = "dnspython"
-version = "2.7.0"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/b5/4a/263763cb2ba3816dd94b08ad3a33d5fdae34ecb856678773cc40a3605829/dnspython-2.7.0.tar.gz", hash = "sha256:ce9c432eda0dc91cf618a5cedf1a4e142651196bbcd2c80e89ed5a907e5cfaf1", size = 345197, upload-time = "2024-10-05T20:14:59.362Z" }
-wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/68/1b/e0a87d256e40e8c888847551b20a017a6b98139178505dc7ffb96f04e954/dnspython-2.7.0-py3-none-any.whl", hash = "sha256:b4c34b7d10b51bcc3a5071e7b8dee77939f1e878477eeecc965e9835f63c6c86", size = 313632, upload-time = "2024-10-05T20:14:57.687Z" },
-]
-
-[[package]]
 name = "docstring-parser"
 version = "0.17.0"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
@@ -601,12 +568,6 @@ sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/b2/9d/c3b43da9515bd2
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/55/e2/2537ebcff11c1ee1ff17d8d0b6f4db75873e3b0fb32c2d4a2ee31ecb310a/docstring_parser-0.17.0-py3-none-any.whl", hash = "sha256:cf2569abd23dce8099b300f9b4fa8191e9582dda731fd533daf54c4551658708", size = 36896, upload-time = "2025-07-21T07:35:00.684Z" },
 ]
-
-[[package]]
-name = "docx2txt"
-version = "0.8"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/7d/7d/60ee3f2b16d9bfdfa72e8599470a2c1a5b759cb113c6fe1006be28359327/docx2txt-0.8.tar.gz", hash = "sha256:2c06d98d7cfe2d3947e5760a57d924e3ff07745b379c8737723922e7009236e5", size = 2814, upload-time = "2019-06-23T19:58:36.94Z" }
 
 [[package]]
 name = "e2b"
@@ -647,19 +608,6 @@ source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/79/ca/9f5dcb8bead39959454c3912266bedc4c315839cee0e0ca9f4328f4588c1/einops-0.8.0.tar.gz", hash = "sha256:63486517fed345712a8385c100cb279108d9d47e6ae59099b07657e983deae85", size = 58861, upload-time = "2024-04-28T04:07:48.041Z" }
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/44/5a/f0b9ad6c0a9017e62d4735daaeb11ba3b6c009d69a26141b258cd37b5588/einops-0.8.0-py3-none-any.whl", hash = "sha256:9572fb63046264a862693b0a87088af3bdc8c068fde03de63453cbbde245465f", size = 43223, upload-time = "2024-04-28T04:07:49.718Z" },
-]
-
-[[package]]
-name = "email-validator"
-version = "2.2.0"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-dependencies = [
-    { name = "dnspython" },
-    { name = "idna" },
-]
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/48/ce/13508a1ec3f8bb981ae4ca79ea40384becc868bfae97fd1c942bb3a001b1/email_validator-2.2.0.tar.gz", hash = "sha256:cb690f344c617a714f22e66ae771445a1ceb46821152df8e165c5f9a364582b7", size = 48967, upload-time = "2024-06-20T11:30:30.034Z" }
-wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/d7/ee/bf0adb559ad3c786f12bcbc9296b3f5675f529199bef03e2df281fa1fadb/email_validator-2.2.0-py3-none-any.whl", hash = "sha256:561977c2d73ce3611850a06fa56b414621e0c8faa9d66f2611407d87465da631", size = 33521, upload-time = "2024-06-20T11:30:28.248Z" },
 ]
 
 [[package]]
@@ -1182,7 +1130,6 @@ dependencies = [
     { name = "anthropic" },
     { name = "anyio" },
     { name = "apscheduler" },
-    { name = "authlib" },
     { name = "beautifulsoup4" },
     { name = "click" },
     { name = "cron-descriptor" },
@@ -1190,12 +1137,9 @@ dependencies = [
     { name = "defusedxml" },
     { name = "django" },
     { name = "django-apscheduler" },
-    { name = "django-phonenumber-field" },
     { name = "django-unfold" },
-    { name = "docx2txt" },
     { name = "e2b-code-interpreter" },
     { name = "einops" },
-    { name = "email-validator" },
     { name = "fastapi" },
     { name = "google-auth" },
     { name = "google-genai" },
@@ -1211,12 +1155,11 @@ dependencies = [
     { name = "markdownify" },
     { name = "mcp" },
     { name = "openai" },
-    { name = "phonenumbers" },
     { name = "pillow" },
     { name = "psutil" },
     { name = "psycopg2-binary" },
     { name = "pyasn1" },
-    { name = "pydantic", extra = ["email"] },
+    { name = "pydantic" },
     { name = "pyjson5" },
     { name = "pymupdf" },
     { name = "python-multipart" },
@@ -1224,7 +1167,6 @@ dependencies = [
     { name = "pyyaml" },
     { name = "rapidocr-onnxruntime" },
     { name = "requests" },
-    { name = "resend" },
     { name = "rich" },
     { name = "schedule" },
     { name = "tenacity" },
@@ -1266,7 +1208,6 @@ requires-dist = [
     { name = "anthropic", specifier = "==0.75.0" },
     { name = "anyio", specifier = "~=4.8.0" },
     { name = "apscheduler", specifier = "~=3.10.0" },
-    { name = "authlib", specifier = "==1.6.12" },
     { name = "beautifulsoup4", specifier = "~=4.12.3" },
     { name = "click", specifier = "<8.2.2" },
     { name = "cron-descriptor", specifier = "==1.4.3" },
@@ -1275,12 +1216,9 @@ requires-dist = [
     { name = "defusedxml", specifier = "==0.7.1" },
     { name = "django", specifier = "==5.1.15" },
     { name = "django-apscheduler", specifier = "==0.7.0" },
-    { name = "django-phonenumber-field", specifier = "==7.3.0" },
     { name = "django-unfold", specifier = "==0.42.0" },
-    { name = "docx2txt", specifier = "==0.8" },
     { name = "e2b-code-interpreter", specifier = "~=1.0.0" },
     { name = "einops", specifier = "==0.8.0" },
-    { name = "email-validator", specifier = "==2.2.0" },
     { name = "factory-boy", marker = "extra == 'dev'", specifier = ">=3.2.1" },
     { name = "fastapi", specifier = ">=0.110.0" },
     { name = "freezegun", marker = "extra == 'dev'", specifier = ">=1.2.0" },
@@ -1305,13 +1243,12 @@ requires-dist = [
     { name = "pandas", marker = "extra == 'dev'" },
     { name = "pgserver", marker = "extra == 'dev'", specifier = "==0.1.4" },
     { name = "pgserver", marker = "extra == 'local'", specifier = "==0.1.4" },
-    { name = "phonenumbers", specifier = "==8.13.27" },
     { name = "pillow", specifier = ">=12.2.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.0.4" },
     { name = "psutil", specifier = ">=5.8.0" },
     { name = "psycopg2-binary", specifier = "==2.9.9" },
     { name = "pyasn1", specifier = ">=0.6.3" },
-    { name = "pydantic", extras = ["email"], specifier = ">=2.0.0" },
+    { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pyjson5", specifier = "==1.6.7" },
     { name = "pymupdf", specifier = "==1.24.11" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.1.2" },
@@ -1323,7 +1260,6 @@ requires-dist = [
     { name = "pyyaml", specifier = "~=6.0" },
     { name = "rapidocr-onnxruntime", specifier = "==1.4.4" },
     { name = "requests", specifier = ">=2.33.0" },
-    { name = "resend", specifier = "==1.2.0" },
     { name = "rich", specifier = ">=13.3.1" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12.0" },
     { name = "schedule", specifier = "==1.1.0" },
@@ -2137,15 +2073,6 @@ wheels = [
 ]
 
 [[package]]
-name = "phonenumbers"
-version = "8.13.27"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/fd/c4/8fc9f546a149e2c94bf33bc291a1aa4f94e7bbd3c80a868afc0b161d8669/phonenumbers-8.13.27.tar.gz", hash = "sha256:983bda7a3a8b2fad31806db109d4d36b2758ed16d0ab7ad5e737541a67d4637e", size = 2278146, upload-time = "2023-12-20T06:37:52.332Z" }
-wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/cc/7c/35a7fcc4d13ddc0cb0cb6f01560f678213144fd55d6ff66946f5f89005d8/phonenumbers-8.13.27-py2.py3-none-any.whl", hash = "sha256:97269235cfd99b907d96bf6223599d3347010ea93bba9d06f88629c021fc2166", size = 2580913, upload-time = "2023-12-20T06:37:47.962Z" },
-]
-
-[[package]]
 name = "pillow"
 version = "12.2.0"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
@@ -2464,11 +2391,6 @@ dependencies = [
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/f0/86/8ce9040065e8f924d642c58e4a344e33163a07f6b57f836d0d734e0ad3fb/pydantic-2.11.5.tar.gz", hash = "sha256:7f853db3d0ce78ce8bbb148c401c2cdd6431b3473c0cdff2755c7690952a7b7a", size = 787102, upload-time = "2025-05-22T21:18:08.761Z" }
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/b5/69/831ed22b38ff9b4b64b66569f0e5b7b97cf3638346eb95a2147fdb49ad5f/pydantic-2.11.5-py3-none-any.whl", hash = "sha256:f9c26ba06f9747749ca1e5c94d6a85cb84254577553c8785576fd38fa64dc0f7", size = 444229, upload-time = "2025-05-22T21:18:06.329Z" },
-]
-
-[package.optional-dependencies]
-email = [
-    { name = "email-validator" },
 ]
 
 [[package]]
@@ -2926,19 +2848,6 @@ dependencies = [
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/f3/61/d7545dafb7ac2230c70d38d31cbfe4cc64f7144dc41f6e4e4b78ecd9f5bb/requests-toolbelt-1.0.0.tar.gz", hash = "sha256:7681a0a3d047012b5bdc0ee37d7f8f07ebe76ab08caeccfc3921ce23c88d5bc6", size = 206888, upload-time = "2023-05-01T04:11:33.229Z" }
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/3f/51/d4db610ef29373b879047326cbf6fa98b6c1969d6f6dc423279de2b1be2c/requests_toolbelt-1.0.0-py2.py3-none-any.whl", hash = "sha256:cccfdd665f0a24fcf4726e690f65639d272bb0637b9b92dfd91a5568ccf6bd06", size = 54481, upload-time = "2023-05-01T04:11:28.427Z" },
-]
-
-[[package]]
-name = "resend"
-version = "1.2.0"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-dependencies = [
-    { name = "requests" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/0d/3e/199a7755e8301908178adf5a0bdf0e61339601f2a0e4e8cf7af70a0e6b11/resend-1.2.0.tar.gz", hash = "sha256:66851ca61ea8501b0f4b19d55d753ee1800783c096c059ca065b4692361473b1", size = 11581, upload-time = "2024-05-24T20:38:19.575Z" }
-wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/c0/51/eb7b66b38b2e2931cb015b87317c8112e8f2ef6117b795c6e31c96c7a256/resend-1.2.0-py2.py3-none-any.whl", hash = "sha256:eaeaf5ba0f25df98220fc4f8346182f214078c26705ca3d24b183b7627d1abd2", size = 17961, upload-time = "2024-05-24T20:38:17.717Z" },
 ]
 
 [[package]]

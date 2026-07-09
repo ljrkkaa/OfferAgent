@@ -21,8 +21,6 @@ import FileContentSnippet from "@/app/components/chatMessage/FileContentSnippet"
 import { useFileContent } from "@/app/components/chatMessage/useFileContent";
 
 import {
-    ThumbsUp,
-    ThumbsDown,
     Copy,
     Brain,
     Cloud,
@@ -205,86 +203,8 @@ export interface ChatHistoryData {
     chat: SingleChatMessage[];
     agent: AgentData | null;
     conversation_id: string;
-    slug: string;
+    slug: string | null;
     is_owner: boolean;
-}
-
-async function sendFeedback(uquery: string, kquery: string, sentiment: string) {
-    const response = await fetch("/api/chat/feedback", {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ uquery: uquery, kquery: kquery, sentiment: sentiment }),
-    });
-    if (!response.ok) {
-        throw new Error((await response.text()) || "Failed to send feedback");
-    }
-}
-
-function FeedbackButtons({ uquery, kquery }: { uquery: string; kquery: string }) {
-    // Tri-state feedback state.
-    // Null = no feedback, true = positive feedback, false = negative feedback.
-    const [feedbackState, setFeedbackState] = useState<boolean | null>(null);
-
-    useEffect(() => {
-        if (feedbackState !== null) {
-            setTimeout(() => {
-                setFeedbackState(null);
-            }, 2000);
-        }
-    }, [feedbackState]);
-
-    return (
-        <div className={`${styles.feedbackButtons} flex align-middle justify-center items-center`}>
-            <button
-                title="Like"
-                className={styles.thumbsUpButton}
-                disabled={feedbackState !== null}
-                onClick={async () => {
-                    try {
-                        await sendFeedback(uquery, kquery, "positive");
-                        setFeedbackState(true);
-                    } catch (error) {
-                        console.error("Failed to send feedback:", error);
-                        window.alert("Failed to send feedback");
-                    }
-                }}
-            >
-                {feedbackState === true ? (
-                    <ThumbsUp alt="Liked Message" className="text-green-500" weight="fill" />
-                ) : (
-                    <ThumbsUp
-                        alt="Like Message"
-                        className="hsl(var(--muted-foreground)) hover:text-green-500"
-                    />
-                )}
-            </button>
-            <button
-                title="Dislike"
-                className={styles.thumbsDownButton}
-                disabled={feedbackState !== null}
-                onClick={async () => {
-                    try {
-                        await sendFeedback(uquery, kquery, "negative");
-                        setFeedbackState(false);
-                    } catch (error) {
-                        console.error("Failed to send feedback:", error);
-                        window.alert("Failed to send feedback");
-                    }
-                }}
-            >
-                {feedbackState === false ? (
-                    <ThumbsDown alt="Disliked Message" className="text-red-500" weight="fill" />
-                ) : (
-                    <ThumbsDown
-                        alt="Dislike Message"
-                        className="hsl(var(--muted-foreground)) hover:text-red-500"
-                    />
-                )}
-            </button>
-        </div>
-    );
 }
 
 interface ChatMessageProps {
@@ -1154,20 +1074,6 @@ const ChatMessage = forwardRef<HTMLDivElement, ChatMessageProps>((props, ref) =>
                                     />
                                 )}
                             </button>
-                            {props.chatMessage.by === "khoj" &&
-                                (props.chatMessage.intent ? (
-                                    <FeedbackButtons
-                                        uquery={props.chatMessage.intent.query}
-                                        kquery={props.chatMessage.message}
-                                    />
-                                ) : (
-                                    <FeedbackButtons
-                                        uquery={
-                                            props.chatMessage.rawQuery || props.chatMessage.message
-                                        }
-                                        kquery={props.chatMessage.message}
-                                    />
-                                ))}
                         </div>
                     </>
                 )}

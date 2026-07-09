@@ -266,7 +266,7 @@ export function modifyFileFilterForConversation(
 
 export async function createNewConversation(slug?: string) {
     try {
-        const agentParam = slug ? `&agent_slug=${encodeURIComponent(slug)}` : "";
+        const agentParam = slug && slug !== "khoj" ? `&agent_slug=${encodeURIComponent(slug)}` : "";
         const response = await fetch(`/api/chat/sessions?client=web${agentParam}`, {
             method: "POST",
         });
@@ -281,6 +281,12 @@ export async function createNewConversation(slug?: string) {
         console.error("Error creating new conversation:", error);
         throw error;
     }
+}
+
+export function buildChatUrl(conversationId: string, query?: string) {
+    const params = new URLSearchParams({ conversationId });
+    if (query) params.set("q", query);
+    return `/chat?${params.toString()}`;
 }
 
 export async function fetchChatOptions(): Promise<ChatOptions> {
@@ -308,9 +314,7 @@ export async function packageFilesForUpload(files: FileList): Promise<FormData> 
                 let fileName = file.name;
                 if (fileType === "") {
                     let fileExtension = fileName.split(".").pop();
-                    if (fileExtension === "org") {
-                        fileType = "text/org";
-                    } else if (fileExtension === "md") {
+                    if (fileExtension === "md") {
                         fileType = "text/markdown";
                     } else if (
                         fileExtension === "txt" ||
@@ -322,9 +326,6 @@ export async function packageFilesForUpload(files: FileList): Promise<FormData> 
                         fileType = "text/html";
                     } else if (fileExtension === "pdf") {
                         fileType = "application/pdf";
-                    } else if (fileExtension === "docx") {
-                        fileType =
-                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
                     } else {
                         // Skip this file if its type is not supported
                         console.warn(
@@ -379,15 +380,8 @@ export function uploadDataForIndexing(
     setUploadedFiles?: (files: string[]) => void,
     conversationId?: string | null,
 ) {
-    const allowedExtensions = [
-        "text/org",
-        "text/markdown",
-        "text/plain",
-        "text/html",
-        "application/pdf",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ];
-    const allowedFileEndings = ["org", "md", "txt", "html", "pdf", "docx"];
+    const allowedExtensions = ["text/markdown", "text/plain", "text/html", "application/pdf"];
+    const allowedFileEndings = ["md", "txt", "html", "pdf"];
     const badFiles: string[] = [];
     const goodFiles: File[] = [];
 
@@ -436,9 +430,7 @@ export function uploadDataForIndexing(
                 let fileName = file.name;
                 if (fileType === "") {
                     let fileExtension = fileName.split(".").pop();
-                    if (fileExtension === "org") {
-                        fileType = "text/org";
-                    } else if (fileExtension === "md") {
+                    if (fileExtension === "md") {
                         fileType = "text/markdown";
                     } else if (fileExtension === "txt") {
                         fileType = "text/plain";
@@ -446,9 +438,6 @@ export function uploadDataForIndexing(
                         fileType = "text/html";
                     } else if (fileExtension === "pdf") {
                         fileType = "application/pdf";
-                    } else if (fileExtension === "docx") {
-                        fileType =
-                            "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
                     } else {
                         // Skip this file if its type is not supported
                         resolve();

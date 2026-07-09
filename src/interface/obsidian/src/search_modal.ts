@@ -1,6 +1,6 @@
 import { App, SuggestModal, request, MarkdownRenderer, Instruction, Platform, Notice } from 'obsidian';
 import { KhojSetting } from 'src/settings';
-import { supportedBinaryFileTypes, createNoteAndCloseModal, getFileFromPath, getLinkToEntry, supportedImageFilesTypes } from 'src/utils';
+import { supportedBinaryFileTypes, createNoteAndCloseModal, getFileFromPath, getLinkToEntry } from 'src/utils';
 
 export interface SearchResult {
     entry: string;
@@ -108,7 +108,7 @@ export class KhojSearchModal extends SuggestModal<SearchResult> {
         this.setInstructions(modalInstructions);
 
         // Set Placeholder Text for Modal
-        this.setPlaceholder('Search with Khoj...');
+        this.setPlaceholder('Search with OfferAgent...');
 
         // Initialize allFiles with files in vault
         this.allFiles = this.app.vault.getFiles().map(file => ({
@@ -331,25 +331,13 @@ export class KhojSearchModal extends SuggestModal<SearchResult> {
         let result_el = el.createEl("div", { cls: 'khoj-result-entry' })
 
         let resultToRender = "";
-        let fileExtension = filename?.split(".").pop() ?? "";
-        if (supportedImageFilesTypes.includes(fileExtension) && filename && result.inVault) {
-            let linkToEntry: string = filename;
-            let imageFiles = this.app.vault.getFiles().filter(file => supportedImageFilesTypes.includes(fileExtension));
-            // Find vault file of chosen search result
-            let fileInVault = getFileFromPath(imageFiles, result.file);
-            if (fileInVault)
-                linkToEntry = this.app.vault.getResourcePath(fileInVault);
+        // Remove YAML frontmatter when rendering string
+        result.entry = result.entry.replace(/---[\n\r][\s\S]*---[\n\r]/, '');
 
-            resultToRender = `![](${linkToEntry})`;
-        } else {
-            // Remove YAML frontmatter when rendering string
-            result.entry = result.entry.replace(/---[\n\r][\s\S]*---[\n\r]/, '');
-
-            // Truncate search results to lines_to_render
-            let entry_snipped_indicator = result.entry.split('\n').length > lines_to_render ? ' **...**' : '';
-            let snipped_entry = result.entry.split('\n').slice(0, lines_to_render).join('\n');
-            resultToRender = `${snipped_entry}${entry_snipped_indicator}`;
-        }
+        // Truncate search results to lines_to_render
+        let entry_snipped_indicator = result.entry.split('\n').length > lines_to_render ? ' **...**' : '';
+        let snipped_entry = result.entry.split('\n').slice(0, lines_to_render).join('\n');
+        resultToRender = `${snipped_entry}${entry_snipped_indicator}`;
         // @ts-ignore
         MarkdownRenderer.renderMarkdown(resultToRender, result_el, result.file, null);
     }

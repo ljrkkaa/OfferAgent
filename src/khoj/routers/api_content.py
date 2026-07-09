@@ -28,7 +28,6 @@ from khoj.routers.helpers import (
     CommonQueryParams,
     configure_content,
     get_file_content,
-    update_telemetry_state,
 )
 from khoj.utils import state
 from khoj.utils.state import SearchType
@@ -81,9 +80,7 @@ async def put_content(
     indexed_data_limiter: ApiIndexedDataLimiter = Depends(
         ApiIndexedDataLimiter(
             incoming_entries_size_limit=50,
-            subscribed_incoming_entries_size_limit=100,
             total_entries_size_limit=50,
-            subscribed_total_entries_size_limit=500,
         )
     ),
 ):
@@ -103,9 +100,7 @@ async def patch_content(
     indexed_data_limiter: ApiIndexedDataLimiter = Depends(
         ApiIndexedDataLimiter(
             incoming_entries_size_limit=50,
-            subscribed_incoming_entries_size_limit=100,
             total_entries_size_limit=50,
-            subscribed_total_entries_size_limit=500,
         )
     ),
 ):
@@ -120,13 +115,6 @@ async def delete_content_files(
     client: Optional[str] = None,
 ):
     user = request.user.object
-
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="delete_file",
-        client=client,
-    )
 
     await EntryAdapters.adelete_entry_by_file(user, filename)
 
@@ -147,13 +135,6 @@ async def delete_content_file(
     client: Optional[str] = None,
 ):
     user = request.user.object
-
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="delete_file",
-        client=client,
-    )
 
     deleted_count = await EntryAdapters.adelete_entries_by_filenames(user, files.files)
     for file in files.files:
@@ -191,13 +172,6 @@ async def get_all_files(
     request: Request, client: Optional[str] = None, truncated: Optional[bool] = True, page: int = Query(0, ge=0)
 ):
     user = request.user.object
-
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="get_all_filenames",
-        client=client,
-    )
 
     files_data = []
     page_size = 10
@@ -242,13 +216,6 @@ async def get_file_object(
 
     file_object = file_objects[0]
 
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="get_file",
-        client=client,
-    )
-
     return Response(
         content=json.dumps(
             {"id": file_object.id, "file_name": file_object.file_name, "raw_text": file_object.raw_text}
@@ -288,14 +255,6 @@ async def delete_content_type(
         # Delete entries of the given type
         await EntryAdapters.adelete_all_entries(user, file_type=content_type)
 
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="delete_content_config",
-        client=client,
-        metadata={"content_type": content_type},
-    )
-
     return {"status": "ok"}
 
 
@@ -315,14 +274,6 @@ async def delete_content_source(
     await FileObjectAdapters.adelete_file_objects_by_names(user, file_list)
     # Delete entries from the given source
     await EntryAdapters.adelete_all_entries(user, file_source=content_source)
-
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="delete_content_config",
-        client=client,
-        metadata={"content_source": content_source},
-    )
 
     return {"status": "ok"}
 
@@ -384,13 +335,6 @@ async def convert_documents(
         else:
             logger.warning(f"Skipped converting unsupported file type sent by {client} client: {file.filename}")
 
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="convert_documents",
-        client=client,
-    )
-
     return Response(content=json.dumps(converted_files), media_type="application/json", status_code=200)
 
 
@@ -449,23 +393,6 @@ async def indexer(
             exc_info=True,
         )
         return Response(content="Failed", status_code=500)
-
-    indexing_metadata = {
-        "num_markdown": len(index_files["markdown"]),
-        "num_pdf": len(index_files["pdf"]),
-        "num_plaintext": len(index_files["plaintext"]),
-    }
-
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="index/update",
-        client=client,
-        user_agent=user_agent,
-        referer=referer,
-        host=host,
-        metadata=indexing_metadata,
-    )
 
     logger.info(f"📪 Content index updated via API call by {client} client")
 

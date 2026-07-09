@@ -17,12 +17,10 @@ import {
     ArrowLeft,
     ArrowRight,
     FileDashed,
-    GithubLogo,
     Lightbulb,
     LinkSimple,
     MagnifyingGlass,
     NoteBlank,
-    NotionLogo,
     Trash,
     DotsThreeVertical,
     Waveform,
@@ -122,12 +120,6 @@ function isFilesResponse(data: unknown): data is { files: FileObject[]; num_page
 }
 
 function getNoteTypeIcon(source: string) {
-    if (source === "notion") {
-        return <NotionLogo className="text-muted-foreground" />;
-    }
-    if (source === "github") {
-        return <GithubLogo className="text-muted-foreground" />;
-    }
     return <NoteBlank className="text-muted-foreground" />;
 }
 
@@ -399,7 +391,7 @@ const UploadFiles: React.FC<{
                 <DialogHeader>
                     <DialogTitle>Build Your Knowledge Base</DialogTitle>
                     <DialogDescription>
-                        Add context for your Khoj knowledge base. Quickly search and get
+                        Add context for your OfferAgent knowledge base. Quickly search and get
                         personalized answers from your documents.
                     </DialogDescription>
                 </DialogHeader>
@@ -821,7 +813,7 @@ export default function Search() {
                     <Separator orientation="vertical" className="mr-2 h-4" />
                     {isMobileWidth ? (
                         <Link className="p-0 no-underline" href="/">
-                            <KhojLogoType className="h-auto w-16" />
+                            <KhojLogoType className="h-auto w-32 max-w-full" />
                         </Link>
                     ) : (
                         <h2 className="text-lg">Search Your Knowledge Base</h2>
@@ -957,7 +949,7 @@ export default function Search() {
                                                                 &quot;Add Documents&quot; button.
                                                             </div>
                                                             <Link
-                                                                href="https://docs.khoj.dev/data-sources/share_your_data"
+                                                                href="/settings"
                                                                 className="no-underline"
                                                             >
                                                                 <div className="mt-4 text-center text-secondary-foreground bg-secondary w-fit m-auto p-2 rounded-lg">

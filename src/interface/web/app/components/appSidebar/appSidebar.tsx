@@ -26,9 +26,8 @@ import { useIsDarkMode, useIsMobileWidth } from "@/app/common/utils";
 import { UserPlusIcon } from "lucide-react";
 import { useAuthenticatedData, UserProfile } from "@/app/common/auth";
 import LoginPrompt from "../loginPrompt/loginPrompt";
-import { usePathname } from "next/navigation";
 import Link from "next/link";
-import { createNewConversation } from "@/app/common/chatFunctions";
+import { buildChatUrl, createNewConversation } from "@/app/common/chatFunctions";
 
 async function openChat(userData: UserProfile | null | undefined) {
     const unauthenticatedRedirectUrl = `/login?redirect=${encodeURIComponent(window.location.pathname)}`;
@@ -39,7 +38,7 @@ async function openChat(userData: UserProfile | null | undefined) {
 
     try {
         const conversationId = await createNewConversation();
-        window.location.href = `/chat?conversationId=${conversationId}`;
+        window.location.href = buildChatUrl(conversationId);
     } catch (error) {
         if (error instanceof Error && /status: (401|403)/.test(error.message)) {
             window.location.href = unauthenticatedRedirectUrl;
@@ -90,21 +89,16 @@ interface AppSidebarProps {
 export function AppSidebar(props: AppSidebarProps) {
     const isMobileWidth = useIsMobileWidth();
     const { data, isLoading, error } = useAuthenticatedData();
-    const pathname = usePathname();
-
     const { state, open, setOpen, openMobile, setOpenMobile, isMobile, toggleSidebar } =
         useSidebar();
 
     const [showLoginPrompt, setShowLoginPrompt] = useState(false);
 
-    // Check if we're on a shared chat page
-    const isSharedChatPage = pathname?.startsWith("/share/chat");
-
     useEffect(() => {
-        if (!isLoading && !data && !isSharedChatPage) {
+        if (!isLoading && !data) {
             setShowLoginPrompt(true);
         }
-    }, [isLoading, data, isSharedChatPage]);
+    }, [isLoading, data]);
 
     return (
         <Sidebar collapsible={"icon"} variant="sidebar" className="md:py-2">
@@ -114,7 +108,7 @@ export function AppSidebar(props: AppSidebarProps) {
                         {open ? (
                             <SidebarMenuButton>
                                 <Link className="p-0 no-underline" href="/">
-                                    <KhojLogoType className="h-auto w-16" />
+                                    <KhojLogoType className="h-auto w-32 max-w-full" />
                                 </Link>
                             </SidebarMenuButton>
                         ) : (

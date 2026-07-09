@@ -17,6 +17,24 @@ export interface EditBlock {
     };
 }
 
+export interface VaultAction {
+    op: 'create_file' | 'append_file' | 'replace_text';
+    path: string;
+    content?: string;
+    heading?: string;
+    mode?: string;
+    find?: string;
+    replace?: string;
+    reason?: string;
+}
+
+export interface VaultActionResult {
+    action: VaultAction;
+    success: boolean;
+    path: string;
+    error?: string;
+}
+
 /**
  * Interface representing the result of parsing a Khoj edit block
  */
@@ -98,7 +116,7 @@ export class FileInteractions {
 
         // Get recently viewed markdown files
         const recentFiles = this.getRecentActiveMarkdownFiles(this.CONTEXT_FILES_LIMIT);
-        if (recentFiles.length === 0) return '';
+        if (recentFiles.length === 0 && fileAccessMode === 'read') return '';
 
         // Instructions in write access mode
         let editInstructions: string = '';
@@ -295,6 +313,10 @@ For context, the user is currently working on the following files:
 
 `;
 
+        if (recentFiles.length === 0) {
+            openFilesContent += "No Markdown files are currently open. You may still create a new safe relative .md file if the user explicitly asks.\n\n";
+        }
+
         for (const file of recentFiles) {
             // Read file content
             let fileContent: string;
@@ -344,6 +366,98 @@ For context, the user is currently working on the following files:
         if (!target || target.startsWith("/") || target.endsWith("/") || !target.endsWith(".md")) return null;
         if (target.split("/").some(part => !part || part === "." || part === "..")) return null;
         return target;
+    }
+
+    private getSafeVaultActionPath(filePath: string): string | null {
+        const target = filePath.trim().replace(/\\/g, "/");
+        if (!target || target.startsWith("/") || target.endsWith("/")) return null;
+        if (!target.endsWith(".md") && !target.endsWith(".txt")) return null;
+        if (target.split("/").some(part => !part || part === "." || part === "..")) return null;
+        return target;
+    }
+
+    private appendContent(existing: string, content: string, heading?: string): string {
+        const normalizedContent = content.endsWith("\n") ? content : `${content}\n`;
+        if (!heading) {
+            const separator = existing.endsWith("\n") || existing.length === 0 ? "" : "\n";
+            return `${existing}${separator}${normalizedContent}`;
+        }
+
+        const lines = existing.split("\n");
+        const headingPattern = new RegExp(`^(#{1,6})\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`);
+        const headingIndex = lines.findIndex(line => headingPattern.test(line));
+        if (headingIndex === -1) {
+            const separator = existing.endsWith("\n") || existing.length === 0 ? "" : "\n";
+            return `${existing}${separator}\n## ${heading}\n\n${normalizedContent}`;
+        }
+
+        const headingLevel = (lines[headingIndex].match(/^#+/)?.[0].length) ?? 1;
+        let insertIndex = lines.length;
+        for (let i = headingIndex + 1; i < lines.length; i++) {
+            const match = lines[i].match(/^(#{1,6})\s+/);
+            if (match && match[1].length <= headingLevel) {
+                insertIndex = i;
+                break;
+            }
+        }
+
+        const insertion = normalizedContent.trimEnd().split("\n");
+        const before = lines.slice(0, insertIndex);
+        const after = lines.slice(insertIndex);
+        if (before.length > 0 && before[before.length - 1].trim() !== "") {
+            before.push("");
+        }
+        return [...before, ...insertion, ...after].join("\n").replace(/\n?$/, "\n");
+    }
+
+    public async applyVaultActions(actions: VaultAction[]): Promise<VaultActionResult[]> {
+        const results: VaultActionResult[] = [];
+
+        for (const action of actions) {
+            const path = this.getSafeVaultActionPath(action.path);
+            if (!path) {
+                results.push({ action, success: false, path: action.path, error: "Unsafe vault action path" });
+                continue;
+            }
+
+            try {
+                const existing = this.app.vault.getAbstractFileByPath(path);
+                if (action.op === "create_file") {
+                    if (existing) {
+                        throw new Error(`File already exists: ${path}`);
+                    }
+                    await this.ensureParentFolders(path);
+                    await this.app.vault.create(path, action.content ?? "");
+                } else if (action.op === "append_file") {
+                    if (!(existing instanceof TFile)) {
+                        throw new Error(`File does not exist: ${path}`);
+                    }
+                    const current = await this.app.vault.read(existing);
+                    await this.app.vault.modify(existing, this.appendContent(current, action.content ?? "", action.heading));
+                } else if (action.op === "replace_text") {
+                    if (!(existing instanceof TFile)) {
+                        throw new Error(`File does not exist: ${path}`);
+                    }
+                    const find = action.find ?? "";
+                    if (!find) {
+                        throw new Error("replace_text requires a non-empty find value");
+                    }
+                    const current = await this.app.vault.read(existing);
+                    const matches = current.split(find).length - 1;
+                    if (matches !== 1) {
+                        throw new Error(`replace_text expected exactly one match, found ${matches}`);
+                    }
+                    await this.app.vault.modify(existing, current.replace(find, action.replace ?? ""));
+                } else {
+                    throw new Error(`Unsupported vault action: ${(action as any).op}`);
+                }
+                results.push({ action, success: true, path });
+            } catch (error) {
+                results.push({ action, success: false, path, error: error.message });
+            }
+        }
+
+        return results;
     }
 
     private async ensureParentFolders(filePath: string): Promise<string[]> {

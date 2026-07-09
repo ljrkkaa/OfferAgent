@@ -16,7 +16,7 @@ CODEX_REFRESH_SKEW_SECONDS = 120
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 DEFAULT_CODEX_MODEL = "gpt-5.4"
 DEFAULT_CODEX_ORIGINATOR = "codex_cli_rs"
-DEFAULT_CODEX_USER_AGENT = "codex_cli_rs/0.0.0 (Khoj Interview Agent)"
+DEFAULT_CODEX_USER_AGENT = "codex_cli_rs/0.0.0 (OfferAgent Interview Agent)"
 CODEX_CONFIG_NAME = "config.toml"
 CODEX_MODELS_CACHE_NAME = "models_cache.json"
 

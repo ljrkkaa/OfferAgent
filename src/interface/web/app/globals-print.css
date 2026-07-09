@@ -281,8 +281,7 @@
     .chat-footer,
     .chat-buttons,
     .code-copy-button,
-    .copy-button,
-    .feedback-buttons {
+    .copy-button {
         display: none !important;
     }
 

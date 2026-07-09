@@ -77,16 +77,10 @@ import { saveAs } from "file-saver";
 interface DropdownComponentProps {
     items: ModelOptions[];
     selected: number;
-    isActive?: boolean;
     callbackFunc: (value: string) => Promise<boolean>;
 }
 
-const DropdownComponent: React.FC<DropdownComponentProps> = ({
-    items,
-    selected,
-    isActive,
-    callbackFunc,
-}) => {
+const DropdownComponent: React.FC<DropdownComponentProps> = ({ items, selected, callbackFunc }) => {
     const [position, setPosition] = useState(selected?.toString() ?? "0");
 
     return (
@@ -123,12 +117,8 @@ const DropdownComponent: React.FC<DropdownComponentProps> = ({
                                 <DropdownMenuRadioItem
                                     key={item.id.toString()}
                                     value={item.id.toString()}
-                                    disabled={!isActive && item.tier !== "free"}
                                 >
-                                    {item.name}{" "}
-                                    {item.tier === "standard" && (
-                                        <span className="text-green-500 ml-2">(standard)</span>
-                                    )}
+                                    {item.name}
                                 </DropdownMenuRadioItem>
                             ))}
                         </DropdownMenuRadioGroup>
@@ -148,7 +138,7 @@ function isUserMemory(memory: unknown): memory is UserMemorySchema {
     return (
         typeof memory === "object" &&
         memory !== null &&
-        typeof (memory as UserMemorySchema).id === "number" &&
+        typeof (memory as UserMemorySchema).id === "string" &&
         typeof (memory as UserMemorySchema).raw === "string" &&
         typeof (memory as UserMemorySchema).created_at === "string"
     );
@@ -292,7 +282,7 @@ function ApiKeyCard() {
             </CardHeader>
             <CardContent className="overflow-hidden grid gap-6">
                 <p className="text-md text-gray-400">
-                    Access Khoj from Obsidian or local API clients.
+                    Access OfferAgent from Obsidian or local API clients.
                 </p>
                 <Table>
                     <TableBody>
@@ -405,27 +395,17 @@ export default function SettingsView() {
             console.error("Error updating name:", error);
             toast({
                 title: "⚠️ Failed to Update Profile",
-                description: "Failed to update name. Try again or contact team@khoj.dev",
+                description:
+                    "Failed to update name. Try again or check the OfferAgent server logs.",
             });
         }
     };
 
     const updateModel = (modelType: string) => async (id: string) => {
-        // Get the selected model from the options
         const modelOptions = userConfig?.chat_model_options;
 
         const selectedModel = modelOptions?.find((model) => model.id.toString() === id);
         const modelName = selectedModel?.name;
-
-        // Check if the model is free tier or if the user is active
-        if (!userConfig?.is_active && selectedModel?.tier !== "free") {
-            toast({
-                title: `Model Update`,
-                description: `This account cannot switch ${modelType} model to ${modelName}.`,
-                variant: "destructive",
-            });
-            return false;
-        }
 
         try {
             const response = await fetch(`/api/model/${modelType}?id=${encodeURIComponent(id)}`, {
@@ -541,7 +521,7 @@ export default function SettingsView() {
         }
     };
 
-    const handleDeleteMemory = async (id: number) => {
+    const handleDeleteMemory = async (id: string) => {
         try {
             const response = await fetch(`/api/memories/${id}`, {
                 method: "DELETE",
@@ -560,7 +540,7 @@ export default function SettingsView() {
         }
     };
 
-    const handleUpdateMemory = async (id: number, raw: string) => {
+    const handleUpdateMemory = async (id: string, raw: string) => {
         try {
             const response = await fetch(`/api/memories/${id}`, {
                 method: "PUT",
@@ -599,8 +579,8 @@ export default function SettingsView() {
             toast({
                 title: enabled ? "Memory enabled" : "Memory disabled",
                 description: enabled
-                    ? "Khoj will learn and remember from your conversations."
-                    : "Khoj will no longer learn or remember from your conversations.",
+                    ? "OfferAgent will learn and remember from your conversations."
+                    : "OfferAgent will no longer learn or remember from your conversations.",
             });
         } catch (error) {
             console.error("Error toggling memory:", error);
@@ -630,7 +610,7 @@ export default function SettingsView() {
             console.error("Error syncing content:", error);
             toast({
                 title: `⚠️ Failed to Sync ${type}`,
-                description: `Failed to sync ${type} content. Try again or contact team@khoj.dev`,
+                description: `Failed to sync ${type} content. Try again or check the OfferAgent server logs.`,
             });
         }
     };
@@ -668,14 +648,14 @@ export default function SettingsView() {
             } else {
                 toast({
                     title: `✅ Disconnected ${source}`,
-                    description: `Your ${source} integration to Khoj has been disconnected.`,
+                    description: `Your ${source} integration to OfferAgent has been disconnected.`,
                 });
             }
         } catch (error) {
             console.error(`Error disconnecting ${source}:`, error);
             toast({
                 title: `⚠️ Failed to Disconnect ${source}`,
-                description: `Failed to disconnect from ${source}. Try again or contact team@khoj.dev`,
+                description: `Failed to disconnect from ${source}. Try again or check the OfferAgent server logs.`,
             });
         }
     };
@@ -691,7 +671,7 @@ export default function SettingsView() {
                     <Separator orientation="vertical" className="mr-2 h-4" />
                     {isMobileWidth ? (
                         <Link className="p-0 no-underline" href="/">
-                            <KhojLogoType className="h-auto w-16" />
+                            <KhojLogoType className="h-auto w-32 max-w-full" />
                         </Link>
                     ) : (
                         <h2 className="text-lg">Settings</h2>
@@ -716,7 +696,7 @@ export default function SettingsView() {
                                                 </CardHeader>
                                                 <CardContent className="overflow-hidden">
                                                     <p className="pb-4 text-gray-400">
-                                                        What should Khoj refer to you as?
+                                                        What should OfferAgent refer to you as?
                                                     </p>
                                                     <Input
                                                         type="text"
@@ -802,22 +782,9 @@ export default function SettingsView() {
                                                             selected={
                                                                 userConfig.selected_chat_model_config
                                                             }
-                                                            isActive={userConfig.is_active}
                                                             callbackFunc={updateModel("chat")}
                                                         />
                                                     </CardContent>
-                                                    <CardFooter className="flex flex-wrap gap-4">
-                                                        {!userConfig.is_active && (
-                                                            <p className="text-gray-400">
-                                                                {userConfig.chat_model_options.some(
-                                                                    (model) =>
-                                                                        model.tier === "free",
-                                                                )
-                                                                    ? "Free models available"
-                                                                    : "Model switching unavailable"}
-                                                            </p>
-                                                        )}
-                                                    </CardFooter>
                                                 </Card>
                                             )}
                                         </div>

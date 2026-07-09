@@ -1,20 +1,20 @@
 import type { Metadata } from "next";
 import "../globals.css";
 import { Toaster } from "@/components/ui/toaster";
-import { ChatwootWidget } from "../components/chatWoot/ChatwootWidget";
 
 export const metadata: Metadata = {
-    title: "Khoj AI - Settings",
-    description: "Configure Khoj to get personalized, deeper assistance.",
+    title: "OfferAgent - Settings",
+    description: "Configure OfferAgent to get personalized, deeper assistance.",
     icons: {
         icon: "/static/assets/icons/khoj_lantern.ico",
         apple: "/static/assets/icons/khoj_lantern_256x256.png",
     },
     openGraph: {
-        siteName: "Khoj AI",
-        title: "Khoj AI - Settings",
-        description: "Setup, configure, and personalize Khoj, your AI research assistant.",
-        url: "https://app.khoj.dev/settings",
+        siteName: "OfferAgent",
+        title: "OfferAgent - Settings",
+        description:
+            "Setup, configure, and personalize OfferAgent, your local interview assistant.",
+        url: "http://localhost:12805/settings",
         type: "website",
         images: [
             {
@@ -40,7 +40,6 @@ export default function ChildLayout({
         <>
             {children}
             <Toaster />
-            <ChatwootWidget />
         </>
     );
 }

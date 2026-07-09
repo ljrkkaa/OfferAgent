@@ -386,20 +386,6 @@ async def test_codex_message_wrapper_skips_database_chat_models(monkeypatch):
     assert result["model"] == "gpt-test-codex"
 
 
-@pytest.mark.asyncio
-async def test_extract_facts_allows_missing_agent(monkeypatch):
-    async def fake_send_message_to_model_wrapper(*_args, **kwargs):
-        assert kwargs["agent_chat_model"] is None
-        return ResponseWithThought(text='{"create": [], "delete": []}')
-
-    monkeypatch.setattr(router_helpers, "send_message_to_model_wrapper", fake_send_message_to_model_wrapper)
-
-    result = await router_helpers.extract_facts_from_query(user=None, conversation_history=[], agent=None)
-
-    assert result.create == []
-    assert result.delete == []
-
-
 def test_cloudflare_challenge_is_classified():
     class CloudflareError(Exception):
         response = SimpleNamespace(status_code=403, headers={"cf-mitigated": "challenge"})

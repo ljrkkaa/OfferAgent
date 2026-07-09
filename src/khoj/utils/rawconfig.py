@@ -47,21 +47,6 @@ class FilesFilterRequest(BaseModel):
     conversation_id: str
 
 
-class GithubRepoConfig(ConfigBase):
-    name: str
-    owner: str
-    branch: Optional[str] = "master"
-
-
-class GithubContentConfig(ConfigBase):
-    pat_token: Optional[str] = None
-    repos: List[GithubRepoConfig]
-
-
-class NotionContentConfig(ConfigBase):
-    token: str
-
-
 class SearchResponse(ConfigBase):
     entry: str
     score: float
@@ -100,6 +85,7 @@ class ChatRequestBody(BaseModel):
     images: Optional[list[str]] = None
     files: Optional[list[FileAttachment]] = []
     create_new: Optional[bool] = False
+    client_capabilities: Optional[dict] = None
 
 
 class Entry:

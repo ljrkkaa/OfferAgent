@@ -23,6 +23,10 @@ interface AutomationsData {
     next: string;
 }
 
+type ScheduleContext = {
+    timezone: string;
+};
+
 import cronstrue from "cronstrue";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { UseFormReturn, useForm } from "react-hook-form";
@@ -41,7 +45,7 @@ import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogTrigger } from "@/components/ui/dialog";
 import { DialogTitle } from "@radix-ui/react-dialog";
 import { Textarea } from "@/components/ui/textarea";
-import { LocationData, useIPLocationData, useIsMobileWidth } from "../common/utils";
+import { useIsMobileWidth } from "../common/utils";
 
 import styles from "./automations.module.css";
 import ShareLink from "../components/shareLink/shareLink";
@@ -55,9 +59,7 @@ import {
     Clock,
     ClockAfternoon,
     DotsThreeVertical,
-    Envelope,
     Lightning,
-    MapPinSimple,
     Play,
     Plus,
     Trash,
@@ -274,7 +276,7 @@ function sendAPreview(automationId: string, setToastMessage: (toastMessage: stri
             return response;
         })
         .then((automations) => {
-            setToastMessage("Automation triggered. Check your inbox in a few minutes!");
+            setToastMessage("Automation triggered.");
         })
         .catch((error) => {
             setToastMessage("Sorry, something went wrong. Try again later.");
@@ -284,7 +286,7 @@ function sendAPreview(automationId: string, setToastMessage: (toastMessage: stri
 interface AutomationsCardProps {
     automation: AutomationsData;
     isMobileWidth: boolean;
-    locationData?: LocationData | null;
+    locationData?: ScheduleContext | null;
     suggestedCard?: boolean;
     setNewAutomationData?: (data: AutomationsData) => void;
     isLoggedIn: boolean;
@@ -353,7 +355,7 @@ function AutomationsCard(props: AutomationsCardProps) {
                                     authenticatedData={props.authenticatedData}
                                     isCreating={isEditing}
                                     automation={updatedAutomationData || automation}
-                                    ipLocationData={props.locationData}
+                                    ipScheduleContext={props.locationData}
                                     setToastMessage={props.setToastMessage}
                                 />
                             )}
@@ -435,7 +437,7 @@ function AutomationsCard(props: AutomationsCardProps) {
                         authenticatedData={props.authenticatedData}
                         isCreating={isEditing}
                         automation={automation}
-                        ipLocationData={props.locationData}
+                        ipScheduleContext={props.locationData}
                         setToastMessage={props.setToastMessage}
                     />
                 )}
@@ -445,7 +447,7 @@ function AutomationsCard(props: AutomationsCardProps) {
 }
 
 interface SharedAutomationCardProps {
-    locationData?: LocationData | null;
+    locationData?: ScheduleContext | null;
     setNewAutomationData: (data: AutomationsData) => void;
     isLoggedIn: boolean;
     setShowLoginPrompt: (showLoginPrompt: boolean) => void;
@@ -487,7 +489,7 @@ function SharedAutomationCard(props: SharedAutomationCardProps) {
             authenticatedData={props.authenticatedData}
             isCreating={isCreating}
             automation={automation}
-            ipLocationData={props.locationData}
+            ipScheduleContext={props.locationData}
             setToastMessage={props.setToastMessage}
         />
     ) : null;
@@ -506,7 +508,7 @@ interface EditCardProps {
     automation?: AutomationsData;
     setIsEditing: (completed: boolean) => void;
     setUpdatedAutomationData: (data: AutomationsData) => void;
-    locationData?: LocationData | null;
+    locationData?: ScheduleContext | null;
     createNew?: boolean;
     isLoggedIn: boolean;
     setShowLoginPrompt: (showLoginPrompt: boolean) => void;
@@ -548,12 +550,6 @@ function EditCard(props: EditCardProps) {
             updateQueryUrl += `&subject=${encodeURIComponent(values.subject)}`;
         }
         updateQueryUrl += `&crontime=${encodeURIComponent(cronFrequency)}`;
-        if (props.locationData && props.locationData.city)
-            updateQueryUrl += `&city=${encodeURIComponent(props.locationData.city)}`;
-        if (props.locationData && props.locationData.region)
-            updateQueryUrl += `&region=${encodeURIComponent(props.locationData.region)}`;
-        if (props.locationData && props.locationData.country)
-            updateQueryUrl += `&country=${encodeURIComponent(props.locationData.country)}`;
         if (props.locationData && props.locationData.timezone)
             updateQueryUrl += `&timezone=${encodeURIComponent(props.locationData.timezone)}`;
 
@@ -579,7 +575,7 @@ function EditCard(props: EditCardProps) {
         } catch (error) {
             console.error("Error saving automation:", error);
             props.setToastMessage(
-                "Sorry, something went wrong. Try again or contact team@khoj.dev.",
+                "Sorry, something went wrong. Try again or check the OfferAgent server logs.",
             );
         }
     };
@@ -638,7 +634,7 @@ interface AutomationModificationFormProps {
     isLoggedIn: boolean;
     setShowLoginPrompt: (showLoginPrompt: boolean) => void;
     authenticatedData: UserProfile | null;
-    locationData: LocationData | null;
+    locationData: ScheduleContext | null;
 }
 
 function AutomationModificationForm(props: AutomationModificationFormProps) {
@@ -686,10 +682,8 @@ function AutomationModificationForm(props: AutomationModificationFormProps) {
             >
                 <FormItem className="space-y-1">
                     <FormDescription>
-                        Emails will be sent to this address. Timezone and location data will be used
-                        to schedule automations.
-                        {props.locationData &&
-                            metadataMap(props.locationData, props.authenticatedData)}
+                        Your browser timezone will be used to schedule automations.
+                        {props.locationData && metadataMap(props.locationData)}
                     </FormDescription>
                 </FormItem>
                 {!props.create && (
@@ -699,9 +693,7 @@ function AutomationModificationForm(props: AutomationModificationFormProps) {
                         render={({ field }) => (
                             <FormItem className="space-y-1">
                                 <FormLabel>Subject</FormLabel>
-                                <FormDescription>
-                                    This is the subject of the email you will receive.
-                                </FormDescription>
+                                <FormDescription>This is the automation subject.</FormDescription>
                                 <FormControl>
                                     <Input
                                         placeholder="Digest of Healthcare AI trends"
@@ -866,7 +858,7 @@ function AutomationModificationForm(props: AutomationModificationFormProps) {
                     render={({ field }) => (
                         <FormItem className="space-y-1">
                             <FormLabel>Instructions</FormLabel>
-                            <FormDescription>What do you want Khoj to do?</FormDescription>
+                            <FormDescription>What do you want OfferAgent to do?</FormDescription>
                             {props.create && (
                                 <div>
                                     {recommendationPills.map((recommendation) =>
@@ -914,34 +906,13 @@ function AutomationModificationForm(props: AutomationModificationFormProps) {
     );
 }
 
-function locationLabel(locationData: LocationData | null | undefined) {
-    if (!locationData?.city && !locationData?.country) return null;
-    return [locationData.city, locationData.country].filter(Boolean).join(", ");
-}
-
-function metadataMap(ipLocationData: LocationData, authenticatedData: UserProfile | null) {
-    const location = locationLabel(ipLocationData);
-
+function metadataMap(scheduleContext: ScheduleContext) {
     return (
         <div className="flex flex-wrap gap-2 items-center justify-start">
-            {authenticatedData ? (
-                <span className="rounded-lg text-sm border-secondary border p-1 flex items-center shadow-sm dark:bg-muted">
-                    <Envelope className="h-4 w-4 mr-2 inline text-orange-500 shadow-sm" />
-                    {authenticatedData.email}
-                </span>
-            ) : null}
-            {location && (
-                <span className="rounded-lg text-sm border-secondary border p-1 flex items-center shadow-sm dark:bg-muted">
-                    <MapPinSimple className="h-4 w-4 mr-2 inline text-purple-500" />
-                    {location}
-                </span>
-            )}
-            {ipLocationData && (
-                <span className="rounded-lg text-sm border-secondary border p-1 flex items-center shadow-sm dark:bg-muted">
-                    <Clock className="h-4 w-4 mr-2 inline text-green-500" />
-                    {ipLocationData ? `${ipLocationData.timezone}` : "Unknown"}
-                </span>
-            )}
+            <span className="rounded-lg text-sm border-secondary border p-1 flex items-center shadow-sm dark:bg-muted">
+                <Clock className="h-4 w-4 mr-2 inline text-green-500" />
+                {scheduleContext.timezone}
+            </span>
         </div>
     );
 }
@@ -955,7 +926,7 @@ interface AutomationComponentWrapperProps {
     setNewAutomationData: (data: AutomationsData) => void;
     authenticatedData: UserProfile | null;
     isCreating: boolean;
-    ipLocationData: LocationData | null | undefined;
+    ipScheduleContext: ScheduleContext | null | undefined;
     automation?: AutomationsData;
     setToastMessage: (toastMessage: string) => void;
 }
@@ -984,7 +955,7 @@ function AutomationComponentWrapper(props: AutomationComponentWrapperProps) {
                     authenticatedData={props.authenticatedData}
                     setShowLoginPrompt={props.setShowLoginPrompt}
                     setUpdatedAutomationData={props.setNewAutomationData}
-                    locationData={props.ipLocationData}
+                    locationData={props.ipScheduleContext}
                     setToastMessage={props.setToastMessage}
                 />
             </DrawerContent>
@@ -1012,7 +983,7 @@ function AutomationComponentWrapper(props: AutomationComponentWrapperProps) {
                     authenticatedData={props.authenticatedData}
                     setShowLoginPrompt={props.setShowLoginPrompt}
                     setUpdatedAutomationData={props.setNewAutomationData}
-                    locationData={props.ipLocationData}
+                    locationData={props.ipScheduleContext}
                     setToastMessage={props.setToastMessage}
                 />
             </DialogContent>
@@ -1040,8 +1011,9 @@ export default function Automations() {
     const [suggestedAutomations, setSuggestedAutomations] = useState<AutomationsData[]>([]);
     const [showLoginPrompt, setShowLoginPrompt] = useState(false);
     const isMobileWidth = useIsMobileWidth();
-    const { locationData, locationDataError, locationDataLoading } = useIPLocationData();
-    const location = locationLabel(locationData);
+    const scheduleContext = {
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+    };
     const [toastMessage, setToastMessage] = useState("");
     const { toast } = useToast();
 
@@ -1095,7 +1067,7 @@ export default function Automations() {
                     <Separator orientation="vertical" className="mr-2 h-4" />
                     {isMobileWidth ? (
                         <Link className="p-0 no-underline" href="/">
-                            <KhojLogoType className="h-auto w-16" />
+                            <KhojLogoType className="h-auto w-32 max-w-full" />
                         </Link>
                     ) : (
                         <h2 className="text-lg">Automations</h2>
@@ -1106,26 +1078,7 @@ export default function Automations() {
                         <div className={`${styles.pageLayout} w-full`}>
                             <div className="pt-6 md:pt-8 grid gap-1 md:flex md:justify-between">
                                 <h1 className="text-3xl flex items-center">Automations</h1>
-                                <div className="flex flex-wrap gap-2 items-center justify-start">
-                                    {authenticatedData ? (
-                                        <span className="rounded-lg text-sm border-secondary border p-1 flex items-center shadow-sm dark:bg-muted">
-                                            <Envelope className="h-4 w-4 mr-2 inline text-orange-500 shadow-sm" />
-                                            {authenticatedData.email}
-                                        </span>
-                                    ) : null}
-                                    {location && (
-                                        <span className="rounded-lg text-sm border-secondary border p-1 flex items-center shadow-sm dark:bg-muted">
-                                            <MapPinSimple className="h-4 w-4 mr-2 inline text-purple-500" />
-                                            {location}
-                                        </span>
-                                    )}
-                                    {locationData && (
-                                        <span className="rounded-lg text-sm border-secondary border p-1 flex items-center shadow-sm dark:bg-muted">
-                                            <Clock className="h-4 w-4 mr-2 inline text-green-500" />
-                                            {locationData ? `${locationData.timezone}` : "Unknown"}
-                                        </span>
-                                    )}
-                                </div>
+                                {metadataMap(scheduleContext)}
                             </div>
                             {showLoginPrompt && (
                                 <LoginPrompt
@@ -1142,7 +1095,7 @@ export default function Automations() {
                                     <span className="font-bold">How it works</span> Automations help
                                     you structure your time by automating tasks you do regularly.
                                     Build your own, or try out our presets. Get results straight to
-                                    your inbox.
+                                    your automation list.
                                 </AlertDescription>
                             </Alert>
                             <div className="flex justify-between items-center py-4">
@@ -1156,7 +1109,7 @@ export default function Automations() {
                                         setNewAutomationData={setNewAutomationData}
                                         authenticatedData={authenticatedData}
                                         isCreating={isCreating}
-                                        ipLocationData={locationData}
+                                        ipScheduleContext={scheduleContext}
                                         setToastMessage={setToastMessage}
                                     />
                                 ) : (
@@ -1174,7 +1127,7 @@ export default function Automations() {
                                 <SharedAutomationCard
                                     isMobileWidth={isMobileWidth}
                                     authenticatedData={authenticatedData || null}
-                                    locationData={locationData}
+                                    locationData={scheduleContext}
                                     isLoggedIn={authenticatedData ? true : false}
                                     setShowLoginPrompt={setShowLoginPrompt}
                                     setNewAutomationData={setNewAutomationData}
@@ -1191,7 +1144,7 @@ export default function Automations() {
                                             key={automation.id}
                                             authenticatedData={authenticatedData}
                                             automation={automation}
-                                            locationData={locationData}
+                                            locationData={scheduleContext}
                                             isLoggedIn={authenticatedData ? true : false}
                                             setShowLoginPrompt={setShowLoginPrompt}
                                             setToastMessage={setToastMessage}
@@ -1204,7 +1157,7 @@ export default function Automations() {
                                             key={automation.id}
                                             authenticatedData={authenticatedData}
                                             automation={automation}
-                                            locationData={locationData}
+                                            locationData={scheduleContext}
                                             isLoggedIn={authenticatedData ? true : false}
                                             setShowLoginPrompt={setShowLoginPrompt}
                                             setToastMessage={setToastMessage}
@@ -1220,7 +1173,7 @@ export default function Automations() {
                                         key={automation.id}
                                         authenticatedData={authenticatedData || null}
                                         automation={automation}
-                                        locationData={locationData}
+                                        locationData={scheduleContext}
                                         isLoggedIn={authenticatedData ? true : false}
                                         setShowLoginPrompt={setShowLoginPrompt}
                                         suggestedCard={true}

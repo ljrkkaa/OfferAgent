@@ -55,9 +55,9 @@ def test_scheduled_chat_tells_chat_api_task_already_triggered(monkeypatch, defau
         return FakeResponse()
 
     monkeypatch.setattr("khoj.routers.helpers.requests.post", fake_post)
-    monkeypatch.setattr("khoj.routers.helpers.should_notify", lambda *args, **kwargs: False)
+    monkeypatch.setattr("khoj.routers.helpers.format_automation_response", lambda *args, **kwargs: "formatted")
 
-    scheduled_chat(
+    result = scheduled_chat(
         query_to_run="/automated_task Remind me to review the edited e2e token.",
         scheduling_request="Every day remind me to review the edited e2e token.",
         subject="edited e2e subject",
@@ -68,6 +68,7 @@ def test_scheduled_chat_tells_chat_api_task_already_triggered(monkeypatch, defau
     assert captured["url"] == "http://testserver/api/chat?client=khoj"
     assert "This scheduled automation has already triggered" in captured["json"]["q"]
     assert "Perform the task now" in captured["json"]["q"]
+    assert result == "formatted"
 
 
 @pytest.mark.django_db(transaction=True)

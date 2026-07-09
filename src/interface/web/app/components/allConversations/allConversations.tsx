@@ -47,7 +47,6 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import {
     ArrowRight,
     ArrowDown,
-    Spinner,
     Check,
     FolderPlus,
     DotsThreeVertical,
@@ -80,7 +79,7 @@ import {
 
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 
-import { Pencil, Trash, Share } from "@phosphor-icons/react";
+import { Pencil, Trash } from "@phosphor-icons/react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -137,22 +136,6 @@ async function renameConversation(conversationId: string, newTitle: string) {
     if (!response.ok || data.success === false) {
         throw new Error(data.message || data.detail || "Failed to rename conversation");
     }
-}
-
-async function shareConversation(conversationId: string, setShareUrl: (url: string) => void) {
-    const shareUrl = `/api/chat/share?client=web&conversation_id=${encodeURIComponent(conversationId)}`;
-
-    const response = await fetch(shareUrl, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-        },
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok || !data.url) {
-        throw new Error(data.message || data.detail || "Failed to share conversation");
-    }
-    setShareUrl(data.url);
 }
 
 async function deleteConversation(conversationId: string) {
@@ -492,30 +475,9 @@ export interface ChatSessionActionMenuProps {
 export function ChatSessionActionMenu(props: ChatSessionActionMenuProps) {
     const [renamedTitle, setRenamedTitle] = useState("");
     const [isRenaming, setIsRenaming] = useState(false);
-    const [isSharing, setIsSharing] = useState(false);
     const [isDeleting, setIsDeleting] = useState(false);
-    const [shareUrl, setShareUrl] = useState("");
-    const [showShareUrl, setShowShareUrl] = useState(false);
 
     const [isOpen, setIsOpen] = useState(false);
-
-    useEffect(() => {
-        if (isSharing) {
-            shareConversation(props.conversationId, setShareUrl)
-                .then(() => {
-                    setShowShareUrl(true);
-                })
-                .catch((error) => {
-                    console.error(error);
-                    window.alert(
-                        error instanceof Error ? error.message : "Failed to share conversation",
-                    );
-                })
-                .finally(() => {
-                    setIsSharing(false);
-                });
-        }
-    }, [isSharing, props.conversationId]);
 
     if (isRenaming) {
         return (
@@ -552,61 +514,6 @@ export function ChatSessionActionMenu(props: ChatSessionActionMenuProps) {
                         >
                             Rename
                         </Button>
-                    </DialogFooter>
-                </DialogContent>
-            </Dialog>
-        );
-    }
-
-    if (isSharing || showShareUrl) {
-        if (shareUrl) {
-            navigator.clipboard.writeText(shareUrl);
-        }
-        return (
-            <Dialog
-                open={isSharing || showShareUrl}
-                onOpenChange={(open) => {
-                    setShowShareUrl(open);
-                    setIsSharing(open);
-                }}
-            >
-                <DialogContent>
-                    <DialogHeader>
-                        <DialogTitle>Conversation Share URL</DialogTitle>
-                        <DialogDescription>
-                            Sharing this chat session will allow anyone with a link to view the
-                            conversation.
-                            <Input
-                                className="w-full bg-accent text-accent-foreground rounded-md p-2 mt-2"
-                                value={shareUrl}
-                                readOnly={true}
-                            />
-                        </DialogDescription>
-                    </DialogHeader>
-                    <DialogFooter>
-                        {!showShareUrl && (
-                            <Button
-                                onClick={() => {
-                                    shareConversation(props.conversationId, setShareUrl);
-                                    setShowShareUrl(true);
-                                }}
-                                className="bg-orange-500"
-                                disabled
-                            >
-                                <Spinner className="mr-2 h-4 w-4 animate-spin" />
-                                Sharing
-                            </Button>
-                        )}
-                        {showShareUrl && (
-                            <Button
-                                onClick={() => {
-                                    navigator.clipboard.writeText(shareUrl);
-                                }}
-                                variant={"default"}
-                            >
-                                Copy
-                            </Button>
-                        )}
                     </DialogFooter>
                 </DialogContent>
             </Dialog>
@@ -667,15 +574,6 @@ export function ChatSessionActionMenu(props: ChatSessionActionMenuProps) {
 
     return (
         <div className="flex items-center gap-2">
-            {(props.sizing === "lg" || props.sizing === "md") && (
-                <Button
-                    className="p-0 text-sm h-auto"
-                    variant={"ghost"}
-                    onClick={() => setIsSharing(true)}
-                >
-                    <Share className={`${size}`} />
-                </Button>
-            )}
             <DropdownMenu onOpenChange={(open) => setIsOpen(open)} open={isOpen}>
                 <DropdownMenuTrigger asChild>
                     {props.sizing === "lg" || props.sizing === "md" ? (
@@ -695,14 +593,6 @@ export function ChatSessionActionMenu(props: ChatSessionActionMenuProps) {
                             Rename
                         </span>
                     </DropdownMenuItem>
-                    {props.sizing === "sm" && (
-                        <DropdownMenuItem onClick={() => setIsSharing(true)}>
-                            <span className="flex items-center">
-                                <Share className={`mr-2 ${size}`} />
-                                Share
-                            </span>
-                        </DropdownMenuItem>
-                    )}
                     <DropdownMenuItem onClick={() => setIsDeleting(true)}>
                         <span className="flex items-center">
                             <Trash className={`mr-2 ${size}`} />

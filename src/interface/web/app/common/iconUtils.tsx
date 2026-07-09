@@ -50,10 +50,8 @@ import {
     KeyReturn,
     FilePdf,
     FileMd,
-    MicrosoftWordLogo,
     Microscope,
 } from "@phosphor-icons/react";
-import { OrgMode } from "@/app/components/logo/fileLogo";
 
 interface IconMap {
     [key: string]: (color: string, width: string, height: string) => JSX.Element | null;
@@ -251,16 +249,11 @@ function getIconFromFilename(
 ) {
     const extension = filename.split(".").pop();
     switch (extension) {
-        case "org":
-            return <OrgMode className={className} />;
         case "markdown":
         case "md":
             return <FileMd className={className} />;
         case "pdf":
             return <FilePdf className={className} />;
-        case "doc":
-        case "docx":
-            return <MicrosoftWordLogo className={className} />;
         case "csv":
         case "json":
             return <MathOperations className={className} />;

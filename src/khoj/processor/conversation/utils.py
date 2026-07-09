@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import logging
@@ -28,9 +29,12 @@ from khoj.database.models import (
     ClientApplication,
     Intent,
     KhojUser,
-    UserMemory,
 )
 from khoj.processor.conversation import prompts
+from khoj.processor.conversation.offeragent_memory import (
+    OfferAgentMemory,
+    format_memories_for_system,
+)
 from khoj.search_filter.base_filter import BaseFilter
 from khoj.search_filter.date_filter import DateFilter
 from khoj.search_filter.file_filter import FileFilter
@@ -163,43 +167,6 @@ class AgentMessage(BaseModel):
     content: Union[str, List]
 
 
-class OperatorRun:
-    def __init__(
-        self,
-        query: str,
-        trajectory: list[AgentMessage] | list[dict] = None,
-        response: str = None,
-        webpages: list[dict] = None,
-    ):
-        self.query = query
-        self.response = response
-        self.webpages = webpages or []
-        self.trajectory: list[AgentMessage] = []
-        if trajectory:
-            for item in trajectory:
-                if isinstance(item, dict):
-                    self.trajectory.append(AgentMessage(**item))
-                elif hasattr(item, "role") and hasattr(item, "content"):  # Heuristic for AgentMessage like object
-                    self.trajectory.append(item)
-                else:
-                    logger.warning(f"Unexpected item type in trajectory: {type(item)}")
-
-    def to_dict(self) -> dict:
-        # Ensure AgentMessage instances in trajectory are also dicts
-        serialized_trajectory = []
-        for msg in self.trajectory:
-            if hasattr(msg, "model_dump"):  # Check if it's a Pydantic model
-                serialized_trajectory.append(msg.model_dump())
-            elif isinstance(msg, dict):
-                serialized_trajectory.append(msg)  # Already a dict
-        return {
-            "query": self.query,
-            "response": self.response,
-            "trajectory": serialized_trajectory,
-            "webpages": self.webpages,
-        }
-
-
 class ToolCall:
     def __init__(self, name: str, args: dict, id: str):
         self.name = name
@@ -214,7 +181,6 @@ class ResearchIteration:
         context: list = None,
         onlineContext: dict = None,
         codeContext: dict = None,
-        operatorContext: dict | OperatorRun = None,
         summarizedResult: str = None,
         warning: str = None,
         raw_response: list = None,
@@ -223,7 +189,6 @@ class ResearchIteration:
         self.context = context
         self.onlineContext = onlineContext
         self.codeContext = codeContext
-        self.operatorContext = OperatorRun(**operatorContext) if isinstance(operatorContext, dict) else operatorContext
         self.summarizedResult = summarizedResult
         self.warning = warning
         self.raw_response = raw_response
@@ -231,7 +196,6 @@ class ResearchIteration:
     def to_dict(self) -> dict:
         data = vars(self).copy()
         data["query"] = self.query.__dict__ if isinstance(self.query, ToolCall) else self.query
-        data["operatorContext"] = self.operatorContext.to_dict() if self.operatorContext else None
         return data
 
 
@@ -377,7 +341,7 @@ def construct_question_history(
     include_query: bool = True,
     lookback: int = 6,
     query_prefix: str = "Q",
-    agent_name: str = "Khoj",
+    agent_name: str = "Assistant",
 ) -> str:
     """
     Constructs a chat history string formatted for query extraction purposes.
@@ -507,6 +471,7 @@ class ChatEvent(Enum):
     MESSAGE = "message"
     REFERENCES = "references"
     GENERATED_ASSETS = "generated_assets"
+    VAULT_ACTIONS = "vault_actions"
     STATUS = "status"
     THOUGHT = "thought"
     METADATA = "metadata"
@@ -566,12 +531,66 @@ def message_to_log(
     try:
         StrictChatMessageModel(**khoj_log)
     except ValidationError as e:
-        logger.error(f"Validation error in khoj chat message: {e}\nKhoj Message: {khoj_log}\n")
+        logger.error(f"Validation error in assistant chat message: {e}\nOfferAgent Message: {khoj_log}\n")
 
     human_message = ChatMessageModel(**human_log)
     khoj_message = ChatMessageModel(**khoj_log)
     chat_history.extend([human_message, khoj_message])
     return chat_history
+
+
+async def _run_offeragent_memory_update(
+    *,
+    user: KhojUser,
+    latest_user_message: str,
+    agent: Any = None,
+    source_turn_id: str = None,
+    used_notes_tool_loop: bool = False,
+    tracer: Dict[str, Any] = None,
+) -> None:
+    from khoj.routers.helpers import ai_update_offeragent_memory
+
+    await ai_update_offeragent_memory(
+        user=user,
+        latest_user_message=latest_user_message,
+        agent=agent,
+        source_turn_id=source_turn_id,
+        used_notes_tool_loop=used_notes_tool_loop,
+        tracer=tracer or {},
+    )
+
+
+def _log_offeragent_memory_update_result(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        logger.debug("OfferAgent background memory update was cancelled")
+    except Exception:
+        logger.exception("OfferAgent background memory update failed")
+
+
+def _schedule_offeragent_memory_update(
+    *,
+    user: KhojUser,
+    latest_user_message: str,
+    agent: Any = None,
+    source_turn_id: str = None,
+    used_notes_tool_loop: bool = False,
+    tracer: Dict[str, Any] = None,
+) -> asyncio.Task:
+    task = asyncio.create_task(
+        _run_offeragent_memory_update(
+            user=user,
+            latest_user_message=latest_user_message,
+            agent=agent,
+            source_turn_id=source_turn_id,
+            used_notes_tool_loop=used_notes_tool_loop,
+            tracer=dict(tracer or {}),
+        ),
+        name=f"offeragent-memory-update-{source_turn_id or 'unknown'}",
+    )
+    task.add_done_callback(_log_offeragent_memory_update_result)
+    return task
 
 
 async def save_to_conversation_log(
@@ -582,13 +601,12 @@ async def save_to_conversation_log(
     compiled_references: List[Dict[str, Any]] = [],
     online_results: Dict[str, Any] = {},
     code_results: Dict[str, Any] = {},
-    operator_results: List[OperatorRun] = None,
     inferred_queries: List[str] = [],
     intent_type: str = "remember",
     client_application: ClientApplication = None,
     conversation_id: str = None,
     automation_id: str = None,
-    relevant_memories: List[UserMemory] = [],
+    relevant_memories: List[OfferAgentMemory] = [],
     query_images: List[str] = None,
     raw_query_files: List[FileAttachment] = [],
     generated_images: List[str] = [],
@@ -596,9 +614,8 @@ async def save_to_conversation_log(
     research_results: Optional[List[ResearchIteration]] = None,
     train_of_thought: List[Any] = [],
     tracer: Dict[str, Any] = {},
+    used_notes_tool_loop: bool = False,
 ):
-    from khoj.routers.helpers import ai_update_memories
-
     user_message_time = user_message_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     turn_id = tracer.get("mid") or str(uuid.uuid4())
 
@@ -612,7 +629,6 @@ async def save_to_conversation_log(
         "intent": {"inferred-queries": inferred_queries, "type": intent_type},
         "onlineContext": online_results,
         "codeContext": code_results,
-        "operatorContext": [o.to_dict() for o in operator_results] if operator_results and not chat_response else None,
         "researchContext": [r.to_dict() for r in research_results] if research_results and not chat_response else None,
         "automationId": automation_id,
         "trainOfThought": train_of_thought,
@@ -650,12 +666,13 @@ async def save_to_conversation_log(
         )
 
     if not automation_id:
-        # Don't update memories from automations, as this could get noisy.
-        await ai_update_memories(
+        # Only explicit local long-term memories are persisted. Tool/file results stay in the vault/index.
+        _schedule_offeragent_memory_update(
             user=user,
-            conversation_history=new_messages or [],
-            memories=relevant_memories,
+            latest_user_message=q,
             agent=db_conversation.agent if db_conversation else None,
+            source_turn_id=turn_id,
+            used_notes_tool_loop=used_notes_tool_loop,
             tracer=tracer,
         )
 
@@ -667,7 +684,7 @@ async def save_to_conversation_log(
 Saved Conversation Turn ({db_conversation.id if db_conversation else "N/A"}):
 You ({user.username}): "{q}"
 
-Khoj: "{chat_response}"
+OfferAgent: "{chat_response}"
 """.strip()
     )
 
@@ -720,7 +737,7 @@ def generate_chatml_messages_with_context(
     query_files: str = None,
     query_images=None,
     context_message="",
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: List[OfferAgentMemory] = None,
     generated_asset_results: Dict[str, Dict] = {},
     program_execution_context: List[str] = [],
     chat_history: list[ChatMessageModel] = [],
@@ -769,16 +786,6 @@ def generate_chatml_messages_with_context(
                 {
                     "type": "text",
                     "text": f"{prompts.code_executed_context.format(code_results=chat.codeContext)}",
-                }
-            ]
-
-        if not is_none_or_empty(chat.operatorContext):
-            operator_context = chat.operatorContext
-            operator_content = "\n\n".join([f"## Task: {oc['query']}\n{oc['response']}\n" for oc in operator_context])
-            message_context += [
-                {
-                    "type": "text",
-                    "text": f"{prompts.operator_execution_context.format(operator_results=operator_content)}",
                 }
             ]
 
@@ -844,6 +851,10 @@ def generate_chatml_messages_with_context(
 
     messages: list[ChatMessage] = []
 
+    memory_context = format_memories_for_system(relevant_memories or [])
+    if not is_none_or_empty(memory_context):
+        system_message = f"{system_message}\n\n{memory_context}" if system_message else memory_context
+
     if not is_none_or_empty(system_message):
         messages.append(ChatMessage(content=system_message, role="system"))
 
@@ -864,14 +875,6 @@ def generate_chatml_messages_with_context(
                 role="user",
             ),
         )
-
-    if not is_none_or_empty(relevant_memories):
-        memory_context = "Your memory system retrieved the following memories about me based on our previous conversations. Ignore them if they are not relevant to the query.\n<retrieved_memories>\n"
-        for memory in relevant_memories:
-            friendly_dt = memory.created_at.strftime("%Y-%m-%d %H:%M:%S")
-            memory_context += f"- [{friendly_dt}]: {memory.raw}\n"
-        memory_context += "</retrieved_memories>"
-        messages.append(ChatMessage(content=memory_context, role="user"))
 
     if not is_none_or_empty(user_message):
         messages.append(

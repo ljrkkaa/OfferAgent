@@ -1,6 +1,5 @@
 import logging
 import os
-import re
 import uuid
 from random import choice
 from typing import Dict, List, Optional, Union
@@ -12,7 +11,6 @@ from django.db import models
 from django.db.models.signals import pre_save
 from django.dispatch import receiver
 from django.utils.text import slugify
-from phonenumber_field.modelfields import PhoneNumberField
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import Field, model_validator
 
@@ -122,7 +120,6 @@ class ChatMessageModel(PydanticBaseModel):
     onlineContext: Dict[str, OnlineContext] = {}
     codeContext: Dict[str, CodeContextData] = {}
     researchContext: Optional[List] = None
-    operatorContext: Optional[List] = None
     created: Optional[str] = None
     images: Optional[List[str]] = None
     queryFiles: Optional[List[Dict]] = None
@@ -153,11 +150,7 @@ class ClientApplication(DbBaseModel):
 
 class KhojUser(AbstractUser):
     uuid = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
-    phone_number = PhoneNumberField(null=True, default=None, blank=True)
-    verified_phone_number = models.BooleanField(default=False)
     verified_email = models.BooleanField(default=False)
-    email_verification_code = models.CharField(max_length=200, null=True, default=None, blank=True)
-    email_verification_code_expiry = models.DateTimeField(null=True, default=None, blank=True)
 
     def save(self, *args, **kwargs):
         if not self.uuid:
@@ -166,21 +159,6 @@ class KhojUser(AbstractUser):
 
     def __str__(self):
         return f"{self.username} ({self.uuid})"
-
-
-class GoogleUser(models.Model):
-    user = models.OneToOneField(KhojUser, on_delete=models.CASCADE)
-    sub = models.CharField(max_length=200)
-    azp = models.CharField(max_length=200)
-    email = models.CharField(max_length=200)
-    name = models.CharField(max_length=200, null=True, default=None, blank=True)
-    given_name = models.CharField(max_length=200, null=True, default=None, blank=True)
-    family_name = models.CharField(max_length=200, null=True, default=None, blank=True)
-    picture = models.CharField(max_length=200, null=True, default=None)
-    locale = models.CharField(max_length=200, null=True, default=None, blank=True)
-
-    def __str__(self):
-        return self.name
 
 
 class KhojApiUser(models.Model):
@@ -192,18 +170,6 @@ class KhojApiUser(models.Model):
     accessed_at = models.DateTimeField(null=True, default=None)
 
 
-class Subscription(DbBaseModel):
-    class Type(models.TextChoices):
-        TRIAL = "trial"
-        STANDARD = "standard"
-
-    user = models.OneToOneField(KhojUser, on_delete=models.CASCADE, related_name="subscription")
-    type = models.CharField(max_length=20, choices=Type.choices, default=Type.STANDARD)
-    is_recurring = models.BooleanField(default=False)
-    renewal_date = models.DateTimeField(null=True, default=None, blank=True)
-    enabled_trial_at = models.DateTimeField(null=True, default=None, blank=True)
-
-
 class AiModelApi(DbBaseModel):
     name = models.CharField(max_length=200)
     api_key = models.CharField(max_length=4000)
@@ -213,11 +179,6 @@ class AiModelApi(DbBaseModel):
         return self.name
 
 
-class PriceTier(models.TextChoices):
-    FREE = "free"
-    STANDARD = "standard"
-
-
 class ChatModel(DbBaseModel):
     class ModelType(models.TextChoices):
         OPENAI = "openai"
@@ -225,12 +186,10 @@ class ChatModel(DbBaseModel):
         GOOGLE = "google"
 
     max_prompt_size = models.IntegerField(default=None, null=True, blank=True)
-    subscribed_max_prompt_size = models.IntegerField(default=None, null=True, blank=True)
     tokenizer = models.CharField(max_length=200, default=None, null=True, blank=True)
     name = models.CharField(max_length=200, default="gemini-2.5-flash")
     friendly_name = models.CharField(max_length=200, default=None, null=True, blank=True)
     model_type = models.CharField(max_length=200, choices=ModelType.choices, default=ModelType.GOOGLE)
-    price_tier = models.CharField(max_length=20, choices=PriceTier.choices, default=PriceTier.FREE)
     vision_enabled = models.BooleanField(default=False)
     ai_model_api = models.ForeignKey(AiModelApi, on_delete=models.CASCADE, default=None, null=True, blank=True)
     description = models.TextField(default=None, null=True, blank=True)
@@ -238,12 +197,6 @@ class ChatModel(DbBaseModel):
 
     def __str__(self):
         return self.friendly_name or self.name
-
-
-class VoiceModelOption(DbBaseModel):
-    model_id = models.CharField(max_length=200)
-    name = models.CharField(max_length=200)
-    price_tier = models.CharField(max_length=20, choices=PriceTier.choices, default=PriceTier.STANDARD)
 
 
 class Agent(DbBaseModel):
@@ -295,11 +248,6 @@ class Agent(DbBaseModel):
         GAVEL = "Gavel"
         BROADCAST = "Broadcast"
 
-    class PrivacyLevel(models.TextChoices):
-        PUBLIC = "public"
-        PRIVATE = "private"
-        PROTECTED = "protected"
-
     class InputToolOptions(models.TextChoices):
         # These map to various ConversationCommand types
         GENERAL = "general"
@@ -310,7 +258,6 @@ class Agent(DbBaseModel):
 
     class OutputModeOptions(models.TextChoices):
         # These map to various ConversationCommand types
-        IMAGE = "image"
         DIAGRAM = "diagram"
 
     creator = models.ForeignKey(
@@ -329,7 +276,6 @@ class Agent(DbBaseModel):
     slug = models.CharField(max_length=200, unique=True)
     style_color = models.CharField(max_length=200, choices=StyleColorTypes.choices, default=StyleColorTypes.ORANGE)
     style_icon = models.CharField(max_length=200, choices=StyleIconTypes.choices, default=StyleIconTypes.LIGHTBULB)
-    privacy_level = models.CharField(max_length=30, choices=PrivacyLevel.choices, default=PrivacyLevel.PRIVATE)
     is_hidden = models.BooleanField(default=False)
 
     def save(self, *args, **kwargs):
@@ -367,27 +313,8 @@ class ProcessLock(DbBaseModel):
 def verify_agent(sender, instance, **kwargs):
     # check if this is a new instance
     if instance._state.adding:
-        if Agent.objects.filter(name=instance.name, privacy_level=Agent.PrivacyLevel.PUBLIC).exists():
-            raise ValidationError(f"A public Agent with the name {instance.name} already exists.")
         if Agent.objects.filter(name=instance.name, creator=instance.creator).exists():
-            raise ValidationError(f"A private Agent with the name {instance.name} already exists.")
-
-
-class NotionConfig(DbBaseModel):
-    token = models.CharField(max_length=200)
-    user = models.ForeignKey(KhojUser, on_delete=models.CASCADE)
-
-
-class GithubConfig(DbBaseModel):
-    pat_token = models.CharField(max_length=200)
-    user = models.ForeignKey(KhojUser, on_delete=models.CASCADE)
-
-
-class GithubRepoConfig(DbBaseModel):
-    name = models.CharField(max_length=200)
-    owner = models.CharField(max_length=200)
-    branch = models.CharField(max_length=200)
-    github_config = models.ForeignKey(GithubConfig, on_delete=models.CASCADE, related_name="githubrepoconfig")
+            raise ValidationError(f"An Agent with the name {instance.name} already exists.")
 
 
 class WebScraper(DbBaseModel):
@@ -473,11 +400,6 @@ class ServerChatSettings(DbBaseModel):
         """Enum for the different chat model slots in ServerChatSettings"""
 
         CHAT_DEFAULT = "chat_default"
-        CHAT_ADVANCED = "chat_advanced"
-        THINK_FREE_FAST = "think_free_fast"
-        THINK_FREE_DEEP = "think_free_deep"
-        THINK_PAID_FAST = "think_paid_fast"
-        THINK_PAID_DEEP = "think_paid_deep"
 
     class MemoryMode(models.TextChoices):
         """Enum for server-level memory feature configuration"""
@@ -488,21 +410,6 @@ class ServerChatSettings(DbBaseModel):
 
     chat_default = models.ForeignKey(
         ChatModel, on_delete=models.CASCADE, default=None, null=True, blank=True, related_name="chat_default"
-    )
-    chat_advanced = models.ForeignKey(
-        ChatModel, on_delete=models.CASCADE, default=None, null=True, blank=True, related_name="chat_advanced"
-    )
-    think_free_fast = models.ForeignKey(
-        ChatModel, on_delete=models.CASCADE, default=None, null=True, blank=True, related_name="think_free_fast"
-    )
-    think_free_deep = models.ForeignKey(
-        ChatModel, on_delete=models.CASCADE, default=None, null=True, blank=True, related_name="think_free_deep"
-    )
-    think_paid_fast = models.ForeignKey(
-        ChatModel, on_delete=models.CASCADE, default=None, null=True, blank=True, related_name="think_paid_fast"
-    )
-    think_paid_deep = models.ForeignKey(
-        ChatModel, on_delete=models.CASCADE, default=None, null=True, blank=True, related_name="think_paid_deep"
     )
     web_scraper = models.ForeignKey(
         WebScraper, on_delete=models.CASCADE, default=None, null=True, blank=True, related_name="web_scraper"
@@ -521,20 +428,7 @@ class ServerChatSettings(DbBaseModel):
         help_text="Server-level memory feature configuration. Disabled overrides user preference.",
     )
 
-    def clean(self):
-        error = {}
-        if self.chat_default and self.chat_default.price_tier != PriceTier.FREE:
-            error["chat_default"] = "Set the price tier of this chat model to free or use a free tier chat model."
-        if self.think_free_fast and self.think_free_fast.price_tier != PriceTier.FREE:
-            error["think_free_fast"] = "Set the price tier of this chat model to free or use a free tier chat model."
-        if self.think_free_deep and self.think_free_deep.price_tier != PriceTier.FREE:
-            error["think_free_deep"] = "Set the price tier of this chat model to free or use a free tier chat model."
-        if error:
-            raise ValidationError(error)
-
     def save(self, *args, **kwargs):
-        self.clean()
-
         if self.priority is None:
             max_priority = ServerChatSettings.objects.aggregate(models.Max("priority"))["priority__max"]
             self.priority = max_priority + 1 if max_priority else 1
@@ -542,74 +436,10 @@ class ServerChatSettings(DbBaseModel):
         super().save(*args, **kwargs)
 
 
-class TextToImageModelConfig(DbBaseModel):
-    class ModelType(models.TextChoices):
-        OPENAI = "openai"
-        REPLICATE = "replicate"
-        GOOGLE = "google"
-
-    model_name = models.CharField(max_length=200, default="dall-e-3")
-    friendly_name = models.CharField(max_length=200, default=None, null=True, blank=True)
-    model_type = models.CharField(max_length=200, choices=ModelType.choices, default=ModelType.OPENAI)
-    price_tier = models.CharField(max_length=20, choices=PriceTier.choices, default=PriceTier.FREE)
-    api_key = models.CharField(max_length=200, default=None, null=True, blank=True)
-    ai_model_api = models.ForeignKey(AiModelApi, on_delete=models.CASCADE, default=None, null=True, blank=True)
-
-    def clean(self):
-        # Custom validation logic
-        error = {}
-        if self.model_type == self.ModelType.OPENAI:
-            if self.api_key and self.ai_model_api:
-                error["api_key"] = (
-                    "Both API key and AI Model API cannot be set for OpenAI models. Please set only one of them."
-                )
-                error["ai_model_api"] = (
-                    "Both API key and OpenAI config cannot be set for OpenAI models. Please set only one of them."
-                )
-        if self.model_type != self.ModelType.OPENAI and self.model_type != self.ModelType.GOOGLE:
-            if not self.api_key:
-                error["api_key"] = "The API key field must be set for non OpenAI, non Google models."
-            if self.ai_model_api:
-                error["ai_model_api"] = "AI Model API cannot be set for non OpenAI, non Google models."
-        if error:
-            raise ValidationError(error)
-
-    def save(self, *args, **kwargs):
-        self.clean()
-        super().save(*args, **kwargs)
-
-    def __str__(self):
-        return f"{self.model_name} - {self.model_type}"
-
-
-class SpeechToTextModelOptions(DbBaseModel):
-    class ModelType(models.TextChoices):
-        OPENAI = "openai"
-
-    model_name = models.CharField(max_length=200, default="whisper-1")
-    friendly_name = models.CharField(max_length=200, default=None, null=True, blank=True)
-    model_type = models.CharField(max_length=200, choices=ModelType.choices, default=ModelType.OPENAI)
-    price_tier = models.CharField(max_length=20, choices=PriceTier.choices, default=PriceTier.FREE)
-    ai_model_api = models.ForeignKey(AiModelApi, on_delete=models.CASCADE, default=None, null=True, blank=True)
-
-    def __str__(self):
-        return f"{self.model_name} - {self.model_type}"
-
-
 class UserConversationConfig(DbBaseModel):
     user = models.OneToOneField(KhojUser, on_delete=models.CASCADE)
     setting = models.ForeignKey(ChatModel, on_delete=models.CASCADE, default=None, null=True, blank=True)
     enable_memory = models.BooleanField(default=True)
-
-
-class UserVoiceModelConfig(DbBaseModel):
-    user = models.OneToOneField(KhojUser, on_delete=models.CASCADE)
-    setting = models.ForeignKey(VoiceModelOption, on_delete=models.CASCADE, default=None, null=True, blank=True)
-
-
-class UserTextToImageModelConfig(DbBaseModel):
-    user = models.OneToOneField(KhojUser, on_delete=models.CASCADE)
-    setting = models.ForeignKey(TextToImageModelConfig, on_delete=models.CASCADE)
 
 
 class Conversation(DbBaseModel):
@@ -698,29 +528,6 @@ class Conversation(DbBaseModel):
             return None
 
 
-class PublicConversation(DbBaseModel):
-    source_owner = models.ForeignKey(KhojUser, on_delete=models.CASCADE)
-    conversation_log = models.JSONField(default=dict)
-    slug = models.CharField(max_length=200, default=None, null=True, blank=True)
-    title = models.CharField(max_length=200, default=None, null=True, blank=True)
-    agent = models.ForeignKey(Agent, on_delete=models.SET_NULL, default=None, null=True, blank=True)
-
-
-@receiver(pre_save, sender=PublicConversation)
-def verify_public_conversation(sender, instance, **kwargs):
-    # check if this is a new instance
-    if instance._state.adding:
-        base_length = 50  # Base slug length before adding random suffix
-        base_slug = re.sub(r"\W+", "-", instance.slug.lower())[:base_length] if instance.slug else uuid.uuid4().hex
-        suffix_length = 8  # Length of the random suffix to ensure uniqueness
-        while True:
-            random_id = uuid.uuid4().hex[:suffix_length]
-            slug = f"{base_slug}-{random_id}"
-            if not PublicConversation.objects.filter(slug=slug).exists():
-                break
-        instance.slug = slug
-
-
 class ReflectiveQuestion(DbBaseModel):
     question = models.CharField(max_length=500)
     user = models.ForeignKey(KhojUser, on_delete=models.CASCADE, default=None, null=True, blank=True)
@@ -736,20 +543,13 @@ class FileObject(DbBaseModel):
 
 class Entry(DbBaseModel):
     class EntryType(models.TextChoices):
-        IMAGE = "image"
         PDF = "pdf"
         PLAINTEXT = "plaintext"
         MARKDOWN = "markdown"
-        ORG = "org"
-        NOTION = "notion"
-        GITHUB = "github"
         CONVERSATION = "conversation"
-        DOCX = "docx"
 
     class EntrySource(models.TextChoices):
         COMPUTER = "computer"
-        NOTION = "notion"
-        GITHUB = "github"
 
     user = models.ForeignKey(KhojUser, on_delete=models.CASCADE, default=None, null=True, blank=True)
     agent = models.ForeignKey(Agent, on_delete=models.CASCADE, default=None, null=True, blank=True)
@@ -807,13 +607,3 @@ class McpServer(DbBaseModel):
 
     def __str__(self):
         return self.name
-
-
-class UserMemory(DbBaseModel):
-    """
-    Long term memory store derived from conversation between user and agent.
-    """
-
-    user = models.ForeignKey(KhojUser, on_delete=models.CASCADE)
-    agent = models.ForeignKey(Agent, on_delete=models.CASCADE, default=None, null=True, blank=True)
-    raw = models.TextField()

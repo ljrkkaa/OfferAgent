@@ -2,13 +2,21 @@ import json
 import logging
 from typing import Optional
 
-from asgiref.sync import sync_to_async
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 from starlette.authentication import requires
 
-from khoj.database.models import UserMemory
+from khoj.processor.conversation.offeragent_memory import (
+    delete_memory as delete_offeragent_memory,
+)
+from khoj.processor.conversation.offeragent_memory import (
+    get_memory_by_id,
+    list_memories,
+)
+from khoj.processor.conversation.offeragent_memory import (
+    update_memory as update_offeragent_memory,
+)
 
 api_memories = APIRouter()
 logger = logging.getLogger(__name__)
@@ -21,19 +29,16 @@ async def get_memories(
     client: Optional[str] = None,
 ):
     """Get all memories for the authenticated user"""
-    user = request.user.object
-
-    memories = UserMemory.objects.filter(user=user)
-    all_memories = await sync_to_async(list)(memories)
-
-    # Convert memories to a list of dictionaries
     formatted_memories = [
         {
             "id": memory.id,
             "raw": memory.raw,
+            "type": memory.memory_type,
+            "description": memory.description,
             "created_at": memory.created_at.isoformat(),
+            "updated_at": memory.updated_at.isoformat(),
         }
-        for memory in all_memories
+        for memory in list_memories()
     ]
 
     return Response(content=json.dumps(formatted_memories), media_type="application/json", status_code=200)
@@ -43,20 +48,18 @@ async def get_memories(
 @requires(["authenticated"])
 async def delete_memory(
     request: Request,
-    memory_id: int,
+    memory_id: str,
     client: Optional[str] = None,
 ):
     """Delete a specific memory by ID"""
-    user = request.user.object
-
-    # Verify memory belongs to user before deleting
-    memory = await UserMemory.objects.filter(id=memory_id, user=user).afirst()
-    if not memory:
+    try:
+        deleted = delete_offeragent_memory(memory_id)
+    except ValueError:
+        deleted = False
+    if not deleted:
         return Response(
             content=json.dumps({"error": "Memory not found"}), media_type="application/json", status_code=404
         )
-
-    await memory.adelete()
 
     return Response(status_code=204)
 
@@ -72,14 +75,14 @@ class UpdateMemoryBody(BaseModel):
 async def update_memory(
     request: Request,
     body: UpdateMemoryBody,
-    memory_id: int,
+    memory_id: str,
     client: Optional[str] = None,
 ):
     """Update a specific memory's content"""
-    user = request.user.object
-
-    # Get the memory and verify it belongs to the user
-    memory = await UserMemory.objects.filter(id=memory_id, user=user).afirst()
+    try:
+        memory = get_memory_by_id(memory_id)
+    except ValueError:
+        memory = None
     if not memory:
         return Response(
             content=json.dumps({"error": "Memory not found"}), media_type="application/json", status_code=404
@@ -93,15 +96,20 @@ async def update_memory(
             status_code=400,
         )
 
-    memory.raw = new_content
-    await memory.asave(update_fields=["raw", "updated_at"])
+    try:
+        memory = update_offeragent_memory(memory_id, new_content)
+    except ValueError as e:
+        return Response(content=json.dumps({"error": str(e)}), media_type="application/json", status_code=400)
 
     return Response(
         content=json.dumps(
             {
                 "id": memory.id,
                 "raw": memory.raw,
+                "type": memory.memory_type,
+                "description": memory.description,
                 "created_at": memory.created_at.isoformat(),
+                "updated_at": memory.updated_at.isoformat(),
             }
         ),
         media_type="application/json",

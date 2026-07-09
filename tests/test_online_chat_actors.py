@@ -5,16 +5,17 @@ import freezegun
 import pytest
 from freezegun import freeze_time
 
-from khoj.database.models import ChatMessageModel
+from khoj.database.models import ChatMessageModel, ChatModel
+from khoj.processor.conversation import prompts
 from khoj.processor.conversation.openai.gpt import converse_openai
-from khoj.processor.conversation.utils import message_to_log
+from khoj.processor.conversation.utils import generate_chatml_messages_with_context, message_to_log
 from khoj.routers.helpers import (
     extract_questions,
     generate_online_subqueries,
     infer_webpage_urls,
     schedule_query,
-    should_notify,
 )
+from khoj.utils.yaml import yaml_dump
 from tests.helpers import get_chat_api_key
 
 # Initialize variables for tests
@@ -26,6 +27,38 @@ if api_key is None or not os.getenv("KHOJ_TEST_CHAT_PROVIDER"):
     )
 
 freezegun.configure(extend_ignore_list=["transformers"])
+
+
+def converse_openai_for_test(
+    *,
+    references=None,
+    user_query: str,
+    chat_history=None,
+    agent=None,
+    api_key=None,
+):
+    current_date = datetime.now()
+    if agent and agent.personality:
+        system_prompt = prompts.custom_personality.format(
+            name=agent.name,
+            bio=agent.personality,
+            current_date=current_date.strftime("%Y-%m-%d"),
+            day_of_week=current_date.strftime("%A"),
+        )
+    else:
+        system_prompt = prompts.personality.format(
+            current_date=current_date.strftime("%Y-%m-%d"),
+            day_of_week=current_date.strftime("%A"),
+        )
+    context_message = prompts.notes_conversation.format(references=yaml_dump(references)) if references else ""
+    messages = generate_chatml_messages_with_context(
+        user_message=user_query,
+        context_message=context_message,
+        chat_history=chat_history or [],
+        system_message=system_prompt,
+        model_type=ChatModel.ModelType.OPENAI,
+    )
+    return converse_openai(messages=messages, api_key=api_key)
 
 
 # Test
@@ -187,7 +220,7 @@ async def test_generate_search_query_using_question_and_answer_from_chat_history
 @pytest.mark.django_db(transaction=True)
 async def test_chat_with_no_chat_history_or_retrieved_content():
     # Act
-    response_gen = converse_openai(
+    response_gen = converse_openai_for_test(
         references=[],  # Assume no context retrieved from notes for the user_query
         user_query="Hello, my name is Testatron. Who are you?",
         api_key=api_key,
@@ -214,7 +247,7 @@ async def test_answer_from_chat_history_and_no_content():
     ]
 
     # Act
-    response_gen = converse_openai(
+    response_gen = converse_openai_for_test(
         references=[],  # Assume no context retrieved from notes for the user_query
         user_query="What is my name?",
         chat_history=populate_chat_history(message_list),
@@ -247,7 +280,7 @@ async def test_answer_from_chat_history_and_previously_retrieved_content():
     ]
 
     # Act
-    response_gen = converse_openai(
+    response_gen = converse_openai_for_test(
         references=[],  # Assume no context retrieved from notes for the user_query
         user_query="Where was I born?",
         chat_history=populate_chat_history(message_list),
@@ -274,7 +307,7 @@ async def test_answer_from_chat_history_and_currently_retrieved_content():
     ]
 
     # Act
-    response_gen = converse_openai(
+    response_gen = converse_openai_for_test(
         references=[
             {"compiled": "Testatron was born on 1st April 1984 in Testville.", "file": "background.md"}
         ],  # Assume context retrieved from notes for the user_query
@@ -302,7 +335,7 @@ async def test_refuse_answering_unanswerable_question():
     ]
 
     # Act
-    response_gen = converse_openai(
+    response_gen = converse_openai_for_test(
         references=[],  # Assume no context retrieved from notes for the user_query
         user_query="Where was I born?",
         chat_history=populate_chat_history(message_list),
@@ -360,7 +393,7 @@ Expenses:Food:Dining  10.00 USD""",
     ]
 
     # Act
-    response_gen = converse_openai(
+    response_gen = converse_openai_for_test(
         references=context,  # Assume context retrieved from notes for the user_query
         user_query="What did I have for Dinner today?",
         api_key=api_key,
@@ -406,7 +439,7 @@ Expenses:Food:Dining  10.00 USD""",
     ]
 
     # Act
-    response_gen = converse_openai(
+    response_gen = converse_openai_for_test(
         references=context,  # Assume context retrieved from notes for the user_query
         user_query="How much did I spend on dining this year?",
         api_key=api_key,
@@ -432,7 +465,7 @@ async def test_answer_general_question_not_in_chat_history_or_retrieved_content(
     ]
 
     # Act
-    response_gen = converse_openai(
+    response_gen = converse_openai_for_test(
         references=[],  # Assume no context retrieved from notes for the user_query
         user_query="Write a haiku about unit testing in 3 lines. Do not say anything else",
         chat_history=populate_chat_history(message_list),
@@ -474,7 +507,7 @@ My sister, Aiyla is married to Tolga. They have 3 kids, Yildiz, Ali and Ahmet.""
     ]
 
     # Act
-    response_gen = converse_openai(
+    response_gen = converse_openai_for_test(
         references=context,  # Assume context retrieved from notes for the user_query
         user_query="How many kids does my older sister have?",
         api_key=api_key,
@@ -509,13 +542,13 @@ async def test_agent_prompt_should_be_used(openai_agent):
     expected_responses = ["9.50", "9.5"]
 
     # Act
-    response_gen = converse_openai(
+    response_gen = converse_openai_for_test(
         references=context,  # Assume context retrieved from notes for the user_query
         user_query="What did I buy?",
         api_key=api_key,
     )
     no_agent_response = "".join([response_chunk.text async for response_chunk in response_gen])
-    response_gen = converse_openai(
+    response_gen = converse_openai_for_test(
         references=context,  # Assume context retrieved from notes for the user_query
         user_query="What did I buy?",
         api_key=api_key,
@@ -630,48 +663,6 @@ def test_infer_task_scheduling_request(
         assert unexpected_q not in inferred_query, (
             f"Did not expect fragment '{unexpected_q}' in query: '{inferred_query}'"
         )
-
-
-# ----------------------------------------------------------------------------------------------------
-@pytest.mark.anyio
-@pytest.mark.django_db(transaction=True)
-@pytest.mark.parametrize(
-    "scheduling_query, executing_query, generated_response, expected_should_notify",
-    [
-        (
-            "Notify me only if it is going to rain tomorrow?",
-            "What's the weather forecast for tomorrow?",
-            "It is sunny and warm tomorrow.",
-            False,
-        ),
-        (
-            "Summarize the latest news every morning",
-            "Summarize today's news",
-            "Today in the news: AI is taking over the world",
-            True,
-        ),
-        (
-            "Create a weather wallpaper every morning using the current weather",
-            "Paint a weather wallpaper using the current weather",
-            "https://khoj-generated-wallpaper.khoj.dev/user110/weathervane.webp",
-            True,
-        ),
-        (
-            "Let me know the election results once they are offically declared",
-            "What are the results of the elections? Has the winner been declared?",
-            "The election results has not been declared yet.",
-            False,
-        ),
-    ],
-)
-def test_decision_on_when_to_notify_scheduled_task_results(
-    chat_client, default_user2, scheduling_query, executing_query, generated_response, expected_should_notify
-):
-    # Act
-    generated_should_notify = should_notify(scheduling_query, executing_query, generated_response, default_user2)
-
-    # Assert
-    assert generated_should_notify == expected_should_notify
 
 
 # Helpers

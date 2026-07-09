@@ -195,10 +195,6 @@ img.khoj-logo {
     width: 40px;
     height: 40px;
 }
-.subscribed {
-    border: 3px solid var(--primary-hover);
-}
-
 @media screen and (max-width: 1000px) {
     .khoj-nav-dropdown-content {
         display: block;

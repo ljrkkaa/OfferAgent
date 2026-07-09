@@ -2,25 +2,20 @@ from __future__ import annotations  # to avoid quoting type hints
 
 import base64
 import copy
-import datetime
 import io
 import ipaddress
 import json
 import logging
 import os
-import platform
 import random
 import re
 import urllib.parse
-import uuid
 from collections import OrderedDict
 from copy import deepcopy
 from enum import Enum
 from functools import lru_cache
 from importlib import import_module
-from importlib.metadata import version
 from itertools import islice
-from os import path
 from pathlib import Path
 from textwrap import dedent
 from time import perf_counter
@@ -35,7 +30,6 @@ import requests
 import tiktoken
 import torch
 from asgiref.sync import sync_to_async
-from email_validator import EmailNotValidError, EmailUndeliverableError, validate_email
 from google import genai
 from google.auth.credentials import Credentials
 from google.oauth2 import service_account
@@ -139,20 +133,10 @@ def get_file_type(file_type: Optional[str], file_content: bytes) -> tuple[str, O
 
     if file_type in ["text/markdown"]:
         return "markdown", encoding
-    elif file_type in ["text/org"]:
-        return "org", encoding
     elif file_type in ["text/plain"]:
         return "plaintext", encoding
     elif file_type in ["application/pdf"]:
         return "pdf", encoding
-    elif file_type in ["application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
-        return "docx", encoding
-    elif file_type in ["image/jpeg"]:
-        return "image", encoding
-    elif file_type in ["image/png"]:
-        return "image", encoding
-    elif file_type in ["image/webp"]:
-        return "image", encoding
     elif content_group in ["code", "text"]:
         return "plaintext", encoding
     else:
@@ -200,83 +184,6 @@ class LRU(OrderedDict):
         if len(self) > self.capacity:
             oldest = next(iter(self))
             del self[oldest]
-
-
-def get_server_id():
-    """Get, Generate Persistent, Random ID per server install.
-    Helps count distinct khoj servers deployed.
-    Maintains anonymity by using non-PII random id."""
-    # Initialize server_id to None
-    server_id = None
-    # Expand path to the khoj env file. It contains persistent internal app data
-    app_env_filename = path.expanduser(constants.app_env_filepath)
-
-    # Check if the file exists
-    if path.exists(app_env_filename):
-        # Read the contents of the file
-        with open(app_env_filename, "r") as f:
-            contents = f.readlines()
-
-        # Extract the server_id from the contents
-        for line in contents:
-            key, value = line.strip().split("=")
-            if key.strip() == "server_id":
-                server_id = value.strip()
-                break
-
-        # If server_id is not found, generate and write to env file
-        if server_id is None:
-            # If server_id is not found, generate a new one
-            server_id = str(uuid.uuid4())
-
-            with open(app_env_filename, "a") as f:
-                f.write("server_id=" + server_id + "\n")
-    else:
-        # If server_id is not found, generate a new one
-        server_id = str(uuid.uuid4())
-
-        # Create khoj config directory if it doesn't exist
-        os.makedirs(path.dirname(app_env_filename), exist_ok=True)
-
-        # Write the server_id to the env file
-        with open(app_env_filename, "w") as f:
-            f.write("server_id=" + server_id + "\n")
-
-    return server_id
-
-
-def log_telemetry(
-    telemetry_type: str,
-    api: str = None,
-    client: Optional[str] = None,
-    disable_telemetry_env: bool = False,
-    properties: dict = None,
-):
-    """Log basic app usage telemetry like client, os, api called"""
-    # Do not log usage telemetry, if telemetry is disabled via app config
-    if disable_telemetry_env:
-        return []
-
-    if properties.get("server_id") is None:
-        properties["server_id"] = get_server_id()
-
-    # Populate telemetry data to log
-    request_body = {
-        "telemetry_type": telemetry_type,
-        "server_version": version("khoj"),
-        "os": platform.system(),
-        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    request_body.update(properties or {})
-    if api:
-        # API endpoint on server called by client
-        request_body["api"] = api
-    if client:
-        # Client from which the API was called. E.g. Web, Obsidian
-        request_body["client"] = client
-
-    # Log telemetry data to telemetry endpoint
-    return request_body
 
 
 def get_device_memory() -> int:
@@ -400,7 +307,6 @@ class ConversationCommand(str, Enum):
     Diagram = "diagram"
     Summarize = "summarize"
     Research = "research"
-    Operator = "operator"
     ViewFile = "view_file"
     ListFiles = "list_files"
     KbHeadings = "kb_headings"
@@ -409,18 +315,16 @@ class ConversationCommand(str, Enum):
     SearchWeb = "search_web"
     ReadWebpage = "read_webpage"
     PythonCoder = "run_code"
-    OperateComputer = "operate_computer"
 
 
 command_descriptions = {
-    ConversationCommand.General: "Only talk about information that relies on Khoj's general knowledge, not your personal knowledge base.",
+    ConversationCommand.General: "Only talk about information that relies on OfferAgent's general knowledge, not your personal knowledge base.",
     ConversationCommand.Notes: "Only talk about information that is available in your knowledge base.",
     ConversationCommand.Online: "Search for information on the internet.",
     ConversationCommand.Webpage: "Get information from webpage suggested by you.",
     ConversationCommand.Code: "Run Python code to parse information, run complex calculations, create documents and charts.",
     ConversationCommand.Diagram: "Draw a flowchart, diagram, or any other visual representation best expressed with primitives like lines, rectangles, and text.",
     ConversationCommand.Research: "Do deep research on a topic. This will take longer than usual, but give a more detailed, comprehensive answer.",
-    ConversationCommand.Operator: "Operate and perform tasks using a computer.",
 }
 
 command_descriptions_for_agent = {
@@ -430,7 +334,6 @@ command_descriptions_for_agent = {
     ConversationCommand.Webpage: "Agent can read suggested web pages for information.",
     ConversationCommand.Research: "Agent can do deep research on a topic.",
     ConversationCommand.Code: "Agent can run a Python script to parse information, run complex calculations, create documents and charts.",
-    ConversationCommand.Operator: "Agent can operate a computer to complete tasks.",
 }
 
 e2b_tool_description = dedent(
@@ -514,20 +417,6 @@ tools_for_research_llm = {
                 },
             },
             "required": ["instructions"],
-        },
-    ),
-    ConversationCommand.OperateComputer: ToolDefinition(
-        name="operate_computer",
-        description="To operate a computer to complete the task.",
-        schema={
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The task to perform on the computer.",
-                },
-            },
-            "required": ["query"],
         },
     ),
     ConversationCommand.ViewFile: ToolDefinition(
@@ -676,20 +565,6 @@ mode_descriptions_for_agent = {
 }
 
 
-class ImageIntentType(Enum):
-    """
-    Chat message intent by Khoj for image responses.
-    Marks the schema used to reference image in chat messages
-    """
-
-    # Images as Inline PNG
-    TEXT_TO_IMAGE = "text-to-image"
-    # Images as URLs
-    TEXT_TO_IMAGE2 = "text-to-image2"
-    # Images as Inline WebP
-    TEXT_TO_IMAGE_V3 = "text-to-image-v3"
-
-
 def generate_random_name():
     # List of adjectives and nouns to choose from
     adjectives = [
@@ -753,12 +628,6 @@ def is_promptrace_enabled():
     """Check if Khoj is running with prompt tracing enabled.
     Set PROMPTRACE_DIR environment variable to prompt tracing path to enable it."""
     return not is_none_or_empty(os.getenv("PROMPTRACE_DIR"))
-
-
-def is_operator_enabled():
-    """Check if Khoj can operate GUI applications.
-    Set KHOJ_OPERATOR_ENABLED env var to true and install playwright to enable it."""
-    return is_env_var_true("KHOJ_OPERATOR_ENABLED")
 
 
 def is_code_sandbox_enabled():
@@ -1187,16 +1056,6 @@ def get_gemini_client(api_key, api_base_url=None) -> genai.Client:
         api_key=api_info.api_key,
         vertexai=api_info.api_key is None,
     )
-
-
-def normalize_email(email: str, check_deliverability=False) -> tuple[str, bool]:
-    """Normalize, validate and check deliverability of email address"""
-    lower_email = email.lower()
-    try:
-        valid_email = validate_email(lower_email, check_deliverability=check_deliverability)
-        return valid_email.normalized, True
-    except (EmailNotValidError, EmailUndeliverableError):
-        return lower_email, False
 
 
 def clean_text_for_db(text):

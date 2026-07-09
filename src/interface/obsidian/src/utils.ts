@@ -15,16 +15,9 @@ function fileExtensionToMimeType(extension: string): string {
     switch (extension) {
         case 'pdf':
             return 'application/pdf';
-        case 'png':
-            return 'image/png';
-        case 'jpg':
-        case 'jpeg':
-            return 'image/jpeg';
         case 'md':
         case 'markdown':
             return 'text/markdown';
-        case 'org':
-            return 'text/org';
         default:
             return 'text/plain';
     }
@@ -34,18 +27,9 @@ function filenameToMimeType(filename: TFile): string {
     switch (filename.extension) {
         case 'pdf':
             return 'application/pdf';
-        case 'png':
-            return 'image/png';
-        case 'jpg':
-        case 'jpeg':
-            return 'image/jpeg';
-        case 'webp':
-            return 'image/webp';
         case 'md':
         case 'markdown':
             return 'text/markdown';
-        case 'org':
-            return 'text/org';
         default:
             console.warn(`Unknown file type: ${filename.extension}. Defaulting to text/plain.`);
             return 'text/plain';
@@ -74,11 +58,9 @@ function parseServerUserConfig(value: unknown): ServerUserConfig | null {
 
 export const fileTypeToExtension = {
     'pdf': ['pdf'],
-    'image': ['png', 'jpg', 'jpeg', 'webp'],
     'markdown': ['md', 'markdown'],
 };
-export const supportedImageFilesTypes = fileTypeToExtension.image;
-export const supportedBinaryFileTypes = fileTypeToExtension.pdf.concat(supportedImageFilesTypes);
+export const supportedBinaryFileTypes = fileTypeToExtension.pdf;
 export const supportedFileTypes = fileTypeToExtension.markdown.concat(supportedBinaryFileTypes);
 
 export function getFilesToSync(vault: Vault, setting: KhojSetting): TFile[] {
@@ -89,7 +71,6 @@ export function getFilesToSync(vault: Vault, setting: KhojSetting): TFile[] {
         .filter(file => {
             if (fileTypeToExtension.markdown.includes(file.extension)) return setting.syncFileType.markdown;
             if (fileTypeToExtension.pdf.includes(file.extension)) return setting.syncFileType.pdf;
-            if (fileTypeToExtension.image.includes(file.extension)) return setting.syncFileType.images;
             return false;
         })
         // Filter in included folders
@@ -110,9 +91,9 @@ export function getFilesToSync(vault: Vault, setting: KhojSetting): TFile[] {
                 file.path.startsWith(folder + '/') || file.path === folder
             );
         })
-        // Sort files by type: markdown > pdf > image
+        // Sort files by type: markdown > pdf
         .sort((a, b) => {
-            const typeOrder: (keyof typeof fileTypeToExtension)[] = ['markdown', 'pdf', 'image'];
+            const typeOrder: (keyof typeof fileTypeToExtension)[] = ['markdown', 'pdf'];
             const aType = typeOrder.findIndex(type => fileTypeToExtension[type].includes(a.extension));
             const bType = typeOrder.findIndex(type => fileTypeToExtension[type].includes(b.extension));
             return aType - bType;
@@ -130,9 +111,9 @@ export async function updateContentIndex(
     onProgress?: (progress: { processed: number, total: number }) => void
 ): Promise<Map<TFile, number>> {
     // Get all markdown, pdf files in the vault
-    console.log(`Khoj: Updating Khoj content index...`);
+    console.log(`OfferAgent: Updating OfferAgent content index...`);
     const files = getFilesToSync(vault, setting);
-    console.log(`Khoj: Found ${files.length} eligible files in vault`);
+    console.log(`OfferAgent: Found ${files.length} eligible files in vault`);
 
     let countOfFilesToIndex = 0;
     let countOfFilesToDelete = 0;
@@ -145,9 +126,9 @@ export async function updateContentIndex(
 
     // Show notice with file counts when user triggers sync
     if (userTriggered) {
-        new Notice(`🔄 Syncing ${filesToSync.length} of ${files.length} files to Khoj...`);
+        new Notice(`🔄 Syncing ${filesToSync.length} of ${files.length} files to OfferAgent...`);
     }
-    console.log(`Khoj: ${filesToSync.length} files to sync (${files.length} total eligible)`);
+    console.log(`OfferAgent: ${filesToSync.length} files to sync (${files.length} total eligible)`);
 
     // Add all files to index as multipart form data, batched by size, item count
     const MAX_BATCH_SIZE = 10 * 1024 * 1024; // 10MB max batch size
@@ -202,14 +183,13 @@ export async function updateContentIndex(
         const contentTypesToDelete: string[] = [];
         if (setting.syncFileType.markdown) contentTypesToDelete.push('markdown');
         if (setting.syncFileType.pdf) contentTypesToDelete.push('pdf');
-        if (setting.syncFileType.images) contentTypesToDelete.push('image');
 
         try {
             for (const contentType of contentTypesToDelete) {
                 await deleteContentByType(setting.khojUrl, setting.khojApiKey, contentType);
             }
         } catch (err) {
-            console.error('Khoj: Error deleting content types:', err);
+            console.error('OfferAgent: Error deleting content types:', err);
             error_message = "❗️Failed to clear existing content index";
             fileData = [];
         }
@@ -234,11 +214,11 @@ export async function updateContentIndex(
                 onProgress({ processed: processedFiles, total: totalFiles });
             }
         } catch (err: any) {
-            console.error('Khoj: Failed to upload batch:', err);
+            console.error('OfferAgent: Failed to upload batch:', err);
             if (err.message?.includes('429')) {
-                error_message = `❗️Requests were throttled. Upgrade your subscription or try again later.`;
+                error_message = `❗️Requests were throttled. Try again later.`;
             } else {
-                error_message = `❗️Failed to sync content with Khoj server. Error: ${err.message ?? String(err)}`;
+                error_message = `Failed to sync content with OfferAgent server. Error: ${err.message ?? String(err)}`;
             }
             break;
         }
@@ -264,7 +244,7 @@ export async function updateContentIndex(
     } else {
         const summary = `Updated ${countOfFilesToIndex}, deleted ${countOfFilesToDelete} files`;
         if (userTriggered) new Notice(`✅ ${summary}`);
-        console.log(`✅ Refreshed Khoj content index. ${summary}.`);
+        console.log(`✅ Refreshed OfferAgent content index. ${summary}.`);
     }
 
     return lastSync;
@@ -273,7 +253,7 @@ export async function updateContentIndex(
 export async function openKhojPluginSettings(): Promise<void> {
     const setting = this.app.setting;
     await setting.open();
-    setting.openTabById('khoj');
+    setting.openTabById('offeragent');
 }
 
 export async function createNote(name: string, newLeaf = false): Promise<void> {
@@ -292,7 +272,7 @@ export async function createNote(name: string, newLeaf = false): Promise<void> {
         }
         await this.app.workspace.openLinkText(`${pathPrefix}${name}.md`, '', newLeaf)
     } catch (e) {
-        console.error('Khoj: Could not create note.\n' + (e as any).message);
+        console.error('OfferAgent: Could not create note.\n' + (e as any).message);
         throw e
     }
 }
@@ -324,7 +304,7 @@ export async function canConnectToBackend(
             userInfo = JSON.parse(response);
         } catch (error) {
             connectedToBackend = false;
-            console.log(`Khoj connection error:\n\n${error}`);
+            console.log(`OfferAgent connection error:\n\n${error}`);
         };
     }
 
@@ -339,19 +319,19 @@ export function getBackendStatusMessage(
     khojUrl: string,
     khojApiKey: string
 ): string {
-    // Welcome message with default settings. Khoj cloud always expects an API key.
+    // Welcome message with default settings. OfferAgent cloud always expects an API key.
     if (!khojApiKey && khojUrl === 'https://app.khoj.dev')
-        return `🌈 Welcome to Khoj! Get your API key from ${khojUrl}/settings#clients and set it in the Khoj plugin settings on Obsidian`;
+        return `Welcome to OfferAgent. Get your API key from ${khojUrl}/settings#clients and set it in the OfferAgent plugin settings on Obsidian`;
 
     if (!connectedToServer)
-        return `❗️Could not connect to Khoj at ${khojUrl}. Ensure your can access it`;
+        return `Could not connect to OfferAgent at ${khojUrl}. Ensure you can access it`;
     else if (!userEmail)
-        return `✅ Connected to Khoj. ❗️Get a valid API key from ${khojUrl}/settings#clients to log in`;
+        return `Connected to OfferAgent. Get a valid API key from ${khojUrl}/settings#clients to log in`;
     else if (userEmail === 'default@example.com')
         // Logged in as default user in anonymous mode
-        return `✅ Welcome back to Khoj`;
+        return `Welcome back to OfferAgent`;
     else
-        return `✅ Welcome back to Khoj, ${userEmail}`;
+        return `Welcome back to OfferAgent, ${userEmail}`;
 }
 
 export async function populateHeaderPane(headerEl: Element, setting: KhojSetting, viewType: string): Promise<void> {
@@ -360,15 +340,15 @@ export async function populateHeaderPane(headerEl: Element, setting: KhojSetting
         const { userInfo: extractedUserInfo } = await canConnectToBackend(setting.khojUrl, setting.khojApiKey, false);
         userInfo = extractedUserInfo;
     } catch (error) {
-        console.error("❗️Could not connect to Khoj");
+        console.error("Could not connect to OfferAgent");
     }
 
-    // Add Khoj title to header element
+    // Add OfferAgent title to header element
     const titlePaneEl = headerEl.createDiv();
     titlePaneEl.className = 'khoj-header-title-pane';
     const titleEl = titlePaneEl.createDiv();
     titleEl.className = 'khoj-logo';
-    titleEl.textContent = "Khoj";
+    titleEl.textContent = "OfferAgent";
 
     // Populate the header element with the navigation pane
     // Create the nav element
@@ -453,7 +433,7 @@ export async function populateHeaderPane(headerEl: Element, setting: KhojSetting
     // Chat link event listener
     chatLink.addEventListener('click', () => {
         // Get the activateView method from the plugin instance
-        const khojPlugin = this.app.plugins.plugins.khoj;
+        const khojPlugin = this.app.plugins.plugins.offeragent ?? this.app.plugins.plugins.khoj;
         khojPlugin?.activateView(KhojView.CHAT, getCurrentKhojLeaf());
     });
 
@@ -466,7 +446,7 @@ export async function populateHeaderPane(headerEl: Element, setting: KhojSetting
     // Similar link event listener
     similarLink.addEventListener('click', () => {
         // Get the activateView method from the plugin instance
-        const khojPlugin = this.app.plugins.plugins.khoj;
+        const khojPlugin = this.app.plugins.plugins.offeragent ?? this.app.plugins.plugins.khoj;
         khojPlugin?.activateView(KhojView.SIMILAR, getCurrentKhojLeaf());
     });
 
@@ -502,7 +482,7 @@ export async function populateHeaderPane(headerEl: Element, setting: KhojSetting
 
         // Add event listener to the New Chat button
         newChatButton.addEventListener('click', () => {
-            const khojPlugin = this.app.plugins.plugins.khoj;
+            const khojPlugin = this.app.plugins.plugins.offeragent ?? this.app.plugins.plugins.khoj;
             if (khojPlugin) {
                 // First activate the chat view
                 khojPlugin.activateView(KhojView.CHAT).then(() => {
@@ -639,37 +619,17 @@ export function getLinkToEntry(sourceFiles: TFile[], chosenFile: string, chosenE
 /**
  * Calculate estimated vault sync metrics (used and total bytes).
  * This is a client-side estimation based on the configured sync file types and folders.
- * The storage limit is determined from the backend-provided `setting.userInfo?.is_active` flag:
- * - if true => premium limit (500 MB)
- * - otherwise => free limit (10 MB)
- * This avoids client-side heuristics and relies on server-provided user info.
+ * The storage limit is a single backend-compatible limit.
  */
 export async function calculateVaultSyncMetrics(vault: Vault, setting: KhojSetting): Promise<{ usedBytes: number, totalBytes: number }> {
     try {
         const files = getFilesToSync(vault, setting);
         const usedBytes = files.reduce((acc, file) => acc + (file.stat?.size ?? 0), 0);
-
-        // Default to free plan limit
-        const FREE_LIMIT = 10 * 1024 * 1024; // 10 MB
-        const PAID_LIMIT = 500 * 1024 * 1024; // 500 MB
-        let totalBytes = FREE_LIMIT;
-
-        // Determine plan from backend-provided user info. Use FREE_LIMIT as default when info missing.
-        try {
-            if (setting.userInfo && setting.userInfo.is_active === true) {
-                totalBytes = PAID_LIMIT;
-            } else {
-                totalBytes = FREE_LIMIT;
-            }
-        } catch (err) {
-            // Defensive: on any unexpected error, fall back to free limit
-            console.warn('Khoj: Error reading userInfo.is_active, defaulting to free limit', err);
-            totalBytes = FREE_LIMIT;
-        }
+        const totalBytes = 50 * 1024 * 1024;
 
         return { usedBytes, totalBytes };
     } catch (err) {
-        console.error('Khoj: Error calculating vault sync metrics:', err);
+        console.error('OfferAgent: Error calculating vault sync metrics:', err);
         return { usedBytes: 0, totalBytes: 10 * 1024 * 1024 };
     }
 }
@@ -693,10 +653,10 @@ export async function fetchChatModels(settings: KhojSetting): Promise<ModelOptio
                 name: model.name,
             }));
         } else {
-            console.warn("Khoj: Failed to fetch chat models:", response.statusText);
+            console.warn("OfferAgent: Failed to fetch chat models:", response.statusText);
         }
     } catch (error) {
-        console.error("Khoj: Error fetching chat models:", error);
+        console.error("OfferAgent: Error fetching chat models:", error);
     }
     return [];
 }
@@ -717,17 +677,17 @@ export async function fetchUserServerSettings(settings: KhojSetting): Promise<Se
             }
             return config;
         } else {
-            console.warn("Khoj: Failed to fetch user server settings:", response.statusText);
+            console.warn("OfferAgent: Failed to fetch user server settings:", response.statusText);
         }
     } catch (error) {
-        console.error("Khoj: Error fetching user server settings:", error);
+        console.error("OfferAgent: Error fetching user server settings:", error);
     }
     return null;
 }
 
 export async function updateServerChatModel(modelId: string, settings: KhojSetting): Promise<boolean> {
     if (!settings.connectedToBackend || !settings.khojUrl) {
-        new Notice("️⛔️ Connect to Khoj to update chat model.");
+        new Notice("️⛔️ Connect to OfferAgent to update chat model.");
         return false;
     }
 
@@ -742,12 +702,12 @@ export async function updateServerChatModel(modelId: string, settings: KhojSetti
         } else {
             const errorData = await response.text();
             new Notice(`️⛔️ Failed to update chat model on server: ${response.status} ${errorData}`);
-            console.error("Khoj: Failed to update chat model:", response.status, errorData);
+            console.error("OfferAgent: Failed to update chat model:", response.status, errorData);
             return false;
         }
     } catch (error) {
         new Notice("️⛔️ Error updating chat model on server. See console.");
-        console.error("Khoj: Error updating chat model:", error);
+        console.error("OfferAgent: Error updating chat model:", error);
         return false;
     }
 }

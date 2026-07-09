@@ -7,7 +7,6 @@ import re
 import secrets
 import sys
 from datetime import date, datetime, timedelta, timezone
-from enum import Enum
 from functools import wraps
 from typing import (
     Any,
@@ -26,7 +25,7 @@ from apscheduler.job import Job
 from asgiref.sync import sync_to_async
 from django.contrib.sessions.backends.db import SessionStore
 from django.db import transaction
-from django.db.models import Prefetch, Q
+from django.db.models import Q
 from django.db.models.manager import BaseManager
 from django.db.utils import IntegrityError
 from django.utils import timezone as django_timezone
@@ -43,28 +42,15 @@ from khoj.database.models import (
     Conversation,
     Entry,
     FileObject,
-    GithubConfig,
-    GithubRepoConfig,
-    GoogleUser,
     KhojApiUser,
     KhojUser,
     McpServer,
-    NotionConfig,
-    PriceTier,
     ProcessLock,
-    PublicConversation,
     RateLimitRecord,
     ReflectiveQuestion,
     ServerChatSettings,
-    SpeechToTextModelOptions,
-    Subscription,
-    TextToImageModelConfig,
     UserConversationConfig,
-    UserMemory,
     UserRequests,
-    UserTextToImageModelConfig,
-    UserVoiceModelConfig,
-    VoiceModelOption,
     WebScraper,
 )
 from khoj.processor.conversation import prompts
@@ -79,23 +65,10 @@ from khoj.utils.helpers import (
     generate_random_name,
     in_debug_mode,
     is_none_or_empty,
-    normalize_email,
     timer,
 )
-from khoj.utils.lexical import query_terms
 
 logger = logging.getLogger(__name__)
-
-
-LENGTH_OF_FREE_TRIAL = 7  #
-
-
-class SubscriptionState(Enum):
-    TRIAL = "trial"
-    SUBSCRIBED = "subscribed"
-    UNSUBSCRIBED = "unsubscribed"
-    EXPIRED = "expired"
-    INVALID = "invalid"
 
 
 P = ParamSpec("P")
@@ -136,17 +109,6 @@ def arequire_valid_user(func: Callable[P, Coroutine[Any, Any, T]]) -> Callable[P
     return async_wrapper
 
 
-@arequire_valid_user
-async def set_notion_config(token: str, user: KhojUser):
-    notion_config = await NotionConfig.objects.filter(user=user).afirst()
-    if not notion_config:
-        notion_config = await NotionConfig.objects.acreate(token=token, user=user)
-    else:
-        notion_config.token = token
-        await notion_config.asave()
-    return notion_config
-
-
 @require_valid_user
 def create_khoj_token(user: KhojUser, name=None):
     "Create Khoj API key for user"
@@ -175,142 +137,6 @@ async def delete_khoj_token(user: KhojUser, token: str):
     await KhojApiUser.objects.filter(token=token, user=user).adelete()
 
 
-async def get_or_create_user(token: dict) -> KhojUser:
-    user = await get_user_by_token(token)
-    if not user:
-        user = await create_user_by_google_token(token)
-    return user
-
-
-async def aget_or_create_user_by_phone_number(phone_number: str) -> tuple[KhojUser, bool]:
-    is_new = False
-    if is_none_or_empty(phone_number):
-        return None, is_new
-    user = await aget_user_by_phone_number(phone_number)
-    if not user:
-        user = await acreate_user_by_phone_number(phone_number)
-        is_new = True
-    return user, is_new
-
-
-@arequire_valid_user
-async def aset_user_phone_number(user: KhojUser, phone_number: str) -> KhojUser:
-    if is_none_or_empty(phone_number):
-        return None
-    phone_number = phone_number.strip()
-    if not phone_number.startswith("+"):
-        phone_number = f"+{phone_number}"
-    existing_user_with_phone_number = await aget_user_by_phone_number(phone_number)
-    if existing_user_with_phone_number and existing_user_with_phone_number.id != user.id:
-        if is_none_or_empty(existing_user_with_phone_number.email):
-            # Transfer conversation history to the new user. If they don't have an associated email, they are effectively a new user
-            async for conversation in Conversation.objects.filter(user=existing_user_with_phone_number).aiterator():
-                conversation.user = user
-                await conversation.asave()
-
-            await existing_user_with_phone_number.adelete()
-        else:
-            raise HTTPException(status_code=400, detail="Phone number already exists")
-
-    user.phone_number = phone_number
-    await user.asave()
-    return user
-
-
-@arequire_valid_user
-async def aremove_phone_number(user: KhojUser) -> KhojUser:
-    user.phone_number = None
-    user.verified_phone_number = False
-    await user.asave()
-    return user
-
-
-async def acreate_user_by_phone_number(phone_number: str) -> KhojUser:
-    if is_none_or_empty(phone_number):
-        return None
-    user, _ = await KhojUser.objects.filter(phone_number=phone_number).aupdate_or_create(
-        defaults={"username": phone_number, "phone_number": phone_number}
-    )
-    await user.asave()
-
-    user_subscription = await Subscription.objects.filter(user=user).afirst()
-    if not user_subscription:
-        await Subscription.objects.acreate(user=user, type=Subscription.Type.STANDARD)
-
-    return user
-
-
-async def aget_or_create_user_by_email(input_email: str, check_deliverability=False) -> tuple[KhojUser, bool]:
-    # Validate deliverability to email address of new user
-    email, is_valid_email = normalize_email(input_email, check_deliverability=check_deliverability)
-    is_existing_user = await KhojUser.objects.filter(email=email).aexists()
-    if not is_existing_user and not is_valid_email:
-        logger.error(f"Account creation failed. Invalid email address: {email}")
-        return None, False
-
-    # Get/create user based on email address
-    user, is_new = await KhojUser.objects.filter(email=email).aupdate_or_create(
-        defaults={"username": email, "email": email}
-    )
-
-    # Generate a secure 6-digit numeric code
-    user.email_verification_code = f"{secrets.randbelow(int(1e6)):06}"
-    user.email_verification_code_expiry = datetime.now(tz=timezone.utc) + timedelta(minutes=5)
-    await user.asave()
-
-    user_subscription = await Subscription.objects.filter(user=user).afirst()
-    if not user_subscription:
-        await Subscription.objects.acreate(user=user, type=Subscription.Type.STANDARD)
-
-    return user, is_new
-
-
-async def aget_user_validated_by_email_verification_code(code: str, email: str) -> tuple[Optional[KhojUser], bool]:
-    # Normalize the email address
-    normalized_email, _ = normalize_email(email)
-
-    # Check if verification code exists for the user
-    user = await KhojUser.objects.filter(email_verification_code=code, email=normalized_email).afirst()
-    if not user:
-        return None, False
-
-    # Check if the code has expired
-    if user.email_verification_code_expiry < datetime.now(tz=timezone.utc):
-        return user, True
-
-    user.email_verification_code = None
-    user.verified_email = True
-    await user.asave()
-
-    return user, False
-
-
-async def create_user_by_google_token(token: dict) -> KhojUser:
-    user, _ = await KhojUser.objects.filter(email=token.get("email")).aupdate_or_create(
-        defaults={"username": token.get("email"), "email": token.get("email")}
-    )
-    user.verified_email = True
-    await user.asave()
-
-    await GoogleUser.objects.acreate(
-        sub=token.get("sub"),
-        azp=token.get("azp"),
-        email=token.get("email"),
-        name=token.get("name"),
-        given_name=token.get("given_name"),
-        family_name=token.get("family_name"),
-        picture=token.get("picture"),
-        locale=token.get("locale"),
-        user=user,
-    )
-
-    user_subscription = await Subscription.objects.filter(user=user).afirst()
-    if not user_subscription:
-        await Subscription.objects.acreate(user=user, type=Subscription.Type.STANDARD)
-
-    return user
-
-
 @require_valid_user
 def set_user_name(user: KhojUser, first_name: str, last_name: str) -> KhojUser:
     user.first_name = first_name
@@ -324,127 +150,13 @@ def get_user_name(user: KhojUser):
     full_name = user.get_full_name()
     if not is_none_or_empty(full_name):
         return full_name
-    google_profile: GoogleUser = GoogleUser.objects.filter(user=user).first()
-    if google_profile:
-        return google_profile.given_name
 
     return None
 
 
 @require_valid_user
 def get_user_photo(user: KhojUser):
-    google_profile: GoogleUser = GoogleUser.objects.filter(user=user).first()
-    if google_profile:
-        return google_profile.picture
-
     return None
-
-
-def get_user_subscription(email: str) -> Optional[Subscription]:
-    return Subscription.objects.filter(user__email=email).first()
-
-
-async def set_user_subscription(
-    email: str, is_recurring=None, renewal_date=None, type="standard"
-) -> tuple[Optional[Subscription], bool]:
-    # Get or create the user object and their subscription
-    user, is_new = await aget_or_create_user_by_email(email)
-    if not user:
-        return None, is_new
-    user_subscription = await Subscription.objects.filter(user=user).afirst()
-
-    # Update the user subscription state
-    user_subscription.type = type
-    if is_recurring is not None:
-        user_subscription.is_recurring = is_recurring
-    if renewal_date is None:
-        user_subscription.renewal_date = None
-    elif renewal_date is not None:
-        user_subscription.renewal_date = renewal_date
-    await user_subscription.asave()
-    return user_subscription, is_new
-
-
-def subscription_to_state(subscription: Subscription) -> str:
-    if not subscription:
-        return SubscriptionState.INVALID.value
-    else:
-        # Ensure created_at is timezone-aware (UTC) if it's naive
-        if django_timezone.is_naive(subscription.created_at):
-            subscription.created_at = django_timezone.make_aware(subscription.created_at, timezone.utc)
-        if subscription.renewal_date and django_timezone.is_naive(subscription.renewal_date):
-            subscription.renewal_date = django_timezone.make_aware(subscription.renewal_date, timezone.utc)
-
-    if subscription.type == Subscription.Type.TRIAL:
-        # Check if the trial has expired
-        if not subscription.renewal_date:
-            # If the renewal date is not set, set it to the current date + trial length and evaluate
-            subscription.renewal_date = subscription.created_at + timedelta(days=LENGTH_OF_FREE_TRIAL)
-            subscription.save()
-
-        if subscription.renewal_date and datetime.now(tz=timezone.utc) > subscription.renewal_date:
-            return SubscriptionState.EXPIRED.value
-        return SubscriptionState.TRIAL.value
-    elif subscription.is_recurring and subscription.renewal_date > datetime.now(tz=timezone.utc):
-        return SubscriptionState.SUBSCRIBED.value
-    elif not subscription.is_recurring and subscription.renewal_date is None:
-        return SubscriptionState.EXPIRED.value
-    elif not subscription.is_recurring and subscription.renewal_date > datetime.now(tz=timezone.utc):
-        return SubscriptionState.UNSUBSCRIBED.value
-    elif not subscription.is_recurring and subscription.renewal_date < datetime.now(tz=timezone.utc):
-        return SubscriptionState.EXPIRED.value
-    return SubscriptionState.INVALID.value
-
-
-def get_user_subscription_state(email: str) -> str:
-    """Get subscription state of user
-    Valid state transitions: trial -> subscribed <-> unsubscribed OR expired
-    """
-    user_subscription = Subscription.objects.filter(user__email=email).first()
-    return subscription_to_state(user_subscription)
-
-
-@arequire_valid_user
-async def aget_user_subscription_state(user: KhojUser) -> str:
-    """Get subscription state of user
-    Valid state transitions: trial -> subscribed <-> unsubscribed OR expired
-    """
-    user_subscription = await Subscription.objects.filter(user=user).afirst()
-    return await sync_to_async(subscription_to_state)(user_subscription)
-
-
-@arequire_valid_user
-async def ais_user_subscribed(user: KhojUser) -> bool:
-    """
-    Get whether the user is subscribed
-    """
-    if not state.billing_enabled or state.anonymous_mode:
-        return True
-
-    subscription_state = await aget_user_subscription_state(user)
-    subscribed = (
-        subscription_state == SubscriptionState.SUBSCRIBED.value
-        or subscription_state == SubscriptionState.TRIAL.value
-        or subscription_state == SubscriptionState.UNSUBSCRIBED.value
-    )
-    return subscribed
-
-
-@require_valid_user
-def is_user_subscribed(user: KhojUser) -> bool:
-    """
-    Get whether the user is subscribed
-    """
-    if not state.billing_enabled or state.anonymous_mode:
-        return True
-
-    subscription_state = get_user_subscription_state(user.email)
-    subscribed = (
-        subscription_state == SubscriptionState.SUBSCRIBED.value
-        or subscription_state == SubscriptionState.TRIAL.value
-        or subscription_state == SubscriptionState.UNSUBSCRIBED.value
-    )
-    return subscribed
 
 
 async def aget_user_by_email(email: str) -> KhojUser:
@@ -457,32 +169,6 @@ def get_user_by_email(email: str) -> KhojUser:
 
 async def aget_user_by_uuid(uuid: str) -> KhojUser:
     return await KhojUser.objects.filter(uuid=uuid).afirst()
-
-
-async def get_user_by_token(token: dict) -> KhojUser:
-    google_user = await GoogleUser.objects.filter(sub=token.get("sub")).select_related("user").afirst()
-    if not google_user:
-        return None
-    return google_user.user
-
-
-async def aget_user_by_phone_number(phone_number: str) -> KhojUser:
-    if is_none_or_empty(phone_number):
-        return None
-    matched_user = await KhojUser.objects.filter(phone_number=phone_number).prefetch_related("subscription").afirst()
-
-    if not matched_user:
-        return None
-
-    # If the user with this phone number does not have an email account with Khoj, return the user
-    if is_none_or_empty(matched_user.email):
-        return matched_user
-
-    # If the user has an email account with Khoj and a verified number, return the user
-    if matched_user.verified_phone_number:
-        return matched_user
-
-    return None
 
 
 async def retrieve_user(session_id: str) -> KhojUser:
@@ -498,18 +184,6 @@ async def retrieve_user(session_id: str) -> KhojUser:
 
 def get_all_users() -> BaseManager[KhojUser]:
     return KhojUser.objects.all()
-
-
-@require_valid_user
-def get_user_github_config(user: KhojUser):
-    config = GithubConfig.objects.filter(user=user).prefetch_related("githubrepoconfig").first()
-    return config
-
-
-@require_valid_user
-def get_user_notion_config(user: KhojUser):
-    config = NotionConfig.objects.filter(user=user).first()
-    return config
 
 
 def delete_user_requests(max_age: timedelta = timedelta(days=1)):
@@ -531,29 +205,8 @@ async def aget_user_name(user: KhojUser):
     full_name = user.get_full_name()
     if not is_none_or_empty(full_name):
         return full_name
-    google_profile: GoogleUser = await GoogleUser.objects.filter(user=user).afirst()
-    if google_profile:
-        return google_profile.given_name
 
     return None
-
-
-@arequire_valid_user
-async def set_user_github_config(user: KhojUser, pat_token: str, repos: list):
-    config = await GithubConfig.objects.filter(user=user).afirst()
-
-    if not config:
-        config = await GithubConfig.objects.acreate(pat_token=pat_token, user=user)
-    else:
-        config.pat_token = pat_token
-        await config.asave()
-        await config.githubrepoconfig.all().adelete()
-
-    for repo in repos:
-        await GithubRepoConfig.objects.acreate(
-            name=repo["name"], owner=repo["owner"], branch=repo["branch"], github_config=config
-        )
-    return config
 
 
 class ProcessLockAdapters:
@@ -640,12 +293,13 @@ class ClientApplicationAdapters:
 
 
 class AgentAdapters:
-    DEFAULT_AGENT_NAME = "Khoj"
+    DEFAULT_AGENT_NAME = "OfferAgent"
+    LEGACY_DEFAULT_AGENT_NAME = "Khoj"
     DEFAULT_AGENT_SLUG = "khoj"
 
     @staticmethod
     def get_readonly_agent_by_slug(agent_slug: str, user: KhojUser):
-        access_filter = Q(privacy_level=Agent.PrivacyLevel.PUBLIC) | Q(privacy_level=Agent.PrivacyLevel.PROTECTED)
+        access_filter = Q(managed_by_admin=True)
         if user:
             access_filter |= Q(creator=user)
         return (
@@ -656,7 +310,7 @@ class AgentAdapters:
 
     @staticmethod
     async def aget_readonly_agent_by_slug(agent_slug: str, user: KhojUser):
-        access_filter = Q(privacy_level=Agent.PrivacyLevel.PUBLIC) | Q(privacy_level=Agent.PrivacyLevel.PROTECTED)
+        access_filter = Q(managed_by_admin=True)
         if user:
             access_filter |= Q(creator=user)
         return (
@@ -681,7 +335,7 @@ class AgentAdapters:
 
     @staticmethod
     async def aget_agent_by_slug(agent_slug: str, user: KhojUser):
-        access_filter = Q(privacy_level=Agent.PrivacyLevel.PUBLIC)
+        access_filter = Q(managed_by_admin=True)
         if user:
             access_filter |= Q(creator=user)
         return (
@@ -692,7 +346,7 @@ class AgentAdapters:
 
     @staticmethod
     async def aget_agent_by_name(agent_name: str, user: KhojUser):
-        access_filter = Q(privacy_level=Agent.PrivacyLevel.PUBLIC)
+        access_filter = Q(managed_by_admin=True)
         if user:
             access_filter |= Q(creator=user)
         return (
@@ -705,27 +359,24 @@ class AgentAdapters:
     def get_agent_by_slug(slug: str, user: KhojUser = None):
         if user:
             return Agent.objects.filter(
-                (Q(slug__iexact=slug.lower())) & (Q(privacy_level=Agent.PrivacyLevel.PUBLIC) | Q(creator=user))
+                (Q(slug__iexact=slug.lower())) & (Q(managed_by_admin=True) | Q(creator=user))
             ).first()
-        return Agent.objects.filter(slug__iexact=slug.lower(), privacy_level=Agent.PrivacyLevel.PUBLIC).first()
+        return Agent.objects.filter(slug__iexact=slug.lower(), managed_by_admin=True).first()
 
     @staticmethod
     def get_all_accessible_agents(user: KhojUser = None):
-        public_query = Q(privacy_level=Agent.PrivacyLevel.PUBLIC)
-        # TODO Update this to allow any public agent that's officially approved once that experience is launched
-        public_query &= Q(managed_by_admin=True)
-
+        default_query = Q(managed_by_admin=True)
         user_query = Q(creator=user)
         user_query &= Q(is_hidden=False)
         if user:
             return (
-                Agent.objects.filter(public_query | user_query)
+                Agent.objects.filter(default_query | user_query)
                 .distinct()
                 .order_by("created_at")
                 .prefetch_related("creator", "chat_model", "fileobject_set")
             )
         return (
-            Agent.objects.filter(public_query)
+            Agent.objects.filter(default_query)
             .order_by("created_at")
             .prefetch_related("creator", "chat_model", "fileobject_set")
         )
@@ -739,11 +390,9 @@ class AgentAdapters:
     async def ais_agent_accessible(agent: Agent, user: KhojUser) -> bool:
         agent = await Agent.objects.select_related("creator").aget(pk=agent.pk)
 
-        if agent.privacy_level == Agent.PrivacyLevel.PUBLIC:
-            return True
         if agent.creator == user:
             return True
-        if agent.privacy_level == Agent.PrivacyLevel.PROTECTED:
+        if agent.managed_by_admin:
             return True
         return False
 
@@ -757,7 +406,12 @@ class AgentAdapters:
 
     @staticmethod
     def get_default_agent():
-        return Agent.objects.filter(name=AgentAdapters.DEFAULT_AGENT_NAME).first()
+        return (
+            Agent.objects.filter(slug=AgentAdapters.DEFAULT_AGENT_SLUG, managed_by_admin=True).first()
+            or Agent.objects.filter(
+                name__in=[AgentAdapters.DEFAULT_AGENT_NAME, AgentAdapters.LEGACY_DEFAULT_AGENT_NAME]
+            ).first()
+        )
 
     @staticmethod
     def create_default_agent():
@@ -767,14 +421,18 @@ class AgentAdapters:
             return None
         default_personality = prompts.personality.format(current_date="placeholder", day_of_week="placeholder")
 
-        agent = Agent.objects.filter(name=AgentAdapters.DEFAULT_AGENT_NAME).first()
+        agent = (
+            Agent.objects.filter(slug=AgentAdapters.DEFAULT_AGENT_SLUG, managed_by_admin=True).first()
+            or Agent.objects.filter(
+                name__in=[AgentAdapters.DEFAULT_AGENT_NAME, AgentAdapters.LEGACY_DEFAULT_AGENT_NAME]
+            ).first()
+        )
 
         if agent:
             agent.personality = default_personality
             agent.chat_model = default_chat_model
             agent.slug = AgentAdapters.DEFAULT_AGENT_SLUG
             agent.name = AgentAdapters.DEFAULT_AGENT_NAME
-            agent.privacy_level = Agent.PrivacyLevel.PUBLIC
             agent.managed_by_admin = True
             agent.input_tools = []
             agent.output_modes = []
@@ -783,7 +441,6 @@ class AgentAdapters:
             # The default agent is public and managed by the admin. It's handled a little differently than other agents.
             agent = Agent.objects.create(
                 name=AgentAdapters.DEFAULT_AGENT_NAME,
-                privacy_level=Agent.PrivacyLevel.PUBLIC,
                 managed_by_admin=True,
                 chat_model=default_chat_model,
                 personality=default_personality,
@@ -795,7 +452,12 @@ class AgentAdapters:
 
     @staticmethod
     async def aget_default_agent():
-        return await Agent.objects.filter(name=AgentAdapters.DEFAULT_AGENT_NAME).afirst()
+        agent = await Agent.objects.filter(slug=AgentAdapters.DEFAULT_AGENT_SLUG, managed_by_admin=True).afirst()
+        if agent:
+            return agent
+        return await Agent.objects.filter(
+            name__in=[AgentAdapters.DEFAULT_AGENT_NAME, AgentAdapters.LEGACY_DEFAULT_AGENT_NAME]
+        ).afirst()
 
     @staticmethod
     def get_agent_chat_model(agent: Agent, user: Optional[KhojUser]) -> Optional[ChatModel]:
@@ -828,7 +490,6 @@ class AgentAdapters:
         user: KhojUser,
         name: str,
         personality: str,
-        privacy_level: str,
         icon: str,
         color: str,
         chat_model_option: ChatModel,
@@ -843,7 +504,6 @@ class AgentAdapters:
                 "name": name,
                 "creator": user,
                 "personality": personality,
-                "privacy_level": privacy_level,
                 "style_icon": icon,
                 "style_color": color,
                 "chat_model": chat_model_option,
@@ -893,7 +553,6 @@ class AgentAdapters:
         user: KhojUser,
         name: str,
         personality: str,
-        privacy_level: str,
         icon: str,
         color: str,
         chat_model: Optional[str],
@@ -913,7 +572,6 @@ class AgentAdapters:
                 user=user,
                 name=name,
                 personality=personality,
-                privacy_level=privacy_level,
                 icon=icon,
                 color=color,
                 chat_model_option=chat_model_option,
@@ -944,7 +602,6 @@ class AgentAdapters:
             user=user,
             name=name,
             personality=persona,
-            privacy_level=Agent.PrivacyLevel.PRIVATE,
             icon=Agent.StyleIconTypes.LIGHTBULB,
             color=Agent.StyleColorTypes.BLUE,
             chat_model=chat_model,
@@ -958,36 +615,7 @@ class AgentAdapters:
         return agent
 
 
-class PublicConversationAdapters:
-    @staticmethod
-    def get_public_conversation_by_slug(slug: str):
-        return PublicConversation.objects.filter(slug=slug).first()
-
-    @staticmethod
-    def get_public_conversation_url(public_conversation: PublicConversation):
-        # Public conversations are viewable by anyone, but not editable.
-        return f"/share/chat/{public_conversation.slug}/"
-
-    @staticmethod
-    def delete_public_conversation_by_slug(user: KhojUser, slug: str):
-        public_conversation = PublicConversation.objects.filter(source_owner=user, slug=slug).first()
-        if not public_conversation:
-            return False
-        public_conversation.delete()
-        return True
-
-
 class ConversationAdapters:
-    @staticmethod
-    def make_public_conversation_copy(conversation: Conversation):
-        return PublicConversation.objects.create(
-            source_owner=conversation.user,
-            agent=conversation.agent,
-            conversation_log=conversation.conversation_log,
-            slug=conversation.slug,
-            title=conversation.title if conversation.title else conversation.slug,
-        )
-
     @staticmethod
     @require_valid_user
     def get_conversation_by_user(
@@ -1015,14 +643,16 @@ class ConversationAdapters:
     @require_valid_user
     def get_all_conversations_for_export(user: KhojUser, page: int = 0):
         start = page * 10
-        all_conversations = Conversation.objects.filter(user=user).order_by("created_at", "id").prefetch_related(
-            "agent"
-        )[start : start + 10]
+        all_conversations = (
+            Conversation.objects.filter(user=user)
+            .order_by("created_at", "id")
+            .prefetch_related("agent")[start : start + 10]
+        )
         histories = []
         for conversation in all_conversations:
             history = {
                 "title": conversation.title,
-                "agent": conversation.agent.name if conversation.agent else "Khoj",
+                "agent": conversation.agent.name if conversation.agent else AgentAdapters.DEFAULT_AGENT_NAME,
                 "created_at": datetime.strftime(conversation.created_at, "%Y-%m-%d %H:%M:%S"),
                 "updated_at": datetime.strftime(conversation.updated_at, "%Y-%m-%d %H:%M:%S"),
                 "conversation_log": conversation.conversation_log,
@@ -1079,6 +709,8 @@ class ConversationAdapters:
     async def acreate_conversation_session(
         user: KhojUser, client_application: ClientApplication = None, agent_slug: str = None, title: str = None
     ):
+        if agent_slug and agent_slug.lower() == AgentAdapters.DEFAULT_AGENT_SLUG:
+            agent_slug = None
         if agent_slug:
             agent = await AgentAdapters.aget_readonly_agent_by_slug(agent_slug, user)
             if agent is None:
@@ -1096,6 +728,8 @@ class ConversationAdapters:
     def create_conversation_session(
         user: KhojUser, client_application: ClientApplication = None, agent_slug: str = None, title: str = None
     ):
+        if agent_slug and agent_slug.lower() == AgentAdapters.DEFAULT_AGENT_SLUG:
+            agent_slug = None
         if agent_slug:
             agent = AgentAdapters.get_readonly_agent_by_slug(agent_slug, user)
             if agent is None:
@@ -1187,51 +821,22 @@ class ConversationAdapters:
         return new_config
 
     @staticmethod
-    @arequire_valid_user
-    async def aset_user_voice_model(user: KhojUser, model_id: str):
-        config = await VoiceModelOption.objects.filter(model_id=model_id).afirst()
-        if not config:
-            return None
-        new_config = await UserVoiceModelConfig.objects.aupdate_or_create(user=user, defaults={"setting": config})
-        return new_config
-
-    @staticmethod
     def get_chat_model(user: KhojUser):
-        subscribed = is_user_subscribed(user)
         config = UserConversationConfig.objects.filter(user=user).first()
-        if subscribed:
-            # Subscibed users can use any available chat model
-            if config and config.setting:
-                return config.setting
-            # Fallback to the default advanced chat model
-            return ConversationAdapters.get_advanced_chat_model(user)
-        else:
-            # Non-subscribed users can use any free chat model
-            if config and config.setting and config.setting.price_tier == PriceTier.FREE:
-                return config.setting
-            # Fallback to the default chat model
-            return ConversationAdapters.get_default_chat_model(user)
+        if config and config.setting:
+            return config.setting
+        return ConversationAdapters.get_default_chat_model(user)
 
     @staticmethod
     async def aget_chat_model(user: KhojUser):
-        subscribed = await ais_user_subscribed(user)
         config = (
             await UserConversationConfig.objects.filter(user=user)
             .prefetch_related("setting", "setting__ai_model_api")
             .afirst()
         )
-        if subscribed:
-            # Subscibed users can use any available chat model
-            if config and config.setting:
-                return config.setting
-            # Fallback to the default advanced chat model
-            return await ConversationAdapters.aget_advanced_chat_model(user)
-        else:
-            # Non-subscribed users can use any free chat model
-            if config and config.setting and config.setting.price_tier == PriceTier.FREE:
-                return config.setting
-            # Fallback to the default chat model
-            return await ConversationAdapters.aget_default_chat_model(user)
+        if config and config.setting:
+            return config.setting
+        return await ConversationAdapters.aget_default_chat_model(user)
 
     @staticmethod
     def get_chat_model_by_name(chat_model_name: str, ai_model_api_name: str = None):
@@ -1254,34 +859,12 @@ class ConversationAdapters:
         return await ChatModel.objects.filter(friendly_name=chat_model_name).prefetch_related("ai_model_api").afirst()
 
     @staticmethod
-    async def aget_voice_model_config(user: KhojUser) -> Optional[VoiceModelOption]:
-        voice_model_config = await UserVoiceModelConfig.objects.filter(user=user).prefetch_related("setting").afirst()
-        if voice_model_config:
-            return voice_model_config.setting
-        return await VoiceModelOption.objects.afirst()
-
-    @staticmethod
-    def get_voice_model_options():
-        return VoiceModelOption.objects.all()
-
-    @staticmethod
-    def get_voice_model_config(user: KhojUser) -> Optional[VoiceModelOption]:
-        voice_model_config = UserVoiceModelConfig.objects.filter(user=user).prefetch_related("setting").first()
-        if voice_model_config:
-            return voice_model_config.setting
-        return VoiceModelOption.objects.first()
-
-    @staticmethod
     def get_default_chat_model(user: KhojUser = None):
         """Get default conversation config. Prefer chat model by server admin > user > first created chat model"""
         # Get the server chat settings
         server_chat_settings = ServerChatSettings.objects.first()
 
-        is_subscribed = is_user_subscribed(user) if user else False
         if server_chat_settings:
-            # If the user is subscribed and the advanced model is enabled, return the advanced model
-            if is_subscribed and server_chat_settings.chat_advanced:
-                return server_chat_settings.chat_advanced
             # If the default model is set, return it
             if server_chat_settings.chat_default:
                 return server_chat_settings.chat_default
@@ -1316,43 +899,13 @@ class ConversationAdapters:
             .prefetch_related(
                 "chat_default",
                 "chat_default__ai_model_api",
-                "chat_advanced",
-                "chat_advanced__ai_model_api",
-                "think_free_fast",
-                "think_free_fast__ai_model_api",
-                "think_free_deep",
-                "think_free_deep__ai_model_api",
-                "think_paid_fast",
-                "think_paid_fast__ai_model_api",
-                "think_paid_deep",
-                "think_paid_deep__ai_model_api",
             )
             .afirst()
         )
-        is_subscribed = await ais_user_subscribed(user) if user else False
 
         if server_chat_settings:
-            # If the user is subscribed
-            if is_subscribed:
-                # If fast is requested and fast paid model is available
-                if server_chat_settings.think_paid_fast and fast is True:
-                    return server_chat_settings.think_paid_fast
-                # Else if fast is not requested and deep paid model is available
-                elif server_chat_settings.think_paid_deep and fast is not None:
-                    return server_chat_settings.think_paid_deep
-                # Else if advanced model is available
-                elif server_chat_settings.chat_advanced:
-                    return server_chat_settings.chat_advanced
-            else:
-                # If fast is requested and fast free model is available
-                if server_chat_settings.think_free_fast and fast:
-                    return server_chat_settings.think_free_fast
-                # Else if fast is not requested and deep free model is available
-                elif server_chat_settings.think_free_deep:
-                    return server_chat_settings.think_free_deep
-                # Else if default model is available
-                elif server_chat_settings.chat_default:
-                    return server_chat_settings.chat_default
+            if server_chat_settings.chat_default:
+                return server_chat_settings.chat_default
 
         # Revert to an explicit fallback model if the server chat settings are not set
         if fallback_chat_model:
@@ -1374,20 +927,10 @@ class ConversationAdapters:
 
     @staticmethod
     def get_advanced_chat_model(user: KhojUser):
-        server_chat_settings = ServerChatSettings.objects.first()
-        if server_chat_settings is not None and server_chat_settings.chat_advanced is not None:
-            return server_chat_settings.chat_advanced
         return ConversationAdapters.get_default_chat_model(user)
 
     @staticmethod
     async def aget_advanced_chat_model(user: KhojUser = None):
-        server_chat_settings: ServerChatSettings = (
-            await ServerChatSettings.objects.filter()
-            .prefetch_related("chat_advanced", "chat_advanced__ai_model_api")
-            .afirst()
-        )
-        if server_chat_settings is not None and server_chat_settings.chat_advanced is not None:
-            return server_chat_settings.chat_advanced
         return await ConversationAdapters.aget_default_chat_model(user)
 
     @staticmethod
@@ -1395,39 +938,28 @@ class ConversationAdapters:
         server_chat_settings = ServerChatSettings.objects.first()
         if server_chat_settings:
             server_chat_settings.chat_default = chat_model
-            server_chat_settings.chat_advanced = chat_model
             server_chat_settings.save()
         else:
-            ServerChatSettings.objects.create(chat_default=chat_model, chat_advanced=chat_model)
+            ServerChatSettings.objects.create(chat_default=chat_model)
 
     @staticmethod
     def get_max_context_size(chat_model: ChatModel, user: KhojUser) -> int | None:
         """Get the max context size for the user based on the chat model."""
-        subscribed = is_user_subscribed(user) if user else False
-        if subscribed and chat_model.subscribed_max_prompt_size:
-            max_tokens = chat_model.subscribed_max_prompt_size
-        else:
-            max_tokens = chat_model.max_prompt_size
-        return max_tokens
+        return chat_model.max_prompt_size
 
     @staticmethod
     async def aget_max_context_size(chat_model: ChatModel, user: KhojUser) -> int | None:
         """Get the max context size for the user based on the chat model."""
-        subscribed = await ais_user_subscribed(user) if user else False
-        if subscribed and chat_model.subscribed_max_prompt_size:
-            max_tokens = chat_model.subscribed_max_prompt_size
-        else:
-            max_tokens = chat_model.max_prompt_size
-        return max_tokens
+        return chat_model.max_prompt_size
 
     @staticmethod
     async def aget_chat_models_with_fallbacks(slot: ServerChatSettings.ChatModelSlot) -> list[ChatModel]:
         """
-        Get chat models for a specific subscription, speed preference from all ServerChatSettings, ordered by priority.
+        Get chat models for a specific server slot from all ServerChatSettings, ordered by priority.
         Used for fallback logic when a chat model fails.
 
         Args:
-            slot: The chat model slot to get based on user subscription, speed preference (e.g., THINK_FREE_FAST, CHAT_DEFAULT)
+            slot: The chat model slot to get.
 
         Returns:
             List of ChatModel objects ordered by ServerChatSettings priority (lower first)
@@ -1458,32 +990,7 @@ class ConversationAdapters:
 
     @staticmethod
     async def aget_chat_model_slot(user: KhojUser = None, fast: Optional[bool] = None):
-        """
-        Determine which chat model slot to use based on user subscription and speed preference.
-
-        Args:
-            user: The user making the request
-            fast: Trinary flag for speed preference (True=fast, False=deep, None=default)
-
-        Returns:
-            The appropriate ChatModelSlot enum value, or None if no slot matches
-        """
-        is_subscribed = await ais_user_subscribed(user) if user else False
-
-        if is_subscribed:
-            if fast is True:
-                return ServerChatSettings.ChatModelSlot.THINK_PAID_FAST
-            elif fast is False:
-                return ServerChatSettings.ChatModelSlot.THINK_PAID_DEEP
-            else:
-                return ServerChatSettings.ChatModelSlot.CHAT_ADVANCED
-        else:
-            if fast is True:
-                return ServerChatSettings.ChatModelSlot.THINK_FREE_FAST
-            elif fast is False:
-                return ServerChatSettings.ChatModelSlot.THINK_FREE_DEEP
-            else:
-                return ServerChatSettings.ChatModelSlot.CHAT_DEFAULT
+        return ServerChatSettings.ChatModelSlot.CHAT_DEFAULT
 
     @staticmethod
     async def aget_server_webscraper():
@@ -1547,23 +1054,6 @@ class ConversationAdapters:
                 )
 
         return enabled_scrapers
-
-    @staticmethod
-    @require_valid_user
-    def create_conversation_from_public_conversation(
-        user: KhojUser, public_conversation: PublicConversation, client_app: ClientApplication
-    ):
-        scrubbed_title = public_conversation.title if public_conversation.title else public_conversation.slug
-        if scrubbed_title:
-            scrubbed_title = scrubbed_title.replace("-", " ")
-        return Conversation.objects.create(
-            user=user,
-            conversation_log=public_conversation.conversation_log,
-            client=client_app,
-            slug=scrubbed_title,
-            title=public_conversation.title,
-            agent=public_conversation.agent,
-        )
 
     @staticmethod
     @require_valid_user
@@ -1706,10 +1196,6 @@ class ConversationAdapters:
         return user_config.enable_memory
 
     @staticmethod
-    async def get_speech_to_text_config():
-        return await SpeechToTextModelOptions.objects.filter().prefetch_related("ai_model_api").afirst()
-
-    @staticmethod
     @arequire_valid_user
     async def aget_conversation_starters(user: KhojUser, max_results=3):
         all_questions = []
@@ -1729,13 +1215,9 @@ class ConversationAdapters:
         return random.sample(all_questions, max_results)
 
     @staticmethod
-    async def aget_valid_chat_model(user: KhojUser, conversation: Conversation, is_subscribed: bool):
-        """
-        For paid users: Prefer any custom agent chat model > user default chat model > server default chat model.
-        For free users: Prefer conversation specific agent's chat model > user default chat model > server default chat model.
-        """
+    async def aget_valid_chat_model(user: KhojUser, conversation: Conversation):
         agent: Agent = conversation.agent if await AgentAdapters.aget_default_agent() != conversation.agent else None
-        if agent and agent.chat_model and (agent.is_hidden or is_subscribed):
+        if agent and agent.chat_model:
             chat_model = await ChatModel.objects.select_related("ai_model_api").aget(
                 pk=conversation.agent.chat_model.pk
             )
@@ -1757,53 +1239,6 @@ class ConversationAdapters:
 
         else:
             raise ValueError("Invalid conversation settings. Configure some chat model on server.")
-
-    @staticmethod
-    async def aget_text_to_image_model_config():
-        return await TextToImageModelConfig.objects.filter().prefetch_related("ai_model_api").afirst()
-
-    @staticmethod
-    def get_text_to_image_model_config():
-        return TextToImageModelConfig.objects.filter().first()
-
-    @staticmethod
-    def get_text_to_image_model_options():
-        return TextToImageModelConfig.objects.all()
-
-    @staticmethod
-    def get_user_text_to_image_model_config(user: KhojUser):
-        config = UserTextToImageModelConfig.objects.filter(user=user).first()
-        if not config:
-            default_config = ConversationAdapters.get_text_to_image_model_config()
-            if not default_config:
-                return None
-            return default_config
-        return config.setting
-
-    @staticmethod
-    async def aget_user_text_to_image_model(user: KhojUser) -> Optional[TextToImageModelConfig]:
-        # Create a custom queryset for prefetching settings__ai_model_api, handling null cases
-        settings_prefetch = Prefetch(
-            "setting", queryset=TextToImageModelConfig.objects.prefetch_related("ai_model_api")
-        )
-
-        config = await UserTextToImageModelConfig.objects.filter(user=user).prefetch_related(settings_prefetch).afirst()
-        if not config:
-            default_config = await ConversationAdapters.aget_text_to_image_model_config()
-            if not default_config:
-                return None
-            return default_config
-        return config.setting
-
-    @staticmethod
-    async def aset_user_text_to_image_model(user: KhojUser, text_to_image_model_config_id: int):
-        config = await TextToImageModelConfig.objects.filter(id=text_to_image_model_config_id).afirst()
-        if not config:
-            return None
-        new_config, _ = await UserTextToImageModelConfig.objects.aupdate_or_create(
-            user=user, defaults={"setting": config}
-        )
-        return new_config
 
     @staticmethod
     def add_files_to_filter(user: KhojUser, conversation_id: str, files: List[str]):
@@ -2207,7 +1642,11 @@ class AutomationAdapters:
         next_run_time = automation.next_run_time
         timezone = next_run_time.strftime("%Z") if next_run_time else ""
         try:
-            schedule = f"{cron_descriptor.get_description(crontime)} {timezone}".strip() if crontime else str(automation.trigger)
+            schedule = (
+                f"{cron_descriptor.get_description(crontime)} {timezone}".strip()
+                if crontime
+                else str(automation.trigger)
+            )
         except Exception:
             schedule = str(automation.trigger)
         return {
@@ -2290,106 +1729,3 @@ class McpServerAdapters:
         except Exception as e:
             logger.error(f"Error retrieving MCP servers: {e}", exc_info=True)
         return servers
-
-
-class UserMemoryAdapters:
-    @staticmethod
-    def _lexical_distance(memory: UserMemory, terms: list[str], query: str) -> float | None:
-        raw = (memory.raw or "").lower()
-        if not terms:
-            return None
-
-        term_hits = sum(1 for term in terms if term in raw)
-        if term_hits == 0:
-            return None
-
-        score = term_hits / len(terms)
-        normalized_query = query.lower().strip()
-        if normalized_query and normalized_query in raw:
-            score += 1.0
-        return 1 / (1 + score)
-
-    @staticmethod
-    @require_valid_user
-    async def pull_memories(user: KhojUser, agent: Agent = None, limit=10, window=7) -> list[UserMemory]:
-        """
-        Pulls memories from the database for a given user. Medium term memory.
-        """
-        time_frame = datetime.now(timezone.utc) - timedelta(days=window)
-        default_agent = await AgentAdapters.aget_default_agent()
-        if agent and agent != default_agent:
-            memories = UserMemory.objects.filter(user=user, agent=agent, updated_at__gte=time_frame).order_by(
-                "-created_at"
-            )[:limit]
-        else:
-            memories = UserMemory.objects.filter(user=user, updated_at__gte=time_frame).order_by("-created_at")[:limit]
-        return await sync_to_async(list)(memories)
-
-    @staticmethod
-    @require_valid_user
-    async def save_memory(user: KhojUser, memory: str, agent: Agent = None) -> UserMemory:
-        """
-        Saves a memory to the database for a given user.
-        """
-        default_agent = await AgentAdapters.aget_default_agent()
-        if agent and agent != default_agent:
-            memory_instance = await UserMemory.objects.acreate(user=user, raw=memory, agent=agent)
-        else:
-            memory_instance = await UserMemory.objects.acreate(user=user, raw=memory)
-
-        return memory_instance
-
-    @staticmethod
-    @require_valid_user
-    async def search_memories(query: str, user: KhojUser, agent: Agent = None, limit: int = 10) -> list[UserMemory]:
-        """
-        Searches for memories in the database for a given user. Long term memory.
-        """
-        default_agent = await AgentAdapters.aget_default_agent()
-
-        if agent and agent != default_agent:
-            relevant_memories = UserMemory.objects.filter(user=user, agent=agent)
-        else:
-            relevant_memories = UserMemory.objects.filter(user=user)
-
-        terms = query_terms(query)
-
-        def lexical_lookup():
-            hits = []
-            for memory in relevant_memories:
-                distance = UserMemoryAdapters._lexical_distance(memory, terms, query)
-                if distance is None:
-                    continue
-                memory.distance = distance
-                hits.append(memory)
-            hits.sort(key=lambda hit: (hit.distance, -hit.updated_at.timestamp(), hit.id))
-            return hits[:limit]
-
-        return await sync_to_async(lexical_lookup)()
-
-    @staticmethod
-    @require_valid_user
-    async def delete_memory(user: KhojUser, memory_id: str) -> bool:
-        """
-        Deletes a memory from the database for a given user.
-        """
-        try:
-            memory = await UserMemory.objects.aget(user=user, id=memory_id)
-            await memory.adelete()
-            return True
-        except UserMemory.DoesNotExist:
-            return False
-
-    @staticmethod
-    def to_dict(memories: List[UserMemory]) -> List[dict]:
-        """
-        Converts a list of Memory objects to a list of dictionaries.
-        """
-        return [
-            {
-                "id": f"{memory.id}",
-                "raw": memory.raw,
-                "updated_at": memory.updated_at.astimezone(timezone.utc).isoformat(timespec="seconds"),
-            }
-            for memory in memories
-        ]

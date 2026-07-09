@@ -5,15 +5,15 @@ import { Pencil, TrashSimple, FloppyDisk, X } from "@phosphor-icons/react";
 import { useToast } from "@/components/ui/use-toast";
 
 export interface UserMemorySchema {
-    id: number;
+    id: string;
     raw: string;
     created_at: string;
 }
 
 interface UserMemoryProps {
     memory: UserMemorySchema;
-    onDelete: (id: number) => Promise<boolean>;
-    onUpdate: (id: number, raw: string) => Promise<boolean>;
+    onDelete: (id: string) => Promise<boolean>;
+    onUpdate: (id: string, raw: string) => Promise<boolean>;
 }
 
 export function UserMemory({ memory, onDelete, onUpdate }: UserMemoryProps) {

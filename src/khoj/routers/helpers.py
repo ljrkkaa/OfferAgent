@@ -34,8 +34,7 @@ from asgiref.sync import sync_to_async
 from django.utils import timezone as django_timezone
 from fastapi import Depends, Header, HTTPException, Request, UploadFile, WebSocket
 from langchain_core.messages.chat import ChatMessage
-from pydantic import BaseModel, EmailStr, Field
-from starlette.authentication import has_required_scope
+from pydantic import BaseModel, Field
 from starlette.requests import URL
 
 from khoj.database.adapters import (
@@ -44,8 +43,6 @@ from khoj.database.adapters import (
     ConversationAdapters,
     EntryAdapters,
     FileObjectAdapters,
-    UserMemoryAdapters,
-    aget_user_by_email,
     create_khoj_token,
     get_khoj_tokens,
     get_user_name,
@@ -59,13 +56,10 @@ from khoj.database.models import (
     Conversation,
     KhojUser,
     ProcessLock,
-    RateLimitRecord,
     ServerChatSettings,
-    UserMemory,
     UserRequests,
 )
 from khoj.processor.content.markdown.markdown_to_entries import MarkdownToEntries
-from khoj.processor.content.org_mode.org_to_entries import OrgToEntries
 from khoj.processor.content.pdf.pdf_to_entries import PdfToEntries
 from khoj.processor.content.plaintext.plaintext_to_entries import PlaintextToEntries
 from khoj.processor.conversation import prompts
@@ -87,13 +81,22 @@ from khoj.processor.conversation.google.gemini_chat import (
     converse_gemini,
     gemini_send_message_to_model,
 )
+from khoj.processor.conversation.offeragent_memory import (
+    MemorySelection,
+    MemoryWriteDecision,
+    OfferAgentMemory,
+    apply_memory_write_decision,
+    build_memory_selection_prompt,
+    build_memory_write_prompt,
+    list_memories,
+    select_memories_from_decision,
+)
 from khoj.processor.conversation.openai.gpt import (
     converse_openai,
     openai_send_message_to_model,
 )
 from khoj.processor.conversation.utils import (
     ChatEvent,
-    OperatorRun,
     ResearchIteration,
     ResponseWithThought,
     RetryableModelError,
@@ -104,7 +107,6 @@ from khoj.processor.conversation.utils import (
     generate_chatml_messages_with_context,
     is_retryable_exception,
 )
-from khoj.routers.email import is_resend_enabled, send_task_email
 from khoj.search_filter.date_filter import DateFilter
 from khoj.search_filter.file_filter import FileFilter
 from khoj.search_filter.word_filter import WordFilter
@@ -117,7 +119,6 @@ from khoj.utils.helpers import (
     get_file_type,
     in_debug_mode,
     is_none_or_empty,
-    is_operator_enabled,
     is_valid_url,
     timer,
     truncate_code_context,
@@ -152,7 +153,6 @@ def _get_codex_formatting_chat_model():
         vision_enabled=False,
         tokenizer=None,
         max_prompt_size=None,
-        subscribed_max_prompt_size=None,
     )
 
 
@@ -208,39 +208,6 @@ def get_file_content(file: UploadFile):
     return FileData(name=file.filename, content=file_content, file_type=file_type, encoding=encoding)
 
 
-def update_telemetry_state(
-    request: Request,
-    telemetry_type: str,
-    api: str,
-    client: Optional[str] = None,
-    user_agent: Optional[str] = None,
-    referer: Optional[str] = None,
-    host: Optional[str] = None,
-    metadata: Optional[dict] = None,
-):
-    user: KhojUser = request.user.object if request.user.is_authenticated else None
-    client_app = request.user.client_app if request.user.is_authenticated else None
-    user_state = {
-        "client_host": request.client.host if request.client else None,
-        "user_agent": user_agent or "unknown",
-        "referer": referer or "unknown",
-        "host": host or "unknown",
-        "server_id": str(user.uuid) if user else None,
-        "client_id": str(client_app.name) if client_app else "default",
-    }
-
-    if metadata:
-        user_state.update(metadata)
-
-    logger.debug(
-        "Telemetry event stored locally only: type=%s api=%s client=%s properties=%s",
-        telemetry_type,
-        api,
-        client,
-        user_state,
-    )
-
-
 def get_next_url(request: Request) -> str:
     "Construct next url relative to current domain from request"
     next_url_param = urlparse(request.query_params.get("next", "/"))
@@ -281,8 +248,6 @@ def get_conversation_command(query: str) -> ConversationCommand:
         return ConversationCommand.Summarize
     elif query.startswith("/research"):
         return ConversationCommand.Research
-    elif query.startswith("/operator") and is_operator_enabled():
-        return ConversationCommand.Operator
     else:
         return ConversationCommand.Default
 
@@ -377,7 +342,7 @@ async def infer_webpage_urls(
     user: KhojUser,
     query_images: List[str] = None,
     query_files: str = None,
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: List[OfferAgentMemory] = None,
     fast_model: bool = True,
     agent: Agent = None,
     tracer: dict = {},
@@ -445,7 +410,7 @@ async def generate_online_subqueries(
     user: KhojUser,
     query_images: List[str] = None,
     query_files: str = None,
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: List[OfferAgentMemory] = None,
     max_queries: int = 3,
     fast_model: bool = True,
     agent: Agent = None,
@@ -582,7 +547,7 @@ async def aschedule_query(
 async def extract_relevant_info(
     qs: set[str],
     corpus: str,
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: List[OfferAgentMemory] = None,
     user: KhojUser = None,
     agent: Agent = None,
     tracer: dict = {},
@@ -746,7 +711,7 @@ async def generate_excalidraw_diagram(
     online_results: Optional[dict] = None,
     query_images: List[str] = None,
     query_files: str = None,
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: List[OfferAgentMemory] = None,
     user: KhojUser = None,
     agent: Agent = None,
     send_status_func: Optional[Callable] = None,
@@ -800,7 +765,7 @@ async def generate_better_diagram_description(
     online_results: Optional[dict] = None,
     query_images: List[str] = None,
     query_files: str = None,
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: List[OfferAgentMemory] = None,
     user: KhojUser = None,
     agent: Agent = None,
     tracer: dict = {},
@@ -904,86 +869,72 @@ async def generate_excalidraw_diagram_from_description(
     return response
 
 
-class MemoryUpdates(BaseModel):
-    """Facts to add or remove from memory."""
-
-    create: List[str] = Field(..., min_items=0, description="List of facts to add to memory.")
-    delete: List[str] = Field(..., min_items=0, description="List of facts to remove from memory.")
-
-
-async def extract_facts_from_query(
+async def select_offeragent_memories(
     user: KhojUser,
-    conversation_history: List[ChatMessageModel],
-    existing_facts: List[UserMemory] = None,
+    query: str,
     agent: Agent = None,
     tracer: dict = {},
-) -> MemoryUpdates:
-    """
-    Extract facts from the given query
-    """
-    chat_history = construct_chat_history(conversation_history, n=2)
+):
+    if not await ConversationAdapters.ais_memory_enabled(user):
+        return []
 
-    formatted_memories = json.dumps(UserMemoryAdapters.to_dict(existing_facts), indent=2) if existing_facts else []
+    memories = list_memories()
+    prompt = build_memory_selection_prompt(query, memories)
+    if not prompt:
+        return []
 
-    extract_facts_prompt = prompts.extract_facts_from_query.format(
-        chat_history=chat_history,
-        matched_facts=formatted_memories,
-    )
-
-    with timer("Chat actor: Extract facts from query", logger):
+    try:
         response = await send_message_to_model_wrapper(
-            extract_facts_prompt,
-            response_schema=MemoryUpdates,
+            query=prompt,
+            response_type="json_object",
+            response_schema=MemorySelection,
+            fast_model=True,
             user=user,
-            fast_model=False,
             agent_chat_model=agent.chat_model if agent else None,
             tracer=tracer,
         )
-        response = response.text.strip()
-        # JSON parse the list of strings
-        try:
-            response = clean_json(response)
-            response = json.loads(response)
-            parsed_response = MemoryUpdates(**response)
-            if not isinstance(parsed_response, MemoryUpdates):
-                raise ValueError(f"Invalid response for extracting facts: {response}")
-            return parsed_response
+        parsed = MemorySelection(**json.loads(clean_json(response.text.strip())))
+    except Exception as e:
+        logger.warning(f"OfferAgent memory selection failed: {e}")
+        return []
 
-        except Exception:
-            logger.error(f"Invalid response for extracting facts: {response}")
-            return MemoryUpdates(create=[], delete=[])
+    return select_memories_from_decision(parsed, memories)
 
 
 @require_valid_user
-async def ai_update_memories(
+async def ai_update_offeragent_memory(
     user: KhojUser,
-    conversation_history: List[ChatMessageModel],
-    memories: List[UserMemory],
-    agent: Agent,
+    latest_user_message: str,
+    agent: Agent = None,
+    source_turn_id: str = None,
+    used_notes_tool_loop: bool = False,
     tracer: dict = {},
 ):
-    """
-    Updates the memories for a given user, based on their latest input query.
-    """
-    # Skip memory updates if memory is disabled for the user
     if not await ConversationAdapters.ais_memory_enabled(user):
-        return
+        return None
 
-    memory_update = await extract_facts_from_query(
-        user=user, conversation_history=conversation_history, existing_facts=memories, agent=agent, tracer=tracer
+    prompt = build_memory_write_prompt(
+        latest_user_message,
+        list_memories(),
+        current_date=datetime.now().date().isoformat(),
+        used_notes_tool_loop=used_notes_tool_loop,
     )
+    try:
+        response = await send_message_to_model_wrapper(
+            query=prompt,
+            response_type="json_object",
+            response_schema=MemoryWriteDecision,
+            fast_model=True,
+            user=user,
+            agent_chat_model=agent.chat_model if agent else None,
+            tracer=tracer,
+        )
+        parsed = MemoryWriteDecision(**json.loads(clean_json(response.text.strip())))
+    except Exception as e:
+        logger.warning(f"OfferAgent memory update failed: {e}")
+        return None
 
-    if not memory_update:
-        return
-
-    # Save the memory updates to the database
-    for memory in memory_update.create:
-        logger.info(f"Creating memory: {memory}")
-        await UserMemoryAdapters.save_memory(user, memory, agent=agent)
-
-    for memory in memory_update.delete:
-        logger.info(f"Deleting memory: {memory}")
-        await UserMemoryAdapters.delete_memory(user, memory)
+    return apply_memory_write_decision(parsed, source_turn_id=source_turn_id)
 
 
 async def generate_mermaidjs_diagram(
@@ -994,7 +945,7 @@ async def generate_mermaidjs_diagram(
     online_results: Optional[dict] = None,
     query_images: List[str] = None,
     query_files: str = None,
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: List[OfferAgentMemory] = None,
     user: KhojUser = None,
     agent: Agent = None,
     send_status_func: Optional[Callable] = None,
@@ -1042,7 +993,7 @@ async def generate_better_mermaidjs_diagram_description(
     online_results: Optional[dict] = None,
     query_images: List[str] = None,
     query_files: str = None,
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: List[OfferAgentMemory] = None,
     user: KhojUser = None,
     agent: Agent = None,
     tracer: dict = {},
@@ -1135,7 +1086,7 @@ async def extract_questions(
     query_files: str = None,
     query_images: Optional[List[str]] = None,
     personality_context: str = "",
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: List[OfferAgentMemory] = None,
     location_data: LocationData = None,
     chat_history: List[ChatMessageModel] = [],
     max_queries: int = 5,
@@ -1251,7 +1202,7 @@ async def execute_search(
 ):
     start_time = time.time()
 
-    if user and agent and not await AgentAdapters.ais_agent_accessible(agent, user):
+    if agent and not await AgentAdapters.ais_agent_accessible(agent, user):
         logger.error(f"Agent {agent.slug} is not accessible by user {user}")
         return []
 
@@ -1382,7 +1333,7 @@ async def send_message_to_model_wrapper(
     query_files: str = None,
     query_images: List[str] = None,
     context: str = "",
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: List[OfferAgentMemory] = None,
     chat_history: list[ChatMessageModel] = [],
     system_message: str = "",
     # Model Config
@@ -1576,10 +1527,9 @@ def build_conversation_context(
     references: List[Dict],
     online_results: Dict[str, Dict],
     code_results: Dict[str, Dict],
-    operator_results: List[OperatorRun],
     query_files: str = None,
     query_images: Optional[List[str]] = None,
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: List[OfferAgentMemory] = None,
     generated_asset_results: Dict[str, Dict] = {},
     program_execution_context: List[str] = None,
     chat_history: List[ChatMessageModel] = [],
@@ -1659,13 +1609,6 @@ def build_conversation_context(
         context_message += (
             f"{prompts.code_executed_context.format(code_results=truncate_code_context(code_results))}\n\n"
         )
-    if not is_none_or_empty(operator_results):
-        operator_content = [
-            {"query": oc.query, "response": oc.response, "webpages": oc.webpages} for oc in operator_results
-        ]
-        context_message += (
-            f"{prompts.operator_execution_context.format(operator_results=yaml_dump(operator_content))}\n\n"
-        )
     context_message = context_message.strip()
     message_with_context = user_query
     if not is_none_or_empty(context_message):
@@ -1700,17 +1643,15 @@ async def agenerate_chat_response(
     compiled_references: List[Dict] = [],
     online_results: Dict[str, Dict] = {},
     code_results: Dict[str, Dict] = {},
-    operator_results: List[OperatorRun] = [],
     research_results: List[ResearchIteration] = [],
     user: KhojUser = None,
     location_data: LocationData = None,
     user_name: Optional[str] = None,
     query_images: Optional[List[str]] = None,
     query_files: str = None,
-    relevant_memories: List[UserMemory] = [],
+    relevant_memories: List[OfferAgentMemory] = [],
     program_execution_context: List[str] = [],
     generated_asset_results: Dict[str, Dict] = {},
-    is_subscribed: bool = False,
     tracer: dict = {},
 ) -> Tuple[AsyncGenerator[ResponseWithThought, None], Dict[str, str]]:
     # Initialize Variables
@@ -1730,7 +1671,6 @@ async def agenerate_chat_response(
             compiled_references = []
             online_results = {}
             code_results = {}
-            operator_results = []
             deepthought = True
 
         if codex_runtime:
@@ -1738,7 +1678,7 @@ async def agenerate_chat_response(
             max_prompt_size = chat_model.max_prompt_size
             vision_available = False
         else:
-            chat_model = await ConversationAdapters.aget_valid_chat_model(user, conversation, is_subscribed)
+            chat_model = await ConversationAdapters.aget_valid_chat_model(user, conversation)
             max_prompt_size = await ConversationAdapters.aget_max_context_size(chat_model, user)
             vision_available = chat_model.vision_enabled
             if not vision_available and query_images:
@@ -1753,7 +1693,6 @@ async def agenerate_chat_response(
             references=compiled_references,
             online_results=online_results,
             code_results=code_results,
-            operator_results=operator_results,
             query_files=query_files,
             query_images=query_images,
             relevant_memories=relevant_memories,
@@ -1838,128 +1777,32 @@ class DeleteMessageRequestBody(BaseModel):
     turn_id: str
 
 
-class FeedbackData(BaseModel):
-    uquery: str
-    kquery: str
-    sentiment: str
-
-
-class MagicLinkForm(BaseModel):
-    email: EmailStr
-
-
-class EmailAttemptRateLimiter:
-    """Rate limiter for email attempts BEFORE get/create user with valid email address."""
-
-    def __init__(self, requests: int, window: int, slug: str):
-        self.requests = requests
-        self.window = window  # Window in seconds
-        self.slug = slug
-
-    async def __call__(self, form: MagicLinkForm):
-        # Disable login rate limiting in debug mode
-        if in_debug_mode():
-            return
-
-        # Calculate the time window cutoff
-        cutoff = django_timezone.now() - timedelta(seconds=self.window)
-
-        # Count recent attempts for this email and slug
-        count = await RateLimitRecord.objects.filter(
-            identifier=form.email, slug=self.slug, created_at__gte=cutoff
-        ).acount()
-
-        if count >= self.requests:
-            logger.warning(f"Email attempt rate limit exceeded for {form.email} (slug: {self.slug})")
-            raise HTTPException(
-                status_code=429, detail="Too many requests for your email address. Please wait before trying again."
-            )
-
-        # Record the current attempt
-        await RateLimitRecord.objects.acreate(identifier=form.email, slug=self.slug)
-
-
-class EmailVerificationApiRateLimiter:
-    """Rate limiter for actions AFTER user with valid email address is known to exist"""
-
-    def __init__(self, requests: int, window: int, slug: str):
-        self.requests = requests
-        self.window = window  # Window in seconds
-        self.slug = slug
-
-    async def __call__(self, email: str = None):
-        # Disable login rate limiting in debug mode
-        if in_debug_mode():
-            return
-
-        user: KhojUser = await aget_user_by_email(email)
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found.")
-
-        # Remove requests outside of the time window
-        cutoff = django_timezone.now() - timedelta(seconds=self.window)
-        count_requests = await UserRequests.objects.filter(user=user, created_at__gte=cutoff, slug=self.slug).acount()
-
-        # Check if the user has exceeded the rate limit
-        if count_requests >= self.requests:
-            logger.warning(
-                f"Rate limit: {count_requests}/{self.requests} requests not allowed in {self.window} seconds for email: {email}."
-            )
-            raise HTTPException(status_code=429, detail="Ran out of login attempts. Please wait before trying again.")
-
-        # Add the current request to the db
-        await UserRequests.objects.acreate(user=user, slug=self.slug)
-
-
 class ApiUserRateLimiter:
-    def __init__(self, requests: int, subscribed_requests: int, window: int, slug: str):
+    def __init__(self, requests: int, window: int, slug: str):
         self.requests = requests
-        self.subscribed_requests = subscribed_requests
         self.window = window
         self.slug = slug
 
     def __call__(self, request: Request):
-        # Rate limiting disabled if billing is disabled
-        if state.billing_enabled is False:
-            return
-
         # Rate limiting is disabled if user unauthenticated.
         # Other systems handle authentication
         if not request.user.is_authenticated:
             return
 
         user: KhojUser = request.user.object
-        subscribed = has_required_scope(request, ["premium"])
 
         # Remove requests outside of the time window
         cutoff = django_timezone.now() - timedelta(seconds=self.window)
         count_requests = UserRequests.objects.filter(user=user, created_at__gte=cutoff, slug=self.slug).count()
 
         # Check if the user has exceeded the rate limit
-        if subscribed and count_requests >= self.subscribed_requests:
-            logger.info(
-                f"Rate limit ({self.slug}): {count_requests}/{self.subscribed_requests} requests not allowed in {self.window} seconds for subscribed user: {user}."
-            )
-            raise HTTPException(
-                status_code=429,
-                detail="I'm glad you're enjoying interacting with me! You've unfortunately exceeded your usage limit for today. But let's chat more tomorrow?",
-            )
-        if not subscribed and count_requests >= self.requests:
-            if self.requests >= self.subscribed_requests:
-                logger.info(
-                    f"Rate limit ({self.slug}): {count_requests}/{self.subscribed_requests} requests not allowed in {self.window} seconds for user: {user}."
-                )
-                raise HTTPException(
-                    status_code=429,
-                    detail="I'm glad you're enjoying interacting with me! You've unfortunately exceeded your usage limit for today. But let's chat more tomorrow?",
-                )
-
+        if count_requests >= self.requests:
             logger.info(
                 f"Rate limit ({self.slug}): {count_requests}/{self.requests} requests not allowed in {self.window} seconds for user: {user}."
             )
             raise HTTPException(
                 status_code=429,
-                detail="I'm glad you're enjoying interacting with me! You've unfortunately exceeded your usage limit for today. You can subscribe to increase your usage limit via [your settings](https://app.khoj.dev/settings) or we can continue our conversation tomorrow?",
+                detail="I'm glad you're enjoying interacting with me! You've unfortunately exceeded your usage limit. Please try again later.",
             )
 
         # Add the current request to the cache
@@ -1967,16 +1810,11 @@ class ApiUserRateLimiter:
 
     async def check_websocket(self, websocket: WebSocket):
         """WebSocket-specific rate limiting method"""
-        # Rate limiting disabled if billing is disabled
-        if state.billing_enabled is False:
-            return
-
         # Rate limiting is disabled if user unauthenticated.
         if not websocket.scope.get("user") or not websocket.scope["user"].is_authenticated:
             return
 
         user: KhojUser = websocket.scope["user"].object
-        subscribed = has_required_scope(websocket, ["premium"])
         current_window = "today" if self.window == 60 * 60 * 24 else "now"
         next_window = "tomorrow" if self.window == 60 * 60 * 24 else "in a bit"
         common_message_prefix = f"I'm glad you're enjoying interacting with me! You've unfortunately exceeded your usage limit for {current_window}."
@@ -1986,30 +1824,13 @@ class ApiUserRateLimiter:
         count_requests = await UserRequests.objects.filter(user=user, created_at__gte=cutoff, slug=self.slug).acount()
 
         # Check if the user has exceeded the rate limit
-        if subscribed and count_requests >= self.subscribed_requests:
-            logger.info(
-                f"Rate limit ({self.slug}): {count_requests}/{self.subscribed_requests} requests not allowed in {self.window} seconds for subscribed user: {user}."
-            )
-            raise HTTPException(
-                status_code=429,
-                detail=f"{common_message_prefix} But let's chat more {next_window}?",
-            )
-        if not subscribed and count_requests >= self.requests:
-            if self.requests >= self.subscribed_requests:
-                logger.info(
-                    f"Rate limit ({self.slug}): {count_requests}/{self.subscribed_requests} requests not allowed in {self.window} seconds for user: {user}."
-                )
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"{common_message_prefix} But let's chat more {next_window}?",
-                )
-
+        if count_requests >= self.requests:
             logger.info(
                 f"Rate limit ({self.slug}): {count_requests}/{self.requests} requests not allowed in {self.window} seconds for user: {user}."
             )
             raise HTTPException(
                 status_code=429,
-                detail=f"{common_message_prefix} You can subscribe to increase your usage limit via [your settings](https://app.khoj.dev/settings) or we can continue our conversation {next_window}.",
+                detail=f"{common_message_prefix} But let's chat more {next_window}?",
             )
 
         # Add the current request to the cache
@@ -2022,9 +1843,6 @@ class ApiImageRateLimiter:
         self.max_combined_size_mb = max_combined_size_mb
 
     def __call__(self, request: Request, body: ChatRequestBody):
-        if state.billing_enabled is False:
-            return
-
         # Rate limiting is disabled if user unauthenticated.
         # Other systems handle authentication
         if not request.user.is_authenticated:
@@ -2064,9 +1882,6 @@ class ApiImageRateLimiter:
 
     def check_websocket(self, websocket: WebSocket, body: ChatRequestBody):
         """WebSocket-specific image rate limiting method"""
-        if state.billing_enabled is False:
-            return
-
         # Rate limiting is disabled if user unauthenticated.
         if not websocket.scope.get("user") or not websocket.scope["user"].is_authenticated:
             return
@@ -2107,9 +1922,8 @@ class ApiImageRateLimiter:
 class WebSocketConnectionManager:
     """Limit max open websockets per user."""
 
-    def __init__(self, trial_user_max_connections: int = 10, subscribed_user_max_connections: int = 10):
-        self.trial_user_max_connections = trial_user_max_connections
-        self.subscribed_user_max_connections = subscribed_user_max_connections
+    def __init__(self, max_connections: int = 10):
+        self.max_connections = max_connections
         self.connection_slug_prefix = "ws_connection_"
         # Set cleanup window to 24 hours for truly stale connections (e.g., server crashes)
         self.cleanup_window = 86400  # 24 hours
@@ -2118,8 +1932,6 @@ class WebSocketConnectionManager:
         """Check if user can establish a new WebSocket connection."""
         # Cleanup very old connections (likely from server crashes)
         user: KhojUser = websocket.scope["user"].object
-        subscribed = has_required_scope(websocket, ["premium"])
-        max_connections = self.subscribed_user_max_connections if subscribed else self.trial_user_max_connections
 
         await self._cleanup_stale_connections(user)
 
@@ -2129,7 +1941,7 @@ class WebSocketConnectionManager:
         ).acount()
 
         # Restrict max active connections per user in production
-        return active_connections < max_connections or state.anonymous_mode or in_debug_mode()
+        return active_connections < self.max_connections or state.anonymous_mode or in_debug_mode()
 
     async def register_connection(self, user: KhojUser, connection_id: str) -> None:
         """Register a new WebSocket connection."""
@@ -2148,16 +1960,12 @@ class WebSocketConnectionManager:
 
 
 class ConversationCommandRateLimiter:
-    def __init__(self, trial_rate_limit: int, subscribed_rate_limit: int, slug: str):
+    def __init__(self, rate_limit: int, slug: str):
         self.slug = slug
-        self.trial_rate_limit = trial_rate_limit
-        self.subscribed_rate_limit = subscribed_rate_limit
+        self.rate_limit = rate_limit
         self.restricted_commands = [ConversationCommand.Research]
 
     async def update_and_check_if_valid(self, request: Request | WebSocket, conversation_command: ConversationCommand):
-        if state.billing_enabled is False:
-            return
-
         if not request.user.is_authenticated:
             return
 
@@ -2165,7 +1973,6 @@ class ConversationCommandRateLimiter:
             return
 
         user: KhojUser = request.user.object
-        subscribed = has_required_scope(request, ["premium"])
 
         # Remove requests outside of the 24-hr time window
         cutoff = django_timezone.now() - timedelta(seconds=60 * 60 * 24)
@@ -2174,21 +1981,13 @@ class ConversationCommandRateLimiter:
             user=user, created_at__gte=cutoff, slug=command_slug
         ).acount()
 
-        if subscribed and count_requests >= self.subscribed_rate_limit:
+        if count_requests >= self.rate_limit:
             logger.info(
-                f"Rate limit: {count_requests}/{self.subscribed_rate_limit} requests not allowed in 24 hours for subscribed user: {user}."
+                f"Rate limit: {count_requests}/{self.rate_limit} requests not allowed in 24 hours for user: {user}."
             )
             raise HTTPException(
                 status_code=429,
                 detail=f"I'm glad you're enjoying interacting with me! You've unfortunately exceeded your `/{conversation_command.value}` command usage limit for today. Maybe we can talk about something else for today?",
-            )
-        if not subscribed and count_requests >= self.trial_rate_limit:
-            logger.info(
-                f"Rate limit: {count_requests}/{self.trial_rate_limit} requests not allowed in 24 hours for user: {user}."
-            )
-            raise HTTPException(
-                status_code=429,
-                detail=f"I'm glad you're enjoying interacting with me! You've unfortunately exceeded your `/{conversation_command.value}` command usage limit for today. You can subscribe to increase your usage limit via [your settings](https://app.khoj.dev/settings) or we can talk about something else for today?",
             )
         await UserRequests.objects.acreate(user=user, slug=command_slug)
         return
@@ -2198,20 +1997,12 @@ class ApiIndexedDataLimiter:
     def __init__(
         self,
         incoming_entries_size_limit: float,
-        subscribed_incoming_entries_size_limit: float,
         total_entries_size_limit: float,
-        subscribed_total_entries_size_limit: float,
     ):
         self.num_entries_size = incoming_entries_size_limit
-        self.subscribed_num_entries_size = subscribed_incoming_entries_size_limit
         self.total_entries_size_limit = total_entries_size_limit
-        self.subscribed_total_entries_size = subscribed_total_entries_size_limit
 
     def __call__(self, request: Request, files: List[UploadFile] = None):
-        if state.billing_enabled is False:
-            return
-
-        subscribed = has_required_scope(request, ["premium"])
         incoming_data_size_mb = 0.0
         deletion_file_names = set()
 
@@ -2233,32 +2024,18 @@ class ApiIndexedDataLimiter:
 
         logger.info(f"Deleted {num_deleted_entries} entries for user: {user}.")
 
-        if subscribed and incoming_data_size_mb >= self.subscribed_num_entries_size:
-            logger.info(
-                f"Data limit: {incoming_data_size_mb}MB incoming will exceed {self.subscribed_num_entries_size}MB allowed for subscribed user: {user}."
-            )
-            raise HTTPException(status_code=429, detail="Too much data indexed.")
-        if not subscribed and incoming_data_size_mb >= self.num_entries_size:
+        if incoming_data_size_mb >= self.num_entries_size:
             logger.info(
                 f"Data limit: {incoming_data_size_mb}MB incoming will exceed {self.num_entries_size}MB allowed for user: {user}."
             )
-            raise HTTPException(
-                status_code=429, detail="Too much data indexed. Subscribe to increase your data index limit."
-            )
+            raise HTTPException(status_code=429, detail="Too much data indexed.")
 
         user_size_data = EntryAdapters.get_size_of_indexed_data_in_mb(user)
-        if subscribed and user_size_data + incoming_data_size_mb >= self.subscribed_total_entries_size:
+        if user_size_data + incoming_data_size_mb >= self.total_entries_size_limit:
             logger.info(
-                f"Data limit: {incoming_data_size_mb}MB incoming + {user_size_data}MB existing will exceed {self.subscribed_total_entries_size}MB allowed for subscribed user: {user}."
+                f"Data limit: {incoming_data_size_mb}MB incoming + {user_size_data}MB existing will exceed {self.total_entries_size_limit}MB allowed for user: {user}."
             )
             raise HTTPException(status_code=429, detail="Too much data indexed.")
-        if not subscribed and user_size_data + incoming_data_size_mb >= self.total_entries_size_limit:
-            logger.info(
-                f"Data limit: {incoming_data_size_mb}MB incoming + {user_size_data}MB existing will exceed {self.subscribed_total_entries_size}MB allowed for non subscribed user: {user}."
-            )
-            raise HTTPException(
-                status_code=429, detail="Too much data indexed. Subscribe to increase your data index limit."
-            )
 
 
 class CommonQueryParamsClass:
@@ -2278,9 +2055,11 @@ class CommonQueryParamsClass:
 CommonQueryParams = Annotated[CommonQueryParamsClass, Depends()]
 
 
-def format_automation_response(scheduling_request: str, executed_query: str, ai_response: str, user: KhojUser) -> bool:
+def format_automation_response(
+    scheduling_request: str, executed_query: str, ai_response: str, user: KhojUser
+) -> Optional[str]:
     """
-    Format the AI response to send in automation email to user.
+    Format the AI response for a scheduled automation result.
     """
     name = get_user_name(user)
     username = prompts.user_name.format(name=name) if name else ""
@@ -2295,48 +2074,6 @@ def format_automation_response(scheduling_request: str, executed_query: str, ai_
     with timer("Chat actor: Format automation response", logger):
         raw_response = send_message_to_model_wrapper_sync(automation_format_prompt, user=user)
         return raw_response.text if raw_response else None
-
-
-def should_notify(original_query: str, executed_query: str, ai_response: str, user: KhojUser) -> bool:
-    """
-    Decide whether to notify the user of the AI response.
-    Default to notifying the user for now.
-    """
-    if any(is_none_or_empty(message) for message in [original_query, executed_query, ai_response]):
-        return False
-
-    generated_asset_request = re.search(
-        r"\b(create|draw|generate|paint|make)\b", f"{original_query} {executed_query}".lower()
-    )
-    generated_asset_response = re.search(r"https?://\S+\.(?:png|jpe?g|webp|gif|svg|pdf|zip)\b", ai_response)
-    if generated_asset_request and generated_asset_response:
-        return True
-
-    to_notify_or_not = prompts.to_notify_or_not.format(
-        original_query=original_query,
-        executed_query=executed_query,
-        response=ai_response,
-    )
-
-    with timer("Chat actor: Decide to notify user of automation response", logger):
-        try:
-            # TODO Replace with async call so we don't have to maintain a sync version
-            raw_response: ResponseWithThought = send_message_to_model_wrapper_sync(
-                to_notify_or_not, user=user, response_type="json_object"
-            )
-            response = json.loads(clean_json(raw_response.text))
-            should_notify_result = response["decision"] == "Yes"
-            reason = response.get("reason", "unknown")
-            logger.info(
-                f"Decided to {'not ' if not should_notify_result else ''}notify user of automation response because of reason: {reason}."
-            )
-            return should_notify_result
-        except Exception as e:
-            logger.warning(
-                f"Fallback to notify user of automation response as failed to infer should notify or not. {e}",
-                exc_info=True,
-            )
-            return True
 
 
 def scheduled_chat(
@@ -2422,26 +2159,13 @@ def scheduled_chat(
 
     # Extract the AI response from the chat API response
     cleaned_query = re.sub(r"^/automated_task\s*", "", query_to_run).strip()
-    is_image = False
     if raw_response.headers.get("Content-Type") == "application/json":
         response_map = raw_response.json()
         ai_response = response_map.get("response") or response_map.get("image")
-        is_image = False
-        if isinstance(ai_response, dict):
-            is_image = ai_response.get("image") is not None
     else:
         ai_response = raw_response.text
 
-    # Notify user if the AI response is satisfactory
-    if should_notify(
-        original_query=scheduling_request, executed_query=cleaned_query, ai_response=ai_response, user=user
-    ):
-        formatted_response = format_automation_response(scheduling_request, cleaned_query, ai_response, user)
-
-        if is_resend_enabled():
-            send_task_email(user.get_short_name(), user.email, cleaned_query, formatted_response, subject, is_image)
-        else:
-            return formatted_response
+    return format_automation_response(scheduling_request, cleaned_query, ai_response, user)
 
 
 async def create_automation(
@@ -2602,6 +2326,7 @@ class MessageProcessor:
         self.generated_images = []
         self.generated_files = []
         self.generated_mermaidjs_diagram = []
+        self.vault_actions = []
 
     def convert_message_chunk_to_json(self, raw_chunk: str) -> Dict[str, Any]:
         if raw_chunk.startswith("{") and raw_chunk.endswith("}"):
@@ -2650,6 +2375,10 @@ class MessageProcessor:
                         self.generated_files = chunk_data[key]
                     elif key == "mermaidjsDiagram":
                         self.generated_mermaidjs_diagram = chunk_data[key]
+        elif chunk_type == ChatEvent.VAULT_ACTIONS:
+            chunk_data = chunk["data"]
+            if isinstance(chunk_data, dict) and isinstance(chunk_data.get("actions"), list):
+                self.vault_actions = chunk_data["actions"]
 
     def handle_json_response(self, json_data: Dict[str, str]) -> str | Dict[str, str]:
         if "image" in json_data or "details" in json_data:
@@ -2686,6 +2415,7 @@ async def read_chat_stream(response_iterator: AsyncGenerator[str, None]) -> Dict
         "images": processor.generated_images,
         "files": processor.generated_files,
         "mermaidjsDiagram": processor.generated_mermaidjs_diagram,
+        "vaultActions": processor.vault_actions,
     }
 
 
@@ -2702,7 +2432,6 @@ def get_message_from_queue(queue: asyncio.Queue) -> Optional[str]:
 
 def get_user_config(user: KhojUser, request: Request, is_detailed: bool = False):
     user_picture = request.session.get("user", {}).get("picture")
-    is_active = has_required_scope(request, ["premium"])
     has_documents = has_user_document_source(user)
 
     if not is_detailed:
@@ -2710,7 +2439,6 @@ def get_user_config(user: KhojUser, request: Request, is_detailed: bool = False)
             "request": request,
             "username": user.username if user else None,
             "user_photo": user_picture,
-            "is_active": is_active,
             "has_documents": has_documents,
             "khoj_version": state.khoj_version,
         }
@@ -2720,8 +2448,6 @@ def get_user_config(user: KhojUser, request: Request, is_detailed: bool = False)
     enabled_content_sources_set = set(EntryAdapters.get_unique_file_sources(user))
     enabled_content_sources = {
         "computer": ("computer" in enabled_content_sources_set),
-        "github": False,
-        "notion": False,
     }
 
     server_chat_settings = ServerChatSettings.objects.first()
@@ -2747,7 +2473,6 @@ def get_user_config(user: KhojUser, request: Request, is_detailed: bool = False)
                     "id": chat_model.id,
                     "strengths": chat_model.strengths,
                     "description": chat_model.description,
-                    "tier": chat_model.price_tier,
                 }
             )
 
@@ -2756,14 +2481,10 @@ def get_user_config(user: KhojUser, request: Request, is_detailed: bool = False)
         # user info
         "username": user.username if user else None,
         "user_photo": user_picture,
-        "is_active": is_active,
         "given_name": given_name,
-        "phone_number": "",
-        "is_phone_number_verified": False,
         # user content settings
         "enabled_content_source": enabled_content_sources,
         "has_documents": has_documents,
-        "notion_token": None,
         "enable_memory": enable_memory,
         "server_memory_mode": server_memory_mode,
         # user model settings
@@ -2775,20 +2496,9 @@ def get_user_config(user: KhojUser, request: Request, is_detailed: bool = False)
         else None,
         "paint_model_options": [],
         "selected_paint_model_config": None,
-        "voice_model_options": [],
-        "selected_voice_model_config": None,
-        # user billing info
-        "subscription_state": "invalid",
-        "subscription_renewal_date": None,
-        "subscription_enabled_trial_at": None,
         # server settings
-        "khoj_cloud_subscription_url": None,
-        "billing_enabled": False,
-        "is_eleven_labs_enabled": False,
         "khoj_version": state.khoj_version,
         "anonymous_mode": state.anonymous_mode,
-        "notion_oauth_url": "",
-        "length_of_free_trial": 0,
     }
 
 
@@ -2815,23 +2525,6 @@ def configure_content(
         return False
 
     search_type = t.value if t else None
-
-    try:
-        # Initialize Org Search
-        if (search_type == state.SearchType.All.value or search_type == state.SearchType.Org.value) and files.get(
-            "org"
-        ):
-            logger.info("🗒️ Setting up search for org notes")
-            text_search.setup(
-                OrgToEntries,
-                files.get("org"),
-                regenerate=regenerate,
-                user=user,
-            )
-
-    except Exception as e:
-        logger.error(f"🚨 Failed to setup org: {e}", exc_info=True)
-        success = False
 
     try:
         # Initialize Markdown Search

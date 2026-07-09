@@ -29,10 +29,6 @@ const nextConfig = {
         remotePatterns: isProd ? [
             {
                 protocol: "https",
-                hostname: "**.googleusercontent.com",
-            },
-            {
-                protocol: "https",
                 hostname: "generated.khoj.dev",
             },
             {

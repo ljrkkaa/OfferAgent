@@ -50,7 +50,7 @@ export class KhojSimilarView extends KhojPaneView {
     }
 
     getDisplayText(): string {
-        return "Khoj Similar Documents";
+        return "OfferAgent Similar Documents";
     }
 
     getIcon(): string {

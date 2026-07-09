@@ -14,7 +14,6 @@ from khoj.database.models import (
     Agent,
     ChatMessageModel,
     KhojUser,
-    UserMemory,
     WebScraper,
 )
 from khoj.routers.helpers import (
@@ -64,7 +63,7 @@ async def search_online(
     max_webpages_to_read: int = 1,
     query_images: List[str] = None,
     query_files: str = None,
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: list | None = None,
     previous_subqueries: Set = set(),
     fast_model: bool = True,
     agent: Agent = None,
@@ -448,7 +447,7 @@ async def read_webpages(
     fast_model: bool = True,
     agent: Agent = None,
     max_webpages_to_read: int = 1,
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: list | None = None,
     tracer: dict = {},
 ):
     "Infer web pages to read from the query and extract relevant information from them"
@@ -483,7 +482,7 @@ async def read_webpages_content(
     user: KhojUser,
     send_status_func: Optional[Callable] = None,
     agent: Agent = None,
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: list | None = None,
     tracer: dict = {},
 ):
     logger.info(f"Reading web pages at: {urls}")
@@ -549,7 +548,7 @@ async def extract_from_webpage(
     url: str,
     subqueries: set[str] = None,
     content: str = None,
-    relevant_memories: List[UserMemory] = None,
+    relevant_memories: list | None = None,
     user: KhojUser = None,
     agent: Agent = None,
     tracer: dict = {},

@@ -2,12 +2,36 @@ export function KhojLogoType({ className }: { className?: string }) {
     const fillClasses = "fill-zinc-950 dark:fill-zinc-300";
     return (
         <svg
-            width="70"
-            viewBox="0 0 442 200"
-            className={`${className} ${fillClasses}`}
+            width="180"
+            viewBox="0 0 220 54"
+            className={`${className} text-zinc-950 dark:text-zinc-300`}
             xmlns="http://www.w3.org/2000/svg"
+            role="img"
+            aria-label="OfferAgent"
         >
-            <g clipPath="url(#clip0_45_75)">
+            <rect x="2" y="8" width="38" height="38" rx="10" fill="#FACC15" />
+            <text
+                x="21"
+                y="32"
+                textAnchor="middle"
+                fontFamily="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+                fontSize="14"
+                fontWeight="800"
+                fill="#18181B"
+            >
+                OA
+            </text>
+            <text
+                x="50"
+                y="35"
+                fontFamily="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+                fontSize="26"
+                fontWeight="750"
+                fill="currentColor"
+            >
+                OfferAgent
+            </text>
+            <g clipPath="url(#clip0_45_75)" style={{ display: "none" }} className={fillClasses}>
                 <path
                     d="M57.9394 93.0404L67.5396 49.1063C68.7987 49.5268 71.7365 51.9442 74.7267 51.9442C78.5039 51.9442 79.2383 47.4246 86.1631 45.7955C91.6715 44.4817 96.3404 45.4276 99.0684 47.6349C99.0684 47.6349 99.6979 53.6259 101.167 55.4127C102.531 57.0418 104.629 56.4637 104.629 56.4637C107.672 70.8106 114.072 100.661 115.279 105.233C116.8 110.961 110.924 114.114 108.669 119.369C106.413 124.625 94.242 126.884 87.0549 127.62C79.8679 128.356 59.723 119.632 57.9394 117.215C56.1557 114.797 55.3688 109.857 55.1065 105.18C54.8442 101.449 56.8902 95.5104 57.9394 93.0404Z"
                     fill="#FFCC09"
@@ -93,8 +117,22 @@ export function KhojLogo({ className }: { className?: string }) {
             viewBox="0 0 200 200"
             className={`${classes}`}
             xmlns="http://www.w3.org/2000/svg"
+            role="img"
+            aria-label="OfferAgent"
         >
-            <g clipPath="url(#clip0_45_75)">
+            <rect x="18" y="18" width="164" height="164" rx="42" fill="#FACC15" />
+            <text
+                x="100"
+                y="119"
+                textAnchor="middle"
+                fontFamily="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+                fontSize="64"
+                fontWeight="800"
+                fill="#18181B"
+            >
+                OA
+            </text>
+            <g clipPath="url(#clip0_45_75)" style={{ display: "none" }}>
                 <path
                     d="M57.9394 93.0404L67.5396 49.1063C68.7987 49.5268 71.7365 51.9442 74.7267 51.9442C78.5039 51.9442 79.2383 47.4246 86.1631 45.7955C91.6715 44.4817 96.3404 45.4276 99.0684 47.6349C99.0684 47.6349 99.6979 53.6259 101.167 55.4127C102.531 57.0418 104.629 56.4637 104.629 56.4637C107.672 70.8106 114.072 100.661 115.279 105.233C116.8 110.961 110.924 114.114 108.669 119.369C106.413 124.625 94.242 126.884 87.0549 127.62C79.8679 128.356 59.723 119.632 57.9394 117.215C56.1557 114.797 55.3688 109.857 55.1065 105.18C54.8442 101.449 56.8902 95.5104 57.9394 93.0404Z"
                     fill="#FAE80B"

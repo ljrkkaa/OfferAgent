@@ -1,10 +1,9 @@
 import csv
 import json
 from datetime import datetime, timedelta
-from urllib.parse import quote
 
 from apscheduler.job import Job
-from django.contrib import admin, messages
+from django.contrib import admin
 from django.contrib.auth.admin import GroupAdmin as BaseGroupAdmin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.models import Group
@@ -21,25 +20,16 @@ from khoj.database.models import (
     ClientApplication,
     Conversation,
     Entry,
-    GithubConfig,
     KhojUser,
     McpServer,
-    NotionConfig,
     ProcessLock,
     RateLimitRecord,
     ReflectiveQuestion,
     ServerChatSettings,
-    SpeechToTextModelOptions,
-    Subscription,
-    TextToImageModelConfig,
     UserConversationConfig,
-    UserMemory,
     UserRequests,
-    UserVoiceModelConfig,
-    VoiceModelOption,
     WebScraper,
 )
-from khoj.utils.helpers import ImageIntentType
 
 
 class KhojDjangoJobAdmin(DjangoJobAdmin, unfold_admin.ModelAdmin):
@@ -104,34 +94,19 @@ class KhojUserAdmin(UserAdmin, unfold_admin.ModelAdmin):
                 return queryset.filter(date_joined__gte=date_threshold)
             return queryset
 
-    class HasGoogleAuthFilter(admin.SimpleListFilter):
-        title = "Has Google Auth"
-        parameter_name = "has_google_auth"
-
-        def lookups(self, request, model_admin):
-            return (("True", "True"), ("False", "False"))
-
-        def queryset(self, request, queryset):
-            if self.value() == "True":
-                return queryset.filter(googleuser__isnull=False)
-            if self.value() == "False":
-                return queryset.filter(googleuser__isnull=True)
-
     list_display = (
         "id",
         "email",
         "username",
-        "phone_number",
         "is_active",
         "uuid",
         "is_staff",
         "is_superuser",
     )
-    search_fields = ("email", "username", "phone_number", "uuid")
+    search_fields = ("email", "username", "uuid")
     filter_horizontal = ("groups", "user_permissions")
 
     list_filter = (
-        HasGoogleAuthFilter,
         DateJoinedAfterFilter,
         "verified_email",
     ) + UserAdmin.list_filter
@@ -141,48 +116,21 @@ class KhojUserAdmin(UserAdmin, unfold_admin.ModelAdmin):
             "Personal info",
             {
                 "fields": (
-                    "phone_number",
-                    "email_verification_code",
-                    "verified_phone_number",
                     "verified_email",
-                    "email_verification_code_expiry",
                 )
             },
         ),
     ) + UserAdmin.fieldsets
-
-    actions = ["get_email_login_url"]
-
-    def get_email_login_url(self, request, queryset):
-        any_valid_otps = False
-        for user in queryset:
-            if user.email and user.email_verification_code:
-                any_valid_otps = True
-                host = request.get_host()
-                otp = quote(user.email_verification_code)
-                encoded_email = quote(user.email)
-                login_url = f"{host}/auth/magic?code={otp}&email={encoded_email}"
-                messages.info(request, f"Email login URL for {user.email}: {login_url}")
-        if not any_valid_otps:
-            messages.error(request, "No valid OTPs found for the selected users.")
-
-    get_email_login_url.short_description = "Get email login URL"  # type: ignore
 
 
 admin.site.unregister(Group)
 admin.site.register(KhojUser, KhojUserAdmin)
 
 admin.site.register(ProcessLock, unfold_admin.ModelAdmin)
-admin.site.register(SpeechToTextModelOptions, unfold_admin.ModelAdmin)
 admin.site.register(ReflectiveQuestion, unfold_admin.ModelAdmin)
 admin.site.register(ClientApplication, unfold_admin.ModelAdmin)
-admin.site.register(GithubConfig, unfold_admin.ModelAdmin)
-admin.site.register(NotionConfig, unfold_admin.ModelAdmin)
-admin.site.register(UserVoiceModelConfig, unfold_admin.ModelAdmin)
-admin.site.register(VoiceModelOption, unfold_admin.ModelAdmin)
 admin.site.register(UserRequests, unfold_admin.ModelAdmin)
 admin.site.register(RateLimitRecord, unfold_admin.ModelAdmin)
-admin.site.register(UserMemory, unfold_admin.ModelAdmin)
 
 
 @admin.register(McpServer)
@@ -202,7 +150,6 @@ class AgentAdmin(unfold_admin.ModelAdmin):
         "name",
     )
     search_fields = ("id", "name")
-    list_filter = ("privacy_level",)
     ordering = ("-created_at",)
 
 
@@ -227,18 +174,6 @@ class EntryAdmin(unfold_admin.ModelAdmin):
     ordering = ("-created_at",)
 
 
-@admin.register(Subscription)
-class KhojUserSubscription(unfold_admin.ModelAdmin):
-    list_display = (
-        "id",
-        "user",
-        "type",
-    )
-
-    search_fields = ("id", "user__email", "user__username", "type")
-    list_filter = ("type",)
-
-
 @admin.register(ChatModel)
 class ChatModelAdmin(unfold_admin.ModelAdmin):
     list_display = (
@@ -249,17 +184,6 @@ class ChatModelAdmin(unfold_admin.ModelAdmin):
         "max_prompt_size",
     )
     search_fields = ("id", "name", "ai_model_api__name")
-
-
-@admin.register(TextToImageModelConfig)
-class TextToImageModelOptionsAdmin(unfold_admin.ModelAdmin):
-    list_display = (
-        "id",
-        "friendly_name",
-        "model_name",
-        "model_type",
-    )
-    search_fields = ("id", "model_name", "model_type")
 
 
 @admin.register(AiModelApi)
@@ -278,11 +202,6 @@ class ServerChatSettingsAdmin(unfold_admin.ModelAdmin):
     list_display = (
         "priority",
         "chat_default",
-        "chat_advanced",
-        "think_free_fast",
-        "think_free_deep",
-        "think_paid_fast",
-        "think_paid_deep",
         "web_scraper",
         "memory_mode",
     )
@@ -365,16 +284,6 @@ class ConversationAdmin(unfold_admin.ModelAdmin):
                 updated_log = {}
                 for key in fields_to_keep:
                     updated_log[key] = log[key]
-                if (
-                    log["by"] == "khoj"
-                    and log["intent"]
-                    and log["intent"]["type"]
-                    and (
-                        log["intent"]["type"] == ImageIntentType.TEXT_TO_IMAGE.value
-                        or log["intent"]["type"] == ImageIntentType.TEXT_TO_IMAGE_V3.value
-                    )
-                ):
-                    updated_log["message"] = "inline image redacted for space"
                 chat_log[idx] = updated_log
             return_log["chat"] = chat_log
 
@@ -408,9 +317,8 @@ class UserConversationConfigAdmin(unfold_admin.ModelAdmin):
         "id",
         "get_user_email",
         "get_chat_model",
-        "get_subscription_type",
     )
-    search_fields = ("id", "user__email", "setting__name", "user__subscription__type")
+    search_fields = ("id", "user__email", "setting__name")
     ordering = ("-updated_at",)
 
     def get_user_email(self, obj):
@@ -424,11 +332,3 @@ class UserConversationConfigAdmin(unfold_admin.ModelAdmin):
 
     get_chat_model.short_description = "Chat Model"  # type: ignore
     get_chat_model.admin_order_field = "setting__name"  # type: ignore
-
-    def get_subscription_type(self, obj):
-        if hasattr(obj.user, "subscription"):
-            return obj.user.subscription.type
-        return None
-
-    get_subscription_type.short_description = "Subscription Type"  # type: ignore
-    get_subscription_type.admin_order_field = "user__subscription__type"  # type: ignore

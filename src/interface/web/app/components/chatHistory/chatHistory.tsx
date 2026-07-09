@@ -39,7 +39,8 @@ function isChatHistoryData(data: unknown): data is ChatHistoryData {
         ((data as ChatHistoryData).agent === null ||
             typeof (data as ChatHistoryData).agent === "object") &&
         typeof (data as ChatHistoryData).conversation_id === "string" &&
-        typeof (data as ChatHistoryData).slug === "string" &&
+        ((data as ChatHistoryData).slug === null ||
+            typeof (data as ChatHistoryData).slug === "string") &&
         typeof (data as ChatHistoryData).is_owner === "boolean"
     );
 }
@@ -50,7 +51,6 @@ interface ChatHistoryProps {
     pendingMessage?: string;
     incomingMessages?: StreamMessage[];
     setIncomingMessages?: (incomingMessages: StreamMessage[]) => void;
-    publicConversationSlug?: string;
     setAgent: (agent: AgentData) => void;
     customClassName?: string;
     setIsChatSideBarOpen?: (isOpen: boolean) => void;
@@ -280,7 +280,6 @@ export default function ChatHistory(props: ChatHistoryProps) {
     const {
         conversationId,
         incomingMessages,
-        publicConversationSlug,
         setAgent,
         setIsChatSideBarOpen,
         setIsOwner,
@@ -300,11 +299,14 @@ export default function ChatHistory(props: ChatHistoryProps) {
         number | null
     >(null);
     const [fetchingData, setFetchingData] = useState(false);
+    const [historyError, setHistoryError] = useState<string | null>(null);
     const [isNearBottom, setIsNearBottom] = useState(true);
     const isMobileWidth = useIsMobileWidth();
     const scrollAreaSelector = "[data-radix-scroll-area-viewport]";
     const fetchMessageCount = 10;
-    const hasStartingMessage = localStorage.getItem("message");
+    const hasStartingMessage = Boolean(
+        props.pendingMessage || incomingMessages?.some((message) => !message.completed),
+    );
 
     const scrollToBottom = useCallback(
         (instant: boolean = false) => {
@@ -347,13 +349,10 @@ export default function ChatHistory(props: ChatHistoryProps) {
             const maxMessagesToFetch = nextPage * fetchMessageCount;
             let conversationFetchURL = "";
 
-            if (conversationId) {
-                conversationFetchURL = `/api/chat/history?client=web&conversation_id=${encodeURIComponent(conversationId)}&n=${maxMessagesToFetch}`;
-            } else if (publicConversationSlug) {
-                conversationFetchURL = `/api/chat/share/history?client=web&public_conversation_slug=${encodeURIComponent(publicConversationSlug)}&n=${maxMessagesToFetch}`;
-            } else {
+            if (!conversationId) {
                 return;
             }
+            conversationFetchURL = `/api/chat/history?client=web&conversation_id=${encodeURIComponent(conversationId)}&n=${maxMessagesToFetch}`;
 
             fetch(conversationFetchURL)
                 .then((response) => {
@@ -365,10 +364,11 @@ export default function ChatHistory(props: ChatHistoryProps) {
                     return response.json();
                 })
                 .then((chatData: ChatResponse) => {
+                    setHistoryError(null);
                     if (chatData.status !== "ok" || !isChatHistoryData(chatData.response)) {
                         throw new Error("Invalid chat history response");
                     }
-                    setTitle(chatData.response.slug);
+                    setTitle(chatData.response.slug || "New Conversation");
                     setIsOwner && setIsOwner(chatData?.response?.is_owner);
                     if (
                         chatData &&
@@ -395,21 +395,19 @@ export default function ChatHistory(props: ChatHistoryProps) {
                             adjustScrollPosition();
                         }
                     } else {
-                        if (chatData.response.agent && chatData.response.conversation_id) {
-                            const chatMetadata = {
-                                chat: [],
-                                agent: chatData.response.agent,
-                                conversation_id: chatData.response.conversation_id,
-                                slug: chatData.response.slug,
-                                is_owner: chatData.response.is_owner,
-                            };
-                            if (chatData.response.agent) {
-                                setAgent(chatData.response.agent);
-                            }
-                            setData(chatMetadata);
-                            if (setIsChatSideBarOpen && !hasStartingMessage) {
-                                setIsChatSideBarOpen(true);
-                            }
+                        const chatMetadata = {
+                            chat: [],
+                            agent: chatData.response.agent,
+                            conversation_id: chatData.response.conversation_id,
+                            slug: chatData.response.slug,
+                            is_owner: chatData.response.is_owner,
+                        };
+                        if (chatData.response.agent) {
+                            setAgent(chatData.response.agent);
+                        }
+                        setData(chatMetadata);
+                        if (setIsChatSideBarOpen && !hasStartingMessage) {
+                            setIsChatSideBarOpen(true);
                         }
 
                         setHasMoreMessages(false);
@@ -418,7 +416,9 @@ export default function ChatHistory(props: ChatHistoryProps) {
                 })
                 .catch((err) => {
                     console.error(err);
-                    window.location.href = "/";
+                    setHistoryError("Unable to load this conversation.");
+                    setHasMoreMessages(false);
+                    setFetchingData(false);
                 });
         },
         [
@@ -429,7 +429,6 @@ export default function ChatHistory(props: ChatHistoryProps) {
             fetchingData,
             hasMoreMessages,
             hasStartingMessage,
-            publicConversationSlug,
             scrollToBottom,
             setAgent,
             setIsChatSideBarOpen,
@@ -531,6 +530,7 @@ export default function ChatHistory(props: ChatHistoryProps) {
         setFetchingData(false);
         setCurrentPage(0);
         setData(null);
+        setHistoryError(null);
     }, [props.conversationId]);
 
     useEffect(() => {
@@ -554,7 +554,7 @@ export default function ChatHistory(props: ChatHistoryProps) {
 
     function constructAgentName() {
         if (!data || !data.agent || !data.agent?.name) return `Agent`;
-        if (data.agent.is_hidden) return "Khoj";
+        if (data.agent.is_hidden) return "OfferAgent";
         return data.agent?.name;
     }
 
@@ -599,7 +599,7 @@ export default function ChatHistory(props: ChatHistoryProps) {
         return retryStarted !== false;
     };
 
-    if (!props.conversationId && !props.publicConversationSlug) {
+    if (!props.conversationId) {
         return null;
     }
 
@@ -621,7 +621,7 @@ export default function ChatHistory(props: ChatHistoryProps) {
                             <KhojLogo className="print-logo" />
                         </div>
                         <div className="print-header-right">
-                            <h1>{data?.slug || "Conversation with Khoj"}</h1>
+                            <h1>{data?.slug || "Conversation with OfferAgent"}</h1>
                             <div className="conversation-meta">
                                 <p>
                                     <strong>Agent:</strong> {constructAgentName()}
@@ -636,6 +636,11 @@ export default function ChatHistory(props: ChatHistoryProps) {
                     <div ref={sentinelRef} style={{ height: "1px" }}>
                         {fetchingData && <InlineLoading className="opacity-50" />}
                     </div>
+                    {historyError && (
+                        <div className="mx-4 my-3 rounded-md border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700 dark:border-rose-900 dark:bg-rose-950 dark:text-rose-200">
+                            {historyError}
+                        </div>
+                    )}
                     {data &&
                         data.chat &&
                         data.chat.map((chatMessage, index) => (

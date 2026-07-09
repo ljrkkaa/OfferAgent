@@ -3,7 +3,7 @@ import "../globals.css";
 import { Toaster } from "@/components/ui/toaster";
 
 export const metadata: Metadata = {
-    title: "Khoj AI - Chat",
+    title: "OfferAgent - Chat",
     description:
         "Ask anything. Research answers from across the internet and your documents, draft messages, summarize documents, generate paintings and chat with personal agents.",
     icons: {
@@ -11,11 +11,11 @@ export const metadata: Metadata = {
         apple: "/static/assets/icons/khoj_lantern_256x256.png",
     },
     openGraph: {
-        siteName: "Khoj AI",
-        title: "Khoj AI - Chat",
+        siteName: "OfferAgent",
+        title: "OfferAgent - Chat",
         description:
             "Ask anything. Research answers from across the internet and your documents, draft messages, summarize documents, generate paintings and chat with personal agents.",
-        url: "https://app.khoj.dev/chat",
+        url: "http://localhost:12805/chat",
         type: "website",
         images: [
             {

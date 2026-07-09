@@ -5,7 +5,7 @@ import React, { Suspense, useCallback, useEffect, useRef, useState } from "react
 import useWebSocket from "react-use-websocket";
 
 import ChatHistory from "../components/chatHistory/chatHistory";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import Loading from "../components/loading/loading";
 
@@ -19,7 +19,7 @@ import {
     OnlineContext,
     StreamMessage,
 } from "../components/chatMessage/chatMessage";
-import { useIPLocationData, useIsMobileWidth, welcomeConsole } from "../common/utils";
+import { useIsMobileWidth, welcomeConsole } from "../common/utils";
 import {
     AttachedFileText,
     ChatInputArea,
@@ -51,7 +51,6 @@ interface ChatBodyDataProps {
     setTriggeredAbort: (triggeredAbort: boolean, newMessage?: string) => void;
     isChatSideBarOpen: boolean;
     setIsChatSideBarOpen: (open: boolean) => void;
-    isActive?: boolean;
     isParentProcessing?: boolean;
     onRetryMessage?: (query: string, turnId?: string) => void;
 }
@@ -68,14 +67,23 @@ type PendingChatRequest = {
 };
 
 function ChatBodyData(props: ChatBodyDataProps) {
+    const router = useRouter();
     const searchParams = useSearchParams();
-    const conversationId = searchParams.get("conversationId");
+    const conversationId =
+        searchParams.get("conversationId") ||
+        (typeof window !== "undefined"
+            ? new URLSearchParams(window.location.search).get("conversationId")
+            : null);
+    const initialQuery =
+        searchParams.get("q") ||
+        (typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("q") : "");
     const [message, setMessage] = useState("");
     const [images, setImages] = useState<string[]>([]);
     const [processingMessage, setProcessingMessage] = useState(false);
     const [agentMetadata, setAgentMetadata] = useState<AgentData | null>(null);
     const [isInResearchMode, setIsInResearchMode] = useState(false);
     const chatInputRef = useRef<HTMLTextAreaElement>(null);
+    const processedInitialQueryRef = useRef<string | null>(null);
 
     const setQueryToProcess = props.setQueryToProcess;
     const onConversationIdChange = props.onConversationIdChange;
@@ -123,16 +131,32 @@ function ChatBodyData(props: ChatBodyDataProps) {
         }
 
         const storedMessage = localStorage.getItem("message");
-        if (storedMessage) {
+        const messageToProcess = initialQuery || storedMessage;
+        const initialQueryKey = `${conversationId}:${messageToProcess || ""}`;
+        if (messageToProcess && processedInitialQueryRef.current !== initialQueryKey) {
+            processedInitialQueryRef.current = initialQueryKey;
             localStorage.removeItem("message");
             setProcessingMessage(true);
-            setQueryToProcess(storedMessage, { images: encodedImages, uploadedFiles });
+            setQueryToProcess(messageToProcess, { images: encodedImages, uploadedFiles });
 
-            if (storedMessage.trim().startsWith("/research")) {
+            if (messageToProcess.trim().startsWith("/research")) {
                 setIsInResearchMode(true);
             }
+
+            if (initialQuery && typeof window !== "undefined") {
+                const params = new URLSearchParams(window.location.search);
+                params.delete("q");
+                router.replace(`/chat?${params.toString()}`, { scroll: false });
+            }
         }
-    }, [setQueryToProcess, setParentImages, setUploadedFiles, conversationId]);
+    }, [
+        setQueryToProcess,
+        setParentImages,
+        setUploadedFiles,
+        conversationId,
+        initialQuery,
+        router,
+    ]);
 
     const queueMessage = (nextMessage: string, nextImages: string[] = []) => {
         const imagesForMessage = nextImages.length > 0 ? nextImages : images;
@@ -163,10 +187,7 @@ function ChatBodyData(props: ChatBodyDataProps) {
         }
     }, [streamedMessages, setUploadedFiles]);
 
-    if (!conversationId) {
-        window.location.href = "/";
-        return;
-    }
+    if (!conversationId) return <Loading />;
 
     return (
         <div className="flex flex-row h-full w-full">
@@ -206,7 +227,6 @@ function ChatBodyData(props: ChatBodyDataProps) {
             <div className="print-hidden">
                 <ChatSidebar
                     conversationId={conversationId}
-                    isActive={props.isActive}
                     isOpen={props.isChatSideBarOpen}
                     onOpenChange={props.setIsChatSideBarOpen}
                     isMobileWidth={props.isMobileWidth}
@@ -217,7 +237,7 @@ function ChatBodyData(props: ChatBodyDataProps) {
 }
 
 export default function Chat() {
-    const defaultTitle = "Khoj AI - Chat";
+    const defaultTitle = "OfferAgent - Chat";
     const [chatOptionsData, setChatOptionsData] = useState<ChatOptions | null>(null);
     const [isLoading, setLoading] = useState(true);
     const [title, setTitle] = useState(defaultTitle);
@@ -235,11 +255,6 @@ export default function Chat() {
     const idleTimerRef = useRef<NodeJS.Timeout | null>(null);
     const sentRequestRef = useRef<PendingChatRequest | null>(null);
 
-    const { locationData, locationDataError, locationDataLoading } = useIPLocationData() || {
-        locationData: {
-            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        },
-    };
     const {
         data: authenticatedData,
         error: authenticationError,
@@ -402,7 +417,25 @@ export default function Chat() {
                     return;
                 } else if (controlMessage.error) {
                     console.error("WebSocket error:", controlMessage.error);
+                    setMessages((prevMessages) => {
+                        if (!prevMessages.length) return prevMessages;
+                        const newMessages = [...prevMessages];
+                        const currentMessage = { ...newMessages[newMessages.length - 1] };
+                        currentMessage.rawResponse =
+                            controlMessage.error || "OfferAgent failed to generate a response.";
+                        currentMessage.completed = true;
+                        newMessages[newMessages.length - 1] = currentMessage;
+                        return newMessages;
+                    });
+                    toast({
+                        title: "OfferAgent could not respond",
+                        description: String(controlMessage.error),
+                        variant: "destructive",
+                        duration: 6000,
+                    });
                     setProcessQuerySignal(false);
+                    setPendingRequest(null);
+                    sentRequestRef.current = null;
                     return;
                 }
             } catch {
@@ -451,7 +484,7 @@ export default function Chat() {
                 }
             }
         }
-    }, [lastMessage, setMessages, conversationId, resetIdleTimer]);
+    }, [lastMessage, setMessages, conversationId, resetIdleTimer, toast]);
 
     useEffect(() => {
         let cancelled = false;
@@ -531,10 +564,6 @@ export default function Chat() {
 
     useEffect(() => {
         if (processQuerySignal) {
-            if (locationDataLoading) {
-                return;
-            }
-
             if (!pendingRequest || !conversationId) {
                 setProcessQuerySignal(false);
                 return;
@@ -559,13 +588,6 @@ export default function Chat() {
                 q: pendingRequest.query,
                 conversation_id: conversationId,
                 stream: true,
-                ...(locationData && {
-                    city: locationData.city,
-                    region: locationData.region,
-                    country: locationData.country,
-                    country_code: locationData.countryCode,
-                    timezone: locationData.timezone,
-                }),
                 ...(pendingRequest.images.length > 0 && { images: pendingRequest.images }),
                 ...(pendingRequest.uploadedFiles && { files: pendingRequest.uploadedFiles }),
             };
@@ -574,12 +596,10 @@ export default function Chat() {
         }
     }, [
         processQuerySignal,
-        locationDataLoading,
         pendingRequest,
         conversationId,
         resetIdleTimer,
         socketUrl,
-        locationData,
         sendMessage,
     ]);
 
@@ -654,7 +674,7 @@ export default function Chat() {
                         >
                             {isMobileWidth ? (
                                 <Link className="p-0 no-underline" href="/">
-                                    <KhojLogoType className="h-auto w-16" />
+                                    <KhojLogoType className="h-auto w-32 max-w-full" />
                                 </Link>
                             ) : (
                                 title && (
@@ -706,7 +726,6 @@ export default function Chat() {
                                     setTriggeredAbort={handleTriggeredAbort}
                                     isChatSideBarOpen={isChatSideBarOpen}
                                     setIsChatSideBarOpen={setIsChatSideBarOpen}
-                                    isActive={authenticatedData?.is_active}
                                     isParentProcessing={processQuerySignal}
                                     onRetryMessage={handleRetryMessage}
                                 />

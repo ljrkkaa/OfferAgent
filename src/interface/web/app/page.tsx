@@ -28,16 +28,11 @@ import {
 } from "@/app/components/suggestions/suggestionsData";
 import LoginPrompt from "@/app/components/loginPrompt/loginPrompt";
 
-import {
-    isUserSubscribed,
-    useAuthenticatedData,
-    UserConfig,
-    useUserConfig,
-} from "@/app/common/auth";
+import { useAuthenticatedData, UserConfig, useUserConfig } from "@/app/common/auth";
 import { convertColorToBorderClass } from "@/app/common/colorUtils";
 import { getIconFromIconName } from "@/app/common/iconUtils";
 import { AgentData } from "@/app/components/agentCard/agentCard";
-import { createNewConversation, fetchChatOptions } from "./common/chatFunctions";
+import { buildChatUrl, createNewConversation, fetchChatOptions } from "./common/chatFunctions";
 import { useDebounce, useIsMobileWidth } from "./common/utils";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
@@ -95,7 +90,6 @@ function AgentCards({
     setSelectedAgent,
     chatInputRef,
     openAgentEditCard,
-    userConfig,
     isMobileWidth,
 }: {
     agents: AgentData[];
@@ -108,7 +102,6 @@ function AgentCards({
     setSelectedAgent: (agent: string | null) => void;
     chatInputRef: React.RefObject<HTMLTextAreaElement>;
     openAgentEditCard: (slug: string) => void;
-    userConfig: UserConfig | null;
     isMobileWidth?: boolean;
 }) {
     return (
@@ -167,7 +160,6 @@ function AgentCards({
                                 filesOptions={[]}
                                 selectedChatModelOption=""
                                 agentSlug=""
-                                isSubscribed={isUserSubscribed(userConfig)}
                                 setAgentChangeTriggered={() => {}}
                                 modelOptions={[]}
                                 inputToolOptions={{}}
@@ -258,8 +250,8 @@ function ChatBodyData(props: ChatBodyDataProps) {
     useEffect(() => {
         const agents = (agentsData || []).filter((agent) => agent !== null && agent !== undefined);
         setAgents(agents);
-        // set the first agent, which is always the default agent, as the default for chat
-        setSelectedAgent(agents.length > 1 ? agents[0].slug : "khoj");
+        // set the first agent as the default for chat; fall back to the built-in default
+        setSelectedAgent(agents.length > 0 ? agents[0].slug : "khoj");
 
         // generate colored icons for the available agents
         const agentIcons = agents.map((agent) => getIconFromIconName(agent.icon, agent.color)!);
@@ -287,12 +279,11 @@ function ChatBodyData(props: ChatBodyDataProps) {
             try {
                 const newConversationId = await createNewConversation(selectedAgent || "khoj");
                 onConversationIdChange?.(newConversationId);
-                localStorage.setItem("message", submission.message);
                 if (submission.images.length > 0) {
                     localStorage.setItem("images", JSON.stringify(submission.images));
                 }
 
-                window.location.href = `/chat?conversationId=${newConversationId}`;
+                router.push(buildChatUrl(newConversationId, submission.message));
             } catch (error) {
                 console.error("Error creating new conversation:", error);
                 setProcessingMessage(false);
@@ -304,7 +295,7 @@ function ChatBodyData(props: ChatBodyDataProps) {
         if (submission) {
             setProcessingMessage(true);
         }
-    }, [selectedAgent, submission, processingMessage, onConversationIdChange]);
+    }, [selectedAgent, submission, processingMessage, onConversationIdChange, router]);
 
     // Close the agent detail hover card when scroll on agent pane
     useEffect(() => {
@@ -360,7 +351,6 @@ function ChatBodyData(props: ChatBodyDataProps) {
                         setSelectedAgent={setSelectedAgent}
                         chatInputRef={chatInputRef}
                         openAgentEditCard={openAgentEditCard}
-                        userConfig={props.userConfig}
                     />
                 )}
             </div>
@@ -477,7 +467,7 @@ function ChatBodyData(props: ChatBodyDataProps) {
                                         <ArrowsVertical className="h-5 w-5" />
                                     )}
                                     {selectedAgent
-                                        ? `${agents?.find((agent) => agent.slug === selectedAgent)?.name ?? "Khoj"}`
+                                        ? `${agents?.find((agent) => agent.slug === selectedAgent)?.name ?? "OfferAgent"}`
                                         : "Select Agent"}
                                 </Button>
                             </DropdownMenuTrigger>
@@ -496,13 +486,13 @@ function ChatBodyData(props: ChatBodyDataProps) {
                                     ))
                                 ) : (
                                     <DropdownMenuItem
-                                        key="0-khoj"
+                                        key="0-offeragent"
                                         onClick={() => {
                                             setSelectedAgent("khoj");
                                             chatInputRef.current?.focus();
                                         }}
                                     >
-                                        {getIconFromIconName("Lightbulb", "orange")} Khoj
+                                        {getIconFromIconName("Lightbulb", "orange")} OfferAgent
                                     </DropdownMenuItem>
                                 )}
                             </DropdownMenuContent>
@@ -601,14 +591,14 @@ export default function Home() {
                     <Separator orientation="vertical" className="mr-2 h-4" />
                     {isMobileWidth ? (
                         <Link className="p-0 no-underline" href="/">
-                            <KhojLogoType className="h-auto w-16" />
+                            <KhojLogoType className="h-auto w-32 max-w-full" />
                         </Link>
                     ) : (
                         <h2 className="text-lg">Ask Anything</h2>
                     )}
                 </header>
                 <div className={`${styles.main} ${styles.chatLayout}`}>
-                    <title>Khoj AI - Your Second Brain</title>
+                    <title>OfferAgent - Interview Assistant</title>
                     <div className={`${styles.chatBox}`}>
                         <div className={`${styles.chatBoxBody}`}>
                             {!authenticationLoading && (

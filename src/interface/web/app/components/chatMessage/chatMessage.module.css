@@ -209,7 +209,6 @@ button.codeCopyButton:hover {
     color: hsla(var(--frosted-background-color));
 }
 
-div.feedbackButtons img,
 button.codeCopyButton img,
 button.copyButton img,
 button.retryButton img {
@@ -335,8 +334,7 @@ div.trainOfThoughtElement ul {
     div.chatButtons,
     button.codeCopyButton,
     button.copyButton,
-    button.retryButton,
-    div.feedbackButtons {
+    button.retryButton {
         display: none !important;
     }
 

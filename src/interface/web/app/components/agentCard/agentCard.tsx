@@ -10,16 +10,12 @@ import {
     PaperPlaneTilt,
     Plus,
     Circle,
-    Info,
     Check,
     ShieldWarning,
-    Lock,
     Book,
     Brain,
     Waveform,
     CaretUpDown,
-    Globe,
-    LockOpen,
     FloppyDisk,
     DotsThreeVertical,
     Pencil,
@@ -43,7 +39,7 @@ import {
     getIconFromIconName,
 } from "@/app/common/iconUtils";
 import { convertColorToTextClass, tailwindColors } from "@/app/common/colorUtils";
-import { createNewConversation } from "@/app/common/chatFunctions";
+import { buildChatUrl, createNewConversation } from "@/app/common/chatFunctions";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 
 import {
@@ -81,16 +77,13 @@ import { uploadDataForIndexing } from "@/app/common/chatFunctions";
 import {
     AlertDialog,
     AlertDialogAction,
-    AlertDialogCancel,
     AlertDialogContent,
     AlertDialogDescription,
-    AlertDialogFooter,
     AlertDialogHeader,
     AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Progress } from "@/components/ui/progress";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import ShareLink from "@/app/components/shareLink/shareLink";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -102,7 +95,6 @@ export interface AgentData {
     persona: string;
     color: string;
     icon: string;
-    privacy_level: string;
     files?: string[];
     creator?: string;
     is_creator?: boolean;
@@ -125,7 +117,7 @@ async function openChat(slug: string, userData: UserProfile | null) {
 
     try {
         const conversationId = await createNewConversation(slug);
-        window.location.href = `/chat?conversationId=${conversationId}`;
+        window.location.href = buildChatUrl(conversationId);
     } catch (error) {
         if (error instanceof Error && /status: (401|403)/.test(error.message)) {
             window.location.href = unauthenticatedRedirectUrl;
@@ -166,9 +158,6 @@ export const EditAgentSchema = z.object({
         .min(1, "Personality is required"),
     color: z.string({ required_error: "Color is required" }).min(1, "Color is required"),
     icon: z.string({ required_error: "Icon is required" }).min(1, "Icon is required"),
-    privacy_level: z
-        .string({ required_error: "Privacy level is required" })
-        .min(1, "Privacy level is required"),
     chat_model: z
         .string({ required_error: "Chat model is required" })
         .min(1, "Chat model is required"),
@@ -186,7 +175,6 @@ interface AgentCardProps {
     filesOptions: string[];
     modelOptions: ModelOptions[];
     selectedChatModelOption: string;
-    isSubscribed: boolean;
     setAgentChangeTriggered: (value: boolean) => void;
     agentSlug: string;
     inputToolOptions: { [key: string]: string };
@@ -198,17 +186,6 @@ export function AgentCard(props: AgentCardProps) {
     const [showLoginPrompt, setShowLoginPrompt] = useState(false);
     const [errors, setErrors] = useState<string | null>(null);
 
-    let lockIcon = <Lock />;
-    let privacyHoverText = "Private agents are only visible to you.";
-
-    if (props.data.privacy_level === "public") {
-        lockIcon = <Globe />;
-        privacyHoverText = "Public agents are visible to everyone.";
-    } else if (props.data.privacy_level === "protected") {
-        lockIcon = <LockOpen />;
-        privacyHoverText = "Protected agents are visible to anyone with a direct link.";
-    }
-
     const userData = props.userProfile;
 
     const form = useForm<z.infer<typeof EditAgentSchema>>({
@@ -218,7 +195,6 @@ export function AgentCard(props: AgentCardProps) {
             persona: props.data.persona,
             color: props.data.color,
             icon: props.data.icon,
-            privacy_level: props.data.privacy_level,
             chat_model: props.data.chat_model,
             files: props.data.files,
             input_tools: props.data.input_tools,
@@ -232,7 +208,6 @@ export function AgentCard(props: AgentCardProps) {
             persona: props.data.persona,
             color: props.data.color,
             icon: props.data.icon,
-            privacy_level: props.data.privacy_level,
             chat_model: props.data.chat_model,
             files: props.data.files,
             input_tools: props.data.input_tools,
@@ -243,7 +218,7 @@ export function AgentCard(props: AgentCardProps) {
     if (showModal) {
         window.history.pushState(
             {},
-            `Khoj AI - Agent ${props.data.slug}`,
+            `OfferAgent - Agent ${props.data.slug}`,
             `/agents?agent=${encodeURIComponent(props.data.slug)}`,
         );
     }
@@ -288,13 +263,6 @@ export function AgentCard(props: AgentCardProps) {
     function makeBadgeFooter() {
         return (
             <div className="flex flex-wrap items-center gap-1">
-                {props.editCard && (
-                    <Badge
-                        icon={lockIcon}
-                        text={props.data.privacy_level}
-                        hoverText={privacyHoverText}
-                    />
-                )}
                 {props.data.files && props.data.files.length > 0 && (
                     <Badge
                         icon={<Book />}
@@ -339,7 +307,7 @@ export function AgentCard(props: AgentCardProps) {
                         open={showModal}
                         onOpenChange={() => {
                             setShowModal(!showModal);
-                            window.history.pushState({}, `Khoj AI - Agents`, `/agents`);
+                            window.history.pushState({}, `OfferAgent - Agents`, `/agents`);
                         }}
                     >
                         <DialogTrigger className="focus-visible:outline-none">
@@ -374,17 +342,6 @@ export function AgentCard(props: AgentCardProps) {
                                                 <Pencil className="w-4 h-4 mr-2" />
                                                 Edit
                                             </Button>
-                                            {props.editCard &&
-                                                props.data.privacy_level !== "private" && (
-                                                    <ShareLink
-                                                        buttonTitle="Share"
-                                                        title="Share Agent"
-                                                        description="Share a link to this agent with others. They'll be able to chat with it, and ask questions to all of its knowledge base."
-                                                        buttonVariant={"ghost" as const}
-                                                        includeIcon={true}
-                                                        url={`${window.location.origin}/agents?agent=${encodeURIComponent(props.data.slug)}`}
-                                                    />
-                                                )}
                                             {props.data.creator === userData?.username && (
                                                 <Button
                                                     className="items-center justify-start"
@@ -465,7 +422,6 @@ export function AgentCard(props: AgentCardProps) {
                                     modelOptions={props.modelOptions}
                                     slug={props.data.slug}
                                     inputToolOptions={props.inputToolOptions}
-                                    isSubscribed={props.isSubscribed}
                                     outputModeOptions={props.outputModeOptions}
                                 />
                             </DialogContent>
@@ -532,7 +488,6 @@ interface AgentModificationFormProps {
     inputToolOptions: { [key: string]: string };
     outputModeOptions: { [key: string]: string };
     slug?: string;
-    isSubscribed: boolean;
 }
 
 export function AgentModificationForm(props: AgentModificationFormProps) {
@@ -552,10 +507,6 @@ export function AgentModificationForm(props: AgentModificationFormProps) {
     const [currentStep, setCurrentStep] = useState(0);
     const [fileSearchValue, setFileSearchValue] = useState("");
 
-    const [showSubscribeDialog, setShowSubscribeDialog] = useState(false);
-
-    const privacyOptions = ["public", "private", "protected"];
-
     const basicFields = [
         { name: "name", label: "Name" },
         { name: "persona", label: "Personality" },
@@ -570,14 +521,11 @@ export function AgentModificationForm(props: AgentModificationFormProps) {
 
     const knowledgeBaseFields = [{ name: "files", label: "Knowledge Base" }];
 
-    const customizationFields = [
-        { name: "chat_model", label: "Chat Model" },
-        { name: "privacy_level", label: "Privacy Level" },
-    ];
+    const customizationFields = [{ name: "chat_model", label: "Chat Model" }];
 
     const formGroups = [
         { fields: basicFields, label: "1. Basic Settings", tabName: "basic" },
-        { fields: customizationFields, label: "2. Model & Privacy", tabName: "customize" },
+        { fields: customizationFields, label: "2. Model", tabName: "customize" },
         { fields: knowledgeBaseFields, label: "3. Knowledge Base", tabName: "knowledge" },
         { fields: toolsFields, label: "4. Tools", tabName: "tools" },
     ];
@@ -714,38 +662,6 @@ export function AgentModificationForm(props: AgentModificationFormProps) {
         }
     };
 
-    if (showSubscribeDialog) {
-        return (
-            <AlertDialog open={true}>
-                <AlertDialogContent>
-                    <AlertDialogHeader>
-                        <AlertDialogTitle>Upgrade to Futurist</AlertDialogTitle>
-                    </AlertDialogHeader>
-                    <AlertDialogDescription>
-                        You need to be a Futurist subscriber to create more agents.{" "}
-                        <Link href="/settings">Upgrade now</Link>.
-                    </AlertDialogDescription>
-                    <AlertDialogFooter>
-                        <AlertDialogCancel
-                            onClick={() => {
-                                setShowSubscribeDialog(false);
-                            }}
-                        >
-                            Cancel
-                        </AlertDialogCancel>
-                        <AlertDialogAction
-                            onClick={() => {
-                                window.location.href = "/settings";
-                            }}
-                        >
-                            Continue
-                        </AlertDialogAction>
-                    </AlertDialogFooter>
-                </AlertDialogContent>
-            </AlertDialog>
-        );
-    }
-
     const renderFormField = (fieldName: string) => {
         switch (fieldName) {
             case "name":
@@ -783,15 +699,7 @@ export function AgentModificationForm(props: AgentModificationFormProps) {
                             <FormItem className="my-2 grid gap-2">
                                 <FormLabel>Chat Model</FormLabel>
                                 <FormDescription>
-                                    {!props.isSubscribed ? (
-                                        <p className="text-secondary-foreground">
-                                            Upgrade to the{" "}
-                                            <Link href="/settings">Futurist plan</Link> to access
-                                            all models.
-                                        </p>
-                                    ) : (
-                                        <p>Which chat model would you like to use?</p>
-                                    )}
+                                    <p>Which chat model would you like to use?</p>
                                 </FormDescription>
                                 <Select onValueChange={field.onChange} defaultValue={field.value}>
                                     <FormControl>
@@ -804,75 +712,9 @@ export function AgentModificationForm(props: AgentModificationFormProps) {
                                             <SelectItem
                                                 key={modelOption.id}
                                                 value={modelOption.name}
-                                                disabled={
-                                                    !props.isSubscribed &&
-                                                    modelOption.tier !== "free"
-                                                }
                                             >
                                                 <div className="flex items-center space-x-2">
-                                                    {modelOption.name}{" "}
-                                                    {modelOption.tier === "standard" && (
-                                                        <span className="text-green-500 ml-2">
-                                                            (Futurist)
-                                                        </span>
-                                                    )}
-                                                </div>
-                                            </SelectItem>
-                                        ))}
-                                    </SelectContent>
-                                </Select>
-                                <FormMessage />
-                            </FormItem>
-                        )}
-                    />
-                );
-            case "privacy_level":
-                return (
-                    <FormField
-                        key={fieldName}
-                        control={props.form.control}
-                        name="privacy_level"
-                        render={({ field }) => (
-                            <FormItem className="my-2 grid gap-2">
-                                <FormLabel>
-                                    <div>Privacy Level</div>
-                                </FormLabel>
-                                <FormDescription>
-                                    <Popover>
-                                        <PopoverTrigger asChild>
-                                            <Button
-                                                variant={"ghost" as const}
-                                                className="p-0 h-fit"
-                                            >
-                                                <span className="items-center flex gap-1 text-sm">
-                                                    <Info className="inline" />
-                                                    <p className="text-sm">Learn more</p>
-                                                </span>
-                                            </Button>
-                                        </PopoverTrigger>
-                                        <PopoverContent>
-                                            <b>Private</b>: only visible to you.
-                                            <br />
-                                            <b>Protected</b>: visible to anyone with a link.
-                                            <br />
-                                            <b>Public</b>: visible to everyone.
-                                            <br />
-                                            All public agents will be reviewed by us before they are
-                                            launched.
-                                        </PopoverContent>
-                                    </Popover>
-                                </FormDescription>
-                                <Select onValueChange={field.onChange} defaultValue={field.value}>
-                                    <FormControl>
-                                        <SelectTrigger className="w-[200px] dark:bg-muted">
-                                            <SelectValue placeholder="private" />
-                                        </SelectTrigger>
-                                    </FormControl>
-                                    <SelectContent className="items-center space-y-1 inline-flex flex-col">
-                                        {privacyOptions.map((privacyOption) => (
-                                            <SelectItem key={privacyOption} value={privacyOption}>
-                                                <div className="flex items-center space-x-2">
-                                                    {privacyOption}
+                                                    {modelOption.name}
                                                 </div>
                                             </SelectItem>
                                         ))}

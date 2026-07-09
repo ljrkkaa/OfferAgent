@@ -20,9 +20,9 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import RedirectResponse, Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.websockets import WebSocketState
-from starlette.authentication import has_required_scope, requires
+from starlette.authentication import requires
 from starlette.requests import URL, Headers
 
 from khoj.app.settings import ALLOWED_HOSTS
@@ -30,30 +30,27 @@ from khoj.database.adapters import (
     AgentAdapters,
     ConversationAdapters,
     EntryAdapters,
-    PublicConversationAdapters,
-    UserMemoryAdapters,
+    FileObjectAdapters,
     aget_user_name,
 )
 from khoj.database.models import Agent, KhojUser
 from khoj.processor.conversation import prompts
 from khoj.processor.conversation.agent_tool_loop import collect_agent_context_and_actions
 from khoj.processor.conversation.notes_tool_loop import collect_notes_evidence_with_tools
-from khoj.processor.conversation.openai.utils import is_local_api
+from khoj.processor.conversation.offeragent_intent_router import RouteDecision, route_offeragent_intent
 from khoj.processor.conversation.prompts import no_entries_found
 from khoj.processor.conversation.utils import (
-    OperatorRun,
     ResponseWithThought,
     defilter_query,
     save_to_conversation_log,
 )
-from khoj.processor.operator import operate_environment
+from khoj.processor.conversation.vault_policy import load_vault_policy
 from khoj.processor.tools.online_search import (
     deduplicate_organic_results,
     read_webpages,
     search_online,
 )
 from khoj.processor.tools.run_code import run_code
-from khoj.routers.email import send_query_feedback
 from khoj.routers.helpers import (
     ApiImageRateLimiter,
     ApiUserRateLimiter,
@@ -62,10 +59,10 @@ from khoj.routers.helpers import (
     CommonQueryParams,
     ConversationCommandRateLimiter,
     DeleteMessageRequestBody,
-    FeedbackData,
     WebSocketConnectionManager,
     acreate_title_from_history,
     agenerate_chat_response,
+    execute_search,
     gather_raw_query_files,
     generate_mermaidjs_diagram,
     generate_summary_from_files,
@@ -74,8 +71,8 @@ from khoj.routers.helpers import (
     is_query_empty,
     is_ready_to_chat,
     read_chat_stream,
+    select_offeragent_memories,
     send_message_to_model_wrapper,
-    update_telemetry_state,
     validate_chat_model,
 )
 from khoj.routers.research import ResearchIteration, research
@@ -88,9 +85,7 @@ from khoj.utils.helpers import (
     get_country_code_from_timezone,
     get_country_name_from_timezone,
     is_code_sandbox_enabled,
-    is_env_var_true,
     is_none_or_empty,
-    is_operator_enabled,
     is_web_search_enabled,
 )
 from khoj.utils.local_kb import get_local_kb_root
@@ -110,15 +105,72 @@ from khoj.utils.rawconfig import (
 
 # Initialize Router
 logger = logging.getLogger(__name__)
-conversation_command_rate_limiter = ConversationCommandRateLimiter(
-    trial_rate_limit=20, subscribed_rate_limit=75, slug="command"
-)
+conversation_command_rate_limiter = ConversationCommandRateLimiter(rate_limit=20, slug="command")
 
 api_chat = APIRouter()
+
+
+async def search_indexed_notes(
+    user: KhojUser, query: str, agent: Optional[Agent], limit: int = 8
+) -> list[dict[str, Any]]:
+    if not getattr(user, "uuid", None):
+        return []
+    searchable_agent = agent if getattr(agent, "pk", None) else None
+    results = await execute_search(user=user, q=query, n=limit * 5, agent=searchable_agent)
+
+    unique_results = []
+    seen_files = set()
+    for result in results:
+        file_name = (result.additional or {}).get("file") or result.corpus_id
+        if file_name in seen_files:
+            continue
+        seen_files.add(file_name)
+        unique_results.append(result)
+        if len(unique_results) >= limit:
+            break
+
+    file_names = [(result.additional or {}).get("file") for result in unique_results]
+    file_objects = await FileObjectAdapters.aget_file_objects_by_names(user, [name for name in file_names if name])
+    raw_text_by_file = {file_object.file_name: file_object.raw_text for file_object in file_objects}
+
+    references: list[dict[str, Any]] = []
+    for result in unique_results:
+        additional = result.additional or {}
+        file_name = additional.get("file")
+        raw_text = raw_text_by_file.get(file_name)
+        references.append(
+            {
+                "query": additional.get("query") or query,
+                "file": file_name,
+                "uri": additional.get("uri") or file_name,
+                "compiled": f"# {file_name}\n{raw_text}" if raw_text else result.entry,
+                "score": result.score,
+                "source": additional.get("source") or "indexed",
+                "heading": additional.get("heading"),
+            }
+        )
+    return references
+
+
+def _client_supports_vault_actions(body: ChatRequestBody, client: Any) -> bool:
+    client_name = str(client or "").lower()
+    capabilities = body.client_capabilities or {}
+    return "obsidian" in client_name and bool(capabilities.get("vaultActions"))
+
+
+def _collect_vault_actions(references: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    actions = []
+    for reference in references:
+        action = reference.get("vault_action")
+        if isinstance(action, dict):
+            actions.append(action)
+    return actions
+
 
 NON_STREAM_STRUCTURED_EVENTS = {
     ChatEvent.REFERENCES,
     ChatEvent.GENERATED_ASSETS,
+    ChatEvent.VAULT_ACTIONS,
     ChatEvent.METADATA,
     ChatEvent.USAGE,
 }
@@ -231,13 +283,6 @@ def remove_file_filter(request: Request, filter: FileFilterRequest) -> Response:
     return Response(content=json.dumps(file_filters), media_type="application/json", status_code=200)
 
 
-@api_chat.post("/feedback")
-@requires(["authenticated"])
-async def sendfeedback(request: Request, data: FeedbackData):
-    user: KhojUser = request.user.object
-    await send_query_feedback(data.uquery, data.kquery, data.sentiment, user.email)
-
-
 @api_chat.get("/starters", response_class=Response)
 @requires(["authenticated"])
 async def chat_starters(
@@ -273,7 +318,7 @@ def chat_history(
 
     agent_metadata = None
     if conversation.agent:
-        if conversation.agent.privacy_level == Agent.PrivacyLevel.PRIVATE and conversation.agent.creator != user:
+        if not conversation.agent.managed_by_admin and conversation.agent.creator != user:
             conversation.agent = None
         else:
             agent_metadata = {
@@ -303,91 +348,6 @@ def chat_history(
         # Else return all messages except latest N
         elif n < 0 and meta_log.get("chat"):
             meta_log["chat"] = meta_log["chat"][:n]
-
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="chat_history",
-        **common.__dict__,
-    )
-
-    return {"status": "ok", "response": meta_log}
-
-
-@api_chat.get("/share/history")
-def get_shared_chat(
-    request: Request,
-    common: CommonQueryParams,
-    public_conversation_slug: str,
-    n: Optional[int] = None,
-):
-    user = request.user.object if request.user.is_authenticated else None
-
-    # Load Conversation History
-    conversation = PublicConversationAdapters.get_public_conversation_by_slug(public_conversation_slug)
-
-    if conversation is None:
-        return Response(
-            content=json.dumps({"status": "error", "message": f"Conversation: {public_conversation_slug} not found"}),
-            status_code=404,
-        )
-
-    agent_metadata = None
-    if conversation.agent:
-        if conversation.agent.privacy_level == Agent.PrivacyLevel.PRIVATE and conversation.agent.creator != user:
-            if conversation.agent.is_hidden:
-                default_agent = AgentAdapters.get_default_agent()
-                agent_metadata = {
-                    "slug": default_agent.slug,
-                    "name": default_agent.name,
-                    "is_creator": False,
-                    "color": default_agent.style_color,
-                    "icon": default_agent.style_icon,
-                    "persona": default_agent.personality,
-                    "is_hidden": default_agent.is_hidden,
-                }
-            else:
-                conversation.agent = None
-        else:
-            agent_metadata = {
-                "slug": conversation.agent.slug,
-                "name": conversation.agent.name,
-                "is_creator": conversation.agent.creator == user,
-                "color": conversation.agent.style_color,
-                "icon": conversation.agent.style_icon,
-                "persona": conversation.agent.personality,
-                "is_hidden": conversation.agent.is_hidden,
-            }
-
-    meta_log = conversation.conversation_log
-    scrubbed_title = conversation.title if conversation.title else conversation.slug
-
-    if scrubbed_title:
-        scrubbed_title = scrubbed_title.replace("-", " ")
-
-    meta_log.update(
-        {
-            "conversation_id": conversation.id,
-            "slug": scrubbed_title,
-            "agent": agent_metadata,
-            "is_owner": conversation.source_owner == user,
-        }
-    )
-
-    if n:
-        # Get latest N messages if N > 0
-        if n > 0 and meta_log.get("chat"):
-            meta_log["chat"] = meta_log["chat"][-n:]
-        # Else return all messages except latest N
-        elif n < 0 and meta_log.get("chat"):
-            meta_log["chat"] = meta_log["chat"][:n]
-
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="get_shared_chat_history",
-        **common.__dict__,
-    )
 
     return {"status": "ok", "response": meta_log}
 
@@ -419,133 +379,7 @@ async def clear_chat_history(
             status_code=404,
         )
 
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="clear_chat_history",
-        **common.__dict__,
-    )
-
     return {"status": "ok", "message": "Conversation history cleared"}
-
-
-@api_chat.post("/share/fork")
-@requires(["authenticated"])
-def fork_public_conversation(
-    request: Request,
-    common: CommonQueryParams,
-    public_conversation_slug: str,
-):
-    user = request.user.object
-
-    # Load Conversation History
-    public_conversation = PublicConversationAdapters.get_public_conversation_by_slug(public_conversation_slug)
-    if public_conversation is None:
-        return Response(
-            content=json.dumps({"status": "error", "message": "Conversation not found"}),
-            status_code=404,
-        )
-
-    # Duplicate Public Conversation to User's Private Conversation
-    new_conversation = ConversationAdapters.create_conversation_from_public_conversation(
-        user, public_conversation, request.user.client_app
-    )
-
-    chat_metadata = {"forked_conversation": public_conversation.slug}
-
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="fork_public_conversation",
-        **common.__dict__,
-        metadata=chat_metadata,
-    )
-
-    redirect_uri = str(request.app.url_path_for("chat_page"))
-
-    return Response(
-        status_code=200,
-        content=json.dumps(
-            {
-                "status": "ok",
-                "next_url": redirect_uri,
-                "conversation_id": str(new_conversation.id),
-            }
-        ),
-    )
-
-
-@api_chat.post("/share")
-@requires(["authenticated"])
-def duplicate_chat_history_public_conversation(
-    request: Request,
-    common: CommonQueryParams,
-    conversation_id: str,
-):
-    user = request.user.object
-    domain = request.headers.get("host")
-    scheme = request.url.scheme
-    # Force https upgrade if not explicitly disabled and not local host
-    if scheme == "http" and not is_env_var_true("KHOJ_NO_HTTPS") and not is_local_api(f"{request.base_url}"):
-        scheme = "https"
-
-    # Throw unauthorized exception if domain not in ALLOWED_HOSTS
-    host_domain = domain.split(":")[0]
-    if host_domain not in ALLOWED_HOSTS:
-        raise HTTPException(status_code=401, detail="Unauthorized domain")
-
-    # Duplicate Conversation History to Public Conversation
-    conversation = ConversationAdapters.get_conversation_by_user(user, request.user.client_app, conversation_id)
-    if conversation is None:
-        return Response(
-            content=json.dumps({"status": "error", "message": "Conversation not found"}),
-            status_code=404,
-        )
-    public_conversation = ConversationAdapters.make_public_conversation_copy(conversation)
-    public_conversation_url = PublicConversationAdapters.get_public_conversation_url(public_conversation)
-
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="post_chat_share",
-        **common.__dict__,
-    )
-
-    return Response(
-        status_code=200, content=json.dumps({"status": "ok", "url": f"{scheme}://{domain}{public_conversation_url}"})
-    )
-
-
-@api_chat.delete("/share")
-@requires(["authenticated"])
-def delete_public_conversation(
-    request: Request,
-    common: CommonQueryParams,
-    public_conversation_slug: str,
-):
-    user = request.user.object
-
-    # Delete Public Conversation
-    deleted = PublicConversationAdapters.delete_public_conversation_by_slug(user=user, slug=public_conversation_slug)
-    if not deleted:
-        return Response(
-            content=json.dumps({"status": "error", "message": "Conversation not found"}),
-            status_code=404,
-        )
-
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="delete_chat_share",
-        **common.__dict__,
-    )
-
-    # Redirect to the main chat page
-    redirect_uri = str(request.app.url_path_for("chat_page"))
-    return RedirectResponse(
-        url=redirect_uri,
-        status_code=301,
-    )
 
 
 @api_chat.get("/sessions")
@@ -589,13 +423,6 @@ def chat_sessions(
         for session in sessions
     ]
 
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="chat_sessions",
-        **common.__dict__,
-    )
-
     return Response(content=json.dumps(session_values), media_type="application/json", status_code=200)
 
 
@@ -618,18 +445,6 @@ async def create_chat_session(
 
     response = {"conversation_id": str(conversation.id)}
 
-    conversation_metadata = {
-        "agent": requested_agent_slug,
-    }
-
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="create_chat_sessions",
-        metadata=conversation_metadata,
-        **common.__dict__,
-    )
-
     return Response(content=json.dumps(response), media_type="application/json", status_code=200)
 
 
@@ -640,8 +455,6 @@ async def chat_options(
 ) -> Response:
     cmd_options = {}
     for cmd in ConversationCommand:
-        if cmd == ConversationCommand.Operator and not is_operator_enabled():
-            continue
         if cmd in [ConversationCommand.Online, ConversationCommand.Webpage] and not is_web_search_enabled():
             continue
         if cmd == ConversationCommand.Code and not is_code_sandbox_enabled():
@@ -649,12 +462,6 @@ async def chat_options(
         if cmd in command_descriptions:
             cmd_options[cmd.value] = command_descriptions[cmd]
 
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="chat_options",
-        **common.__dict__,
-    )
     return Response(content=json.dumps(cmd_options), media_type="application/json", status_code=200)
 
 
@@ -675,13 +482,6 @@ async def set_conversation_title(
     )
 
     success = True if conversation else False
-
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="set_conversation_title",
-        **common.__dict__,
-    )
 
     return Response(
         content=json.dumps({"status": "ok", "success": success}), media_type="application/json", status_code=200
@@ -749,10 +549,8 @@ async def event_generator(
 
     start_time = time.perf_counter()
     ttft = None
-    chat_metadata: dict = {}
     conversation = None
     user: KhojUser = user_scope.object
-    is_subscribed = has_required_scope(request_obj, ["premium"])
     q = unquote(q)
     defiltered_query = defilter_query(q)
     train_of_thought = []
@@ -785,7 +583,6 @@ async def event_generator(
     research_results: List[ResearchIteration] = []
     online_results: Dict = dict()
     code_results: Dict = dict()
-    operator_results: List[OperatorRun] = []
     compiled_references: List[Any] = []
     inferred_queries: List[Any] = []
     attached_file_context = gather_raw_query_files(query_files)
@@ -793,6 +590,7 @@ async def event_generator(
     generated_images: List[str] = []
     generated_mermaidjs_diagram: str = None
     generated_asset_results: Dict = dict()
+    vault_actions: list[dict[str, Any]] = []
     conversation_commands: List[ConversationCommand] = []
     program_execution_context: List[str] = []
     user_message_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -819,7 +617,6 @@ async def event_generator(
                                 compiled_references=compiled_references,
                                 online_results=online_results,
                                 code_results=code_results,
-                                operator_results=operator_results,
                                 research_results=research_results,
                                 inferred_queries=inferred_queries,
                                 client_application=user_scope.client_app,
@@ -865,7 +662,6 @@ async def event_generator(
                         compiled_references=compiled_references,
                         online_results=online_results,
                         code_results=code_results,
-                        operator_results=operator_results,
                         research_results=research_results,
                         inferred_queries=inferred_queries,
                         client_application=user_scope.client_app,
@@ -949,30 +745,12 @@ async def event_generator(
             yield result
 
     def collect_telemetry():
-        # Gather chat response telemetry
-        nonlocal chat_metadata
         latency = time.perf_counter() - start_time
-        cmd_set = set([cmd.value for cmd in conversation_commands])
         cost = (tracer.get("usage", {}) or {}).get("cost", 0)
-        chat_metadata = chat_metadata or {}
-        chat_metadata["conversation_command"] = cmd_set
-        chat_metadata["agent"] = conversation.agent.slug if conversation and conversation.agent else None
-        chat_metadata["cost"] = f"{cost:.5f}"
-        chat_metadata["latency"] = f"{latency:.3f}"
         if ttft:
-            chat_metadata["ttft_latency"] = f"{ttft:.3f}"
             logger.info(f"Chat response time to first token: {ttft:.3f} seconds")
         logger.info(f"Chat response total time: {latency:.3f} seconds")
         logger.info(f"Chat response cost: ${cost:.5f}")
-        update_telemetry_state(
-            request=request_obj,
-            telemetry_type="api",
-            api="chat",
-            client=common.client,
-            user_agent=headers.get("user-agent"),
-            host=headers.get("host"),
-            metadata=chat_metadata,
-        )
 
     # Start the disconnect monitor in the background
     disconnect_monitor_task = asyncio.create_task(monitor_disconnection())
@@ -1024,18 +802,16 @@ async def event_generator(
         location = LocationData(city=city, region=region, country=country, country_code=country_code)
     chat_history = conversation.messages
 
-    # Get most recent memories and long term relevant memories if memory is enabled
     relevant_memories = []
     if await ConversationAdapters.ais_memory_enabled(user):
-        recent_memories = await UserMemoryAdapters.pull_memories(user=user, agent=agent)
-        long_term_memories = await UserMemoryAdapters.search_memories(query=q, user=user, agent=agent)
-        # Create a de-duped set of memories
-        relevant_memories = list({m.id: m for m in recent_memories + long_term_memories}.values())
+        relevant_memories = await select_offeragent_memories(user, q, agent, tracer=tracer)
 
     local_kb_root = get_local_kb_root()
     kb_engine = get_kb_engine()
     notes_local_source_available = local_kb_root is not None and kb_engine in {"file_first", "hybrid"}
     notes_openkb_source_available = kb_engine in {"openkb", "hybrid"} and openkb_is_ready()
+    vault_policy = load_vault_policy(local_kb_root)
+    vault_actions_supported = _client_supports_vault_actions(body, common.client)
 
     # If interrupted message in DB
     if last_message := await conversation.pop_message(interrupted=True):
@@ -1048,9 +824,46 @@ async def event_generator(
             for iter_dict in last_message.researchContext or []
             if iter_dict.get("summarizedResult")
         ]
-        operator_results = [OperatorRun(**iter_dict) for iter_dict in last_message.operatorContext or []]
         train_of_thought = [thought.model_dump() for thought in last_message.trainOfThought or []]
         logger.info(f"Loaded interrupted partial context from conversation {conversation_id}.")
+
+    explicit_command = q.lstrip().startswith("/")
+    route_decision: RouteDecision | None = None
+    if conversation_commands == [ConversationCommand.Default] and not explicit_command:
+        async def router_send_message(**kwargs):
+            return await send_message_to_model_wrapper(
+                user=user,
+                query_files=attached_file_context,
+                query_images=uploaded_images,
+                relevant_memories=relevant_memories,
+                tracer=tracer,
+                **kwargs,
+            )
+
+        route_decision = await route_offeragent_intent(
+            q,
+            chat_history,
+            send_message=router_send_message,
+            vault_policy=vault_policy,
+            client_app=common.client,
+            client_capabilities=body.client_capabilities,
+        )
+        if route_decision.needs_confirmation and route_decision.question:
+            async for result in send_llm_response(route_decision.question, tracer.get("usage")):
+                yield result
+            return
+        try:
+            routed_command = ConversationCommand(route_decision.command)
+        except ValueError:
+            routed_command = ConversationCommand.Default
+        if routed_command != ConversationCommand.Default:
+            conversation_commands = [routed_command]
+            inferred_queries.append(f"router:{route_decision.intent}:{route_decision.route}")
+            async for result in send_event(
+                ChatEvent.STATUS,
+                f"**Routed by intent:** {route_decision.route}",
+            ):
+                yield result
 
     if conversation_commands == [ConversationCommand.Default]:
         try:
@@ -1088,6 +901,8 @@ async def event_generator(
                 allow_openkb=notes_openkb_source_available,
                 allow_web=is_web_search_enabled(),
                 conversation_id=conversation_id,
+                write_mode="client_actions" if vault_actions_supported else "server",
+                vault_policy=vault_policy,
                 location=location,
                 query_images=uploaded_images,
                 query_files=attached_file_context,
@@ -1095,6 +910,7 @@ async def event_generator(
                 tracer=tracer,
             )
             compiled_references.extend(agent_result.references)
+            vault_actions.extend(_collect_vault_actions(agent_result.references))
             inferred_queries.extend(agent_result.inferred_queries)
             online_results.update(agent_result.online_results)
             program_execution_context.extend(agent_result.program_context)
@@ -1191,21 +1007,6 @@ async def event_generator(
             else:
                 yield research_result
 
-            # Track operator results across research and operator iterations
-            # This relies on two conditions:
-            # 1. Check to append new (partial) operator results
-            #    Relies on triggering this check on every status updates.
-            #    Status updates cascade up from operator to research to chat api on every step.
-            # 2. Keep operator results in sync with each research operator step
-            #    Relies on python object references to ensure operator results
-            #    are implicitly kept in sync after the initial append
-            if (
-                research_results
-                and research_results[-1].operatorContext
-                and (not operator_results or operator_results[-1] is not research_results[-1].operatorContext)
-            ):
-                operator_results.append(research_results[-1].operatorContext)
-
         # researched_results = await extract_relevant_info(q, researched_results, agent)
         if state.verbose > 1:
             logger.debug(f"Researched Results: {''.join(r.summarizedResult or '' for r in research_results)}")
@@ -1255,8 +1056,11 @@ async def event_generator(
                 allow_local_kb=allow_local_kb,
                 allow_openkb=allow_openkb,
                 conversation_id=conversation_id,
+                write_mode="client_actions" if vault_actions_supported else "server",
+                vault_policy=vault_policy,
             )
             compiled_references.extend(notes_result.references)
+            vault_actions.extend(_collect_vault_actions(notes_result.references))
             inferred_queries.extend(notes_result.inferred_queries)
             notes_tool_loop_has_evidence = not is_none_or_empty(notes_result.references)
             for reference in notes_result.references:
@@ -1271,6 +1075,8 @@ async def event_generator(
                     write_instruction = "Final answer must report this exact Notes write tool result."
                     if reference.get("status") == "written":
                         write_instruction += " Do not say writing is unavailable."
+                    elif reference.get("status") == "action_prepared":
+                        write_instruction = "Final answer should say a local vault action was prepared for the client to apply."
                     program_execution_context.append(
                         "Notes write tool result: "
                         f"{json.dumps(write_result, ensure_ascii=False, default=str)}. "
@@ -1296,6 +1102,19 @@ async def event_generator(
             yield result
 
         compiled_references[:] = dedupe_references(compiled_references)
+
+    if (
+        (conversation_commands == [ConversationCommand.General] or notes_requested)
+        and is_none_or_empty(compiled_references)
+        and not used_notes_tool_loop
+        and not notes_tool_loop_failed
+    ):
+        indexed_references = await search_indexed_notes(user, defiltered_query, agent)
+        if indexed_references:
+            compiled_references.extend(indexed_references)
+            inferred_queries.append(defiltered_query)
+            async for result in send_event(ChatEvent.STATUS, "Searched synced knowledge base"):
+                yield result
 
     if notes_requested and notes_tool_loop_failed:
         async for result in send_llm_response(
@@ -1427,45 +1246,6 @@ async def event_generator(
                 exc_info=True,
             )
 
-    ## Operate Computer
-    if ConversationCommand.Operator in conversation_commands:
-        try:
-            async for result in operate_environment(
-                defiltered_query,
-                user,
-                chat_history,
-                location,
-                list(operator_results)[-1] if operator_results else None,
-                query_images=uploaded_images,
-                query_files=attached_file_context,
-                relevant_memories=relevant_memories,
-                send_status_func=partial(send_event, ChatEvent.STATUS),
-                agent=agent,
-                cancellation_event=cancellation_event,
-                interrupt_queue=child_interrupt_queue,
-                tracer=tracer,
-            ):
-                if isinstance(result, dict) and ChatEvent.STATUS in result:
-                    yield result[ChatEvent.STATUS]
-                elif isinstance(result, OperatorRun):
-                    if not operator_results or operator_results[-1] is not result:
-                        operator_results.append(result)
-                    # Add webpages visited while operating browser to references
-                    if result.webpages:
-                        if not online_results.get(defiltered_query):
-                            online_results[defiltered_query] = {"webpages": result.webpages}
-                        elif not online_results[defiltered_query].get("webpages"):
-                            online_results[defiltered_query]["webpages"] = result.webpages
-                        else:
-                            online_results[defiltered_query]["webpages"] += result.webpages
-        except ValueError as e:
-            program_execution_context.append(f"Browser operation error: {e}")
-            logger.warning(f"Failed to operate browser with {e}", exc_info=True)
-            async for result in send_event(
-                ChatEvent.STATUS, "Operating browser failed. I'll try respond appropriately"
-            ):
-                yield result
-
     ## Send Gathered References
     unique_online_results = deduplicate_organic_results(online_results)
     async for result in send_event(
@@ -1534,18 +1314,21 @@ async def event_generator(
         await cancel_disconnect_monitor()
         return
 
+    if vault_actions:
+        async for result in send_event(ChatEvent.VAULT_ACTIONS, {"actions": vault_actions}):
+            yield result
+
     ## Generate Text Output
     async for result in send_event(ChatEvent.STATUS, "**Generating a well-informed response**"):
         yield result
 
-    llm_response, chat_metadata = await agenerate_chat_response(
+    llm_response, _ = await agenerate_chat_response(
         defiltered_query,
         chat_history,
         conversation,
         compiled_references,
         online_results,
         code_results,
-        operator_results,
         research_results,
         user,
         location,
@@ -1555,7 +1338,6 @@ async def event_generator(
         relevant_memories,
         program_execution_context,
         generated_asset_results,
-        is_subscribed,
         tracer,
     )
 
@@ -1625,7 +1407,6 @@ async def event_generator(
             compiled_references=compiled_references,
             online_results=online_results,
             code_results=code_results,
-            operator_results=operator_results,
             research_results=research_results,
             inferred_queries=inferred_queries,
             client_application=user_scope.client_app,
@@ -1636,6 +1417,7 @@ async def event_generator(
             relevant_memories=relevant_memories,
             generated_images=generated_images,
             generated_mermaidjs_diagram=generated_mermaidjs_diagram,
+            used_notes_tool_loop=used_notes_tool_loop,
             tracer=tracer,
         )
     )
@@ -1670,7 +1452,7 @@ async def chat_ws(
 
     # Limit open websocket connections per user
     user = websocket.scope["user"].object
-    connection_manager = WebSocketConnectionManager(trial_user_max_connections=5, subscribed_user_max_connections=10)
+    connection_manager = WebSocketConnectionManager(max_connections=10)
     connection_id = str(uuid.uuid4())
 
     if not await connection_manager.can_connect(websocket):
@@ -1684,10 +1466,8 @@ async def chat_ws(
     await connection_manager.register_connection(user, connection_id)
 
     # Initialize rate limiters
-    rate_limiter_per_minute = ApiUserRateLimiter(requests=20, subscribed_requests=20, window=60, slug="chat_minute")
-    rate_limiter_per_day = ApiUserRateLimiter(
-        requests=100, subscribed_requests=600, window=60 * 60 * 24, slug="chat_day"
-    )
+    rate_limiter_per_minute = ApiUserRateLimiter(requests=20, window=60, slug="chat_minute")
+    rate_limiter_per_day = ApiUserRateLimiter(requests=100, window=60 * 60 * 24, slug="chat_day")
     image_rate_limiter = ApiImageRateLimiter(max_images=10, max_combined_size_mb=20)
 
     # Shared interrupt queue for communicating interrupts to ongoing research
@@ -1911,12 +1691,8 @@ async def chat(
     request: Request,
     common: CommonQueryParams,
     body: ChatRequestBody,
-    rate_limiter_per_minute=Depends(
-        ApiUserRateLimiter(requests=20, subscribed_requests=20, window=60, slug="chat_minute")
-    ),
-    rate_limiter_per_day=Depends(
-        ApiUserRateLimiter(requests=100, subscribed_requests=600, window=60 * 60 * 24, slug="chat_day")
-    ),
+    rate_limiter_per_minute=Depends(ApiUserRateLimiter(requests=20, window=60, slug="chat_minute")),
+    rate_limiter_per_day=Depends(ApiUserRateLimiter(requests=100, window=60 * 60 * 24, slug="chat_day")),
     image_rate_limiter=Depends(ApiImageRateLimiter(max_images=10, max_combined_size_mb=20)),
 ):
     if body.conversation_id is not None and not body.create_new:

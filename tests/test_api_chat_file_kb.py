@@ -5,6 +5,7 @@ import pytest
 from starlette.datastructures import Headers
 
 from khoj.processor.conversation.agent_tool_loop import AgentToolLoopResult
+from khoj.processor.conversation.offeragent_intent_router import RouteDecision
 from khoj.processor.conversation.utils import ResponseWithThought
 from khoj.routers import api_chat
 from khoj.routers.helpers import CommonQueryParamsClass
@@ -37,7 +38,14 @@ async def ok_response(*args, **kwargs):
 
 
 async def run_chat(
-    monkeypatch, q, *, agent_slug="default", client_app="web", generate_response=ok_response, **patched
+    monkeypatch,
+    q,
+    *,
+    agent_slug="default",
+    client_app="web",
+    client_capabilities=None,
+    generate_response=ok_response,
+    **patched,
 ):
     user = SimpleNamespace(id=1)
     user_scope = SimpleNamespace(object=user, client_app=client_app)
@@ -55,7 +63,6 @@ async def run_chat(
     async def fake_memory_disabled(user):
         return False
 
-    monkeypatch.setattr(api_chat, "has_required_scope", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(api_chat.ConversationAdapters, "aget_conversation_by_user", fake_conversation)
     monkeypatch.setattr(api_chat.AgentAdapters, "aget_default_agent", fake_default_agent)
     monkeypatch.setattr(api_chat, "is_ready_to_chat", noop_async)
@@ -64,11 +71,15 @@ async def run_chat(
     monkeypatch.setattr(api_chat.conversation_command_rate_limiter, "update_and_check_if_valid", noop_async)
     monkeypatch.setattr(api_chat, "agenerate_chat_response", generate_response)
     monkeypatch.setattr(api_chat, "save_to_conversation_log", noop_async)
-    monkeypatch.setattr(api_chat, "update_telemetry_state", lambda *a, **k: None)
+    if "route_offeragent_intent" not in patched:
+        async def fake_default_router(*args, **kwargs):
+            return RouteDecision(route="default", intent="conversation", confidence=1.0)
+
+        monkeypatch.setattr(api_chat, "route_offeragent_intent", fake_default_router)
     for name, value in patched.items():
         monkeypatch.setattr(api_chat, name, value)
 
-    body = ChatRequestBody(q=q, stream=True)
+    body = ChatRequestBody(q=q, stream=True, client_capabilities=client_capabilities)
     return [
         event
         async for event in api_chat.event_generator(
@@ -99,6 +110,37 @@ def fake_notes_model(*responses):
 
 
 @pytest.mark.asyncio
+async def test_search_indexed_notes_dedupes_files_and_prefers_raw_text(monkeypatch):
+    user = SimpleNamespace(uuid="user-uuid")
+
+    class Result:
+        def __init__(self, file, entry):
+            self.additional = {"file": file, "uri": f"file://{file}", "query": "daily"}
+            self.corpus_id = file
+            self.entry = entry
+            self.score = 0.1
+
+    async def fake_execute_search(*args, **kwargs):
+        return [
+            Result("daily/2026-07-06.md", "chunk one"),
+            Result("daily/2026-07-06.md", "chunk two"),
+            Result("daily/2026-07-05.md", "chunk three"),
+        ]
+
+    async def fake_file_objects(*args, **kwargs):
+        return [SimpleNamespace(file_name="daily/2026-07-06.md", raw_text="full daily text")]
+
+    monkeypatch.setattr(api_chat, "execute_search", fake_execute_search)
+    monkeypatch.setattr(api_chat.FileObjectAdapters, "aget_file_objects_by_names", fake_file_objects)
+
+    refs = await api_chat.search_indexed_notes(user, "daily", None, limit=2)
+
+    assert [ref["file"] for ref in refs] == ["daily/2026-07-06.md", "daily/2026-07-05.md"]
+    assert refs[0]["compiled"] == "# daily/2026-07-06.md\nfull daily text"
+    assert refs[1]["compiled"] == "chunk three"
+
+
+@pytest.mark.asyncio
 async def test_default_chat_uses_unified_agent_runtime(monkeypatch):
     captured = {}
 
@@ -118,7 +160,6 @@ async def test_default_chat_uses_unified_agent_runtime(monkeypatch):
         compiled_references,
         online_results,
         code_results,
-        operator_results,
         research_results,
         user,
         location,
@@ -155,6 +196,52 @@ async def test_default_chat_uses_unified_agent_runtime(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_obsidian_router_notes_write_returns_vault_actions(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+    monkeypatch.setenv("KHOJ_ALLOW_VAULT_WRITE", "true")
+
+    async def fake_router(*args, **kwargs):
+        return RouteDecision(route="notes", intent="create_daily_plan", confidence=0.95)
+
+    events = await run_chat(
+        monkeypatch,
+        "帮我创建 daily/2026-07-09.md，内容是：# 2026-07-09 每日计划",
+        client_app="obsidian",
+        client_capabilities={"vaultActions": True},
+        route_offeragent_intent=fake_router,
+        send_message_to_model_wrapper=fake_notes_model(
+            json.dumps(
+                {
+                    "calls": [
+                        {
+                            "name": "append_note",
+                            "args": {
+                                "path": "daily/2026-07-09.md",
+                                "content": "# 2026-07-09 每日计划\n",
+                            },
+                            "id": "1",
+                        }
+                    ]
+                }
+            ),
+            "done",
+        ),
+    )
+
+    assert not (tmp_path / "daily" / "2026-07-09.md").exists()
+    vault_actions = events_of_type(events, "vault_actions")
+    assert vault_actions[0]["data"]["actions"] == [
+        {
+            "op": "create_file",
+            "path": "daily/2026-07-09.md",
+            "content": "# 2026-07-09 每日计划\n",
+            "heading": None,
+            "mode": "create_only",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_default_chat_can_search_web_then_write_to_local_kb(tmp_path, monkeypatch):
     target = tmp_path / "agent-eval.md"
     target.write_text("# Agent Eval\n", encoding="utf-8")
@@ -184,7 +271,6 @@ async def test_default_chat_can_search_web_then_write_to_local_kb(tmp_path, monk
         compiled_references,
         online_results,
         code_results,
-        operator_results,
         research_results,
         user,
         location,
@@ -259,6 +345,94 @@ async def test_chat_notes_local_kb_uses_main_tool_loop(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_default_chat_uses_synced_index_when_no_local_kb(monkeypatch):
+    monkeypatch.delenv("KHOJ_LOCAL_KB_PATH", raising=False)
+    captured = {}
+
+    async def fake_agent_runtime(*args, **kwargs):
+        return AgentToolLoopResult()
+
+    async def fake_indexed_notes(*args, **kwargs):
+        return [
+            {
+                "query": "最近五天 daily",
+                "file": "daily/2026-07-06.md",
+                "uri": "daily/2026-07-06.md",
+                "compiled": "2026-07-06 daily evidence",
+                "source": "indexed",
+            }
+        ]
+
+    async def fake_generate_response(
+        q,
+        chat_history,
+        conversation,
+        compiled_references,
+        *args,
+        **kwargs,
+    ):
+        captured["compiled_references"] = compiled_references
+
+        async def stream():
+            yield ResponseWithThought(text="ok")
+
+        return stream(), {}
+
+    events = await run_chat(
+        monkeypatch,
+        "帮我评价一下我最近五天的daily任务完成的如何",
+        collect_agent_context_and_actions=fake_agent_runtime,
+        search_indexed_notes=fake_indexed_notes,
+        generate_response=fake_generate_response,
+    )
+
+    assert captured["compiled_references"][0]["file"] == "daily/2026-07-06.md"
+    assert events_of_type(events, "references")[0]["data"]["context"][0]["source"] == "indexed"
+
+
+@pytest.mark.asyncio
+async def test_notes_chat_uses_synced_index_when_no_local_kb(monkeypatch):
+    monkeypatch.delenv("KHOJ_LOCAL_KB_PATH", raising=False)
+    captured = {}
+
+    async def fake_indexed_notes(*args, **kwargs):
+        return [
+            {
+                "query": "daily",
+                "file": "daily/2026-07-06.md",
+                "uri": "daily/2026-07-06.md",
+                "compiled": "2026-07-06 daily evidence",
+                "source": "indexed",
+            }
+        ]
+
+    async def fake_generate_response(
+        q,
+        chat_history,
+        conversation,
+        compiled_references,
+        *args,
+        **kwargs,
+    ):
+        captured["compiled_references"] = compiled_references
+
+        async def stream():
+            yield ResponseWithThought(text="ok")
+
+        return stream(), {}
+
+    events = await run_chat(
+        monkeypatch,
+        "/notes daily",
+        search_indexed_notes=fake_indexed_notes,
+        generate_response=fake_generate_response,
+    )
+
+    assert captured["compiled_references"][0]["file"] == "daily/2026-07-06.md"
+    assert events_of_type(events, "references")[0]["data"]["context"][0]["source"] == "indexed"
+
+
+@pytest.mark.asyncio
 async def test_chat_notes_local_kb_miss_returns_insufficient_evidence(tmp_path, monkeypatch):
     (tmp_path / "notes.md").write_text("Redis evidence", encoding="utf-8")
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
@@ -324,9 +498,7 @@ async def test_chat_notes_openkb_engine_uses_wiki_evidence(tmp_path, monkeypatch
             args[0],
         )
 
-    monkeypatch.setattr(
-        "khoj.processor.conversation.notes_tool_loop.wiki_search_documents", fake_wiki_search_documents
-    )
+    monkeypatch.setattr("khoj.processor.conversation.notes_tool_loop.wiki_search_documents", fake_wiki_search_documents)
     events = await run_chat(
         monkeypatch,
         "/notes Redis",
@@ -355,7 +527,6 @@ async def test_chat_notes_local_kb_write_request_appends_and_reports_tool_result
         compiled_references,
         online_results,
         code_results,
-        operator_results,
         research_results,
         user,
         location,
@@ -442,7 +613,6 @@ async def test_chat_notes_qqbot_write_reports_blocked_tool_result(tmp_path, monk
         compiled_references,
         online_results,
         code_results,
-        operator_results,
         research_results,
         user,
         location,
@@ -511,9 +681,7 @@ async def test_chat_explicit_save_writes_openkb_exploration(tmp_path, monkeypatc
 
         return stream(), {}
 
-    monkeypatch.setattr(
-        "khoj.processor.conversation.notes_tool_loop.wiki_search_documents", fake_wiki_search_documents
-    )
+    monkeypatch.setattr("khoj.processor.conversation.notes_tool_loop.wiki_search_documents", fake_wiki_search_documents)
     events = await run_chat(
         monkeypatch,
         "/notes 保存这次 Redis 回答",
@@ -562,9 +730,7 @@ async def test_chat_explicit_save_reports_openkb_save_failure(tmp_path, monkeypa
             args[0],
         )
 
-    monkeypatch.setattr(
-        "khoj.processor.conversation.notes_tool_loop.wiki_search_documents", fake_wiki_search_documents
-    )
+    monkeypatch.setattr("khoj.processor.conversation.notes_tool_loop.wiki_search_documents", fake_wiki_search_documents)
     events = await run_chat(
         monkeypatch,
         "/notes 保存这次 Redis 回答",

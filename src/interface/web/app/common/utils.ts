@@ -1,26 +1,5 @@
 import { useEffect, useState } from "react";
-import useSWR from "swr";
 import * as React from "react";
-
-export interface LocationData {
-    city?: string;
-    region?: string;
-    country?: string;
-    countryCode?: string;
-    timezone: string;
-}
-
-const browserTimezone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-
-const locationFetcher = (url: string) =>
-    window
-        .fetch(url)
-        .then((res) => (res.ok ? res.json() : Promise.resolve({} as Partial<LocationData>)))
-        .then((data: Partial<LocationData>) => ({
-            ...data,
-            timezone: data.timezone || browserTimezone(),
-        }))
-        .catch(() => ({ timezone: browserTimezone() }));
 
 export const toTitleCase = (str: string) =>
     str.replace(/\w\S*/g, (txt) => txt.charAt(0).toUpperCase() + txt.slice(1).toLowerCase());
@@ -30,30 +9,18 @@ export function welcomeConsole() {
         `%c %s`,
         "font-family:monospace",
         `
- __  __     __  __     ______       __        _____      __
-/\\ \\/ /    /\\ \\_\\ \\   /\\  __ \\     /\\ \\      /\\  __ \\   /\\ \\
-\\ \\  _"-.  \\ \\  __ \\  \\ \\ \\/\\ \\   _\\_\\ \\     \\ \\  __ \\  \\ \\ \\
- \\ \\_\\ \\_\\  \\ \\_\\ \\_\\  \\ \\_____\\ /\\_____\\     \\ \\_\\ \\_\\  \\ \\_\\
-  \\/_/\\/_/   \\/_/\\/_/   \\/_____/ \\/_____/      \\/_/\\/_/   \\/_/
+  ___   __  __             ___                 __
+ / _ \\ / _|/ _|___ _ _    /   \\ __ _ ___ _ _  / /_
+| (_) |  _|  _/ -_) '_|  / /\\ / _\` / -_) ' \\|  _|
+ \\___/|_| |_| \\___|_|    \\/_//\\__, \\___|_||_|\\__|
+                              |___/
 
 
 Greetings traveller,
 
-I am ✨Khoj✨, your open-source, personal AI copilot.
-
-See my source code at https://github.com/khoj-ai/khoj
-Read my operating manual at https://docs.khoj.dev
+I am ✨OfferAgent✨, your local interview-prep AI assistant.
 `,
     );
-}
-
-export function useIPLocationData() {
-    const {
-        data: locationData,
-        error: locationDataError,
-        isLoading: locationDataLoading,
-    } = useSWR<LocationData>("/api/ip", locationFetcher, { revalidateOnFocus: false });
-    return { locationData, locationDataError, locationDataLoading };
 }
 
 export function useIsMobileWidth() {

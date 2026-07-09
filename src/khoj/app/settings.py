@@ -78,7 +78,6 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    "phonenumber_field",
     "django_apscheduler",
 ]
 
@@ -225,7 +224,6 @@ USE_TZ = True
 STATIC_ROOT = BASE_DIR / "static"
 STATICFILES_DIRS = [
     BASE_DIR / "interface/web",
-    BASE_DIR / "interface/email",
     BASE_DIR / "interface/built",
     BASE_DIR / "interface/compiled",
 ]

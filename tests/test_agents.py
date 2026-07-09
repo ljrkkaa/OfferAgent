@@ -2,17 +2,15 @@
 import asyncio
 import warnings
 from collections import Counter
-from datetime import timedelta
 
 import pytest
 from asgiref.sync import sync_to_async
 from django.utils import timezone as django_timezone
 
 from khoj.database.adapters import AgentAdapters, ConversationAdapters
-from khoj.database.models import Agent, ChatModel, Conversation, Entry, FileObject, KhojApiUser, KhojUser, PriceTier
+from khoj.database.models import Agent, ChatModel, Conversation, Entry, FileObject, KhojApiUser, KhojUser
 from khoj.routers.api_agents import _recent_conversation_cutoff
 from khoj.routers.helpers import execute_search
-from khoj.utils import state
 from khoj.utils.helpers import get_absolute_path
 from tests.helpers import ChatModelFactory, ConversationFactory
 
@@ -26,7 +24,6 @@ def test_create_default_agent(default_user: KhojUser):
     assert agent is not None
     assert agent.input_tools == []
     assert agent.output_modes == []
-    assert agent.privacy_level == Agent.PrivacyLevel.PUBLIC
     assert agent.managed_by_admin
 
 
@@ -38,7 +35,6 @@ def test_sync_create_conversation_session_accepts_agent_slug(default_user: KhojU
         slug="sync-session-agent",
         creator=default_user,
         chat_model=chat_model,
-        privacy_level=Agent.PrivacyLevel.PRIVATE,
     )
 
     conversation = ConversationAdapters.create_conversation_session(default_user, agent_slug=agent.slug)
@@ -79,7 +75,6 @@ def test_agents_endpoint_handles_missing_default_agent(chat_client_with_auth, ap
         creator=api_user2.user,
         chat_model=chat_model,
         personality="Answer directly.",
-        privacy_level=Agent.PrivacyLevel.PRIVATE,
     )
 
     response = chat_client_with_auth.get("/api/agents", headers={"Authorization": f"Bearer {api_user2.token}"})
@@ -150,9 +145,7 @@ def test_hidden_agent_create_without_chat_model_uses_default_model(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_non_creator_cannot_update_public_agent(
-    chat_client_with_auth, default_user: KhojUser, api_user2: KhojApiUser
-):
+def test_non_creator_cannot_update_user_agent(chat_client_with_auth, default_user: KhojUser, api_user2: KhojApiUser):
     chat_model = ChatModelFactory(friendly_name="agent-permission-model")
     agent = Agent.objects.create(
         name="Shared Agent",
@@ -160,7 +153,6 @@ def test_non_creator_cannot_update_public_agent(
         creator=default_user,
         chat_model=chat_model,
         personality="Stay helpful.",
-        privacy_level=Agent.PrivacyLevel.PUBLIC,
     )
     headers = {"Authorization": f"Bearer {api_user2.token}"}
 
@@ -170,7 +162,6 @@ def test_non_creator_cannot_update_public_agent(
         json={
             "name": "Hijacked Agent",
             "persona": agent.personality,
-            "privacy_level": agent.privacy_level,
             "icon": agent.style_icon,
             "color": agent.style_color,
             "chat_model": chat_model.friendly_name,
@@ -187,7 +178,7 @@ def test_non_creator_cannot_update_public_agent(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_non_creator_can_read_public_agent(chat_client_with_auth, default_user: KhojUser, api_user2: KhojApiUser):
+def test_non_creator_cannot_read_user_agent(chat_client_with_auth, default_user: KhojUser, api_user2: KhojApiUser):
     chat_model = ChatModelFactory(friendly_name="agent-read-permission-model")
     agent = Agent.objects.create(
         name="Readable Shared Agent",
@@ -195,56 +186,50 @@ def test_non_creator_can_read_public_agent(chat_client_with_auth, default_user: 
         creator=default_user,
         chat_model=chat_model,
         personality="Stay helpful.",
-        privacy_level=Agent.PrivacyLevel.PUBLIC,
     )
     headers = {"Authorization": f"Bearer {api_user2.token}"}
 
     response = chat_client_with_auth.get(f"/api/agents/{agent.slug}", headers=headers)
 
-    assert response.status_code == 200
-    assert response.json()["slug"] == agent.slug
+    assert response.status_code == 404
 
 
 @pytest.mark.django_db(transaction=True)
-def test_unauthenticated_user_cannot_read_admin_private_agent(client):
-    chat_model = ChatModelFactory(friendly_name="admin-private-agent-model")
+def test_unauthenticated_user_can_read_managed_admin_agent(client):
+    chat_model = ChatModelFactory(friendly_name="admin-managed-agent-model")
     agent = Agent.objects.create(
         name="Admin Private Agent",
-        slug="admin-private-agent",
+        slug="admin-managed-agent",
         chat_model=chat_model,
-        privacy_level=Agent.PrivacyLevel.PRIVATE,
     )
 
     response = client.get(f"/api/agents/{agent.slug}")
 
-    assert response.status_code == 404
+    assert response.status_code == 200
+    assert response.json()["slug"] == agent.slug
 
 
 @pytest.mark.anyio
 @pytest.mark.django_db(transaction=True)
-async def test_anonymous_async_agent_lookup_ignores_admin_private_agent(default_openai_chat_model_option: ChatModel):
+async def test_anonymous_async_agent_lookup_reads_managed_admin_agent(default_openai_chat_model_option: ChatModel):
     agent = await sync_to_async(Agent.objects.create)(
         name="Async Admin Private Agent",
-        slug="async-admin-private-agent",
+        slug="async-admin-managed-agent",
         chat_model=default_openai_chat_model_option,
-        privacy_level=Agent.PrivacyLevel.PRIVATE,
     )
 
-    assert await AgentAdapters.aget_agent_by_slug(agent.slug, None) is None
-    assert await AgentAdapters.aget_agent_by_name(agent.name, None) is None
+    assert await AgentAdapters.aget_agent_by_slug(agent.slug, None) == agent
+    assert await AgentAdapters.aget_agent_by_name(agent.name, None) == agent
 
 
 @pytest.mark.django_db(transaction=True)
-def test_non_creator_cannot_delete_public_agent(
-    chat_client_with_auth, default_user: KhojUser, api_user2: KhojApiUser
-):
+def test_non_creator_cannot_delete_user_agent(chat_client_with_auth, default_user: KhojUser, api_user2: KhojApiUser):
     chat_model = ChatModelFactory(friendly_name="agent-delete-permission-model")
     agent = Agent.objects.create(
         name="Shared Agent",
         slug="shared-agent-delete",
         creator=default_user,
         chat_model=chat_model,
-        privacy_level=Agent.PrivacyLevel.PUBLIC,
     )
     headers = {"Authorization": f"Bearer {api_user2.token}"}
 
@@ -264,7 +249,6 @@ def test_create_agent_with_unknown_chat_model_returns_bad_request(chat_client_wi
         json={
             "name": "Broken Model Agent",
             "persona": "Stay helpful.",
-            "privacy_level": Agent.PrivacyLevel.PRIVATE,
             "icon": Agent.StyleIconTypes.LIGHTBULB,
             "color": Agent.StyleColorTypes.BLUE,
             "chat_model": "missing-model",
@@ -279,65 +263,6 @@ def test_create_agent_with_unknown_chat_model_returns_bad_request(chat_client_wi
 
 
 @pytest.mark.django_db(transaction=True)
-def test_create_agent_with_unavailable_paid_chat_model_returns_forbidden(
-    chat_client_with_auth, api_user4: KhojApiUser, monkeypatch
-):
-    monkeypatch.setattr(state, "billing_enabled", True)
-    subscription = api_user4.user.subscription
-    subscription.is_recurring = False
-    subscription.renewal_date = django_timezone.now() - timedelta(days=1)
-    subscription.save()
-    paid_model = ChatModelFactory(friendly_name="paid-agent-model", price_tier=PriceTier.STANDARD)
-    headers = {"Authorization": f"Bearer {api_user4.token}"}
-
-    response = chat_client_with_auth.post(
-        "/api/agents",
-        headers=headers,
-        json={
-            "name": "Paid Model Agent",
-            "persona": "Stay helpful.",
-            "privacy_level": Agent.PrivacyLevel.PRIVATE,
-            "icon": Agent.StyleIconTypes.LIGHTBULB,
-            "color": Agent.StyleColorTypes.BLUE,
-            "chat_model": paid_model.friendly_name,
-            "files": [],
-            "input_tools": [],
-            "output_modes": [],
-        },
-    )
-
-    assert response.status_code == 403
-    assert response.json()["error"] == "Chat model paid-agent-model is not available for this account."
-    assert not Agent.objects.filter(name="Paid Model Agent", creator=api_user4.user).exists()
-
-
-@pytest.mark.django_db(transaction=True)
-def test_create_agent_rejects_invalid_privacy_level(chat_client_with_auth, api_user2: KhojApiUser):
-    chat_model = ChatModelFactory(friendly_name="agent-invalid-privacy-model")
-    headers = {"Authorization": f"Bearer {api_user2.token}"}
-
-    response = chat_client_with_auth.post(
-        "/api/agents",
-        headers=headers,
-        json={
-            "name": "Invalid Privacy Agent",
-            "persona": "Stay helpful.",
-            "privacy_level": "public-ish",
-            "icon": Agent.StyleIconTypes.LIGHTBULB,
-            "color": Agent.StyleColorTypes.BLUE,
-            "chat_model": chat_model.friendly_name,
-            "files": [],
-            "input_tools": [],
-            "output_modes": [],
-        },
-    )
-
-    assert response.status_code == 400
-    assert response.json()["error"] == "Invalid privacy_level: public-ish"
-    assert not Agent.objects.filter(name="Invalid Privacy Agent", creator=api_user2.user).exists()
-
-
-@pytest.mark.django_db(transaction=True)
 def test_hidden_agent_update_rejects_regular_agent(
     chat_client_with_auth, default_user2: KhojUser, api_user2: KhojApiUser
 ):
@@ -348,7 +273,6 @@ def test_hidden_agent_update_rejects_regular_agent(
         creator=default_user2,
         chat_model=chat_model,
         personality="Keep me regular.",
-        privacy_level=Agent.PrivacyLevel.PRIVATE,
         is_hidden=False,
     )
     headers = {"Authorization": f"Bearer {api_user2.token}"}
@@ -379,7 +303,6 @@ async def test_create_or_update_agent(default_user: KhojUser, default_openai_cha
         default_user,
         "Test Agent",
         "Test Personality",
-        Agent.PrivacyLevel.PRIVATE,
         "icon",
         "color",
         default_openai_chat_model_option.name,
@@ -389,7 +312,6 @@ async def test_create_or_update_agent(default_user: KhojUser, default_openai_cha
     )
     assert new_agent is not None
     assert new_agent.name == "Test Agent"
-    assert new_agent.privacy_level == Agent.PrivacyLevel.PRIVATE
     assert new_agent.creator == default_user
 
 
@@ -411,7 +333,6 @@ async def test_create_or_update_agent_with_knowledge_base(
         default_user2,
         "Test Agent",
         "Test Personality",
-        Agent.PrivacyLevel.PRIVATE,
         "icon",
         "color",
         default_openai_chat_model_option.name,
@@ -426,7 +347,6 @@ async def test_create_or_update_agent_with_knowledge_base(
 
     assert new_agent is not None
     assert new_agent.name == "Test Agent"
-    assert new_agent.privacy_level == Agent.PrivacyLevel.PRIVATE
     assert new_agent.creator == default_user2
     assert len(entries) > 0
     assert full_filename in file_names
@@ -443,7 +363,6 @@ async def test_create_or_update_agent_with_knowledge_base_and_search(
         default_user2,
         "Test Agent",
         "Test Personality",
-        Agent.PrivacyLevel.PRIVATE,
         "icon",
         "color",
         default_openai_chat_model_option.name,
@@ -460,7 +379,7 @@ async def test_create_or_update_agent_with_knowledge_base_and_search(
 
 @pytest.mark.anyio
 @pytest.mark.django_db(transaction=True)
-async def test_agent_with_knowledge_base_and_search_not_creator(
+async def test_agent_with_knowledge_base_and_search_not_creator_denied(
     default_user2: KhojUser, default_openai_chat_model_option: ChatModel, chat_client, default_user3: KhojUser
 ):
     full_filename = get_absolute_path("tests/data/markdown/having_kids.markdown")
@@ -468,32 +387,6 @@ async def test_agent_with_knowledge_base_and_search_not_creator(
         default_user2,
         "Test Agent",
         "Test Personality",
-        Agent.PrivacyLevel.PUBLIC,
-        "icon",
-        "color",
-        default_openai_chat_model_option.name,
-        [full_filename],
-        [],
-        [],
-    )
-
-    search_result = await execute_search(user=default_user3, q="having kids", agent=new_agent)
-
-    assert len(search_result) > 0
-    assert any("Having Kids" in result.entry for result in search_result)
-
-
-@pytest.mark.anyio
-@pytest.mark.django_db(transaction=True)
-async def test_agent_with_knowledge_base_and_search_not_creator_and_private(
-    default_user2: KhojUser, default_openai_chat_model_option: ChatModel, chat_client, default_user3: KhojUser
-):
-    full_filename = get_absolute_path("tests/data/markdown/having_kids.markdown")
-    new_agent = await AgentAdapters.aupdate_agent(
-        default_user2,
-        "Test Agent",
-        "Test Personality",
-        Agent.PrivacyLevel.PRIVATE,
         "icon",
         "color",
         default_openai_chat_model_option.name,
@@ -509,7 +402,30 @@ async def test_agent_with_knowledge_base_and_search_not_creator_and_private(
 
 @pytest.mark.anyio
 @pytest.mark.django_db(transaction=True)
-async def test_agent_with_knowledge_base_and_search_not_creator_and_private_accessible_to_none(
+async def test_agent_with_knowledge_base_and_search_not_creator_denied_again(
+    default_user2: KhojUser, default_openai_chat_model_option: ChatModel, chat_client, default_user3: KhojUser
+):
+    full_filename = get_absolute_path("tests/data/markdown/having_kids.markdown")
+    new_agent = await AgentAdapters.aupdate_agent(
+        default_user2,
+        "Test Agent",
+        "Test Personality",
+        "icon",
+        "color",
+        default_openai_chat_model_option.name,
+        [full_filename],
+        [],
+        [],
+    )
+
+    search_result = await execute_search(user=default_user3, q="having kids", agent=new_agent)
+
+    assert len(search_result) == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.django_db(transaction=True)
+async def test_agent_with_knowledge_base_and_search_anonymous_denied(
     default_user2: KhojUser, default_openai_chat_model_option: ChatModel, chat_client
 ):
     full_filename = get_absolute_path("tests/data/markdown/having_kids.markdown")
@@ -517,7 +433,6 @@ async def test_agent_with_knowledge_base_and_search_not_creator_and_private_acce
         default_user2,
         "Test Agent",
         "Test Personality",
-        Agent.PrivacyLevel.PRIVATE,
         "icon",
         "color",
         default_openai_chat_model_option.name,
@@ -528,8 +443,7 @@ async def test_agent_with_knowledge_base_and_search_not_creator_and_private_acce
 
     search_result = await execute_search(user=None, q="having kids", agent=new_agent)
 
-    assert len(search_result) > 0
-    assert any("Having Kids" in result.entry for result in search_result)
+    assert len(search_result) == 0
 
 
 @pytest.mark.anyio
@@ -542,7 +456,6 @@ async def test_multiple_agents_with_knowledge_base_and_users(
         default_user2,
         "Test Agent",
         "Test Personality",
-        Agent.PrivacyLevel.PUBLIC,
         "icon",
         "color",
         default_openai_chat_model_option.name,
@@ -556,7 +469,6 @@ async def test_multiple_agents_with_knowledge_base_and_users(
         default_user2,
         "Test Agent 2",
         "Test Personality",
-        Agent.PrivacyLevel.PUBLIC,
         "icon",
         "color",
         default_openai_chat_model_option.name,
@@ -565,12 +477,10 @@ async def test_multiple_agents_with_knowledge_base_and_users(
         [],
     )
 
-    search_result = await execute_search(user=default_user3, q="having kids", agent=new_agent2)
     search_result2 = await execute_search(
-        user=default_user3, q="Namita", agent=new_agent2, max_distance=AGENT_KB_ENGLISH_NAME_MAX_DISTANCE
+        user=default_user2, q="Namita", agent=new_agent2, max_distance=AGENT_KB_ENGLISH_NAME_MAX_DISTANCE
     )
 
-    assert len(search_result) == 0
     assert len(search_result2) > 0
     assert any("Namita" in result.entry for result in search_result2)
 
@@ -601,7 +511,6 @@ async def test_large_knowledge_base_atomic_update(
         default_user2,
         "Large KB Agent",
         "Test agent with large knowledge base",
-        Agent.PrivacyLevel.PRIVATE,
         "icon",
         "color",
         default_openai_chat_model_option.name,
@@ -620,7 +529,6 @@ async def test_large_knowledge_base_atomic_update(
         default_user2,
         "Large KB Agent Updated",  # Change name to trigger update
         "Test agent with large knowledge base - updated",
-        Agent.PrivacyLevel.PRIVATE,
         "icon",
         "color",
         default_openai_chat_model_option.name,
@@ -700,7 +608,6 @@ async def test_concurrent_agent_updates_atomicity(
         default_user2,
         "Concurrent Test Agent",
         "Test concurrent updates",
-        Agent.PrivacyLevel.PRIVATE,
         "icon",
         "color",
         default_openai_chat_model_option.name,
@@ -717,7 +624,6 @@ async def test_concurrent_agent_updates_atomicity(
             default_user2,
             f"Concurrent Test Agent {name_suffix}",
             f"Test concurrent updates {name_suffix}",
-            Agent.PrivacyLevel.PRIVATE,
             "icon",
             "color",
             default_openai_chat_model_option.name,

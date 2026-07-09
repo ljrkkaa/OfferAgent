@@ -26,7 +26,7 @@ console.log(`%c %s`, "font-family:monospace", `
 
 Greetings traveller,
 
-I am ✨Khoj✨, your open-source, personal AI copilot.
+I am ✨OfferAgent✨, your local interview-prep AI assistant.
 
 See my source code at https://github.com/khoj-ai/khoj
 Read my operating manual at https://docs.khoj.dev

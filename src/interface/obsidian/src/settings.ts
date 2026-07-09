@@ -5,14 +5,12 @@ import { canConnectToBackend, fetchChatModels, fetchUserServerSettings, getBacke
 export interface UserInfo {
     username?: string;
     photo?: string;
-    is_active?: boolean;
     has_documents?: boolean;
     email?: string;
 }
 
 interface SyncFileTypes {
     markdown: boolean;
-    images: boolean;
     pdf: boolean;
 }
 
@@ -52,7 +50,6 @@ export const DEFAULT_SETTINGS: KhojSetting = {
     lastSync: new Map(),
     syncFileType: {
         markdown: true,
-        images: false,
         pdf: true,
     },
     userInfo: null,
@@ -90,7 +87,7 @@ export class KhojSettingTab extends PluginSettingTab {
 
         const connectHeaderEl = containerEl.createEl('h3', { title: backendStatusMessage });
         const connectHeaderContentEl = connectHeaderEl.createSpan({ cls: 'khoj-connect-settings-header' });
-        const connectTitleEl = connectHeaderContentEl.createSpan({ text: 'Connect' });
+        const connectTitleEl = connectHeaderContentEl.createSpan({ text: 'Connect OfferAgent' });
         const backendStatusEl = connectTitleEl.createSpan({ text: this.connectStatusIcon(), cls: 'khoj-connect-settings-header-status' });
         if (this.plugin.settings.userInfo && this.plugin.settings.connectedToBackend) {
             if (this.plugin.settings.userInfo.photo) {
@@ -116,7 +113,7 @@ export class KhojSettingTab extends PluginSettingTab {
 
         // Add khoj settings configurable from the plugin settings tab
         const apiKeySetting = new Setting(containerEl)
-            .setName('Khoj API Key')
+            .setName('OfferAgent API Key')
             .addText(text => text
                 .setValue(`${this.plugin.settings.khojApiKey}`)
                 .onChange(async (value) => {
@@ -139,7 +136,7 @@ export class KhojSettingTab extends PluginSettingTab {
 
         // Add API key setting description with link to get API key
         apiKeySetting.descEl.createEl('span', {
-            text: 'Optional for anonymous local Khoj. Required for authenticated servers. ',
+            text: 'Optional for anonymous local OfferAgent. Required for authenticated servers. ',
         });
         apiKeySetting.descEl.createEl('a', {
             text: 'Get your API Key',
@@ -148,8 +145,8 @@ export class KhojSettingTab extends PluginSettingTab {
         });
 
         new Setting(containerEl)
-            .setName('Khoj URL')
-            .setDesc('The URL of the Khoj backend.')
+            .setName('OfferAgent URL')
+            .setDesc('The URL of the OfferAgent backend.')
             .addText(text => text
                 .setValue(`${this.plugin.settings.khojUrl}`)
                 .onChange(async (value) => {
@@ -201,7 +198,7 @@ export class KhojSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Auto Sync')
-            .setDesc('Automatically index your vault with Khoj.')
+            .setDesc('Automatically index your vault with OfferAgent.')
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.autoConfigure)
                 .onChange(async (value) => {
@@ -212,7 +209,7 @@ export class KhojSettingTab extends PluginSettingTab {
         // Add setting to sync markdown notes
         new Setting(containerEl)
             .setName('Sync Notes')
-            .setDesc('Index Markdown files in your vault with Khoj.')
+            .setDesc('Index Markdown files in your vault with OfferAgent.')
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.syncFileType.markdown)
                 .onChange(async (value) => {
@@ -224,7 +221,7 @@ export class KhojSettingTab extends PluginSettingTab {
         // Add setting to sync PDFs
         new Setting(containerEl)
             .setName('Sync PDFs')
-            .setDesc('Index PDF files in your vault with Khoj.')
+            .setDesc('Index PDF files in your vault with OfferAgent.')
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.syncFileType.pdf)
                 .onChange(async (value) => {
@@ -309,7 +306,7 @@ export class KhojSettingTab extends PluginSettingTab {
         let indexVaultSetting = new Setting(containerEl);
         indexVaultSetting
             .setName('Force Sync')
-            .setDesc('Manually force Khoj to re-index your Obsidian Vault.')
+            .setDesc('Manually force OfferAgent to re-index your Obsidian Vault.')
             .addButton(button => button
                 .setButtonText('Update')
                 .setCta()
@@ -442,7 +439,7 @@ export class KhojSettingTab extends PluginSettingTab {
             this.storageProgressEl.max = metrics.totalBytes;
             this.storageProgressText.textContent = `${usedStr} / ${totalStr}`;
         } catch (err) {
-            console.error('Khoj: Failed to update storage display', err);
+            console.error('OfferAgent: Failed to update storage display', err);
             this.storageProgressText.textContent = 'Estimation unavailable';
         }
     }
@@ -464,8 +461,8 @@ export class KhojSettingTab extends PluginSettingTab {
                     serverSelectedModelId = serverModelIdStr;
                 } else {
                     // Server has a selection, but it's not in the options list (e.g. model removed, or different set of models)
-                    // In this case, we might fall back to null (Khoj Default)
-                    console.warn(`Khoj: Server's selected model ID ${serverModelIdStr} not in available models. Falling back to default.`);
+                    // In this case, we might fall back to null (OfferAgent Default)
+                    console.warn(`OfferAgent: Server's selected model ID ${serverModelIdStr} not in available models. Falling back to default.`);
                     serverSelectedModelId = null;
                 }
             } else {
@@ -495,13 +492,13 @@ export class KhojSettingTab extends PluginSettingTab {
         const modelSetting = this.chatModelSetting;
 
         if (!this.plugin.settings.connectedToBackend) {
-            modelSetting.setDesc('Connect to Khoj to load and set chat model options.');
+            modelSetting.setDesc('Connect to OfferAgent to load and set chat model options.');
             modelSetting.addText(text => text.setValue("Not connected").setDisabled(true));
             return;
         }
 
         if (this.plugin.settings.availableChatModels.length === 0 && this.plugin.settings.connectedToBackend) {
-            modelSetting.setDesc('Fetching models or no models available. Check Khoj connection or try refreshing.');
+            modelSetting.setDesc('Fetching models or no models available. Check OfferAgent connection or try refreshing.');
             modelSetting.addButton(button => button
                 .setButtonText('Refresh Models')
                 .onClick(async () => {

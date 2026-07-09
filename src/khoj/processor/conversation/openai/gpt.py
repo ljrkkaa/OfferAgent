@@ -1,12 +1,9 @@
 import logging
 import os
-from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from langchain_core.messages.chat import ChatMessage
 
-from khoj.database.models import Agent, ChatMessageModel, ChatModel
-from khoj.processor.conversation import prompts
 from khoj.processor.conversation.openai.utils import (
     chat_completion_with_backoff,
     clean_response_schema,
@@ -22,11 +19,9 @@ from khoj.processor.conversation.openai.utils import (
 from khoj.processor.conversation.utils import (
     ResponseWithThought,
     StructuredOutputSupport,
-    generate_chatml_messages_with_context,
     messages_to_print,
 )
 from khoj.utils.helpers import ToolDefinition
-from khoj.utils.yaml import yaml_dump
 
 logger = logging.getLogger(__name__)
 
@@ -100,8 +95,7 @@ def openai_send_message_to_model(
 
 
 async def converse_openai(
-    # Query
-    messages: Optional[List[ChatMessage]] = None,
+    messages: List[ChatMessage],
     # Model
     model: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -109,45 +103,12 @@ async def converse_openai(
     temperature: float = 0.6,
     deepthought: Optional[bool] = False,
     tracer: dict = {},
-    # Legacy test/direct-call interface
-    references: Optional[List[Dict[str, Any]]] = None,
-    user_query: Optional[str] = None,
-    chat_history: Optional[List[ChatMessageModel]] = None,
-    agent: Optional[Agent] = None,
 ) -> AsyncGenerator[ResponseWithThought, None]:
     """
     Converse with user using OpenAI's ChatGPT
     """
     model = model or os.getenv("KHOJ_DEFAULT_CHAT_MODEL", "gpt-4.1-mini")
     api_base_url = get_effective_openai_api_base_url(api_base_url)
-    if messages is None:
-        if user_query is None:
-            raise TypeError("converse_openai requires messages or user_query")
-        current_date = datetime.now()
-        if agent and agent.personality:
-            system_prompt = prompts.custom_personality.format(
-                name=agent.name,
-                bio=agent.personality,
-                current_date=current_date.strftime("%Y-%m-%d"),
-                day_of_week=current_date.strftime("%A"),
-            )
-        else:
-            system_prompt = prompts.personality.format(
-                current_date=current_date.strftime("%Y-%m-%d"),
-                day_of_week=current_date.strftime("%A"),
-            )
-        context_message = ""
-        if references:
-            context_message = prompts.notes_conversation.format(references=yaml_dump(references))
-        messages = generate_chatml_messages_with_context(
-            user_message=user_query,
-            context_message=context_message,
-            chat_history=chat_history or [],
-            system_message=system_prompt,
-            model_name=model,
-            model_type=ChatModel.ModelType.OPENAI,
-        )
-
     logger.debug(f"Conversation Context for GPT: {messages_to_print(messages)}")
 
     # Get Response from GPT

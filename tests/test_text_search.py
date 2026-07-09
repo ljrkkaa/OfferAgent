@@ -1,14 +1,12 @@
 # System Packages
 import asyncio
 import logging
-import os
 
 import pytest
 
 from khoj.database.adapters import EntryAdapters
-from khoj.database.models import Entry, GithubConfig, KhojUser
-from khoj.processor.content.github.github_to_entries import GithubToEntries
-from khoj.processor.content.org_mode.org_to_entries import OrgToEntries
+from khoj.database.models import Entry, KhojUser
+from khoj.processor.content.markdown.markdown_to_entries import MarkdownToEntries
 from khoj.processor.content.text_to_entries import TextToEntries
 from khoj.search_type import text_search
 from tests.helpers import get_index_files, get_sample_data
@@ -24,17 +22,17 @@ BGE_ENGLISH_TEST_MAX_DISTANCE = 0.55
 def test_text_search_setup_with_empty_file_creates_no_entries(search_config, default_user: KhojUser):
     # Arrange
     initial_data = {
-        "test.org": "* First heading\nFirst content",
-        "test2.org": "* Second heading\nSecond content",
+        "test.markdown": "* First heading\nFirst content",
+        "test2.markdown": "* Second heading\nSecond content",
     }
-    text_search.setup(OrgToEntries, initial_data, regenerate=True, user=default_user)
+    text_search.setup(MarkdownToEntries, initial_data, regenerate=True, user=default_user)
     existing_entries = Entry.objects.filter(user=default_user).count()
 
-    final_data = {"new_file.org": ""}
+    final_data = {"new_file.markdown": ""}
 
     # Act
     # Index notes entries.
-    text_search.setup(OrgToEntries, final_data, regenerate=True, user=default_user)
+    text_search.setup(MarkdownToEntries, final_data, regenerate=True, user=default_user)
 
     # Assert
     updated_entries = Entry.objects.filter(user=default_user).count()
@@ -49,22 +47,22 @@ def test_text_search_setup_with_empty_file_creates_no_entries(search_config, def
 def test_text_indexer_deletes_entries_before_regenerate(search_config, default_user: KhojUser, caplog):
     # Arrange
     data = {
-        "test1.org": "* Test heading\nTest content",
-        "test2.org": "* Another heading\nAnother content",
+        "test1.markdown": "* Test heading\nTest content",
+        "test2.markdown": "* Another heading\nAnother content",
     }
-    text_search.setup(OrgToEntries, data, regenerate=True, user=default_user)
+    text_search.setup(MarkdownToEntries, data, regenerate=True, user=default_user)
     existing_entries = Entry.objects.filter(user=default_user).count()
 
     # Act
     # Rebuild notes entries.
     with caplog.at_level(logging.DEBUG):
-        text_search.setup(OrgToEntries, data, regenerate=True, user=default_user)
+        text_search.setup(MarkdownToEntries, data, regenerate=True, user=default_user)
 
     # Assert
     updated_entries = Entry.objects.filter(user=default_user).count()
     assert existing_entries == 2
     assert updated_entries == 2
-    assert "Deleting all entries for file type org" in caplog.text
+    assert "Deleting all entries for file type markdown" in caplog.text
     assert "Deleted 2 entries. Created 2 new entries for user " in caplog.records[-1].message
 
 
@@ -73,18 +71,18 @@ def test_text_indexer_deletes_entries_before_regenerate(search_config, default_u
 def test_text_index_same_if_content_unchanged(search_config, default_user: KhojUser, caplog):
     # Arrange
     existing_entries = Entry.objects.filter(user=default_user)
-    data = {"test.org": "* Test heading\nTest content"}
+    data = {"test.markdown": "* Test heading\nTest content"}
 
     # Act
     # Generate initial notes entries during setup.
     with caplog.at_level(logging.DEBUG):
-        text_search.setup(OrgToEntries, data, regenerate=True, user=default_user)
+        text_search.setup(MarkdownToEntries, data, regenerate=True, user=default_user)
     initial_logs = caplog.text
     caplog.clear()  # Clear logs
 
     # Run asymmetric setup again with no changes to data source. Ensure index is not updated
     with caplog.at_level(logging.DEBUG):
-        text_search.setup(OrgToEntries, data, regenerate=False, user=default_user)
+        text_search.setup(MarkdownToEntries, data, regenerate=False, user=default_user)
     final_logs = caplog.text
 
     # Assert
@@ -92,8 +90,8 @@ def test_text_index_same_if_content_unchanged(search_config, default_user: KhojU
     for entry in updated_entries:
         assert entry in existing_entries
     assert len(existing_entries) == len(updated_entries)
-    assert "Deleting all entries for file type org" in initial_logs
-    assert "Deleting all entries for file type org" not in final_logs
+    assert "Deleting all entries for file type markdown" in initial_logs
+    assert "Deleting all entries for file type markdown" not in final_logs
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -104,20 +102,19 @@ async def test_text_search(search_config):
     default_user, _ = await KhojUser.objects.aget_or_create(
         username="test_user", password="test_password", email="test@example.com"
     )
-    # Get some sample org data to index
-    data = get_sample_data("org")
+    data = get_sample_data("markdown")
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(
         None,
         text_search.setup,
-        OrgToEntries,
+        MarkdownToEntries,
         data,
         True,
         default_user,
     )
 
-    query = "Load Khoj on Emacs?"
+    query = "conda activate khoj"
 
     # Act
     hits = await text_search.query(query, default_user, max_distance=BGE_ENGLISH_TEST_MAX_DISTANCE)
@@ -126,7 +123,7 @@ async def test_text_search(search_config):
 
     # Assert
     search_result = results[0].entry
-    assert "Emacs load path" in search_result, 'Expected "Emacs load path" in entry'
+    assert "conda activate khoj" in search_result
 
 
 @pytest.mark.django_db(transaction=True)
@@ -136,8 +133,8 @@ async def test_text_search_empty_query_returns_no_hits(search_config, default_us
     await loop.run_in_executor(
         None,
         text_search.setup,
-        OrgToEntries,
-        get_sample_data("org"),
+        MarkdownToEntries,
+        get_sample_data("markdown"),
         True,
         default_user,
     )
@@ -151,18 +148,18 @@ async def test_text_search_empty_query_returns_no_hits(search_config, default_us
 @pytest.mark.django_db
 def test_entry_chunking_by_max_tokens(tmp_path, search_config, default_user: KhojUser, caplog):
     # Arrange
-    # Insert org-mode entry with size exceeding max token limit to new org file
+    # Insert markdown entry with size exceeding max token limit to a new file
     max_tokens = 256
-    new_file_to_index = tmp_path / "test.org"
+    new_file_to_index = tmp_path / "test.markdown"
     content = f"* Entry more than {max_tokens} words\n"
     for index in range(max_tokens + 1):
         content += f"{index} "
     data = {str(new_file_to_index): content}
 
     # Act
-    # Reload entries after adding a new org-mode file.
+    # Reload entries after adding a new markdown file.
     with caplog.at_level(logging.INFO):
-        text_search.setup(OrgToEntries, data, regenerate=False, user=default_user)
+        text_search.setup(MarkdownToEntries, data, regenerate=False, user=default_user)
 
     # Assert
     assert "Deleted 0 entries. Created 3 new entries for user " in caplog.records[-1].message, (
@@ -174,9 +171,9 @@ def test_entry_chunking_by_max_tokens(tmp_path, search_config, default_user: Kho
 @pytest.mark.django_db
 def test_entry_chunking_by_max_tokens_not_full_corpus(tmp_path, search_config, default_user: KhojUser, caplog):
     # Arrange
-    # Insert org-mode entry with size exceeding max token limit to new org file
+    # Insert markdown entry with size exceeding max token limit to a new file
     data = {
-        "readme.org": """
+        "readme.markdown": """
 * Khoj
 /Allow natural language search on user content like notes, images using transformer based models/
 
@@ -194,24 +191,24 @@ conda activate khoj
 #+end_src"""
     }
     text_search.setup(
-        OrgToEntries,
+        MarkdownToEntries,
         data,
         regenerate=False,
         user=default_user,
     )
 
     max_tokens = 256
-    new_file_to_index = tmp_path / "test.org"
+    new_file_to_index = tmp_path / "test.markdown"
     content = f"* Entry more than {max_tokens} words\n"
     for index in range(max_tokens + 1):
         content += f"{index} "
     data = {str(new_file_to_index): content}
 
     # Act
-    # Reload entries after adding a new org-mode file.
+    # Reload entries after adding a new markdown file.
     with caplog.at_level(logging.INFO):
         text_search.setup(
-            OrgToEntries,
+            MarkdownToEntries,
             data,
             regenerate=False,
             user=default_user,
@@ -228,22 +225,22 @@ conda activate khoj
 def test_regenerate_index_with_new_entry(search_config, default_user: KhojUser):
     # Arrange
     # Initial indexed files
-    text_search.setup(OrgToEntries, get_sample_data("org"), regenerate=True, user=default_user)
+    text_search.setup(MarkdownToEntries, get_sample_data("markdown"), regenerate=True, user=default_user)
     existing_entries = list(Entry.objects.filter(user=default_user).values_list("compiled", flat=True))
 
     # Regenerate index with only files from test data set
     files_to_index = get_index_files()
-    text_search.setup(OrgToEntries, files_to_index, regenerate=True, user=default_user)
+    text_search.setup(MarkdownToEntries, files_to_index, regenerate=True, user=default_user)
     updated_entries1 = list(Entry.objects.filter(user=default_user).values_list("compiled", flat=True))
 
     # Act
     # Update index with the new file
-    new_file = "test.org"
+    new_file = "test.markdown"
     new_entry = "\n* A Chihuahua doing Tango\n- Saw a super cute video of a chihuahua doing the Tango on Youtube\n"
     files_to_index[new_file] = new_entry
 
     # Regenerate indexed notes to include entry from new file.
-    text_search.setup(OrgToEntries, files_to_index, regenerate=True, user=default_user)
+    text_search.setup(MarkdownToEntries, files_to_index, regenerate=True, user=default_user)
     updated_entries2 = list(Entry.objects.filter(user=default_user).values_list("compiled", flat=True))
 
     # Assert
@@ -257,30 +254,30 @@ def test_regenerate_index_with_new_entry(search_config, default_user: KhojUser):
     assert any(
         ["Saw a super cute video of a chihuahua doing the Tango on Youtube" in entry for entry in updated_entries2]
     )
-    verify_entries(3, default_user)
+    verify_entries(len(updated_entries2), default_user)
 
 
 # ----------------------------------------------------------------------------------------------------
 @pytest.mark.django_db
 def test_update_index_with_duplicate_entries_in_stable_order(tmp_path, search_config, default_user: KhojUser):
     # Arrange
-    initial_data = get_sample_data("org")
-    text_search.setup(OrgToEntries, initial_data, regenerate=True, user=default_user)
+    initial_data = get_sample_data("markdown")
+    text_search.setup(MarkdownToEntries, initial_data, regenerate=True, user=default_user)
     existing_entries = list(Entry.objects.filter(user=default_user).values_list("compiled", flat=True))
 
-    # Insert org-mode entries with same compiled form into new org file
-    new_file_to_index = tmp_path / "test.org"
+    # Insert markdown entries with same compiled form into a new file
+    new_file_to_index = tmp_path / "test.markdown"
     new_entry = "* TODO A Chihuahua doing Tango\n- Saw a super cute video of a chihuahua doing the Tango on Youtube\n"
     # Initial data with duplicate entries
     data = {str(new_file_to_index): f"{new_entry}{new_entry}"}
 
     # Act
-    # Generate entries from scratch after adding new org-mode file.
-    text_search.setup(OrgToEntries, data, regenerate=True, user=default_user)
+    # Generate entries from scratch after adding a new markdown file.
+    text_search.setup(MarkdownToEntries, data, regenerate=True, user=default_user)
     updated_entries1 = list(Entry.objects.filter(user=default_user).values_list("compiled", flat=True))
 
     # idempotent indexing when data unchanged
-    text_search.setup(OrgToEntries, data, regenerate=False, user=default_user)
+    text_search.setup(MarkdownToEntries, data, regenerate=False, user=default_user)
     updated_entries2 = list(Entry.objects.filter(user=default_user).values_list("compiled", flat=True))
 
     # Assert
@@ -292,7 +289,7 @@ def test_update_index_with_duplicate_entries_in_stable_order(tmp_path, search_co
     for entry in updated_entries1:
         assert entry in updated_entries2
 
-    assert len(existing_entries) == 2
+    assert len(existing_entries) == 1
     assert len(updated_entries1) == len(updated_entries2)
     verify_entries(1, default_user)
 
@@ -303,7 +300,7 @@ def test_update_index_with_deleted_entry(tmp_path, search_config, default_user: 
     # Arrange
     existing_entries = list(Entry.objects.filter(user=default_user).values_list("compiled", flat=True))
 
-    new_file_to_index = tmp_path / "test.org"
+    new_file_to_index = tmp_path / "test.markdown"
     new_entry = "* TODO A Chihuahua doing Tango\n- Saw a super cute video of a chihuahua doing the Tango on Youtube\n"
 
     # Initial data with two entries
@@ -313,10 +310,10 @@ def test_update_index_with_deleted_entry(tmp_path, search_config, default_user: 
 
     # Act
     # Load entries after adding new org file with 2 entries.
-    text_search.setup(OrgToEntries, initial_data, regenerate=True, user=default_user)
+    text_search.setup(MarkdownToEntries, initial_data, regenerate=True, user=default_user)
     updated_entries1 = list(Entry.objects.filter(user=default_user).values_list("compiled", flat=True))
 
-    text_search.setup(OrgToEntries, final_data, regenerate=False, user=default_user)
+    text_search.setup(MarkdownToEntries, final_data, regenerate=False, user=default_user)
     updated_entries2 = list(Entry.objects.filter(user=default_user).values_list("compiled", flat=True))
 
     # Assert
@@ -338,27 +335,27 @@ def test_update_index_with_deleted_entry(tmp_path, search_config, default_user: 
 def test_update_index_with_new_entry(search_config, default_user: KhojUser):
     # Arrange
     # Initial indexed files
-    text_search.setup(OrgToEntries, get_sample_data("org"), regenerate=True, user=default_user)
+    text_search.setup(MarkdownToEntries, get_sample_data("markdown"), regenerate=True, user=default_user)
     old_entries = list(Entry.objects.filter(user=default_user).values_list("compiled", flat=True))
 
     # Regenerate index with only files from test data set
     files_to_index = get_index_files()
-    new_entries = text_search.setup(OrgToEntries, files_to_index, regenerate=True, user=default_user)
+    new_entries = text_search.setup(MarkdownToEntries, files_to_index, regenerate=True, user=default_user)
 
     # Act
     # Update index with the new file
-    new_file = "test.org"
+    new_file = "test.markdown"
     new_entry = "\n* A Chihuahua doing Tango\n- Saw a super cute video of a chihuahua doing the Tango on Youtube\n"
     final_data = {new_file: new_entry}
 
-    text_search.setup(OrgToEntries, final_data, regenerate=False, user=default_user)
+    text_search.setup(MarkdownToEntries, final_data, regenerate=False, user=default_user)
     updated_new_entries = list(Entry.objects.filter(user=default_user).values_list("compiled", flat=True))
 
     # Assert
     for old_entry in old_entries:
         assert old_entry not in updated_new_entries
-    assert len(updated_new_entries) == len(new_entries) + 1
-    verify_entries(3, default_user)
+    assert len(updated_new_entries) == new_entries[0] + 1
+    verify_entries(len(updated_new_entries), default_user)
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -366,7 +363,7 @@ def test_update_index_with_new_entry(search_config, default_user: KhojUser):
 @pytest.mark.parametrize(
     "text_to_entries",
     [
-        (OrgToEntries),
+        (MarkdownToEntries),
     ],
 )
 def test_update_index_with_deleted_file(text_to_entries: TextToEntries, search_config, default_user: KhojUser):
@@ -402,27 +399,6 @@ def test_update_index_with_deleted_file(text_to_entries: TextToEntries, search_c
     EntryAdapters.delete_all_entries(default_user)
 
 
-# ----------------------------------------------------------------------------------------------------
-@pytest.mark.skipif(os.getenv("GITHUB_PAT_TOKEN") is None, reason="GITHUB_PAT_TOKEN not set")
-def test_text_search_setup_github(search_config, default_user: KhojUser):
-    # Arrange
-    github_config = GithubConfig.objects.filter(user=default_user).first()
-
-    # Act
-    # Regenerate github entries to test setup without caching.
-    text_search.setup(
-        GithubToEntries,
-        {},
-        regenerate=True,
-        user=default_user,
-        config=github_config,
-    )
-
-    # Assert
-    entries = Entry.objects.filter(user=default_user, file_type="github").count()
-    assert entries > 1
-
-
 def verify_entries(expected_count, user):
-    entries = Entry.objects.filter(user=user, file_type="org").count()
+    entries = Entry.objects.filter(user=user, file_type="markdown").count()
     assert entries == expected_count

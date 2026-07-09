@@ -11,8 +11,6 @@ class Migration(migrations.Migration):
             sql=[
                 "ALTER TABLE database_entry DROP COLUMN IF EXISTS embeddings;",
                 "ALTER TABLE database_entry DROP COLUMN IF EXISTS search_model_id;",
-                "ALTER TABLE database_usermemory DROP COLUMN IF EXISTS embeddings;",
-                "ALTER TABLE database_usermemory DROP COLUMN IF EXISTS search_model_id;",
                 "DROP TABLE IF EXISTS database_entrydates CASCADE;",
                 "DROP TABLE IF EXISTS database_searchmodelconfig CASCADE;",
             ],

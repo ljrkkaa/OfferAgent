@@ -23,7 +23,7 @@ from khoj.utils.openkb import get_kb_engine
 logger = logging.getLogger(__name__)
 
 AGENT_TOOL_SYSTEM_PROMPT = """
-You are the tool planner for the main Khoj chat answer.
+You are the tool planner for the main OfferAgent chat answer.
 Return only a json object: {"calls":[{"name":"...", "args":{...}, "id":"1"}]}.
 Use tools when the user asks for current web information, personal knowledge base evidence, or writeback.
 Do not decide intent with keywords. Choose tools from task meaning, conversation context, and available tools.
@@ -100,7 +100,9 @@ def parse_agent_tool_calls(raw: str) -> list[ToolCall]:
     return calls
 
 
-def build_agent_tool_registry(*, allow_local_kb: bool, allow_openkb: bool, allow_web: bool) -> dict[str, ToolDefinition]:
+def build_agent_tool_registry(
+    *, allow_local_kb: bool, allow_openkb: bool, allow_web: bool
+) -> dict[str, ToolDefinition]:
     registry: dict[str, ToolDefinition] = {}
     if allow_web:
         registry[WEB_SEARCH_TOOL.name] = WEB_SEARCH_TOOL
@@ -238,6 +240,8 @@ async def run_notes_tool_call(
     allow_local_kb: bool = True,
     allow_openkb: bool = False,
     conversation_id: str = "agent-tool-loop",
+    write_mode: str = "server",
+    vault_policy: Optional[dict[str, Any]] = None,
     **_: Any,
 ) -> None:
     used = False
@@ -268,6 +272,8 @@ async def run_notes_tool_call(
         conversation_id=conversation_id,
         max_iterations=3,
         initial_tool_transcript=result.tool_transcript,
+        write_mode=write_mode,
+        vault_policy=vault_policy,
     )
     result.references.extend(notes_result.references)
     result.inferred_queries.extend(notes_result.inferred_queries)
@@ -291,11 +297,7 @@ def add_write_reference_context(result: AgentToolLoopResult, reference: dict[str
     instruction = "Final answer must report this exact write tool result."
     if reference.get("status") == "written":
         instruction += " Do not say writing is unavailable."
-    context = (
-        "Notes write tool result: "
-        f"{json.dumps(payload, ensure_ascii=False, default=str)}. "
-        f"{instruction}"
-    )
+    context = f"Notes write tool result: {json.dumps(payload, ensure_ascii=False, default=str)}. {instruction}"
     if context not in result.program_context:
         result.program_context.append(context)
 
@@ -315,6 +317,8 @@ async def collect_agent_context_and_actions(
     allow_web: bool,
     conversation_id: str = "agent-tool-loop",
     max_iterations: int = 4,
+    write_mode: str = "server",
+    vault_policy: Optional[dict[str, Any]] = None,
     location: Any = None,
     query_images: list[str] | None = None,
     query_files: str | None = None,
@@ -364,6 +368,8 @@ async def collect_agent_context_and_actions(
                 allow_local_kb=allow_local_kb,
                 allow_openkb=allow_openkb,
                 conversation_id=conversation_id,
+                write_mode=write_mode,
+                vault_policy=vault_policy,
                 location=location,
                 query_images=query_images,
                 query_files=query_files,
@@ -406,6 +412,8 @@ async def _run_tool_batch(
     allow_local_kb: bool,
     allow_openkb: bool,
     conversation_id: str,
+    write_mode: str = "server",
+    vault_policy: Optional[dict[str, Any]] = None,
     location: Any = None,
     query_images: list[str] | None = None,
     query_files: str | None = None,
@@ -439,6 +447,8 @@ async def _run_tool_batch(
                     allow_local_kb=allow_local_kb,
                     allow_openkb=allow_openkb,
                     conversation_id=conversation_id,
+                    write_mode=write_mode,
+                    vault_policy=vault_policy,
                     location=location,
                     query_images=query_images,
                     query_files=query_files,
@@ -468,6 +478,8 @@ async def _run_tool_batch(
             allow_local_kb=allow_local_kb,
             allow_openkb=allow_openkb,
             conversation_id=conversation_id,
+            write_mode=write_mode,
+            vault_policy=vault_policy,
             location=location,
             query_images=query_images,
             query_files=query_files,
@@ -492,6 +504,8 @@ async def _run_tool_call(
     allow_local_kb: bool,
     allow_openkb: bool,
     conversation_id: str,
+    write_mode: str = "server",
+    vault_policy: Optional[dict[str, Any]] = None,
     location: Any = None,
     query_images: list[str] | None = None,
     query_files: str | None = None,
@@ -547,6 +561,8 @@ async def _run_tool_call(
                 allow_local_kb=allow_local_kb,
                 allow_openkb=allow_openkb,
                 conversation_id=conversation_id,
+                write_mode=write_mode,
+                vault_policy=vault_policy,
             )
     except Exception as exc:
         logger.warning("Agent runtime tool failed: %s", call.name, exc_info=True)
@@ -687,7 +703,9 @@ def _tool_result_text(value: Any, limit: int = 8000) -> str:
     return text[:limit]
 
 
-def _record_tool_result(result: AgentToolLoopResult, tool: str, args: dict[str, Any], value: Any, limit: int = 8000) -> None:
+def _record_tool_result(
+    result: AgentToolLoopResult, tool: str, args: dict[str, Any], value: Any, limit: int = 8000
+) -> None:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
     if len(text) <= limit:
         result.tool_transcript.append({"tool": tool, "args": args, "result": text})

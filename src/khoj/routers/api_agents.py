@@ -9,10 +9,10 @@ from django.core.exceptions import ValidationError
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
-from starlette.authentication import has_required_scope, requires
+from starlette.authentication import requires
 
 from khoj.database.adapters import AgentAdapters, ConversationAdapters
-from khoj.database.models import Agent, Conversation, KhojUser, PriceTier
+from khoj.database.models import Agent, Conversation, KhojUser
 from khoj.processor.conversation.codex.auth import get_codex_model
 from khoj.processor.conversation.codex.utils import use_codex_runtime
 from khoj.routers.helpers import CommonQueryParams, acheck_if_safe_prompt
@@ -20,7 +20,6 @@ from khoj.utils.helpers import (
     ConversationCommand,
     command_descriptions_for_agent,
     is_code_sandbox_enabled,
-    is_operator_enabled,
     is_web_search_enabled,
     mode_descriptions_for_agent,
 )
@@ -39,7 +38,6 @@ def _recent_conversation_cutoff():
 class ModifyAgentBody(BaseModel):
     name: str
     persona: str
-    privacy_level: str
     icon: str
     color: str
     chat_model: str
@@ -60,7 +58,6 @@ class ModifyHiddenAgentBody(BaseModel):
 
 def _validate_agent_choices(body: BaseModel) -> Optional[Response]:
     checks = {
-        "privacy_level": {choice.value for choice in Agent.PrivacyLevel},
         "icon": {choice.value for choice in Agent.StyleIconTypes},
         "color": {choice.value for choice in Agent.StyleColorTypes},
         "input_tools": {choice.value for choice in Agent.InputToolOptions},
@@ -106,13 +103,7 @@ async def _resolve_agent_chat_model(
             status_code=400,
         )
 
-    if has_required_scope(request, ["premium"]) or chat_model.price_tier == PriceTier.FREE:
-        return chat_model.name, None
-    return None, Response(
-        content=json.dumps({"error": f"Chat model {chat_model_name} is not available for this account."}),
-        media_type="application/json",
-        status_code=403,
-    )
+    return chat_model.name, None
 
 
 async def _agent_chat_model_name(agent: Agent, user: Optional[KhojUser]) -> Optional[str]:
@@ -145,7 +136,6 @@ async def all_agents(
             "managed_by_admin": agent.managed_by_admin,
             "color": agent.style_color,
             "icon": agent.style_icon,
-            "privacy_level": agent.privacy_level,
             "chat_model": await _agent_chat_model_name(agent, user),
             "files": file_names,
             "input_tools": agent.input_tools,
@@ -185,7 +175,6 @@ async def get_agent_by_conversation(
     conversation_id: str,
 ) -> Response:
     user: KhojUser = request.user.object if request.user.is_authenticated else None
-    is_subscribed = has_required_scope(request, ["premium"])
     conversation = await ConversationAdapters.aget_conversation_by_user(user=user, conversation_id=conversation_id)
 
     if not conversation:
@@ -209,7 +198,6 @@ async def get_agent_by_conversation(
                 "managed_by_admin": True,
                 "color": Agent.StyleColorTypes.ORANGE,
                 "icon": Agent.StyleIconTypes.LIGHTBULB,
-                "privacy_level": Agent.PrivacyLevel.PUBLIC,
                 "chat_model": get_codex_model(),
                 "has_files": False,
                 "input_tools": [],
@@ -225,10 +213,7 @@ async def get_agent_by_conversation(
         )
 
     chat_model = await AgentAdapters.aget_agent_chat_model(agent, user)
-    if is_subscribed or chat_model.price_tier == PriceTier.FREE:
-        agent_chat_model = chat_model.friendly_name
-    else:
-        agent_chat_model = None
+    agent_chat_model = chat_model.friendly_name if chat_model else None
 
     has_files = await agent.fileobject_set.aexists()
 
@@ -240,7 +225,6 @@ async def get_agent_by_conversation(
         "managed_by_admin": agent.managed_by_admin,
         "color": agent.style_color,
         "icon": agent.style_icon,
-        "privacy_level": agent.privacy_level,
         "chat_model": agent_chat_model,
         "has_files": has_files,
         "input_tools": agent.input_tools,
@@ -263,8 +247,6 @@ async def get_agent_configuration_options(
     agent_input_tool_with_descriptions: Dict[str, str] = {}
     for key in agent_input_tools:
         conversation_command = ConversationCommand(key)
-        if conversation_command == ConversationCommand.Operator and not is_operator_enabled():
-            continue
         if (
             conversation_command in [ConversationCommand.Online, ConversationCommand.Webpage]
             and not is_web_search_enabled()
@@ -319,7 +301,6 @@ async def get_agent(
         "managed_by_admin": agent.managed_by_admin,
         "color": agent.style_color,
         "icon": agent.style_icon,
-        "privacy_level": agent.privacy_level,
         "chat_model": await _agent_chat_model_name(agent, user),
         "files": file_names,
         "input_tools": agent.input_tools,
@@ -484,9 +465,7 @@ async def create_agent(
     if validation_error:
         return validation_error
 
-    is_safe_prompt, reason = await acheck_if_safe_prompt(
-        body.persona, user, lax=body.privacy_level == Agent.PrivacyLevel.PRIVATE
-    )
+    is_safe_prompt, reason = await acheck_if_safe_prompt(body.persona, user, lax=True)
 
     if not is_safe_prompt:
         return Response(
@@ -504,7 +483,6 @@ async def create_agent(
             user,
             body.name,
             body.persona,
-            body.privacy_level,
             body.icon,
             body.color,
             agent_chat_model,
@@ -529,7 +507,6 @@ async def create_agent(
         "managed_by_admin": agent.managed_by_admin,
         "color": agent.style_color,
         "icon": agent.style_icon,
-        "privacy_level": agent.privacy_level,
         "chat_model": await _agent_chat_model_name(agent, user),
         "files": body.files,
         "input_tools": agent.input_tools,
@@ -564,9 +541,7 @@ async def update_agent(
 
     if selected_agent.personality != body.persona:
         # Check if the new persona is safe
-        is_safe_prompt, reason = await acheck_if_safe_prompt(
-            body.persona, user, lax=body.privacy_level == Agent.PrivacyLevel.PRIVATE
-        )
+        is_safe_prompt, reason = await acheck_if_safe_prompt(body.persona, user, lax=True)
 
         if not is_safe_prompt:
             return Response(
@@ -584,7 +559,6 @@ async def update_agent(
             user,
             body.name,
             body.persona,
-            body.privacy_level,
             body.icon,
             body.color,
             agent_chat_model,
@@ -608,7 +582,6 @@ async def update_agent(
         "managed_by_admin": agent.managed_by_admin,
         "color": agent.style_color,
         "icon": agent.style_icon,
-        "privacy_level": agent.privacy_level,
         "chat_model": await _agent_chat_model_name(agent, user),
         "files": body.files,
         "input_tools": agent.input_tools,

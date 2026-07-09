@@ -4,7 +4,7 @@ import { KhojPaneView } from 'src/pane_view';
 import { KhojView, createCopyParentText, getLinkToEntry, pasteTextAtCursor } from 'src/utils';
 import { KhojSearchModal } from 'src/search_modal';
 import Khoj from 'src/main';
-import { FileInteractions, EditBlock } from 'src/interact_with_files';
+import { FileInteractions, EditBlock, VaultAction, VaultActionResult } from 'src/interact_with_files';
 
 export interface ChatJsonResult {
     image?: string;
@@ -27,6 +27,7 @@ interface ChatMessageState {
     rawQuery: string;
     isVoice: boolean;
     generatedAssets: string;
+    vaultActionStatus: string;
     turnId: string;
     editBlocks: EditBlock[];
     editRetryCount: number;
@@ -74,7 +75,7 @@ interface ChatHistoryLog {
     by: string;
     message: string;
     turnId?: string;
-    context?: string[];
+    context?: object[];
     onlineContext?: object;
     created?: string | number;
     intent?: {
@@ -113,11 +114,23 @@ function isStringArray(value: unknown): value is string[] {
     return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
+function isVaultAction(value: unknown): value is VaultAction {
+    return isRecord(value)
+        && typeof value.op === "string"
+        && ["create_file", "append_file", "replace_text"].includes(value.op)
+        && typeof value.path === "string";
+}
+
+function getVaultActions(value: unknown): VaultAction[] {
+    if (!isRecord(value) || !Array.isArray(value.actions)) return [];
+    return value.actions.filter(isVaultAction);
+}
+
 function isChatHistoryLog(value: unknown): value is ChatHistoryLog {
     if (!isRecord(value) || typeof value.by !== "string" || typeof value.message !== "string") {
         return false;
     }
-    if (value.context !== undefined && !isStringArray(value.context)) return false;
+    if (value.context !== undefined && !Array.isArray(value.context)) return false;
     if (value.images !== undefined && !isStringArray(value.images)) return false;
     if (value.intent !== undefined && !isRecord(value.intent)) return false;
     return true;
@@ -161,8 +174,7 @@ export class KhojChatView extends KhojPaneView {
         { value: "online", label: "Online", iconName: "globe", command: "/online" },
         { value: "code", label: "Code", iconName: "code", command: "/code" },
         { value: "image", label: "Image", iconName: "image", command: "/image" },
-        { value: "research", label: "Research", iconName: "microscope", command: "/research" },
-        { value: "operator", label: "Operator", iconName: "laptop", command: "/operator" }
+        { value: "research", label: "Research", iconName: "microscope", command: "/research" }
     ];
     private editRetryCount: number = 0;  // Track number of retries for edit blocks
     private fileInteractions: FileInteractions;
@@ -182,25 +194,7 @@ export class KhojChatView extends KhojPaneView {
         // Initialize file access mode from persisted settings
         this.fileAccessMode = this.setting.fileAccessMode ?? 'read';
 
-        this.waitingForLocation = true;
-
-        fetch("https://ipapi.co/json")
-            .then(response => response.json())
-            .then(data => {
-                this.location = {
-                    region: data.region,
-                    city: data.city,
-                    countryName: data.country_name,
-                    countryCode: data.country_code,
-                    timezone: data.timezone,
-                };
-            })
-            .catch(err => {
-                console.log(err);
-            })
-            .finally(() => {
-                this.waitingForLocation = false;
-            });
+        this.waitingForLocation = false;
 
         // Register chat view keybindings
         this.scope = new Scope(this.app.scope);
@@ -215,7 +209,7 @@ export class KhojChatView extends KhojPaneView {
     }
 
     getDisplayText(): string {
-        return "Khoj Chat";
+        return "OfferAgent Chat";
     }
 
     getIcon(): string {
@@ -276,7 +270,7 @@ export class KhojChatView extends KhojPaneView {
         let defaultDomains = `'self' ${this.setting.khojUrl} https://*.obsidian.md https://app.khoj.dev https://assets.khoj.dev`;
         const defaultSrc = `default-src ${defaultDomains};`;
         const scriptSrc = `script-src ${defaultDomains} 'unsafe-inline';`;
-        const connectSrc = `connect-src ${this.setting.khojUrl} wss://*.obsidian.md/ https://ipapi.co/json;`;
+        const connectSrc = `connect-src ${this.setting.khojUrl} wss://*.obsidian.md/;`;
         const styleSrc = `style-src ${defaultDomains} 'unsafe-inline';`;
         const imgSrc = `img-src * app: data:;`;
         const childSrc = `child-src 'none';`;
@@ -297,7 +291,7 @@ export class KhojChatView extends KhojPaneView {
 
         // Populate the agent selector in the header
         const headerAgentSelect = this.contentEl.querySelector('.khoj-header-agent-select') as HTMLSelectElement;
-        if (headerAgentSelect && this.agents.length > 0) {
+        if (headerAgentSelect) {
             // Clear existing options
             headerAgentSelect.innerHTML = '';
 
@@ -419,7 +413,7 @@ export class KhojChatView extends KhojPaneView {
         // Get chat history from Khoj backend and set chat input state
         let getChatHistorySucessfully = await this.getChatHistory(chatBodyEl);
 
-        let placeholderText: string = getChatHistorySucessfully ? this.startingMessage : "Configure Khoj to enable chat";
+        let placeholderText: string = getChatHistorySucessfully ? this.startingMessage : "Configure OfferAgent to enable chat";
         chatInput.placeholder = placeholderText;
         chatInput.disabled = !getChatHistorySucessfully;
         this.autoResize();
@@ -647,7 +641,7 @@ export class KhojChatView extends KhojPaneView {
         message: string,
         sender: string,
         turnId: string,
-        context?: string[],
+        context?: object[],
         onlineContext?: object,
         dt?: Date,
         intentType?: string,
@@ -661,7 +655,6 @@ export class KhojChatView extends KhojPaneView {
 
         let chatMessageEl;
         if (
-            intentType?.includes("text-to-image") ||
             intentType === "excalidraw" ||
             (images && images.length > 0) ||
             mermaidjsDiagram ||
@@ -700,13 +693,7 @@ export class KhojChatView extends KhojPaneView {
 
     generateImageMarkdown(message: string, intentType: string, inferredQueries?: string[], conversationId?: string, images?: string[], excalidrawDiagram?: string, mermaidjsDiagram?: string): string {
         let imageMarkdown = "";
-        if (intentType === "text-to-image") {
-            imageMarkdown = `![](data:image/png;base64,${message})`;
-        } else if (intentType === "text-to-image2") {
-            imageMarkdown = `![](${message})`;
-        } else if (intentType === "text-to-image-v3") {
-            imageMarkdown = `![](${message})`;
-        } else if (intentType === "excalidraw" || excalidrawDiagram) {
+        if (intentType === "excalidraw" || excalidrawDiagram) {
             const domain = this.setting.khojUrl.endsWith("/") ? this.setting.khojUrl : `${this.setting.khojUrl}/`;
             const redirectMessage = `Hey, I'm not ready to show you diagrams yet here. But you can view it in ${domain}chat?conversationId=${conversationId}`;
             imageMarkdown = redirectMessage;
@@ -973,6 +960,10 @@ export class KhojChatView extends KhojPaneView {
             const agentSelect = this.contentEl.querySelector('.khoj-header-agent-select') as HTMLSelectElement;
             if (agentSelect) {
                 agentSelect.value = this.currentAgent || '';
+            }
+            if (chatInput) {
+                chatInput.removeAttribute("disabled");
+                chatInput.focus();
             }
         } catch (error) {
             console.error("Error creating session:", error);
@@ -1246,7 +1237,7 @@ export class KhojChatView extends KhojPaneView {
                     chatLog.message,
                     chatLog.by,
                     chatLog.turnId ?? "",
-                    chatLog.context,
+                chatLog.context,
                     chatLog.onlineContext,
                     chatLog.created ? new Date(chatLog.created) : undefined,
                     chatLog.intent?.type,
@@ -1269,9 +1260,10 @@ export class KhojChatView extends KhojPaneView {
             const chatInput = this.contentEl.querySelector('.khoj-chat-input') as HTMLTextAreaElement;
             if (chatInput) {
                 chatInput.placeholder = this.startingMessage;
+                chatInput.removeAttribute("disabled");
             }
         } catch (err) {
-            let errorMsg = "Unable to get response from Khoj server ❤️‍🩹. Ensure server is running or contact developers for help at [team@khoj.dev](mailto:team@khoj.dev) or in [Discord](https://discord.gg/BDgyabRM6e)";
+            let errorMsg = "Unable to get response from OfferAgent server. Ensure the server is running and the OfferAgent URL is correct.";
             this.renderMessage({
                 chatBodyEl,
                 message: errorMsg,
@@ -1323,6 +1315,17 @@ export class KhojChatView extends KhojPaneView {
             this.chatMessageState.generatedAssets = imageData;
             this.handleStreamResponse(this.chatMessageState.newResponseTextEl, imageData, this.chatMessageState.loadingEllipsis, false);
         }
+        else if (chunk.type === 'vault_actions') {
+            const actions = getVaultActions(chunk.data);
+            const results = await this.fileInteractions.applyVaultActions(actions);
+            this.chatMessageState.vaultActionStatus = this.formatVaultActionResults(results);
+            this.handleStreamResponse(
+                this.chatMessageState.newResponseTextEl,
+                this.chatMessageState.vaultActionStatus,
+                this.chatMessageState.loadingEllipsis,
+                false
+            );
+        }
         else if (chunk.type === 'end_llm_response') {
             // End of streaming - reset flag and restore normal UI behavior
             this.isStreaming = false;
@@ -1358,7 +1361,7 @@ export class KhojChatView extends KhojPaneView {
                             return; // Wait for retry response
                         } else {
                             // Exhausted retries; surface error and do not attempt further automatic retries
-                            console.warn('[Khoj] Max edit retries reached. Aborting further retries.');
+                            console.warn('[OfferAgent] Max edit retries reached. Aborting further retries.');
                         }
                     } else {
                         // Successful parse => reset counter and apply edits
@@ -1385,6 +1388,7 @@ export class KhojChatView extends KhojPaneView {
                 rawQuery: liveQuery,
                 isVoice: false,
                 generatedAssets: "",
+                vaultActionStatus: "",
                 turnId: "",
                 editBlocks: [],
                 editRetryCount: 0,
@@ -1404,11 +1408,11 @@ export class KhojChatView extends KhojPaneView {
                     this.handleJsonResponse(jsonData);
                 } catch (e) {
                     this.chatMessageState.rawResponse += chunkData;
-                    this.handleStreamResponse(this.chatMessageState.newResponseTextEl, this.chatMessageState.rawResponse + this.chatMessageState.generatedAssets, this.chatMessageState.loadingEllipsis);
+                    this.handleStreamResponse(this.chatMessageState.newResponseTextEl, this.chatMessageState.vaultActionStatus + this.chatMessageState.rawResponse + this.chatMessageState.generatedAssets, this.chatMessageState.loadingEllipsis);
                 }
             } else {
                 this.chatMessageState.rawResponse += chunkData;
-                this.handleStreamResponse(this.chatMessageState.newResponseTextEl, this.chatMessageState.rawResponse + this.chatMessageState.generatedAssets, this.chatMessageState.loadingEllipsis);
+                this.handleStreamResponse(this.chatMessageState.newResponseTextEl, this.chatMessageState.vaultActionStatus + this.chatMessageState.rawResponse + this.chatMessageState.generatedAssets, this.chatMessageState.loadingEllipsis);
             }
         }
         else if (chunk.type === "metadata") {
@@ -1417,6 +1421,19 @@ export class KhojChatView extends KhojPaneView {
                 this.chatMessageState.turnId = turnId;
             }
         }
+    }
+
+    private formatVaultActionResults(results: VaultActionResult[]): string {
+        if (results.length === 0) {
+            return "";
+        }
+        const lines = results.map(result => {
+            if (result.success) {
+                return `- ${result.action.op}: ${result.path}`;
+            }
+            return `- failed ${result.action.op}: ${result.path} (${result.error || "unknown error"})`;
+        });
+        return `Local vault actions:\n${lines.join("\n")}\n\n`;
     }
 
     handleJsonResponse(jsonData: any): void {
@@ -1428,7 +1445,7 @@ export class KhojChatView extends KhojPaneView {
 
         if (this.chatMessageState.newResponseTextEl) {
             this.chatMessageState.newResponseTextEl.innerHTML = "";
-            this.chatMessageState.newResponseTextEl.appendChild(this.formatHTMLMessage(this.chatMessageState.rawResponse));
+            this.chatMessageState.newResponseTextEl.appendChild(this.formatHTMLMessage(this.chatMessageState.vaultActionStatus + this.chatMessageState.rawResponse));
         }
     }
 
@@ -1541,6 +1558,9 @@ export class KhojChatView extends KhojPaneView {
             ...(!!this.location && this.location.countryName && { country: this.location.countryName }),
             ...(!!this.location && this.location.countryCode && { country_code: this.location.countryCode }),
             ...(!!this.location && this.location.timezone && { timezone: this.location.timezone }),
+            client_capabilities: {
+                vaultActions: this.fileAccessMode === 'write',
+            },
         };
 
         let newResponseEl = this.createKhojResponseDiv();
@@ -1561,6 +1581,7 @@ export class KhojChatView extends KhojPaneView {
             rawResponse: "",
             isVoice: isVoice,
             generatedAssets: "",
+            vaultActionStatus: "",
             turnId: "",
             editBlocks: [],
             editRetryCount: 0
@@ -1586,8 +1607,8 @@ export class KhojChatView extends KhojPaneView {
             // Stream and render chat response
             await this.readChatStream(response);
         } catch (err) {
-            console.error(`Khoj chat response failed with\n${err}`);
-            let errorMsg = "Sorry, unable to get response from Khoj backend ❤️‍🩹. Retry or contact developers for help at <a href=mailto:'team@khoj.dev'>team@khoj.dev</a> or <a href='https://discord.gg/BDgyabRM6e'>on Discord</a>";
+            console.error(`OfferAgent chat response failed with\n${err}`);
+            let errorMsg = "Sorry, unable to get response from OfferAgent backend. Retry after checking the OfferAgent URL and server.";
             newResponseTextEl.textContent = errorMsg;
         }
     }
@@ -1804,14 +1825,7 @@ export class KhojChatView extends KhojPaneView {
         if (imageJson.image) {
             const inferredQuery = imageJson.inferredQueries?.[0] ?? "generated image";
 
-            // If response has image field, response is a generated image.
-            if (imageJson.intentType === "text-to-image") {
-                rawResponse += `![generated_image](data:image/png;base64,${imageJson.image})`;
-            } else if (imageJson.intentType === "text-to-image2") {
-                rawResponse += `![generated_image](${imageJson.image})`;
-            } else if (imageJson.intentType === "text-to-image-v3") {
-                rawResponse = `![generated_image](${imageJson.image})`;
-            } else if (imageJson.intentType === "excalidraw") {
+            if (imageJson.intentType === "excalidraw") {
                 const domain = this.setting.khojUrl.endsWith("/") ? this.setting.khojUrl : `${this.setting.khojUrl}/`;
                 const redirectMessage = `Hey, I'm not ready to show you diagrams yet here. But you can view it in ${domain}`;
                 rawResponse += redirectMessage;

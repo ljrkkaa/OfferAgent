@@ -5,13 +5,10 @@ from typing import Optional
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
-from starlette.authentication import has_required_scope, requires
+from starlette.authentication import requires
 
 from khoj.database.adapters import ConversationAdapters
-from khoj.database.models import (
-    ChatModel,
-    PriceTier,
-)
+from khoj.database.models import ChatModel
 from khoj.processor.conversation.codex.auth import (
     get_codex_chat_model_options,
     get_codex_fast_mode,
@@ -22,7 +19,6 @@ from khoj.processor.conversation.codex.auth import (
     set_codex_model,
 )
 from khoj.processor.conversation.codex.utils import use_codex_runtime
-from khoj.routers.helpers import update_telemetry_state
 
 api_model = APIRouter()
 logger = logging.getLogger(__name__)
@@ -33,7 +29,6 @@ class ChatModelOptionResponse(BaseModel):
     id: int
     strengths: Optional[str] = None
     description: Optional[str] = None
-    tier: Optional[str] = None
 
 
 @api_model.get("/chat/options", response_model=list[ChatModelOptionResponse])
@@ -108,13 +103,6 @@ def update_chat_fast_mode(
         return Response(status_code=400, content=json.dumps({"status": "error", "message": "Fast mode requires Codex"}))
 
     set_codex_fast_mode(enabled)
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="set_conversation_fast_mode",
-        client=client,
-        metadata={"processor_conversation_type": "codex", "fast_mode": enabled},
-    )
     return {"status": "ok", "enabled": enabled}
 
 
@@ -126,7 +114,6 @@ async def update_chat_model(
     client: Optional[str] = None,
 ):
     user = request.user.object
-    subscribed = has_required_scope(request, ["premium"])
 
     if use_codex_runtime():
         model = get_codex_model_by_option_id(id)
@@ -135,13 +122,6 @@ async def update_chat_model(
                 status_code=404, content=json.dumps({"status": "error", "message": "Codex model not found"})
             )
         set_codex_model(model)
-        update_telemetry_state(
-            request=request,
-            telemetry_type="api",
-            api="set_conversation_chat_model",
-            client=client,
-            metadata={"processor_conversation_type": "codex", "chat_model": model},
-        )
         return {"status": "ok"}
 
     try:
@@ -153,21 +133,8 @@ async def update_chat_model(
     chat_model = await ChatModel.objects.filter(id=chat_model_id).afirst()
     if chat_model is None:
         return Response(status_code=404, content=json.dumps({"status": "error", "message": "Chat model not found"}))
-    if not subscribed and chat_model.price_tier != PriceTier.FREE:
-        return Response(
-            status_code=403,
-            content=json.dumps({"status": "error", "message": "Subscribe to switch to this chat model"}),
-        )
 
     new_config = await ConversationAdapters.aset_user_conversation_processor(user, chat_model_id)
-
-    update_telemetry_state(
-        request=request,
-        telemetry_type="api",
-        api="set_conversation_chat_model",
-        client=client,
-        metadata={"processor_conversation_type": "conversation"},
-    )
 
     if new_config is None:
         return Response(status_code=404, content=json.dumps({"status": "error", "message": "Model not found"}))

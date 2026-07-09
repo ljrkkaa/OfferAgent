@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -70,6 +72,67 @@ async def test_save_to_conversation_log_adds_assistant_artifact(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_save_to_conversation_log_schedules_memory_without_waiting(monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    captured = {}
+
+    async def fake_save_conversation(*args, **kwargs):
+        return SimpleNamespace(id="conv-1", agent="agent-1")
+
+    async def fake_memory_update(**kwargs):
+        captured.update(kwargs)
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(convo_utils.ConversationAdapters, "save_conversation", fake_save_conversation)
+    monkeypatch.setattr(convo_utils, "_run_offeragent_memory_update", fake_memory_update)
+
+    await asyncio.wait_for(
+        convo_utils.save_to_conversation_log(
+            "以后回答简洁一点",
+            "好的",
+            user=SimpleNamespace(username="tester"),
+            tracer={"mid": "turn-1"},
+            used_notes_tool_loop=True,
+        ),
+        timeout=0.2,
+    )
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+
+    assert captured["latest_user_message"] == "以后回答简洁一点"
+    assert captured["agent"] == "agent-1"
+    assert captured["source_turn_id"] == "turn-1"
+    assert captured["used_notes_tool_loop"] is True
+
+    release.set()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_background_memory_update_failure_is_logged(monkeypatch, caplog):
+    async def failing_memory_update(**kwargs):
+        raise RuntimeError("memory boom")
+
+    monkeypatch.setattr(convo_utils, "_run_offeragent_memory_update", failing_memory_update)
+
+    with caplog.at_level(logging.ERROR, logger=convo_utils.logger.name):
+        task = convo_utils._schedule_offeragent_memory_update(
+            user=SimpleNamespace(username="tester"),
+            latest_user_message="记住我偏好简洁回答",
+            source_turn_id="turn-1",
+        )
+        for _ in range(10):
+            if task.done():
+                break
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    assert task.done()
+    assert "OfferAgent background memory update failed" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_notes_tool_loop_reads_llm_selected_file_lines(tmp_path, monkeypatch):
     (tmp_path / "notes.md").write_text("alpha\nRedis evidence\nomega\n", encoding="utf-8")
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
@@ -123,6 +186,44 @@ async def test_notes_tool_loop_appends_only_when_model_calls_write_tool(tmp_path
     assert "HashMap 扩容要讲清楚。" in (tmp_path / "notes.md").read_text(encoding="utf-8")
     assert result.references[-1]["query"] == "append_note"
     assert result.references[-1]["status"] == "written"
+
+
+@pytest.mark.asyncio
+async def test_notes_tool_loop_prepares_client_vault_action_without_server_write(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+    monkeypatch.setenv("KHOJ_ALLOW_VAULT_WRITE", "true")
+
+    result = await collect_notes_evidence_with_tools(
+        "创建 daily/2026-07-09.md，内容是：# 2026-07-09 每日计划",
+        [],
+        user=object(),
+        agent=None,
+        send_message=fake_model(
+            json.dumps(
+                {
+                    "calls": [
+                        {
+                            "name": "append_note",
+                            "args": {"path": "daily/2026-07-09.md", "content": "# 2026-07-09 每日计划\n"},
+                            "id": "1",
+                        }
+                    ]
+                }
+            ),
+            "done",
+        ),
+        write_mode="client_actions",
+    )
+
+    assert not (tmp_path / "daily" / "2026-07-09.md").exists()
+    assert result.references[-1]["status"] == "action_prepared"
+    assert result.references[-1]["vault_action"] == {
+        "op": "create_file",
+        "path": "daily/2026-07-09.md",
+        "content": "# 2026-07-09 每日计划\n",
+        "heading": None,
+        "mode": "create_only",
+    }
 
 
 @pytest.mark.asyncio

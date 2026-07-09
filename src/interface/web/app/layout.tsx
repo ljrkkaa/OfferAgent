@@ -6,22 +6,22 @@ import { ContentSecurityPolicy } from "./common/layoutHelper";
 import { ThemeProvider } from "./components/providers/themeProvider";
 
 export const metadata: Metadata = {
-    title: "Khoj AI - Ask Anything",
+    title: "OfferAgent - Ask Anything",
     description:
-        "Khoj is a personal research assistant. It helps you understand better and create faster.",
+        "OfferAgent is a local interview-prep assistant that helps you use your own notes.",
     icons: {
         icon: "/static/assets/icons/khoj_lantern.ico",
         apple: "/static/assets/icons/khoj_lantern_256x256.png",
     },
     manifest: "/static/khoj.webmanifest",
     keywords:
-        "research assistant, productivity, AI, Khoj, open source, model agnostic, research, productivity tool, personal assistant, personal research assistant, personal productivity assistant",
+        "interview assistant, offer agent, productivity, AI, local knowledge base, personal assistant",
     openGraph: {
-        siteName: "Khoj AI",
-        title: "Khoj AI",
+        siteName: "OfferAgent",
+        title: "OfferAgent",
         description:
-            "Khoj is a personal research assistant. It helps you understand better and create faster.",
-        url: "https://app.khoj.dev",
+            "OfferAgent is a local interview-prep assistant that helps you use your own notes.",
+        url: "http://localhost:12805",
         type: "website",
         images: [
             {

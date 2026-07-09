@@ -54,10 +54,8 @@
         "file-saver": "^2.0.5",
         "framer-motion": "^12.23.12",
         "input-otp": "^1.4.2",
-        "intl-tel-input": "^23.9.3",
         "jszip": "^3.10.1",
         "katex": "^0.16.22",
-        "libphonenumber-js": "^1.12.17",
         "lucide-react": "^0.468.0",
         "markdown-it": "^14.1.0",
         "markdown-it-highlightjs": "^4.2.0",
@@ -76,7 +74,6 @@
     "devDependencies": {
         "@types/dompurify": "^3.2.0",
         "@types/file-saver": "^2.0.7",
-        "@types/intl-tel-input": "^18.1.4",
         "@types/katex": "^0.16.7",
         "@types/markdown-it": "^14.1.2",
         "@types/node": "^20.19.15",

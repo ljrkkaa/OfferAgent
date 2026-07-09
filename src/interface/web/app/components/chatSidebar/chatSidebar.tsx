@@ -43,7 +43,7 @@ import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Tooltip, TooltipTrigger } from "@/components/ui/tooltip";
 import { TooltipContent } from "@radix-ui/react-tooltip";
-import { ModelOptions, useAuthenticatedData } from "@/app/common/auth";
+import { ModelOptions } from "@/app/common/auth";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
     Dialog,
@@ -72,7 +72,6 @@ interface ChatSideBarProps {
     isOpen: boolean;
     isMobileWidth?: boolean;
     onOpenChange: (open: boolean) => void;
-    isActive?: boolean;
 }
 
 const fetcher = async (url: string) => {
@@ -145,7 +144,6 @@ function AgentCreationForm(props: IAgentCreationProps) {
             chat_model: props.selectedModel,
             input_tools: props.inputTools,
             output_modes: props.outputModes,
-            privacy_level: "private",
         };
 
         const createAgentUrl = `/api/agents`;
@@ -357,11 +355,6 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
         `/api/agents/conversation?conversation_id=${encodeURIComponent(props.conversationId)}`,
         fetcher,
     );
-    const {
-        data: authenticatedData,
-        error: authenticationError,
-        isLoading: authenticationLoading,
-    } = useAuthenticatedData();
     const { data: fastModeData } = useSWR<FastModeData>("/api/model/chat/fast", fetcher);
 
     const [customPrompt, setCustomPrompt] = useState<string | undefined>();
@@ -376,8 +369,6 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
     const [displayOutputModes, setDisplayOutputModes] = useState<string[] | undefined>();
 
     const [isSaving, setIsSaving] = useState<boolean>(false);
-
-    const isSubscribed = authenticatedData?.is_active ?? false;
 
     const setupAgentData = useCallback(() => {
         if (agentData) {
@@ -661,17 +652,7 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
                 {!agentDataLoading && agentData && (
                     <SidebarGroup key={"model"}>
                         <SidebarGroupContent>
-                            <SidebarGroupLabel>
-                                Model
-                                {!isSubscribed && (
-                                    <a
-                                        href="/settings"
-                                        className="hover:font-bold text-accent-foreground m-2 bg-accent bg-opacity-10 p-1 rounded-lg"
-                                    >
-                                        Upgrade
-                                    </a>
-                                )}
-                            </SidebarGroupLabel>
+                            <SidebarGroupLabel>Model</SidebarGroupLabel>
                             <SidebarMenu className="p-0 m-0">
                                 <SidebarMenuItem key={"model"} className="list-none">
                                     <ModelSelector
@@ -680,7 +661,6 @@ function ChatSidebarInternal({ ...props }: ChatSideBarProps) {
                                         initialModel={
                                             isDefaultAgent ? undefined : agentData?.chat_model
                                         }
-                                        isActive={props.isActive}
                                     />
                                 </SidebarMenuItem>
                                 {isDefaultAgent && fastModeData?.available && (

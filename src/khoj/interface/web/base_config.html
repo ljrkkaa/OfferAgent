@@ -4,23 +4,18 @@
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0 maximum-scale=1.0">
         <link rel="icon" type="image/png" sizes="128x128" href="https://assets.khoj.dev/khoj_lantern_128x128.png?v={{ khoj_version }}">
-        <title>Khoj</title>
+        <title>OfferAgent</title>
         <meta http-equiv="Content-Security-Policy"
               content="default-src 'self' https://assets.khoj.dev;
                        script-src 'self' https://assets.khoj.dev 'unsafe-inline';
                        connect-src 'self';
                        style-src 'self' https://assets.khoj.dev 'unsafe-inline' https://fonts.googleapis.com;
-                       img-src 'self' data: https://*.khoj.dev https://*.googleusercontent.com;
+                       img-src 'self' data: https://*.khoj.dev;
                        font-src https://assets.khoj.dev https://fonts.gstatic.com;
                        child-src 'none';
                        object-src 'none';">
         <link rel="stylesheet" href="/static/assets/pico.min.css?v={{ khoj_version }}">
         <link rel="stylesheet" href="/static/assets/khoj.css?v={{ khoj_version }}">
-        <script
-            integrity="sha384-05IkdNHoAlkhrFVUCCN805WC/h4mcI98GUBssmShF2VJAXKyZTrO/TmJ+4eBo0Cy"
-            crossorigin="anonymous"
-            src="https://assets.khoj.dev/intl-tel-input/intlTelInput.min.js"></script>
-        <link rel="stylesheet" href="https://assets.khoj.dev/intl-tel-input/intlTelInput.css">
     </head>
     <script type="text/javascript" src="/static/assets/utils.js?v={{ khoj_version }}"></script>
     <script type="text/javascript" src="/static/assets/purify.min.js?v={{ khoj_version }}"></script>
@@ -30,7 +25,7 @@
 
             <!--Add Header Logo and Nav Pane-->
             {% import 'utils.html' as utils %}
-            {{ utils.heading_pane(user_photo, username, is_active, has_documents) }}
+            {{ utils.heading_pane(user_photo, username, has_documents) }}
 
             <div class="filler"></div>
         </div>
@@ -343,7 +338,6 @@
 
         select#paint-models,
         select#search-models,
-        select#voice-models,
         select#chat-models {
             margin-bottom: 0;
             padding: 8px;

@@ -1,8 +1,8 @@
 {
-    "name": "Khoj",
+    "name": "OfferAgent",
     "version": "2.0.0-beta.28",
-    "description": "Your Second Brain",
-    "author": "Debanjum Singh Solanky, Saba Imran <team@khoj.dev>",
+    "description": "Interview prep and offer workflow assistant for Obsidian",
+    "author": "OfferAgent",
     "license": "GPL-3.0-or-later",
     "main": "src/main.js",
     "scripts": {

@@ -4,7 +4,7 @@ from urllib.parse import quote
 import pytest
 
 from khoj.database.models import KhojApiUser, KhojUser
-from khoj.processor.content.org_mode.org_to_entries import OrgToEntries
+from khoj.processor.content.markdown.markdown_to_entries import MarkdownToEntries
 from khoj.search_type import text_search
 
 
@@ -13,7 +13,7 @@ from khoj.search_type import text_search
 def test_search_for_user2_returns_empty(client, api_user2: KhojApiUser):
     token = api_user2.token
     headers = {"Authorization": f"Bearer {token}"}
-    for content_type in ["all", "org", "markdown", "pdf", "github", "notion", "plaintext"]:
+    for content_type in ["all", "markdown", "pdf", "plaintext"]:
         # Act
         response = client.get(f"/api/search?q=random&t={content_type}", headers=headers)
         # Assert
@@ -57,14 +57,14 @@ def test_index_update_with_user2_inaccessible_user1(client, api_user2: KhojApiUs
 
 # ----------------------------------------------------------------------------------------------------
 @pytest.mark.django_db(transaction=True)
-def test_different_user_data_not_accessed(client, sample_org_data, default_user: KhojUser):
+def test_different_user_data_not_accessed(client, sample_markdown_data, default_user: KhojUser):
     # Arrange
     headers = {"Authorization": "Bearer kk-token"}  # Token for default_user2
-    text_search.setup(OrgToEntries, sample_org_data, regenerate=False, user=default_user)
+    text_search.setup(MarkdownToEntries, sample_markdown_data, regenerate=False, user=default_user)
     user_query = quote("How to git install application?")
 
     # Act
-    response = client.get(f"/api/search?q={user_query}&n=1&t=org", headers=headers)
+    response = client.get(f"/api/search?q={user_query}&n=1&t=markdown", headers=headers)
 
     # Assert
     assert response.status_code == 403
@@ -74,9 +74,9 @@ def test_different_user_data_not_accessed(client, sample_org_data, default_user:
 
 def get_sample_files_data():
     return [
-        ("files", ("path/to/filename.org", "* practicing piano", "text/org")),
-        ("files", ("path/to/filename1.org", "** top 3 reasons why I moved to SF", "text/org")),
-        ("files", ("path/to/filename2.org", "* how to build a search engine", "text/org")),
+        ("files", ("path/to/filename.markdown", "* practicing piano", "text/markdown")),
+        ("files", ("path/to/filename1.markdown", "** top 3 reasons why I moved to SF", "text/markdown")),
+        ("files", ("path/to/filename2.markdown", "* how to build a search engine", "text/markdown")),
         ("files", ("path/to/filename.pdf", "Moore's law does not apply to consumer hardware", "application/pdf")),
         ("files", ("path/to/filename1.pdf", "The sun is a ball of helium", "application/pdf")),
         ("files", ("path/to/filename2.pdf", "Effect of sunshine on baseline human happiness", "application/pdf")),

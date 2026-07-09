@@ -6,11 +6,6 @@ from enum import Enum
 
 class SearchType(str, Enum):
     All = "all"
-    Org = "org"
     Markdown = "markdown"
-    Image = "image"
     Pdf = "pdf"
-    Github = "github"
-    Notion = "notion"
     Plaintext = "plaintext"
-    Docx = "docx"
