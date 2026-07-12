@@ -3,17 +3,7 @@ import React, { useEffect, useRef, useState, forwardRef } from "react";
 
 import DOMPurify from "dompurify";
 import "katex/dist/katex.min.css";
-import { ArrowUp, Paperclip, X, Stop, ToggleLeft, ToggleRight } from "@phosphor-icons/react";
-
-import {
-    Command,
-    CommandEmpty,
-    CommandGroup,
-    CommandInput,
-    CommandItem,
-    CommandList,
-    CommandSeparator,
-} from "@/components/ui/command";
+import { ArrowUp, Paperclip, X, Stop } from "@phosphor-icons/react";
 
 import {
     AlertDialog,
@@ -25,14 +15,12 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
-import { Popover, PopoverContent } from "@/components/ui/popover";
-import { PopoverTrigger } from "@radix-ui/react-popover";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { convertColorToTextClass, convertToBGClass } from "@/app/common/colorUtils";
+import { convertToBGClass } from "@/app/common/colorUtils";
 
 import LocalAuthError from "../localAuthError/localAuthError";
-import { getIconForSlashCommand, getIconFromFilename } from "@/app/common/iconUtils";
+import { getIconFromFilename } from "@/app/common/iconUtils";
 import { packageFilesForUpload } from "@/app/common/chatFunctions";
 import { convertBytesToText } from "@/app/common/utils";
 import {
@@ -44,10 +32,6 @@ import {
     DialogTrigger,
 } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
-
-export interface ChatOptions {
-    [key: string]: string;
-}
 
 export interface AttachedFileText {
     name: string;
@@ -70,7 +54,6 @@ function isAttachedFileText(file: unknown): file is AttachedFileText {
 export enum ChatInputFocus {
     MESSAGE = "message",
     FILE = "file",
-    RESEARCH = "research",
 }
 
 interface ChatInputProps {
@@ -78,12 +61,9 @@ interface ChatInputProps {
     sendImage: (image: string) => void;
     sendDisabled: boolean;
     setUploadedFiles: (files: AttachedFileText[]) => void;
-    conversationId?: string | null;
-    chatOptionsData?: ChatOptions | null;
     isMobileWidth?: boolean;
     isLoggedIn: boolean;
     agentColor?: string;
-    isResearchModeEnabled?: boolean;
     setTriggeredAbort: (value: boolean, newMessage?: string) => void;
     prefillMessage?: string;
     focus?: ChatInputFocus;
@@ -93,7 +73,6 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
     const [message, setMessage] = useState("");
     const fileInputRef = useRef<HTMLInputElement>(null);
     const fileInputButtonRef = useRef<HTMLButtonElement>(null);
-    const researchModeRef = useRef<HTMLButtonElement>(null);
 
     const [warning, setWarning] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
@@ -110,11 +89,6 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
 
     const [progressValue, setProgressValue] = useState(0);
     const [isDragAndDropping, setIsDragAndDropping] = useState(false);
-
-    const [showCommandList, setShowCommandList] = useState(false);
-    const [useResearchMode, setUseResearchMode] = useState<boolean>(
-        props.isResearchModeEnabled || false,
-    );
 
     const chatInputRef = ref as React.MutableRefObject<HTMLTextAreaElement>;
     useEffect(() => {
@@ -145,8 +119,6 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
             chatInputRef?.current?.focus();
         } else if (props.focus === ChatInputFocus.FILE) {
             fileInputButtonRef.current?.focus();
-        } else if (props.focus === ChatInputFocus.RESEARCH) {
-            researchModeRef.current?.focus();
         }
     }, [props.focus, chatInputRef]);
 
@@ -172,12 +144,6 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
         fetchImageData();
     }, [imagePaths]);
 
-    useEffect(() => {
-        if (props.isResearchModeEnabled) {
-            setUseResearchMode(props.isResearchModeEnabled);
-        }
-    }, [props.isResearchModeEnabled]);
-
     function onSendMessage() {
         if (!message.trim() && imageData.length === 0) return;
         if (!props.isLoggedIn) {
@@ -200,24 +166,10 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
             imagesToSend.forEach((data) => props.sendImage(data));
         }
 
-        let messageToSend = message.trim();
-        // Check if message starts with an explicit slash command
-        const startsWithSlashCommand =
-            props.chatOptionsData &&
-            Object.keys(props.chatOptionsData).some((cmd) => messageToSend.startsWith(`/${cmd}`));
-        // Only add /research if useResearchMode is enabled and message doesn't already use a slash command
-        if (useResearchMode && !startsWithSlashCommand) {
-            messageToSend = `/research ${messageToSend}`;
-        }
-
-        props.sendMessage(messageToSend, imagesToSend);
+        props.sendMessage(message.trim(), imagesToSend);
         setAttachedFiles(null);
         setConvertedAttachedFiles([]);
         setMessage("");
-    }
-
-    function handleSlashCommandClick(command: string) {
-        setMessage(`/${command} `);
     }
 
     function handleFileButtonClick() {
@@ -337,12 +289,6 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
         chatInputRef.current.style.height = "auto";
         chatInputRef.current.style.height =
             Math.max(chatInputRef.current.scrollHeight - 24, 64) + "px";
-
-        if (message.startsWith("/") && message.split(" ").length === 1) {
-            setShowCommandList(true);
-        } else {
-            setShowCommandList(false);
-        }
     }, [message, chatInputRef]);
 
     function handleDragOver(event: React.DragEvent<HTMLDivElement>) {
@@ -422,59 +368,6 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
                         </AlertDialogAction>
                     </AlertDialogContent>
                 </AlertDialog>
-            )}
-            {showCommandList && (
-                <div className="flex justify-center text-center">
-                    <Popover open={showCommandList} onOpenChange={setShowCommandList}>
-                        <PopoverTrigger className="flex justify-center text-center"></PopoverTrigger>
-                        <PopoverContent
-                            onOpenAutoFocus={(e) => e.preventDefault()}
-                            className={`${props.isMobileWidth ? "w-[100vw]" : "w-full"} rounded-md`}
-                            side="bottom"
-                            align="center"
-                            /* Offset below text area on home page (i.e where conversationId is unset) */
-                            sideOffset={props.conversationId ? 0 : 80}
-                            alignOffset={0}
-                        >
-                            <Command className="max-w-full">
-                                <CommandInput
-                                    placeholder="Type a command or search..."
-                                    value={message}
-                                    className="hidden"
-                                />
-                                <CommandList>
-                                    <CommandEmpty>No matching commands.</CommandEmpty>
-                                    <CommandGroup heading="Agent Tools">
-                                        {props.chatOptionsData &&
-                                            Object.entries(props.chatOptionsData).map(
-                                                ([key, value]) => (
-                                                    <CommandItem
-                                                        key={key}
-                                                        className={`text-md`}
-                                                        onSelect={() =>
-                                                            handleSlashCommandClick(key)
-                                                        }
-                                                    >
-                                                        <div className="grid grid-cols-1 gap-1">
-                                                            <div className="font-bold flex items-center">
-                                                                {getIconForSlashCommand(
-                                                                    key,
-                                                                    "h-4 w-4 mr-2",
-                                                                )}
-                                                                /{key}
-                                                            </div>
-                                                            <div>{value}</div>
-                                                        </div>
-                                                    </CommandItem>
-                                                ),
-                                            )}
-                                    </CommandGroup>
-                                    <CommandSeparator />
-                                </CommandList>
-                            </Command>
-                        </PopoverContent>
-                    </Popover>
-                </div>
             )}
             <div>
                 <div className="flex items-center gap-2 overflow-x-auto">
@@ -607,7 +500,7 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
                                 focus:outline-none focus-visible:ring-transparent
                                 w-full h-16 min-h-16 max-h-[128px] md:py-4 rounded-lg resize-none dark:bg-neutral-700
                                 ${props.isMobileWidth ? "text-md" : "text-lg"}`}
-                            placeholder="Type / to see a list of commands"
+                            placeholder="Ask about your notes or anything else"
                             id="message"
                             autoFocus={true}
                             value={message}
@@ -657,39 +550,6 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
                         </Button>
                     </div>
                 </div>
-                <TooltipProvider>
-                    <Tooltip>
-                        <TooltipTrigger asChild>
-                            <Button
-                                variant="ghost"
-                                className="float-right justify-center gap-1 flex items-center p-1.5 mr-2 h-fit"
-                                disabled={props.sendDisabled || !props.isLoggedIn}
-                                ref={researchModeRef}
-                                onClick={() => {
-                                    setUseResearchMode(!useResearchMode);
-                                    chatInputRef?.current?.focus();
-                                }}
-                            >
-                                <span className="text-muted-foreground text-sm">Research Mode</span>
-                                {useResearchMode ? (
-                                    <ToggleRight
-                                        weight="fill"
-                                        className={`w-6 h-6 inline-block ${props.agentColor ? convertColorToTextClass(props.agentColor) : convertColorToTextClass("orange")} rounded-full`}
-                                    />
-                                ) : (
-                                    <ToggleLeft
-                                        weight="fill"
-                                        className={`w-6 h-6 inline-block ${convertColorToTextClass("gray")} rounded-full`}
-                                    />
-                                )}
-                            </Button>
-                        </TooltipTrigger>
-                        <TooltipContent className="text-xs">
-                            Research Mode allows you to get more deeply researched, detailed
-                            responses. Response times may be longer.
-                        </TooltipContent>
-                    </Tooltip>
-                </TooltipProvider>
             </div>
         </>
     );

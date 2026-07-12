@@ -1,4 +1,3 @@
-import type { ChatOptions } from "../components/chatInputArea/chatInputArea";
 import type { Context, OnlineContext, StreamMessage } from "../components/chatMessage/chatMessage";
 import { attachVaultActionBatch } from "./vaultActions";
 
@@ -189,14 +188,6 @@ export function buildChatUrl(conversationId: string, query?: string) {
     const params = new URLSearchParams({ conversationId });
     if (query) params.set("q", query);
     return `/chat?${params.toString()}`;
-}
-
-export async function fetchChatOptions(): Promise<ChatOptions> {
-    const response = await fetch("/api/chat/options");
-    if (!response.ok) {
-        throw new Error(`Failed to fetch chat options: ${response.status}`);
-    }
-    return response.json();
 }
 
 export async function packageFilesForUpload(files: FileList): Promise<FormData> {

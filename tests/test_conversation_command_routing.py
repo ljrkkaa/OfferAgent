@@ -1,27 +1,18 @@
 import pytest
 
-from khoj.routers.helpers import parse_conversation_command
-from khoj.utils.helpers import ConversationCommand
+from khoj.routers.helpers import parse_summary_command
 
 
-def test_explicit_conversation_command_matches_the_first_token_exactly():
-    assert parse_conversation_command(" /notes read notes.md") == (
-        ConversationCommand.Notes,
-        "read notes.md",
-        True,
-    )
+def test_summary_command_matches_only_the_first_token():
+    assert parse_summary_command(" /summarize focus on decisions") == ("focus on decisions", True)
+    assert parse_summary_command("mention /summarize literally") == ("mention /summarize literally", False)
+    assert parse_summary_command("/summarize") == ("Create a general summary of the selected files.", True)
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["/default hi", "/general hi", "/notes hi", "/online hi", "/webpage hi", "/research hi"],
+)
+def test_removed_chat_modes_are_unknown(query):
     with pytest.raises(ValueError, match="Unknown conversation command"):
-        parse_conversation_command("/notes-extra read notes.md")
-    assert parse_conversation_command("please use /notes literally") == (
-        ConversationCommand.Default,
-        "please use /notes literally",
-        False,
-    )
-
-
-def test_default_command_is_explicit_and_removed_from_the_user_query():
-    assert parse_conversation_command("/default explain this") == (
-        ConversationCommand.Default,
-        "explain this",
-        True,
-    )
+        parse_summary_command(query)

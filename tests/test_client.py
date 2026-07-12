@@ -413,7 +413,7 @@ def test_chat_history_returns_obsidian_session_shape(client, api_user: KhojApiUs
         "chat": [
             {
                 "by": "you",
-                "message": "/notes ask from vault",
+                "message": "ask from vault",
                 "turnId": "turn-1",
                 "created": "2026-07-01T00:00:00Z",
             }
@@ -433,15 +433,14 @@ def test_chat_history_returns_obsidian_session_shape(client, api_user: KhojApiUs
     assert data["response"]["slug"] == "Obsidian Resume"
     assert data["response"]["agent"]["slug"] == "khoj"
     assert data["response"]["chat"][0]["by"] == "you"
-    assert data["response"]["chat"][0]["message"] == "/notes ask from vault"
+    assert data["response"]["chat"][0]["message"] == "ask from vault"
 
 
 @pytest.mark.django_db(transaction=True)
-def test_chat_options_endpoint_returns_command_map(client):
+def test_removed_chat_options_endpoint_is_not_registered(client):
     response = client.get("/api/chat/options")
 
-    assert response.status_code == 200
-    assert isinstance(response.json(), dict)
+    assert response.status_code == 404
 
 
 def test_removed_product_routes_are_not_registered(fastapi_app):

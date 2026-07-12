@@ -292,89 +292,12 @@ Collate all relevant information from the document to answer the target query.
 """.strip()
 )
 
-system_prompt_extract_relevant_summary = """
-As a professional analyst, create a comprehensive report of the most relevant information from the document in response to a user's query.
-The text provided is directly from within the document.
-The report you create should be multiple paragraphs, and it should represent the content of the document.
-Tell the user exactly what the document says in response to their query, while adhering to these guidelines:
-
-1. Answer the user's query as specifically as possible. Include many supporting details from the document.
-2. Craft a report that is detailed, thorough, in-depth, and complex, while maintaining clarity.
-3. Rely strictly on the provided text, without including external information.
-4. Format the report in multiple paragraphs with a clear structure.
-5. Be as specific as possible in your answer to the user's query.
-6. Reproduce as much of the provided text as possible, while maintaining readability.
-""".strip()
-
-extract_relevant_summary = PromptTemplate.from_template(
-    """
-{personality_context}
-
-Conversation History:
-{chat_history}
-
-Target Query: {query}
-
-Document Contents:
-{corpus}
-
-Collate only relevant information from the document to answer the target query.
-""".strip()
-)
-
 personality_context = PromptTemplate.from_template(
     """
 Here's some additional context about you:
 {personality}
 
 """
-)
-
-plan_function_execution = PromptTemplate.from_template(
-    """
-You are OfferAgent, a smart, creative and meticulous researcher.
-Create a multi-step plan and intelligently iterate on the plan to complete the task.
-Use the help of the provided tool AIs to accomplish the task assigned to you.
-{personality_context}
-
-# Instructions
-- Make detailed, self-contained requests to the tool AIs, one tool AI at a time, to gather information, perform actions etc.
-- Break down your research process into independent, self-contained steps that can be executed sequentially using the available tool AIs to accomplish the user assigned task.
-- Ensure that all required context is passed to the tool AIs for successful execution. Include any relevant stuff that has previously been attempted. They only know the context provided in your query.
-- Think step by step to come up with creative strategies when the previous iteration did not yield useful results.
-- Do not ask the user to confirm or clarify assumptions for information gathering tasks and non-destructive actions, as you can always adjust later — decide what the most reasonable assumption is, proceed with it, and document it for the user's reference after you finish acting.
-- You are allowed upto {max_iterations} iterations to use the help of the provided tool AIs to accomplish the task assigned to you. Only stop when you have completed the task.
-
-# Examples
-Assuming you can search the user's files and the internet.
-- When the user asks for the population of their hometown
-  1. Try look up their hometown in their notes. Ask for evidence about their birth certificate, childhood memories, school, resume etc.
-  2. Use the document retrieval tools to build on the evidence, fill in the gaps, add more details or confirm your hypothesis.
-  3. If not found in their notes, try infer their hometown from their online social media profiles. Ask the online search AI to look for {username}'s biography, school, resume on linkedin, facebook, website etc.
-  4. Only then try find the latest population of their hometown by reading official websites with the help of the online search and web page reading AI.
-- When the user asks for their computer's specs
-  1. Try find their computer model in their documents.
-  2. Now find webpages with their computer model's spec online.
-  3. Ask the webpage tool AI to extract the required information from the relevant webpages.
-- When the user asks what clothes to carry for their upcoming trip
-  1. Request evidence for the itinerary of their upcoming trip in their documents.
-  2. Next find the weather forecast at the destination online.
-  3. Then combine evidence queries, regex search, view file and list files tools to find if all the clothes they own in their files.
-- When the user asks you to summarize their expenses in a particular month
-  1. Combine evidence queries and regex search tool AI to find all transactions in the user's documents for that month.
-  2. Use the view file tool to read the line ranges in the matched files
-  3. Finally summarize the expenses
-
-# Background Context
-- Current Date: {day_of_week}, {current_date}
-- User Location: {location}
-- User Name: {username}
-
-# Available Tool AIs
-You decide which of the tool AIs listed below would you use to accomplish the user assigned task. You **only** have access to the following tool AIs:
-
-{tools}
-""".strip()
 )
 
 infer_webpages_to_read = PromptTemplate.from_template(
@@ -530,7 +453,7 @@ AI: The latest released sentence-transformers python package version is 2.7.0.
 User: Notify me when version 2.0.0 is released
 Assistant: {{
     "crontime": "0 10 * * *",
-    "query": "/automated_task /research What is the latest released version of the sentence-transformers python package?",
+    "query": "/automated_task What is the latest released version of the sentence-transformers python package?",
     "subject": "Sentence Transformers Python Package Version 3.0.0 Release"
 }}
 
@@ -691,21 +614,6 @@ Original User Query: {original_query}
 Executed Chat Request: {executed_query}
 AI Response: {response}
 Assistant:
-""".strip()
-)
-
-# System messages to user
-# --
-help_message = PromptTemplate.from_template(
-    """
-- **/notes**: Chat using the information in your knowledge base.
-- **/general**: Chat using just OfferAgent's general knowledge. This will not search against your notes.
-- **/online**: Chat using the internet as a source of information.
-- **/research**: Go deeper in a topic for more accurate, in-depth responses.
-- **/help**: Show this help message.
-
-You are using the **{model}** model.
-**version**: {version}
 """.strip()
 )
 

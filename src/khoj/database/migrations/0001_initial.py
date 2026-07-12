@@ -37,20 +37,6 @@ class Migration(migrations.Migration):
             },
         ),
         migrations.CreateModel(
-            name="McpServer",
-            fields=[
-                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
-                ("created_at", models.DateTimeField(auto_now_add=True)),
-                ("updated_at", models.DateTimeField(auto_now=True)),
-                ("name", models.CharField(max_length=50, unique=True)),
-                ("path", models.CharField(max_length=200, unique=True)),
-                ("api_key", models.CharField(blank=True, max_length=4000, null=True)),
-            ],
-            options={
-                "abstract": False,
-            },
-        ),
-        migrations.CreateModel(
             name="ProcessLock",
             fields=[
                 ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),

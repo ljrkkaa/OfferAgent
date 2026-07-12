@@ -15,7 +15,7 @@ from khoj.processor.conversation.tool_protocol import parse_tool_plan, validate_
 from khoj.processor.conversation.utils import ToolCall
 from khoj.processor.tools.online_search import read_webpages, read_webpages_content, search_online
 from khoj.routers.helpers import ChatEvent
-from khoj.utils.helpers import ConversationCommand, ToolDefinition, tools_for_research_llm
+from khoj.utils.helpers import AgentToolName, ToolDefinition, agent_tool_definitions
 
 logger = logging.getLogger(__name__)
 WRITE_TOOL_NAMES = {"append_note", "propose_edit"}
@@ -24,21 +24,22 @@ WRITE_COMPLETION_RESERVE = 3
 
 AGENT_TOOL_SYSTEM_PROMPT = """
 You are the tool planner for the main OfferAgent chat answer.
-Return only a json object: {"calls":[{"name":"...", "args":{...}, "id":"1"}]}.
+Return only a json object: {"requires_write_action":false,"calls":[{"name":"...", "args":{...}, "id":"1"}]}.
 Use tools when the user asks for current web information, personal knowledge base evidence, or writeback.
 Do not decide intent with keywords. Choose tools from task meaning, conversation context, and available tools.
+Set requires_write_action=true only when the user explicitly asks to persist, create, append, or modify a file in the vault.
 When runtime facts say persistent_write_required=true, a write tool only prepares a VaultAction for later user review.
 The user's explicit write request authorizes preparing that action; do not ask for a second confirmation first.
 For a missing .md/.txt target under an existing folder, append_note prepares a create-only action.
-In that mode, {"calls":[]} is invalid until append_note or propose_edit returns status action_prepared or written.
+In that mode, an empty calls list is invalid until append_note or propose_edit returns status action_prepared or written.
 Rejected statuses such as source_mismatch are not completion; use their reason to correct and retry the write.
-When enough evidence is collected, return {"calls":[]}.
+When enough evidence is collected, return {"requires_write_action":false,"calls":[]}.
 """.strip()
 
 WEB_SEARCH_TOOL = ToolDefinition(
     name="web_search",
-    description=tools_for_research_llm[ConversationCommand.SearchWeb].description,
-    schema=tools_for_research_llm[ConversationCommand.SearchWeb].schema,
+    description=agent_tool_definitions[AgentToolName.SearchWeb].description,
+    schema=agent_tool_definitions[AgentToolName.SearchWeb].schema,
 )
 
 
@@ -66,7 +67,6 @@ class ToolBatch:
 class ExecutableTool:
     definition: ToolDefinition
     handler: Callable[..., Awaitable[None]]
-    command: ConversationCommand
     concurrency_safe: bool = False
 
 
@@ -78,14 +78,12 @@ def build_agent_tool_registry(
         registry[WEB_SEARCH_TOOL.name] = ExecutableTool(
             WEB_SEARCH_TOOL,
             run_web_search_tool,
-            ConversationCommand.Online,
             concurrency_safe=True,
         )
-        read_webpage = tools_for_research_llm[ConversationCommand.ReadWebpage]
+        read_webpage = agent_tool_definitions[AgentToolName.ReadWebpage]
         registry[read_webpage.name] = ExecutableTool(
             read_webpage,
             run_read_webpage_tool,
-            ConversationCommand.Webpage,
             concurrency_safe=True,
         )
     for tool in available_workspace_tools(allow_local_kb=allow_local_kb, allow_openkb=allow_openkb):
@@ -94,7 +92,6 @@ def build_agent_tool_registry(
         registry[tool.name] = ExecutableTool(
             tool,
             run_notes_tool_call,
-            ConversationCommand.Notes,
             concurrency_safe=tool.name not in {"append_note", "propose_edit"},
         )
     return registry
@@ -277,7 +274,6 @@ async def collect_agent_context_and_actions(
     agent: Any,
     send_message: Callable[..., Awaitable[Any]],
     send_status: Optional[Callable[[str], Any]] = None,
-    before_tool_call: Optional[Callable[[ConversationCommand], Awaitable[None]]] = None,
     client_app: Any = None,
     allow_local_kb: bool,
     allow_openkb: bool,
@@ -291,25 +287,20 @@ async def collect_agent_context_and_actions(
     query_files: str | None = None,
     relevant_memories: list | None = None,
     tracer: dict | None = None,
-    require_notes_evidence: bool = False,
-    require_write_action: bool = False,
 ) -> AgentToolLoopResult:
     result = AgentToolLoopResult()
+    write_action_required = False
     registry = build_agent_tool_registry(
         allow_local_kb=allow_local_kb,
         allow_openkb=allow_openkb,
         allow_web=allow_web,
         write_mode=write_mode,
     )
-    if not registry:
-        result.errors.append("No agent runtime tools are available.")
-        return result
-
     await _send_status(send_status, "Planning with unified agent runtime")
     for iteration in range(max(1, max_iterations)):
         iterations_remaining = max(1, max_iterations) - iteration
         write_completion_phase = (
-            require_write_action
+            write_action_required
             and not _has_write_tool_result(result)
             and iterations_remaining <= WRITE_COMPLETION_RESERVE
         )
@@ -328,7 +319,7 @@ async def collect_agent_context_and_actions(
                 allow_openkb=allow_openkb,
                 client_app=client_app,
                 write_mode=write_mode,
-                require_write_action=require_write_action,
+                require_write_action=write_action_required,
                 successful_write_result_present=_has_write_tool_result(result),
                 tool_iterations_remaining=iterations_remaining,
                 write_completion_phase=write_completion_phase,
@@ -343,46 +334,20 @@ async def collect_agent_context_and_actions(
         except Exception as error:
             _record_tool_error(result, "planner", {}, f"Planner unavailable after retry: {error}")
             result.planner_failed = True
+            result.program_context.append(
+                "The agent planner failed before confirming any file change. No file change is pending or applied."
+            )
             break
         if response and getattr(response, "thought", None):
             await _send_status(send_status, response.thought)
         try:
-            calls = parse_tool_plan(getattr(response, "text", response) or "")
+            plan_requires_write_action, calls = parse_tool_plan(getattr(response, "text", response) or "")
+            write_action_required = write_action_required or plan_requires_write_action
         except ValueError as error:
             _record_tool_error(result, "planner", {}, str(error))
             continue
         if not calls:
-            if require_notes_evidence and not result.tool_transcript:
-                result.tool_transcript.append(
-                    {
-                        "tool": "system",
-                        "args": {},
-                        "result": (
-                            "This is an explicit Notes request. Use at least one available Notes tool before stopping."
-                        ),
-                    }
-                )
-                continue
-            if (
-                require_notes_evidence
-                and not result.references
-                and not any(
-                    item.get("tool") == "system" and "exact Notes evidence" in str(item.get("result") or "")
-                    for item in result.tool_transcript
-                )
-            ):
-                result.tool_transcript.append(
-                    {
-                        "tool": "system",
-                        "args": {},
-                        "result": (
-                            "No exact Notes evidence has been collected yet. Discovery tools are not final evidence; "
-                            "read a selected file with view_file before stopping."
-                        ),
-                    }
-                )
-                continue
-            if require_write_action and not _has_write_tool_result(result):
+            if write_action_required and not _has_write_tool_result(result):
                 if not any(
                     item.get("tool") == "system"
                     and "explicitly requested a persistent file change" in str(item.get("result") or "")
@@ -411,7 +376,6 @@ async def collect_agent_context_and_actions(
                 agent=agent,
                 send_message=send_message,
                 send_status=send_status,
-                before_tool_call=before_tool_call,
                 client_app=client_app,
                 allow_local_kb=allow_local_kb,
                 allow_openkb=allow_openkb,
@@ -424,7 +388,7 @@ async def collect_agent_context_and_actions(
                 tracer=tracer,
             )
 
-    if require_write_action and not _has_write_tool_result(result):
+    if write_action_required and not _has_write_tool_result(result):
         error = "Planner exhausted its tool budget without preparing the explicitly requested file change."
         result.errors.append(error)
         result.program_context.append(
@@ -456,7 +420,6 @@ async def _run_tool_batch(
     agent: Any,
     send_message: Callable[..., Awaitable[Any]],
     send_status: Optional[Callable[[str], Any]],
-    before_tool_call: Optional[Callable[[ConversationCommand], Awaitable[None]]],
     client_app: Any,
     allow_local_kb: bool,
     allow_openkb: bool,
@@ -470,11 +433,6 @@ async def _run_tool_batch(
 ) -> None:
     if batch.is_concurrency_safe and len(batch.calls) > 1:
         await _send_status(send_status, f"Using agent tools: {', '.join(call.name for call in batch.calls)}")
-        for call in batch.calls:
-            tool = registry.get(call.name)
-            if tool and before_tool_call:
-                await before_tool_call(tool.command)
-
         semaphore = asyncio.Semaphore(_max_tool_concurrency())
 
         async def run_one(call: ToolCall) -> AgentToolLoopResult:
@@ -490,7 +448,6 @@ async def _run_tool_batch(
                     agent=agent,
                     send_message=send_message,
                     send_status=None,
-                    before_tool_call=None,
                     client_app=client_app,
                     allow_local_kb=allow_local_kb,
                     allow_openkb=allow_openkb,
@@ -520,7 +477,6 @@ async def _run_tool_batch(
             agent=agent,
             send_message=send_message,
             send_status=send_status,
-            before_tool_call=before_tool_call,
             client_app=client_app,
             allow_local_kb=allow_local_kb,
             allow_openkb=allow_openkb,
@@ -545,7 +501,6 @@ async def _run_tool_call(
     agent: Any,
     send_message: Callable[..., Awaitable[Any]],
     send_status: Optional[Callable[[str], Any]],
-    before_tool_call: Optional[Callable[[ConversationCommand], Awaitable[None]]],
     client_app: Any,
     allow_local_kb: bool,
     allow_openkb: bool,
@@ -566,8 +521,6 @@ async def _run_tool_call(
     except ValueError as error:
         _record_tool_error(result, call.name, call.args, str(error))
         return
-    if before_tool_call:
-        await before_tool_call(tool.command)
     await _send_status(send_status, f"Using agent tool: {call.name}")
     reference_start = len(result.references)
     try:

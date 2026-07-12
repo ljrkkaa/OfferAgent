@@ -1,10 +1,48 @@
 # Interview Personal KB Agent Research Spec
 
-> 目标：在当前 Khoj 面试精简分支上，做一个面试个人知识库 Agent。原则是沿用 Khoj 已经能用的 `/api/chat`、Agent、Research loop、Memory 和 Obsidian 插件，只做必要修改；不重写 Agent 框架，不引入新的检索框架。
+> 目标：在当前 Khoj 面试精简分支上，做一个面试个人知识库 Agent。原则是沿用 Khoj 已经能用的 `/api/chat`、统一 Agent Tool Loop、Memory 和 Obsidian 插件，只做必要修改；不重写 Agent 框架，不引入新的检索框架。
 
 ## 0. 当前完成度与下一步
 
 更新时间：2026-07-01。基于最新阶段提交 `0474cab8 feat(agent): add file-first local kb workspace`、`12643a0d feat(agent): add interview writeback runtime`、`1b731764 fix(agent): require explicit vault write intent` 和 `2f1d4ed4 feat(qqbot): add thin interview chat adapter`；当前工作区已落地 Phase 5 OpenKB Knowledge Harness、旧向量检索硬删除、本地 embedded DB 重建验证、Notes 主 tool loop 的本地 SKILL.md 绑定，以及本轮 OpenAI-level review 修复的真实 UI/API/Agent 断点，正在按功能分阶段提交。最新真实 HTTP E2E 已验证：Notes agent 能读取嵌套官方 Obsidian skill、按 vault 规则写入 daily note、根据本地 Redis 笔记生成面试八股问答，且 Obsidian 上传/搜索/删除和 chat/session/agent options smoke 通过。新的 Agent Harness worker / observability 设计已写入独立 spec；2026-07-01 根据真实 “Agent 评估八股 + 补充到项目里” 失败链路，已选择 Claude-style unified agent runtime 方案并写入中文实施计划 `docs/superpowers/plans/2026-07-01-unified-claude-style-agent-runtime-zh.md`，英文版保留在 `docs/superpowers/plans/2026-07-01-unified-claude-style-agent-runtime.md`。第一版代码已新增 `src/khoj/processor/conversation/agent_tool_loop.py` 并接入 default chat：默认聊天删除浅 source router 依赖，而是由单主 tool loop 统一调度 web/local-KB/OpenKB/writeback，并把 web 工具结果传给 Notes 写入 verifier；旧 `aget_data_sources_and_output_format()` 和 `pick_relevant_tools` prompt 已删除。Codex `json_object` payload 已修复，避免 Responses API 因 input 缺少 json hint 报 400。Interview Card Maintainer 已作为项目级本地 skill 第一版落地，按当前知识库项目设定读取目录、索引、命名和写入边界，不绑定具体库名或项目名。下一步：用真实模型和真实浏览器/Obsidian 复测 “根据网络资料补充 agent 评估八股内容 → 补充到项目里”。
+
+2026-07-10 架构精简 Phase 0 基线（已完成，文档保持未提交）：以 OfferAgent 架构审核报告为范围，确认后续按“删除重复路径、单一事实来源、语义结构化意图、显式校验和路由”分阶段实施，不复制 Claude Code 的 subagent/fork/provider 复杂度。当前 `HEAD=14fbec1b`，除本 spec 原有本地修改外工作区干净；`git diff --check`、`uv run ruff check src/khoj tests`、`uv run --isolated python src/khoj/manage.py check`、`uv run python src/khoj/manage.py makemigrations --check --dry-run`、Obsidian `tsc --noEmit` 全部通过，完整测试为 `357 passed, 11 skipped`。下一步：Phase 1 只保留结构化 VaultAction，先补原生 Node 安全/原子性检查，再删除 `<khoj_edit>` prompt/parser/retry/rollback 兼容链和 `diff` 依赖，并把所有写入收敛到同一个用户确认入口。
+
+2026-07-10 架构精简 Phase 1 Vault 写入协议（已完成，文档保持未提交）：Obsidian 现在只接受完整 Schema 的 `create_file` / `append_file` / `replace_text` VaultAction；流事件只暂存动作并展示 Apply/Cancel，用户明确 Apply 后才进入唯一执行器。执行器先在内存中规划整批文件结果，统一校验安全相对路径、必填参数、唯一替换匹配和文件并发变化，再一次应用；任一失败会拒绝整批或回滚已经落盘的同批变更与新建目录。实施时确认旧 `<khoj_edit>` 的 Apply 按钮实际出现在文件已修改之后，只是接受现状，Cancel 才回滚；现已删除该 prompt/parser/partial render/retry/rollback UI、复制兼容、相关 CSS 和 `diff` 依赖。后端 VaultAction 不再输出 `heading: null` / `reason: null`，与客户端严格 Schema 保持一致。验证：新增 Node 原生 `npm test` 5 项覆盖 Schema、路径越界、原子验证失败、创建失败目录清理和顺序执行；`npm run build` 通过，bundle 为 217.3KB；VaultAction 后端 2 项定向 pytest 与 Ruff 通过；旧协议符号残留扫描无命中；构建产物已同步到 vault 的 `.obsidian/plugins/offeragent/`。下一步：Phase 2 收拢结构化语义意图、参数/权限/安全校验、显式路由和可执行工具 registry，删除 Notes 嵌套 planner、重复 dispatch 和关键词/字符串启发式。
+
+2026-07-10 架构精简 Phase 2 语义意图与工具协议（已完成，文档保持未提交）：新增严格 `RouteDecision`、`ToolPlan` 和共享工具参数校验；路由与工具计划只接受精确 JSON 和完整 Schema，非法、缺字段、旧 `tool/arguments` 别名、JSON 字符串参数、JSON5、代码块及尾随文本均拒绝，路由失败或语义不明确时返回澄清问题而不是默认猜测。slash command 改为首 token 精确映射，未知命令明确报错，自动任务 marker 也不再用前缀/replace 解析。`ExecutableTool` registry 集中 definition、handler、权限命令和并发安全属性，删除工具名 alias、if/elif dispatch、独立安全集合与浅参数校验；`source_refs` 改为递归判别联合 Schema，写入意图使用 enum。普通聊天和显式 `/notes` 现在复用同一个主 planner，Notes 模块只执行已经规划的调用，旧 Notes planner 与测试兼容路径已删除；同时修复 Notes 执行结果把既有 transcript 重复合并的问题。测试文件同步收敛，Notes 用例从约 1275 行缩到约 520 行。验证：Phase 2 聚焦 68 项通过；`uv run ruff check src/khoj tests` 通过；全仓 `uv run pytest -q` 为 `359 passed, 11 skipped, 7 warnings`。下一步：Phase 3 建立单一 Knowledge Workspace seam，统一 local vault / synced index / OpenKB 的源选择、证据与写入边界，删除关键词触发的 exploration 直写旁路和零调用 wrapper。
+
+2026-07-10 架构精简 Phase 3 Knowledge Workspace（已完成，文档保持未提交）：新增单一 `knowledge_workspace.py` 深模块，集中 Local Vault、同步索引与 OpenKB 的源策略、搜索、读取、路径约束、工具定义/执行和统一证据去重；Chat、Research、`/api/search` 与摘要调用方不再自行选择或直接访问具体存储。OpenKB exploration 的关键词触发与响应后直接落盘旁路已删除，所有写入只允许经过主 planner 的 `append_note` / VaultAction 协议；同时删除 Local KB 的零生产调用 wrapper、旧 profile 遍历链、OpenKB 重复引用/格式化/原子写入 helper，以及对应只验证死接口的测试。实施中修复两处真实缺陷：动态生成的 `SearchType` 与静态导入 enum 因对象身份不同导致 `/api/search` 漏结果，现按稳定值判断；摘要异常分支曾继续 yield 未定义的 `result`，现明确返回错误事件。验证：Phase 3 聚焦回归为 `175 passed, 1 skipped`；`uv run ruff check src/khoj tests` 与 `git diff --check` 通过；全仓 `uv run pytest -q` 为 `348 passed, 11 skipped, 7 warnings`，数量下降来自删除死接口测试。下一步：Phase 4 收拢 Conversation Turn 的状态、事件和唯一持久化出口，并把文件 Memory 改为显式用户作用域，消除 anonymous/LAN 场景的跨用户边界模糊。
+
+2026-07-10 架构精简 Phase 4 Conversation Turn 与部署边界（已完成，文档保持未提交）：新增 `ConversationTurn` 深模块，显式持有一个回合的消息、证据、工具结果、附件、思考事件、生成资产与持久化状态；HTTP 正常结束、HTTP 断开、WebSocket 中断和澄清/错误回复全部进入同一个带锁的 exactly-once 持久化出口。正常回合会在向客户端发送 `end_response` 前等待会话落库；中断只写可恢复的空助手消息，不触发长期 Memory；删除旧 fire-and-forget 多入口、无用途持久化参数和 mutable defaults，并修复状态事件重复记录。文件 Memory 的 list/get/create/update/delete 与模型选择/写入现在都必须显式传入用户，目录按稳定 user UUID 隔离；Memory 决策也改为严格 JSON Schema，拒绝代码块、额外字段和旧宽松格式。认证后端只有在显式 `--anonymous-mode` 时才把无 token 请求映射到 default 用户；CLI 禁止 anonymous 绑定非 loopback，`run_local.sh` 在 localhost 自动使用匿名模式、LAN 监听自动使用 Bearer token 模式，适配通过 localhost 端口转发到 Windows 的部署方式。默认用户不再创建已知密码，Session secret 无配置时改为进程随机值。新增回合竞态/中断/澄清持久化、Memory 跨用户隔离、认证模式和网络绑定测试；`bash -n scripts/run_local.sh`、Ruff、`git diff --check` 通过，全仓 `uv run pytest -q` 为 `364 passed, 11 skipped, 7 warnings`。下一步：Phase 5 把 Obsidian 的 URL、认证、错误和流事件统一到 Server adapter / Chat runtime，删除未引用 UI、依赖与品牌残留。
+
+2026-07-10 架构精简 Phase 5 Obsidian runtime 与产品残留（已完成，文档保持未提交）：`OfferAgentServer` 现在是插件唯一网络边界，集中 URL、可选 Bearer 认证、HTTP 错误、响应 Schema、内容同步/搜索、模型与设置、会话 CRUD/历史、Agent 和消息删除；视图层不再直接发请求或重复解析搜索响应。新增 `ChatRuntime` 管理会话 id、创建/恢复、严格流事件 envelope、跨 chunk 解码和真实 `AbortController` 取消；纯文本仍按消息显示，缺失 `type` 的 JSON 作为普通消息，未知或畸形的类型化事件明确拒绝，不再按字符串形状猜协议。`ChatView` 删除本地流 parser、伪取消、图片/语音/Operator/Excalidraw 死分支与外部 DOMPurify 依赖，使用 Obsidian 原生 sanitizer；设置页删除虚构的 50MB cloud storage 指标。根 manifest 与插件 manifest 已逐字统一为 OfferAgent，插件 package metadata/main 修正；删除无 lint 脚本却遗留的 ESLint 配置与 TypeScript ESLint 依赖。Web 删除 5 个零引用 UI 组件及 6 个直接依赖，Bun 锁文件重新生成；前端 tracked diff 加上新增 runtime/tests 后净减少约 2,746 行，共移除 11 个直接依赖。验证：插件原生 Node 测试 `11 passed`，覆盖 Server 错误/响应边界、严格流协议、跨 chunk 解码、取消和 VaultAction 原子写入；Obsidian `npm run build` 通过，bundle 从 Phase 1 的 217.3KB 降至 137.9KB；Web `npm run build` 生产构建通过。下一步：Phase 6 运行整仓静态检查、全量 pytest、迁移检查、真实服务/API smoke，并把最终插件产物同步到 Windows vault。
+
+2026-07-10 架构精简 Phase 6 整体运行验收（已完成，文档保持未提交）：先在隔离 embedded Postgres 与临时 Vault 上通过真实启动和插件同款 HTTP 链验证 health、用户、模型、设置、Agent、搜索、内容上传/列出/读取/删除、会话创建/列表/历史/重命名/删除及删除后 404；再直接编译实际 `OfferAgentServer` 连接正式服务，8 项 adapter 契约全部通过并清理测试会话。真实启动额外发现并修复四个测试外阻断：项目未声明 HTTPX SOCKS transport，导致继承 `ALL_PROXY=socks5` 时 OpenAI 客户端初始化崩溃，现使用同版本 `httpx[socks]` 并有构造级回归；`run_local.sh` 的 `.env` 会覆盖显式 localhost/端口，现调用方 `KHOJ_HOST/KHOJ_PORT` 优先且有脚本级测试；新会话 Server 合法返回 `slug: null`，插件 adapter 现严格接受并归一化为空标题；scheduler 启动读取僵尸锁时绕过已有过期检查，现会删除超时锁并重新当选，避免异常退出后 Automations 永久暂停。正式服务已由用户级 systemd 托管在 `127.0.0.1:42110`，状态 `active/running`，scheduler leader 时间已刷新；旧 `0.0.0.0:12805 --anonymous-mode` 服务已停止。插件最新产物与 Web export 已同步到实际 Vault/运行目录，插件配置指向 Windows 可转发的 localhost 地址且三项产物哈希一致。最终复验：`git diff --check`、Ruff、isolated Django check、迁移 dry-run、`uv lock --check`、脚本语法均通过；全仓 pytest 为 `367 passed, 11 skipped, 7 warnings`；插件 `12 passed`、bundle 138.2KB；Web 与 Obsidian 生产构建、正式 Web 根路径均通过。下一步：Phase 7 独立审查完整 diff，修复最后的正确性/安全性阻断项后重跑最终证据，不再扩展产品功能。
+
+2026-07-10 架构精简 Phase 7 三轮独立复审与最终收口（已完成，文档保持未提交）：第一轮封闭服务端写旁路、Vault TOCTOU、LAN bootstrap、WebSocket 中断持久化、workspace memory guard、Memory 文件并发、Schema 边界和流 envelope；第二轮继续修复 Conversation row lock、保守 Vault rollback、monitor finalizer、插件会话/待确认动作隔离、Memory 跨进程锁、Unix socket anonymous、真实工具 bounds 和分隔符碰撞；第三轮修复陈旧 Conversation 全字段保存覆盖新消息、同 turn 中断重试无法补齐 assistant、满中断队列无界等待及 HTTP watcher 子任务泄漏。最终会话日志 append/pop/delete 和 file filter 更新均使用事务行锁，元数据保存限定 `update_fields`，turn 合并按 `(turnId, by)` 幂等补齐；Vault 对无法原子确认归属的新文件/目录不做危险删除而返回 manual review；WebSocket 入队非阻塞、shutdown 优先等待 monitor，插件切换会话会 Abort 旧流并丢弃迟到事件。独立审查最终结论为“无阻塞或重要问题，Ready to merge: Yes”。最终证据：全仓 `385 passed, 11 skipped, 7 warnings`；插件 `17 passed`；`git diff --check`、Ruff/格式、isolated Django check、迁移 dry-run、`uv lock --check`、Shell 语法、Web/插件生产构建均通过。正式服务已重启并保持 `127.0.0.1:42110 active/running`；实际编译后的 `OfferAgentServer` 用户/模型/设置/Agent/搜索/会话生命周期与删除后 404 共 8 项 smoke 通过。下一步：不再增加并行框架，转入真实面试准备工作流验收和产品指标观察。
+
+2026-07-10 真实对话无响应现场修复（已完成，文档保持未提交）：会话 `3b5c25ce-c428-4693-8731-1e8179914655` 的“帮我写7.10的学习计划”在数据库中延迟约 3 分钟后只落下意图路由失败兜底；同期 `/api/health` 和 history 均 5–10 秒超时。现场 socket 证明唯一 Uvicorn 进程卡在错误 DNS 解析出的外部 HTTPS `SYN-SENT`；调用链确认 async `send_message_to_model_wrapper()` 直接执行同步 Codex/OpenAI SDK，因而冻结整个事件循环。修复复用现有 `converse_codex()` 模式，通过 `asyncio.to_thread()` 隔离所有同步格式化/规划模型调用，并增加慢模型期间事件循环仍可运行的红绿回归测试；临时 systemd 服务同时导入当前 HTTP/SOCKS 代理，避免 `chatgpt.com` 被污染 DNS 直连。真实同句请求 27.998 秒返回完整学习计划，请求期间及完成后 4 次 health 均为 `200`、约 15–27ms；临时验证会话均已删除。最终证据：全仓 `386 passed, 11 skipped, 7 warnings`，Ruff、format 和 `git diff --check` 通过，正式服务 active。
+
+2026-07-10 Phase 8 Web VaultAction / Daily Planner（已完整实现并真实验收，文档保持未提交）：planner 已去掉严格 `response_schema=ToolPlan`，保留 `json_object`、`parse_tool_plan` 和逐工具参数校验；语义路由新增严格 `requires_vault_write`，与 code 生成资产分离。主工具循环保留 `read_skill` / `view_file` 等读取工具，使用 skill/system/最新结果优先的有界 transcript，并为明确 Vault 写请求预留 write-only 收尾阶段；只有 `action_prepared` / `written` 才算完成，`source_mismatch` 会携带 verifier 原因重试。Vault 写入新增持久 `VaultActionBatch`、30 分钟过期、同 turn 幂等、root/action 摘要、路径/大小/扩展名边界、同源 CSRF、所有权、PostgreSQL advisory lock、条件过期、启动/定时 crash recovery，以及 Linux `renameat2` 原子交换；被替换 inode 保留为批次可发现的恢复副本，避免 Obsidian 外部编辑、晚到文件描述符和回滚删除丢数据。Web 可恢复 pending/applying/problem 批次，展示完整动作、diff、截断内容、确认/取消和恢复副本；删除 turn 与取消 pending 批次处于同一事务并与 apply 串行。Vault 本地新增 `skills/daily-planner/SKILL.md`，自然匹配“每日计划/学习计划”，要求读取模板、进度、面经和题卡后准备同批写入。`database.0007_vaultactionbatch` 已应用到正式 embedded DB，服务保持 `127.0.0.1:42110 active`，默认运行时模型确认为 `gpt-5.6-luna`。真实 Luna 自然语言请求已生成 `daily/2026-07-10.md` 的 pending create-only 批次，确认前文件不存在；Web 审核卡恢复、diff 和取消按钮通过，取消后文件仍不存在，所有测试会话/批次已清理。最终独立复审结论“无 P0-P2，Ready”；干净数据库全仓 `438 passed, 11 skipped, 7 warnings`，Web 协议 `7 passed`，Obsidian `17 passed`，Ruff、Prettier、TypeScript、Django check、迁移 dry-run、`uv lock --check`、diff check 和 Web/Obsidian 生产构建均通过。下一步：用户在 Web 对真实计划内容执行一次人工审阅与“确认并写入”，随后观察恢复副本保留策略和实际学习计划质量，不再扩展写入协议。
+
+2026-07-12 架构精简 Phase 9 最后产品面硬删除（已完成，文档保持未提交）：按“不兼容、不留兼容层”删除空 LoginPrompt 与 `/login` 假跳转，未认证客户端统一显示本地 `KHOJ_API_KEY` 配置错误；删除 starters/update/content-size/profile/account-delete/chat-export/token CRUD 路由和 UI，认证启动只保留当前 bootstrap key，轮换或取消配置会使所有旧 token 失效。删除 DataStore、ReflectiveQuestion、ClientApplication 及 Conversation/FileObject/Entry 的伪 Agent/Client 隔离字段；自定义 Agent API、Web/Obsidian 选择器、样式/工具/所有权字段全部移除，只保留固定 `khoj` 默认 Agent。Diagram/Excalidraw/Mermaid 从意图路由、生成 prompt、流协议、历史 Schema、Web/Obsidian renderer 和依赖树整条删除；聊天导出的 file-saver/jszip 也同步删除。Python 端移除 rapidocr-onnxruntime、defusedxml、lxml、einops、torch、transformers、直接 Hugging Face tokenizer 与设备探测，token 估算统一使用 tiktoken；XML 输入因失去 lxml parser 明确拒绝。`database.0008_hard_delete_unused_surfaces` 会先把旧会话重绑到默认 Agent，再删除自定义 Agent、旧 token、废表和废列，reverse 为 noop。独立复审发现并验证修复 Agent FK 删除顺序、token rotation、XML 暗依赖和遗留前端依赖，最终结论无 Critical/Important 阻塞。验证使用全新临时 embedded Postgres，完整 pytest 为 `408 passed, 11 skipped, 7 warnings`；Ruff、Django check、迁移 dry-run、lock/diff 检查、Web 协议与生产构建、Obsidian 17 项测试与生产构建均通过。下一步：修复或重建当前损坏的正式 `pgserver_data`，部署时执行迁移并重新 export Web 到生成目录 `src/khoj/interface/built` / static，再通过 localhost:42110 端口转发 smoke Web、Obsidian、Automation 和默认 Agent 聊天；本阶段不直接改生成产物、不提交 docs。
+
+2026-07-08 本地单用户产品面硬删：已删除 Notion/GitHub 内容源模型、adapter、processor、SearchType/Entry enum、前端内容源类型/图标分支和相关测试；已删除 Text-to-image 模型配置、用户配置、图片迁移命令和 ImageIntentType 残留；已移除外发 telemetry 常量/helper/调用；Google OAuth 登录路由、GoogleUser、OAuth metadata、Google 登录 UI 外联和 logout 入口已移除，认证收敛为 default user + Bearer API key；Android `assetlinks` route/常量已删除；迁移 `0004_drop_removed_product_surfaces` 会 drop 旧表，`0005_alter_agent_output_modes` 收窄 agent output mode。验证：残留搜索对旧功能关键词无命中；`uv run python src/khoj/manage.py makemigrations --check --dry-run` 无变更；`uv run ruff check src/khoj tests` 通过；`uv run pytest tests/test_client.py tests/test_text_search.py tests/test_multiple_users.py tests/test_api_chat_file_kb.py -q --reuse-db` 为 `107 passed, 1 skipped`；`cd src/interface/web && npm exec next build` 通过。下一步：如继续瘦身，优先清理仍保留但已经非主线的多用户资料字段/电话登录痕迹和空 LoginPrompt 兼容层。
+
+2026-07-08 本地单用户产品面二次硬删：已删除 Operator/电脑控制命令、processor、工具 schema、conversation log 字段和 Obsidian 模式；已删除 Agent 分享/公开能力，Agent 权限收敛为 default admin 或创建者本人可见；已删除 phone/user profile 电话字段、依赖、前端输入样式和旧库 drop 迁移；已删除 `/api/ip`、ipapi 调用和基于 IP 的城市/地区/国家注入，仅保留浏览器 timezone；已删除 email templates/notification 判断和 automation 邮件正文生成；已删除 Home 落地页 route、模板和旧生成静态残留。迁移 `0006_drop_removed_local_demo_surfaces` 会 drop 旧 `phone_number`、`verified_phone_number`、`privacy_level` 列。验证：旧功能关键词残留搜索无命中，除 `0006` drop SQL 中必要旧列名；`uv run ruff check src/khoj tests` 通过；`uv run python src/khoj/manage.py makemigrations --check --dry-run` 无变更；`cd src/interface/web && npm exec next build` 通过；`uv run pytest tests/test_agents.py tests/test_client.py tests/test_api_automation.py tests/test_api_chat_file_kb.py -q --reuse-db` 为 `121 passed, 6 skipped`。下一步：服务器部署时运行迁移，并 smoke `/api/chat`、`/api/agents`、`/automations`、Obsidian 同步/聊天四条本地主链路。
+
+2026-07-07 本地 OfferAgent 口径收敛：默认 agent 用户可见名称改为 OfferAgent，后端主 persona、custom persona、检索/网页/代码/自动任务/通知/写作等模型提示词去除旧身份标签，Obsidian 插件、Web metadata、静态模板和邮件默认文案同步改为 OfferAgent；内部默认 slug 继续保留 `khoj` 以兼容现有会话和插件接口。已确认当前 embedded DB 没有可迁移的默认 Agent/ChatModel 行，旧“你是谁”历史会话中的旧回答已替换为 OfferAgent；服务已重启到 `0.0.0.0:12805`，插件 zip 已重新编译并更新。验证：`uv run ruff check` 相关后端文件通过；`uv run pytest tests/test_agents.py::test_create_default_agent tests/test_agents.py::test_agent_conversation_returns_virtual_default_agent_for_codex_runtime tests/test_client.py::test_create_chat_session_accepts_agent_slug_in_json_body tests/test_client.py::test_chat_history_returns_obsidian_session_shape` 为 `4 passed`；`cd src/interface/obsidian && npm run build` 通过；`cd src/interface/web && npm run build` 通过；`/api/chat/history?client=obsidian` 返回的“你是谁”历史回答已是“我是 OfferAgent...”。下一步：在 Windows Obsidian vault 里重新安装/刷新 `offeragent` 插件后，用新会话实测“你是谁”和本地知识库检索。
+
+2026-07-07 Obsidian / Web 统一同步索引路线：按当前产品取舍，网页端和 Obsidian 插件都先走 `/api/content` 同步到后端索引，再由 `/api/chat` 复用同步索引证据回答；Obsidian 插件 `autoConfigure=true` 时启动即执行一次 `updateContentIndex()`，不再等 60 分钟定时器，并监听 vault 的 create/modify/delete/rename 事件，对可同步文件做 5 秒 debounce 后增量同步，60 分钟定时器保留为兜底。后端 default chat 和 `/notes` 在没有 file-first local KB / OpenKB references 时，会从已同步 Entry/FileObject 中检索证据；检索结果按文件去重，并优先把完整 `FileObject.raw_text` 注入 context，避免“五天 daily”只拿到同一天多个 chunk。验证：`uv run pytest tests/test_api_chat_file_kb.py -q` 为 `14 passed`；`uv run ruff check src/khoj/routers/api_chat.py tests/test_api_chat_file_kb.py` 通过；`cd src/interface/obsidian && npm run build` 通过；真实 HTTP 上传 5 篇 `daily/*.md` 后，`/api/content/files` 列出 5 个文件，`/api/search?q=daily` 命中 daily；同一问题“帮我评价一下我最近五天的daily任务完成的如何”分别请求 `client=web` 和 `client=obsidian`，两边均返回正常评价，`references.context` 均含 5 个 daily 文件。后台服务已重启在 `0.0.0.0:12805`，插件下载包 `http://10.106.17.252:12807/offeragent-obsidian-plugin.zip` 已更新并验证包含启动同步、文件变更 debounce 同步代码和 `autoConfigure: true`。下一步：在 Windows Obsidian 重新安装/启用新 zip 后，让插件用真实 Windows vault 自动同步，再用同一问题复测是否包含 `2026-07-03` 到 `2026-07-07` 的实际 daily。
+
+2026-07-07 Obsidian 安装配置文档已收敛到 `docs/OFFERAGENT_OBSIDIAN_PLUGIN_SETUP.md`，仅保留当前正确链路：Windows vault `E:\面试胜利！` 内安装 `offeragent` 插件、连接 `http://10.106.17.252:12805`、启用 `autoConfigure`，由插件把当前 vault 同步到后端索引供 Obsidian 和 Web 共用。
+
+2026-07-07 Web 新会话创建修复：前端默认新会话会传 `agent_slug=khoj`，但 Codex runtime 下默认 OfferAgent 可能只是虚拟默认 agent，数据库没有 `slug=khoj` 的 Agent 行，导致 `/api/chat/sessions?client=web&agent_slug=khoj` 返回 400，表现为网页端新对话输入无反应。现已在会话创建适配器中把默认 slug 归一到默认会话分支。验证：新增回归测试 `test_create_chat_session_accepts_virtual_default_agent_slug_in_codex_runtime`，并与相关会话测试一起通过；`ruff check src/khoj/database/adapters/__init__.py tests/test_client.py` 通过；真实服务已重启到 `0.0.0.0:12805`，`POST /api/chat/sessions?client=web&agent_slug=khoj` 返回 200，随后用该新会话请求 `/api/chat?client=web` 发送“你好”返回 OfferAgent 回答。
+
+2026-07-07 Web 新会话交互二次修复：真实服务之前仍在加载旧 `src/khoj/interface/built` 静态包，且 `/chat` 页面在 `conversationId` 暂时不可读时会直接 `window.location.href="/"`，导致首页写入 `localStorage.message` 后跳转到新会话又被弹回首页，看起来像“新对话输入无反应”。现已重新构建并部署 Web 静态包到 `src/khoj/interface/built` 和 `src/khoj/static`，前端默认创建会话不再发送 `agent_slug=khoj`，`/chat` 改为等待 `conversationId` 而不是跳首页，CSP `connect-src` 放开同源 `ws:`/`wss:`。验证：`npx prettier --check app/common/chatFunctions.ts app/chat/page.tsx app/common/layoutHelper.tsx` 通过；`npx next build` 通过；服务端 `/chat` HTML 已引用新 chunk `app/chat/page-a00dcab967cb8550.js`，静态包中 `agent_slug=khoj` 搜索无命中；真实 WebSocket 新会话 `6979f17c-1f60-4785-9097-51e142692ce3` 发送“你好”后返回 metadata、tool status、synced knowledge base references 和 OfferAgent 回答并保存 conversation turn。下一步：Windows 浏览器强制刷新后复测首页新建对话；若仍复现，直接看浏览器 Console/Network 的具体请求和 chunk hash。
+
+2026-07-07 Web 新会话交互三次修复：复查真实服务日志发现一次用户新会话在后端实际报 `APIConnectionError`，但前端只 `console.error` websocket control error，没有在聊天区或 toast 展示，用户看到的就是“没反应”；同时首页首条消息仍主要靠 `localStorage.message` 跨页面传递，导航/多 tab/刷新时序下容易丢。现已把 websocket error 显示为当前 assistant 消息并弹 toast，首页新建会话改为 `router.push(/chat?conversationId=...&q=...)` 显式携带首条问题，聊天页优先消费 URL `q` 后立即 `router.replace` 清掉，继续兼容旧 localStorage。服务已重建部署到 `0.0.0.0:12805`，当前进程 PID `3202287`；主页 chunk 为 `app/page-07a9d1d7630fbaaf.js`，聊天页 chunk 为 `app/chat/page-fb3c5c6f3bf1bbdc.js`。验证：`npx prettier --check app/page.tsx app/chat/page.tsx app/common/chatFunctions.ts` 通过；`git diff --check` 通过；`NEXT_TELEMETRY_DISABLED=1 npx next build` 通过；`collectstatic` 复制 241 个静态文件；`GET /api/health` 返回 `{"email":"default@example.com"}`；真实 WebSocket 新会话 `3e47546b-0e4b-400f-988f-699e6bbae2b2` 发送“你好，简单回复一句，不要展开”收到 metadata/status/references/start/end 事件和正文“你好，我是 OfferAgent，很高兴帮你。”并保存 conversation turn。下一步：Windows 浏览器对 `http://10.106.17.252:12805/` 强制刷新后从首页直接发起新会话，确认首条消息能自动进入 `/chat` 并收到可见回复；若后续再出现不可见失败，优先截图 Network/WebSocket frames 和 Console。
 
 2026-07-01 分阶段提交进度：第一阶段 `ab72ad9d refactor(search): remove legacy vector search stack` 已提交，范围为旧 vector/embedding 检索栈删除、数据库迁移压缩和词法索引测试更新。验证：迁移 `replaces=114 deleted=114`；`makemigrations --check --dry-run` 无变更；`showmigrations --plan` 中 `database.0001_initial` 在 `admin.0001_initial` 前；`ruff check` 相关后端目录通过；`pytest --create-db tests/test_text_search.py tests/test_client.py::test_search_with_valid_content_type tests/test_agents.py::test_create_or_update_agent_with_knowledge_base_and_search -q` 为 `14 passed, 1 skipped`。第二阶段 `6a8e1aef feat(kb): add notes and openkb tool primitives` 已提交，范围为 local KB 文件工具、OpenKB wiki harness、Notes tool loop 和对应工具层测试。验证：`ruff check` 本阶段文件通过；`git diff --cached --check` 通过；`pytest tests/test_local_kb.py tests/test_notes_tool_loop.py tests/test_openkb_harness.py -q` 为 `54 passed`。第三阶段 `d9098e11 feat(api): wire kb evidence into backend routes` 已提交，范围为 `/api/chat`、`/api/search`、Research/helper 文档工具、后端 API 边界修复和对应真实 route 测试。验证：`ruff check` 本阶段文件通过；`git diff --cached --check` 通过；`pytest --create-db tests/test_api_chat_file_kb.py tests/test_local_kb_summary.py tests/test_local_kb_fallback.py tests/test_local_vault_references.py tests/test_research_document_tools.py tests/test_api_automation.py tests/test_memory_settings.py tests/test_helpers.py tests/test_online_chat_actors.py tests/test_agents.py tests/test_client.py tests/test_multiple_users.py -q` 为 `172 passed, 9 skipped`。第四阶段 `d7c54926 fix(web): harden client response handling` 已提交，范围为 Web 端响应 shape 校验、HTTP 失败回滚、附件提交快照、hook 依赖和静态资源修正。验证：`npx prettier --check app components`、两个 SVG 的 `prettier --parser html`、`npx tsc --noEmit`、`npx next lint`、`timeout 180s npx next build` 均通过。第五阶段 `6fb271a8 feat(clients): update obsidian and qqbot adapters` 已提交，范围为 Obsidian 插件 HTTP/会话/搜索交互修复和 QQBot 薄适配器。验证：`ruff check src/khoj/integrations/qqbot tests/test_qqbot_adapter.py` 通过；`pytest tests/test_qqbot_adapter.py -q` 为 `5 passed`；`cd src/interface/obsidian && npm run build` 通过。第六阶段 `c5cdf892 docs: update kb evidence setup notes` 已提交，范围为 README、Postgres/docker compose 和 ignore 说明收尾。验证：`docker compose -f docker-compose.yml config` 通过。下一步：跑最终整体验证并准备交付。
 
@@ -18,6 +56,7 @@
 | Phase 5：OpenKB Knowledge Harness / 旧向量检索硬删除 | 已分阶段提交，待最终整体验证 | `ab72ad9d refactor(search): remove legacy vector search stack`；`6a8e1aef feat(kb): add notes and openkb tool primitives`；`d9098e11 feat(api): wire kb evidence into backend routes`；`d7c54926 fix(web): harden client response handling`；`6fb271a8 feat(clients): update obsidian and qqbot adapters`；`c5cdf892 docs: update kb evidence setup notes`；`docs/superpowers/specs/2026-06-30-openkb-knowledge-harness-design.md`；`docs/superpowers/plans/2026-06-30-openkb-knowledge-harness.md`；实现 `src/khoj/utils/openkb.py` 的 `wiki_search_documents()`、PageIndex JSON 页码读取、显式 `save_exploration()`；`/api/chat` 按 `KHOJ_KB_ENGINE=file_first/openkb/hybrid` 把 local KB / OpenKB / write 工具交给主聊天模型选择，OpenKB 只输出 `compiled_references`，最终回答仍由主链路生成；删除 `/api/chat` legacy document-search fallback、旧运行时开关、research 旧语义工具面，以及旧本地 KB / 面试硬解码设计；`/api/search` 保持非 agentic direct endpoint：配置 local KB 时只查本地 evidence，显式 OpenKB 时查 compiled wiki，否则查权限过滤后的 `text_search.query()` 词法索引；Memory search 也为权限过滤后的词法扫描；删除旧检索模型配置、旧检索管理命令、Entry/UserMemory 向量字段和日期旁表，并把 database migration 历史压成新的无旧检索初始迁移；ponytail cleanup 删除旧 local KB wrappers、孤立 vector placeholder、重复 query-term helpers、旧 API 参数和旧 prompt/doc 残词；已删除旧 embedded DB 目录并用新迁移重建 `/data/ljr/my_project/khoj/pgserver_data`，验证旧表/旧列不存在；Notes tool loop 已按 OpenKB runtime 方式扫描 bound vault 的 `.codex/skills/*/SKILL.md` 和 `skills/*/SKILL.md`，向主 agent 注入 skill catalog 且只保留 `read_skill` 工具，并把根目录 `agents.md` 等项目说明作为规划上下文注入；真实用户场景验收后补强了中文写入/更新工具规划、append_note 新建文件说明、首轮无工具调用二次规划、planner 瞬断重试，以及写入结果对最终回答的强 grounding；同日 review 后删除重复 `list_skills` 工具、收窄 retry 代码、把写入结果上下文改成短 JSON，并把 prompt 文案测试改为真实创建行为测试；OpenAI-level review 继续修复：发现类工具 grep/list/headings 后未 `view_file` 会导致 `/api/chat` 证据不足，现强制二次规划精读；`read_skill` 文件消失不再打崩 Notes loop；Codex runtime 下不再用传统 `KHOJ_DEFAULT_CHAT_MODEL` 误报默认模型错误；Research/helper grep 的本地 KB 参数名回归已修复；继续补测真实 HTTP 后修复自动任务执行语义丢失（已触发任务不再重新询问何时提醒）和非法 `conversation_id` 触发 UUID ValidationError 500；本轮真实浏览器 review 继续修复 `/search` 因 `/api/content/computer` 返回对象而崩溃、缺失文件接口 500、Next static export `.txt` 404、SVG `height=auto` 控制台错误、浏览器直连 ipapi CORS 错误、Automations 在只有浏览器时区 fallback 时显示 `undefined, undefined`，并删除 Web CSP / legacy template 中已不再需要的 `ipapi` connect-src 残留；浏览器 CSP 下同源 WebSocket 已真实打开；2026-07-01 继续修复首页/分享页/聊天页附件提交快照，确保同一轮消息的 images/files 不被 React 批量状态刷新或 localStorage effect 重跑丢失，并修复空白 query 的 websocket telemetry `conversation_commands` 未初始化错误 | 下一步：跑最终整体验证并准备交付 |
 | Phase 6：Claude-style unified agent runtime / observability | 第一版已实现，待真实模型/浏览器复测 | `docs/superpowers/specs/2026-06-30-agent-harness-workers-observability-design.md`；中文计划 `docs/superpowers/plans/2026-07-01-unified-claude-style-agent-runtime-zh.md`；英文计划 `docs/superpowers/plans/2026-07-01-unified-claude-style-agent-runtime.md`；新增 `src/khoj/processor/conversation/agent_tool_loop.py`，default chat 已删除 `aget_data_sources_and_output_format()` 浅 source routing，进入单主 planner，统一调度 `web_search` / `read_webpage`、local-KB/OpenKB Notes 工具、`append_note` / `propose_edit` 和 write grounding verifier；旧 `pick_relevant_tools` prompt、旧 source/output mode 常量和旧 source-router 测试已删除；Codex `json_object` payload 已加入 input JSON hint；显式 slash commands 保持现有专用路径；验证：`uv run pytest tests/test_agent_tool_loop.py tests/test_codex_conversation_adapter.py tests/test_notes_tool_loop.py tests/test_api_chat_file_kb.py tests/test_research_document_tools.py -q` 为 `79 passed`，`uv run ruff check src/khoj tests` 通过，`uv run pytest -q` 为 `385 passed, 12 skipped` | 下一步：真实模型 + 浏览器/Obsidian 跑 “根据网络资料补充 agent 评估八股内容 → 补充到项目里”，确认真实 web evidence、assistant artifact 和落盘写入都符合预期 |
 | Phase 7：Interview Card Maintainer / 项目事实卡 grounding | 第一版已实现，待真实面经跑通；本轮不提交 | 已创建项目级本地 skill `skills/interview-card-maintainer/SKILL.md`，自然语言手动触发，不安装到全局 `/data/ljr/.codex/skills/`，不新增按钮或 API；skill 启动时先读取用户指定设置、根目录 `agents.md` / `AGENTS.md` / `agent.md`，再按设置派生面经目录、面试卡目录、项目事实卡目录、索引、进度文件、命名规则和回答风格；fallback 目录只作为设置缺失时的兜底，不绑定具体知识库名或项目名；已新增通用 `templates/面试知识库项目设定模板.md` 和 `templates/面试项目事实卡模板.md`，并保留一张项目事实卡实例用于把 RAG、MCP、评估和可观测性题卡 grounded 到真实项目事实；验证：`quick_validate.py` 通过，`uv run pytest tests/test_notes_tool_loop.py::test_notes_tool_loop_loads_nested_official_obsidian_skill -q` 通过 `1 passed`，skill/templates 硬编码库名/项目名和占位符扫描无输出；原三次 docs commit 已按用户要求 reset 到 `c5cdf892` 后 | 下一步：用一篇现有面经手动触发 skill，检查能否创建/更新设置定义的面试题卡、补 `## 结合我的项目`、更新索引和进度 |
+| Phase 8：Web VaultAction / Daily Planner | 已完整实现并真实验收；本轮不提交 | 设计：`docs/superpowers/specs/2026-07-10-web-vault-daily-planner-design.md`；计划：`docs/superpowers/plans/2026-07-10-web-vault-daily-planner.md`；planner 使用宽松 `json_object` + 严格本地 parse/argument validation；新增 `requires_vault_write`、8 轮有界工具循环与 write-only completion；新增持久 `VaultActionBatch`、0007 迁移、CSRF/ownership/idempotency/conflict/rollback/recovery/advisory lock/`renameat2` 原子交换和恢复副本；Web 审核卡支持恢复、diff、确认/取消；Vault 新增 `skills/daily-planner`；真实 Luna 请求产生 pending create-only 批次，Web 取消后未落盘；最终 `438 passed, 11 skipped`，Web 7 项、Obsidian 17 项，独立复审无 P0-P2 | 在 Web 人工审阅真实计划后点击一次“确认并写入”，观察实际计划质量与恢复副本策略 |
 
 2026-07-01 Agent 语义判断准则：不要用词表、关键词命中、token overlap 比例这类伪智能规则判断用户意图或内容是否 grounded。代码只负责协议完整性、权限、路径、数据形状、安全边界和预算控制；语义选择、写入意图、内容 grounding 交给模型通过结构化 JSON 协议裁决。Notes 写入链路已按这个准则重修：`append_note` 增加 `write_intent` 和 `source_refs`；执行端不再用指代词表判断，而是按工具参数关系判断：如果 `content` 不是用户当前请求里明确给出的原文，就必须带 `source_refs`，否则返回 `source_refs_required`。第一版曾用 stop tokens 和 token overlap 比例判断来源一致性，真实浏览器复测证明这会误杀学习日记模板化改写；现已删除该启发式。当前边界改为：先确定性拦截写入内容中新冒出的文件名/路径，再用一次隔离上下文的结构化 grounding verifier 判断候选写入是否只来自声明来源；不通过就返回 `source_mismatch`，让 planner 带着错误状态重试。主 chat 的 data source 选择也删除了英文关键词 override，不再用 `latest/weather/image/my` 等词强行覆盖模型已返回的结构化选择，只保留 allowlist 校验。验证：先红后绿覆盖“携程 AI 应用开发面经学习日记写入时混入 raw/Windows 同步问题”、“没有文件名但混入 Windows 同步问题”、“面经内容模板化写入日记”和“data source 选择尊重模型裁决、不被关键词 override”的回归；`uv run pytest tests/test_notes_tool_loop.py -q` 为 `21 passed`；`uv run pytest tests/test_research_document_tools.py::test_data_source_selection_respects_model_verdict_without_keyword_override tests/test_research_document_tools.py::test_local_kb_makes_notes_source_available_without_entries -q` 为 `2 passed`；`uv run pytest tests/test_api_chat_file_kb.py::test_chat_notes_local_kb_write_request_appends_and_reports_tool_result tests/test_api_chat_file_kb.py::test_chat_notes_qqbot_write_reports_blocked_tool_result -q` 为 `2 passed`；`uv run ruff check src/khoj/processor/conversation/notes_tool_loop.py src/khoj/routers/helpers.py tests/test_notes_tool_loop.py tests/test_research_document_tools.py` 通过。下一步：在真实浏览器/Obsidian 对同一条“根据 experiences/... 规划今日学习日记，然后把这个写入学习日记”做人工复测。
 
@@ -485,6 +524,12 @@
 - `cd src/interface/web && CI=1 NEXT_TELEMETRY_DISABLED=1 CIRCLE_NODE_TOTAL=2 timeout 180s npm run build` 返回成功
 - `cd src/interface/obsidian && yarn build` 返回成功，生成 `main.js 249.2kb`
 
+2026-07-12 架构精简 Phase 10 QQBot / 生成资产 / 代码沙箱硬删除（已完成，文档保持未提交）：删除只有测试调用、没有生产入口的 QQBot adapter 与测试包；客户端能力测试改用明确的未知 client，不保留 QQBot 特判。删除后端 `generated_images`、paint model 空配置、图片生成 prompt、`generated_assets` SSE 事件以及 Web/Obsidian 的生成图片/文件状态和渲染分支；用户上传图片、`query_images`、视觉模型转换和历史图片字段继续保留。删除 `/code`、Research `run_code` 工具、`codeContext` 历史协议、代码产物引用面板、E2B/Terrarium 配置与 Docker sandbox 服务，并从依赖锁移除 `e2b` / `e2b-code-interpreter`。验证：目标符号生产源码无残留；全新 embedded Postgres 全量 pytest、Ruff、Django check、迁移 dry-run、`uv lock --check`、Web 协议/生产构建、Obsidian 17 项测试/生产构建通过。下一步：修复或重建正式 `pgserver_data` 后部署迁移与 Web export，通过 localhost:42110 端口转发 smoke 图片上传/视觉理解、默认聊天、Research、VaultAction 与 Obsidian，确认删除生成链未影响图片输入链；本阶段不直接改生成产物、不提交 docs。
+
+2026-07-12 架构精简 Phase 11 最终更改区复审与提交收口（已完成，文档保持未提交）：独立 reviewer 找到并修复三个阻断项。`0008_hard_delete_unused_surfaces` 现在先删除旧 FileObject/Entry 的级联 `agent_id` 外键列，再删除自定义 Agent，真实重建旧 schema 的 PostgreSQL 回归证明内容行保留；整会话删除统一进入 VaultAction advisory lock，等待进行中的 apply、恢复 crash 状态、级联前取消 pending，并对 failed/manual-review 批次返回 409 保留会话和 rollback journal，新增 pending 顺序、双线程 apply/delete 等待和 API problem-status 回归；Obsidian Review 卡使用原生 `<details>` 展示 create/append 完整内容与 replace 的 reason/find/replace，不恢复 diff 依赖。继续删除无调用的 Operator history helper、to-image 兼容分支、LoginPrompt CSS、自定义 Agent 图标/配色 helper，以及无法在现有认证边界下提供可用 Web UI、且默认拉上游镜像的旧 `docker-compose.yml` 和引用说明。最终验证：全新 embedded PostgreSQL 0001→0008 全迁移与 migration dry-run 通过；全仓 `409 passed, 11 skipped, 7 warnings`；Ruff check/format、`git diff --check`、isolated Django check、`uv lock --check`、Shell 语法、Web VaultAction 7 项与生产 build、Obsidian 19 项与生产 build 全部通过。已按功能提交：`c872bc6e refactor(agent): unify local knowledge runtime`、`4e3cbf82 refactor(web): trim local chat surfaces`、`f89b624d refactor(obsidian): consolidate chat and vault runtime`、`ac55173f chore(runtime): remove unsupported deployment surfaces`，四个提交均排除 `docs/**`。下一步：部署前同步生成的 Web export 与 Obsidian bundle，并通过 localhost:42110 端口转发 smoke 图片上传/视觉理解、默认聊天、Research、VaultAction 与 Obsidian。
+
+2026-07-12 架构精简 Phase 12 单一 Note Agent 路由收口（已完成，文档保持未提交）：`/api/chat` 已删除 default/general/notes/online/webpage/research 分叉、语义路由器、独立摘要模型链和命令 options API；普通消息、Automation 与唯一保留的 `/summarize` 动作都进入同一个 Agent Tool Loop。`/summarize` 只负责预读当前会话勾选文件并作为结构化文件上下文交给统一 Agent，Web 文件菜单新增 `Summarize selected` 一键动作。写入必需性由严格 `ToolPlan.requires_write_action` 声明并在循环内保持，不再有外部关键词或路由分类；工具注册表删除 route command、per-tool rate callback 和 Notes 强制模式。Research loop、Research conversation state/prompts、MCP client/server 模型/adapter/admin/初始迁移及 `mcp` 依赖全部硬删除；新增 `database.0009_drop_removed_research_surfaces`，真实从 0008 旧库造出 `database_mcpserver` 后升级到 0009，确认旧表被删除。Web 删除斜杠菜单与 Research toggle，Obsidian 删除 mode dropdown、命令注入和历史模式标签，同时保留文件访问与 VaultAction 审阅。生成的 Web export 已同步到 `src/khoj/interface/built` 和清理后的 static。真实 localhost:42110 + 临时 Vault 验收已覆盖普通统一聊天、联网搜索证据、两份 `.md` 勾选后一键总结、Automation 内部 marker、`/general` 明确拒绝、Web pending batch 和 Obsidian client action；两种写入在确认前都未落盘。验收中发现 Web pending batch 引用缺少统一 `Context.file` 字段会在持久化时返回 500，已用失败回归复现并补齐批次文件字段，真实 HTTP 重跑通过。最终证据：隔离环境全仓 `398 passed, 11 skipped, 7 warnings`；Ruff、格式、Django check、migration dry-run、`uv lock --check`、`git diff --check` 通过；Web VaultAction `7 passed`、TypeScript 和生产 build 通过；Obsidian `19 passed` 且生产 build 通过；生成资产扫描无 `Research Mode`、旧命令帮助或 `/api/chat/options`，并存在 `Summarize selected`。下一步：Windows 端只需人工确认真实笔记内容和 Web 审核卡视觉交互；不再恢复任何旧模式路由。
+
 ## 1. 总体结论
 
 当前项目已经具备可复用的 Agent 外壳：
@@ -935,6 +980,181 @@ QQ inbound message
 
 下一步：用真实 UI 手测“规划学习日记 → 写入学习日记”，确认模型会优先选择 `artifact_id`。
 
+### Phase 5A：Web 新会话首问链路与 OfferAgent 口径收敛（已完成，2026-07-07）
+
+目标：修复网页端从首页新建对话后输入首问会回到首页、首问状态丢失、口径仍显示 Khoj 的问题。
+
+根因：
+
+- 首页首问依赖 `localStorage.message` 暂存，再跳转到 `/chat?conversationId=...`；旧静态 chunk 和新代码混用时容易把首问状态弄丢。
+- `ChatHistory` 对空历史会话只在 `agent` 非空时初始化 metadata，但默认 OfferAgent 会话允许 `agent: null`，导致新会话首屏历史加载分支不稳定。
+- 历史加载失败时直接 `window.location.href = "/"`，会关闭 WebSocket，使正在生成的首问保存为空回复。
+- `collectstatic` 不删除旧 hashed `_next` chunk，导致浏览器可能继续命中旧前端逻辑。
+- 网页端 logo、控制台欢迎语、PWA/metadata 和底部菜单仍残留 Khoj 口径。
+
+改动：
+
+- 首问改成显式 URL handoff：`buildChatUrl(conversationId, query)` 写入 `q` 参数；首页和分享 fork 不再写 `localStorage.message`。
+- `/chat` 消费 `q` 参数后发送首问，并用 `router.replace` 清掉 URL 中的 `q`，保留稳定的 `conversationId`。
+- `ChatHistory` 支持 `agent: null` 的空历史初始化；历史加载失败改为页面内错误状态，不再跳回首页。
+- 默认 agent slug 规范化：前端不会再为默认会话追加 `agent_slug=khoj`。
+- 统一前端 chat 链接构造，侧边栏和 agent card 都走 `buildChatUrl()`。
+- 清理并重建 `src/khoj/static/_next`，防止旧 chunk 继续被服务。
+- Web 可见品牌改为 OfferAgent：字标、图标、控制台欢迎语、底部菜单、manifest/metadata。
+
+验收：
+
+- `NEXT_TELEMETRY_DISABLED=1 npx next build`
+- `npx prettier --check ...`
+- `git diff --check -- ...`
+- `uv run python src/khoj/manage.py collectstatic --noinput`
+- 服务重启：`python3` PID `3236235` 监听 `0.0.0.0:12805`，`/api/health` 返回 `{"email":"default@example.com"}`。
+- Playwright 真实浏览器新会话测试通过：从 `http://10.106.17.252:12805/` 输入“你好”，最终停留在 `http://10.106.17.252:12805/chat?conversationId=2d24bc1b-c769-4350-8156-b7eacdfa8d8e`，页面渲染 OfferAgent 字标，后端保存非空 OfferAgent 回复。
+- 验证截图：`/tmp/offeragent-web-new-chat-final.png`。
+
+补充修复（2026-07-07 22:27）：
+
+- 空会话 history API 合法返回 `slug: null`；前端 `ChatHistoryData` 和 `isChatHistoryData()` 已放宽为 `string | null`，标题显示兜底为 `New Conversation`。
+- 修复前空会话会被前端误判为 invalid response，并显示 `Unable to load this conversation.`。
+- Playwright 验证空会话 `5a7f58f2-4518-4758-a90a-e642c9ce7a2b` 正常显示输入框和右侧设置，不再显示 unable；首页新建首问 “你好” 仍能正常生成非空 OfferAgent 回复。
+
+下一步：让用户在 Windows 浏览器 Ctrl+F5 强制刷新后复测“新建对话 → 输入你好”和“最近五天 daily 学习情况”两个问题；若 daily 问题仍不够准，继续检查本地 vault 工具召回和意图规划。
+
+### Phase 5B：OfferAgent 本地长期记忆（已完成，2026-07-07）
+
+目标：修复跨 session 记忆污染，避免 daily 分析、文件读取结论和旧 DB `UserMemory` 被注入新对话。
+
+改动：
+
+- 新增本地文件记忆目录：优先写入 vault 下 `.offeragent/memory/`，无 vault 时写入 `~/.offeragent/memory/default/`。
+- 记忆只允许 `user`、`feedback`、`project` 三类；不保存 `reference`，路径和知识库内容继续由本地 vault/index/grep 负责。
+- 聊天入口不再调用 DB `pull_memories()` / `search_memories()`，改为结构化决策 prompt 从本地 memory manifest 选择最多 3 条相关记忆。
+- 保存对话后不再自动从 user+assistant 回合抽 DB facts，改为结构化决策 prompt 只基于最新用户消息决定是否创建一条本地长期记忆。
+- `/api/memories` 改为管理本地文件记忆；旧 `manage_memories` 命令只保留删除 legacy DB memories 的能力。
+
+验收：
+
+- `uv run ruff check src/khoj/processor/conversation/offeragent_memory.py src/khoj/routers/helpers.py src/khoj/processor/conversation/utils.py src/khoj/routers/api_chat.py src/khoj/routers/api_memories.py src/khoj/database/management/commands/manage_memories.py tests/test_offeragent_memory.py tests/test_memory_settings.py`
+- `uv run pytest tests/test_offeragent_memory.py tests/test_memory_settings.py tests/test_notes_tool_loop.py tests/test_api_chat_file_kb.py -q`
+- `uv run pytest -q`
+
+下一步：真实网页端和 Obsidian 端复测“你好”“忽略记忆”“评价近五天 daily 学习情况”，确认记忆不污染本地 notes 工具链。
+
+### Phase 5C：OfferAgent 后台记忆判断（已完成，2026-07-07）
+
+目标：对齐 Claude Code 的 turn-end 后台记忆提取思路，让长期记忆判断不阻塞网页端和 Obsidian 端主对话链路。
+
+设计：
+
+- 主链路只负责回答问题和保存 conversation log；保存完成后立即继续返回，不等待长期记忆判断。
+- 记忆写入改为后台 best-effort task：复用现有 `ai_update_offeragent_memory(..., fast_model=True)`，不用 Codex 桌面环境，也不引入新的队列/worker。
+- 后台任务只看最新用户消息、本轮是否使用 notes/local KB 工具、已有 memory manifest；仍不从 assistant 回复或工具结果自动沉淀 daily/report 结论。
+- 后台任务异常只写日志，不影响本轮聊天保存和前端响应。
+- 暂不实现 Claude 的完整 forked agent 工具体系、pending drain、subagent transcript 和多轮工具预算；OfferAgent v1 只需要低延迟、可审计、低污染的本地长期记忆。
+
+验收：
+
+- `save_to_conversation_log()` 不再 `await` 长期记忆写入，改为 `asyncio.create_task(...)` 后台调度。
+- 单测覆盖：对话日志保存后会调度后台 memory task；后台异常只写日志，不向主链路冒泡。
+- `uv run ruff check src/khoj/processor/conversation/utils.py tests/test_notes_tool_loop.py`
+- `uv run pytest tests/test_notes_tool_loop.py::test_save_to_conversation_log_schedules_memory_without_waiting tests/test_notes_tool_loop.py::test_background_memory_update_failure_is_logged -q`
+- `uv run pytest tests/test_offeragent_memory.py tests/test_memory_settings.py tests/test_notes_tool_loop.py tests/test_api_chat_file_kb.py -q`
+- `uv run pytest -q`：409 passed, 12 skipped, 9 warnings。
+
+下一步：重编 Obsidian 插件和网页静态资源后，在真实 Windows 端复测“新建对话 → 你好”和“评价近五天 daily 学习情况”，确认主链路响应速度和记忆写入都符合预期。
+
+### Phase 5D：Obsidian 写模式空工作区新建文件提示（已完成，2026-07-08）
+
+目标：修复 Obsidian 插件在 `Read & Write` 模式但主编辑区没有打开 Markdown 文件时，不向模型注入 `<khoj_edit>` 写入协议，导致模型误答“没有文件写入工具”的问题。
+
+根因：
+
+- `FileInteractions.getOpenFilesContent()` 在最近打开 Markdown 文件数量为 0 时直接返回空字符串。
+- 这个早返回同时截断了 write mode 的 edit instructions；模型看不到“空 SEARCH + safe relative .md path 可创建新 Markdown 文件”的协议。
+- `applyEditBlocks()` 已经支持安全相对 `.md` 新文件创建，所以不需要新增真实文件工具或额外后端 API。
+
+改动：
+
+- read mode 保持原行为：无打开 Markdown 文件时不注入文件上下文。
+- write mode 改为即使无打开 Markdown 文件，也注入 `<khoj_edit>` 协议和空 `WORKING_FILE_SET`。
+- 空工作集里明确提示：没有 Markdown 文件打开时，只有用户明确要求，才可创建安全相对路径的 `.md` 文件。
+
+验收：
+
+- Node harness 复现：修复前 `getOpenFilesContent('write')` 在空工作区返回 `""`；修复后包含 `<khoj_edit>` 和 `safe relative new file path ending in .md`。
+- `cd src/interface/obsidian && npm run build`
+
+下一步：重新打 Obsidian 插件包，安装到 `E:\面试胜利！\.obsidian\plugins\offeragent` 后，在插件里切到 `Read & Write`，不打开主编辑区 Markdown 文件也能让模型输出创建 `daily/2026-07-08.md` 的 `<khoj_edit>` block。
+
+### Phase 5E：旧 DB Memory 硬删除（已完成，2026-07-08）
+
+目标：不再兼容旧 `UserMemory` DB 记忆，当前长期记忆只走 OfferAgent 本地文件 memory。
+
+改动：
+
+- 删除 `UserMemory` Django model、admin 注册、`UserMemoryAdapters`、旧 `manage_memories` 命令和旧事实抽取 prompt。
+- `relevant_memories` 类型改为 `OfferAgentMemory`，聊天入口和 `/api/memories` 继续复用文件 memory。
+- 迁移层新增 `0003_drop_legacy_usermemory`，并让 `0002` 对新库安全，旧库会 `DROP TABLE IF EXISTS database_usermemory CASCADE`。
+- 删除 DB memory scoping/search 测试，只保留 memory 开关和文件 memory API 测试。
+
+验收：
+
+- `uv run ruff check src/khoj/database/migrations/0002_drop_legacy_vector_search_artifacts.py src/khoj/database/migrations/0003_drop_legacy_usermemory.py src/khoj/database/adapters/__init__.py src/khoj/database/admin.py src/khoj/database/models/__init__.py src/khoj/processor/conversation/prompts.py src/khoj/processor/conversation/utils.py src/khoj/routers/helpers.py src/khoj/routers/research.py src/khoj/processor/tools/run_code.py src/khoj/processor/tools/online_search.py src/khoj/processor/operator/__init__.py tests/helpers.py tests/test_memory_settings.py tests/test_codex_conversation_adapter.py`
+- `uv run python src/khoj/manage.py makemigrations --check --dry-run`
+- `uv run pytest --create-db tests/test_memory_settings.py tests/test_offeragent_memory.py tests/test_codex_conversation_adapter.py::test_codex_message_wrapper_skips_database_chat_models -q`
+
+下一步：在服务器启动时跑迁移，确认生产库中的 `database_usermemory` 表被删除，Settings Memory 仍只展示 `.offeragent/memory` 文件记忆。
+
+2026-07-08 ponytail 兼容层 cleanup 补充：删除 `0002` 中重复的 `database_usermemory` drop，保留 `0003_drop_legacy_usermemory` 作为唯一旧表清理入口；移除 pass-through 模块里的 `OfferAgentMemory` 具体类型依赖；删掉 OpenAI `converse_openai()` 的旧 `references/user_query/chat_history/agent` direct-call 入口，测试改为先构造 `messages`；删除 Python 旧 `ast.Str` 分支；`responses_chat_completion_with_backoff.deepthought` 实际仍用于 reasoning effort，只去掉误导性的 legacy 注释。验证：`uv run ruff check ...`、`uv run pytest --create-db tests/test_memory_settings.py tests/test_offeragent_memory.py tests/test_codex_conversation_adapter.py::test_codex_message_wrapper_skips_database_chat_models tests/test_online_chat_actors.py -q`、`uv run python src/khoj/manage.py makemigrations --check --dry-run`。
+
+### Phase 5F：商业/分享/邮件/语音/旧解析硬删除（已完成，2026-07-08）
+
+目标：按本地个人知识库产品面裁剪 Khoj，不做兼容，不保留商业化、分享聊天、邮件登录/反馈、语音、DOCX、图片 OCR、Org-mode 解析入口；Automations 仅保留创建、编辑、删除、手动触发 cron 任务，不再发送邮件。
+
+改动：
+
+- 删除公开分享聊天 API、页面和 fork/read/create/delete 流程。
+- 删除邮件服务、magic link、welcome、feedback、automation email 发送路径和 `resend` 依赖。
+- 删除 `Subscription`、`PriceTier`、Futurist badge、付费模型限制、free/paid rate-limit 分支和相关前端提示。
+- 删除 voice/speech 模型配置、用户 voice config、SpeechToText 模型和 Obsidian/Web 里的 voice 同步残留。
+- 删除 DOCX、图片 OCR、Org-mode 内容处理器、上传入口、Obsidian `.org`/image sync、GitHub `.org` 解析和对应测试。
+- 新增 `0004_drop_removed_product_surfaces`，旧库会 drop 分享/订阅/语音表和旧字段。
+
+验收：
+
+- `uv run ruff check ...`
+- `uv run python src/khoj/manage.py check`
+- `uv run pytest tests/test_client.py tests/test_agents.py tests/test_memory_settings.py tests/test_api_chat_file_kb.py tests/test_research_document_tools.py`
+- `cd src/interface/web && npm run build`
+- `cd src/interface/obsidian && npm run build`
+
+下一步：服务器部署时运行迁移，确认旧表和旧列删除后 Automations 手动触发仍返回结果且不发邮件。
+
+### Phase 5G：本地 demo 外部产品面二次硬删除（已完成，2026-07-08）
+
+目标：继续按单用户本地 demo 收敛，不保留电脑控制、公开 Agent、电话资料、IP 粗定位、邮件通知模板和 Home 落地页。
+
+改动：
+
+- 删除 Operator/电脑控制命令、operator processor、tool schema、chat history operator context、research/chat 执行分支和 Obsidian `Operator` 模式。
+- 删除 Agent `privacy_level` 模型字段、公开/受保护 Agent 访问策略、分享 UI、public agent 探索入口和相关测试假设。
+- 删除 `KhojUser.phone_number` / `verified_phone_number`、phone adapters、admin 字段、`django-phonenumber-field` / `phonenumbers`、Web 电话输入依赖和静态 remote include。
+- 删除 `/api/ip`、ipapi 请求、IP 城市/地区/国家上下文注入和 Obsidian CSP 里的 ipapi 域。
+- 删除 automation email notification prompt/helper、email template 静态目录引用和 Automations 页面里的收件箱/邮件语义。
+- 删除 `/home` route、home template 常量和旧生成静态残留。
+- 新增 `0006_drop_removed_local_demo_surfaces`，旧库会 drop 电话字段和 Agent 公开能力字段。
+
+验收：
+
+- 旧功能关键词残留搜索无命中，除 `0006_drop_removed_local_demo_surfaces` 中必要的 drop-column SQL。
+- `uv run ruff check src/khoj tests`
+- `uv run python src/khoj/manage.py makemigrations --check --dry-run`
+- `cd src/interface/web && npm exec next build`
+- `uv run pytest tests/test_agents.py tests/test_client.py tests/test_api_automation.py tests/test_api_chat_file_kb.py -q --reuse-db` 返回 `121 passed, 6 skipped`。
+- 复查后继续删除残留：清掉 operator `__pycache__` 和空目录 `interface/email`、`interface/web/home`、`app/share`；删除 Obsidian `text-to-image*` 兼容渲染分支。验证：残留搜索无命中；`cd src/interface/obsidian && npm run build` 通过；`uv run ruff check src/khoj tests` 通过；`uv run python src/khoj/manage.py check` 无问题。
+
+下一步：服务器部署时运行迁移，随后 smoke 本地主链路：Web `/api/chat`、Agent 创建/编辑、Automations 手动触发、Obsidian 同步和聊天。
+
 ## 6. 主要代码触点
 
 | 文件 | 必要改动 |
@@ -949,10 +1169,8 @@ QQ inbound message
 | `src/interface/obsidian/src/settings.ts` | 默认本地 URL，减少 Cloud 文案；保留 API key/匿名模式配置 |
 | `src/interface/obsidian/src/chat_view.ts` | 面试快捷命令 |
 | `src/interface/obsidian/src/interact_with_files.ts` | 继续复用确认写回和插件侧文件交互 |
-| `src/khoj/integrations/qqbot/` | 新增 QQBot 薄 adapter |
 | `tests/test_codex_conversation_adapter.py` | auth、headers、payload、tool_call normalize |
 | `tests/test_interview_vault_tools.py` | local kb / vault profile、root jail、read/grep/append |
-| `tests/test_qqbot_adapter.py` | 入站归一化、白名单、分片、调用 `/api/chat` |
 
 ## 7. 测试策略
 
@@ -963,7 +1181,7 @@ QQ inbound message
 3. Local KB file tools：用临时目录测 root jail、read、grep、写入禁用；同一组测试覆盖 Obsidian vault 目录。
 4. Write tools：写入关闭时不改文件；写入开启时 `append_note` 改临时 vault；`propose_edit` 只产出待确认 patch。
 5. Obsidian plugin integration：插件指向本地 Khoj URL，验证 chat 请求、匿名/API key 两种配置、Force Sync 不破坏本地直读路径。
-6. `/api/chat` integration：client 分别为 `web`、`obsidian`、`qqbot`，验证上下文权限。
+6. `/api/chat` integration：client 分别为 `web`、`obsidian`，验证上下文权限和 VaultAction 能力边界。
 7. Gold set：八股单点、多跳追问、项目经历、无答案拒答、写入确认。
 8. 全量 pytest：确认不破坏现有 Khoj 行为。
 
@@ -981,7 +1199,7 @@ QQ inbound message
 
 核心口径：
 
-> 我没有重写 Khoj，而是复用了它已有的 `/api/chat`、Agent、Research loop、Memory 和 Obsidian 插件。我的改造点是：模型层新增 CodexConversationAdapter，本地文件库工具优先读本机目录或 Obsidian vault，Interview Agent 加面试场景 persona 和安全写回规则，QQBot 作为薄入口接入 `/api/chat`。Phase 5 用 OpenKB 做 compiled wiki evidence，并硬删除旧文档检索栈。
+> 我没有重写 Khoj，而是复用了它已有的 `/api/chat`、Research loop、Memory 和 Obsidian 插件。我的改造点是：模型层新增 CodexConversationAdapter，本地文件库工具优先读本机目录或 Obsidian vault，OfferAgent 加面试场景 persona 和安全写回规则。Phase 5 用 OpenKB 做 compiled wiki evidence，并硬删除旧文档检索栈；后续继续删除了没有生产入口的 QQBot、图片生成和代码沙箱链。
 
 如果问为什么要删除旧文档检索：
 

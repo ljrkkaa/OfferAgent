@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 KHOJ_URL = os.getenv("KHOJ_URL", "http://localhost:42110")
 KHOJ_CHAT_API_URL = f"{KHOJ_URL}/api/chat"
 KHOJ_API_KEY = os.getenv("KHOJ_API_KEY")
-KHOJ_MODE = os.getenv("KHOJ_MODE", "default").lower()  # E.g research, general, default etc.
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_EVAL_MODEL = os.getenv("GEMINI_EVAL_MODEL", "gemini-2.5-flash")
@@ -46,7 +45,7 @@ RANDOMIZE = os.getenv("RANDOMIZE", "false").lower() == "true"  # Randomize examp
 BATCH_SIZE = int(
     os.getenv("BATCH_SIZE", int(SAMPLE_SIZE) / 10 if SAMPLE_SIZE else 10)
 )  # Examples to evaluate in each batch
-SLEEP_SECONDS = 3 if KHOJ_MODE == "general" else 1  # Sleep between API calls to avoid rate limiting
+SLEEP_SECONDS = 1  # Sleep between API calls to avoid rate limiting
 KHOJ_API_TIMEOUT_SECONDS = 1200  # Default to 20 minutes
 
 
@@ -522,9 +521,6 @@ def process_batch(batch, batch_start, results, dataset_length, response_evaluato
         current_index = batch_start + idx
         logger.info(f"Processing example: {current_index}/{dataset_length}")
 
-        # Trigger research mode if enabled
-        prompt = f"/{KHOJ_MODE} {prompt}" if KHOJ_MODE and not prompt.startswith(f"/{KHOJ_MODE}") else prompt
-
         # Get agent response
         response = get_agent_response(prompt)
         agent_response = response["response"]
@@ -715,10 +711,8 @@ if __name__ == "__main__":
 
     Khoj should be running at KHOJ_URL (default: http://localhost:42110).
     The Gemini judge model is accessed via the Gemini API with your GEMINI_API_KEY.
-    To evaluate Khoj in research mode, set the KHOJ_MODE environment variable to "research".
-
     Run the script using the following command:
-    KHOJ_MODE="research" GEMINI_API_KEY="<your_gemini_api_key>" python eval_frames.py
+    GEMINI_API_KEY="<your_gemini_api_key>" python eval_frames.py
     """
     logger.info(f"{datetime.now()} - Begin Quizzing Khoj.")
     with timer("Ran eval script in", logger, log_level=logging.INFO):

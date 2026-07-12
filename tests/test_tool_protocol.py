@@ -2,12 +2,15 @@ import pytest
 
 from khoj.processor.conversation.knowledge_workspace import OPENKB_TOOL, PROPOSE_EDIT_TOOL
 from khoj.processor.conversation.tool_protocol import parse_tool_plan, validate_tool_arguments
-from khoj.utils.helpers import ConversationCommand, ToolDefinition, tools_for_research_llm
+from khoj.utils.helpers import AgentToolName, ToolDefinition, agent_tool_definitions
 
 
-def test_parse_tool_plan_requires_canonical_schema():
-    calls = parse_tool_plan('{"calls":[{"name":"view_file","args":{"path":"notes.md"},"id":"1"}]}')
+def test_parse_tool_plan_requires_write_intent_and_canonical_calls():
+    requires_write_action, calls = parse_tool_plan(
+        '{"requires_write_action":true,"calls":[{"name":"view_file","args":{"path":"notes.md"},"id":"1"}]}'
+    )
 
+    assert requires_write_action is True
     assert [(call.name, call.args, call.id) for call in calls] == [("view_file", {"path": "notes.md"}, "1")]
 
 
@@ -16,6 +19,7 @@ def test_parse_tool_plan_requires_canonical_schema():
     [
         "plain text",
         "{'calls':[]}",
+        '{"calls":[]}',
         '{"calls":[]} trailing text',
         '```json\n{"calls":[]}\n```',
         '{"tools":[]}',
@@ -136,6 +140,6 @@ def test_real_workspace_schemas_allow_empty_replacement_and_enforce_limits():
     with pytest.raises(ValueError, match="n.*at most 10"):
         validate_tool_arguments(OPENKB_TOOL, {"query": "Redis", "n": 11})
 
-    view_file = tools_for_research_llm[ConversationCommand.ViewFile]
+    view_file = agent_tool_definitions[AgentToolName.ViewFile]
     with pytest.raises(ValueError, match="start_line.*at least 1"):
         validate_tool_arguments(view_file, {"path": "notes.md", "start_line": 0})

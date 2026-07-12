@@ -79,6 +79,7 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 
 import { Pencil, Trash } from "@phosphor-icons/react";
+import { FileText } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -163,6 +164,7 @@ interface FilesMenuProps {
     conversationId: string | null;
     uploadedFiles: string[];
     isMobileWidth: boolean;
+    onSummarizeSelected?: () => void;
 }
 
 export function FilesMenu(props: FilesMenuProps) {
@@ -267,6 +269,16 @@ export function FilesMenu(props: FilesMenuProps) {
                             >
                                 <FolderPlus className="h-4 w-4 mr-2" />
                                 <span>Select all</span>
+                            </CommandItem>
+                            <CommandItem
+                                disabled={addedFiles.length === 0}
+                                onSelect={() => {
+                                    props.onSummarizeSelected?.();
+                                    setIsOpen(false);
+                                }}
+                            >
+                                <FileText className="h-4 w-4 mr-2" />
+                                <span>Summarize selected</span>
                             </CommandItem>
                         </CommandGroup>
                     )}

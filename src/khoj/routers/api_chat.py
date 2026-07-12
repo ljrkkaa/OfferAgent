@@ -5,7 +5,6 @@ import logging
 import time
 import uuid
 from datetime import datetime
-from functools import partial
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
 
@@ -36,10 +35,9 @@ from khoj.processor.conversation.conversation_turn import ConversationTurn, pers
 from khoj.processor.conversation.knowledge_workspace import (
     dedupe_workspace_evidence,
     get_workspace_sources,
+    read_workspace_document,
     search_indexed_evidence,
 )
-from khoj.processor.conversation.offeragent_intent_router import route_offeragent_intent
-from khoj.processor.conversation.prompts import no_entries_found
 from khoj.processor.conversation.utils import (
     ResponseWithThought,
     defilter_query,
@@ -53,43 +51,33 @@ from khoj.processor.conversation.vault_actions import (
     web_vault_write_enabled,
 )
 from khoj.processor.conversation.vault_policy import load_vault_policy
-from khoj.processor.tools.online_search import (
-    deduplicate_organic_results,
-    read_webpages,
-    search_online,
-)
+from khoj.processor.tools.online_search import deduplicate_organic_results
 from khoj.routers.helpers import (
     ApiImageRateLimiter,
     ApiUserRateLimiter,
     ChatEvent,
     ChatRequestBody,
     CommonQueryParams,
-    ConversationCommandRateLimiter,
     DeleteMessageRequestBody,
     WebSocketConnectionManager,
     acreate_title_from_history,
     agenerate_chat_response,
     gather_raw_query_files,
-    generate_summary_from_files,
     get_message_from_queue,
     is_query_empty,
     is_ready_to_chat,
-    parse_conversation_command,
+    parse_summary_command,
     read_chat_stream,
     select_offeragent_memories,
     send_message_to_model_wrapper,
     validate_chat_model,
 )
-from khoj.routers.research import ResearchIteration, research
 from khoj.utils import state
 from khoj.utils.helpers import (
-    ConversationCommand,
     clean_text_for_db,
-    command_descriptions,
     convert_image_to_webp,
     get_country_code_from_timezone,
     get_country_name_from_timezone,
-    is_none_or_empty,
     is_web_search_enabled,
 )
 from khoj.utils.rawconfig import (
@@ -100,8 +88,6 @@ from khoj.utils.rawconfig import (
 
 # Initialize Router
 logger = logging.getLogger(__name__)
-conversation_command_rate_limiter = ConversationCommandRateLimiter(rate_limit=20, slug="command")
-
 api_chat = APIRouter()
 WEBSOCKET_INTERRUPT_GRACE_SECONDS = 5.0
 
@@ -426,21 +412,6 @@ async def create_chat_session(
     return Response(content=json.dumps(response), media_type="application/json", status_code=200)
 
 
-@api_chat.get("/options", response_class=Response)
-async def chat_options(
-    request: Request,
-    common: CommonQueryParams,
-) -> Response:
-    cmd_options = {}
-    for cmd in ConversationCommand:
-        if cmd in [ConversationCommand.Online, ConversationCommand.Webpage] and not is_web_search_enabled():
-            continue
-        if cmd in command_descriptions:
-            cmd_options[cmd.value] = command_descriptions[cmd]
-
-    return Response(content=json.dumps(cmd_options), media_type="application/json", status_code=200)
-
-
 @api_chat.patch("/title", response_class=Response)
 @requires(["authenticated"])
 async def set_conversation_title(
@@ -564,7 +535,6 @@ async def _run_conversation_turn_impl(
     defiltered_query = defilter_query(q)
     train_of_thought = []
     cancellation_event = asyncio.Event()
-    child_interrupt_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
 
     tracer: dict = {
         "mid": turn_id,
@@ -589,7 +559,6 @@ async def _run_conversation_turn_impl(
         for file in raw_query_files:
             query_files[file.name] = file.content
 
-    research_results: List[ResearchIteration] = []
     online_results: Dict = dict()
     compiled_references: List[Any] = []
     inferred_queries: List[Any] = []
@@ -597,14 +566,11 @@ async def _run_conversation_turn_impl(
 
     vault_actions: list[dict[str, Any]] = []
     vault_action_event_payload: dict[str, Any] | None = None
-    conversation_commands: List[ConversationCommand] = []
     program_execution_context: List[str] = []
     user_message_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     relevant_memories = []
     full_response = ""
     used_workspace_tools = False
-    workspace_has_evidence = False
-    workspace_tools_failed = False
 
     turn = ConversationTurn(
         user=user,
@@ -614,7 +580,6 @@ async def _run_conversation_turn_impl(
         user_message_time=user_message_time,
         compiled_references=compiled_references,
         online_results=online_results,
-        research_results=research_results,
         inferred_queries=inferred_queries,
         query_images=uploaded_images,
         raw_query_files=raw_query_files or [],
@@ -663,11 +628,6 @@ async def _run_conversation_turn_impl(
                             logger.debug("Chat interrupted.")
                         else:
                             logger.info(f"Continuing chat with the new instruction: {interrupt_query}")
-                            _enqueue_interrupt_signal(
-                                child_interrupt_queue,
-                                interrupt_query,
-                                replace_pending=True,
-                            )
                             q += f"\n\n{interrupt_query}"
                             defiltered_query += f"\n\n{defilter_query(interrupt_query)}"
                     await asyncio.sleep(0.1)
@@ -769,20 +729,18 @@ async def _run_conversation_turn_impl(
         return
 
     # Automated task execution is an exact transport marker, not a semantic intent guess.
-    cmds_to_rate_limit = []
     automation_parts = q.lstrip().split(maxsplit=1)
     if automation_parts and automation_parts[0] == "/automated_task":
         q = automation_parts[1] if len(automation_parts) > 1 else ""
-        cmds_to_rate_limit += [ConversationCommand.AutomatedTask]
 
-    # Explicit slash commands are exact first-token routes, never semantic guesses.
+    # Summarization changes input preparation, not the runtime that executes the turn.
     try:
-        conversation_command, q, explicit_command = parse_conversation_command(q)
+        q, summary_requested = parse_summary_command(q)
     except ValueError as error:
         async for result in send_llm_response(str(error), tracer.get("usage")):
             yield result
         return
-    conversation_commands = [conversation_command]
+    defiltered_query = defilter_query(q)
 
     conversation = await ConversationAdapters.aget_conversation_by_user(
         user,
@@ -834,316 +792,122 @@ async def _run_conversation_turn_impl(
         # Populate context from interrupted message
         online_results.update({key: val.model_dump() for key, val in last_message.onlineContext.items() or []})
         compiled_references.extend(ref.model_dump() for ref in last_message.context or [])
-        research_results.extend(
-            ResearchIteration(**iter_dict)
-            for iter_dict in last_message.researchContext or []
-            if iter_dict.get("summarizedResult")
-        )
         train_of_thought.extend(thought.model_dump() for thought in last_message.trainOfThought or [])
         logger.info(f"Loaded interrupted partial context from conversation {conversation_id}.")
 
     await conversation.arefresh_from_db(fields=["conversation_log"])
     chat_history = conversation.messages
 
-    requires_write_action = False
-
-    async def router_send_message(**kwargs):
-        return await send_message_to_model_wrapper(
-            user=user,
-            query_files=attached_file_context,
-            query_images=uploaded_images,
-            relevant_memories=relevant_memories,
-            tracer=tracer,
-            **kwargs,
-        )
-
-    route_decision = await route_offeragent_intent(
-        q,
-        chat_history,
-        send_message=router_send_message,
-    )
-    if route_decision.needs_clarification:
-        if not explicit_command:
-            async for result in send_llm_response(route_decision.question, tracer.get("usage")):
-                yield result
-            return
-        program_execution_context.append(
-            "The explicit command fixed the route, but write intent classification was inconclusive. "
-            "Do not claim a file change unless a write tool result confirms it."
-        )
-    else:
-        requires_write_action = route_decision.requires_vault_write
-
-    if conversation_commands == [ConversationCommand.Default] and not explicit_command:
-        routed_command = ConversationCommand(route_decision.route)
-        if routed_command != ConversationCommand.Default:
-            conversation_commands = [routed_command]
-            inferred_queries.append(f"router:{route_decision.intent}:{route_decision.route}")
-            async for result in send_event(
-                ChatEvent.STATUS,
-                f"**Routed by intent:** {route_decision.route}",
+    if summary_requested:
+        if not conversation.file_filters and not attached_file_context:
+            async for result in send_llm_response(
+                "No files selected for summarization. Please select one or more files first.",
+                tracer.get("usage"),
             ):
                 yield result
-
-    if requires_write_action and not vault_actions_supported:
-        program_execution_context.append(
-            "The user explicitly requested a persistent file change, but this client cannot prepare reviewed "
-            "VaultActions. No file change is pending or applied; the final answer must report that exact state."
-        )
-    elif requires_write_action and conversation_commands not in (
-        [ConversationCommand.Default],
-        [ConversationCommand.Notes],
-    ):
-        program_execution_context.append(
-            "The selected specialized command does not prepare reviewed VaultActions. No file change is pending or "
-            "applied; the final answer must not claim the requested write succeeded."
-        )
-
-    if conversation_commands == [ConversationCommand.Default]:
-        try:
-            status_messages = []
-            agent_chat_model = (
-                AgentAdapters.get_agent_chat_model(agent, user)
-                if agent and hasattr(agent, "slug") and hasattr(agent, "chat_model")
-                else None
-            )
-
-            async def agent_runtime_send_message(**kwargs):
-                return await send_message_to_model_wrapper(
-                    user=user,
-                    query_files=attached_file_context,
-                    query_images=uploaded_images,
-                    relevant_memories=relevant_memories,
-                    agent_chat_model=agent_chat_model,
-                    tracer=tracer,
-                    **kwargs,
-                )
-
-            async def check_agent_tool_rate_limit(command: ConversationCommand) -> None:
-                await conversation_command_rate_limiter.update_and_check_if_valid(request_obj, command)
-
-            agent_result = await collect_agent_context_and_actions(
-                q,
-                chat_history,
-                user=user,
-                agent=agent,
-                send_message=agent_runtime_send_message,
-                send_status=status_messages.append,
-                before_tool_call=check_agent_tool_rate_limit,
-                client_app=common.client,
-                allow_local_kb=notes_local_source_available,
-                allow_openkb=notes_openkb_source_available,
-                allow_web=is_web_search_enabled(),
-                conversation_id=conversation_id,
-                write_mode="client_actions" if vault_actions_supported else "disabled",
-                vault_policy=vault_policy,
-                location=location,
-                query_images=uploaded_images,
-                query_files=attached_file_context,
-                relevant_memories=relevant_memories,
-                tracer=tracer,
-                require_write_action=requires_write_action and vault_actions_supported,
-            )
-            compiled_references.extend(agent_result.references)
-            used_workspace_tools = used_workspace_tools or agent_result.used_workspace_tools
-            vault_actions.extend(_collect_vault_actions(agent_result.references))
-            inferred_queries.extend(agent_result.inferred_queries)
-            online_results.update(agent_result.online_results)
-            program_execution_context.extend(agent_result.program_context)
-            if agent_result.errors:
-                program_execution_context.append(
-                    "Unified agent runtime tool errors: " + "; ".join(agent_result.errors[:8])
-                )
-            for message in status_messages:
-                async for result in send_event(ChatEvent.STATUS, message):
-                    yield result
-        except HTTPException as e:
-            async for result in send_llm_response(str(e.detail), tracer.get("usage")):
-                yield result
             return
-        except Exception as e:
-            logger.error(f"Error running unified agent runtime: {e}. Falling back to general response.", exc_info=True)
-            if requires_write_action:
-                program_execution_context.append(
-                    "The write-capable agent runtime failed before confirming a VaultAction. No file change is "
-                    "pending or applied; the final answer must report that exact state."
-                )
-            async for result in send_event(
-                ChatEvent.STATUS, "Unified agent runtime failed. I'll answer without tool results."
+
+        selected_documents: list[str] = []
+        missing_documents: list[str] = []
+        for selected_path in conversation.file_filters:
+            document = await read_workspace_document(str(selected_path), user, max_lines=200)
+            if document is None:
+                missing_documents.append(str(selected_path))
+                continue
+            path, content = document
+            selected_documents.append(f"File: {path}\n\n{content}")
+            compiled_references.append(
+                {
+                    "query": "selected-file-summary",
+                    "file": path,
+                    "uri": path,
+                    "compiled": content,
+                    "source": "selected_file",
+                }
+            )
+
+        if missing_documents:
+            program_execution_context.append("Selected files that could not be read: " + ", ".join(missing_documents))
+        if not selected_documents and conversation.file_filters and not attached_file_context:
+            async for result in send_llm_response(
+                "I couldn't read the selected files, so no summary was generated.",
+                tracer.get("usage"),
             ):
                 yield result
-
-        conversation_commands = [ConversationCommand.General]
-
-        conversation_commands_str = ", ".join([cmd.value for cmd in conversation_commands])
-        async for result in send_event(ChatEvent.STATUS, f"**Selected Tools:** {conversation_commands_str}"):
-            yield result
-
-    cmds_to_rate_limit += conversation_commands
-    for cmd in cmds_to_rate_limit:
-        try:
-            await conversation_command_rate_limiter.update_and_check_if_valid(request_obj, cmd)
-        except HTTPException as e:
-            async for result in send_llm_response(str(e.detail), tracer.get("usage")):
-                yield result
             return
+        if selected_documents:
+            attached_file_context = "\n\n".join(part for part in (attached_file_context, *selected_documents) if part)
+            used_workspace_tools = True
+        program_execution_context.append(
+            "The user requested a summary of the explicitly selected files. Base the response on those files."
+        )
 
-    defiltered_query = defilter_query(q)
-
-    if conversation_commands == [ConversationCommand.Summarize]:
-        no_files_selected = "No files selected for summarization. Please add files using the section on the left."
-        if is_none_or_empty(conversation.file_filters) and not attached_file_context:
-            async for result in send_llm_response(no_files_selected, tracer.get("usage")):
-                yield result
-            return
-
-        async for summary_result in generate_summary_from_files(
-            defiltered_query,
-            user,
-            conversation.file_filters,
-            chat_history,
-            query_images=uploaded_images,
-            query_files=attached_file_context,
-            agent=agent,
-            send_status_func=partial(send_event, ChatEvent.STATUS),
-            tracer=tracer,
-        ):
-            if isinstance(summary_result, dict) and ChatEvent.STATUS in summary_result:
-                yield summary_result[ChatEvent.STATUS]
-            else:
-                async for result in send_llm_response(str(summary_result), tracer.get("usage")):
-                    yield result
-                return
-
-    if conversation_commands == [ConversationCommand.Research]:
-        async for research_result in research(
-            user=user,
-            query=defiltered_query,
-            conversation_id=conversation_id,
-            conversation_history=chat_history,
-            previous_iterations=list(research_results),
-            query_images=uploaded_images,
-            query_files=attached_file_context,
-            relevant_memories=relevant_memories,
-            user_name=user_name,
-            location=location,
-            send_status_func=partial(send_event, ChatEvent.STATUS),
-            cancellation_event=cancellation_event,
-            interrupt_queue=child_interrupt_queue,
-            abort_message=ChatEvent.END_EVENT.value,
-            agent=agent,
-            tracer=tracer,
-        ):
-            if isinstance(research_result, ResearchIteration):
-                if research_result.summarizedResult:
-                    if research_result.onlineContext:
-                        online_results.update(research_result.onlineContext)
-                    if research_result.context:
-                        compiled_references.extend(research_result.context)
-                if not research_results or research_results[-1] is not research_result:
-                    research_results.append(research_result)
-            else:
-                yield research_result
-
-        # researched_results = await extract_relevant_info(q, researched_results, agent)
-        if state.verbose > 1:
-            logger.debug(f"Researched Results: {''.join(r.summarizedResult or '' for r in research_results)}")
-
-    # Gather Context
-    ## Gather Document References
-    notes_requested = ConversationCommand.Notes in conversation_commands
-
-    async def collect_notes_evidence():
-        nonlocal used_workspace_tools, workspace_has_evidence, workspace_tools_failed
-        allow_local_kb = notes_local_source_available
-        allow_openkb = notes_openkb_source_available
-        if used_workspace_tools or not (allow_local_kb or allow_openkb):
-            return
+    planner_failed = False
+    try:
         status_messages = []
+        agent_chat_model = (
+            AgentAdapters.get_agent_chat_model(agent, user)
+            if agent and hasattr(agent, "slug") and hasattr(agent, "chat_model")
+            else None
+        )
 
-        used_workspace_tools = True
-        try:
-            agent_chat_model = (
-                AgentAdapters.get_agent_chat_model(agent, user)
-                if agent and hasattr(agent, "slug") and hasattr(agent, "chat_model")
-                else None
-            )
-
-            async def notes_send_message(**kwargs):
-                return await send_message_to_model_wrapper(
-                    user=user,
-                    query_files=attached_file_context,
-                    query_images=uploaded_images,
-                    relevant_memories=relevant_memories,
-                    agent_chat_model=agent_chat_model,
-                    tracer=tracer,
-                    **kwargs,
-                )
-
-            notes_result = await collect_agent_context_and_actions(
-                q,
-                chat_history,
+        async def agent_runtime_send_message(**kwargs):
+            return await send_message_to_model_wrapper(
                 user=user,
-                agent=agent,
-                send_message=notes_send_message,
-                send_status=status_messages.append,
-                client_app=common.client,
-                allow_local_kb=allow_local_kb,
-                allow_openkb=allow_openkb,
-                allow_web=False,
-                conversation_id=conversation_id,
-                write_mode="client_actions" if vault_actions_supported else "disabled",
-                vault_policy=vault_policy,
-                require_notes_evidence=True,
-                require_write_action=requires_write_action and vault_actions_supported,
+                query_files=attached_file_context,
+                query_images=uploaded_images,
+                relevant_memories=relevant_memories,
+                agent_chat_model=agent_chat_model,
+                tracer=tracer,
+                **kwargs,
             )
-            compiled_references.extend(notes_result.references)
-            vault_actions.extend(_collect_vault_actions(notes_result.references))
-            inferred_queries.extend(notes_result.inferred_queries)
-            program_execution_context.extend(notes_result.program_context)
-            if notes_result.errors:
-                program_execution_context.append("Notes tool errors: " + "; ".join(notes_result.errors[:8]))
-            if notes_result.planner_failed:
-                workspace_tools_failed = True
-                async for result in send_event(
-                    ChatEvent.STATUS,
-                    "Notes evidence tools failed. I did not read or modify the local knowledge base",
-                ):
-                    yield result
-                return
-            workspace_has_evidence = not is_none_or_empty(notes_result.references)
-            for message in status_messages:
-                async for result in send_event(ChatEvent.STATUS, message):
-                    yield result
-            if not workspace_has_evidence and notes_result.searched:
-                program_execution_context.append(
-                    "No Notes evidence found. Tools used: " + ", ".join(notes_result.searched[:8])
-                )
-        except Exception as e:
-            workspace_tools_failed = True
-            logger.error(f"Error using Notes evidence tools: {e}", exc_info=True)
-            if requires_write_action:
-                program_execution_context.append(
-                    "The Notes runtime failed before confirming a VaultAction. No file change is pending or applied; "
-                    "the final answer must report that exact state."
-                )
-            async for result in send_event(
-                ChatEvent.STATUS, "Notes evidence tools failed. I did not read or modify the local knowledge base"
-            ):
-                yield result
 
-    if notes_requested:
-        async for result in collect_notes_evidence():
+        agent_result = await collect_agent_context_and_actions(
+            q,
+            chat_history,
+            user=user,
+            agent=agent,
+            send_message=agent_runtime_send_message,
+            send_status=status_messages.append,
+            client_app=common.client,
+            allow_local_kb=notes_local_source_available,
+            allow_openkb=notes_openkb_source_available,
+            allow_web=is_web_search_enabled(),
+            conversation_id=conversation_id,
+            write_mode="client_actions" if vault_actions_supported else "disabled",
+            vault_policy=vault_policy,
+            location=location,
+            query_images=uploaded_images,
+            query_files=attached_file_context,
+            relevant_memories=relevant_memories,
+            tracer=tracer,
+        )
+        planner_failed = agent_result.planner_failed
+        compiled_references.extend(agent_result.references)
+        used_workspace_tools = used_workspace_tools or agent_result.used_workspace_tools
+        vault_actions.extend(_collect_vault_actions(agent_result.references))
+        inferred_queries.extend(agent_result.inferred_queries)
+        online_results.update(agent_result.online_results)
+        program_execution_context.extend(agent_result.program_context)
+        if agent_result.errors:
+            program_execution_context.append("Agent tool errors: " + "; ".join(agent_result.errors[:8]))
+        for message in status_messages:
+            async for result in send_event(ChatEvent.STATUS, message):
+                yield result
+    except HTTPException as error:
+        async for result in send_llm_response(str(error.detail), tracer.get("usage")):
+            yield result
+        return
+    except Exception as error:
+        planner_failed = True
+        logger.error(f"Error running agent tools: {error}. Falling back to a context-free response.", exc_info=True)
+        program_execution_context.append(
+            "The agent planner failed before confirming any file change. No file change is pending or applied."
+        )
+        async for result in send_event(ChatEvent.STATUS, "Agent tools failed. I'll answer without tool results."):
             yield result
 
-        compiled_references[:] = dedupe_workspace_evidence(compiled_references)
-
-    if (
-        (conversation_commands == [ConversationCommand.General] or notes_requested)
-        and is_none_or_empty(compiled_references)
-        and not used_workspace_tools
-        and not workspace_tools_failed
-    ):
+    if not compiled_references and not used_workspace_tools and not planner_failed and not summary_requested:
         indexed_references = await search_indexed_evidence(user, defiltered_query, agent)
         if indexed_references:
             compiled_references.extend(indexed_references)
@@ -1151,108 +915,7 @@ async def _run_conversation_turn_impl(
             async for result in send_event(ChatEvent.STATUS, "Searched synced knowledge base"):
                 yield result
 
-    if notes_requested and workspace_tools_failed:
-        async for result in send_llm_response(
-            "Notes evidence tools failed, so I did not read or modify the local knowledge base.",
-            tracer.get("usage"),
-        ):
-            yield result
-        return
-
-    if (
-        notes_requested
-        and is_none_or_empty(compiled_references)
-        and conversation_commands == [ConversationCommand.Notes]
-        and (used_workspace_tools or not (notes_local_source_available or notes_openkb_source_available))
-    ):
-        message = (
-            "I couldn't find enough local knowledge base evidence to answer that."
-            if used_workspace_tools
-            else f"{no_entries_found.format()}"
-        )
-        async for result in send_llm_response(message, tracer.get("usage")):
-            yield result
-        return
-
     compiled_references[:] = dedupe_workspace_evidence(compiled_references)
-
-    if (
-        ConversationCommand.Notes in conversation_commands
-        and is_none_or_empty(compiled_references)
-        and not used_workspace_tools
-    ):
-        conversation_commands.remove(ConversationCommand.Notes)
-
-    ## Gather Online References
-    if ConversationCommand.Online in conversation_commands:
-        try:
-            async for result in search_online(
-                defiltered_query,
-                chat_history,
-                location,
-                user,
-                partial(send_event, ChatEvent.STATUS),
-                custom_filters=[],
-                max_online_searches=3,
-                query_images=uploaded_images,
-                query_files=attached_file_context,
-                relevant_memories=relevant_memories,
-                agent=agent,
-                tracer=tracer,
-            ):
-                if isinstance(result, dict) and ChatEvent.STATUS in result:
-                    yield result[ChatEvent.STATUS]
-                else:
-                    online_results.clear()
-                    online_results.update(result)
-        except Exception as e:
-            error_message = f"Error searching online: {e}. Attempting to respond without online results"
-            logger.warning(error_message)
-            async for result in send_event(
-                ChatEvent.STATUS, "Online search failed. I'll try respond without online references"
-            ):
-                yield result
-
-    ## Gather Webpage References
-    if ConversationCommand.Webpage in conversation_commands:
-        try:
-            async for result in read_webpages(
-                defiltered_query,
-                chat_history,
-                location,
-                user,
-                partial(send_event, ChatEvent.STATUS),
-                max_webpages_to_read=1,
-                query_images=uploaded_images,
-                query_files=attached_file_context,
-                relevant_memories=relevant_memories,
-                agent=agent,
-                tracer=tracer,
-            ):
-                if isinstance(result, dict) and ChatEvent.STATUS in result:
-                    yield result[ChatEvent.STATUS]
-                else:
-                    direct_web_pages = result
-            webpages = []
-            for query in direct_web_pages:
-                if online_results.get(query):
-                    online_results[query]["webpages"] = direct_web_pages[query]["webpages"]
-                else:
-                    online_results[query] = {"webpages": direct_web_pages[query]["webpages"]}
-
-                for webpage in direct_web_pages[query]["webpages"]:
-                    webpages.append(webpage["link"])
-            async for result in send_event(ChatEvent.STATUS, f"**Read web pages**: {webpages}"):
-                yield result
-        except Exception as e:
-            logger.warning(
-                f"Error reading webpages: {e}. Attempting to respond without webpage results",
-                exc_info=True,
-            )
-            async for result in send_event(
-                ChatEvent.STATUS, "Webpage read failed. I'll try respond without webpage references"
-            ):
-                yield result
 
     if vault_actions and vault_action_mode == "server_review":
         batch = None
@@ -1288,6 +951,7 @@ async def _run_conversation_turn_impl(
             compiled_references.append(
                 {
                     "query": "vault_action_batch",
+                    "file": ", ".join(paths),
                     "uri": f"vault-action://{batch.id}",
                     "compiled": f"VaultAction batch {batch.id} has status {batch.status}.",
                     "action": "vault_action_batch",
@@ -1343,7 +1007,6 @@ async def _run_conversation_turn_impl(
         conversation,
         compiled_references,
         online_results,
-        research_results,
         user,
         location,
         user_name,
