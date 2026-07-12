@@ -65,7 +65,7 @@ import {
     Trash,
 } from "@phosphor-icons/react";
 import { useAuthenticatedData, UserProfile } from "../common/auth";
-import LoginPrompt from "../components/loginPrompt/loginPrompt";
+import LocalAuthError from "../components/localAuthError/localAuthError";
 import { useToast } from "@/components/ui/use-toast";
 import { ToastAction } from "@/components/ui/toast";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -290,7 +290,7 @@ interface AutomationsCardProps {
     suggestedCard?: boolean;
     setNewAutomationData?: (data: AutomationsData) => void;
     isLoggedIn: boolean;
-    setShowLoginPrompt: (showLoginPrompt: boolean) => void;
+    setShowAuthError: (showAuthError: boolean) => void;
     authenticatedData: UserProfile | null;
     setToastMessage: (toastMessage: string) => void;
 }
@@ -350,7 +350,7 @@ function AutomationsCard(props: AutomationsCardProps) {
                                     callToAction="Edit"
                                     createNew={false}
                                     setIsCreating={setIsEditing}
-                                    setShowLoginPrompt={props.setShowLoginPrompt}
+                                    setShowAuthError={props.setShowAuthError}
                                     setNewAutomationData={setUpdatedAutomationData}
                                     authenticatedData={props.authenticatedData}
                                     isCreating={isEditing}
@@ -432,7 +432,7 @@ function AutomationsCard(props: AutomationsCardProps) {
                         callToAction="Add"
                         createNew={true}
                         setIsCreating={setIsEditing}
-                        setShowLoginPrompt={props.setShowLoginPrompt}
+                        setShowAuthError={props.setShowAuthError}
                         setNewAutomationData={props.setNewAutomationData}
                         authenticatedData={props.authenticatedData}
                         isCreating={isEditing}
@@ -450,7 +450,7 @@ interface SharedAutomationCardProps {
     locationData?: ScheduleContext | null;
     setNewAutomationData: (data: AutomationsData) => void;
     isLoggedIn: boolean;
-    setShowLoginPrompt: (showLoginPrompt: boolean) => void;
+    setShowAuthError: (showAuthError: boolean) => void;
     authenticatedData: UserProfile | null;
     isMobileWidth: boolean;
     setToastMessage: (toastMessage: string) => void;
@@ -484,7 +484,7 @@ function SharedAutomationCard(props: SharedAutomationCardProps) {
             callToAction="Shared"
             createNew={true}
             setIsCreating={setIsCreating}
-            setShowLoginPrompt={props.setShowLoginPrompt}
+            setShowAuthError={props.setShowAuthError}
             setNewAutomationData={props.setNewAutomationData}
             authenticatedData={props.authenticatedData}
             isCreating={isCreating}
@@ -511,7 +511,7 @@ interface EditCardProps {
     locationData?: ScheduleContext | null;
     createNew?: boolean;
     isLoggedIn: boolean;
-    setShowLoginPrompt: (showLoginPrompt: boolean) => void;
+    setShowAuthError: (showAuthError: boolean) => void;
     authenticatedData: UserProfile | null;
     setToastMessage: (toastMessage: string) => void;
 }
@@ -622,7 +622,7 @@ function EditCard(props: EditCardProps) {
             onSubmit={onSubmit}
             create={props.createNew}
             isLoggedIn={props.isLoggedIn}
-            setShowLoginPrompt={props.setShowLoginPrompt}
+            setShowAuthError={props.setShowAuthError}
         />
     );
 }
@@ -632,7 +632,7 @@ interface AutomationModificationFormProps {
     onSubmit: (values: z.infer<typeof EditAutomationSchema>) => Promise<void>;
     create?: boolean;
     isLoggedIn: boolean;
-    setShowLoginPrompt: (showLoginPrompt: boolean) => void;
+    setShowAuthError: (showAuthError: boolean) => void;
     authenticatedData: UserProfile | null;
     locationData: ScheduleContext | null;
 }
@@ -893,11 +893,11 @@ function AutomationModificationForm(props: AutomationModificationFormProps) {
                         <Button
                             onClick={(event) => {
                                 event.preventDefault();
-                                props.setShowLoginPrompt(true);
+                                props.setShowAuthError(true);
                             }}
                             variant={"default"}
                         >
-                            Login to Save
+                            Authentication required
                         </Button>
                     )}
                 </fieldset>
@@ -922,7 +922,7 @@ interface AutomationComponentWrapperProps {
     callToAction: string;
     createNew: boolean;
     setIsCreating: (completed: boolean) => void;
-    setShowLoginPrompt: (showLoginPrompt: boolean) => void;
+    setShowAuthError: (showAuthError: boolean) => void;
     setNewAutomationData: (data: AutomationsData) => void;
     authenticatedData: UserProfile | null;
     isCreating: boolean;
@@ -953,7 +953,7 @@ function AutomationComponentWrapper(props: AutomationComponentWrapperProps) {
                     setIsEditing={props.setIsCreating}
                     isLoggedIn={props.authenticatedData ? true : false}
                     authenticatedData={props.authenticatedData}
-                    setShowLoginPrompt={props.setShowLoginPrompt}
+                    setShowAuthError={props.setShowAuthError}
                     setUpdatedAutomationData={props.setNewAutomationData}
                     locationData={props.ipScheduleContext}
                     setToastMessage={props.setToastMessage}
@@ -981,7 +981,7 @@ function AutomationComponentWrapper(props: AutomationComponentWrapperProps) {
                     setIsEditing={props.setIsCreating}
                     isLoggedIn={props.authenticatedData ? true : false}
                     authenticatedData={props.authenticatedData}
-                    setShowLoginPrompt={props.setShowLoginPrompt}
+                    setShowAuthError={props.setShowAuthError}
                     setUpdatedAutomationData={props.setNewAutomationData}
                     locationData={props.ipScheduleContext}
                     setToastMessage={props.setToastMessage}
@@ -1009,7 +1009,7 @@ export default function Automations() {
     const [newAutomationData, setNewAutomationData] = useState<AutomationsData | null>(null);
     const [allNewAutomations, setAllNewAutomations] = useState<AutomationsData[]>([]);
     const [suggestedAutomations, setSuggestedAutomations] = useState<AutomationsData[]>([]);
-    const [showLoginPrompt, setShowLoginPrompt] = useState(false);
+    const [showAuthError, setShowAuthError] = useState(false);
     const isMobileWidth = useIsMobileWidth();
     const scheduleContext = {
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
@@ -1080,12 +1080,7 @@ export default function Automations() {
                                 <h1 className="text-3xl flex items-center">Automations</h1>
                                 {metadataMap(scheduleContext)}
                             </div>
-                            {showLoginPrompt && (
-                                <LoginPrompt
-                                    onOpenChange={setShowLoginPrompt}
-                                    isMobileWidth={isMobileWidth}
-                                />
-                            )}
+                            {showAuthError && <LocalAuthError />}
                             <Alert className="bg-secondary border-none my-4">
                                 <AlertDescription>
                                     <Lightning
@@ -1105,7 +1100,7 @@ export default function Automations() {
                                         callToAction="Create Automation"
                                         createNew={true}
                                         setIsCreating={setIsCreating}
-                                        setShowLoginPrompt={setShowLoginPrompt}
+                                        setShowAuthError={setShowAuthError}
                                         setNewAutomationData={setNewAutomationData}
                                         authenticatedData={authenticatedData}
                                         isCreating={isCreating}
@@ -1115,7 +1110,7 @@ export default function Automations() {
                                 ) : (
                                     <Button
                                         className="shadow-sm"
-                                        onClick={() => setShowLoginPrompt(true)}
+                                        onClick={() => setShowAuthError(true)}
                                         variant={"outline"}
                                     >
                                         <Plus className="h-4 w-4 mr-2" />
@@ -1129,7 +1124,7 @@ export default function Automations() {
                                     authenticatedData={authenticatedData || null}
                                     locationData={scheduleContext}
                                     isLoggedIn={authenticatedData ? true : false}
-                                    setShowLoginPrompt={setShowLoginPrompt}
+                                    setShowAuthError={setShowAuthError}
                                     setNewAutomationData={setNewAutomationData}
                                     setToastMessage={setToastMessage}
                                 />
@@ -1146,7 +1141,7 @@ export default function Automations() {
                                             automation={automation}
                                             locationData={scheduleContext}
                                             isLoggedIn={authenticatedData ? true : false}
-                                            setShowLoginPrompt={setShowLoginPrompt}
+                                            setShowAuthError={setShowAuthError}
                                             setToastMessage={setToastMessage}
                                         />
                                     ))}
@@ -1159,7 +1154,7 @@ export default function Automations() {
                                             automation={automation}
                                             locationData={scheduleContext}
                                             isLoggedIn={authenticatedData ? true : false}
-                                            setShowLoginPrompt={setShowLoginPrompt}
+                                            setShowAuthError={setShowAuthError}
                                             setToastMessage={setToastMessage}
                                         />
                                     ))}
@@ -1175,7 +1170,7 @@ export default function Automations() {
                                         automation={automation}
                                         locationData={scheduleContext}
                                         isLoggedIn={authenticatedData ? true : false}
-                                        setShowLoginPrompt={setShowLoginPrompt}
+                                        setShowAuthError={setShowAuthError}
                                         suggestedCard={true}
                                         setToastMessage={setToastMessage}
                                     />

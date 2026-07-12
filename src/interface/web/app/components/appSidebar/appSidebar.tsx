@@ -10,13 +10,7 @@ import {
     SidebarMenuItem,
     SidebarRail,
 } from "@/components/ui/sidebar";
-import {
-    KhojAgentLogo,
-    KhojAutomationLogo,
-    KhojLogo,
-    KhojLogoType,
-    KhojSearchLogo,
-} from "../logo/khojLogo";
+import { KhojAutomationLogo, KhojLogo, KhojLogoType, KhojSearchLogo } from "../logo/khojLogo";
 import { Plus, Gear, HouseSimple } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
 import AllConversations from "../allConversations/allConversations";
@@ -25,14 +19,13 @@ import { useSidebar } from "@/components/ui/sidebar";
 import { useIsDarkMode, useIsMobileWidth } from "@/app/common/utils";
 import { UserPlusIcon } from "lucide-react";
 import { useAuthenticatedData, UserProfile } from "@/app/common/auth";
-import LoginPrompt from "../loginPrompt/loginPrompt";
+import LocalAuthError, { LOCAL_AUTH_ERROR } from "../localAuthError/localAuthError";
 import Link from "next/link";
 import { buildChatUrl, createNewConversation } from "@/app/common/chatFunctions";
 
 async function openChat(userData: UserProfile | null | undefined) {
-    const unauthenticatedRedirectUrl = `/login?redirect=${encodeURIComponent(window.location.pathname)}`;
     if (!userData) {
-        window.location.href = unauthenticatedRedirectUrl;
+        alert(LOCAL_AUTH_ERROR);
         return;
     }
 
@@ -41,7 +34,7 @@ async function openChat(userData: UserProfile | null | undefined) {
         window.location.href = buildChatUrl(conversationId);
     } catch (error) {
         if (error instanceof Error && /status: (401|403)/.test(error.message)) {
-            window.location.href = unauthenticatedRedirectUrl;
+            alert(LOCAL_AUTH_ERROR);
             return;
         }
         console.error("Failed to start chat session:", error);
@@ -55,11 +48,6 @@ const items = [
         title: "Home",
         url: "/",
         icon: HouseSimple,
-    },
-    {
-        title: "Agents",
-        url: "/agents",
-        icon: KhojAgentLogo,
     },
     {
         title: "Automations",
@@ -92,11 +80,11 @@ export function AppSidebar(props: AppSidebarProps) {
     const { state, open, setOpen, openMobile, setOpenMobile, isMobile, toggleSidebar } =
         useSidebar();
 
-    const [showLoginPrompt, setShowLoginPrompt] = useState(false);
+    const [showAuthError, setShowAuthError] = useState(false);
 
     useEffect(() => {
         if (!isLoading && !data) {
-            setShowLoginPrompt(true);
+            setShowAuthError(true);
         }
     }, [isLoading, data]);
 
@@ -122,12 +110,7 @@ export function AppSidebar(props: AppSidebarProps) {
                 </SidebarMenu>
             </SidebarHeader>
             <SidebarContent>
-                {showLoginPrompt && (
-                    <LoginPrompt
-                        onOpenChange={(isOpen) => setShowLoginPrompt(isOpen)}
-                        isMobileWidth={isMobileWidth}
-                    />
-                )}
+                {showAuthError && <LocalAuthError />}
                 <SidebarGroup>
                     <SidebarGroupContent>
                         <SidebarMenu className="p-0 m-0">
@@ -136,11 +119,11 @@ export function AppSidebar(props: AppSidebarProps) {
                                     <SidebarMenuButton
                                         asChild
                                         variant={"default"}
-                                        onClick={() => setShowLoginPrompt(true)}
+                                        onClick={() => setShowAuthError(true)}
                                     >
                                         <div>
                                             <UserPlusIcon />
-                                            <span>Sign up to get started</span>
+                                            <span>Authentication required</span>
                                         </div>
                                     </SidebarMenuButton>
                                 </SidebarMenuItem>

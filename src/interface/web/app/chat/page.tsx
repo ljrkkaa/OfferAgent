@@ -10,15 +10,17 @@ import Link from "next/link";
 import Loading from "../components/loading/loading";
 
 import { fetchChatOptions, generateNewTitle, processMessageChunk } from "../common/chatFunctions";
+import {
+    fetchVaultActionCapability,
+    listVaultActionBatches,
+    upsertVaultActionBatch,
+    type VaultActionBatch,
+    type VaultActionCapability,
+} from "../common/vaultActions";
 
 import "katex/dist/katex.min.css";
 
-import {
-    CodeContext,
-    Context,
-    OnlineContext,
-    StreamMessage,
-} from "../components/chatMessage/chatMessage";
+import { Context, OnlineContext, StreamMessage } from "../components/chatMessage/chatMessage";
 import { useIsMobileWidth, welcomeConsole } from "../common/utils";
 import {
     AttachedFileText,
@@ -26,7 +28,7 @@ import {
     ChatOptions,
 } from "../components/chatInputArea/chatInputArea";
 import { useAuthenticatedData } from "../common/auth";
-import { AgentData } from "@/app/components/agentCard/agentCard";
+import { AgentData } from "@/app/common/agent";
 import { ChatSessionActionMenu } from "../components/allConversations/allConversations";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "../components/appSidebar/appSidebar";
@@ -53,6 +55,9 @@ interface ChatBodyDataProps {
     setIsChatSideBarOpen: (open: boolean) => void;
     isParentProcessing?: boolean;
     onRetryMessage?: (query: string, turnId?: string) => void;
+    vaultActionBatches: VaultActionBatch[];
+    vaultActionCapability: VaultActionCapability | null;
+    onVaultActionBatchChange: (batch: VaultActionBatch) => void;
 }
 
 type QueuedQueryAttachments = {
@@ -203,6 +208,9 @@ function ChatBodyData(props: ChatBodyDataProps) {
                         customClassName={chatHistoryCustomClassName}
                         setIsChatSideBarOpen={props.setIsChatSideBarOpen}
                         onRetryMessage={props.onRetryMessage}
+                        vaultActionBatches={props.vaultActionBatches}
+                        vaultActionCapability={props.vaultActionCapability}
+                        onVaultActionBatchChange={props.onVaultActionBatchChange}
                     />
                 </div>
                 <div
@@ -248,6 +256,10 @@ export default function Chat() {
     const [uploadedFiles, setUploadedFiles] = useState<AttachedFileText[] | undefined>(undefined);
     const [images, setImages] = useState<string[]>([]);
     const [pendingRequest, setPendingRequest] = useState<PendingChatRequest | null>(null);
+    const [vaultActionCapability, setVaultActionCapability] =
+        useState<VaultActionCapability | null>(null);
+    const [vaultActionCapabilityLoaded, setVaultActionCapabilityLoaded] = useState(false);
+    const [vaultActionBatches, setVaultActionBatches] = useState<VaultActionBatch[]>([]);
 
     const [triggeredAbort, setTriggeredAbort] = useState(false);
     const [interruptMessage, setInterruptMessage] = useState<string>("");
@@ -392,6 +404,17 @@ export default function Chat() {
         [images, uploadedFiles],
     );
 
+    const handleVaultActionBatchChange = useCallback((batch: VaultActionBatch) => {
+        setVaultActionBatches((current) => upsertVaultActionBatch(current, batch));
+        setMessages((current) =>
+            current.map((message) =>
+                message.vaultActionBatch?.id === batch.id
+                    ? { ...message, vaultActionBatch: batch }
+                    : message,
+            ),
+        );
+    }, []);
+
     // Handle page unload / refresh: mark intentional so we don't show a toast
     useEffect(() => {
         const handleBeforeUnload = () => {
@@ -457,18 +480,16 @@ export default function Chat() {
                             return prevMessages;
                         }
 
-                        const { context, onlineContext, codeContext } = processMessageChunk(
+                        const { context, onlineContext } = processMessageChunk(
                             eventChunk,
                             currentMessage,
                             currentMessage.context || [],
                             currentMessage.onlineContext || {},
-                            currentMessage.codeContext || {},
                         );
 
                         // Update the current message with the new reference data
                         currentMessage.context = context;
                         currentMessage.onlineContext = onlineContext;
-                        currentMessage.codeContext = codeContext;
 
                         if (currentMessage.completed) {
                             setQueryToProcess("");
@@ -511,6 +532,51 @@ export default function Chat() {
         };
     }, []);
 
+    useEffect(() => {
+        let cancelled = false;
+        if (authenticationLoading) return;
+        if (authenticationError || !authenticatedData) {
+            setVaultActionCapability(null);
+            setVaultActionCapabilityLoaded(true);
+            return;
+        }
+
+        setVaultActionCapabilityLoaded(false);
+        fetchVaultActionCapability()
+            .then((capability) => {
+                if (!cancelled) setVaultActionCapability(capability);
+            })
+            .catch((error) => {
+                console.error("Failed to load Web VaultAction capability", error);
+                if (!cancelled) setVaultActionCapability(null);
+            })
+            .finally(() => {
+                if (!cancelled) setVaultActionCapabilityLoaded(true);
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [authenticatedData, authenticationError, authenticationLoading]);
+
+    useEffect(() => {
+        let cancelled = false;
+        setVaultActionBatches([]);
+        if (!authenticatedData || !conversationId) return;
+
+        listVaultActionBatches(conversationId)
+            .then((batches) => {
+                if (!cancelled) setVaultActionBatches(batches);
+            })
+            .catch((error) => {
+                console.error("Failed to recover Web VaultAction batches", error);
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [authenticatedData, conversationId]);
+
     const handleTriggeredAbort = (value: boolean, newMessage?: string) => {
         if (value) {
             setInterruptMessage(newMessage || "");
@@ -550,7 +616,6 @@ export default function Chat() {
                 trainOfThought: [],
                 context: [],
                 onlineContext: {},
-                codeContext: {},
                 completed: false,
                 timestamp: new Date().toISOString(),
                 rawQuery: pendingRequest.query,
@@ -588,6 +653,9 @@ export default function Chat() {
                 q: pendingRequest.query,
                 conversation_id: conversationId,
                 stream: true,
+                client_capabilities: {
+                    vaultActions: vaultActionCapability?.enabled === true,
+                },
                 ...(pendingRequest.images.length > 0 && { images: pendingRequest.images }),
                 ...(pendingRequest.uploadedFiles && { files: pendingRequest.uploadedFiles }),
             };
@@ -601,6 +669,7 @@ export default function Chat() {
         resetIdleTimer,
         socketUrl,
         sendMessage,
+        vaultActionCapability?.enabled,
     ]);
 
     useEffect(() => {
@@ -657,7 +726,7 @@ export default function Chat() {
         return true;
     };
 
-    if (isLoading) return <Loading />;
+    if (isLoading || authenticationLoading || !vaultActionCapabilityLoaded) return <Loading />;
 
     return (
         <SidebarProvider>
@@ -728,6 +797,9 @@ export default function Chat() {
                                     setIsChatSideBarOpen={setIsChatSideBarOpen}
                                     isParentProcessing={processQuerySignal}
                                     onRetryMessage={handleRetryMessage}
+                                    vaultActionBatches={vaultActionBatches}
+                                    vaultActionCapability={vaultActionCapability}
+                                    onVaultActionBatchChange={handleVaultActionBatchChange}
                                 />
                             </Suspense>
                         </div>

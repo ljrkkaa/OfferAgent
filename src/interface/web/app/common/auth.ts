@@ -57,8 +57,6 @@ export interface UserConfig {
     // user model settings
     chat_model_options: ModelOptions[];
     selected_chat_model_config: number;
-    paint_model_options: ModelOptions[];
-    selected_paint_model_config: number | null;
     // server settings
     khoj_version: string;
     anonymous_mode: boolean;

@@ -31,7 +31,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { convertColorToTextClass, convertToBGClass } from "@/app/common/colorUtils";
 
-import LoginPrompt from "../loginPrompt/loginPrompt";
+import LocalAuthError from "../localAuthError/localAuthError";
 import { getIconForSlashCommand, getIconFromFilename } from "@/app/common/iconUtils";
 import { packageFilesForUpload } from "@/app/common/chatFunctions";
 import { convertBytesToText } from "@/app/common/utils";
@@ -98,8 +98,8 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
     const [warning, setWarning] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [uploading, setUploading] = useState(false);
-    const [loginRedirectMessage, setLoginRedirectMessage] = useState<string | null>(null);
-    const [showLoginPrompt, setShowLoginPrompt] = useState(false);
+    const [authErrorMessage, setLoginRedirectMessage] = useState<string | null>(null);
+    const [showAuthError, setShowAuthError] = useState(false);
 
     const [imageUploaded, setImageUploaded] = useState(false);
     const [imagePaths, setImagePaths] = useState<string[]>([]);
@@ -181,10 +181,8 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
     function onSendMessage() {
         if (!message.trim() && imageData.length === 0) return;
         if (!props.isLoggedIn) {
-            setLoginRedirectMessage(
-                "Hey there, you need to be signed in to send messages to OfferAgent",
-            );
-            setShowLoginPrompt(true);
+            setLoginRedirectMessage("Authentication is required to send messages.");
+            setShowAuthError(true);
             return;
         }
 
@@ -244,8 +242,8 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
 
     function uploadFiles(files: FileList) {
         if (!props.isLoggedIn) {
-            setLoginRedirectMessage("Please login to chat with your files");
-            setShowLoginPrompt(true);
+            setLoginRedirectMessage("Authentication is required to chat with files.");
+            setShowAuthError(true);
             return;
         }
         // check for image files
@@ -367,12 +365,7 @@ export const ChatInputArea = forwardRef<HTMLTextAreaElement, ChatInputProps>((pr
 
     return (
         <>
-            {showLoginPrompt && loginRedirectMessage && (
-                <LoginPrompt
-                    onOpenChange={setShowLoginPrompt}
-                    isMobileWidth={props.isMobileWidth}
-                />
-            )}
+            {showAuthError && authErrorMessage && <LocalAuthError />}
             {uploading && (
                 <AlertDialog open={uploading}>
                     <AlertDialogContent>

@@ -49,11 +49,6 @@ export default function FooterMenu({ sideBarIsOpen }: NavMenuProps) {
             icon: <Code className="w-6 h-6" />,
             link: "/",
         },
-        {
-            title: "Agents",
-            icon: <BuildingOffice className="w-6 h-6" />,
-            link: "/agents",
-        },
     ];
 
     return (

@@ -1,15 +1,10 @@
-import type { AttachedFileText, ChatOptions } from "../components/chatInputArea/chatInputArea";
-import {
-    CodeContext,
-    Context,
-    OnlineContext,
-    StreamMessage,
-} from "../components/chatMessage/chatMessage";
+import type { ChatOptions } from "../components/chatInputArea/chatInputArea";
+import type { Context, OnlineContext, StreamMessage } from "../components/chatMessage/chatMessage";
+import { attachVaultActionBatch } from "./vaultActions";
 
 export interface RawReferenceData {
     context?: Context[];
     onlineContext?: OnlineContext;
-    codeContext?: CodeContext;
 }
 
 export interface MessageMetadata {
@@ -17,67 +12,59 @@ export interface MessageMetadata {
     turnId: string;
 }
 
-export interface GeneratedAssetsData {
-    images: string[];
-    mermaidjsDiagram: string;
-    files: AttachedFileText[];
-}
-
-export interface ResponseWithIntent {
-    intentType: string;
-    response: string;
-    inferredQueries?: string[];
-}
-
 interface MessageChunk {
     type: string;
-    data: string | object;
+    data: unknown;
+}
+
+const STREAM_EVENT_TYPES = new Set([
+    "start_llm_response",
+    "end_llm_response",
+    "end_response",
+    "status",
+    "thought",
+    "references",
+    "vault_actions",
+    "metadata",
+    "usage",
+    "message",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null;
 }
 
 export function convertMessageChunkToJson(chunk: string): MessageChunk {
-    if (chunk.startsWith("{") && chunk.endsWith("}")) {
-        try {
-            const jsonChunk = JSON.parse(chunk);
-            if (!jsonChunk.type) {
-                return {
-                    type: "message",
-                    data: jsonChunk,
-                };
-            }
-            return jsonChunk;
-        } catch (error) {
-            return {
-                type: "message",
-                data: chunk,
-            };
-        }
-    } else if (chunk.length > 0) {
-        return {
-            type: "message",
-            data: chunk,
-        };
-    } else {
-        return {
-            type: "message",
-            data: "",
-        };
+    let event: unknown;
+    try {
+        event = JSON.parse(chunk);
+    } catch {
+        throw new Error("Invalid OfferAgent stream event");
     }
-}
-
-function handleJsonResponse(chunkData: any) {
-    const jsonData = chunkData as any;
-    if (jsonData.image || jsonData.detail) {
-        let responseWithIntent = handleImageResponse(chunkData, true);
-        return responseWithIntent;
-    } else if (jsonData.response) {
-        return {
-            response: jsonData.response,
-            intentType: "",
-            inferredQueries: [],
-        };
-    } else {
-        throw new Error("Invalid JSON response");
+    if (
+        !isRecord(event) ||
+        Object.keys(event).length !== 2 ||
+        typeof event.type !== "string" ||
+        !STREAM_EVENT_TYPES.has(event.type) ||
+        !("data" in event)
+    ) {
+        throw new Error("Invalid OfferAgent stream event");
     }
+    const textEvents = new Set([
+        "start_llm_response",
+        "end_llm_response",
+        "end_response",
+        "status",
+        "thought",
+        "message",
+    ]);
+    if (textEvents.has(event.type) && typeof event.data !== "string") {
+        throw new Error(`Invalid ${event.type} stream event`);
+    }
+    if (!textEvents.has(event.type) && !isRecord(event.data)) {
+        throw new Error(`Invalid ${event.type} stream event`);
+    }
+    return { type: event.type, data: event.data };
 }
 
 export function processMessageChunk(
@@ -85,11 +72,10 @@ export function processMessageChunk(
     currentMessage: StreamMessage,
     context: Context[] = [],
     onlineContext: OnlineContext = {},
-    codeContext: CodeContext = {},
-): { context: Context[]; onlineContext: OnlineContext; codeContext: CodeContext } {
+): { context: Context[]; onlineContext: OnlineContext } {
     const chunk = convertMessageChunkToJson(rawChunk);
 
-    if (!currentMessage || !chunk || !chunk.type) return { context, onlineContext, codeContext };
+    if (!currentMessage || !chunk || !chunk.type) return { context, onlineContext };
 
     console.log(`chunk type: ${chunk.type}`);
 
@@ -113,112 +99,29 @@ export function processMessageChunk(
 
         if (references.context) context = references.context;
         if (references.onlineContext) onlineContext = references.onlineContext;
-        if (references.codeContext) codeContext = references.codeContext;
-        return { context, onlineContext, codeContext };
+        return { context, onlineContext };
     } else if (chunk.type === "metadata") {
         const messageMetadata = chunk.data as MessageMetadata;
         currentMessage.turnId = messageMetadata.turnId;
-    } else if (chunk.type === "generated_assets") {
-        const generatedAssets = chunk.data as GeneratedAssetsData;
-
-        if (generatedAssets.images) {
-            currentMessage.generatedImages = generatedAssets.images;
-        }
-
-        if (generatedAssets.mermaidjsDiagram) {
-            currentMessage.generatedMermaidjsDiagram = generatedAssets.mermaidjsDiagram;
-        }
-
-        if (generatedAssets.files) {
-            currentMessage.generatedFiles = generatedAssets.files;
-        }
+    } else if (chunk.type === "vault_actions") {
+        attachVaultActionBatch(currentMessage, chunk.data);
     } else if (chunk.type === "message") {
         const chunkData = chunk.data;
-        // Here, handle if the response is a JSON response with an image, but the intentType is excalidraw
-        if (chunkData !== null && typeof chunkData === "object") {
-            let responseWithIntent = handleJsonResponse(chunkData);
-
-            if (responseWithIntent.intentType && responseWithIntent.intentType === "excalidraw") {
-                currentMessage.rawResponse = responseWithIntent.response;
-            } else {
-                currentMessage.rawResponse += responseWithIntent.response;
-            }
-
-            currentMessage.intentType = responseWithIntent.intentType;
-            currentMessage.inferredQueries = responseWithIntent.inferredQueries;
-        } else if (
-            typeof chunkData === "string" &&
-            chunkData.trim()?.startsWith("{") &&
-            chunkData.trim()?.endsWith("}")
-        ) {
-            try {
-                const jsonData = JSON.parse(chunkData.trim());
-                let responseWithIntent = handleJsonResponse(jsonData);
-                currentMessage.rawResponse += responseWithIntent.response;
-                currentMessage.intentType = responseWithIntent.intentType;
-                currentMessage.inferredQueries = responseWithIntent.inferredQueries;
-            } catch (e) {
-                currentMessage.rawResponse += chunkData;
-            }
-        } else {
-            currentMessage.rawResponse += chunkData;
-        }
+        if (typeof chunkData !== "string") throw new Error("Invalid message stream event");
+        currentMessage.rawResponse += chunkData;
     } else if (chunk.type === "start_llm_response") {
         console.log(`Started streaming: ${new Date()}`);
     } else if (chunk.type === "end_llm_response") {
         console.log(`Completed streaming: ${new Date()}`);
     } else if (chunk.type === "end_response") {
         // Append any references after all the data has been streamed
-        if (codeContext) currentMessage.codeContext = codeContext;
         if (onlineContext) currentMessage.onlineContext = onlineContext;
         if (context) currentMessage.context = context;
 
         // Mark current message streaming as completed
         currentMessage.completed = true;
     }
-    return { context, onlineContext, codeContext };
-}
-
-export function handleImageResponse(imageJson: any, liveStream: boolean): ResponseWithIntent {
-    let rawResponse = "";
-
-    if (imageJson.image) {
-        // If response has image field, response may be a generated image
-        rawResponse = imageJson.image;
-    }
-
-    let responseWithIntent: ResponseWithIntent = {
-        intentType: imageJson.intentType,
-        response: rawResponse,
-        inferredQueries: imageJson.inferredQueries,
-    };
-
-    if (imageJson.detail) {
-        // The detail field contains the improved image prompt
-        rawResponse += imageJson.detail;
-    }
-
-    return responseWithIntent;
-}
-
-export function renderCodeGenImageInline(message: string, codeContext: CodeContext) {
-    if (!codeContext) return message;
-
-    Object.values(codeContext).forEach((contextData) => {
-        contextData.results?.output_files?.forEach((file) => {
-            const regex = new RegExp(`!?\\[.*?\\]\\(.*${file.filename}\\)`, "g");
-            if (file.filename.match(/\.(png|jpg|jpeg)$/i)) {
-                const replacement = `![${file.filename}](data:image/${file.filename.split(".").pop()};base64,${file.b64_data})`;
-                message = message.replace(regex, replacement);
-            } else if (file.filename.match(/\.(txt|org|md|csv|json)$/i)) {
-                // render output files generated by codegen as downloadable links
-                const replacement = `![${file.filename}](data:text/plain;base64,${file.b64_data})`;
-                message = message.replace(regex, replacement);
-            }
-        });
-    });
-
-    return message;
+    return { context, onlineContext };
 }
 
 export function modifyFileFilterForConversation(
@@ -264,10 +167,9 @@ export function modifyFileFilterForConversation(
         });
 }
 
-export async function createNewConversation(slug?: string) {
+export async function createNewConversation() {
     try {
-        const agentParam = slug && slug !== "khoj" ? `&agent_slug=${encodeURIComponent(slug)}` : "";
-        const response = await fetch(`/api/chat/sessions?client=web${agentParam}`, {
+        const response = await fetch("/api/chat/sessions?client=web", {
             method: "POST",
         });
         if (!response.ok)

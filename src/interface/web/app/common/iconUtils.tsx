@@ -30,7 +30,6 @@ import {
     Question,
     Browser,
     Notebook,
-    Shapes,
     ChatsTeardrop,
     GlobeSimple,
     ArrowRight,
@@ -204,10 +203,6 @@ export function getIconForSlashCommand(command: string, customClassName: string 
         return <KeyReturn className={className} />;
     }
 
-    if (command.includes("diagram")) {
-        return <Shapes className={className} />;
-    }
-
     if (command.includes("general")) {
         return <ChatsTeardrop className={className} />;
     }
@@ -271,8 +266,4 @@ function getIconFromFilename(
     }
 }
 
-function getAvailableIcons() {
-    return Object.keys(iconMap);
-}
-
-export { getIconFromIconName, getIconFromFilename, getAvailableIcons };
+export { getIconFromIconName, getIconFromFilename };

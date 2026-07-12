@@ -12,6 +12,7 @@
 # next.js
 /.next/
 /out/
+/.vault-action-tests/
 
 # production
 /build

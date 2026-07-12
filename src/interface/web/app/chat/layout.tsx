@@ -5,7 +5,7 @@ import { Toaster } from "@/components/ui/toaster";
 export const metadata: Metadata = {
     title: "OfferAgent - Chat",
     description:
-        "Ask anything. Research answers from across the internet and your documents, draft messages, summarize documents, generate paintings and chat with personal agents.",
+        "Ask anything. Research answers from across the internet and your documents, draft messages, and summarize documents.",
     icons: {
         icon: "/static/assets/icons/khoj_lantern.ico",
         apple: "/static/assets/icons/khoj_lantern_256x256.png",
@@ -14,7 +14,7 @@ export const metadata: Metadata = {
         siteName: "OfferAgent",
         title: "OfferAgent - Chat",
         description:
-            "Ask anything. Research answers from across the internet and your documents, draft messages, summarize documents, generate paintings and chat with personal agents.",
+            "Ask anything. Research answers from across the internet and your documents, draft messages, and summarize documents.",
         url: "http://localhost:12805/chat",
         type: "website",
         images: [
@@ -41,11 +41,6 @@ export default function ChildLayout({
         <>
             {children}
             <Toaster />
-            <script
-                dangerouslySetInnerHTML={{
-                    __html: `window.EXCALIDRAW_ASSET_PATH = 'https://assets.khoj.dev/@excalidraw/excalidraw/dist/';`,
-                }}
-            />
         </>
     );
 }

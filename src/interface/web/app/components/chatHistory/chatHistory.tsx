@@ -10,7 +10,6 @@ import ChatMessage, {
     TrainOfThought,
     TrainOfThoughtObject,
 } from "../chatMessage/chatMessage";
-import TrainOfThoughtVideoPlayer from "../../../components/trainOfThoughtVideoPlayer/trainOfThoughtVideoPlayer";
 
 import { ScrollArea } from "@/components/ui/scroll-area";
 
@@ -20,11 +19,18 @@ import { Lightbulb, ArrowDown, CaretDown, CaretUp } from "@phosphor-icons/react"
 
 import AgentProfileCard from "../profileCard/profileCard";
 import { getIconFromIconName } from "@/app/common/iconUtils";
-import { AgentData } from "@/app/components/agentCard/agentCard";
+import { AgentData } from "@/app/common/agent";
 import React from "react";
 import { useIsMobileWidth } from "@/app/common/utils";
 import { Button } from "@/components/ui/button";
 import { KhojLogo } from "../logo/khojLogo";
+import {
+    listVaultActionBatches,
+    vaultActionBatchForTurn,
+    type VaultActionBatch,
+    type VaultActionCapability,
+} from "@/app/common/vaultActions";
+import VaultActionReview from "../chatMessage/vaultActionReview";
 
 interface ChatResponse {
     status: string;
@@ -56,18 +62,9 @@ interface ChatHistoryProps {
     setIsChatSideBarOpen?: (isOpen: boolean) => void;
     setIsOwner?: (isOwner: boolean) => void;
     onRetryMessage?: (query: string, turnId?: string) => Promise<boolean> | boolean | void;
-}
-
-interface TrainOfThoughtFrame {
-    text: string;
-    image?: string;
-    timestamp: number;
-}
-
-interface TrainOfThoughtGroup {
-    type: "video" | "text";
-    frames?: TrainOfThoughtFrame[];
-    textEntries?: TrainOfThoughtObject[];
+    vaultActionBatches: VaultActionBatch[];
+    vaultActionCapability: VaultActionCapability | null;
+    onVaultActionBatchChange: (batch: VaultActionBatch) => void;
 }
 
 interface TrainOfThoughtComponentProps {
@@ -78,90 +75,11 @@ interface TrainOfThoughtComponentProps {
     completed?: boolean;
 }
 
-function extractTrainOfThoughtGroups(
-    trainOfThought?: TrainOfThoughtObject[],
-): TrainOfThoughtGroup[] {
-    if (!trainOfThought) return [];
-
-    const groups: TrainOfThoughtGroup[] = [];
-    let currentVideoFrames: TrainOfThoughtFrame[] = [];
-    let currentTextEntries: TrainOfThoughtObject[] = [];
-
-    trainOfThought.forEach((thought, index) => {
-        let text = thought.data;
-        let hasImage = false;
-
-        // Extract screenshot image from the thought data
-        try {
-            const jsonMatch = text.match(
-                /\{.*(\"action\": \"screenshot\"|\"type\": \"screenshot\"|\"image\": \"data:image\/.*\").*\}/,
-            );
-            if (jsonMatch) {
-                const jsonMessage = JSON.parse(jsonMatch[0]);
-                if (jsonMessage.image) {
-                    hasImage = true;
-                    // Clean up the text to remove the JSON action
-                    text = text.replace(`:\n**Action**: ${jsonMatch[0]}`, "");
-                    if (jsonMessage.text) {
-                        text += `\n\n${jsonMessage.text}`;
-                    }
-
-                    // If we have accumulated text entries, add them as a text group
-                    if (currentTextEntries.length > 0) {
-                        groups.push({
-                            type: "text",
-                            textEntries: [...currentTextEntries],
-                        });
-                        currentTextEntries = [];
-                    }
-
-                    // Add to current video frames
-                    currentVideoFrames.push({
-                        text: text,
-                        image: jsonMessage.image,
-                        timestamp: index,
-                    });
-                }
-            }
-        } catch (e) {
-            console.error("Failed to parse screenshot data", e);
-        }
-
-        if (!hasImage) {
-            // If we have accumulated video frames, add them as a video group
-            if (currentVideoFrames.length > 0) {
-                groups.push({
-                    type: "video",
-                    frames: [...currentVideoFrames],
-                });
-                currentVideoFrames = [];
-            }
-
-            // Add to current text entries
-            currentTextEntries.push(thought);
-        }
-    });
-
-    // Add any remaining frames/entries
-    if (currentVideoFrames.length > 0) {
-        groups.push({
-            type: "video",
-            frames: currentVideoFrames,
-        });
-    }
-    if (currentTextEntries.length > 0) {
-        groups.push({
-            type: "text",
-            textEntries: currentTextEntries,
-        });
-    }
-
-    return groups;
-}
-
 function TrainOfThoughtComponent(props: TrainOfThoughtComponentProps) {
     const [collapsed, setCollapsed] = useState(props.completed);
-    const [trainOfThoughtGroups, setTrainOfThoughtGroups] = useState<TrainOfThoughtGroup[]>([]);
+    const trainOfThoughtEntries: TrainOfThoughtObject[] = (props.trainOfThought || []).map(
+        (entry) => (typeof entry === "string" ? { type: "text", data: entry } : entry),
+    );
 
     const variants = {
         open: {
@@ -181,29 +99,6 @@ function TrainOfThoughtComponent(props: TrainOfThoughtComponentProps) {
             setCollapsed(true);
         }
     }, [props.completed]);
-
-    useEffect(() => {
-        // Handle empty array case
-        if (!props.trainOfThought || props.trainOfThought.length === 0) {
-            setTrainOfThoughtGroups([]);
-            return;
-        }
-
-        // Convert string array to TrainOfThoughtObject array if needed
-        let trainOfThoughtObjects: TrainOfThoughtObject[];
-
-        if (typeof props.trainOfThought[0] === "string") {
-            trainOfThoughtObjects = (props.trainOfThought as string[]).map((data, index) => ({
-                type: "text",
-                data: data,
-            }));
-        } else {
-            trainOfThoughtObjects = props.trainOfThought as TrainOfThoughtObject[];
-        }
-
-        const groups = extractTrainOfThoughtGroups(trainOfThoughtObjects);
-        setTrainOfThoughtGroups(groups);
-    }, [props.trainOfThought]);
 
     return (
         <div
@@ -234,40 +129,17 @@ function TrainOfThoughtComponent(props: TrainOfThoughtComponentProps) {
             <AnimatePresence initial={false}>
                 {!collapsed && (
                     <motion.div initial="closed" animate="open" exit="closed" variants={variants}>
-                        {trainOfThoughtGroups.map((group, groupIndex) => (
-                            <div key={`train-group-${groupIndex}`}>
-                                {group.type === "video" &&
-                                    group.frames &&
-                                    group.frames.length > 0 && (
-                                        <TrainOfThoughtVideoPlayer
-                                            frames={group.frames}
-                                            autoPlay={false}
-                                            playbackSpeed={1500}
-                                        />
-                                    )}
-                                {group.type === "text" &&
-                                    group.textEntries &&
-                                    group.textEntries.map((entry, entryIndex) => {
-                                        const lastIndex = trainOfThoughtGroups.length - 1;
-                                        const isLastGroup = groupIndex === lastIndex;
-                                        const isLastEntry =
-                                            entryIndex === group.textEntries!.length - 1;
-                                        const isPrimaryEntry =
-                                            isLastGroup &&
-                                            isLastEntry &&
-                                            props.lastMessage &&
-                                            !props.completed;
-
-                                        return (
-                                            <TrainOfThought
-                                                key={`train-text-${groupIndex}-${entryIndex}-${entry.data.length}`}
-                                                message={entry.data}
-                                                primary={isPrimaryEntry}
-                                                agentColor={props.agentColor}
-                                            />
-                                        );
-                                    })}
-                            </div>
+                        {trainOfThoughtEntries.map((entry, index) => (
+                            <TrainOfThought
+                                key={`train-text-${index}-${entry.data.length}`}
+                                message={entry.data}
+                                primary={
+                                    index === trainOfThoughtEntries.length - 1 &&
+                                    props.lastMessage &&
+                                    !props.completed
+                                }
+                                agentColor={props.agentColor}
+                            />
                         ))}
                     </motion.div>
                 )}
@@ -547,24 +419,17 @@ export default function ChatHistory(props: ChatHistoryProps) {
         }
     }, [incomingMessages, setTitle]);
 
-    function constructAgentLink() {
-        if (!data || !data.agent || !data.agent?.slug) return `/agents`;
-        return `/agents?agent=${encodeURIComponent(data.agent.slug)}`;
-    }
-
     function constructAgentName() {
-        if (!data || !data.agent || !data.agent?.name) return `Agent`;
-        if (data.agent.is_hidden) return "OfferAgent";
-        return data.agent?.name;
+        return "OfferAgent";
     }
 
     function constructAgentPersona() {
         if (!data || !data.agent) {
-            return `Your agent is no longer available. You will be reset to the default agent.`;
+            return "Your local knowledge agent.";
         }
 
         if (!data.agent?.persona) {
-            return `You can set a persona for your agent in the Chat Options side panel.`;
+            return "Your local knowledge agent.";
         }
 
         return data.agent?.persona;
@@ -587,6 +452,15 @@ export default function ChatHistory(props: ChatHistoryProps) {
                 props.incomingMessages.filter((msg) => msg.turnId !== turnId),
             );
         }
+
+        listVaultActionBatches(props.conversationId)
+            .then((batches) => batches.forEach(props.onVaultActionBatchChange))
+            .catch((error) =>
+                console.error(
+                    "Failed to refresh VaultAction batches after message deletion",
+                    error,
+                ),
+            );
     };
 
     const handleRetryMessage = async (query: string, turnId?: string) => {
@@ -602,6 +476,22 @@ export default function ChatHistory(props: ChatHistoryProps) {
     if (!props.conversationId) {
         return null;
     }
+
+    const assistantTurnIds = new Set([
+        ...(data?.chat
+            .filter((message) => message.by === "khoj")
+            .map((message) => message.turnId)
+            .filter((turnId): turnId is string => Boolean(turnId)) ?? []),
+        ...(props.incomingMessages
+            ?.map((message) => message.turnId)
+            .filter((turnId): turnId is string => Boolean(turnId)) ?? []),
+    ]);
+    const unmatchedVaultActionBatches = props.vaultActionBatches.filter(
+        (batch) =>
+            ["pending", "applying", "conflict", "failed", "manual_review_required"].includes(
+                batch.status,
+            ) && !assistantTurnIds.has(batch.turn_id),
+    );
 
     return (
         <ScrollArea
@@ -670,13 +560,24 @@ export default function ChatHistory(props: ChatHistoryProps) {
                                               : null
                                     }
                                     isMobileWidth={isMobileWidth}
-                                    chatMessage={chatMessage}
+                                    chatMessage={{
+                                        ...chatMessage,
+                                        vaultActionBatch:
+                                            chatMessage.by === "khoj"
+                                                ? vaultActionBatchForTurn(
+                                                      props.vaultActionBatches,
+                                                      chatMessage.turnId,
+                                                  )
+                                                : undefined,
+                                    }}
                                     customClassName="fullHistory"
                                     borderLeftColor={`${data?.agent?.color}-500`}
                                     isLastMessage={index === data.chat.length - 1}
                                     onDeleteMessage={handleDeleteMessage}
                                     onRetryMessage={handleRetryMessage}
                                     conversationId={props.conversationId}
+                                    vaultActionCapability={props.vaultActionCapability}
+                                    onVaultActionBatchChange={props.onVaultActionBatchChange}
                                 />
                             </React.Fragment>
                         ))}
@@ -692,7 +593,6 @@ export default function ChatHistory(props: ChatHistoryProps) {
                                             message: message.rawQuery,
                                             context: [],
                                             onlineContext: {},
-                                            codeContext: {},
                                             created: message.timestamp,
                                             by: "you",
                                             automationId: "",
@@ -728,7 +628,6 @@ export default function ChatHistory(props: ChatHistoryProps) {
                                             message: message.rawResponse,
                                             context: message.context,
                                             onlineContext: message.onlineContext,
-                                            codeContext: message.codeContext,
                                             created: message.timestamp,
                                             by: "khoj",
                                             automationId: "",
@@ -740,10 +639,13 @@ export default function ChatHistory(props: ChatHistoryProps) {
                                                 "inferred-queries": message.inferredQueries || [],
                                             },
                                             conversationId: props.conversationId,
-                                            images: message.generatedImages,
-                                            queryFiles: message.generatedFiles,
-                                            mermaidjsDiagram: message.generatedMermaidjsDiagram,
                                             turnId: messageTurnId,
+                                            vaultActionBatch:
+                                                message.vaultActionBatch ??
+                                                vaultActionBatchForTurn(
+                                                    props.vaultActionBatches,
+                                                    messageTurnId,
+                                                ),
                                         }}
                                         conversationId={props.conversationId}
                                         turnId={messageTurnId}
@@ -752,10 +654,27 @@ export default function ChatHistory(props: ChatHistoryProps) {
                                         customClassName="fullHistory"
                                         borderLeftColor={`${data?.agent?.color}-500`}
                                         isLastMessage={index === props.incomingMessages!.length - 1}
+                                        vaultActionCapability={props.vaultActionCapability}
+                                        onVaultActionBatchChange={props.onVaultActionBatchChange}
                                     />
                                 </React.Fragment>
                             );
                         })}
+                    {unmatchedVaultActionBatches.length > 0 && (
+                        <section className="mx-2 my-4" aria-label="恢复的文件修改批次">
+                            <p className="mb-2 text-sm font-medium text-amber-700 dark:text-amber-300">
+                                以下文件修改没有可见的助手消息，仍需单独处理：
+                            </p>
+                            {unmatchedVaultActionBatches.map((batch) => (
+                                <VaultActionReview
+                                    key={batch.id}
+                                    batch={batch}
+                                    capability={props.vaultActionCapability}
+                                    onBatchChange={props.onVaultActionBatchChange}
+                                />
+                            ))}
+                        </section>
+                    )}
                     {props.pendingMessage && (
                         <ChatMessage
                             key={`pendingMessage-${props.pendingMessage.length}`}
@@ -764,7 +683,6 @@ export default function ChatHistory(props: ChatHistoryProps) {
                                 message: props.pendingMessage,
                                 context: [],
                                 onlineContext: {},
-                                codeContext: {},
                                 created: new Date().getTime().toString(),
                                 by: "you",
                                 automationId: "",
@@ -784,7 +702,6 @@ export default function ChatHistory(props: ChatHistoryProps) {
                             <div className="relative group mx-2 cursor-pointer">
                                 <AgentProfileCard
                                     name={constructAgentName()}
-                                    link={constructAgentLink()}
                                     avatar={
                                         getIconFromIconName(
                                             data.agent?.icon ?? "Lightbulb",

@@ -2,7 +2,6 @@ import { getIconFromIconName } from "@/app/common/iconUtils";
 import { ChatInputFocus } from "../chatInputArea/chatInputArea";
 
 export enum SuggestionType {
-    Paint = "Paint",
     Travel = "Travel",
     Health = "Health",
     Learning = "Learning",
@@ -37,7 +36,6 @@ function addSuggestionColorMap(type: SuggestionType, color: string) {
     suggestionToColorMap[type] = color;
 }
 
-addSuggestionColorMap(SuggestionType.Paint, "indigo");
 addSuggestionColorMap(SuggestionType.Travel, "yellow");
 addSuggestionColorMap(SuggestionType.Health, "teal");
 addSuggestionColorMap(SuggestionType.Learning, "purple");
@@ -56,7 +54,6 @@ addSuggestionColorMap(SuggestionType.Document, "orange");
 const DEFAULT_COLOR = "orange";
 
 export function convertSuggestionTitleToIconClass(title: string, color: string) {
-    if (title === SuggestionType.Paint) return getIconFromIconName("Palette", color, "w-6", "h-6");
     if (title === SuggestionType.PopCulture)
         return getIconFromIconName("Confetti", color, "w-6", "h-6");
     if (title === SuggestionType.Travel) return getIconFromIconName("Jeep", color, "w-6", "h-6");
@@ -100,13 +97,6 @@ export const stepOneSuggestions: StepOneSuggestion[] = [
         color: suggestionToColorMap[SuggestionType.Learning] || DEFAULT_COLOR,
         focus: ChatInputFocus.MESSAGE,
         intent: "I want to understand a concept",
-    },
-    {
-        type: SuggestionType.Paint,
-        actionTagline: "Create image",
-        color: suggestionToColorMap[SuggestionType.Paint] || DEFAULT_COLOR,
-        focus: ChatInputFocus.MESSAGE,
-        intent: "Paint a picture of",
     },
     // {
     //     type: SuggestionType.Travel,
@@ -188,23 +178,6 @@ export const stepOneSuggestions: StepOneSuggestion[] = [
 ];
 
 export const stepTwoSuggestion: { [key: string]: StepTwoSuggestion[] } = {
-    [SuggestionType.Paint]: [
-        {
-            prompt: "Paint a picture of a sunset but it's made of stained glass tiles.",
-        },
-        {
-            prompt: "Paint a futuristic cityscape with flying cars.",
-        },
-        {
-            prompt: "Paint a neon-lit street scene with reflections in the rain.",
-        },
-        {
-            prompt: "Paint a portrait of a person with a unique hairstyle.",
-        },
-        {
-            prompt: "Paint a landscape of a forest with a hidden waterfall.",
-        },
-    ],
     [SuggestionType.Travel]: [
         {
             prompt: "Search for the best attractions in Austria Hungary.",
@@ -302,9 +275,6 @@ export const stepTwoSuggestion: { [key: string]: StepTwoSuggestion[] } = {
         },
         {
             prompt: "Suggest a recipe for a quick and easy weeknight dinner.",
-        },
-        {
-            prompt: "Create a diagram that explains how to make a traditional Italian lasagna.",
         },
     ],
     [SuggestionType.Interviewing]: [

@@ -61,7 +61,6 @@ interface ChatHistory {
     agent_name: string;
     agent_icon: string;
     agent_color: string;
-    agent_is_hidden: boolean;
     compressed: boolean;
     created: string;
     updated: string;
@@ -448,9 +447,6 @@ function SessionsAndFiles(props: SessionsAndFilesProps) {
                                                         agent_name={chatHistory.agent_name}
                                                         agent_color={chatHistory.agent_color}
                                                         agent_icon={chatHistory.agent_icon}
-                                                        agent_is_hidden={
-                                                            chatHistory.agent_is_hidden
-                                                        }
                                                     />
                                                 ),
                                             )}
@@ -643,70 +639,23 @@ interface ChatSessionsModalProps {
     sideBarOpen: boolean;
 }
 
-interface AgentStyle {
-    color: string;
-    icon: string;
-}
-
 function ChatSessionsModal({ data, sideBarOpen }: ChatSessionsModalProps) {
-    const [agentsFilter, setAgentsFilter] = useState<string[]>([]);
-    const [agentOptions, setAgentOptions] = useState<string[]>([]);
     const [searchQuery, setSearchQuery] = useState<string>("");
-
-    const [agentNameToStyleMap, setAgentNameToStyleMap] = useState<Record<string, AgentStyle>>({});
-
-    useEffect(() => {
-        if (data) {
-            const agents: string[] = [];
-            let agentNameToStyleMapLocal: Record<string, AgentStyle> = {};
-            Object.keys(data).forEach((timeGrouping) => {
-                data[timeGrouping].forEach((chatHistory) => {
-                    if (chatHistory.agent_is_hidden) return;
-                    if (!chatHistory.agent_color) return;
-                    if (!chatHistory.agent_name) return;
-                    if (!chatHistory.agent_icon) return;
-
-                    const agentName = chatHistory.agent_name;
-
-                    if (agentName && !agents.includes(agentName)) {
-                        agents.push(chatHistory.agent_name);
-
-                        agentNameToStyleMapLocal = {
-                            ...agentNameToStyleMapLocal,
-                            [chatHistory.agent_name]: {
-                                color: chatHistory.agent_color ?? "orange",
-                                icon: chatHistory.agent_icon ?? "Lightbulb",
-                            },
-                        };
-                    }
-                });
-            });
-            setAgentNameToStyleMap(agentNameToStyleMapLocal);
-            setAgentOptions(agents);
-        }
-    }, [data]);
 
     // Memoize the filtered results
     const filteredData = useMemo(() => {
         if (!data) return null;
 
         // Early return if no filters active
-        if (agentsFilter.length === 0 && searchQuery.length === 0) {
+        if (searchQuery.length === 0) {
             return data;
         }
 
         const filtered: GroupedChatHistory = {};
-        const agentSet = new Set(agentsFilter);
         const searchLower = searchQuery.toLowerCase();
 
         for (const timeGrouping in data) {
             const matches = data[timeGrouping].filter((chatHistory) => {
-                // Early return for agent filter
-                if (agentsFilter.length > 0 && !agentSet.has(chatHistory.agent_name)) {
-                    return false;
-                }
-
-                // Early return for search query
                 if (searchQuery && !chatHistory.slug?.toLowerCase().includes(searchLower)) {
                     return false;
                 }
@@ -720,7 +669,7 @@ function ChatSessionsModal({ data, sideBarOpen }: ChatSessionsModalProps) {
         }
 
         return filtered;
-    }, [data, agentsFilter, searchQuery]);
+    }, [data, searchQuery]);
 
     return (
         <Dialog>
@@ -736,7 +685,7 @@ function ChatSessionsModal({ data, sideBarOpen }: ChatSessionsModalProps) {
                 <DialogHeader>
                     <DialogTitle>All Conversations</DialogTitle>
                     <DialogDescription className="p-0">
-                        <div className="flex flex-row justify-between mt-2 gap-2 w-fit md:w-full">
+                        <div className="mt-2 w-full">
                             <Input
                                 value={searchQuery}
                                 onChange={(e) => {
@@ -744,44 +693,6 @@ function ChatSessionsModal({ data, sideBarOpen }: ChatSessionsModalProps) {
                                 }}
                                 placeholder="Search conversations"
                             />
-                            <DropdownMenu>
-                                <DropdownMenuTrigger asChild>
-                                    <Button
-                                        variant="ghost"
-                                        className={`p-0 px-1 ${agentsFilter.length > 0 ? "bg-muted text-muted-foreground" : "bg-inherit"} `}
-                                    >
-                                        <FunnelSimple />
-                                    </Button>
-                                </DropdownMenuTrigger>
-                                <DropdownMenuContent>
-                                    <DropdownMenuLabel>Agents</DropdownMenuLabel>
-                                    <DropdownMenuSeparator />
-                                    {agentOptions.map((agent) => (
-                                        <DropdownMenuCheckboxItem
-                                            key={agent}
-                                            onSelect={(e) => e.preventDefault()}
-                                            checked={agentsFilter.includes(agent)}
-                                            onCheckedChange={(checked) => {
-                                                if (checked) {
-                                                    setAgentsFilter([...agentsFilter, agent]);
-                                                } else {
-                                                    setAgentsFilter(
-                                                        agentsFilter.filter((a) => a !== agent),
-                                                    );
-                                                }
-                                            }}
-                                        >
-                                            <div className="flex items-center justify-center px-1">
-                                                {getIconFromIconName(
-                                                    agentNameToStyleMap[agent]?.icon,
-                                                    agentNameToStyleMap[agent]?.color,
-                                                )}
-                                                <div className="break-words">{agent}</div>
-                                            </div>
-                                        </DropdownMenuCheckboxItem>
-                                    ))}
-                                </DropdownMenuContent>
-                            </DropdownMenu>
                         </div>
                         <ScrollArea className="h-[500px] py-4">
                             {filteredData &&
@@ -803,7 +714,6 @@ function ChatSessionsModal({ data, sideBarOpen }: ChatSessionsModalProps) {
                                                 agent_name={chatHistory.agent_name}
                                                 agent_color={chatHistory.agent_color}
                                                 agent_icon={chatHistory.agent_icon}
-                                                agent_is_hidden={chatHistory.agent_is_hidden}
                                             />
                                         ))}
                                     </div>

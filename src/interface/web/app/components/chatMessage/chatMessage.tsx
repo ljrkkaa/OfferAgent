@@ -14,7 +14,6 @@ import {
     TeaserReferencesSection,
     constructAllReferences,
 } from "@/app/components/referencePanel/referencePanel";
-import { renderCodeGenImageInline } from "@/app/common/chatFunctions";
 import { fileLinksPlugin } from "@/app/components/chatMessage/fileLinksPlugin";
 import { imageValidationPlugin } from "@/app/components/chatMessage/imageValidationPlugin";
 import FileContentSnippet from "@/app/components/chatMessage/FileContentSnippet";
@@ -28,11 +27,9 @@ import {
     Book,
     Aperture,
     MagnifyingGlass,
-    Palette,
     ClipboardText,
     Check,
     Code,
-    Shapes,
     Trash,
     Toolbox,
     Browser,
@@ -42,10 +39,9 @@ import {
 import DOMPurify from "dompurify";
 import { InlineLoading } from "../loading/loading";
 import { convertColorToTextClass } from "@/app/common/colorUtils";
-import { AgentData } from "@/app/components/agentCard/agentCard";
+import { AgentData } from "@/app/common/agent";
 
 import renderMathInElement from "katex/contrib/auto-render";
-import ExcalidrawComponent from "../excalidraw/excalidraw";
 import { AttachedFileText } from "../chatInputArea/chatInputArea";
 import {
     Dialog,
@@ -58,7 +54,9 @@ import { DialogTitle } from "@radix-ui/react-dialog";
 import { convertBytesToText } from "@/app/common/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { getIconFromFilename } from "@/app/common/iconUtils";
-import Mermaid from "../mermaid/mermaid";
+import type { VaultActionBatch } from "@/app/common/vaultActions";
+import type { VaultActionCapability } from "@/app/common/vaultActions";
+import VaultActionReview from "./vaultActionReview";
 
 const md = new markdownIt({
     html: true,
@@ -124,26 +122,6 @@ export interface OnlineContextData {
     peopleAlsoAsk: PeopleAlsoAsk[];
 }
 
-export interface CodeContext {
-    [key: string]: CodeContextData;
-}
-
-export interface CodeContextData {
-    code: string;
-    results: {
-        success: boolean;
-        output_files: CodeContextFile[];
-        std_out: string;
-        std_err: string;
-        code_runtime?: number;
-    };
-}
-
-export interface CodeContextFile {
-    filename: string;
-    b64_data: string;
-}
-
 interface Intent {
     type: string;
     query: string;
@@ -163,7 +141,6 @@ export interface SingleChatMessage {
     created: string;
     context: Context[];
     onlineContext: OnlineContext;
-    codeContext: CodeContext;
     trainOfThought?: TrainOfThoughtObject[];
     rawQuery?: string;
     intent?: Intent;
@@ -172,8 +149,7 @@ export interface SingleChatMessage {
     conversationId: string;
     turnId?: string;
     queryFiles?: AttachedFileText[];
-    excalidrawDiagram?: string;
-    mermaidjsDiagram?: string;
+    vaultActionBatch?: VaultActionBatch;
 }
 
 export interface StreamMessage {
@@ -181,7 +157,6 @@ export interface StreamMessage {
     trainOfThought: string[];
     context: Context[];
     onlineContext: OnlineContext;
-    codeContext: CodeContext;
     completed: boolean;
     rawQuery: string;
     timestamp: string;
@@ -191,12 +166,7 @@ export interface StreamMessage {
     inferredQueries?: string[];
     turnId?: string;
     queryFiles?: AttachedFileText[];
-    excalidrawDiagram?: string;
-    mermaidjsDiagram?: string;
-    generatedFiles?: AttachedFileText[];
-    generatedImages?: string[];
-    generatedExcalidrawDiagram?: string;
-    generatedMermaidjsDiagram?: string;
+    vaultActionBatch?: VaultActionBatch;
 }
 
 export interface ChatHistoryData {
@@ -218,10 +188,8 @@ interface ChatMessageProps {
     onRetryMessage?: (query: string, turnId?: string) => Promise<boolean> | boolean | void;
     conversationId: string;
     turnId?: string;
-    generatedImage?: string;
-    excalidrawDiagram?: string;
-    mermaidjsDiagram?: string;
-    generatedFiles?: AttachedFileText[];
+    vaultActionCapability?: VaultActionCapability | null;
+    onVaultActionBatchChange?: (batch: VaultActionBatch) => void;
 }
 
 interface TrainOfThoughtProps {
@@ -269,14 +237,6 @@ function chooseIconFromHeader(header: string, iconColor: string) {
         return <Aperture className={`${classNames}`} />;
     }
 
-    if (compareHeader.includes("diagram")) {
-        return <Shapes className={`${classNames}`} />;
-    }
-
-    if (compareHeader.includes("paint")) {
-        return <Palette className={`${classNames}`} />;
-    }
-
     if (compareHeader.includes("code")) {
         return <Code className={`${classNames}`} />;
     }
@@ -296,24 +256,6 @@ export function TrainOfThought(props: TrainOfThoughtProps) {
     const icon = chooseIconFromHeader(header, iconColor);
     let message = props.message;
 
-    // Render screenshot image in screenshot action message
-    let jsonMessage = null;
-    try {
-        const jsonMatch = message.match(
-            /\{.*("action": "screenshot"|"type": "screenshot"|"image": "data:image\/.*").*\}/,
-        );
-        if (jsonMatch) {
-            jsonMessage = JSON.parse(jsonMatch[0]);
-            const screenshotHtmlString = `<img src="${jsonMessage.image}" alt="State of environment" class="max-w-full" />`;
-            message = message.replace(
-                `:\n**Action**: ${jsonMatch[0]}`,
-                `\n\n- ${jsonMessage.text}\n${screenshotHtmlString}`,
-            );
-        }
-    } catch (e) {
-        console.error("Failed to parse screenshot data", e);
-    }
-
     // Render the sanitized train of thought as markdown
     let markdownRendered = DOMPurify.sanitize(md.render(message));
 
@@ -330,55 +272,11 @@ export function TrainOfThought(props: TrainOfThoughtProps) {
     );
 }
 
-// Clean mermaid chart by removing/fixing invalid syntax patterns
-function cleanMermaidChart(chart: string): string {
-    return chart
-        .split("\n")
-        .filter((line) => !line.trim().match(/^title\s*\[.*\]\s*$/i)) // Remove invalid title[...] lines
-        .map((line) => {
-            // Fix parentheses inside square bracket node labels: [Text (with parens)]
-            // Mermaid interprets () as special syntax, so we need to quote the content
-            // Replace [Label (text)] with ["Label (text)"]
-            return line.replace(/\[([^\]]*\([^\]]*\)[^\]]*)\]/g, '["$1"]');
-        })
-        .join("\n");
-}
-
-// Extract mermaid code blocks from markdown content
-function extractMermaidBlocks(content: string): {
-    cleanedContent: string;
-    mermaidBlocks: string[];
-} {
-    const mermaidBlocks: string[] = [];
-    // Match ```mermaid ... ``` code blocks
-    // Allow optional whitespace before/after delimiters and handle various line endings
-    const mermaidRegex = /```\s*mermaid\s*\r?\n([\s\S]*?)```/gi;
-
-    const cleanedContent = content.replace(mermaidRegex, (match, mermaidCode) => {
-        const trimmedCode = mermaidCode.trim();
-        if (trimmedCode) {
-            // Clean the mermaid chart before adding
-            const cleanedChart = cleanMermaidChart(trimmedCode);
-            if (cleanedChart.trim()) {
-                mermaidBlocks.push(cleanedChart);
-            }
-        }
-        // Replace with empty string to remove from markdown
-        return "";
-    });
-
-    return { cleanedContent, mermaidBlocks };
-}
-
 const ChatMessage = forwardRef<HTMLDivElement, ChatMessageProps>((props, ref) => {
     const [copySuccess, setCopySuccess] = useState<boolean>(false);
     const [isHovering, setIsHovering] = useState<boolean>(false);
     const [textRendered, setTextRendered] = useState<string>("");
     const [markdownRendered, setMarkdownRendered] = useState<string>("");
-    const [excalidrawData, setExcalidrawData] = useState<string>("");
-    const [mermaidjsData, setMermaidjsData] = useState<string>("");
-    const [inlineMermaidBlocks, setInlineMermaidBlocks] = useState<string[]>([]);
-
     // State for file content preview on file link click, hover
     const [previewOpen, setPreviewOpen] = useState<boolean>(false);
     const [previewFilePath, setPreviewFilePath] = useState<string>("");
@@ -429,37 +327,7 @@ const ChatMessage = forwardRef<HTMLDivElement, ChatMessageProps>((props, ref) =>
         // Prepare initial message for rendering
         let message = props.chatMessage.message;
 
-        if (props.chatMessage.excalidrawDiagram) {
-            setExcalidrawData(props.chatMessage.excalidrawDiagram);
-        }
-
-        if (props.chatMessage.mermaidjsDiagram) {
-            setMermaidjsData(props.chatMessage.mermaidjsDiagram);
-        }
-
-        // Extract mermaid blocks from the message content
-        const { cleanedContent, mermaidBlocks } = extractMermaidBlocks(message);
-        message = cleanedContent;
-        setInlineMermaidBlocks(mermaidBlocks);
-
-        // Replace file links with base64 data
-        message = renderCodeGenImageInline(message, props.chatMessage.codeContext);
-
-        // Add code context files to the message
-        if (props.chatMessage.codeContext) {
-            Object.entries(props.chatMessage.codeContext).forEach(([key, value]) => {
-                value.results?.output_files?.forEach((file) => {
-                    if (file.filename.endsWith(".png") || file.filename.endsWith(".jpg")) {
-                        // Don't add the image again if it's already in the message!
-                        if (!message.includes(`![${file.filename}](`)) {
-                            message += `\n\n![${file.filename}](data:image/png;base64,${file.b64_data})`;
-                        }
-                    }
-                });
-            });
-        }
-
-        // Handle rendering user attached or khoj generated images
+        // Handle rendering user attached images
         let messageForClipboard = message;
         let messageToRender = message;
         if (props.chatMessage.images && props.chatMessage.images.length > 0) {
@@ -521,14 +389,7 @@ const ChatMessage = forwardRef<HTMLDivElement, ChatMessageProps>((props, ref) =>
         });
 
         setMarkdownRendered(cleanMarkdown);
-    }, [
-        props.chatMessage.message,
-        props.chatMessage.images,
-        props.chatMessage.intent,
-        props.chatMessage.codeContext,
-        props.chatMessage.excalidrawDiagram,
-        props.chatMessage.mermaidjsDiagram,
-    ]);
+    }, [props.chatMessage.message, props.chatMessage.images, props.chatMessage.intent]);
 
     useEffect(() => {
         if (copySuccess) {
@@ -808,7 +669,6 @@ const ChatMessage = forwardRef<HTMLDivElement, ChatMessageProps>((props, ref) =>
     const allReferences = constructAllReferences(
         props.chatMessage.context,
         props.chatMessage.onlineContext,
-        props.chatMessage.codeContext,
     );
 
     return (
@@ -865,6 +725,13 @@ const ChatMessage = forwardRef<HTMLDivElement, ChatMessageProps>((props, ref) =>
                     className={styles.chatMessage}
                     dangerouslySetInnerHTML={{ __html: markdownRendered }}
                 />
+                {props.chatMessage.by === "khoj" && props.chatMessage.vaultActionBatch && (
+                    <VaultActionReview
+                        batch={props.chatMessage.vaultActionBatch}
+                        capability={props.vaultActionCapability}
+                        onBatchChange={props.onVaultActionBatchChange}
+                    />
+                )}
                 {/* File preview hover dialog */}
                 {hoverOpen &&
                     typeof window !== "undefined" &&
@@ -979,18 +846,12 @@ const ChatMessage = forwardRef<HTMLDivElement, ChatMessageProps>((props, ref) =>
                         </div>
                     </DialogContent>
                 </Dialog>
-                {excalidrawData && <ExcalidrawComponent data={excalidrawData} />}
-                {mermaidjsData && <Mermaid chart={mermaidjsData} />}
-                {inlineMermaidBlocks.map((chart, index) => (
-                    <Mermaid key={`inline-mermaid-${index}`} chart={chart} />
-                ))}
             </div>
             <div className={styles.teaserReferencesContainer}>
                 <TeaserReferencesSection
                     isMobileWidth={props.isMobileWidth}
                     notesReferenceCardData={allReferences.notesReferenceCardData}
                     onlineReferenceCardData={allReferences.onlineReferenceCardData}
-                    codeReferenceCardData={allReferences.codeReferenceCardData}
                 />
             </div>
             <div className={styles.chatFooter}>
