@@ -10,7 +10,7 @@ from khoj.database.models import (
     ChatModel,
     KhojUser,
 )
-from khoj.processor.conversation.utils import model_to_prompt_size, model_to_tokenizer
+from khoj.processor.conversation.utils import model_to_prompt_size
 from khoj.utils.constants import (
     default_anthropic_chat_models,
     default_gemini_chat_models,
@@ -136,7 +136,6 @@ def initialization(interactive: bool = True):
 
         for chat_model in chat_models:
             default_max_tokens = model_to_prompt_size.get(chat_model)
-            default_tokenizer = model_to_tokenizer.get(chat_model)
             vision_enabled = vision_enabled and chat_model in supported_vision_models
 
             chat_model_options = {
@@ -145,7 +144,6 @@ def initialization(interactive: bool = True):
                 "model_type": model_type,
                 "max_prompt_size": default_max_tokens,
                 "vision_enabled": vision_enabled,
-                "tokenizer": default_tokenizer,
                 "ai_model_api": ai_model_api,
             }
 
@@ -186,7 +184,6 @@ def initialization(interactive: bool = True):
                                 model_type=ChatModel.ModelType.OPENAI,
                                 max_prompt_size=model_to_prompt_size.get(model_name),
                                 vision_enabled=model_name in default_openai_chat_models,
-                                tokenizer=model_to_tokenizer.get(model_name),
                                 ai_model_api=config,
                             )
 

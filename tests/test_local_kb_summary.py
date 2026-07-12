@@ -11,9 +11,6 @@ async def test_summarize_uses_kb_read_not_fileobject_raw_text(tmp_path, monkeypa
     (tmp_path / "notes.md").write_text("alpha\nbeta\n", encoding="utf-8")
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
 
-    async def fail_db_lookup(*args, **kwargs):
-        raise AssertionError("DB file lookup should not run for local KB file filters")
-
     captured = {}
 
     async def fake_summary(q, contextual_data, **kwargs):
@@ -23,7 +20,6 @@ async def test_summarize_uses_kb_read_not_fileobject_raw_text(tmp_path, monkeypa
     async def status(message):
         yield f"{ChatEvent.STATUS.value}:{message}"
 
-    monkeypatch.setattr(helpers.FileObjectAdapters, "aget_file_objects_by_names", fail_db_lookup)
     monkeypatch.setattr(helpers, "extract_relevant_summary", fake_summary)
 
     results = [

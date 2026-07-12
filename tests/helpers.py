@@ -7,7 +7,6 @@ from asgiref.sync import sync_to_async
 
 from khoj.database.adapters import AgentAdapters
 from khoj.database.models import (
-    Agent,
     AiModelApi,
     ChatMessageModel,
     ChatModel,
@@ -200,7 +199,6 @@ class ChatModelFactory(factory.django.DjangoModelFactory):
         model = ChatModel
 
     max_prompt_size = 20000
-    tokenizer = None
     name = factory.LazyAttribute(lambda obj: get_chat_model_name(obj.model_type))
     model_type = get_chat_provider()
     ai_model_api = factory.LazyAttribute(
@@ -250,11 +248,3 @@ async def acreate_chat_model():
 
 async def acreate_default_agent():
     return await sync_to_async(AgentAdapters.create_default_agent)()
-
-
-async def acreate_agent(name, chat_model, personality):
-    return await sync_to_async(Agent.objects.create)(
-        name=name,
-        chat_model=chat_model,
-        personality=personality,
-    )

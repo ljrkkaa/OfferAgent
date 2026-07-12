@@ -8,7 +8,7 @@ from openai import OpenAI
 
 from khoj.database.models import ProcessLock
 from khoj.utils import config as utils_config
-from khoj.utils.helpers import LRU, get_device
+from khoj.utils.helpers import LRU
 
 # Application Global State
 openai_client: OpenAI = None
@@ -24,5 +24,4 @@ SearchType = utils_config.SearchType
 scheduler: BackgroundScheduler = None
 schedule_leader_process_lock: ProcessLock = None
 khoj_version: str = None
-device = get_device()
 anonymous_mode: bool = False

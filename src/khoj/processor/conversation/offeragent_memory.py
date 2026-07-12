@@ -1,16 +1,27 @@
+import os
 import re
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
+from uuid import uuid4
 
-from pydantic import BaseModel, Field
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
+from pydantic import BaseModel, ConfigDict, Field
+
+from khoj.database.models import KhojUser
 from khoj.utils.local_kb import get_local_kb_root
 
 MEMORY_TYPES = {"user", "feedback", "project"}
 INDEX_NAME = "MEMORY.md"
 MAX_RELEVANT_MEMORIES = 3
+_memory_write_lock = threading.Lock()
 
 MEMORY_POLICY = """
 OfferAgent has a persistent, local, file-based memory system.
@@ -31,6 +42,8 @@ If current files or tool output are relevant, those are authoritative. Memory is
 
 
 class MemorySelection(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     selected_memories: list[str] = Field(
         default_factory=list,
         description="Memory ids from the manifest to inject into this turn. Empty means inject no memory.",
@@ -38,6 +51,8 @@ class MemorySelection(BaseModel):
 
 
 class MemoryWriteDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     action: Literal["create", "none"] = Field(description="Whether to create one memory from the latest user message.")
     memory_type: Optional[Literal["user", "feedback", "project"]] = Field(default=None)
     raw: Optional[str] = Field(default=None, description="Atomic memory content to save.")
@@ -55,19 +70,24 @@ class OfferAgentMemory:
     path: Path
 
 
-def get_memory_root() -> Path:
+def get_memory_root(user: KhojUser) -> Path:
+    user_id = getattr(user, "uuid", None)
+    if not user_id:
+        raise ValueError("A persisted user is required for memory access")
     local_root = get_local_kb_root()
     if local_root:
-        return local_root / ".offeragent" / "memory"
-    return Path.home() / ".offeragent" / "memory" / "default"
+        base = local_root / ".offeragent" / "memory"
+    else:
+        base = Path.home() / ".offeragent" / "memory"
+    return base / str(user_id)
 
 
 def is_supported_memory_type(memory_type: str) -> bool:
     return memory_type in MEMORY_TYPES
 
 
-def list_memories() -> list[OfferAgentMemory]:
-    root = get_memory_root()
+def list_memories(user: KhojUser) -> list[OfferAgentMemory]:
+    root = get_memory_root(user)
     if not root.exists():
         return []
     memories = [_read_memory(path) for path in root.glob("*.md") if path.name != INDEX_NAME]
@@ -78,14 +98,15 @@ def list_memories() -> list[OfferAgentMemory]:
     )
 
 
-def get_memory_by_id(memory_id: str) -> Optional[OfferAgentMemory]:
-    path = _memory_path(memory_id)
+def get_memory_by_id(user: KhojUser, memory_id: str) -> Optional[OfferAgentMemory]:
+    path = _memory_path(user, memory_id)
     if not path.exists():
         return None
     return _read_memory(path)
 
 
 def create_memory(
+    user: KhojUser,
     raw: str,
     memory_type: str,
     *,
@@ -99,46 +120,74 @@ def create_memory(
     if not raw:
         raise ValueError("Memory content cannot be empty")
 
-    root = get_memory_root()
-    root.mkdir(parents=True, exist_ok=True)
-    now = _now()
-    description = _one_line(description or raw)
-    name = _one_line(name or description)
-    path = _unique_memory_path(root, name or raw)
-    _write_memory(path, raw, memory_type, name, description, now, now, source_turn_id)
-    _write_index()
-    return _read_memory(path)
+    with _memory_write_lock:
+        root = get_memory_root(user)
+        root.mkdir(parents=True, exist_ok=True)
+        with _memory_root_lock(root):
+            now = _now()
+            description = _one_line(description or raw)
+            name = _one_line(name or description)
+            while True:
+                path = _unique_memory_path(root, name or raw)
+                try:
+                    _write_memory(
+                        path,
+                        raw,
+                        memory_type,
+                        name,
+                        description,
+                        now,
+                        now,
+                        source_turn_id,
+                        exclusive=True,
+                    )
+                    break
+                except FileExistsError:
+                    continue
+            _write_index(user)
+            memory = _read_memory(path)
+            if memory is None:
+                raise RuntimeError(f"Failed to read newly created memory: {path.name}")
+            return memory
 
 
-def update_memory(memory_id: str, raw: str) -> Optional[OfferAgentMemory]:
-    memory = get_memory_by_id(memory_id)
-    if not memory:
-        return None
+def update_memory(user: KhojUser, memory_id: str, raw: str) -> Optional[OfferAgentMemory]:
     raw = raw.strip()
     if not raw:
         raise ValueError("Memory content cannot be empty")
 
-    _write_memory(
-        memory.path,
-        raw,
-        memory.memory_type,
-        memory.description,
-        _one_line(raw),
-        memory.created_at,
-        _now(),
-        None,
-    )
-    _write_index()
-    return get_memory_by_id(memory_id)
+    with _memory_write_lock:
+        root = get_memory_root(user)
+        root.mkdir(parents=True, exist_ok=True)
+        with _memory_root_lock(root):
+            memory = get_memory_by_id(user, memory_id)
+            if not memory:
+                return None
+            _write_memory(
+                memory.path,
+                raw,
+                memory.memory_type,
+                memory.description,
+                _one_line(raw),
+                memory.created_at,
+                _now(),
+                None,
+            )
+            _write_index(user)
+            return get_memory_by_id(user, memory_id)
 
 
-def delete_memory(memory_id: str) -> bool:
-    path = _memory_path(memory_id)
-    if not path.exists():
-        return False
-    path.unlink()
-    _write_index()
-    return True
+def delete_memory(user: KhojUser, memory_id: str) -> bool:
+    with _memory_write_lock:
+        root = get_memory_root(user)
+        root.mkdir(parents=True, exist_ok=True)
+        with _memory_root_lock(root):
+            path = _memory_path(user, memory_id)
+            if not path.exists():
+                return False
+            path.unlink()
+            _write_index(user)
+            return True
 
 
 def build_memory_selection_prompt(query: str, memories: list[OfferAgentMemory]) -> str:
@@ -187,7 +236,7 @@ def build_memory_write_prompt(
     memories: list[OfferAgentMemory],
     *,
     current_date: str,
-    used_notes_tool_loop: bool,
+    used_workspace_tools: bool,
 ) -> str:
     return f"""
 {MEMORY_POLICY}
@@ -203,7 +252,7 @@ Rules:
 - Return action "none" unless the memory would be useful in future conversations.
 
 current_date: {current_date}
-local_notes_or_tools_used: {used_notes_tool_loop}
+local_notes_or_tools_used: {used_workspace_tools}
 
 Existing memory manifest:
 {format_memory_manifest(memories)}
@@ -214,6 +263,7 @@ Latest user message:
 
 
 def apply_memory_write_decision(
+    user: KhojUser,
     decision: MemoryWriteDecision,
     *,
     source_turn_id: Optional[str] = None,
@@ -226,6 +276,7 @@ def apply_memory_write_decision(
     if not raw:
         return None
     return create_memory(
+        user,
         raw,
         decision.memory_type,
         description=_one_line(decision.description or raw),
@@ -257,11 +308,11 @@ def format_memory_manifest(memories: list[OfferAgentMemory]) -> str:
     )
 
 
-def _memory_path(memory_id: str) -> Path:
+def _memory_path(user: KhojUser, memory_id: str) -> Path:
     if "/" in memory_id or "\\" in memory_id or memory_id in {"", ".", "..", INDEX_NAME}:
         raise ValueError("Invalid memory id")
-    path = (get_memory_root() / memory_id).resolve(strict=False)
-    root = get_memory_root().resolve(strict=False)
+    path = (get_memory_root(user) / memory_id).resolve(strict=False)
+    root = get_memory_root(user).resolve(strict=False)
     if not path.is_relative_to(root):
         raise ValueError("Invalid memory id")
     return path
@@ -304,6 +355,8 @@ def _write_memory(
     created_at: datetime,
     updated_at: datetime,
     source_turn_id: Optional[str],
+    *,
+    exclusive: bool = False,
 ) -> None:
     fields = {
         "name": _frontmatter_value(name),
@@ -315,17 +368,51 @@ def _write_memory(
     if source_turn_id:
         fields["source_turn_id"] = _frontmatter_value(source_turn_id)
     frontmatter = "\n".join(f"{key}: {value}" for key, value in fields.items())
-    path.write_text(f"---\n{frontmatter}\n---\n{raw.strip()}\n", encoding="utf-8")
+    _write_text_atomic(path, f"---\n{frontmatter}\n---\n{raw.strip()}\n", exclusive=exclusive)
 
 
-def _write_index() -> None:
-    root = get_memory_root()
+def _write_index(user: KhojUser) -> None:
+    root = get_memory_root(user)
     root.mkdir(parents=True, exist_ok=True)
     lines = [
-        f"- [{memory.description or memory.id}]({memory.id}) - {memory.memory_type}"
-        for memory in list_memories()
+        f"- [{memory.description or memory.id}]({memory.id}) - {memory.memory_type}" for memory in list_memories(user)
     ]
-    (root / INDEX_NAME).write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    _write_text_atomic(root / INDEX_NAME, "\n".join(lines) + ("\n" if lines else ""))
+
+
+def _write_text_atomic(path: Path, text: str, *, exclusive: bool = False) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        if exclusive:
+            os.link(temporary, path)
+        else:
+            temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def _memory_root_lock(root: Path):
+    lock_path = root / ".memory.lock"
+    with lock_path.open("a+b") as lock_file:
+        if os.name == "nt":
+            lock_file.seek(0)
+            if lock_file.read(1) == b"":
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _parse_frontmatter(text: str) -> dict[str, str]:
@@ -369,5 +456,4 @@ def _unique_memory_path(root: Path, text: str) -> Path:
     path = root / f"{stem}.md"
     if not path.exists():
         return path
-    suffix = abs(hash(text)) % 1_000_000
-    return root / f"{stem}-{suffix}.md"
+    return root / f"{stem}-{uuid4().hex[:12]}.md"

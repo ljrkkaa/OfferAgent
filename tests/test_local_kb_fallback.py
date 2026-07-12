@@ -1,6 +1,6 @@
 import pytest
 
-from khoj.routers import helpers
+from khoj.processor.conversation import knowledge_workspace
 
 
 async def collect(async_iterable):
@@ -20,13 +20,13 @@ async def test_local_kb_miss_does_not_fall_back_to_db_by_default(local_kb, monke
     async def fail_db(*args, **kwargs):
         raise AssertionError("DB fallback should be disabled")
 
-    monkeypatch.setattr(helpers.FileObjectAdapters, "aget_file_objects_by_name", fail_db)
-    monkeypatch.setattr(helpers.FileObjectAdapters, "aget_file_objects_by_regex", fail_db)
-    monkeypatch.setattr(helpers.FileObjectAdapters, "aget_all_file_objects", fail_db)
+    monkeypatch.setattr(knowledge_workspace.FileObjectAdapters, "aget_file_objects_by_name", fail_db)
+    monkeypatch.setattr(knowledge_workspace.FileObjectAdapters, "aget_file_objects_by_regex", fail_db)
+    monkeypatch.setattr(knowledge_workspace.FileObjectAdapters, "aget_all_file_objects", fail_db)
 
-    viewed = await collect(helpers.view_file_content("db.md"))
-    grepped = await collect(helpers.grep_files("needle"))
-    listed = await collect(helpers.list_files(pattern="*.txt"))
+    viewed = await collect(knowledge_workspace.view_workspace_file("db.md"))
+    grepped = await collect(knowledge_workspace.grep_workspace_files("needle"))
+    listed = await collect(knowledge_workspace.list_workspace_files(pattern="*.txt"))
 
     assert "not found in local knowledge base" in viewed[0][0]["compiled"]
     assert grepped[0]["compiled"] == "No matches found."

@@ -14,17 +14,14 @@ from django_apscheduler.models import DjangoJob, DjangoJobExecution
 from unfold import admin as unfold_admin
 
 from khoj.database.models import (
-    Agent,
     AiModelApi,
     ChatModel,
-    ClientApplication,
     Conversation,
     Entry,
     KhojUser,
     McpServer,
     ProcessLock,
     RateLimitRecord,
-    ReflectiveQuestion,
     ServerChatSettings,
     UserConversationConfig,
     UserRequests,
@@ -114,11 +111,7 @@ class KhojUserAdmin(UserAdmin, unfold_admin.ModelAdmin):
     fieldsets = (
         (
             "Personal info",
-            {
-                "fields": (
-                    "verified_email",
-                )
-            },
+            {"fields": ("verified_email",)},
         ),
     ) + UserAdmin.fieldsets
 
@@ -127,8 +120,6 @@ admin.site.unregister(Group)
 admin.site.register(KhojUser, KhojUserAdmin)
 
 admin.site.register(ProcessLock, unfold_admin.ModelAdmin)
-admin.site.register(ReflectiveQuestion, unfold_admin.ModelAdmin)
-admin.site.register(ClientApplication, unfold_admin.ModelAdmin)
 admin.site.register(UserRequests, unfold_admin.ModelAdmin)
 admin.site.register(RateLimitRecord, unfold_admin.ModelAdmin)
 
@@ -143,16 +134,6 @@ class McpServerAdmin(unfold_admin.ModelAdmin):
     search_fields = ("id", "name", "path")
 
 
-@admin.register(Agent)
-class AgentAdmin(unfold_admin.ModelAdmin):
-    list_display = (
-        "id",
-        "name",
-    )
-    search_fields = ("id", "name")
-    ordering = ("-created_at",)
-
-
 @admin.register(Entry)
 class EntryAdmin(unfold_admin.ModelAdmin):
     list_display = (
@@ -160,7 +141,6 @@ class EntryAdmin(unfold_admin.ModelAdmin):
         "created_at",
         "updated_at",
         "user",
-        "agent",
         "file_source",
         "file_type",
         "file_name",
@@ -229,10 +209,9 @@ class ConversationAdmin(unfold_admin.ModelAdmin):
         "user",
         "created_at",
         "updated_at",
-        "client",
     )
-    search_fields = ("id", "user__email", "user__username", "client__name")
-    list_filter = ("agent", "client", "user")
+    search_fields = ("id", "user__email", "user__username")
+    list_filter = ("user",)
     ordering = ("-created_at",)
 
     actions = ["export_selected_objects", "export_selected_minimal_objects"]

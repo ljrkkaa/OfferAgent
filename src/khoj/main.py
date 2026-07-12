@@ -18,8 +18,6 @@ from importlib.metadata import version
 from khoj.utils.helpers import in_debug_mode, is_env_var_true
 
 # Ignore non-actionable warnings
-warnings.filterwarnings("ignore", message=r"snapshot_download.py has been made private", category=FutureWarning)
-warnings.filterwarnings("ignore", message=r"legacy way to download files from the HF hub,", category=FutureWarning)
 warnings.filterwarnings("ignore", message=r"Warning: Empty content on page \d+ of document", category=UserWarning)
 
 
@@ -117,9 +115,6 @@ def shutdown_scheduler():
 
 
 def run(should_start_server=True):
-    # Turn Tokenizers Parallelism Off. App does not support it.
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
     # Load config from CLI
     state.cli_args = sys.argv[1:]
     args = cli(state.cli_args)

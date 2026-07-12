@@ -232,9 +232,7 @@ def test_edit_automation_repairs_legacy_plain_name(client: TestClient, monkeypat
 
 
 @pytest.mark.django_db(transaction=True)
-def test_edit_automation_cleans_created_conversation_when_modify_fails(
-    client: TestClient, monkeypatch, default_user2
-):
+def test_edit_automation_cleans_created_conversation_when_modify_fails(client: TestClient, monkeypatch, default_user2):
     state.anonymous_mode = True
     automation = schedule_automation(
         query_to_run="/automated_task old automation",

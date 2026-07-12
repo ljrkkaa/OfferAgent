@@ -1,16 +1,18 @@
 # Standard Modules
 import os
 import re
+import uuid
 from urllib.parse import quote
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from khoj.configure import configure_routes
-from khoj.database.adapters import EntryAdapters, FileObjectAdapters
-from khoj.database.models import Agent, Conversation, KhojApiUser, KhojUser
+from khoj.configure import UserAuthenticationBackend, configure_routes
+from khoj.database.adapters import ConversationAdapters, EntryAdapters, FileObjectAdapters
+from khoj.database.models import Agent, ChatMessageModel, Conversation, KhojApiUser, KhojUser, VaultActionBatch
 from khoj.processor.content.markdown.markdown_to_entries import MarkdownToEntries
+from khoj.processor.conversation.vault_actions import create_vault_action_batch
 from khoj.search_type import text_search
 from khoj.utils import constants, state
 from tests.helpers import ChatModelFactory
@@ -20,8 +22,31 @@ BGE_TEST_MAX_DISTANCE = 0.36
 
 # Test
 # ----------------------------------------------------------------------------------------------------
+def test_authentication_backend_seeds_explicit_bootstrap_api_key(monkeypatch):
+    monkeypatch.setenv("KHOJ_API_KEY", "kk-old-secret")
+    UserAuthenticationBackend()
+
+    monkeypatch.setenv("KHOJ_API_KEY", "kk-bootstrap-secret")
+    UserAuthenticationBackend()
+
+    api_user = KhojApiUser.objects.get(token="kk-bootstrap-secret")
+    assert api_user.user.username == "default"
+    assert api_user.name == "Local bootstrap"
+    assert list(KhojApiUser.objects.values_list("token", flat=True)) == ["kk-bootstrap-secret"]
+
+
+def test_authentication_backend_removes_tokens_without_bootstrap_key(monkeypatch):
+    monkeypatch.setenv("KHOJ_API_KEY", "kk-old-secret")
+    UserAuthenticationBackend()
+
+    monkeypatch.delenv("KHOJ_API_KEY")
+    UserAuthenticationBackend()
+
+    assert not KhojApiUser.objects.exists()
+
+
 @pytest.mark.django_db(transaction=True)
-def test_search_with_no_auth_key(client):
+def test_search_requires_auth_when_anonymous_mode_is_disabled(client):
     # Arrange
     user_query = quote("How to call Khoj from Emacs?")
 
@@ -29,7 +54,7 @@ def test_search_with_no_auth_key(client):
     response = client.get(f"/api/search?q={user_query}")
 
     # Assert
-    assert response.status_code == 200
+    assert response.status_code == 403
 
 
 @pytest.mark.django_db(transaction=True)
@@ -92,7 +117,7 @@ def test_search_with_valid_content_type(client):
 
 # ----------------------------------------------------------------------------------------------------
 @pytest.mark.django_db(transaction=True)
-def test_index_update_with_no_auth_key(client):
+def test_index_update_requires_auth_when_anonymous_mode_is_disabled(client):
     # Arrange
     files = get_sample_files_data()
 
@@ -100,6 +125,15 @@ def test_index_update_with_no_auth_key(client):
     response = client.patch("/api/content", files=files)
 
     # Assert
+    assert response.status_code == 403
+
+
+@pytest.mark.django_db(transaction=True)
+def test_anonymous_mode_explicitly_uses_default_user(client):
+    state.anonymous_mode = True
+
+    response = client.get("/api/search?q=hello")
+
     assert response.status_code == 200
 
 
@@ -115,42 +149,6 @@ def test_index_update_with_invalid_auth_key(client):
 
     # Assert
     assert response.status_code == 403
-
-
-# ----------------------------------------------------------------------------------------------------
-@pytest.mark.django_db(transaction=True)
-def test_update_with_invalid_content_type(client):
-    # Arrange
-    headers = {"Authorization": "Bearer kk-secret"}
-
-    # Act
-    response = client.get("/api/update?t=invalid_content_type", headers=headers)
-
-    # Assert
-    assert response.status_code == 422
-
-
-@pytest.mark.django_db(transaction=True)
-def test_index_update_with_invalid_content_type(client):
-    headers = {"Authorization": "Bearer kk-secret"}
-    files = get_sample_files_data()
-
-    response = client.patch("/api/content?t=not-a-type", files=files, headers=headers)
-
-    assert response.status_code == 422
-
-
-# ----------------------------------------------------------------------------------------------------
-@pytest.mark.django_db(transaction=True)
-def test_regenerate_with_invalid_content_type(client):
-    # Arrange
-    headers = {"Authorization": "Bearer kk-secret"}
-
-    # Act
-    response = client.get("/api/update?force=true&t=invalid_content_type", headers=headers)
-
-    # Assert
-    assert response.status_code == 422
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -260,10 +258,10 @@ def test_get_configured_types_via_api(client, sample_markdown_data, default_user
 
 # ----------------------------------------------------------------------------------------------------
 @pytest.mark.django_db(transaction=True)
-def test_get_api_config_types(client, sample_markdown_data, default_user: KhojUser):
+def test_get_api_config_types(client, sample_markdown_data, api_user: KhojApiUser):
     # Arrange
     headers = {"Authorization": "Bearer kk-secret"}
-    text_search.setup(MarkdownToEntries, sample_markdown_data, regenerate=False, user=default_user)
+    text_search.setup(MarkdownToEntries, sample_markdown_data, regenerate=False, user=api_user.user)
 
     # Act
     response = client.get("/api/content/types", headers=headers)
@@ -274,9 +272,9 @@ def test_get_api_config_types(client, sample_markdown_data, default_user: KhojUs
 
 
 @pytest.mark.django_db(transaction=True)
-def test_get_content_source_files_for_search_page(client, sample_markdown_data, default_user: KhojUser):
+def test_get_content_source_files_for_search_page(client, sample_markdown_data, api_user: KhojApiUser):
     headers = {"Authorization": "Bearer kk-secret"}
-    text_search.setup(MarkdownToEntries, sample_markdown_data, regenerate=False, user=default_user)
+    text_search.setup(MarkdownToEntries, sample_markdown_data, regenerate=False, user=api_user.user)
 
     response = client.get("/api/content/computer", headers=headers)
 
@@ -368,59 +366,6 @@ def test_convert_text_file_without_content_type(client, api_user: KhojApiUser):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_create_chat_session_accepts_agent_slug_in_json_body(client, api_user: KhojApiUser):
-    chat_model = ChatModelFactory()
-    Agent.objects.update_or_create(
-        name="Khoj",
-        defaults={
-            "slug": "khoj",
-            "chat_model": chat_model,
-            "managed_by_admin": True,
-        },
-    )
-    agent = Agent.objects.create(
-        name="Obsidian Body Agent",
-        slug="obsidian-body-agent",
-        creator=api_user.user,
-        chat_model=chat_model,
-    )
-    headers = {"Authorization": f"Bearer {api_user.token}"}
-
-    response = client.post("/api/chat/sessions", headers=headers, json={"agent_slug": agent.slug})
-
-    assert response.status_code == 200
-    conversation = Conversation.objects.get(id=response.json()["conversation_id"])
-    assert conversation.agent_id == agent.id
-
-    response = client.post(f"/api/chat/sessions?agent_slug={agent.slug}", headers=headers)
-
-    assert response.status_code == 200
-    conversation = Conversation.objects.get(id=response.json()["conversation_id"])
-    assert conversation.agent_id == agent.id
-
-    response = client.post("/api/chat/sessions", headers=headers)
-
-    assert response.status_code == 200
-    conversation = Conversation.objects.get(id=response.json()["conversation_id"])
-    assert conversation.agent.slug == "khoj"
-
-
-@pytest.mark.django_db(transaction=True)
-def test_create_chat_session_accepts_virtual_default_agent_slug_in_codex_runtime(
-    chat_client_with_auth, api_user: KhojApiUser, monkeypatch
-):
-    monkeypatch.setenv("KHOJ_CONVERSATION_RUNTIME", "codex")
-    Agent.objects.all().delete()
-    headers = {"Authorization": f"Bearer {api_user.token}"}
-
-    response = chat_client_with_auth.post("/api/chat/sessions?client=web&agent_slug=khoj", headers=headers)
-
-    assert response.status_code == 200
-    conversation = Conversation.objects.get(id=response.json()["conversation_id"])
-    assert conversation.agent is None
-
-
-@pytest.mark.django_db(transaction=True)
 def test_sidebar_chat_session_endpoints_return_lists(client, api_user: KhojApiUser):
     chat_model = ChatModelFactory()
     Agent.objects.update_or_create(
@@ -428,7 +373,6 @@ def test_sidebar_chat_session_endpoints_return_lists(client, api_user: KhojApiUs
         defaults={
             "slug": "khoj",
             "chat_model": chat_model,
-            "managed_by_admin": True,
         },
     )
     headers = {"Authorization": f"Bearer {api_user.token}"}
@@ -457,7 +401,6 @@ def test_chat_history_returns_obsidian_session_shape(client, api_user: KhojApiUs
         defaults={
             "slug": "khoj",
             "chat_model": chat_model,
-            "managed_by_admin": True,
         },
     )
     headers = {"Authorization": f"Bearer {api_user.token}"}
@@ -494,33 +437,6 @@ def test_chat_history_returns_obsidian_session_shape(client, api_user: KhojApiUs
 
 
 @pytest.mark.django_db(transaction=True)
-def test_delete_self_removes_current_user_data_and_revokes_token(
-    client,
-    api_user3: KhojApiUser,
-    api_user2: KhojApiUser,
-):
-    chat_model = ChatModelFactory()
-    agent = Agent.objects.create(
-        name="Delete Me Agent",
-        creator=api_user3.user,
-        chat_model=chat_model,
-    )
-    Conversation.objects.create(user=api_user3.user, title="delete me", agent=agent)
-
-    response = client.delete("/api/self", headers={"Authorization": f"Bearer {api_user3.token}"})
-
-    assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
-    assert not KhojUser.objects.filter(id=api_user3.user_id).exists()
-    assert not KhojApiUser.objects.filter(token=api_user3.token).exists()
-    assert not Conversation.objects.filter(user_id=api_user3.user_id).exists()
-    assert not Agent.objects.filter(id=agent.id).exists()
-    assert KhojUser.objects.filter(id=api_user2.user_id).exists()
-
-    revoked_response = client.get("/api/search?q=hello", headers={"Authorization": f"Bearer {api_user3.token}"})
-    assert revoked_response.status_code == 403
-
-
 def test_chat_options_endpoint_returns_command_map(client):
     response = client.get("/api/chat/options")
 
@@ -528,46 +444,22 @@ def test_chat_options_endpoint_returns_command_map(client):
     assert isinstance(response.json(), dict)
 
 
-@pytest.mark.django_db(transaction=True)
-def test_api_token_generate_list_delete_flow(client, api_user: KhojApiUser):
-    headers = {"Authorization": f"Bearer {api_user.token}"}
+def test_removed_product_routes_are_not_registered(fastapi_app):
+    registered_paths = {route.path for route in fastapi_app.routes if hasattr(route, "path")}
+    removed_paths = {
+        "/login",
+        "/auth/token",
+        "/api/self",
+        "/api/user/name",
+        "/api/update",
+        "/api/content/size",
+        "/api/chat/starters",
+        "/api/chat/stats",
+        "/api/chat/export",
+        "/api/agents",
+    }
 
-    create_response = client.post("/auth/token", headers=headers)
-
-    assert create_response.status_code == 200
-    created_token = create_response.json()
-    assert isinstance(created_token["token"], str)
-    assert isinstance(created_token["name"], str)
-
-    list_response = client.get("/auth/token", headers=headers)
-    assert list_response.status_code == 200
-    assert any(token["token"] == created_token["token"] for token in list_response.json())
-
-    delete_response = client.delete(
-        f"/auth/token?token={quote(created_token['token'], safe='')}",
-        headers=headers,
-    )
-
-    assert delete_response.status_code == 200
-    list_response = client.get("/auth/token", headers=headers)
-    assert created_token["token"] not in [token["token"] for token in list_response.json()]
-
-
-@pytest.mark.django_db(transaction=True)
-def test_agent_generated_slug_is_url_safe(client, api_user: KhojApiUser):
-    chat_model = ChatModelFactory()
-    agent = Agent.objects.create(
-        name="R&D / 面试 #1?",
-        creator=api_user.user,
-        chat_model=chat_model,
-    )
-    headers = {"Authorization": f"Bearer {api_user.token}"}
-
-    assert re.fullmatch(r"[a-z0-9-]+", agent.slug)
-    response = client.get(f"/api/agents/{agent.slug}", headers=headers)
-
-    assert response.status_code == 200
-    assert response.json()["slug"] == agent.slug
+    assert removed_paths.isdisjoint(registered_paths)
 
 
 @pytest.mark.django_db(transaction=True)
@@ -596,6 +488,36 @@ def test_generate_chat_title_missing_conversation_returns_not_found(client, api_
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Conversation not found"}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_generate_chat_title_does_not_overwrite_messages_appended_while_waiting(client, api_user, monkeypatch):
+    from khoj.routers import api_chat
+
+    conversation = Conversation.objects.create(user=api_user.user, conversation_log={"chat": []})
+
+    async def append_turn_before_returning_title(user, *, conversation):
+        await ConversationAdapters.save_conversation(
+            user,
+            [
+                ChatMessageModel(by="you", message="question", turnId="concurrent-turn"),
+                ChatMessageModel(by="khoj", message="answer", turnId="concurrent-turn"),
+            ],
+            conversation_id=str(conversation.id),
+        )
+        return "Generated title"
+
+    monkeypatch.setattr(api_chat, "acreate_title_from_history", append_turn_before_returning_title)
+
+    response = client.post(
+        f"/api/chat/title?conversation_id={conversation.id}",
+        headers={"Authorization": f"Bearer {api_user.token}"},
+    )
+
+    assert response.status_code == 200
+    conversation.refresh_from_db()
+    assert conversation.slug == "Generated title"
+    assert [message["message"] for message in conversation.conversation_log["chat"]] == ["question", "answer"]
 
 
 @pytest.mark.django_db(transaction=True)
@@ -708,6 +630,35 @@ def test_delete_message_turn_removes_matching_messages(client, api_user: KhojApi
 
 
 @pytest.mark.django_db(transaction=True)
+def test_delete_message_turn_cancels_pending_vault_batch(client, api_user: KhojApiUser, tmp_path, monkeypatch):
+    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+    monkeypatch.setenv("KHOJ_ALLOW_VAULT_WRITE", "true")
+    turn_id = str(uuid.uuid4())
+    conversation = Conversation.objects.create(
+        user=api_user.user,
+        conversation_log={"chat": [{"by": "you", "message": "write", "turnId": turn_id}]},
+    )
+    batch = create_vault_action_batch(
+        user=api_user.user,
+        conversation=conversation,
+        turn_id=turn_id,
+        actions=[{"op": "create_file", "path": "daily.md", "content": "plan", "mode": "create_only"}],
+    )
+
+    response = client.request(
+        "DELETE",
+        "/api/chat/conversation/message",
+        headers={"Authorization": f"Bearer {api_user.token}"},
+        json={"conversation_id": str(conversation.id), "turn_id": turn_id},
+    )
+
+    batch.refresh_from_db()
+    assert response.status_code == 200
+    assert batch.status == VaultActionBatch.Status.CANCELLED
+    assert batch.result["reason"] == "conversation_turn_deleted"
+
+
+@pytest.mark.django_db(transaction=True)
 def test_delete_invalid_content_type_returns_bad_request(client):
     headers = {"Authorization": "Bearer kk-secret"}
 
@@ -728,19 +679,6 @@ def test_delete_invalid_content_source_returns_bad_request(client):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_set_user_name_accepts_encoded_special_characters(client, api_user: KhojApiUser):
-    name = "A&B"
-
-    response = client.patch(
-        f"/api/user/name?name={quote(name, safe='')}",
-        headers={"Authorization": f"Bearer {api_user.token}"},
-    )
-
-    assert response.status_code == 200
-    api_user.user.refresh_from_db()
-    assert api_user.user.first_name == name
-
-
 def test_next_export_text_files_are_served(client, tmp_path, monkeypatch):
     (tmp_path / "index.txt").write_text("root rsc", encoding="utf-8")
     settings_dir = tmp_path / "settings"
@@ -992,35 +930,19 @@ def test_chat_event_structured_streaming_predicate():
 
 
 @pytest.mark.django_db(transaction=True)
-def test_chat_export_pages_do_not_overlap(client, api_user: KhojApiUser):
-    Conversation.objects.filter(user=api_user.user).delete()
-    for index in range(12):
-        Conversation.objects.create(user=api_user.user, title=f"export-{index:02d}")
-    headers = {"Authorization": f"Bearer {api_user.token}"}
-
-    stats = client.get("/api/chat/stats", headers=headers).json()
-    first_page = client.get("/api/chat/export?page=0", headers=headers).json()
-    second_page = client.get("/api/chat/export?page=1", headers=headers).json()
-
-    first_titles = {conversation["title"] for conversation in first_page}
-    second_titles = {conversation["title"] for conversation in second_page}
-    assert stats == {"num_conversations": 12}
-    assert len(first_page) == 10
-    assert len(second_page) == 2
-    assert not first_titles & second_titles
-    assert first_titles | second_titles == {f"export-{index:02d}" for index in range(12)}
-
-
 @pytest.mark.asyncio
-async def test_websocket_chat_flushes_debounced_thought(monkeypatch):
+async def test_websocket_chat_forwards_enveloped_events(monkeypatch):
     import asyncio
     import json
 
     from khoj.routers import api_chat
     from khoj.utils.rawconfig import ChatRequestBody
 
-    async def fake_event_generator(*args, **kwargs):
+    async def fake_run_conversation_turn(*args, **kwargs):
         yield json.dumps({"type": api_chat.ChatEvent.THOUGHT.value, "data": "planning"})
+        yield api_chat.ChatEvent.END_EVENT.value
+        yield json.dumps({"type": api_chat.ChatEvent.MESSAGE.value, "data": '{"type":"invoice"}'})
+        yield api_chat.ChatEvent.END_EVENT.value
 
     class FakeUser:
         id = 1
@@ -1038,7 +960,7 @@ async def test_websocket_chat_flushes_debounced_thought(monkeypatch):
         async def send_text(self, text):
             self.sent.append(text)
 
-    monkeypatch.setattr(api_chat, "event_generator", fake_event_generator)
+    monkeypatch.setattr(api_chat, "run_conversation_turn", fake_run_conversation_turn)
     websocket = FakeWebSocket()
 
     await api_chat.process_chat_request(
@@ -1047,51 +969,193 @@ async def test_websocket_chat_flushes_debounced_thought(monkeypatch):
         common=None,
         interrupt_queue=asyncio.Queue(),
     )
-    await asyncio.sleep(0.2)
 
-    assert json.dumps({"type": "thought", "data": "planning"}) in websocket.sent
-    assert api_chat.ChatEvent.END_EVENT.value in websocket.sent
+    assert websocket.sent == [
+        json.dumps({"type": "thought", "data": "planning"}),
+        api_chat.ChatEvent.END_EVENT.value,
+        json.dumps({"type": "message", "data": '{"type":"invoice"}'}),
+        api_chat.ChatEvent.END_EVENT.value,
+    ]
 
 
 @pytest.mark.asyncio
-async def test_websocket_chat_flushes_first_debounced_message(monkeypatch):
+async def test_interrupt_chat_task_waits_for_graceful_persistence():
+    import asyncio
+
+    from khoj.routers import api_chat
+
+    interrupt_queue = asyncio.Queue()
+    persisted = asyncio.Event()
+
+    async def active_turn():
+        signal, acknowledged = await interrupt_queue.get()
+        assert signal == api_chat.ChatEvent.INTERRUPT.value
+        await asyncio.sleep(0)
+        persisted.set()
+        acknowledged.set()
+
+    task = asyncio.create_task(active_turn())
+    await api_chat._interrupt_chat_task(task, interrupt_queue)
+
+    assert persisted.is_set()
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_chat_task_cancels_after_bounded_grace(monkeypatch):
+    import asyncio
+
+    from khoj.routers import api_chat
+
+    interrupt_queue = asyncio.Queue()
+    cleaned_up = asyncio.Event()
+
+    async def stuck_turn():
+        await interrupt_queue.get()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned_up.set()
+
+    monkeypatch.setattr(api_chat, "WEBSOCKET_INTERRUPT_GRACE_SECONDS", 0.01)
+    task = asyncio.create_task(stuck_turn())
+
+    await api_chat._interrupt_chat_task(task, interrupt_queue)
+
+    assert task.cancelled()
+    assert cleaned_up.is_set()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_chat_task_replaces_a_full_queue_without_blocking(monkeypatch):
+    import asyncio
+
+    from khoj.routers import api_chat
+
+    interrupt_queue = asyncio.Queue(maxsize=1)
+    interrupt_queue.put_nowait("stale instruction")
+    cleaned_up = asyncio.Event()
+
+    async def stuck_turn():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned_up.set()
+
+    monkeypatch.setattr(api_chat, "WEBSOCKET_INTERRUPT_GRACE_SECONDS", 0.01)
+    task = asyncio.create_task(stuck_turn())
+
+    await asyncio.wait_for(api_chat._interrupt_chat_task(task, interrupt_queue), timeout=0.1)
+
+    assert task.cancelled()
+    assert cleaned_up.is_set()
+
+
+def test_continuation_interrupt_rejects_a_full_queue_without_waiting():
+    import asyncio
+
+    from khoj.routers import api_chat
+
+    interrupt_queue = asyncio.Queue(maxsize=1)
+    interrupt_queue.put_nowait("existing instruction")
+
+    assert api_chat._enqueue_interrupt_signal(interrupt_queue, "new instruction") is False
+    assert interrupt_queue.get_nowait() == "existing instruction"
+
+
+@pytest.mark.asyncio
+async def test_http_disconnect_waiter_reaps_children_when_cancelled():
+    import asyncio
+
+    from khoj.routers import api_chat
+
+    receive_started = asyncio.Event()
+    receive_cleaned = asyncio.Event()
+
+    class WaitingRequest:
+        async def receive(self):
+            receive_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                receive_cleaned.set()
+
+    waiter = asyncio.create_task(api_chat._wait_for_http_disconnect(WaitingRequest(), asyncio.Event()))
+    await receive_started.wait()
+    waiter.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert receive_cleaned.is_set()
+
+
+@pytest.mark.asyncio
+async def test_monitor_shutdown_allows_finalizer_to_finish():
+    import asyncio
+
+    from khoj.routers import api_chat
+
+    shutdown = asyncio.Event()
+    finalized = asyncio.Event()
+
+    async def monitor():
+        try:
+            await shutdown.wait()
+        finally:
+            await asyncio.sleep(0)
+            finalized.set()
+
+    monitor_task = asyncio.create_task(monitor())
+    await api_chat._shutdown_monitor_task(monitor_task, shutdown)
+
+    assert finalized.is_set()
+    assert monitor_task.done() and not monitor_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_conversation_turn_wrapper_cleans_monitor_after_failure(monkeypatch):
     import asyncio
 
     from khoj.routers import api_chat
     from khoj.utils.rawconfig import ChatRequestBody
 
-    async def fake_event_generator(*args, **kwargs):
-        yield "hello"
+    monitor_cleaned = asyncio.Event()
 
-    class FakeUser:
-        id = 1
+    async def failing_turn(*args, shutdown_event, monitor_tasks, **kwargs):
+        async def monitor():
+            await shutdown_event.wait()
+            monitor_cleaned.set()
 
-    class FakeScopeUser:
-        object = FakeUser()
+        monitor_tasks.append(asyncio.create_task(monitor()))
+        yield "event"
+        raise RuntimeError("turn failed")
 
-    class FakeWebSocket:
-        scope = {"user": FakeScopeUser()}
-        headers = {}
-
-        def __init__(self):
-            self.sent = []
-
-        async def send_text(self, text):
-            self.sent.append(text)
-
-    monkeypatch.setattr(api_chat, "event_generator", fake_event_generator)
-    websocket = FakeWebSocket()
-
-    await api_chat.process_chat_request(
-        websocket,
+    monkeypatch.setattr(api_chat, "_run_conversation_turn_impl", failing_turn)
+    iterator = api_chat.run_conversation_turn(
         ChatRequestBody(q="hello", stream=True),
-        common=None,
-        interrupt_queue=asyncio.Queue(),
+        object(),
+        object(),
+        object(),
+        object(),
     )
-    await asyncio.sleep(0.2)
 
-    assert "hello" in websocket.sent
-    assert api_chat.ChatEvent.END_EVENT.value in websocket.sent
+    with pytest.raises(RuntimeError, match="turn failed"):
+        _ = [event async for event in iterator]
+
+    assert monitor_cleaned.is_set()
+
+
+def test_message_processor_requires_envelopes_and_preserves_json_text():
+    from khoj.routers.helpers import MessageProcessor
+
+    processor = MessageProcessor()
+    with pytest.raises(ValueError, match="stream event"):
+        processor.convert_message_chunk_to_json("plain text")
+
+    processor.process_message_chunk('{"type":"message","data":"{\\"type\\":\\"invoice\\"}"}')
+
+    assert processor.raw_response == '{"type":"invoice"}'
 
 
 @pytest.mark.django_db(transaction=True)

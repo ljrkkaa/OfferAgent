@@ -30,11 +30,6 @@ def chat_page(request: Request):
     return templates.TemplateResponse(request, name="chat/index.html")
 
 
-@web_client.get("/agents", response_class=HTMLResponse)
-def agents_page(request: Request):
-    return templates.TemplateResponse(request, name="agents/index.html")
-
-
 @web_client.get("/settings", response_class=HTMLResponse)
 def config_page(request: Request):
     return templates.TemplateResponse(request, name="settings/index.html")

@@ -1,19 +1,24 @@
+import fnmatch
 import inspect
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, AsyncGenerator, Awaitable, Callable, Optional
 
 import yaml
+from pydantic import BaseModel, ConfigDict, ValidationError
 
-from khoj.processor.conversation.utils import ToolCall, load_complex_json
+from khoj.database.adapters import FileObjectAdapters
+from khoj.processor.conversation.utils import ToolCall
 from khoj.processor.conversation.vault_policy import compact_policy_for_prompt
+from khoj.search_type import text_search
 from khoj.utils.helpers import ConversationCommand, ToolDefinition, tools_for_research_llm
+from khoj.utils.lexical import query_terms
 from khoj.utils.local_kb import (
     LocalKBError,
     LocalKBWriteResult,
-    append_local_kb_note,
     get_local_kb_root,
     kb_grep,
     kb_headings,
@@ -21,19 +26,443 @@ from khoj.utils.local_kb import (
     kb_read,
     kb_resolve_link,
     local_kb_relative_path,
-    propose_local_kb_edit,
     resolve_local_kb_path,
 )
-from khoj.utils.openkb import wiki_search_documents
+from khoj.utils.openkb import get_kb_engine, openkb_is_ready, wiki_search_documents
+from khoj.utils.rawconfig import SearchResponse
+from khoj.utils.state import SearchType
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
-class NotesToolLoopResult:
+class WorkspaceToolResult:
     references: list[dict[str, Any]] = field(default_factory=list)
     inferred_queries: list[str] = field(default_factory=list)
     searched: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     tool_transcript: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class WorkspaceSources:
+    engine: str
+    local_root: Optional[Path]
+    local_enabled: bool
+    openkb_enabled: bool
+
+    @property
+    def tool_source_available(self) -> bool:
+        return self.local_enabled or self.openkb_enabled
+
+
+def get_workspace_sources() -> WorkspaceSources:
+    engine = get_kb_engine()
+    local_root = get_local_kb_root()
+    return WorkspaceSources(
+        engine=engine,
+        local_root=local_root,
+        local_enabled=local_root is not None and engine in {"file_first", "hybrid"},
+        openkb_enabled=engine in {"openkb", "hybrid"} and openkb_is_ready(),
+    )
+
+
+def dedupe_workspace_evidence(references: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for reference in references:
+        key = (
+            str(reference.get("uri") or ""),
+            str(reference.get("file") or ""),
+            str(reference.get("source_pages") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(reference)
+    return deduped
+
+
+async def search_indexed_evidence(user: Any, query: str, agent: Any = None, limit: int = 8) -> list[dict[str, Any]]:
+    if not getattr(user, "uuid", None):
+        return []
+    hits = await text_search.query(query, user, SearchType.All)
+    results = list(text_search.collate_results(hits))[: limit * 5]
+
+    unique_results = []
+    seen_files = set()
+    for result in results:
+        file_name = (result.additional or {}).get("file") or result.corpus_id
+        if file_name in seen_files:
+            continue
+        seen_files.add(file_name)
+        unique_results.append(result)
+        if len(unique_results) >= limit:
+            break
+
+    file_names = [(result.additional or {}).get("file") for result in unique_results]
+    file_objects = await FileObjectAdapters.aget_file_objects_by_names(user, [name for name in file_names if name])
+    raw_text_by_file = {file_object.file_name: file_object.raw_text for file_object in file_objects}
+
+    references: list[dict[str, Any]] = []
+    for result in unique_results:
+        additional = result.additional or {}
+        file_name = additional.get("file")
+        raw_text = raw_text_by_file.get(file_name)
+        references.append(
+            {
+                "query": additional.get("query") or query,
+                "file": file_name,
+                "uri": additional.get("uri") or file_name,
+                "compiled": f"# {file_name}\n{raw_text}" if raw_text else result.entry,
+                "score": result.score,
+                "source": additional.get("source") or "indexed",
+                "heading": additional.get("heading"),
+            }
+        )
+    return references
+
+
+def _search_local_workspace(query: str, limit: int) -> list[SearchResponse]:
+    results: list[SearchResponse] = []
+    seen: set[tuple[str, int]] = set()
+    terms = query_terms(query, max_terms=6, cjk_sizes=(4, 3, 2), ignore_prefixes=("file:", "dt:"))
+    for term in terms:
+        try:
+            matches = kb_grep(term, mode="literal", before=1, after=2, max_results=max(limit * 2, 1)).matches
+        except LocalKBError:
+            continue
+        for match in matches:
+            key = (str(match.get("path") or ""), int(match.get("line") or 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                item = kb_read(key[0], start_line=max(1, key[1] - 2), end_line=key[1] + 4, max_lines=80)
+            except LocalKBError:
+                continue
+            uri = f"local-kb://{item.path}#L{item.start_line}-L{item.end_line}"
+            results.append(
+                SearchResponse(
+                    entry=item.text,
+                    score=float(len(results)),
+                    additional={"file": item.path, "uri": uri, "query": term, "source": "local_kb"},
+                    corpus_id=uri,
+                )
+            )
+            if len(results) >= limit:
+                return results
+    return results
+
+
+async def search_workspace(
+    query: str,
+    user: Any,
+    *,
+    limit: int = 5,
+    search_type: SearchType = SearchType.All,
+) -> list[SearchResponse]:
+    searchable_types = {
+        SearchType.All.value,
+        SearchType.Markdown.value,
+        SearchType.Plaintext.value,
+        SearchType.Pdf.value,
+    }
+    if not query.strip() or getattr(search_type, "value", search_type) not in searchable_types:
+        return []
+
+    sources = get_workspace_sources()
+    results: list[SearchResponse] = []
+    if sources.local_enabled:
+        results.extend(_search_local_workspace(query, limit))
+    if len(results) < limit and sources.openkb_enabled:
+        refs, _, _ = await wiki_search_documents(query, limit - len(results), user, [], "api-search")
+        for index, reference in enumerate(dedupe_workspace_evidence(refs)[: limit - len(results)]):
+            results.append(
+                SearchResponse(
+                    entry=str(reference.get("compiled") or ""),
+                    score=float(index),
+                    additional={
+                        "file": reference.get("file"),
+                        "uri": reference.get("uri"),
+                        "query": reference.get("query"),
+                        "source": "openkb",
+                    },
+                    corpus_id=str(reference.get("uri") or reference.get("file") or index),
+                )
+            )
+    if not sources.tool_source_available:
+        hits = await text_search.query(query, user, search_type)
+        results.extend(list(text_search.collate_results(hits))[:limit])
+    return results[:limit]
+
+
+async def view_workspace_file(
+    path: str,
+    start_line: Optional[int] = None,
+    end_line: Optional[int] = None,
+    user: Any = None,
+) -> AsyncGenerator[list[dict[str, str]], None]:
+    query = f"View file: {path}"
+    if start_line and end_line:
+        query += f" (lines {start_line}-{end_line})"
+    if get_workspace_sources().local_enabled:
+        try:
+            item = kb_read(path, start_line=start_line, end_line=end_line, max_lines=80)
+            yield [{"query": query, "file": item.path, "uri": item.path, "compiled": item.text}]
+        except LocalKBError as error:
+            yield [{"query": query, "file": path, "uri": path, "compiled": str(error)}]
+        return
+
+    file_objects = await FileObjectAdapters.aget_file_objects_by_name(user, path)
+    if not file_objects:
+        message = f"File '{path}' not found in user documents"
+        yield [{"query": query, "file": path, "uri": path, "compiled": message}]
+        return
+    lines = file_objects[0].raw_text.split("\n")
+    first = start_line or 1
+    last = end_line or len(lines)
+    if first < 1 or last < 1 or first > last:
+        message = f"Invalid line range: {first}-{last}"
+        yield [{"query": query, "file": path, "uri": path, "compiled": message}]
+        return
+    if first > len(lines):
+        message = f"Start line {first} exceeds total number of lines {len(lines)}"
+        yield [{"query": query, "file": path, "uri": path, "compiled": message}]
+        return
+    start_index = first - 1
+    end_index = min(len(lines), last)
+    suffix = ""
+    if end_index - start_index > 50:
+        end_index = start_index + 50
+        suffix = "\n\n[Truncated after 50 lines! Use narrower line range to view complete section.]"
+    yield [{"query": query, "file": path, "uri": path, "compiled": "\n".join(lines[start_index:end_index]) + suffix}]
+
+
+async def read_workspace_document(path: str, user: Any, *, max_lines: int = 200) -> Optional[tuple[str, str]]:
+    if get_workspace_sources().local_enabled:
+        try:
+            item = kb_read(path, max_lines=max_lines)
+        except LocalKBError:
+            return None
+        return item.path, item.text
+    file_objects = await FileObjectAdapters.aget_file_objects_by_name(user, path)
+    if not file_objects:
+        return None
+    item = file_objects[0]
+    return item.file_name, item.raw_text
+
+
+def _grep_query(
+    line_count: int,
+    document_count: int,
+    path: str,
+    pattern: str,
+    lines_before: int,
+    lines_after: int,
+    max_results: int = 1000,
+) -> str:
+    query = f"**Found {line_count} matches for '{pattern}' in {document_count} documents**"
+    if path:
+        query += f" in {path}"
+    if lines_before or lines_after or line_count > max_results:
+        query += " Showing"
+    context = []
+    if lines_before:
+        context.append(f"{lines_before} lines before")
+    if lines_after:
+        context.append(f"{lines_after} lines after")
+    if context:
+        query += f" {' and '.join(context)}"
+    if line_count > max_results:
+        query += f"{' for' if context else ''} first {max_results} results"
+    return query
+
+
+async def grep_workspace_files(
+    regex_pattern: str,
+    path_prefix: Optional[str] = None,
+    lines_before: Optional[int] = None,
+    lines_after: Optional[int] = None,
+    user: Any = None,
+):
+    path_prefix = path_prefix or ""
+    before = lines_before or 0
+    after = lines_after or 0
+    try:
+        regex = re.compile(regex_pattern, re.IGNORECASE | re.MULTILINE)
+    except re.error as error:
+        yield {
+            "query": _grep_query(0, 0, path_prefix, regex_pattern, before, after),
+            "file": path_prefix,
+            "compiled": f"Invalid regex pattern: {error}",
+        }
+        return
+
+    if get_workspace_sources().local_enabled:
+        try:
+            result = kb_grep(
+                regex_pattern,
+                path_prefix=path_prefix,
+                mode="regex",
+                before=before,
+                after=after,
+                max_results=1000,
+            )
+            yield {
+                "query": _grep_query(
+                    result.line_count,
+                    result.document_count,
+                    path_prefix,
+                    regex_pattern,
+                    before,
+                    after,
+                ),
+                "file": path_prefix,
+                "uri": path_prefix,
+                "compiled": "\n".join(result.lines) if result.lines else "No matches found.",
+            }
+        except LocalKBError as error:
+            yield {
+                "query": _grep_query(0, 0, path_prefix, regex_pattern, before, after),
+                "file": path_prefix,
+                "uri": path_prefix,
+                "compiled": str(error),
+            }
+        return
+
+    db_pattern = re.sub(r"\(\?\w*\)", "", regex_pattern)
+    db_pattern = re.sub(r"^\^", "", db_pattern)
+    db_pattern = re.sub(r"\$$", "", db_pattern)
+    file_objects = await FileObjectAdapters.aget_file_objects_by_regex(user, db_pattern, path_prefix)
+    output: list[str] = []
+    match_count = 0
+    for file_object in file_objects:
+        lines = file_object.raw_text.split("\n")
+        matches = [index for index, line in enumerate(lines, 1) if regex.search(line)]
+        match_count += len(matches)
+        for line_number in matches:
+            start_index = max(0, line_number - 1 - before)
+            end_index = min(len(lines), line_number + after)
+            for index in range(start_index, end_index):
+                current = index + 1
+                marker = ":" if current == line_number else "-"
+                separator = " " if current == line_number else "  "
+                output.append(f"{file_object.file_name}{marker}{current}{marker}{separator}{lines[index]}")
+            if before or after:
+                output.append("--")
+    if output and output[-1] == "--":
+        output.pop()
+    query = _grep_query(match_count, len(file_objects), path_prefix, regex_pattern, before, after)
+    if not output:
+        yield {"query": query, "file": path_prefix, "uri": path_prefix, "compiled": "No matches found."}
+        return
+    if len(output) > 1000:
+        output = output[:1000] + [f"... {len(output) - 1000} more results found. Use a stricter regex."]
+    yield {"query": query, "file": path_prefix, "uri": path_prefix, "compiled": "\n".join(output)}
+
+
+async def list_workspace_files(
+    path: Optional[str] = None,
+    pattern: Optional[str] = None,
+    user: Any = None,
+):
+    def query(count: int) -> str:
+        text = f"**Found {count} files**"
+        if path:
+            text += f" in {path}"
+        if pattern:
+            text += f" filtered by {pattern}"
+        return text
+
+    if get_workspace_sources().local_enabled:
+        try:
+            result = kb_list(path, pattern, limit=100)
+            items = [f"{item['path']}/" if item["type"] == "directory" else item["path"] for item in result.items]
+            if result.truncated:
+                items.append(f"... {result.total - len(result.items)} more files found. Use a narrower pattern.")
+            yield {
+                "query": query(result.total),
+                "file": path,
+                "uri": path,
+                "compiled": "\n- ".join(items) if items else "No files found.",
+            }
+        except LocalKBError as error:
+            yield {"query": query(0), "file": path, "uri": path, "compiled": str(error)}
+        return
+
+    normalized_path = path or ""
+    if normalized_path in {"", "/", ".", "./", "~", "~/"}:
+        file_objects = await FileObjectAdapters.aget_all_file_objects(user, limit=10000)
+    else:
+        file_objects = await FileObjectAdapters.aget_file_objects_by_path_prefix(user, normalized_path)
+    files = [item.file_name for item in file_objects]
+    if normalized_path:
+        files = [name[len(normalized_path) :] for name in files]
+    if pattern:
+        files = [name for name in files if fnmatch.fnmatch(name, pattern)]
+    count = len(files)
+    if len(files) > 100:
+        files = files[:100] + [f"... {len(files) - 100} more files found. Use a narrower pattern."]
+    yield {
+        "query": query(count),
+        "file": normalized_path,
+        "uri": normalized_path,
+        "compiled": "\n- ".join(files) if files else "No files found.",
+    }
+
+
+async def view_workspace_headings(path: str, user: Any = None):
+    query = f"View headings: {path}"
+    if not get_workspace_sources().local_enabled:
+        yield {"query": query, "file": path, "uri": path, "compiled": "Local knowledge base is not configured."}
+        return
+    try:
+        result = kb_headings(path)
+        compiled = "\n".join(
+            f"{'#' * heading['level']} {heading['title']} (L{heading['start_line']}-L{heading['end_line']})"
+            for heading in result.headings
+        )
+        yield {
+            "query": query,
+            "file": result.path,
+            "uri": result.path,
+            "compiled": compiled or "No Markdown headings found.",
+        }
+    except LocalKBError as error:
+        yield {"query": query, "file": path, "uri": path, "compiled": str(error)}
+
+
+async def resolve_workspace_link(from_path: str, link: str, user: Any = None):
+    query = f"Resolve link: {link} from {from_path}"
+    if not get_workspace_sources().local_enabled:
+        yield {
+            "query": query,
+            "file": from_path,
+            "uri": from_path,
+            "compiled": "Local knowledge base is not configured.",
+        }
+        return
+    result = kb_resolve_link(from_path, link)
+    if result.status == "resolved":
+        compiled = f"Resolved to {result.resolved}{f'#{result.anchor}' if result.anchor else ''}"
+    elif result.status == "ambiguous":
+        compiled = "Ambiguous link candidates:\n- " + "\n- ".join(result.candidates)
+    else:
+        compiled = f"Link {result.status}."
+    yield {
+        "query": query,
+        "file": result.resolved or from_path,
+        "uri": result.resolved or from_path,
+        "compiled": compiled,
+    }
+
+
+class GroundingDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    grounded: bool
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -43,7 +472,62 @@ class LocalSkill:
     path: Path
 
 
-NOTES_TOOL_SYSTEM_PROMPT = """
+SOURCE_REF_SCHEMA = {
+    "type": "array",
+    "minItems": 1,
+    "description": "Exact sources used to produce note content.",
+    "items": {
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {"type": {"const": "current_user_request"}},
+                "required": ["type"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "type": {"const": "artifact"},
+                    "id": {"type": "string", "minLength": 1},
+                },
+                "required": ["type", "id"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "type": {"enum": ["assistant_message", "user_message"]},
+                    "turn": {"type": "integer"},
+                },
+                "required": ["type", "turn"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "type": {"const": "file"},
+                    "path": {"type": "string", "minLength": 1},
+                    "start_line": {"type": "integer", "minimum": 1, "maximum": 1_000_000},
+                    "end_line": {"type": "integer", "minimum": 1, "maximum": 1_000_000},
+                },
+                "required": ["type", "path"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "type": {"const": "tool_result"},
+                    "tool": {"type": "string", "minLength": 1},
+                },
+                "required": ["type", "tool"],
+                "additionalProperties": False,
+            },
+        ]
+    },
+}
+
+
+WORKSPACE_PLANNER_INSTRUCTIONS = """
 You collect evidence from the user's personal knowledge base for the main chat answer.
 
 For Notes requests, your first response should normally be a JSON tool call, not prose.
@@ -59,8 +543,11 @@ Use tools instead of guessing. Prefer this workflow:
 Only exact view_file or OpenKB evidence becomes final references. Use append_note only when the
 user clearly asks to create or append note content. append_note can create a new .md/.txt file under an
 existing folder. Use propose_edit for replace/delete/overwrite-style requests.
-For append_note, include source_refs and write_intent whenever content is derived from prior chat,
-files, tool results, or any source other than text explicitly provided in the current user request.
+When VaultActions are enabled, calling a write tool only prepares a reviewed action; it does not apply it.
+An explicit user request to write is sufficient to prepare that action. Do not ask a second confirmation,
+including when append_note will create a missing file; the client review UI is the confirmation boundary.
+For append_note, always include write_intent and source_refs. Use
+source_refs=[{"type":"current_user_request"}] when the content comes directly from the current request.
 When the needed content exists in Recent conversation artifacts, prefer artifact_id or
 source_refs=[{"type":"artifact","id":"..."}] over re-copying from raw chat history.
 If append_note says source_refs_required or source_mismatch, retry with concrete source_refs and
@@ -77,13 +564,14 @@ When enough evidence has been collected, return {"calls":[]}.
 APPEND_NOTE_TOOL = ToolDefinition(
     name="append_note",
     description=(
-        "Create or append user-approved content to a local knowledge base Markdown or text file. "
-        "Can create a new .md/.txt file under an existing folder when vault writes are enabled."
+        "Prepare a reviewed VaultAction to create or append grounded content in a local knowledge base file. "
+        "This does not immediately write. A missing .md/.txt file under an existing folder becomes a create-only "
+        "action, and the client review UI provides the later confirmation."
     ),
     schema={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Target local KB file path."},
+            "path": {"type": "string", "minLength": 1, "description": "Target local KB file path."},
             "artifact_id": {
                 "type": "string",
                 "description": "Conversation artifact id to append or adapt, e.g. assistant:<turnId>.",
@@ -92,30 +580,12 @@ APPEND_NOTE_TOOL = ToolDefinition(
             "heading": {"type": "string", "description": "Optional Markdown heading to append under."},
             "write_intent": {
                 "type": "string",
+                "enum": ["preserve", "summarize", "adapt_to_template", "merge"],
                 "description": "How content transforms source_refs, e.g. preserve, summarize, adapt_to_template, merge.",
             },
-            "source_refs": {
-                "type": "array",
-                "description": (
-                    "Concrete sources used to write content when content is not explicitly provided by the current user request. "
-                    "Examples: {type:'artifact', id:'assistant:<turnId>'}, {type:'assistant_message', turn:-1}, {type:'user_message', turn:-1}, "
-                    "{type:'file', path:'templates/daily-template.md'}."
-                ),
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "type": {"type": "string"},
-                        "id": {"type": "string"},
-                        "artifact_id": {"type": "string"},
-                        "turn": {"type": "integer"},
-                        "path": {"type": "string"},
-                        "start_line": {"type": "integer"},
-                        "end_line": {"type": "integer"},
-                    },
-                },
-            },
+            "source_refs": SOURCE_REF_SCHEMA,
         },
-        "required": ["path"],
+        "required": ["path", "write_intent", "source_refs"],
     },
 )
 
@@ -125,11 +595,11 @@ PROPOSE_EDIT_TOOL = ToolDefinition(
     schema={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Target local KB file path."},
-            "find": {"type": "string", "description": "Existing text to replace."},
+            "path": {"type": "string", "minLength": 1, "description": "Target local KB file path."},
+            "find": {"type": "string", "minLength": 1, "description": "Existing text to replace."},
             "replace": {"type": "string", "description": "Replacement text."},
             "reason": {"type": "string", "description": "Optional edit reason."},
-            "source_refs": APPEND_NOTE_TOOL.schema["properties"]["source_refs"],
+            "source_refs": SOURCE_REF_SCHEMA,
         },
         "required": ["path", "find", "replace"],
     },
@@ -141,8 +611,13 @@ OPENKB_TOOL = ToolDefinition(
     schema={
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "OpenKB wiki evidence query."},
-            "n": {"type": "integer", "description": "Maximum number of references to return."},
+            "query": {"type": "string", "minLength": 1, "description": "OpenKB wiki evidence query."},
+            "n": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "description": "Maximum number of references to return.",
+            },
         },
         "required": ["query"],
     },
@@ -154,7 +629,13 @@ READ_SKILL_TOOL = ToolDefinition(
     description="Read one local SKILL.md package by name before following its instructions.",
     schema={
         "type": "object",
-        "properties": {"name": {"type": "string", "description": "Skill name from the available skills catalog."}},
+        "properties": {
+            "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Skill name from the available skills catalog.",
+            }
+        },
         "required": ["name"],
     },
 )
@@ -332,24 +813,16 @@ def _local_read_reference(item, reason: str, remaining_chars: int) -> dict[str, 
 
 
 def _write_reference(result: LocalKBWriteResult) -> dict[str, Any]:
-    compiled = result.message
     local_root = get_local_kb_root()
-    if result.diff:
-        compiled += f"\n\n```diff\n{result.diff.rstrip()}\n```"
-    if result.start_line and result.end_line:
-        compiled += f"\n\nLines: {result.start_line}-{result.end_line}"
     return {
         "query": result.action,
         "file": result.path,
         "uri": f"local-kb://{result.path}",
         "kb_root": str(local_root) if local_root else None,
-        "compiled": compiled,
+        "compiled": result.message,
         "action": result.action,
         "status": result.status,
         "changed": result.changed,
-        "start_line": result.start_line,
-        "end_line": result.end_line,
-        "checksum": result.checksum,
     }
 
 
@@ -373,9 +846,10 @@ def _client_vault_action_reference(tool_name: str, args: dict[str, Any]) -> dict
             "op": op,
             "path": relpath,
             "content": content,
-            "heading": args.get("heading"),
             "mode": "append" if op == "append_file" else "create_only",
         }
+        if op == "append_file" and (heading := str(args.get("heading") or "").strip()):
+            vault_action["heading"] = heading
         message = f"Prepared client vault action {op} for {relpath}."
     elif tool_name == "propose_edit":
         vault_action = {
@@ -383,9 +857,10 @@ def _client_vault_action_reference(tool_name: str, args: dict[str, Any]) -> dict
             "path": relpath,
             "find": str(args.get("find") or ""),
             "replace": str(args.get("replace") or ""),
-            "reason": args.get("reason"),
             "mode": "replace",
         }
+        if reason := str(args.get("reason") or "").strip():
+            vault_action["reason"] = reason
         message = f"Prepared client vault action replace_text for {relpath}."
     else:
         raise LocalKBError(f"Unsupported client vault action: {tool_name}")
@@ -405,45 +880,10 @@ def _client_vault_action_reference(tool_name: str, args: dict[str, Any]) -> dict
 
 def _tool_result_text(value: Any, limit: int = 8000) -> str:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-    return text[:limit]
-
-
-def _parse_tool_calls(text: str) -> list[ToolCall]:
-    try:
-        payload = load_complex_json(text)
-    except Exception:
-        return []
-    if isinstance(payload, dict):
-        for key in ("calls", "tool_calls", "tools"):
-            if isinstance(payload.get(key), list):
-                payload = payload[key]
-                break
-        else:
-            payload = [payload]
-    calls = []
-    for item in payload or []:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name") or item.get("tool")
-        if not name:
-            continue
-        args = item.get("args") or item.get("arguments") or {}
-        if isinstance(args, str):
-            try:
-                args = load_complex_json(args)
-            except Exception:
-                args = {}
-        if not isinstance(args, dict):
-            args = {}
-        calls.append(ToolCall(name=name, args=args, id=item.get("id")))
-    return calls
-
-
-def _tool_specs(tools: list[ToolDefinition]) -> list[dict[str, Any]]:
-    return [{"name": tool.name, "description": tool.description, "schema": tool.schema} for tool in tools]
-
-
-_FILE_REF_RE = re.compile(r"[\w./-]+\.(?:md|txt|pdf|png|jpe?g|webp|json|ya?ml)", re.I)
+    if len(text) <= limit:
+        return text
+    preview_chars = max(1, (limit - 80) // 2)
+    return f"{text[:preview_chars]}\n...[tool result truncated]...\n{text[-preview_chars:]}"
 
 
 def _plain_message_text(message: Any) -> str:
@@ -466,7 +906,11 @@ def _plain_message_text(message: Any) -> str:
 
 
 def _message_by(message: Any) -> str:
-    value = (message.get("by") or message.get("role")) if isinstance(message, dict) else (getattr(message, "by", None) or getattr(message, "role", ""))
+    value = (
+        (message.get("by") or message.get("role"))
+        if isinstance(message, dict)
+        else (getattr(message, "by", None) or getattr(message, "role", ""))
+    )
     return str(value).lower()
 
 
@@ -521,46 +965,48 @@ def _select_turn(messages: list[Any], turn: Any) -> Any | None:
     return None
 
 
-def _source_ref_text(ref: dict[str, Any], chat_history: list, tool_transcript: list[dict[str, Any]]) -> str:
-    ref_type = str(ref.get("type") or ref.get("kind") or "").lower()
+def _source_ref_text(ref: dict[str, Any], query: str, chat_history: list, tool_transcript: list[dict[str, Any]]) -> str:
+    ref_type = str(ref.get("type") or "")
+    if ref_type == "current_user_request":
+        return query
     if ref_type == "artifact":
-        artifact = _find_artifact(chat_history, str(ref.get("id") or ref.get("artifact_id") or ""))
+        artifact = _find_artifact(chat_history, str(ref.get("id") or ""))
         return str(artifact.get("content") or "") if artifact else ""
-    if ref_type in {"assistant_message", "assistant"}:
+    if ref_type == "assistant_message":
         messages = [item for item in chat_history if _message_by(item) not in {"you", "user"}]
         selected = _select_turn(messages, ref.get("turn", -1))
         return _plain_message_text(selected) if selected is not None else ""
-    if ref_type in {"user_message", "user"}:
+    if ref_type == "user_message":
         messages = [item for item in chat_history if _message_by(item) in {"you", "user"}]
         selected = _select_turn(messages, ref.get("turn", -1))
         return _plain_message_text(selected) if selected is not None else ""
-    if ref_type in {"file", "view_file"} and ref.get("path"):
-        item = kb_read(ref.get("path") or "", start_line=ref.get("start_line"), end_line=ref.get("end_line"), max_lines=200)
+    if ref_type == "file":
+        item = kb_read(
+            ref.get("path") or "", start_line=ref.get("start_line"), end_line=ref.get("end_line"), max_lines=200
+        )
         return item.text
-    if ref_type in {"tool_result", "tool"}:
-        tool_name = str(ref.get("tool") or ref.get("name") or "")
+    if ref_type == "tool_result":
+        tool_name = str(ref.get("tool") or "")
         for item in reversed(tool_transcript):
-            if tool_name and item.get("tool") != tool_name:
+            if item.get("tool") != tool_name:
                 continue
             return str(item.get("result") or "")
     return ""
-
-
-def _compact_text(text: str) -> str:
-    return re.sub(r"\s+", "", text or "")
 
 
 def _tool_result_value(item: dict[str, Any]) -> Any:
     value = item.get("result")
     if isinstance(value, str):
         try:
-            return load_complex_json(value)
-        except Exception:
+            return json.loads(value)
+        except json.JSONDecodeError:
             return value
     return value
 
 
-def _edit_source_error(args: dict[str, Any], chat_history: list, tool_transcript: list[dict[str, Any]]) -> str:
+def _edit_source_error(
+    query: str, args: dict[str, Any], chat_history: list, tool_transcript: list[dict[str, Any]]
+) -> str:
     find = str(args.get("find") or "").strip()
     path = str(args.get("path") or "").strip()
     if not find:
@@ -569,7 +1015,7 @@ def _edit_source_error(args: dict[str, Any], chat_history: list, tool_transcript
     refs = args.get("source_refs")
     if isinstance(refs, list) and refs:
         source_text = "\n\n".join(
-            _source_ref_text(ref, chat_history, tool_transcript) for ref in refs if isinstance(ref, dict)
+            _source_ref_text(ref, query, chat_history, tool_transcript) for ref in refs if isinstance(ref, dict)
         )
         if find in source_text:
             return ""
@@ -588,24 +1034,11 @@ def _edit_source_error(args: dict[str, Any], chat_history: list, tool_transcript
     return "edit_source_required: Read the target file with view_file before calling propose_edit."
 
 
-def _source_refs_required_error(query: str, args: dict[str, Any]) -> str:
-    if args.get("source_refs"):
+def _source_refs_required_error(args: dict[str, Any]) -> str:
+    refs = args.get("source_refs")
+    if isinstance(refs, list) and refs:
         return ""
-    content = str(args.get("content") or "").strip()
-    if content and _compact_text(content) in _compact_text(query):
-        return ""
-    return (
-        "source_refs_required: append content was not explicitly provided in the current user request. "
-        "Retry append_note with concrete source_refs such as assistant_message, user_message, file, or tool_result."
-    )
-
-
-def _json_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"true", "yes", "ok", "grounded"}
-    return False
+    return "source_refs_required: append_note requires at least one concrete source_ref."
 
 
 async def _source_bound_append_error(
@@ -620,7 +1053,9 @@ async def _source_bound_append_error(
         return ""
     if not isinstance(refs, list):
         return "source_refs must be an array of concrete source objects."
-    source_texts = [_source_ref_text(ref, chat_history, tool_transcript) for ref in refs if isinstance(ref, dict)]
+    source_texts = [
+        _source_ref_text(ref, query, chat_history, tool_transcript) for ref in refs if isinstance(ref, dict)
+    ]
     source_text = "\n\n".join(text for text in source_texts if text.strip())
     if not source_text.strip():
         return "Could not resolve source_refs. Retry with concrete assistant_message, user_message, file, or tool_result refs."
@@ -629,19 +1064,12 @@ async def _source_bound_append_error(
     if content.strip() and any(content.strip() == text.strip() for text in source_texts):
         return ""
 
-    # Keep execution deterministic: code checks protocol/safety; the verifier owns semantic grounding.
-    content_file_refs = {ref.lower() for ref in _FILE_REF_RE.findall(content)}
-    source_file_refs = {ref.lower() for ref in _FILE_REF_RE.findall(source_text)}
-    new_file_refs = content_file_refs - source_file_refs
-    if new_file_refs:
-        return f"source_mismatch: append content mentions file refs not present in source_refs: {', '.join(sorted(new_file_refs))}."
-
     if not content.strip():
         return ""
 
     prompt = (
         "Check whether this append_note content is grounded in the declared sources.\n"
-        "Return only JSON: {\"grounded\": true|false, \"reason\": \"short reason\"}.\n"
+        'Return only JSON: {"grounded": true|false, "reason": "short reason"}.\n'
         "Accept summaries, rewording, and template formatting. Reject unrelated conversation topics, "
         "unsupported facts, or content that appears to come from another source.\n\n"
         f"User request:\n{query[:4000]}\n\n"
@@ -655,16 +1083,16 @@ async def _source_bound_append_error(
         chat_history=[],
         tools=[],
         response_type="json_object",
+        response_schema=GroundingDecision,
         deepthought=False,
         fast_model=False,
     )
     try:
-        verdict = load_complex_json(getattr(response, "text", "") or "")
-    except Exception:
-        verdict = {}
-    if not isinstance(verdict, dict) or not _json_bool(verdict.get("grounded")):
-        reason = verdict.get("reason") if isinstance(verdict, dict) else ""
-        return f"source_mismatch: grounding verifier rejected append content. {str(reason or '').strip()}"
+        verdict = GroundingDecision.model_validate(json.loads(getattr(response, "text", "") or ""))
+    except (json.JSONDecodeError, TypeError, ValueError, ValidationError):
+        return "source_mismatch: grounding verifier returned an invalid structured verdict."
+    if not verdict.grounded:
+        return f"source_mismatch: grounding verifier rejected append content. {verdict.reason.strip()}"
     return ""
 
 
@@ -689,11 +1117,32 @@ def _notes_tools(*, allow_local_kb: bool, allow_openkb: bool, allow_skills: bool
     return tools
 
 
-async def collect_notes_evidence_with_tools(
+def available_workspace_tools(*, allow_local_kb: bool, allow_openkb: bool) -> list[ToolDefinition]:
+    local_root = get_local_kb_root() if allow_local_kb else None
+    return _notes_tools(
+        allow_local_kb=local_root is not None,
+        allow_openkb=allow_openkb,
+        allow_skills=bool(_scan_local_skills(local_root)) if local_root else False,
+    )
+
+
+def workspace_planner_context(*, allow_local_kb: bool, vault_policy: Optional[dict[str, Any]] = None) -> str:
+    local_root = get_local_kb_root() if allow_local_kb else None
+    skills = _scan_local_skills(local_root) if local_root else []
+    return (
+        WORKSPACE_PLANNER_INSTRUCTIONS
+        + _vault_policy_prompt(vault_policy)
+        + _local_profile_prompt(local_root)
+        + _skill_prompt(skills)
+    )
+
+
+async def execute_workspace_tool_calls(
     query: str,
     chat_history: list,
     user: Any,
     agent: Any,
+    calls: list[ToolCall],
     *,
     send_message: Callable[..., Awaitable[Any]],
     send_status: Optional[Callable[[str], Any]] = None,
@@ -701,46 +1150,47 @@ async def collect_notes_evidence_with_tools(
     allow_local_kb: bool = True,
     allow_openkb: bool = False,
     conversation_id: str = "notes-tool-loop",
-    max_iterations: int = 4,
     max_evidence_chars: int = 16000,
     initial_tool_transcript: Optional[list[dict[str, Any]]] = None,
-    write_mode: str = "server",
-    vault_policy: Optional[dict[str, Any]] = None,
-) -> NotesToolLoopResult:
-    result = NotesToolLoopResult()
+    write_mode: str = "disabled",
+) -> WorkspaceToolResult:
+    result = WorkspaceToolResult()
     references: list[dict[str, Any]] = []
     evidence_chars = 0
     read_keys: set[tuple[str, int, int, str]] = set()
     local_root = get_local_kb_root()
     local_kb_allowed = allow_local_kb and local_root is not None
     local_skills = _scan_local_skills(local_root) if local_kb_allowed else []
-    tools = _notes_tools(
-        allow_local_kb=local_kb_allowed,
-        allow_openkb=allow_openkb,
-        allow_skills=bool(local_skills),
-    )
+    tools = available_workspace_tools(allow_local_kb=local_kb_allowed, allow_openkb=allow_openkb)
+    if write_mode != "client_actions":
+        tools = [tool for tool in tools if tool.name not in {"append_note", "propose_edit"}]
     if not tools:
         result.errors.append("No Notes evidence tools are available.")
         return result
-    allowed_tool_names = {tool.name for tool in tools}
+    tool_by_name = {tool.name: tool for tool in tools}
     skill_index = {skill.name: skill for skill in local_skills}
-    system_message = (
-        NOTES_TOOL_SYSTEM_PROMPT
-        + _vault_policy_prompt(vault_policy)
-        + _local_profile_prompt(local_root if local_kb_allowed else None)
-    )
-    system_message += _skill_prompt(local_skills)
-
+    initial_transcript_size = len(initial_tool_transcript or [])
     tool_transcript: list[dict[str, Any]] = list(initial_tool_transcript or [])
-    exact_evidence_retry_sent = False
-    artifact_catalog = _recent_artifact_catalog(chat_history)
-    await _send_status(send_status, "Planning Notes evidence with the main agent")
+    await _send_status(send_status, "Executing Notes tools")
+
+    async def finish_result() -> WorkspaceToolResult:
+        result.references = references
+        result.tool_transcript = tool_transcript[initial_transcript_size:]
+        result.inferred_queries = list(
+            dict.fromkeys(result.inferred_queries + [ref.get("query", "") for ref in references] + result.searched)
+        )
+        if result.references:
+            await _send_status(send_status, f"Found {len(result.references)} Notes references")
+        else:
+            await _send_status(send_status, "No Notes evidence found")
+        return result
 
     async def execute_tool(call: ToolCall) -> Any:
         nonlocal evidence_chars
         args = call.args or {}
         result.searched.append(f"{call.name} {json.dumps(args, ensure_ascii=False, default=str)}")
-        if call.name not in allowed_tool_names:
+        tool = tool_by_name.get(call.name)
+        if tool is None:
             message = f"Notes tool is not available: {call.name}"
             result.errors.append(message)
             return {"error": message}
@@ -759,8 +1209,8 @@ async def collect_notes_evidence_with_tools(
                     args.get("regex_pattern") or "",
                     path_prefix=args.get("path_prefix"),
                     mode="regex",
-                    before=_as_int(args.get("lines_before"), 0, 0, 5),
-                    after=_as_int(args.get("lines_after"), 0, 0, 5),
+                    before=_as_int(args.get("lines_before"), 0, 0, 20),
+                    after=_as_int(args.get("lines_after"), 0, 0, 20),
                     max_results=80,
                 )
                 return {
@@ -809,16 +1259,6 @@ async def collect_notes_evidence_with_tools(
                     "truncated": item.truncated,
                 }
             if call.name == "append_note":
-                if str(client_app or "").lower() == "qqbot":
-                    blocked = LocalKBWriteResult(
-                        action="append_note",
-                        path=str(args.get("path") or "").strip(),
-                        status="blocked",
-                        changed=False,
-                        message="QQBot client writes are disabled by default.",
-                    )
-                    references.append(_write_reference(blocked))
-                    return blocked.__dict__
                 args = dict(args)
                 artifact_id = str(args.get("artifact_id") or "").strip()
                 if artifact_id:
@@ -838,9 +1278,7 @@ async def collect_notes_evidence_with_tools(
                     source_refs = args.get("source_refs") if isinstance(args.get("source_refs"), list) else []
                     artifact_ref = {"type": "artifact", "id": artifact_id}
                     if not any(
-                        isinstance(ref, dict)
-                        and str(ref.get("type") or "") == "artifact"
-                        and str(ref.get("id") or ref.get("artifact_id") or "") == artifact_id
+                        isinstance(ref, dict) and ref.get("type") == "artifact" and ref.get("id") == artifact_id
                         for ref in source_refs
                     ):
                         args["source_refs"] = [*source_refs, artifact_ref]
@@ -855,7 +1293,7 @@ async def collect_notes_evidence_with_tools(
                     )
                     references.append(_write_reference(blocked))
                     return blocked.__dict__
-                source_refs_error = _source_refs_required_error(query, args)
+                source_refs_error = _source_refs_required_error(args)
                 if source_refs_error:
                     blocked = LocalKBWriteResult(
                         action="append_note",
@@ -866,7 +1304,9 @@ async def collect_notes_evidence_with_tools(
                     )
                     references.append(_write_reference(blocked))
                     return blocked.__dict__
-                source_error = await _source_bound_append_error(query, args, chat_history, tool_transcript, send_message)
+                source_error = await _source_bound_append_error(
+                    query, args, chat_history, tool_transcript, send_message
+                )
                 if source_error:
                     blocked = LocalKBWriteResult(
                         action="append_note",
@@ -877,15 +1317,11 @@ async def collect_notes_evidence_with_tools(
                     )
                     references.append(_write_reference(blocked))
                     return blocked.__dict__
-                if write_mode == "client_actions":
-                    action_ref = _client_vault_action_reference("append_note", args)
-                    references.append(action_ref)
-                    return {"status": "action_prepared", "vault_action": action_ref["vault_action"]}
-                write = append_local_kb_note(args.get("path") or "", args.get("content") or "", args.get("heading"))
-                references.append(_write_reference(write))
-                return write.__dict__
+                action_ref = _client_vault_action_reference("append_note", args)
+                references.append(action_ref)
+                return {"status": "action_prepared", "vault_action": action_ref["vault_action"]}
             if call.name == "propose_edit":
-                edit_source_error = _edit_source_error(args, chat_history, tool_transcript)
+                edit_source_error = _edit_source_error(query, args, chat_history, tool_transcript)
                 if edit_source_error:
                     blocked = LocalKBWriteResult(
                         action="propose_edit",
@@ -896,18 +1332,9 @@ async def collect_notes_evidence_with_tools(
                     )
                     references.append(_write_reference(blocked))
                     return blocked.__dict__
-                if write_mode == "client_actions":
-                    action_ref = _client_vault_action_reference("propose_edit", args)
-                    references.append(action_ref)
-                    return {"status": "action_prepared", "vault_action": action_ref["vault_action"]}
-                edit = propose_local_kb_edit(
-                    args.get("path") or "",
-                    args.get("find") or "",
-                    args.get("replace") or "",
-                    reason=args.get("reason"),
-                )
-                references.append(_write_reference(edit))
-                return edit.__dict__
+                action_ref = _client_vault_action_reference("propose_edit", args)
+                references.append(action_ref)
+                return {"status": "action_prepared", "vault_action": action_ref["vault_action"]}
             if call.name == "read_skill":
                 skill_name = str(args.get("name") or "").strip()
                 skill = skill_index.get(skill_name)
@@ -947,76 +1374,8 @@ async def collect_notes_evidence_with_tools(
                 return failed.__dict__
             return {"error": str(e)}
 
-    for _ in range(max(1, max_iterations)):
-        prompt = (
-            f"User question:\n{query}\n\n"
-            f"Recent conversation artifacts:\n{json.dumps(artifact_catalog, ensure_ascii=False, default=str)[:6000]}\n\n"
-            "Return a json object with a calls array. Use an empty calls array when no more tools are needed.\n\n"
-            f"Available tools:\n{json.dumps(_tool_specs(tools), ensure_ascii=False, default=str)[:8000]}\n\n"
-            f"Tool results so far:\n{json.dumps(tool_transcript, ensure_ascii=False, default=str)[:12000]}"
-        )
-        message_kwargs = {
-            "query": prompt,
-            "system_message": system_message,
-            "chat_history": chat_history,
-            "tools": [],
-            "response_type": "json_object",
-            "deepthought": True,
-            "fast_model": False,
-        }
-        for attempt in range(2):
-            try:
-                response = await send_message(
-                    **message_kwargs,
-                )
-                break
-            except Exception:
-                if attempt:
-                    raise
-                await _send_status(send_status, "Notes planner failed once; retrying")
-        if response and getattr(response, "thought", None):
-            await _send_status(send_status, response.thought)
-        calls = _parse_tool_calls(getattr(response, "text", "") or "")
-        if not calls:
-            if not tool_transcript:
-                tool_transcript.append(
-                    {
-                        "tool": "system",
-                        "args": {},
-                        "result": (
-                            "No tool call was returned. For a Notes request, use at least one relevant available "
-                            "tool before stopping. For write requests, call append_note or propose_edit."
-                        ),
-                    }
-                )
-                continue
-            if not references and not exact_evidence_retry_sent:
-                exact_evidence_retry_sent = True
-                tool_transcript.append(
-                    {
-                        "tool": "system",
-                        "args": {},
-                        "result": (
-                            "No exact Notes evidence has been collected yet. Discovery tools like list_files, "
-                            "regex_search_files, kb_headings, kb_resolve_link, and read_skill are not final "
-                            "references. If their results contain a candidate file or line, call view_file next."
-                        ),
-                    }
-                )
-                continue
-            break
-        for call in calls:
-            await _send_status(send_status, f"Using Notes tool: {call.name}")
-            tool_output = await execute_tool(call)
-            tool_transcript.append({"tool": call.name, "args": call.args, "result": _tool_result_text(tool_output)})
-
-    result.references = references
-    result.tool_transcript = tool_transcript
-    result.inferred_queries = list(
-        dict.fromkeys(result.inferred_queries + [ref.get("query", "") for ref in references] + result.searched)
-    )
-    if result.references:
-        await _send_status(send_status, f"Found {len(result.references)} Notes references")
-    else:
-        await _send_status(send_status, "No Notes evidence found")
-    return result
+    for call in calls:
+        await _send_status(send_status, f"Using Notes tool: {call.name}")
+        tool_output = await execute_tool(call)
+        tool_transcript.append({"tool": call.name, "args": call.args, "result": _tool_result_text(tool_output)})
+    return await finish_result()

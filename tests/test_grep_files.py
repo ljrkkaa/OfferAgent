@@ -5,7 +5,7 @@ import pytest
 
 from khoj.database.adapters import FileObjectAdapters
 from khoj.database.models import KhojUser
-from khoj.routers.helpers import grep_files
+from khoj.processor.conversation.knowledge_workspace import grep_workspace_files
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ async def test_grep_files_simple_match(default_user: KhojUser):
     # Act
     results = [
         result
-        async for result in grep_files(
+        async for result in grep_workspace_files(
             regex_pattern="hello",
             user=user,
         )
@@ -70,7 +70,7 @@ async def test_grep_files_no_match(default_user: KhojUser):
     # Act
     results = [
         result
-        async for result in grep_files(
+        async for result in grep_workspace_files(
             regex_pattern="nonexistent",
             user=user,
         )
@@ -103,7 +103,7 @@ async def test_grep_files_with_path_prefix(default_user: KhojUser):
     # Act
     results = [
         result
-        async for result in grep_files(
+        async for result in grep_workspace_files(
             regex_pattern="hello",
             path_prefix="dir1/",
             user=user,
@@ -134,7 +134,7 @@ async def test_grep_files_with_context(default_user: KhojUser):
     # Act
     results = [
         result
-        async for result in grep_files(
+        async for result in grep_workspace_files(
             regex_pattern="match",
             lines_before=1,
             lines_after=1,
@@ -162,7 +162,7 @@ async def test_grep_files_invalid_regex(default_user: KhojUser):
     # Act
     results = [
         result
-        async for result in grep_files(
+        async for result in grep_workspace_files(
             regex_pattern="[",
             user=user,
         )
@@ -194,7 +194,7 @@ async def test_grep_files_multiple_files(default_user: KhojUser):
     # Act
     results = [
         result
-        async for result in grep_files(
+        async for result in grep_workspace_files(
             regex_pattern="hello",
             user=user,
         )
@@ -262,7 +262,7 @@ async def test_grep_files_financial_entries_regex_patterns(
     # Act - Test the regex pattern
     results = [
         result
-        async for result in grep_files(
+        async for result in grep_workspace_files(
             regex_pattern=regex_pattern,
             user=user,
         )

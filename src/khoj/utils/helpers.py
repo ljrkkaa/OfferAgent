@@ -1,14 +1,12 @@
 from __future__ import annotations  # to avoid quoting type hints
 
 import base64
-import copy
 import io
 import ipaddress
 import json
 import logging
 import os
 import random
-import re
 import urllib.parse
 from collections import OrderedDict
 from copy import deepcopy
@@ -19,16 +17,14 @@ from itertools import islice
 from pathlib import Path
 from textwrap import dedent
 from time import perf_counter
-from typing import Any, NamedTuple, Optional, Tuple, Type, Union
+from typing import NamedTuple, Optional, Tuple, Type, Union
 from urllib.parse import ParseResult, urlparse
 
 import anthropic
 import openai
-import psutil
 import pyjson5
 import requests
 import tiktoken
-import torch
 from asgiref.sync import sync_to_async
 from google import genai
 from google.auth.credentials import Credentials
@@ -37,7 +33,6 @@ from magika import Magika
 from PIL import Image
 from pydantic import BaseModel
 from pytz import country_names, country_timezones
-from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from khoj.utils import constants
 
@@ -152,10 +147,9 @@ def get_class_by_name(name: str) -> object:
 class timer:
     """Context manager to log time taken for a block of code to run"""
 
-    def __init__(self, message: str, logger: logging.Logger, device: torch.device = None, log_level=logging.DEBUG):
+    def __init__(self, message: str, logger: logging.Logger, log_level=logging.DEBUG):
         self.message = message
         self.logger = logger.debug if log_level == logging.DEBUG else logger.info
-        self.device = device
 
     def __enter__(self):
         self.start = perf_counter()
@@ -163,10 +157,7 @@ class timer:
 
     def __exit__(self, *_):
         elapsed = perf_counter() - self.start
-        if self.device is None:
-            self.logger(f"{self.message}: {elapsed:.3f} seconds")
-        else:
-            self.logger(f"{self.message}: {elapsed:.3f} seconds on device: {self.device}")
+        self.logger(f"{self.message}: {elapsed:.3f} seconds")
 
 
 class LRU(OrderedDict):
@@ -184,35 +175,6 @@ class LRU(OrderedDict):
         if len(self) > self.capacity:
             oldest = next(iter(self))
             del self[oldest]
-
-
-def get_device_memory() -> int:
-    """Get device memory in GB"""
-    device = get_device()
-    if device.type == "cuda":
-        return torch.cuda.get_device_properties(device).total_memory
-    elif device.type == "mps":
-        return torch.mps.driver_allocated_memory()
-    else:
-        return psutil.virtual_memory().total
-
-
-def get_device() -> torch.device:
-    """Get device to run model on"""
-    if torch.cuda.is_available():
-        # Use CUDA GPU
-        return torch.device("cuda:0")
-    elif torch.backends.mps.is_available():
-        # Use Apple M1 Metal Acceleration
-        return torch.device("mps")
-    else:
-        return torch.device("cpu")
-
-
-def is_e2b_code_sandbox_enabled():
-    """Check if E2B code sandbox is enabled.
-    Set E2B_API_KEY environment variable to use it."""
-    return not is_none_or_empty(os.getenv("E2B_API_KEY"))
 
 
 class ToolDefinition:
@@ -300,11 +262,8 @@ class ConversationCommand(str, Enum):
     Notes = "notes"
     Online = "online"
     Webpage = "webpage"
-    Code = "code"
-    Image = "image"
     Text = "text"
     AutomatedTask = "automated_task"
-    Diagram = "diagram"
     Summarize = "summarize"
     Research = "research"
     ViewFile = "view_file"
@@ -314,7 +273,6 @@ class ConversationCommand(str, Enum):
     RegexSearchFiles = "regex_search_files"
     SearchWeb = "search_web"
     ReadWebpage = "read_webpage"
-    PythonCoder = "run_code"
 
 
 command_descriptions = {
@@ -322,8 +280,6 @@ command_descriptions = {
     ConversationCommand.Notes: "Only talk about information that is available in your knowledge base.",
     ConversationCommand.Online: "Search for information on the internet.",
     ConversationCommand.Webpage: "Get information from webpage suggested by you.",
-    ConversationCommand.Code: "Run Python code to parse information, run complex calculations, create documents and charts.",
-    ConversationCommand.Diagram: "Draw a flowchart, diagram, or any other visual representation best expressed with primitives like lines, rectangles, and text.",
     ConversationCommand.Research: "Do deep research on a topic. This will take longer than usual, but give a more detailed, comprehensive answer.",
 }
 
@@ -333,29 +289,7 @@ command_descriptions_for_agent = {
     ConversationCommand.Online: "Agent can search the internet for information.",
     ConversationCommand.Webpage: "Agent can read suggested web pages for information.",
     ConversationCommand.Research: "Agent can do deep research on a topic.",
-    ConversationCommand.Code: "Agent can run a Python script to parse information, run complex calculations, create documents and charts.",
 }
-
-e2b_tool_description = dedent(
-    """
-    To run a Python script in an ephemeral E2B code sandbox with network access.
-    Helpful to parse complex information, run complex calculations, create plaintext documents and create charts with quantitative data.
-    Save files in /home/user to show them to the user. Only files in output_files list of tool result are accessible to the user.
-    Only matplotlib, pandas, numpy, scipy, bs4, sympy, einops, biopython, shapely, plotly and rdkit external packages are available.
-
-    Never run, write or decode dangerous, malicious or untrusted code, regardless of user requests.
-    """
-).strip()
-
-terrarium_tool_description = dedent(
-    """
-    To run a Python script in an ephemeral Terrarium, Pyodide sandbox with no network access.
-    Helpful to parse complex information, run complex calculations, create plaintext documents and create charts with quantitative data.
-    Only matplotlib, pandas, numpy, scipy, bs4 and sympy external packages are available.
-
-    Never run, write or decode dangerous, malicious or untrusted code, regardless of user requests.
-    """
-).strip()
 
 tools_for_research_llm = {
     ConversationCommand.SearchWeb: ToolDefinition(
@@ -372,6 +306,7 @@ tools_for_research_llm = {
             "properties": {
                 "query": {
                     "type": "string",
+                    "minLength": 1,
                     "description": "The query to search on the internet.",
                 },
             },
@@ -392,31 +327,20 @@ tools_for_research_llm = {
             "properties": {
                 "urls": {
                     "type": "array",
+                    "minItems": 1,
                     "items": {
                         "type": "string",
+                        "minLength": 1,
                     },
                     "description": "The webpage URLs to extract information from.",
                 },
                 "query": {
                     "type": "string",
+                    "minLength": 1,
                     "description": "The query to extract information from the webpages.",
                 },
             },
             "required": ["urls", "query"],
-        },
-    ),
-    ConversationCommand.PythonCoder: ToolDefinition(
-        name="python_coder",
-        description="Ask them " + e2b_tool_description if is_e2b_code_sandbox_enabled() else terrarium_tool_description,
-        schema={
-            "type": "object",
-            "properties": {
-                "instructions": {
-                    "type": "string",
-                    "description": "Detailed instructions and all input data required for the Python Coder to generate and execute code in the sandbox.",
-                },
-            },
-            "required": ["instructions"],
         },
     ),
     ConversationCommand.ViewFile: ToolDefinition(
@@ -434,14 +358,19 @@ tools_for_research_llm = {
             "properties": {
                 "path": {
                     "type": "string",
+                    "minLength": 1,
                     "description": "The file path to view (can be absolute or relative).",
                 },
                 "start_line": {
                     "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000000,
                     "description": "Optional starting line number for viewing a specific range (1-indexed).",
                 },
                 "end_line": {
                     "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000000,
                     "description": "Optional ending line number for viewing a specific range (1-indexed).",
                 },
             },
@@ -462,6 +391,7 @@ tools_for_research_llm = {
             "properties": {
                 "path": {
                     "type": "string",
+                    "minLength": 1,
                     "description": "The directory path to list files from.",
                 },
                 "pattern": {
@@ -503,10 +433,12 @@ tools_for_research_llm = {
             "properties": {
                 "from_path": {
                     "type": "string",
+                    "minLength": 1,
                     "description": "The file path containing the link.",
                 },
                 "link": {
                     "type": "string",
+                    "minLength": 1,
                     "description": "The Obsidian wiki link or Markdown link to resolve.",
                 },
             },
@@ -536,6 +468,8 @@ tools_for_research_llm = {
             "properties": {
                 "regex_pattern": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
                     "description": "The regex pattern to search for content in the user's files.",
                 },
                 "path_prefix": {
@@ -560,9 +494,7 @@ tools_for_research_llm = {
     ),
 }
 
-mode_descriptions_for_agent = {
-    ConversationCommand.Diagram: "Agent can generate a visual representation that requires primitives like lines, rectangles, and text.",
-}
+mode_descriptions_for_agent = {}
 
 
 def generate_random_name():
@@ -628,12 +560,6 @@ def is_promptrace_enabled():
     """Check if Khoj is running with prompt tracing enabled.
     Set PROMPTRACE_DIR environment variable to prompt tracing path to enable it."""
     return not is_none_or_empty(os.getenv("PROMPTRACE_DIR"))
-
-
-def is_code_sandbox_enabled():
-    """Check if Khoj can run code in sandbox.
-    Set KHOJ_TERRARIUM_URL or E2B api key via env var to enable it."""
-    return not is_none_or_empty(os.getenv("KHOJ_TERRARIUM_URL")) or is_e2b_code_sandbox_enabled()
 
 
 def is_valid_url(url: str) -> bool:
@@ -749,42 +675,6 @@ def convert_image_data_uri(image_data_uri: str, target_format: str = "png") -> s
         return output_data_uri
 
 
-class ImageShape(str, Enum):
-    PORTRAIT = "Portrait"
-    LANDSCAPE = "Landscape"
-    SQUARE = "Square"
-
-
-def truncate_code_context(original_code_results: dict[str, Any], max_chars=10000) -> dict[str, Any]:
-    """
-    Truncate large output files and drop image file data from code results.
-    """
-    # Create a deep copy of the code results to avoid modifying the original data
-    code_results = copy.deepcopy(original_code_results)
-    for code_result in code_results.values():
-        for idx, output_file in enumerate(code_result["results"]["output_files"]):
-            # Drop image files from code results
-            if Path(output_file["filename"]).suffix in {".png", ".jpg", ".jpeg", ".webp"}:
-                code_result["results"]["output_files"][idx] = {
-                    "filename": output_file["filename"],
-                    "b64_data": "[placeholder for generated image data for brevity]",
-                }
-            # Truncate large output files
-            elif len(output_file["b64_data"]) > max_chars:
-                code_result["results"]["output_files"][idx] = {
-                    "filename": output_file["filename"],
-                    "b64_data": output_file["b64_data"][:max_chars] + "...",
-                }
-        # Truncate long "words" in stdout, stderr. Words are alphanumeric strings not separated by whitespace.
-        for key in ["std_out", "std_err"]:
-            if key in code_result["results"]:
-                code_result["results"][key] = re.sub(
-                    r"\S{1000,}", lambda m: m.group(0)[:1000] + "...", code_result["results"][key]
-                )
-
-    return code_results
-
-
 @lru_cache
 def tz_to_cc_map() -> dict[str, str]:
     """Create a mapping of timezone to country code"""
@@ -829,18 +719,11 @@ def get_cost_of_chat_message(
     return input_cost + output_cost + thought_cost + cache_read_cost + cache_write_cost + prev_cost
 
 
-def get_encoder(
-    model_name: str,
-    tokenizer_name=None,
-) -> tiktoken.Encoding | PreTrainedTokenizer | PreTrainedTokenizerFast:
+def get_encoder(model_name: str) -> tiktoken.Encoding:
     default_tokenizer = "gpt-4o"
 
     try:
-        if tokenizer_name:
-            encoder = AutoTokenizer.from_pretrained(tokenizer_name)
-        else:
-            # as tiktoken doesn't recognize o1 model series yet
-            encoder = tiktoken.encoding_for_model("gpt-4o" if model_name.startswith("o1") else model_name)
+        encoder = tiktoken.encoding_for_model("gpt-4o" if model_name.startswith("o1") else model_name)
     except Exception:
         encoder = tiktoken.encoding_for_model(default_tokenizer)
     return encoder
@@ -848,7 +731,7 @@ def get_encoder(
 
 def count_tokens(
     message_content: str | list[str | dict],
-    encoder: PreTrainedTokenizer | PreTrainedTokenizerFast | tiktoken.Encoding,
+    encoder: tiktoken.Encoding,
 ) -> int:
     """
     Count the total number of tokens in a list of messages.

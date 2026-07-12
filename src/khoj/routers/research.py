@@ -10,6 +10,14 @@ import yaml
 from khoj.database.adapters import AgentAdapters, EntryAdapters, McpServerAdapters
 from khoj.database.models import Agent, ChatMessageModel, KhojUser
 from khoj.processor.conversation import prompts
+from khoj.processor.conversation.knowledge_workspace import (
+    get_workspace_sources,
+    grep_workspace_files,
+    list_workspace_files,
+    resolve_workspace_link,
+    view_workspace_file,
+    view_workspace_headings,
+)
 from khoj.processor.conversation.utils import (
     ResearchIteration,
     ToolCall,
@@ -19,29 +27,20 @@ from khoj.processor.conversation.utils import (
 )
 from khoj.processor.tools.mcp import MCPClient
 from khoj.processor.tools.online_search import read_webpages_content, search_online
-from khoj.processor.tools.run_code import run_code
 from khoj.routers.helpers import (
     ChatEvent,
     get_message_from_queue,
-    grep_files,
-    list_files,
-    resolve_kb_link,
     send_message_to_model_wrapper,
-    view_file_content,
-    view_kb_headings,
 )
 from khoj.utils.helpers import (
     ConversationCommand,
     ToolDefinition,
     dict_to_tuple,
-    is_code_sandbox_enabled,
     is_none_or_empty,
     is_web_search_enabled,
     timer,
     tools_for_research_llm,
-    truncate_code_context,
 )
-from khoj.utils.local_kb import get_local_kb_root
 from khoj.utils.rawconfig import LocationData
 
 logger = logging.getLogger(__name__)
@@ -64,7 +63,6 @@ class ToolExecutionResult:
         self.status_messages: List = []
         self.document_results: List[Dict[str, str]] = []
         self.online_results: Dict = {}
-        self.code_results: Dict = {}
         self.mcp_results: List = []
         self.should_terminate: bool = False
 
@@ -151,29 +149,8 @@ async def execute_tool(
                             result.online_results[web_query] = {"webpages": direct_web_pages[web_query]["webpages"]}
                     iteration.onlineContext = result.online_results
 
-        elif iteration.query.name == ConversationCommand.PythonCoder:
-            async for res in run_code(
-                **iteration.query.args,
-                conversation_history=construct_tool_chat_history(previous_iterations, ConversationCommand.PythonCoder),
-                context="",
-                location_data=location,
-                user=user,
-                send_status_func=status_collector,
-                query_images=query_images,
-                query_files=query_files,
-                agent=agent,
-                tracer=tracer,
-            ):
-                # Status messages are collected by status_collector, skip ChatEvent.STATUS here
-                if not (isinstance(res, dict) and ChatEvent.STATUS in res):
-                    result.code_results = res
-                    iteration.codeContext = result.code_results
-            if iteration.codeContext:
-                async for _ in status_collector(f"**Ran code snippets**: {len(iteration.codeContext)}"):
-                    pass
-
         elif iteration.query.name == ConversationCommand.ViewFile:
-            async for res in view_file_content(
+            async for res in view_workspace_file(
                 **iteration.query.args,
                 user=user,
             ):
@@ -186,7 +163,7 @@ async def execute_tool(
                 pass
 
         elif iteration.query.name == ConversationCommand.ListFiles:
-            async for res in list_files(
+            async for res in list_workspace_files(
                 **iteration.query.args,
                 user=user,
             ):
@@ -201,7 +178,7 @@ async def execute_tool(
                     pass
 
         elif iteration.query.name == ConversationCommand.KbHeadings:
-            async for res in view_kb_headings(
+            async for res in view_workspace_headings(
                 **iteration.query.args,
                 user=user,
             ):
@@ -215,7 +192,7 @@ async def execute_tool(
                     pass
 
         elif iteration.query.name == ConversationCommand.KbResolveLink:
-            async for res in resolve_kb_link(
+            async for res in resolve_workspace_link(
                 **iteration.query.args,
                 user=user,
             ):
@@ -229,7 +206,7 @@ async def execute_tool(
                     pass
 
         elif iteration.query.name == ConversationCommand.RegexSearchFiles:
-            async for res in grep_files(
+            async for res in grep_workspace_files(
                 **iteration.query.args,
                 user=user,
             ):
@@ -291,32 +268,16 @@ async def apick_next_tool(
     # Construct tool options for the agent to choose from
     tools = []
     tool_options_str = ""
-    agent_input_tools = agent.input_tools if agent and agent.input_tools else []
-    agent_tools = []
-
-    # Map agent user facing tools to research tools to include in agents toolbox
     document_research_tools = _document_research_tools()
     web_research_tools = [ConversationCommand.SearchWeb, ConversationCommand.ReadWebpage]
-    input_tools_to_research_tools = {
-        ConversationCommand.Notes.value: [tool.value for tool in document_research_tools],
-        ConversationCommand.Webpage.value: [ConversationCommand.ReadWebpage.value],
-        ConversationCommand.Online.value: [ConversationCommand.SearchWeb.value],
-        ConversationCommand.Code.value: [ConversationCommand.PythonCoder.value],
-    }
-    for input_tool, research_tools in input_tools_to_research_tools.items():
-        if input_tool in agent_input_tools:
-            agent_tools += research_tools
 
     user_has_entries = await EntryAdapters.auser_has_entries(user)
-    has_document_source = user_has_entries or get_local_kb_root() is not None
+    has_document_source = user_has_entries or get_workspace_sources().tool_source_available
     for tool, tool_data in tools_for_research_llm.items():
         if tool in document_research_tools and not has_document_source:
             continue
         # Skip showing web search tool if agent has no access to internet
         if tool in web_research_tools and not is_web_search_enabled():
-            continue
-        # Skip showing code tool if agent has no access to code execution sandbox
-        if tool == ConversationCommand.PythonCoder and not is_code_sandbox_enabled():
             continue
         # Format description with relevant usage limits
         if tool == ConversationCommand.ReadWebpage:
@@ -325,16 +286,14 @@ async def apick_next_tool(
             description = tool_data.description.format(max_search_queries=max_online_searches)
         else:
             description = tool_data.description
-        # Add tool if agent does not have any tools defined or the tool is supported by the agent.
-        if len(agent_tools) == 0 or tool.value in agent_tools:
-            tool_options_str += f'- "{tool.value}": "{description}"\n'
-            tools.append(
-                ToolDefinition(
-                    name=tool.value,
-                    description=description,
-                    schema=tool_data.schema,
-                )
+        tool_options_str += f'- "{tool.value}": "{description}"\n'
+        tools.append(
+            ToolDefinition(
+                name=tool.value,
+                description=description,
+                schema=tool_data.schema,
             )
+        )
 
     # Get MCP tools
     for mcp_client in mcp_clients:
@@ -574,7 +533,6 @@ async def research(
                 if (
                     tool_result.document_results
                     or tool_result.online_results
-                    or tool_result.code_results
                     or tool_result.mcp_results
                     or this_iteration.warning
                 ):
@@ -583,8 +541,6 @@ async def research(
                         results_data += f"\n<document_references>\n{yaml.dump(tool_result.document_results, allow_unicode=True, sort_keys=False, default_flow_style=False)}\n</document_references>"
                     if tool_result.online_results:
                         results_data += f"\n<online_results>\n{yaml.dump(tool_result.online_results, allow_unicode=True, sort_keys=False, default_flow_style=False)}\n</online_results>"
-                    if tool_result.code_results:
-                        results_data += f"\n<code_results>\n{yaml.dump(truncate_code_context(tool_result.code_results), allow_unicode=True, sort_keys=False, default_flow_style=False)}\n</code_results>"
                     if tool_result.mcp_results:
                         results_data += f"\n<mcp_tool_results>\n{yaml.dump(tool_result.mcp_results, allow_unicode=True, sort_keys=False, default_flow_style=False)}\n</mcp_tool_results>"
                     if this_iteration.warning:

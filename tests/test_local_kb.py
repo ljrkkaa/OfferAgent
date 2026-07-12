@@ -6,14 +6,11 @@ from pathlib import Path
 
 from khoj.utils.local_kb import (
     LocalKBError,
-    append_local_kb_note,
     kb_grep,
     kb_headings,
     kb_list,
     kb_read,
     kb_resolve_link,
-    load_local_kb_profile_references,
-    propose_local_kb_edit,
     resolve_local_kb_path,
 )
 
@@ -31,11 +28,6 @@ class LocalKBTest(unittest.TestCase):
         keys = {
             "KHOJ_LOCAL_KB_PATH",
             "KHOJ_OBSIDIAN_VAULT_PATH",
-            "KHOJ_LOCAL_KB_PROFILE_MAX_FILES",
-            "KHOJ_LOCAL_KB_PROFILE_MAX_CHARS",
-            "KHOJ_LOCAL_VAULT_MAX_FILES",
-            "KHOJ_LOCAL_VAULT_MAX_CHARS",
-            "KHOJ_ALLOW_VAULT_WRITE",
         }
         old_values = {key: os.environ.get(key) for key in keys}
         try:
@@ -68,47 +60,6 @@ class LocalKBTest(unittest.TestCase):
 
         self.assertEqual(files, ["local.md"])
         self.assertEqual(result.total, 1)
-
-    def test_profile_references_read_agents_indexes_and_entry_links(self):
-        self.write("agents.md", "agent instructions")
-        self.write("index.md", "home [[interview/java]] [project](projects/index.md)")
-        self.write("interview/index.md", "interview home")
-        self.write("interview/java.md", "java notes")
-        self.write("projects/index.md", "project home")
-
-        with self.env(KHOJ_LOCAL_KB_PATH=str(self.root)):
-            references = load_local_kb_profile_references(max_files=10)
-
-        files = [item["file"] for item in references]
-        self.assertEqual(files[:3], ["agents.md", "index.md", "interview/index.md"])
-        self.assertIn("interview/java.md", files)
-        self.assertIn("projects/index.md", files)
-        self.assertTrue(references[0]["compiled"].startswith("# agents.md"))
-        self.assertEqual(references[0]["query"], "local_kb_profile")
-
-    def test_profile_references_ignore_invalid_caps(self):
-        self.write("agents.md", "agent instructions")
-
-        with self.env(
-            KHOJ_LOCAL_KB_PATH=str(self.root),
-            KHOJ_LOCAL_KB_PROFILE_MAX_FILES="abc",
-            KHOJ_LOCAL_KB_PROFILE_MAX_CHARS="bad",
-        ):
-            references = load_local_kb_profile_references(max_files=1, max_chars=12000)
-
-        self.assertEqual(references[0]["file"], "agents.md")
-
-    def test_profile_references_ignore_removed_local_vault_caps(self):
-        self.write("agents.md", "agent instructions")
-        self.write("index.md", "home")
-
-        with self.env(
-            KHOJ_LOCAL_KB_PATH=str(self.root),
-            KHOJ_LOCAL_VAULT_MAX_FILES="1",
-        ):
-            references = load_local_kb_profile_references(max_files=10)
-
-        self.assertEqual([item["file"] for item in references[:2]], ["agents.md", "index.md"])
 
     def test_read_file_limits_to_80_lines(self):
         self.write("notes.md", "\n".join(f"line {i}" for i in range(1, 101)))
@@ -156,11 +107,9 @@ class LocalKBTest(unittest.TestCase):
         with self.env(KHOJ_LOCAL_KB_PATH=str(self.root)):
             result = kb_list(limit=100)
             files = [item["path"] for item in result.items if item["type"] == "file"]
-            references = load_local_kb_profile_references()
 
         self.assertEqual(files, [])
         self.assertEqual(result.total, 0)
-        self.assertEqual(references, [])
 
     def test_list_skips_symlink_directories_outside_root(self):
         outside = tempfile.TemporaryDirectory()
@@ -316,61 +265,6 @@ class LocalKBTest(unittest.TestCase):
         with self.env():
             with self.assertRaisesRegex(LocalKBError, "not configured"):
                 kb_resolve_link("index.md", "[[Java]]")
-
-    def test_append_note_requires_write_flag(self):
-        self.write("notes.md", "alpha\n")
-
-        with self.env(KHOJ_LOCAL_KB_PATH=str(self.root)):
-            result = append_local_kb_note("notes.md", "beta")
-
-        self.assertFalse(result.changed)
-        self.assertEqual(result.status, "disabled")
-        self.assertEqual((self.root / "notes.md").read_text(encoding="utf-8"), "alpha\n")
-
-    def test_append_note_writes_with_flag_and_heading(self):
-        self.write("notes.md", "# Java\nold\n")
-
-        with self.env(KHOJ_LOCAL_KB_PATH=str(self.root), KHOJ_ALLOW_VAULT_WRITE="true"):
-            result = append_local_kb_note("notes.md", "HashMap 扩容要讲清楚。", heading="Java")
-
-        self.assertTrue(result.changed)
-        self.assertEqual(result.status, "written")
-        self.assertEqual(result.start_line, 4)
-        self.assertIn("HashMap 扩容要讲清楚。", (self.root / "notes.md").read_text(encoding="utf-8"))
-        self.assertTrue(result.checksum.startswith("sha256:"))
-
-    def test_append_note_creates_missing_parent_directories(self):
-        with self.env(KHOJ_LOCAL_KB_PATH=str(self.root), KHOJ_ALLOW_VAULT_WRITE="true"):
-            result = append_local_kb_note("daily/2026-07-01.md", "# Daily\nRedis review")
-
-        self.assertTrue(result.changed)
-        self.assertEqual(result.status, "written")
-        self.assertEqual((self.root / "daily/2026-07-01.md").read_text(encoding="utf-8"), "# Daily\nRedis review\n")
-
-    def test_propose_edit_does_not_modify_file(self):
-        self.write("notes.md", "old answer\n")
-
-        with self.env(KHOJ_LOCAL_KB_PATH=str(self.root), KHOJ_ALLOW_VAULT_WRITE="true"):
-            result = propose_local_kb_edit("notes.md", "old", "new", reason="test")
-
-        self.assertFalse(result.changed)
-        self.assertEqual(result.status, "proposed")
-        self.assertIn("-old answer", result.diff)
-        self.assertIn("+new answer", result.diff)
-        self.assertEqual((self.root / "notes.md").read_text(encoding="utf-8"), "old answer\n")
-
-    def test_propose_edit_rejects_ambiguous_find_text(self):
-        original = "## Redis 穿透\n解决方案：布隆过滤器。\n\n## Redis 击穿\n解决方案：布隆过滤器。\n"
-        self.write("notes.md", original)
-
-        with self.env(KHOJ_LOCAL_KB_PATH=str(self.root), KHOJ_ALLOW_VAULT_WRITE="true"):
-            result = propose_local_kb_edit("notes.md", "解决方案：布隆过滤器。", "解决方案：布隆过滤器 + 空值缓存。")
-
-        self.assertFalse(result.changed)
-        self.assertEqual(result.status, "ambiguous_match")
-        self.assertEqual(result.diff, "")
-        self.assertIn("matched 2 times", result.message)
-        self.assertEqual((self.root / "notes.md").read_text(encoding="utf-8"), original)
 
 
 if __name__ == "__main__":

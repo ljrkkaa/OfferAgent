@@ -1,9 +1,19 @@
 import argparse
+import ipaddress
 import logging
 import pathlib
 from importlib.metadata import version
 
 logger = logging.getLogger(__name__)
+
+
+def is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def cli(args=None):
@@ -40,6 +50,17 @@ def cli(args=None):
     )
 
     args, remaining_args = parser.parse_known_args(args)
+
+    if args.anonymous_mode and args.socket:
+        parser.error(
+            "--anonymous-mode cannot be used with --socket because a reverse proxy may expose it. "
+            "Use Bearer token mode behind a proxy."
+        )
+    if args.anonymous_mode and not is_loopback_host(args.host):
+        parser.error(
+            "--anonymous-mode may only bind to localhost/loopback. "
+            "Use Bearer token mode for LAN binds or forward the localhost port."
+        )
 
     if len(remaining_args) > 0:
         logger.info(f"⚠️  Ignoring unknown commandline args: {remaining_args}")

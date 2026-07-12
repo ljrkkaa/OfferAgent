@@ -241,13 +241,17 @@ def test_get_user_config_memory_server_enabled_default_on_user_opted_out():
 
 
 @pytest.mark.django_db(transaction=True)
-def test_memories_api_list_update_delete_preserves_memory_identity(client, api_user, tmp_path, monkeypatch):
+def test_memories_api_list_update_delete_preserves_memory_identity(
+    client, api_user, default_user, tmp_path, monkeypatch
+):
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
     memory = create_memory(
+        api_user.user,
         "prefers Java interview drills",
         "feedback",
         description="prefers Java interview drills",
     )
+    create_memory(default_user, "must not leak across users", "user")
     headers = {"Authorization": f"Bearer {api_user.token}"}
 
     response = client.get("/api/memories", headers=headers)
@@ -277,4 +281,4 @@ def test_memories_api_list_update_delete_preserves_memory_identity(client, api_u
 
     response = client.delete(f"/api/memories/{memory.id}", headers=headers)
     assert response.status_code == 204
-    assert get_memory_by_id(memory.id) is None
+    assert get_memory_by_id(api_user.user, memory.id) is None

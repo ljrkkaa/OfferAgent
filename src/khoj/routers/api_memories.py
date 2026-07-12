@@ -38,7 +38,7 @@ async def get_memories(
             "created_at": memory.created_at.isoformat(),
             "updated_at": memory.updated_at.isoformat(),
         }
-        for memory in list_memories()
+        for memory in list_memories(request.user.object)
     ]
 
     return Response(content=json.dumps(formatted_memories), media_type="application/json", status_code=200)
@@ -53,7 +53,7 @@ async def delete_memory(
 ):
     """Delete a specific memory by ID"""
     try:
-        deleted = delete_offeragent_memory(memory_id)
+        deleted = delete_offeragent_memory(request.user.object, memory_id)
     except ValueError:
         deleted = False
     if not deleted:
@@ -80,7 +80,7 @@ async def update_memory(
 ):
     """Update a specific memory's content"""
     try:
-        memory = get_memory_by_id(memory_id)
+        memory = get_memory_by_id(request.user.object, memory_id)
     except ValueError:
         memory = None
     if not memory:
@@ -97,7 +97,7 @@ async def update_memory(
         )
 
     try:
-        memory = update_offeragent_memory(memory_id, new_content)
+        memory = update_offeragent_memory(request.user.object, memory_id, new_content)
     except ValueError as e:
         return Response(content=json.dumps({"error": str(e)}), media_type="application/json", status_code=400)
 

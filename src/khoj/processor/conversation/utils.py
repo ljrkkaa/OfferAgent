@@ -1,16 +1,14 @@
-import asyncio
 import base64
 import json
 import logging
 import mimetypes
 import os
 import re
-import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from io import BytesIO
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 import PIL.Image
@@ -21,14 +19,11 @@ from anthropic import APIError as AnthropicAPIError
 from anthropic import RateLimitError as AnthropicRateLimitError
 from google.genai import errors as gerrors
 from langchain_core.messages.chat import ChatMessage
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import ConfigDict, ValidationError
 
-from khoj.database.adapters import ConversationAdapters
 from khoj.database.models import (
     ChatMessageModel,
-    ClientApplication,
     Intent,
-    KhojUser,
 )
 from khoj.processor.conversation import prompts
 from khoj.processor.conversation.offeragent_memory import (
@@ -47,8 +42,6 @@ from khoj.utils.helpers import (
     is_promptrace_enabled,
     merge_dicts,
 )
-from khoj.utils.rawconfig import FileAttachment
-from khoj.utils.yaml import yaml_dump
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +92,6 @@ model_to_prompt_size = {
     "claude-opus-4-0": 60000,
     "claude-opus-4-20250514": 60000,
 }
-model_to_tokenizer: Dict[str, str] = {}
 
 
 class RetryableModelError(Exception):
@@ -162,11 +154,6 @@ def is_retryable_exception(exception: BaseException) -> bool:
     return False
 
 
-class AgentMessage(BaseModel):
-    role: Literal["user", "assistant", "system", "environment"]
-    content: Union[str, List]
-
-
 class ToolCall:
     def __init__(self, name: str, args: dict, id: str):
         self.name = name
@@ -180,7 +167,6 @@ class ResearchIteration:
         query: ToolCall | dict | str,
         context: list = None,
         onlineContext: dict = None,
-        codeContext: dict = None,
         summarizedResult: str = None,
         warning: str = None,
         raw_response: list = None,
@@ -188,7 +174,6 @@ class ResearchIteration:
         self.query = ToolCall(**query) if isinstance(query, dict) else query
         self.context = context
         self.onlineContext = onlineContext
-        self.codeContext = codeContext
         self.summarizedResult = summarizedResult
         self.warning = warning
         self.raw_response = raw_response
@@ -197,31 +182,6 @@ class ResearchIteration:
         data = vars(self).copy()
         data["query"] = self.query.__dict__ if isinstance(self.query, ToolCall) else self.query
         return data
-
-
-_ARTIFACT_SOURCE_KEYS = ("query", "file", "uri", "action", "status", "start_line", "end_line", "kb_root")
-
-
-def _assistant_response_artifact(
-    chat_response: str,
-    turn_id: str,
-    compiled_references: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-    if not turn_id or not str(chat_response or "").strip():
-        return None
-    source_refs = []
-    for item in compiled_references or []:
-        if not isinstance(item, dict):
-            continue
-        ref = {key: item[key] for key in _ARTIFACT_SOURCE_KEYS if item.get(key) not in (None, "", [])}
-        if ref:
-            source_refs.append(ref)
-    return {
-        "id": f"assistant:{turn_id}",
-        "type": "assistant_response",
-        "content": chat_response,
-        "source_refs": source_refs,
-    }
 
 
 def construct_iteration_history(
@@ -318,10 +278,6 @@ def construct_chat_history(chat_history: list[ChatMessageModel], n: int = 4, age
             if inferred_queries:
                 chat_history_str += f'{agent_name}: {{"queries": {inferred_queries}}}\n'
             chat_history_str += f"{agent_name}: {chat.message}\n\n"
-        elif chat.by == "khoj" and chat.images:
-            chat_history_str += f"{agent_name}: [generated image redacted for space]\n"
-        elif chat.by == "khoj" and ("excalidraw" in intent_type):
-            chat_history_str += f"{agent_name}: {inferred_queries[0]}\n"
         elif chat.by == "you":
             chat_history_str += f"User: {chat.message}\n"
             raw_query_files = chat.queryFiles
@@ -367,11 +323,8 @@ def construct_question_history(
                 inferred_queries_list = [inferred_queries_list]
 
             if include_query:
-                # Ensure 'type' exists and is a string before checking 'to-image'
-                intent_type = chat.intent.type if chat.intent and chat.intent.type else ""
-                if "to-image" not in intent_type:
-                    history_parts += f'{agent_name}: {{"queries": {inferred_queries_list}}}\n'
-                    history_parts += f"A: {message}\n\n"
+                history_parts += f'{agent_name}: {{"queries": {inferred_queries_list}}}\n'
+                history_parts += f"A: {message}\n\n"
             else:
                 history_parts += f"{agent_name}: {message}\n\n"
 
@@ -379,27 +332,6 @@ def construct_question_history(
             original_query = None
 
     return history_parts
-
-
-def construct_chat_history_for_operator(conversation_history: List[ChatMessageModel], n: int = 6) -> list[AgentMessage]:
-    """
-    Construct chat history for operator agent in conversation log.
-    Only include last n completed turns (i.e with user and khoj message).
-    """
-    chat_history: list[AgentMessage] = []
-    user_message: Optional[AgentMessage] = None
-
-    for chat in conversation_history:
-        if len(chat_history) >= n:
-            break
-        if chat.by == "you" and chat.message:
-            content = [{"type": "text", "text": chat.message}]
-            for file in chat.queryFiles or []:
-                content += [{"type": "text", "text": f"## File: {file['name']}\n\n{file['content']}"}]
-            user_message = AgentMessage(role="user", content=content)
-        elif chat.by == "khoj" and chat.message:
-            chat_history += [user_message, AgentMessage(role="assistant", content=chat.message)]
-    return chat_history
 
 
 def construct_tool_chat_history(
@@ -422,9 +354,6 @@ def construct_tool_chat_history(
         ),
         ConversationCommand.ReadWebpage: (
             lambda iteration: list(iteration.onlineContext.keys()) if iteration.onlineContext else []
-        ),
-        ConversationCommand.PythonCoder: (
-            lambda iteration: list(iteration.codeContext.keys()) if iteration.codeContext else []
         ),
     }
     for iteration in previous_iterations:
@@ -470,7 +399,6 @@ class ChatEvent(Enum):
     END_LLM_RESPONSE = "end_llm_response"
     MESSAGE = "message"
     REFERENCES = "references"
-    GENERATED_ASSETS = "generated_assets"
     VAULT_ACTIONS = "vault_actions"
     STATUS = "status"
     THOUGHT = "thought"
@@ -484,11 +412,14 @@ class ChatEvent(Enum):
 def message_to_log(
     user_message,
     chat_response,
-    user_message_metadata={},
-    khoj_message_metadata={},
-    chat_history: List[ChatMessageModel] = [],
+    user_message_metadata=None,
+    khoj_message_metadata=None,
+    chat_history: Optional[List[ChatMessageModel]] = None,
 ) -> List[ChatMessageModel]:
     """Create json logs from messages, metadata for conversation log"""
+    user_message_metadata = {} if user_message_metadata is None else user_message_metadata
+    khoj_message_metadata = {} if khoj_message_metadata is None else khoj_message_metadata
+    chat_history = [] if chat_history is None else chat_history
     default_khoj_message_metadata = {
         "intent": {"type": "remember", "memory-type": "notes", "query": user_message},
     }
@@ -537,156 +468,6 @@ def message_to_log(
     khoj_message = ChatMessageModel(**khoj_log)
     chat_history.extend([human_message, khoj_message])
     return chat_history
-
-
-async def _run_offeragent_memory_update(
-    *,
-    user: KhojUser,
-    latest_user_message: str,
-    agent: Any = None,
-    source_turn_id: str = None,
-    used_notes_tool_loop: bool = False,
-    tracer: Dict[str, Any] = None,
-) -> None:
-    from khoj.routers.helpers import ai_update_offeragent_memory
-
-    await ai_update_offeragent_memory(
-        user=user,
-        latest_user_message=latest_user_message,
-        agent=agent,
-        source_turn_id=source_turn_id,
-        used_notes_tool_loop=used_notes_tool_loop,
-        tracer=tracer or {},
-    )
-
-
-def _log_offeragent_memory_update_result(task: asyncio.Task) -> None:
-    try:
-        task.result()
-    except asyncio.CancelledError:
-        logger.debug("OfferAgent background memory update was cancelled")
-    except Exception:
-        logger.exception("OfferAgent background memory update failed")
-
-
-def _schedule_offeragent_memory_update(
-    *,
-    user: KhojUser,
-    latest_user_message: str,
-    agent: Any = None,
-    source_turn_id: str = None,
-    used_notes_tool_loop: bool = False,
-    tracer: Dict[str, Any] = None,
-) -> asyncio.Task:
-    task = asyncio.create_task(
-        _run_offeragent_memory_update(
-            user=user,
-            latest_user_message=latest_user_message,
-            agent=agent,
-            source_turn_id=source_turn_id,
-            used_notes_tool_loop=used_notes_tool_loop,
-            tracer=dict(tracer or {}),
-        ),
-        name=f"offeragent-memory-update-{source_turn_id or 'unknown'}",
-    )
-    task.add_done_callback(_log_offeragent_memory_update_result)
-    return task
-
-
-async def save_to_conversation_log(
-    q: str,
-    chat_response: str,
-    user: KhojUser,
-    user_message_time: str = None,
-    compiled_references: List[Dict[str, Any]] = [],
-    online_results: Dict[str, Any] = {},
-    code_results: Dict[str, Any] = {},
-    inferred_queries: List[str] = [],
-    intent_type: str = "remember",
-    client_application: ClientApplication = None,
-    conversation_id: str = None,
-    automation_id: str = None,
-    relevant_memories: List[OfferAgentMemory] = [],
-    query_images: List[str] = None,
-    raw_query_files: List[FileAttachment] = [],
-    generated_images: List[str] = [],
-    generated_mermaidjs_diagram: str = None,
-    research_results: Optional[List[ResearchIteration]] = None,
-    train_of_thought: List[Any] = [],
-    tracer: Dict[str, Any] = {},
-    used_notes_tool_loop: bool = False,
-):
-    user_message_time = user_message_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    turn_id = tracer.get("mid") or str(uuid.uuid4())
-
-    user_message_metadata = {"created": user_message_time, "images": query_images, "turnId": turn_id}
-
-    if raw_query_files and len(raw_query_files) > 0:
-        user_message_metadata["queryFiles"] = [file.model_dump(mode="json") for file in raw_query_files]
-
-    khoj_message_metadata = {
-        "context": compiled_references,
-        "intent": {"inferred-queries": inferred_queries, "type": intent_type},
-        "onlineContext": online_results,
-        "codeContext": code_results,
-        "researchContext": [r.to_dict() for r in research_results] if research_results and not chat_response else None,
-        "automationId": automation_id,
-        "trainOfThought": train_of_thought,
-        "turnId": turn_id,
-        "images": generated_images,
-    }
-
-    artifact = _assistant_response_artifact(chat_response, turn_id, compiled_references)
-    if artifact:
-        khoj_message_metadata["artifacts"] = [artifact]
-
-    if generated_mermaidjs_diagram:
-        khoj_message_metadata["mermaidjsDiagram"] = generated_mermaidjs_diagram
-
-    try:
-        new_messages = message_to_log(
-            user_message=q,
-            chat_response=chat_response,
-            user_message_metadata=user_message_metadata,
-            khoj_message_metadata=khoj_message_metadata,
-            chat_history=[],
-        )
-    except ValidationError as e:
-        new_messages = None
-        logger.error(f"Error constructing chat history: {e}")
-
-    db_conversation = None
-    if new_messages:
-        db_conversation = await ConversationAdapters.save_conversation(
-            user,
-            new_messages,
-            client_application=client_application,
-            conversation_id=conversation_id,
-            user_message=q,
-        )
-
-    if not automation_id:
-        # Only explicit local long-term memories are persisted. Tool/file results stay in the vault/index.
-        _schedule_offeragent_memory_update(
-            user=user,
-            latest_user_message=q,
-            agent=db_conversation.agent if db_conversation else None,
-            source_turn_id=turn_id,
-            used_notes_tool_loop=used_notes_tool_loop,
-            tracer=tracer,
-        )
-
-    if is_promptrace_enabled():
-        merge_message_into_conversation_trace(q, chat_response, tracer)
-
-    logger.info(
-        f"""
-Saved Conversation Turn ({db_conversation.id if db_conversation else "N/A"}):
-You ({user.username}): "{q}"
-
-OfferAgent: "{chat_response}"
-""".strip()
-    )
 
 
 def construct_structured_message(
@@ -738,7 +519,6 @@ def generate_chatml_messages_with_context(
     query_images=None,
     context_message="",
     relevant_memories: List[OfferAgentMemory] = None,
-    generated_asset_results: Dict[str, Dict] = {},
     program_execution_context: List[str] = [],
     chat_history: list[ChatMessageModel] = [],
     system_message: str = None,
@@ -746,7 +526,6 @@ def generate_chatml_messages_with_context(
     model_name="gpt-4o-mini",
     model_type="",
     max_prompt_size=None,
-    tokenizer_name=None,
     vision_enabled=False,
 ):
     """Generate chat messages with appropriate context from previous conversation to send to the chat model"""
@@ -763,14 +542,8 @@ def generate_chatml_messages_with_context(
         message_context = []
         message_attached_files = ""
 
-        generated_assets = {}
-
         chat_message = chat.message
         role = "user" if chat.by == "you" else "assistant"
-
-        # Legacy code to handle excalidraw diagrams prior to Dec 2024
-        if chat.by == "khoj" and chat.intent and "excalidraw" in chat.intent.type:
-            chat_message = (chat.intent.inferred_queries or [])[0]
 
         # Add search and action context
         if not is_none_or_empty(chat.onlineContext):
@@ -778,14 +551,6 @@ def generate_chatml_messages_with_context(
                 {
                     "type": "text",
                     "text": f"{prompts.online_search_conversation.format(online_results=chat.onlineContext)}",
-                }
-            ]
-
-        if not is_none_or_empty(chat.codeContext):
-            message_context += [
-                {
-                    "type": "text",
-                    "text": f"{prompts.code_executed_context.format(code_results=chat.codeContext)}",
                 }
             ]
 
@@ -806,25 +571,6 @@ def generate_chatml_messages_with_context(
         if not is_none_or_empty(message_context):
             reconstructed_context_message = ChatMessage(content=message_context, role="user")
             chatml_messages.append(reconstructed_context_message)
-
-        # Add generated assets
-        if not is_none_or_empty(chat.images) and role == "assistant":
-            generated_assets["image"] = {
-                "description": (chat.intent.inferred_queries or [user_message])[0],
-            }
-
-        if not is_none_or_empty(chat.mermaidjsDiagram) and role == "assistant":
-            generated_assets["diagram"] = {
-                "query": (chat.intent.inferred_queries or [user_message])[0],
-            }
-
-        if not is_none_or_empty(generated_assets):
-            chatml_messages.append(
-                ChatMessage(
-                    content=f"{prompts.generated_assets_context.format(generated_assets=yaml_dump(generated_assets))}\n",
-                    role="user",
-                )
-            )
 
         # Add user query with attached file, images or khoj response
         if chat.queryFiles:
@@ -868,14 +614,6 @@ def generate_chatml_messages_with_context(
     if not is_none_or_empty(context_message):
         messages.append(ChatMessage(content=context_message, role="user"))
 
-    if not is_none_or_empty(generated_asset_results):
-        messages.append(
-            ChatMessage(
-                content=prompts.generated_assets_context.format(generated_assets=yaml_dump(generated_asset_results)),
-                role="user",
-            ),
-        )
-
     if not is_none_or_empty(user_message):
         messages.append(
             ChatMessage(
@@ -892,7 +630,7 @@ def generate_chatml_messages_with_context(
             message.content = [{"type": "text", "text": message.content}]
 
     # Truncate oldest messages from conversation history until under max supported prompt size by model
-    messages = truncate_messages(messages, max_prompt_size, model_name, tokenizer_name)
+    messages = truncate_messages(messages, max_prompt_size, model_name)
 
     # Return messages in chronological order
     return messages
@@ -915,10 +653,9 @@ def truncate_messages(
     messages: list[ChatMessage],
     max_prompt_size: int,
     model_name: str,
-    tokenizer_name=None,
 ) -> list[ChatMessage]:
     """Truncate messages to fit within max prompt size supported by model"""
-    encoder = get_encoder(model_name, tokenizer_name)
+    encoder = get_encoder(model_name)
 
     # Extract system message from messages
     system_message = []
@@ -1001,11 +738,6 @@ def reciprocal_conversation_to_chatml(message_pair):
 def clean_json(response: str):
     """Remove any markdown json codeblock and newline formatting if present. Useful for non schema enforceable models"""
     return response.strip().replace("\n", "").removeprefix("```json").removesuffix("```")
-
-
-def clean_mermaidjs(response: str):
-    """Remove any markdown mermaidjs codeblock and newline formatting if present. Useful for non schema enforceable models"""
-    return response.strip().removeprefix("```mermaid").removesuffix("```")
 
 
 def clean_code_python(code: str):

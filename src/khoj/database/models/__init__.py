@@ -1,16 +1,11 @@
 import logging
 import os
 import uuid
-from random import choice
 from typing import Dict, List, Optional, Union
 
 from django.contrib.auth.models import AbstractUser
-from django.contrib.postgres.fields import ArrayField
 from django.core.exceptions import ValidationError
 from django.db import models
-from django.db.models.signals import pre_save
-from django.dispatch import receiver
-from django.utils.text import slugify
 from pydantic import BaseModel as PydanticBaseModel
 from pydantic import Field, model_validator
 
@@ -36,24 +31,6 @@ class Context(PydanticBaseModel):
         else:
             self.uri = None
         return self
-
-
-class CodeContextFile(PydanticBaseModel):
-    filename: str
-    b64_data: str
-
-
-class CodeContextResult(PydanticBaseModel):
-    success: bool
-    output_files: List[CodeContextFile]
-    std_out: Optional[str] = None
-    std_err: str
-    code_runtime: Optional[int] = None
-
-
-class CodeContextData(PydanticBaseModel):
-    code: str
-    results: Optional[CodeContextResult] = None
 
 
 class WebPage(PydanticBaseModel):
@@ -118,14 +95,11 @@ class ChatMessageModel(PydanticBaseModel):
     trainOfThought: List[TrainOfThought] = []
     context: List[Context] = []
     onlineContext: Dict[str, OnlineContext] = {}
-    codeContext: Dict[str, CodeContextData] = {}
     researchContext: Optional[List] = None
     created: Optional[str] = None
     images: Optional[List[str]] = None
     queryFiles: Optional[List[Dict]] = None
     artifacts: Optional[List[Dict]] = None
-    excalidrawDiagram: Optional[List[Dict]] = None
-    mermaidjsDiagram: Optional[str] = None
     turnId: Optional[str] = None
     intent: Optional[Intent] = None
     automationId: Optional[str] = None
@@ -137,15 +111,6 @@ class DbBaseModel(models.Model):
 
     class Meta:
         abstract = True
-
-
-class ClientApplication(DbBaseModel):
-    name = models.CharField(max_length=200)
-    client_id = models.CharField(max_length=200)
-    client_secret = models.CharField(max_length=200)
-
-    def __str__(self):
-        return self.name
 
 
 class KhojUser(AbstractUser):
@@ -186,7 +151,6 @@ class ChatModel(DbBaseModel):
         GOOGLE = "google"
 
     max_prompt_size = models.IntegerField(default=None, null=True, blank=True)
-    tokenizer = models.CharField(max_length=200, default=None, null=True, blank=True)
     name = models.CharField(max_length=200, default="gemini-2.5-flash")
     friendly_name = models.CharField(max_length=200, default=None, null=True, blank=True)
     model_type = models.CharField(max_length=200, choices=ModelType.choices, default=ModelType.GOOGLE)
@@ -200,96 +164,10 @@ class ChatModel(DbBaseModel):
 
 
 class Agent(DbBaseModel):
-    class StyleColorTypes(models.TextChoices):
-        BLUE = "blue"
-        GREEN = "green"
-        RED = "red"
-        YELLOW = "yellow"
-        ORANGE = "orange"
-        PURPLE = "purple"
-        PINK = "pink"
-        TEAL = "teal"
-        CYAN = "cyan"
-        LIME = "lime"
-        INDIGO = "indigo"
-        FUCHSIA = "fuchsia"
-        ROSE = "rose"
-        SKY = "sky"
-        AMBER = "amber"
-        EMERALD = "emerald"
-
-    class StyleIconTypes(models.TextChoices):
-        LIGHTBULB = "Lightbulb"
-        HEALTH = "Health"
-        ROBOT = "Robot"
-        APERTURE = "Aperture"
-        GRADUATION_CAP = "GraduationCap"
-        JEEP = "Jeep"
-        ISLAND = "Island"
-        MATH_OPERATIONS = "MathOperations"
-        ASCLEPIUS = "Asclepius"
-        COUCH = "Couch"
-        CODE = "Code"
-        ATOM = "Atom"
-        CLOCK_COUNTER_CLOCKWISE = "ClockCounterClockwise"
-        PENCIL_LINE = "PencilLine"
-        CHALKBOARD = "Chalkboard"
-        CIGARETTE = "Cigarette"
-        CRANE_TOWER = "CraneTower"
-        HEART = "Heart"
-        LEAF = "Leaf"
-        NEWSPAPER_CLIPPING = "NewspaperClipping"
-        ORANGE_SLICE = "OrangeSlice"
-        SMILEY_MELTING = "SmileyMelting"
-        YIN_YANG = "YinYang"
-        SNEAKER_MOVE = "SneakerMove"
-        STUDENT = "Student"
-        OVEN = "Oven"
-        GAVEL = "Gavel"
-        BROADCAST = "Broadcast"
-
-    class InputToolOptions(models.TextChoices):
-        # These map to various ConversationCommand types
-        GENERAL = "general"
-        ONLINE = "online"
-        NOTES = "notes"
-        WEBPAGE = ("webpage",)
-        CODE = "code"
-
-    class OutputModeOptions(models.TextChoices):
-        # These map to various ConversationCommand types
-        DIAGRAM = "diagram"
-
-    creator = models.ForeignKey(
-        KhojUser, on_delete=models.CASCADE, default=None, null=True, blank=True
-    )  # Creator will only be null when the agents are managed by admin
     name = models.CharField(max_length=200)
     personality = models.TextField(default=None, null=True, blank=True)
-    input_tools = ArrayField(
-        models.CharField(max_length=200, choices=InputToolOptions.choices), default=list, null=True, blank=True
-    )
-    output_modes = ArrayField(
-        models.CharField(max_length=200, choices=OutputModeOptions.choices), default=list, null=True, blank=True
-    )
-    managed_by_admin = models.BooleanField(default=False)
     chat_model = models.ForeignKey(ChatModel, on_delete=models.CASCADE)
-    slug = models.CharField(max_length=200, unique=True)
-    style_color = models.CharField(max_length=200, choices=StyleColorTypes.choices, default=StyleColorTypes.ORANGE)
-    style_icon = models.CharField(max_length=200, choices=StyleIconTypes.choices, default=StyleIconTypes.LIGHTBULB)
-    is_hidden = models.BooleanField(default=False)
-
-    def save(self, *args, **kwargs):
-        is_new = self._state.adding
-
-        if self.creator is None:
-            self.managed_by_admin = True
-
-        if is_new and not self.slug:
-            random_sequence = "".join(choice("0123456789") for i in range(6))
-            slug = f"{slugify(self.name) or 'agent'}-{random_sequence}"
-            self.slug = slug
-
-        super().save(*args, **kwargs)
+    slug = models.CharField(max_length=200, unique=True, default="khoj")
 
     def __str__(self):
         return self.name
@@ -307,14 +185,6 @@ class ProcessLock(DbBaseModel):
     name = models.CharField(max_length=200, choices=Operation.choices, unique=True)
     started_at = models.DateTimeField(auto_now_add=True)
     max_duration_in_seconds = models.IntegerField(default=60 * 60 * 12)  # 12 hours
-
-
-@receiver(pre_save, sender=Agent)
-def verify_agent(sender, instance, **kwargs):
-    # check if this is a new instance
-    if instance._state.adding:
-        if Agent.objects.filter(name=instance.name, creator=instance.creator).exists():
-            raise ValidationError(f"An Agent with the name {instance.name} already exists.")
 
 
 class WebScraper(DbBaseModel):
@@ -445,7 +315,6 @@ class UserConversationConfig(DbBaseModel):
 class Conversation(DbBaseModel):
     user = models.ForeignKey(KhojUser, on_delete=models.CASCADE)
     conversation_log = models.JSONField(default=dict)
-    client = models.ForeignKey(ClientApplication, on_delete=models.CASCADE, default=None, null=True, blank=True)
 
     # Slug is an app-generated conversation identifier. Need not be unique. Used as display title essentially.
     slug = models.CharField(max_length=200, default=None, null=True, blank=True)
@@ -499,38 +368,46 @@ class Conversation(DbBaseModel):
                 continue
         return validated_messages
 
-    async def pop_message(self, interrupted: bool = False) -> Optional[ChatMessageModel]:
-        """
-        Remove and return the last message from the conversation log, persisting the change to the database.
-        When interrupted is True, we only drop the last message if it was an interrupted message by khoj.
-        """
-        chat_log = self.conversation_log.get("chat", [])
 
-        if not chat_log:
-            return None
+class VaultActionBatch(DbBaseModel):
+    class Status(models.TextChoices):
+        PENDING = "pending"
+        APPLYING = "applying"
+        APPLIED = "applied"
+        CANCELLED = "cancelled"
+        CONFLICT = "conflict"
+        FAILED = "failed"
+        EXPIRED = "expired"
+        MANUAL_REVIEW_REQUIRED = "manual_review_required"
 
-        last_message = chat_log[-1]
-        is_interrupted_msg = last_message.get("by") == "khoj" and not last_message.get("message")
-        # When handling an interruption, only pop if the last message is an empty one by khoj.
-        if interrupted and not is_interrupted_msg:
-            return None
+    id = models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True)
+    user = models.ForeignKey(KhojUser, on_delete=models.CASCADE)
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE)
+    turn_id = models.UUIDField()
+    status = models.CharField(max_length=32, choices=Status.choices, default=Status.PENDING)
+    actions = models.JSONField(default=list)
+    snapshots = models.JSONField(default=dict)
+    previews = models.JSONField(default=list)
+    root_fingerprint = models.CharField(max_length=64)
+    action_digest = models.CharField(max_length=64)
+    rollback_journal = models.JSONField(default=dict)
+    result = models.JSONField(default=dict)
+    expires_at = models.DateTimeField()
 
-        # Pop the last message, save the conversation, and then return the message.
-        popped_message_dict = chat_log.pop()
-        await self.asave()
-
-        # Try to validate and return the popped message as a Pydantic model
-        try:
-            return ChatMessageModel.model_validate(popped_message_dict)
-        except ValidationError as e:
-            logger.warning(f"Popped an invalid message from conversation. The removal has been saved. Error: {e}")
-            # The invalid message was removed and saved, but we can't return a valid model.
-            return None
-
-
-class ReflectiveQuestion(DbBaseModel):
-    question = models.CharField(max_length=500)
-    user = models.ForeignKey(KhojUser, on_delete=models.CASCADE, default=None, null=True, blank=True)
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["conversation", "turn_id"],
+                name="unique_vault_batch_turn",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["user", "conversation", "status", "created_at"],
+                name="vault_batch_owner_status_idx",
+            ),
+            models.Index(fields=["status", "expires_at"], name="vault_batch_expiry_idx"),
+        ]
 
 
 class FileObject(DbBaseModel):
@@ -538,7 +415,6 @@ class FileObject(DbBaseModel):
     file_name = models.CharField(max_length=400, default=None, null=True, blank=True)
     raw_text = models.TextField()
     user = models.ForeignKey(KhojUser, on_delete=models.CASCADE, default=None, null=True, blank=True)
-    agent = models.ForeignKey(Agent, on_delete=models.CASCADE, default=None, null=True, blank=True)
 
 
 class Entry(DbBaseModel):
@@ -552,7 +428,6 @@ class Entry(DbBaseModel):
         COMPUTER = "computer"
 
     user = models.ForeignKey(KhojUser, on_delete=models.CASCADE, default=None, null=True, blank=True)
-    agent = models.ForeignKey(Agent, on_delete=models.CASCADE, default=None, null=True, blank=True)
     raw = models.TextField()
     compiled = models.TextField()
     heading = models.CharField(max_length=1000, default=None, null=True, blank=True)
@@ -564,10 +439,6 @@ class Entry(DbBaseModel):
     hashed_value = models.CharField(max_length=100)
     corpus_id = models.UUIDField(default=uuid.uuid4, editable=False)
     file_object = models.ForeignKey(FileObject, on_delete=models.CASCADE, default=None, null=True, blank=True)
-
-    def save(self, *args, **kwargs):
-        if self.user and self.agent:
-            raise ValidationError("An Entry cannot be associated with both a user and an agent.")
 
 
 class UserRequests(DbBaseModel):
@@ -591,13 +462,6 @@ class RateLimitRecord(DbBaseModel):
 
     def __str__(self):
         return f"{self.slug} - {self.identifier} at {self.created_at}"
-
-
-class DataStore(DbBaseModel):
-    key = models.CharField(max_length=200, unique=True)
-    value = models.JSONField(default=dict)
-    private = models.BooleanField(default=False)
-    owner = models.ForeignKey(KhojUser, on_delete=models.CASCADE, default=None, null=True, blank=True)
 
 
 class McpServer(DbBaseModel):

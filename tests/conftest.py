@@ -37,6 +37,11 @@ from tests.helpers import (
 
 
 @pytest.fixture(autouse=True)
+def local_bootstrap_api_key(monkeypatch):
+    monkeypatch.setenv("KHOJ_API_KEY", "kk-secret")
+
+
+@pytest.fixture(autouse=True)
 def enable_db_access_for_all_tests(db):
     pass
 
@@ -114,27 +119,20 @@ def default_user4():
 
 
 @pytest.fixture
-def api_user(default_user):
-    if KhojApiUser.objects.filter(user=default_user).exists():
-        return KhojApiUser.objects.get(user=default_user)
-
-    return KhojApiUser.objects.create(
-        user=default_user,
-        name="api-key",
-        token="kk-secret",
-    )
-
-
-@pytest.fixture
-def api_user2(default_user2):
+def api_user(default_user2):
     if KhojApiUser.objects.filter(user=default_user2).exists():
         return KhojApiUser.objects.get(user=default_user2)
 
     return KhojApiUser.objects.create(
         user=default_user2,
         name="api-key",
-        token="kk-diff-secret",
+        token="kk-secret",
     )
+
+
+@pytest.fixture
+def api_user2(api_user):
+    return api_user
 
 
 @pytest.fixture
@@ -170,11 +168,15 @@ def default_openai_chat_model_option():
 @pytest.fixture
 def openai_agent():
     chat_model = ChatModelFactory(name=get_chat_model_name(ChatModel.ModelType.OPENAI), model_type="openai")
-    return Agent.objects.create(
-        name="Accountant",
-        chat_model=chat_model,
-        personality="You are a certified CPA. You are able to tell me how much I've spent based on my notes. Regardless of what I ask, you should always respond with the total amount I've spent. ALWAYS RESPOND WITH A SUMMARY TOTAL OF HOW MUCH MONEY I HAVE SPENT.",
+    agent, _ = Agent.objects.update_or_create(
+        slug="khoj",
+        defaults={
+            "name": "OfferAgent",
+            "chat_model": chat_model,
+            "personality": "You are a certified CPA. You are able to tell me how much I've spent based on my notes. Regardless of what I ask, you should always respond with the total amount I've spent. ALWAYS RESPOND WITH A SUMMARY TOTAL OF HOW MUCH MONEY I HAVE SPENT.",
+        },
     )
+    return agent
 
 
 @pytest.fixture
@@ -327,7 +329,7 @@ End of file {i}.
         configure_content(user, files_to_index)
 
         # Verify we have a substantial knowledge base
-        file_count = FileObject.objects.filter(user=user, agent=None).count()
+        file_count = FileObject.objects.filter(user=user).count()
         if file_count < 150:
             raise RuntimeError(f"Large KB fixture failed: only {file_count} files indexed, expected at least 150")
 

@@ -1,18 +1,14 @@
-import hashlib
 import inspect
 import json
 import logging
 import os
 import re
-import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from khoj.utils.helpers import is_env_var_true
 from khoj.utils.lexical import message_text, query_terms
-from khoj.utils.local_kb import LocalKBError, get_local_kb_root, is_local_kb_write_allowed, resolve_local_kb_path
 
 logger = logging.getLogger(__name__)
 
@@ -20,33 +16,10 @@ OPENKB_ENABLE_ENV = "KHOJ_ENABLE_OPENKB"
 OPENKB_ROOT_ENV = "KHOJ_OPENKB_ROOT"
 KB_ENGINE_ENV = "KHOJ_KB_ENGINE"
 OPENKB_ALLOWED_SUFFIXES = {".md", ".txt", ".json"}
-WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
 
 
 class OpenKBError(ValueError):
     pass
-
-
-@dataclass(frozen=True)
-class OpenKBSaveResult:
-    path: str
-    status: str
-    changed: bool
-    message: str
-    checksum: str = ""
-
-    def to_reference(self, query: str) -> dict[str, Any]:
-        return {
-            "query": "save_exploration",
-            "file": self.path,
-            "uri": f"openkb://local/{self.path}" if self.path.startswith("wiki/") else f"local-kb://{self.path}",
-            "compiled": self.message,
-            "action": "save_exploration",
-            "status": self.status,
-            "changed": self.changed,
-            "checksum": self.checksum,
-            "source_query": query,
-        }
 
 
 def get_kb_engine() -> str:
@@ -220,108 +193,6 @@ def read_openkb_page_range(source_path_or_doc: str, pages: str) -> str:
     return "\n\n".join(blocks)
 
 
-def wants_openkb_exploration_save(query: str) -> bool:
-    text = query.lower()
-    return any(
-        marker in text
-        for marker in (
-            "保存为 exploration",
-            "save exploration",
-            "保存成一篇复盘",
-            "保存这次",
-            "沉淀到 wiki",
-            "沉淀到wiki",
-            "保存到 wiki",
-            "保存到wiki",
-        )
-    )
-
-
-def save_exploration(
-    query: str,
-    answer: str,
-    references: list[dict[str, Any]],
-    *,
-    conversation_id: str,
-    client_app: Any = None,
-) -> OpenKBSaveResult:
-    if str(client_app or "").lower() == "qqbot":
-        return OpenKBSaveResult(
-            path="",
-            status="disabled",
-            changed=False,
-            message="QQBot client exploration saves are disabled by default; no file was modified.",
-        )
-
-    if openkb_is_ready():
-        wiki = get_openkb_wiki_root()
-        explore_dir = wiki / "explorations"
-        if explore_dir.exists() and not _is_safe_wiki_child(explore_dir, wiki, require_file=False):
-            raise OpenKBError("OpenKB exploration directory escapes wiki root.")
-        rel_prefix = "wiki/explorations"
-        link_root = wiki
-    else:
-        local_root = get_local_kb_root()
-        if local_root is None or not is_local_kb_write_allowed():
-            return OpenKBSaveResult(
-                path="",
-                status="disabled",
-                changed=False,
-                message="Exploration save is disabled; enable OpenKB or local KB writes first.",
-            )
-        try:
-            explore_dir = resolve_local_kb_path("review/explorations", root=local_root)
-        except LocalKBError as e:
-            raise OpenKBError(str(e)) from e
-        rel_prefix = "review/explorations"
-        link_root = local_root
-
-    explore_dir.mkdir(parents=True, exist_ok=True)
-    title = _title_from_query(query)
-    body = strip_ghost_wikilinks(answer.strip(), _existing_wiki_targets(link_root))
-    content = _exploration_markdown(query, body, references, conversation_id)
-    target = _unique_path(explore_dir / f"{title}.md")
-    _write_text_atomic(target, content)
-    relpath = f"{rel_prefix}/{target.name}"
-    return OpenKBSaveResult(
-        path=relpath,
-        status="written",
-        changed=True,
-        message=f"Saved exploration to {relpath}.",
-        checksum=_checksum(content),
-    )
-
-
-def dedupe_references(references: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for reference in references:
-        key = (
-            str(reference.get("uri") or ""),
-            str(reference.get("file") or ""),
-            str(reference.get("source_pages") or ""),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(reference)
-    return deduped
-
-
-def strip_ghost_wikilinks(text: str, known_targets: set[str]) -> str:
-    known = {target.strip().strip("/") for target in known_targets}
-    known.update(Path(target).name for target in known.copy())
-
-    def replace(match: re.Match[str]) -> str:
-        target = match.group(1).strip().strip("/")
-        alias = match.group(2)
-        if target in known or Path(target).name in known:
-            return match.group(0)
-        return (alias or target).strip()
-
-    return WIKILINK_RE.sub(replace, text)
-
-
 @dataclass(frozen=True)
 class _Candidate:
     path: Path
@@ -342,7 +213,6 @@ def _rank_candidates(query: str, terms: list[str]) -> list[_Candidate]:
             candidates.extend(path for path in sorted(directory.glob("*.md"))[:200] if _is_safe_wiki_child(path, wiki))
 
     ranked: list[_Candidate] = []
-    broad = _is_broad_query(query)
     for path in candidates:
         try:
             text = path.read_text(encoding="utf-8", errors="replace")[:12000]
@@ -357,10 +227,8 @@ def _rank_candidates(query: str, terms: list[str]) -> list[_Candidate]:
                 score += 8
             if lowered in haystack:
                 score += 2
-        if path.name == "index.md" and (broad or score):
-            score += 4
-        if path.name == "AGENTS.md" and broad:
-            score += 2
+        if path.name == "index.md":
+            score += 1
         if score:
             ranked.append(_Candidate(path=path, score=score, evidence_type=_evidence_type(relpath)))
 
@@ -443,10 +311,6 @@ def _history_terms(chat_history: list[dict], max_terms: int = 8) -> list[str]:
     return query_terms(" ".join(texts), max_terms=max_terms, cjk_sizes=(4, 3, 2))
 
 
-def _is_broad_query(query: str) -> bool:
-    return any(marker in query for marker in ("目录", "总览", "有哪些", "哪几块", "结构", "index", "overview"))
-
-
 def _candidate_order(path: Path) -> int:
     rel = path.relative_to(get_openkb_wiki_root()).as_posix()
     if rel == "index.md":
@@ -483,78 +347,6 @@ def _pages_from_query(query: str) -> str:
     if ranges:
         return ",".join(range_text.replace(" ", "") for range_text in ranges)
     return ""
-
-
-def _existing_wiki_targets(wiki: Path) -> set[str]:
-    if not wiki.is_dir():
-        return set()
-    targets: set[str] = set()
-    for page in wiki.rglob("*.md"):
-        if "sources" in page.relative_to(wiki).parts:
-            continue
-        rel = page.relative_to(wiki).with_suffix("").as_posix()
-        targets.add(rel)
-        targets.add(page.stem)
-    return targets
-
-
-def _title_from_query(query: str) -> str:
-    ascii_slug = re.sub(r"[^a-z0-9]+", "-", query.lower()).strip("-")
-    if ascii_slug:
-        return ascii_slug[:60].strip("-")
-    digest = hashlib.sha1(query.encode("utf-8")).hexdigest()[:10]
-    return f"exploration-{digest}"
-
-
-def _exploration_markdown(
-    query: str,
-    answer: str,
-    references: list[dict[str, Any]],
-    conversation_id: str,
-) -> str:
-    created_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    refs = [str(ref.get("file") or ref.get("uri") or "") for ref in references if ref.get("file") or ref.get("uri")]
-    ref_lines = "\n".join(f"- {ref}" for ref in dict.fromkeys(refs))
-    return (
-        "---\n"
-        f"query: {json.dumps(query, ensure_ascii=False)}\n"
-        f"conversation_id: {json.dumps(str(conversation_id), ensure_ascii=False)}\n"
-        "source: offeragent-chat\n"
-        f"created_at: {json.dumps(created_at)}\n"
-        "---\n\n"
-        f"# {query.strip()[:80] or 'Exploration'}\n\n"
-        f"{answer.strip()}\n\n"
-        "## References\n\n"
-        f"{ref_lines or '- No references captured.'}\n"
-    )
-
-
-def _unique_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    for index in range(2, 1000):
-        candidate = path.with_name(f"{path.stem}-{index}{path.suffix}")
-        if not candidate.exists():
-            return candidate
-    raise OpenKBError(f"Could not allocate unique exploration path for {path.name}")
-
-
-def _checksum(text: str) -> str:
-    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-
-
-def _write_text_atomic(path: Path, text: str) -> None:
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
-            tmp.write(text)
-        os.replace(tmp_name, path)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
-        raise
 
 
 async def _send_status(send_status: Optional[Callable], message: str) -> None:

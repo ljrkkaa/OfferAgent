@@ -2,10 +2,7 @@ import json
 import logging
 import math
 import os
-import random
 import re
-import secrets
-import sys
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from typing import (
@@ -32,22 +29,20 @@ from django.utils import timezone as django_timezone
 from django_apscheduler import util
 from django_apscheduler.models import DjangoJob, DjangoJobExecution
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from khoj.database.models import (
     Agent,
     AiModelApi,
     ChatMessageModel,
     ChatModel,
-    ClientApplication,
     Conversation,
     Entry,
     FileObject,
-    KhojApiUser,
     KhojUser,
     McpServer,
     ProcessLock,
     RateLimitRecord,
-    ReflectiveQuestion,
     ServerChatSettings,
     UserConversationConfig,
     UserRequests,
@@ -61,8 +56,6 @@ from khoj.utils import state
 from khoj.utils.helpers import (
     clean_object_for_db,
     clean_text_for_db,
-    generate_random_internal_agent_name,
-    generate_random_name,
     in_debug_mode,
     is_none_or_empty,
     timer,
@@ -107,42 +100,6 @@ def arequire_valid_user(func: Callable[P, Coroutine[Any, Any, T]]) -> Callable[P
         return await func(*args, **kwargs)
 
     return async_wrapper
-
-
-@require_valid_user
-def create_khoj_token(user: KhojUser, name=None):
-    "Create Khoj API key for user"
-    token = f"kk-{secrets.token_urlsafe(32)}"
-    name = name or f"{generate_random_name().title()}"
-    return KhojApiUser.objects.create(token=token, user=user, name=name)
-
-
-@arequire_valid_user
-async def acreate_khoj_token(user: KhojUser, name=None):
-    "Create Khoj API key for user"
-    token = f"kk-{secrets.token_urlsafe(32)}"
-    name = name or f"{generate_random_name().title()}"
-    return await KhojApiUser.objects.acreate(token=token, user=user, name=name)
-
-
-@require_valid_user
-def get_khoj_tokens(user: KhojUser):
-    "Get all Khoj API keys for user"
-    return list(KhojApiUser.objects.filter(user=user))
-
-
-@arequire_valid_user
-async def delete_khoj_token(user: KhojUser, token: str):
-    "Delete Khoj API Key for user"
-    await KhojApiUser.objects.filter(token=token, user=user).adelete()
-
-
-@require_valid_user
-def set_user_name(user: KhojUser, first_name: str, last_name: str) -> KhojUser:
-    user.first_name = first_name
-    user.last_name = last_name
-    user.save()
-    return user
 
 
 @require_valid_user
@@ -212,7 +169,10 @@ async def aget_user_name(user: KhojUser):
 class ProcessLockAdapters:
     @staticmethod
     def get_process_lock(process_name: str):
-        return ProcessLock.objects.filter(name=process_name).first()
+        process_lock = ProcessLock.objects.filter(name=process_name).first()
+        if process_lock and not ProcessLockAdapters.is_process_locked(process_lock):
+            return None
+        return process_lock
 
     @staticmethod
     def set_process_lock(process_name: str, max_duration_in_seconds: int = 600):
@@ -286,128 +246,15 @@ def run_with_process_lock(*args, **kwargs):
     return ProcessLockAdapters.run_with_lock(*args, **kwargs)
 
 
-class ClientApplicationAdapters:
-    @staticmethod
-    async def aget_client_application_by_id(client_id: str, client_secret: str):
-        return await ClientApplication.objects.filter(client_id=client_id, client_secret=client_secret).afirst()
-
-
 class AgentAdapters:
     DEFAULT_AGENT_NAME = "OfferAgent"
     LEGACY_DEFAULT_AGENT_NAME = "Khoj"
     DEFAULT_AGENT_SLUG = "khoj"
 
     @staticmethod
-    def get_readonly_agent_by_slug(agent_slug: str, user: KhojUser):
-        access_filter = Q(managed_by_admin=True)
-        if user:
-            access_filter |= Q(creator=user)
-        return (
-            Agent.objects.filter((Q(slug__iexact=agent_slug.lower())) & access_filter)
-            .prefetch_related("creator", "chat_model", "fileobject_set")
-            .first()
-        )
-
-    @staticmethod
-    async def aget_readonly_agent_by_slug(agent_slug: str, user: KhojUser):
-        access_filter = Q(managed_by_admin=True)
-        if user:
-            access_filter |= Q(creator=user)
-        return (
-            await Agent.objects.filter((Q(slug__iexact=agent_slug.lower())) & access_filter)
-            .prefetch_related("creator", "chat_model", "fileobject_set")
-            .afirst()
-        )
-
-    @staticmethod
-    @arequire_valid_user
-    async def adelete_agent_by_slug(agent_slug: str, user: KhojUser):
-        agent = await AgentAdapters.aget_agent_by_slug(agent_slug, user)
-        if not agent or agent.creator != user:
-            return False
-
-        await Entry.objects.filter(agent=agent).adelete()
-
-        if agent:
-            await agent.adelete()
-            return True
-        return False
-
-    @staticmethod
-    async def aget_agent_by_slug(agent_slug: str, user: KhojUser):
-        access_filter = Q(managed_by_admin=True)
-        if user:
-            access_filter |= Q(creator=user)
-        return (
-            await Agent.objects.filter((Q(slug__iexact=agent_slug.lower())) & access_filter)
-            .prefetch_related("creator", "chat_model", "fileobject_set")
-            .afirst()
-        )
-
-    @staticmethod
-    async def aget_agent_by_name(agent_name: str, user: KhojUser):
-        access_filter = Q(managed_by_admin=True)
-        if user:
-            access_filter |= Q(creator=user)
-        return (
-            await Agent.objects.filter((Q(name__iexact=agent_name.lower())) & access_filter)
-            .prefetch_related("creator", "chat_model", "fileobject_set")
-            .afirst()
-        )
-
-    @staticmethod
-    def get_agent_by_slug(slug: str, user: KhojUser = None):
-        if user:
-            return Agent.objects.filter(
-                (Q(slug__iexact=slug.lower())) & (Q(managed_by_admin=True) | Q(creator=user))
-            ).first()
-        return Agent.objects.filter(slug__iexact=slug.lower(), managed_by_admin=True).first()
-
-    @staticmethod
-    def get_all_accessible_agents(user: KhojUser = None):
-        default_query = Q(managed_by_admin=True)
-        user_query = Q(creator=user)
-        user_query &= Q(is_hidden=False)
-        if user:
-            return (
-                Agent.objects.filter(default_query | user_query)
-                .distinct()
-                .order_by("created_at")
-                .prefetch_related("creator", "chat_model", "fileobject_set")
-            )
-        return (
-            Agent.objects.filter(default_query)
-            .order_by("created_at")
-            .prefetch_related("creator", "chat_model", "fileobject_set")
-        )
-
-    @staticmethod
-    async def aget_all_accessible_agents(user: KhojUser = None) -> List[Agent]:
-        agents = await sync_to_async(AgentAdapters.get_all_accessible_agents)(user)
-        return await sync_to_async(list)(agents)
-
-    @staticmethod
-    async def ais_agent_accessible(agent: Agent, user: KhojUser) -> bool:
-        agent = await Agent.objects.select_related("creator").aget(pk=agent.pk)
-
-        if agent.creator == user:
-            return True
-        if agent.managed_by_admin:
-            return True
-        return False
-
-    @staticmethod
-    async def aget_conversation_agent_by_id(agent_id: int):
-        agent = await Agent.objects.filter(id=agent_id).afirst()
-        if agent == await AgentAdapters.aget_default_agent():
-            # If the agent is set to the default agent, then return None and let the default application code be used
-            return None
-        return agent
-
-    @staticmethod
     def get_default_agent():
         return (
-            Agent.objects.filter(slug=AgentAdapters.DEFAULT_AGENT_SLUG, managed_by_admin=True).first()
+            Agent.objects.filter(slug=AgentAdapters.DEFAULT_AGENT_SLUG).first()
             or Agent.objects.filter(
                 name__in=[AgentAdapters.DEFAULT_AGENT_NAME, AgentAdapters.LEGACY_DEFAULT_AGENT_NAME]
             ).first()
@@ -422,7 +269,7 @@ class AgentAdapters:
         default_personality = prompts.personality.format(current_date="placeholder", day_of_week="placeholder")
 
         agent = (
-            Agent.objects.filter(slug=AgentAdapters.DEFAULT_AGENT_SLUG, managed_by_admin=True).first()
+            Agent.objects.filter(slug=AgentAdapters.DEFAULT_AGENT_SLUG).first()
             or Agent.objects.filter(
                 name__in=[AgentAdapters.DEFAULT_AGENT_NAME, AgentAdapters.LEGACY_DEFAULT_AGENT_NAME]
             ).first()
@@ -433,15 +280,10 @@ class AgentAdapters:
             agent.chat_model = default_chat_model
             agent.slug = AgentAdapters.DEFAULT_AGENT_SLUG
             agent.name = AgentAdapters.DEFAULT_AGENT_NAME
-            agent.managed_by_admin = True
-            agent.input_tools = []
-            agent.output_modes = []
             agent.save()
         else:
-            # The default agent is public and managed by the admin. It's handled a little differently than other agents.
             agent = Agent.objects.create(
                 name=AgentAdapters.DEFAULT_AGENT_NAME,
-                managed_by_admin=True,
                 chat_model=default_chat_model,
                 personality=default_personality,
                 slug=AgentAdapters.DEFAULT_AGENT_SLUG,
@@ -452,7 +294,7 @@ class AgentAdapters:
 
     @staticmethod
     async def aget_default_agent():
-        agent = await Agent.objects.filter(slug=AgentAdapters.DEFAULT_AGENT_SLUG, managed_by_admin=True).afirst()
+        agent = await Agent.objects.filter(slug=AgentAdapters.DEFAULT_AGENT_SLUG).afirst()
         if agent:
             return agent
         return await Agent.objects.filter(
@@ -461,236 +303,48 @@ class AgentAdapters:
 
     @staticmethod
     def get_agent_chat_model(agent: Agent, user: Optional[KhojUser]) -> Optional[ChatModel]:
-        """
-        Gets the appropriate chat model for an agent.
-        For the default agent, it dynamically determines the model based on user/server settings.
-        For other agents, it returns their statically assigned chat model.
-        Requires the user context to determine the correct default model.
-        """
-        if agent.slug == AgentAdapters.DEFAULT_AGENT_SLUG:
-            # Dynamically get the default model based on context
-            return ConversationAdapters.get_default_chat_model(user)
-        elif agent.chat_model:
-            # Return the model assigned directly to the specific agent
-            # Ensure the related object is loaded if necessary (prefetching is recommended)
-            return agent.chat_model
-        else:
-            # Fallback if agent has no unset chat_model. For example if chat_model associated with agent was deleted.
-            logger.warning(f"Agent {agent.slug} has no chat_model or agent is None, returning overall default.")
-            return ConversationAdapters.get_default_chat_model(user)
+        return ConversationAdapters.get_default_chat_model(user)
 
     @staticmethod
     async def aget_agent_chat_model(agent: Agent, user: Optional[KhojUser]) -> Optional[ChatModel]:
         return await sync_to_async(AgentAdapters.get_agent_chat_model)(agent, user)
 
-    @staticmethod
-    @transaction.atomic
-    @require_valid_user
-    def atomic_update_agent(
-        user: KhojUser,
-        name: str,
-        personality: str,
-        icon: str,
-        color: str,
-        chat_model_option: ChatModel,
-        files: List[str],
-        input_tools: List[str],
-        output_modes: List[str],
-        slug: Optional[str] = None,
-        is_hidden: Optional[bool] = False,
-    ):
-        agent, created = Agent.objects.filter(slug=slug, creator=user).update_or_create(
-            defaults={
-                "name": name,
-                "creator": user,
-                "personality": personality,
-                "style_icon": icon,
-                "style_color": color,
-                "chat_model": chat_model_option,
-                "input_tools": input_tools,
-                "output_modes": output_modes,
-                "is_hidden": is_hidden,
-            }
-        )
-
-        FileObject.objects.filter(agent=agent).delete()
-        Entry.objects.filter(agent=agent).delete()
-
-        new_file_objects = []
-        reference_files_qs = FileObject.objects.filter(file_name__in=files, user=agent.creator, agent=None)
-        for ref_file in reference_files_qs:
-            new_file_objects.append(FileObject(file_name=ref_file.file_name, agent=agent, raw_text=ref_file.raw_text))
-
-        if new_file_objects:
-            FileObject.objects.bulk_create(new_file_objects, batch_size=100)
-
-        entries_to_create = []
-        reference_entries_qs = Entry.objects.filter(file_path__in=files, user=agent.creator, agent=None)
-        for entry in reference_entries_qs:
-            entries_to_create.append(
-                Entry(
-                    agent=agent,
-                    raw=entry.raw,
-                    compiled=entry.compiled,
-                    heading=entry.heading,
-                    file_source=entry.file_source,
-                    file_type=entry.file_type,
-                    file_path=entry.file_path,
-                    file_name=entry.file_name,
-                    url=entry.url,
-                    hashed_value=entry.hashed_value,
-                )
-            )
-
-        if entries_to_create:
-            Entry.objects.bulk_create(entries_to_create, batch_size=500)
-
-        return agent
-
-    @staticmethod
-    @arequire_valid_user
-    async def aupdate_agent(
-        user: KhojUser,
-        name: str,
-        personality: str,
-        icon: str,
-        color: str,
-        chat_model: Optional[str],
-        files: List[str],
-        input_tools: List[str],
-        output_modes: List[str],
-        slug: Optional[str] = None,
-        is_hidden: Optional[bool] = False,
-    ):
-        if chat_model:
-            chat_model_option = await ChatModel.objects.filter(name=chat_model).afirst()
-        else:
-            chat_model_option = await ConversationAdapters.aget_default_chat_model(user)
-
-        try:
-            return await sync_to_async(AgentAdapters.atomic_update_agent, thread_sensitive=True)(
-                user=user,
-                name=name,
-                personality=personality,
-                icon=icon,
-                color=color,
-                chat_model_option=chat_model_option,
-                files=files,
-                input_tools=input_tools,
-                output_modes=output_modes,
-                slug=slug,
-                is_hidden=is_hidden,
-            )
-        except Exception as e:
-            logger.error(f"Error updating agent: {e}", exc_info=True)
-            raise
-
-    @staticmethod
-    @arequire_valid_user
-    async def aupdate_hidden_agent(
-        user: KhojUser,
-        slug: Optional[str] = None,
-        persona: Optional[str] = None,
-        chat_model: Optional[str] = None,
-        input_tools: Optional[List[str]] = None,
-        output_modes: Optional[List[str]] = None,
-        existing_agent: Optional[Agent] = None,
-    ):
-        name = generate_random_internal_agent_name() if not existing_agent else existing_agent.name
-
-        agent = await AgentAdapters.aupdate_agent(
-            user=user,
-            name=name,
-            personality=persona,
-            icon=Agent.StyleIconTypes.LIGHTBULB,
-            color=Agent.StyleColorTypes.BLUE,
-            chat_model=chat_model,
-            files=[],
-            input_tools=input_tools,
-            output_modes=output_modes,
-            slug=slug,
-            is_hidden=True,
-        )
-
-        return agent
-
 
 class ConversationAdapters:
     @staticmethod
     @require_valid_user
-    def get_conversation_by_user(
-        user: KhojUser, client_application: ClientApplication = None, conversation_id: str = None
-    ) -> Optional[Conversation]:
+    def get_conversation_by_user(user: KhojUser, conversation_id: str = None) -> Optional[Conversation]:
         if conversation_id is not None:
             try:
                 UUID(str(conversation_id))
             except ValueError:
                 return None
-            conversation = (
-                Conversation.objects.filter(user=user, client=client_application, id=conversation_id)
-                .order_by("-updated_at")
-                .first()
-            )
+            conversation = Conversation.objects.filter(user=user, id=conversation_id).order_by("-updated_at").first()
         else:
             agent = AgentAdapters.get_default_agent()
-            conversation = (
-                Conversation.objects.filter(user=user, client=client_application).order_by("-updated_at").first()
-            ) or Conversation.objects.create(user=user, client=client_application, agent=agent)
+            conversation = Conversation.objects.filter(user=user).order_by(
+                "-updated_at"
+            ).first() or Conversation.objects.create(user=user, agent=agent)
 
         return conversation
 
     @staticmethod
     @require_valid_user
-    def get_all_conversations_for_export(user: KhojUser, page: int = 0):
-        start = page * 10
-        all_conversations = (
-            Conversation.objects.filter(user=user)
-            .order_by("created_at", "id")
-            .prefetch_related("agent")[start : start + 10]
-        )
-        histories = []
-        for conversation in all_conversations:
-            history = {
-                "title": conversation.title,
-                "agent": conversation.agent.name if conversation.agent else AgentAdapters.DEFAULT_AGENT_NAME,
-                "created_at": datetime.strftime(conversation.created_at, "%Y-%m-%d %H:%M:%S"),
-                "updated_at": datetime.strftime(conversation.updated_at, "%Y-%m-%d %H:%M:%S"),
-                "conversation_log": conversation.conversation_log,
-                "file_filters": conversation.file_filters,
-            }
-            histories.append(history)
-        return histories
-
-    @staticmethod
-    @require_valid_user
-    def get_num_conversations(user: KhojUser):
-        return Conversation.objects.filter(user=user).count()
-
-    @staticmethod
-    @require_valid_user
-    def get_conversation_sessions(user: KhojUser, client_application: ClientApplication = None):
-        return (
-            Conversation.objects.filter(user=user, client=client_application)
-            .prefetch_related("agent")
-            .order_by("-updated_at")
-        )
+    def get_conversation_sessions(user: KhojUser):
+        return Conversation.objects.filter(user=user).prefetch_related("agent").order_by("-updated_at")
 
     @staticmethod
     @arequire_valid_user
-    async def aset_conversation_title(
-        user: KhojUser, client_application: ClientApplication, conversation_id: str, title: str
-    ):
+    async def aset_conversation_title(user: KhojUser, conversation_id: str, title: str):
         if conversation_id is not None:
             try:
                 UUID(str(conversation_id))
             except ValueError:
                 return None
-        conversation = await Conversation.objects.filter(
-            user=user, client=client_application, id=conversation_id
-        ).afirst()
+        conversation = await Conversation.objects.filter(user=user, id=conversation_id).afirst()
         if conversation:
             conversation.title = clean_text_for_db(title)
-            await conversation.asave()
+            await conversation.asave(update_fields=["title", "updated_at"])
             return conversation
         return None
 
@@ -706,53 +360,30 @@ class ConversationAdapters:
 
     @staticmethod
     @arequire_valid_user
-    async def acreate_conversation_session(
-        user: KhojUser, client_application: ClientApplication = None, agent_slug: str = None, title: str = None
-    ):
-        if agent_slug and agent_slug.lower() == AgentAdapters.DEFAULT_AGENT_SLUG:
-            agent_slug = None
-        if agent_slug:
-            agent = await AgentAdapters.aget_readonly_agent_by_slug(agent_slug, user)
-            if agent is None:
-                raise HTTPException(status_code=400, detail="No such agent currently exists.")
-            return await Conversation.objects.select_related("agent", "agent__creator", "agent__chat_model").acreate(
-                user=user, client=client_application, agent=agent, title=title
-            )
+    async def acreate_conversation_session(user: KhojUser, title: str = None):
         agent = await AgentAdapters.aget_default_agent()
-        return await Conversation.objects.select_related("agent", "agent__creator", "agent__chat_model").acreate(
-            user=user, client=client_application, agent=agent, title=title
+        return await Conversation.objects.select_related("agent", "agent__chat_model").acreate(
+            user=user, agent=agent, title=title
         )
 
     @staticmethod
     @require_valid_user
-    def create_conversation_session(
-        user: KhojUser, client_application: ClientApplication = None, agent_slug: str = None, title: str = None
-    ):
-        if agent_slug and agent_slug.lower() == AgentAdapters.DEFAULT_AGENT_SLUG:
-            agent_slug = None
-        if agent_slug:
-            agent = AgentAdapters.get_readonly_agent_by_slug(agent_slug, user)
-            if agent is None:
-                raise HTTPException(status_code=400, detail="No such agent currently exists.")
-            return Conversation.objects.create(user=user, client=client_application, agent=agent, title=title)
+    def create_conversation_session(user: KhojUser, title: str = None):
         agent = AgentAdapters.get_default_agent()
-        return Conversation.objects.create(user=user, client=client_application, agent=agent, title=title)
+        return Conversation.objects.create(user=user, agent=agent, title=title)
 
     @staticmethod
     @arequire_valid_user
     async def aget_conversation_by_user(
         user: KhojUser,
-        client_application: ClientApplication = None,
         conversation_id: str = None,
         title: str = None,
         create_new: bool = False,
     ) -> Optional[Conversation]:
         if create_new:
-            return await ConversationAdapters.acreate_conversation_session(user, client_application)
+            return await ConversationAdapters.acreate_conversation_session(user)
 
-        query = Conversation.objects.filter(user=user, client=client_application).prefetch_related(
-            "agent", "agent__chat_model"
-        )
+        query = Conversation.objects.filter(user=user).prefetch_related("agent", "agent__chat_model")
 
         if conversation_id is not None:
             try:
@@ -766,21 +397,8 @@ class ConversationAdapters:
         conversation = await query.order_by("-updated_at").afirst()
 
         return conversation or await Conversation.objects.prefetch_related("agent", "agent__chat_model").acreate(
-            user=user, client=client_application
+            user=user
         )
-
-    @staticmethod
-    @arequire_valid_user
-    async def adelete_conversation_by_user(
-        user: KhojUser, client_application: ClientApplication = None, conversation_id: str = None
-    ):
-        if conversation_id is not None:
-            try:
-                UUID(str(conversation_id))
-            except ValueError:
-                return 0, {}
-            return await Conversation.objects.filter(user=user, client=client_application, id=conversation_id).adelete()
-        return await Conversation.objects.filter(user=user, client=client_application).adelete()
 
     @staticmethod
     @require_valid_user
@@ -1057,45 +675,102 @@ class ConversationAdapters:
 
     @staticmethod
     @require_valid_user
-    async def save_conversation(
+    @transaction.atomic
+    def _save_conversation_atomic(
         user: KhojUser,
         new_messages: List[ChatMessageModel],
-        client_application: ClientApplication = None,
         conversation_id: str = None,
         user_message: str = None,
     ):
         slug = user_message.strip()[:200] if user_message else None
+        conversations = Conversation.objects.select_for_update(of=("self",)).select_related(
+            "agent", "agent__chat_model"
+        )
         if conversation_id is not None:
-            try:
-                UUID(str(conversation_id))
-            except ValueError:
-                return None
-            conversation = (
-                await Conversation.objects.filter(user=user, client=client_application, id=conversation_id)
-                .prefetch_related("agent", "agent__chat_model")
-                .afirst()
-            )
+            conversation = conversations.filter(user=user, id=conversation_id).first()
         else:
-            conversation = (
-                await Conversation.objects.filter(user=user, client=client_application)
-                .prefetch_related("agent", "agent__chat_model")
-                .order_by("-updated_at")
-                .afirst()
-            )
+            conversation = conversations.filter(user=user).order_by("-updated_at").first()
 
-        existing_messages = conversation.messages if conversation else []
-        conversation_log = {"chat": [msg.model_dump() for msg in existing_messages + new_messages]}
+        merged_messages = list(conversation.messages if conversation else [])
+        existing_message_indexes = {
+            (message.turnId, message.by): index for index, message in enumerate(merged_messages) if message.turnId
+        }
+        for message in new_messages:
+            if not message.turnId:
+                merged_messages.append(message)
+                continue
+
+            message_key = (message.turnId, message.by)
+            existing_index = existing_message_indexes.get(message_key)
+            if existing_index is None:
+                existing_message_indexes[message_key] = len(merged_messages)
+                merged_messages.append(message)
+            elif not merged_messages[existing_index].message and message.message:
+                # Complete an interrupted assistant placeholder without duplicating
+                # the user side of the same turn.
+                merged_messages[existing_index] = message
+
+        conversation_log = {"chat": [msg.model_dump() for msg in merged_messages]}
         cleaned_conversation_log = clean_object_for_db(conversation_log)
         if conversation:
             conversation.conversation_log = cleaned_conversation_log
             conversation.slug = slug
             conversation.updated_at = django_timezone.now()
-            await conversation.asave()
+            conversation.save(update_fields=["conversation_log", "slug", "updated_at"])
         else:
-            conversation = await Conversation.objects.acreate(
-                user=user, conversation_log=cleaned_conversation_log, client=client_application, slug=slug
-            )
+            conversation = Conversation.objects.create(user=user, conversation_log=cleaned_conversation_log, slug=slug)
         return conversation
+
+    @staticmethod
+    @require_valid_user
+    async def save_conversation(
+        user: KhojUser,
+        new_messages: List[ChatMessageModel],
+        conversation_id: str = None,
+        user_message: str = None,
+    ):
+        if conversation_id is not None:
+            try:
+                UUID(str(conversation_id))
+            except ValueError:
+                return None
+        return await sync_to_async(ConversationAdapters._save_conversation_atomic, thread_sensitive=True)(
+            user,
+            new_messages,
+            conversation_id=conversation_id,
+            user_message=user_message,
+        )
+
+    @staticmethod
+    @require_valid_user
+    @transaction.atomic
+    def pop_message(
+        user: KhojUser,
+        conversation_id: str,
+        *,
+        interrupted: bool = False,
+    ) -> Optional[ChatMessageModel]:
+        conversation = Conversation.objects.select_for_update().filter(user=user, id=conversation_id).first()
+        if not conversation:
+            return None
+        chat_log = conversation.conversation_log.get("chat", [])
+        if not chat_log:
+            return None
+        last_message = chat_log[-1]
+        if interrupted and not (last_message.get("by") == "khoj" and not last_message.get("message")):
+            return None
+        popped_message = chat_log.pop()
+        conversation.conversation_log = clean_object_for_db({"chat": chat_log})
+        conversation.save(update_fields=["conversation_log", "updated_at"])
+        try:
+            return ChatMessageModel.model_validate(popped_message)
+        except ValidationError as error:
+            logger.warning(f"Popped an invalid message from conversation: {error}")
+            return None
+
+    @staticmethod
+    async def apop_message(*args, **kwargs) -> Optional[ChatMessageModel]:
+        return await sync_to_async(ConversationAdapters.pop_message, thread_sensitive=True)(*args, **kwargs)
 
     @staticmethod
     def get_conversation_processor_options():
@@ -1196,25 +871,6 @@ class ConversationAdapters:
         return user_config.enable_memory
 
     @staticmethod
-    @arequire_valid_user
-    async def aget_conversation_starters(user: KhojUser, max_results=3):
-        all_questions = []
-        if await ReflectiveQuestion.objects.filter(user=user).aexists():
-            all_questions = await sync_to_async(ReflectiveQuestion.objects.filter(user=user).values_list)(
-                "question", flat=True
-            )
-
-        all_questions = await sync_to_async(ReflectiveQuestion.objects.filter(user=None).values_list)(
-            "question", flat=True
-        )
-
-        all_questions = await sync_to_async(list)(all_questions)  # type: ignore
-        if len(all_questions) < max_results:
-            return all_questions
-
-        return random.sample(all_questions, max_results)
-
-    @staticmethod
     async def aget_valid_chat_model(user: KhojUser, conversation: Conversation):
         agent: Agent = conversation.agent if await AgentAdapters.aget_default_agent() != conversation.agent else None
         if agent and agent.chat_model:
@@ -1241,51 +897,52 @@ class ConversationAdapters:
             raise ValueError("Invalid conversation settings. Configure some chat model on server.")
 
     @staticmethod
+    @require_valid_user
+    @transaction.atomic
     def add_files_to_filter(user: KhojUser, conversation_id: str, files: List[str]):
-        conversation = ConversationAdapters.get_conversation_by_user(user, conversation_id=conversation_id)
+        try:
+            conversation_uuid = UUID(str(conversation_id))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        conversation = Conversation.objects.select_for_update().filter(user=user, id=conversation_uuid).first()
         file_list = EntryAdapters.get_all_filenames_by_source(user, "computer")
         if not conversation:
             return None
-        for filename in files:
-            if filename in file_list and filename not in conversation.file_filters:
-                conversation.file_filters.append(filename)
-        conversation.save()
-
-        # remove files from conversation.file_filters that are not in file_list
         conversation.file_filters = [file for file in conversation.file_filters if file in file_list]
-        conversation.save()
+        conversation.file_filters.extend(
+            filename for filename in files if filename in file_list and filename not in conversation.file_filters
+        )
+        conversation.save(update_fields=["file_filters", "updated_at"])
         return conversation.file_filters
 
     @staticmethod
+    @require_valid_user
+    @transaction.atomic
     def remove_files_from_filter(user: KhojUser, conversation_id: str, files: List[str]):
-        conversation = ConversationAdapters.get_conversation_by_user(user, conversation_id=conversation_id)
+        try:
+            conversation_uuid = UUID(str(conversation_id))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        conversation = Conversation.objects.select_for_update().filter(user=user, id=conversation_uuid).first()
         if not conversation:
             return None
-        for filename in files:
-            if filename in conversation.file_filters:
-                conversation.file_filters.remove(filename)
-        conversation.save()
-
-        # remove files from conversation.file_filters that are not in file_list
         file_list = EntryAdapters.get_all_filenames_by_source(user, "computer")
-        conversation.file_filters = [file for file in conversation.file_filters if file in file_list]
-        conversation.save()
+        conversation.file_filters = [
+            file for file in conversation.file_filters if file in file_list and file not in files
+        ]
+        conversation.save(update_fields=["file_filters", "updated_at"])
         return conversation.file_filters
 
     @staticmethod
     @require_valid_user
     def delete_message_by_turn_id(user: KhojUser, conversation_id: str, turn_id: str):
-        conversation = ConversationAdapters.get_conversation_by_user(user, conversation_id=conversation_id)
-        if not conversation or not conversation.conversation_log or not conversation.conversation_log.get("chat"):
-            return False
-        conversation_log = conversation.conversation_log
-        updated_log = [msg for msg in conversation_log["chat"] if msg.get("turnId") != turn_id]
-        if len(updated_log) == len(conversation_log["chat"]):
-            return False
-        conversation.conversation_log["chat"] = updated_log
-        conversation.conversation_log = clean_object_for_db(conversation.conversation_log)
-        conversation.save()
-        return True
+        from khoj.processor.conversation.vault_actions import delete_conversation_turn_and_cancel_batch
+
+        return delete_conversation_turn_and_cancel_batch(
+            user=user,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+        )
 
 
 class FileObjectAdapters:
@@ -1335,16 +992,14 @@ class FileObjectAdapters:
 
     @staticmethod
     @arequire_valid_user
-    async def aget_file_objects_by_name(user: KhojUser, file_name: str, agent: Agent = None):
-        return await sync_to_async(list)(FileObject.objects.filter(user=user, file_name=file_name, agent=agent))
+    async def aget_file_objects_by_name(user: KhojUser, file_name: str):
+        return await sync_to_async(list)(FileObject.objects.filter(user=user, file_name=file_name))
 
     @staticmethod
     @arequire_valid_user
-    async def aget_file_objects_by_path_prefix(user: KhojUser, path_prefix: str, agent: Agent = None):
+    async def aget_file_objects_by_path_prefix(user: KhojUser, path_prefix: str):
         """Get file objects from the database by path prefix."""
-        return await sync_to_async(list)(
-            FileObject.objects.filter(user=user, agent=agent, file_name__startswith=path_prefix)
-        )
+        return await sync_to_async(list)(FileObject.objects.filter(user=user, file_name__startswith=path_prefix))
 
     @staticmethod
     @arequire_valid_user
@@ -1385,7 +1040,7 @@ class FileObjectAdapters:
         Search for a regex pattern in file objects, with an optional path prefix filter.
         Outputs results in grep format.
         """
-        query = FileObject.objects.filter(user=user, agent=None, raw_text__iregex=regex_pattern)
+        query = FileObject.objects.filter(user=user, raw_text__iregex=regex_pattern)
         if path_prefix:
             query = query.filter(file_name__startswith=path_prefix)
         return await sync_to_async(list)(query)
@@ -1467,19 +1122,9 @@ class EntryAdapters:
         return Entry.objects.filter(user=user).exists()
 
     @staticmethod
-    def agent_has_entries(agent: Agent):
-        return Entry.objects.filter(agent=agent).exists()
-
-    @staticmethod
     @arequire_valid_user
     async def auser_has_entries(user: KhojUser):
         return await Entry.objects.filter(user=user).aexists()
-
-    @staticmethod
-    async def aagent_has_entries(agent: Agent):
-        if agent is None:
-            return False
-        return await Entry.objects.filter(agent=agent).aexists()
 
     @staticmethod
     @arequire_valid_user
@@ -1496,14 +1141,6 @@ class EntryAdapters:
             deleted_count += count
 
         return deleted_count
-
-    @staticmethod
-    async def aget_agent_entry_filepaths(agent: Agent):
-        if agent is None:
-            return []
-        return await sync_to_async(set)(
-            Entry.objects.filter(agent=agent).distinct("file_path").values_list("file_path", flat=True)
-        )
 
     @staticmethod
     @require_valid_user
@@ -1526,27 +1163,20 @@ class EntryAdapters:
     @staticmethod
     @require_valid_user
     def get_size_of_indexed_data_in_mb(user: KhojUser):
-        entries = Entry.objects.filter(user=user).iterator()
-        total_size = sum(sys.getsizeof(entry.compiled) for entry in entries)
+        total_size = sum(len(entry.compiled.encode("utf-8")) for entry in Entry.objects.filter(user=user).iterator())
         return total_size / 1024 / 1024
 
     @staticmethod
-    def apply_filters(user: KhojUser, query: str, file_type_filter: str = None, agent: Agent = None):
+    def apply_filters(user: KhojUser, query: str, file_type_filter: str = None):
         q_filter_terms = Q()
 
         word_filters = EntryAdapters.word_filter.get_filter_terms(query)
         file_filters = EntryAdapters.file_filter.get_filter_terms(query)
         date_filters = EntryAdapters.date_filter.get_query_date_range(query)
 
-        owner_filter = Q()
-
-        if user is not None:
-            owner_filter = Q(user=user)
-        if agent is not None:
-            owner_filter |= Q(agent=agent)
-
-        if owner_filter == Q():
+        if user is None:
             return Entry.objects.none()
+        owner_filter = Q(user=user)
 
         if len(word_filters) == 0 and len(file_filters) == 0 and len(date_filters) == 0:
             return Entry.objects.filter(owner_filter)

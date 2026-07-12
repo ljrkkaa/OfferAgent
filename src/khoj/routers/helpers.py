@@ -1,10 +1,10 @@
 import asyncio
 import base64
-import fnmatch
 import hashlib
 import json
 import logging
 import math
+import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -42,9 +42,6 @@ from khoj.database.adapters import (
     AutomationAdapters,
     ConversationAdapters,
     EntryAdapters,
-    FileObjectAdapters,
-    create_khoj_token,
-    get_khoj_tokens,
     get_user_name,
     require_valid_user,
     run_with_process_lock,
@@ -81,6 +78,10 @@ from khoj.processor.conversation.google.gemini_chat import (
     converse_gemini,
     gemini_send_message_to_model,
 )
+from khoj.processor.conversation.knowledge_workspace import (
+    get_workspace_sources,
+    read_workspace_document,
+)
 from khoj.processor.conversation.offeragent_memory import (
     MemorySelection,
     MemoryWriteDecision,
@@ -101,7 +102,6 @@ from khoj.processor.conversation.utils import (
     ResponseWithThought,
     RetryableModelError,
     clean_json,
-    clean_mermaidjs,
     construct_chat_history,
     construct_question_history,
     generate_chatml_messages_with_context,
@@ -121,16 +121,6 @@ from khoj.utils.helpers import (
     is_none_or_empty,
     is_valid_url,
     timer,
-    truncate_code_context,
-)
-from khoj.utils.local_kb import (
-    LocalKBError,
-    get_local_kb_root,
-    kb_grep,
-    kb_headings,
-    kb_list,
-    kb_read,
-    kb_resolve_link,
 )
 from khoj.utils.rawconfig import (
     ChatRequestBody,
@@ -151,7 +141,6 @@ def _get_codex_formatting_chat_model():
         model_type=ChatModel.ModelType.OPENAI,
         ai_model_api=None,
         vision_enabled=False,
-        tokenizer=None,
         max_prompt_size=None,
     )
 
@@ -174,7 +163,7 @@ def validate_chat_model(user: KhojUser):
 
 
 def has_user_document_source(user: KhojUser) -> bool:
-    return EntryAdapters.user_has_entries(user=user) or get_local_kb_root() is not None
+    return EntryAdapters.user_has_entries(user=user) or get_workspace_sources().tool_source_available
 
 
 async def is_ready_to_chat(user: KhojUser):
@@ -229,27 +218,26 @@ def get_next_url(request: Request) -> str:
     return next_url
 
 
-def get_conversation_command(query: str) -> ConversationCommand:
-    if query.startswith("/notes"):
-        return ConversationCommand.Notes
-    elif query.startswith("/general"):
-        return ConversationCommand.General
-    elif query.startswith("/online"):
-        return ConversationCommand.Online
-    elif query.startswith("/webpage"):
-        return ConversationCommand.Webpage
-    elif query.startswith("/automated_task"):
-        return ConversationCommand.AutomatedTask
-    elif query.startswith("/diagram"):
-        return ConversationCommand.Diagram
-    elif query.startswith("/code"):
-        return ConversationCommand.Code
-    elif query.startswith("/summarize"):
-        return ConversationCommand.Summarize
-    elif query.startswith("/research"):
-        return ConversationCommand.Research
-    else:
-        return ConversationCommand.Default
+EXPLICIT_CONVERSATION_COMMANDS = {
+    "/default": ConversationCommand.Default,
+    "/notes": ConversationCommand.Notes,
+    "/general": ConversationCommand.General,
+    "/online": ConversationCommand.Online,
+    "/webpage": ConversationCommand.Webpage,
+    "/summarize": ConversationCommand.Summarize,
+    "/research": ConversationCommand.Research,
+}
+
+
+def parse_conversation_command(query: str) -> tuple[ConversationCommand, str, bool]:
+    parts = query.lstrip().split(maxsplit=1)
+    token = parts[0] if parts else ""
+    command = EXPLICIT_CONVERSATION_COMMANDS.get(token)
+    if command is None:
+        if token.startswith("/"):
+            raise ValueError(f"Unknown conversation command: {token}")
+        return ConversationCommand.Default, query, False
+    return command, parts[1] if len(parts) > 1 else "", True
 
 
 def gather_raw_query_files(
@@ -639,35 +627,23 @@ async def generate_summary_from_files(
     tracer: dict = {},
 ):
     try:
-        file_objects = []
         local_file_names = []
         local_context = []
         if file_filters:
-            if get_local_kb_root():
-                for file_filter in file_filters:
-                    try:
-                        local_file = kb_read(file_filter, max_lines=200)
-                        local_file_names.append(local_file.path)
-                        local_context.append(f"File: {local_file.path}\n\n{local_file.text}")
-                    except LocalKBError as e:
-                        yield str(e)
-                        return
-                file_filters = []
-            if file_filters:
-                file_objects = await FileObjectAdapters.aget_file_objects_by_names(user, file_filters)
-        elif await EntryAdapters.aagent_has_entries(agent):
-            file_names = await EntryAdapters.aget_agent_entry_filepaths(agent)
-            if len(file_names) > 0:
-                file_objects = await FileObjectAdapters.aget_file_objects_by_name(None, file_names.pop(), agent)
-
-        if len(file_objects) == 0 and not local_context and not query_files:
+            for file_filter in file_filters:
+                document = await read_workspace_document(file_filter, user, max_lines=200)
+                if document is None:
+                    yield f"File '{file_filter}' not found in the knowledge workspace."
+                    return
+                file_name, text = document
+                local_file_names.append(file_name)
+                local_context.append(f"File: {file_name}\n\n{text}")
+        if not local_context and not query_files:
             response_log = "Sorry, I couldn't find anything to summarize."
             yield response_log
             return
 
-        contextual_data = " ".join(
-            local_context + [f"File: {file.file_name}\n\n{file.raw_text}" for file in file_objects]
-        )
+        contextual_data = " ".join(local_context)
 
         if query_files:
             contextual_data += f"\n\n{query_files}"
@@ -675,12 +651,9 @@ async def generate_summary_from_files(
         if not q:
             q = "Create a general summary of the file"
 
-        file_names = local_file_names + [file.file_name for file in file_objects]
-        file_names.extend(file_filters)
-
         all_file_names = ""
 
-        for file_name in file_names:
+        for file_name in local_file_names:
             all_file_names += f"- {file_name}\n"
 
         async for result in send_status_func(f"**Constructing Summary Using:**\n{all_file_names}"):
@@ -700,173 +673,7 @@ async def generate_summary_from_files(
     except Exception as e:
         response_log = "Error summarizing file. Please try again, or contact support."
         logger.error(f"Error summarizing file for {user.email}: {e}", exc_info=True)
-        yield result
-
-
-async def generate_excalidraw_diagram(
-    q: str,
-    chat_history: List[ChatMessageModel],
-    location_data: LocationData,
-    note_references: List[Dict[str, Any]],
-    online_results: Optional[dict] = None,
-    query_images: List[str] = None,
-    query_files: str = None,
-    relevant_memories: List[OfferAgentMemory] = None,
-    user: KhojUser = None,
-    agent: Agent = None,
-    send_status_func: Optional[Callable] = None,
-    tracer: dict = {},
-):
-    if send_status_func:
-        async for event in send_status_func("**Enhancing the Diagramming Prompt**"):
-            yield {ChatEvent.STATUS: event}
-
-    better_diagram_description_prompt = await generate_better_diagram_description(
-        q=q,
-        chat_history=chat_history,
-        location_data=location_data,
-        note_references=note_references,
-        online_results=online_results,
-        query_images=query_images,
-        query_files=query_files,
-        relevant_memories=relevant_memories,
-        user=user,
-        agent=agent,
-        tracer=tracer,
-    )
-
-    if send_status_func:
-        async for event in send_status_func(f"**Diagram to Create:**:\n{better_diagram_description_prompt}"):
-            yield {ChatEvent.STATUS: event}
-    try:
-        excalidraw_diagram_description = await generate_excalidraw_diagram_from_description(
-            q=better_diagram_description_prompt,
-            user=user,
-            agent=agent,
-            tracer=tracer,
-        )
-    except Exception as e:
-        logger.error(f"Error generating Excalidraw diagram for {user.email}: {e}", exc_info=True)
-        yield better_diagram_description_prompt, None
-        return
-
-    scratchpad = excalidraw_diagram_description.get("scratchpad")
-
-    inferred_queries = f"Instruction: {better_diagram_description_prompt}\n\nScratchpad: {scratchpad}"
-
-    yield inferred_queries, excalidraw_diagram_description.get("elements")
-
-
-async def generate_better_diagram_description(
-    q: str,
-    chat_history: List[ChatMessageModel],
-    location_data: LocationData,
-    note_references: List[Dict[str, Any]],
-    online_results: Optional[dict] = None,
-    query_images: List[str] = None,
-    query_files: str = None,
-    relevant_memories: List[OfferAgentMemory] = None,
-    user: KhojUser = None,
-    agent: Agent = None,
-    tracer: dict = {},
-) -> str:
-    """
-    Generate a diagram description from the given query and context
-    """
-
-    today_date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d, %A")
-    personality_context = (
-        prompts.personality_context.format(personality=agent.personality) if agent and agent.personality else ""
-    )
-
-    location = f"{location_data}" if location_data else "Unknown"
-
-    user_references = "\n\n".join([f"# {item['compiled']}" for item in note_references])
-
-    chat_history_str = construct_chat_history(chat_history)
-
-    simplified_online_results = {}
-
-    if online_results:
-        for result in online_results:
-            if online_results[result].get("answerBox"):
-                simplified_online_results[result] = online_results[result]["answerBox"]
-            elif online_results[result].get("webpages"):
-                simplified_online_results[result] = online_results[result]["webpages"]
-
-    improve_diagram_description_prompt = prompts.improve_excalidraw_diagram_description_prompt.format(
-        query=q,
-        chat_history=chat_history_str,
-        location=location,
-        current_date=today_date,
-        references=user_references,
-        online_results=simplified_online_results,
-        personality_context=personality_context,
-    )
-
-    agent_chat_model = AgentAdapters.get_agent_chat_model(agent, user) if agent else None
-
-    with timer("Chat actor: Generate better diagram description", logger):
-        response = await send_message_to_model_wrapper(
-            improve_diagram_description_prompt,
-            query_images=query_images,
-            query_files=query_files,
-            relevant_memories=relevant_memories,
-            fast_model=False,
-            agent_chat_model=agent_chat_model,
-            user=user,
-            tracer=tracer,
-        )
-        response = response.text.strip()
-        if response.startswith(('"', "'")) and response.endswith(('"', "'")):
-            response = response[1:-1]
-
-    return response
-
-
-async def generate_excalidraw_diagram_from_description(
-    q: str,
-    user: KhojUser = None,
-    agent: Agent = None,
-    tracer: dict = {},
-) -> Dict[str, Any]:
-    personality_context = (
-        prompts.personality_context.format(personality=agent.personality) if agent and agent.personality else ""
-    )
-
-    excalidraw_diagram_generation = prompts.excalidraw_diagram_generation_prompt.format(
-        personality_context=personality_context,
-        query=q,
-    )
-
-    agent_chat_model = AgentAdapters.get_agent_chat_model(agent, user) if agent else None
-
-    with timer("Chat actor: Generate excalidraw diagram", logger):
-        raw_response = await send_message_to_model_wrapper(
-            query=excalidraw_diagram_generation,
-            fast_model=False,
-            agent_chat_model=agent_chat_model,
-            user=user,
-            tracer=tracer,
-        )
-        raw_response_text = clean_json(raw_response.text)
-        try:
-            # Expect response to have `elements` and `scratchpad` keys
-            response: Dict[str, str] = json.loads(raw_response_text)
-            if (
-                not response
-                or not isinstance(response, Dict)
-                or not response.get("elements")
-                or not response.get("scratchpad")
-            ):
-                raise AssertionError(f"Invalid response for generating Excalidraw diagram: {response}")
-        except Exception:
-            raise AssertionError(f"Invalid response for generating Excalidraw diagram: {raw_response_text}")
-        if not response or not isinstance(response["elements"], List) or not isinstance(response["elements"][0], Dict):
-            # TODO Some additional validation here that it's a valid Excalidraw diagram
-            raise AssertionError(f"Invalid response for improving diagram description: {response}")
-
-    return response
+        yield response_log
 
 
 async def select_offeragent_memories(
@@ -878,7 +685,7 @@ async def select_offeragent_memories(
     if not await ConversationAdapters.ais_memory_enabled(user):
         return []
 
-    memories = list_memories()
+    memories = list_memories(user)
     prompt = build_memory_selection_prompt(query, memories)
     if not prompt:
         return []
@@ -893,7 +700,7 @@ async def select_offeragent_memories(
             agent_chat_model=agent.chat_model if agent else None,
             tracer=tracer,
         )
-        parsed = MemorySelection(**json.loads(clean_json(response.text.strip())))
+        parsed = MemorySelection.model_validate_json(response.text.strip())
     except Exception as e:
         logger.warning(f"OfferAgent memory selection failed: {e}")
         return []
@@ -907,7 +714,7 @@ async def ai_update_offeragent_memory(
     latest_user_message: str,
     agent: Agent = None,
     source_turn_id: str = None,
-    used_notes_tool_loop: bool = False,
+    used_workspace_tools: bool = False,
     tracer: dict = {},
 ):
     if not await ConversationAdapters.ais_memory_enabled(user):
@@ -915,9 +722,9 @@ async def ai_update_offeragent_memory(
 
     prompt = build_memory_write_prompt(
         latest_user_message,
-        list_memories(),
+        list_memories(user),
         current_date=datetime.now().date().isoformat(),
-        used_notes_tool_loop=used_notes_tool_loop,
+        used_workspace_tools=used_workspace_tools,
     )
     try:
         response = await send_message_to_model_wrapper(
@@ -929,155 +736,12 @@ async def ai_update_offeragent_memory(
             agent_chat_model=agent.chat_model if agent else None,
             tracer=tracer,
         )
-        parsed = MemoryWriteDecision(**json.loads(clean_json(response.text.strip())))
+        parsed = MemoryWriteDecision.model_validate_json(response.text.strip())
     except Exception as e:
         logger.warning(f"OfferAgent memory update failed: {e}")
         return None
 
-    return apply_memory_write_decision(parsed, source_turn_id=source_turn_id)
-
-
-async def generate_mermaidjs_diagram(
-    q: str,
-    chat_history: List[ChatMessageModel],
-    location_data: LocationData,
-    note_references: List[Dict[str, Any]],
-    online_results: Optional[dict] = None,
-    query_images: List[str] = None,
-    query_files: str = None,
-    relevant_memories: List[OfferAgentMemory] = None,
-    user: KhojUser = None,
-    agent: Agent = None,
-    send_status_func: Optional[Callable] = None,
-    tracer: dict = {},
-):
-    if send_status_func:
-        async for event in send_status_func("**Enhancing the Diagramming Prompt**"):
-            yield {ChatEvent.STATUS: event}
-
-    better_diagram_description_prompt = await generate_better_mermaidjs_diagram_description(
-        q=q,
-        chat_history=chat_history,
-        location_data=location_data,
-        note_references=note_references,
-        online_results=online_results,
-        query_images=query_images,
-        query_files=query_files,
-        relevant_memories=relevant_memories,
-        user=user,
-        agent=agent,
-        tracer=tracer,
-    )
-
-    if send_status_func:
-        async for event in send_status_func(f"**Diagram to Create:**:\n{better_diagram_description_prompt}"):
-            yield {ChatEvent.STATUS: event}
-
-    mermaidjs_diagram_description = await generate_mermaidjs_diagram_from_description(
-        q=better_diagram_description_prompt,
-        user=user,
-        agent=agent,
-        tracer=tracer,
-    )
-
-    inferred_queries = f"Instruction: {better_diagram_description_prompt}"
-
-    yield inferred_queries, mermaidjs_diagram_description
-
-
-async def generate_better_mermaidjs_diagram_description(
-    q: str,
-    chat_history: List[ChatMessageModel],
-    location_data: LocationData,
-    note_references: List[Dict[str, Any]],
-    online_results: Optional[dict] = None,
-    query_images: List[str] = None,
-    query_files: str = None,
-    relevant_memories: List[OfferAgentMemory] = None,
-    user: KhojUser = None,
-    agent: Agent = None,
-    tracer: dict = {},
-) -> str:
-    """
-    Generate a diagram description from the given query and context
-    """
-
-    today_date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d, %A")
-    personality_context = (
-        prompts.personality_context.format(personality=agent.personality) if agent and agent.personality else ""
-    )
-
-    location = f"{location_data}" if location_data else "Unknown"
-
-    user_references = "\n\n".join([f"# {item['compiled']}" for item in note_references])
-
-    chat_history_str = construct_chat_history(chat_history)
-
-    simplified_online_results = {}
-
-    if online_results:
-        for result in online_results:
-            if online_results[result].get("answerBox"):
-                simplified_online_results[result] = online_results[result]["answerBox"]
-            elif online_results[result].get("webpages"):
-                simplified_online_results[result] = online_results[result]["webpages"]
-
-    improve_diagram_description_prompt = prompts.improve_mermaid_js_diagram_description_prompt.format(
-        query=q,
-        chat_history=chat_history_str,
-        location=location,
-        current_date=today_date,
-        references=user_references,
-        online_results=simplified_online_results,
-        personality_context=personality_context,
-    )
-
-    agent_chat_model = AgentAdapters.get_agent_chat_model(agent, user) if agent else None
-
-    with timer("Chat actor: Generate better Mermaid.js diagram description", logger):
-        response = await send_message_to_model_wrapper(
-            improve_diagram_description_prompt,
-            query_files=query_files,
-            query_images=query_images,
-            relevant_memories=relevant_memories,
-            fast_model=False,
-            agent_chat_model=agent_chat_model,
-            user=user,
-            tracer=tracer,
-        )
-        response_text = response.text.strip()
-        if response_text.startswith(('"', "'")) and response_text.endswith(('"', "'")):
-            response_text = response_text[1:-1]
-
-    return response_text
-
-
-async def generate_mermaidjs_diagram_from_description(
-    q: str,
-    user: KhojUser = None,
-    agent: Agent = None,
-    tracer: dict = {},
-) -> str:
-    personality_context = (
-        prompts.personality_context.format(personality=agent.personality) if agent and agent.personality else ""
-    )
-
-    mermaidjs_diagram_generation = prompts.mermaid_js_diagram_generation_prompt.format(
-        personality_context=personality_context,
-        query=q,
-    )
-
-    agent_chat_model = AgentAdapters.get_agent_chat_model(agent, user) if agent else None
-
-    with timer("Chat actor: Generate Mermaid.js diagram", logger):
-        raw_response = await send_message_to_model_wrapper(
-            query=mermaidjs_diagram_generation,
-            fast_model=False,
-            agent_chat_model=agent_chat_model,
-            user=user,
-            tracer=tracer,
-        )
-        return clean_mermaidjs(raw_response.text.strip())
+    return apply_memory_write_decision(user, parsed, source_turn_id=source_turn_id)
 
 
 async def extract_questions(
@@ -1202,10 +866,6 @@ async def execute_search(
 ):
     start_time = time.time()
 
-    if agent and not await AgentAdapters.ais_agent_accessible(agent, user):
-        logger.error(f"Agent {agent.slug} is not accessible by user {user}")
-        return []
-
     if q is None or q == "":
         logger.warning("No query param (q) passed in API call to initiate search")
         return []
@@ -1223,7 +883,7 @@ async def execute_search(
     for filter in [DateFilter(), WordFilter(), FileFilter()]:
         defiltered_query = filter.defilter(defiltered_query)
     file_type_filter = None if t.value == SearchType.All.value else t.value
-    query = await sync_to_async(EntryAdapters.apply_filters)(user, user_query, file_type_filter, agent)
+    query = await sync_to_async(EntryAdapters.apply_filters)(user, user_query, file_type_filter)
     entries = await sync_to_async(list)(query[: max(results_count * 20, 50)])
     terms = [term.lower() for term in re.findall(r"[A-Za-z0-9_+#.-]+|[\u4e00-\u9fff]{2,}", defiltered_query)]
 
@@ -1400,13 +1060,13 @@ async def send_message_to_model_wrapper(
             system_message=system_message,
             model_name=chat_model.name,
             model_type=chat_model.model_type,
-            tokenizer_name=chat_model.tokenizer,
             max_prompt_size=max_tokens,
             vision_enabled=chat_model.vision_enabled if not query_images else vision_available,
         )
 
         try:
-            return send_message_to_model(
+            return await asyncio.to_thread(
+                send_message_to_model,
                 chat_model=chat_model,
                 truncated_messages=truncated_messages,
                 response_type=response_type,
@@ -1526,11 +1186,9 @@ def build_conversation_context(
     user_query: str,
     references: List[Dict],
     online_results: Dict[str, Dict],
-    code_results: Dict[str, Dict],
     query_files: str = None,
     query_images: Optional[List[str]] = None,
     relevant_memories: List[OfferAgentMemory] = None,
-    generated_asset_results: Dict[str, Dict] = {},
     program_execution_context: List[str] = None,
     chat_history: List[ChatMessageModel] = [],
     location_data: LocationData = None,
@@ -1540,7 +1198,6 @@ def build_conversation_context(
     model_name: str = None,
     model_type: ChatModel.ModelType = None,
     max_prompt_size: int = None,
-    tokenizer_name: str = None,
     vision_available: bool = False,
 ) -> List[ChatMessage]:
     """
@@ -1605,10 +1262,6 @@ def build_conversation_context(
         context_message = f"{prompts.notes_conversation.format(references=yaml_dump(prompt_references))}\n\n"
     if not is_none_or_empty(online_results):
         context_message += f"{prompts.online_search_conversation.format(online_results=yaml_dump(online_results))}\n\n"
-    if not is_none_or_empty(code_results):
-        context_message += (
-            f"{prompts.code_executed_context.format(code_results=truncate_code_context(code_results))}\n\n"
-        )
     context_message = context_message.strip()
     message_with_context = user_query
     if not is_none_or_empty(context_message):
@@ -1622,14 +1275,12 @@ def build_conversation_context(
         query_images=query_images,
         context_message=context_message,
         relevant_memories=relevant_memories,
-        generated_asset_results=generated_asset_results,
         program_execution_context=program_execution_context,
         chat_history=chat_history,
         system_message=system_prompt,
         model_name=model_name,
         model_type=model_type,
         max_prompt_size=max_prompt_size,
-        tokenizer_name=tokenizer_name,
         vision_enabled=vision_available,
     )
 
@@ -1642,7 +1293,6 @@ async def agenerate_chat_response(
     conversation: Conversation,
     compiled_references: List[Dict] = [],
     online_results: Dict[str, Dict] = {},
-    code_results: Dict[str, Dict] = {},
     research_results: List[ResearchIteration] = [],
     user: KhojUser = None,
     location_data: LocationData = None,
@@ -1651,14 +1301,13 @@ async def agenerate_chat_response(
     query_files: str = None,
     relevant_memories: List[OfferAgentMemory] = [],
     program_execution_context: List[str] = [],
-    generated_asset_results: Dict[str, Dict] = {},
     tracer: dict = {},
 ) -> Tuple[AsyncGenerator[ResponseWithThought, None], Dict[str, str]]:
     # Initialize Variables
     chat_response_generator: AsyncGenerator[ResponseWithThought, None] = None
 
     metadata = {}
-    agent = await AgentAdapters.aget_conversation_agent_by_id(conversation.agent.id) if conversation.agent else None
+    agent = None
 
     try:
         codex_runtime = use_codex_runtime()
@@ -1670,7 +1319,6 @@ async def agenerate_chat_response(
                 query_to_run = f"<query>{q}</query>\n<collected_research>\n{compiled_research}\n</collected_research>"
             compiled_references = []
             online_results = {}
-            code_results = {}
             deepthought = True
 
         if codex_runtime:
@@ -1692,11 +1340,9 @@ async def agenerate_chat_response(
             user_query=query_to_run,
             references=compiled_references,
             online_results=online_results,
-            code_results=code_results,
             query_files=query_files,
             query_images=query_images,
             relevant_memories=relevant_memories,
-            generated_asset_results=generated_asset_results,
             program_execution_context=program_execution_context,
             chat_history=chat_history,
             location_data=location_data,
@@ -1705,7 +1351,6 @@ async def agenerate_chat_response(
             model_type=chat_model.model_type,
             model_name=chat_model.name,
             max_prompt_size=max_prompt_size,
-            tokenizer_name=chat_model.tokenizer,
             vision_available=vision_available,
         )
 
@@ -2135,12 +1780,10 @@ def scheduled_chat(
     # Construct the Headers for the chat API
     headers = {"User-Agent": "Khoj", "Content-Type": "application/json"}
     if not state.anonymous_mode:
-        # Add authorization request header in non-anonymous mode
-        token = get_khoj_tokens(user)
-        if is_none_or_empty(token):
-            token = create_khoj_token(user).token
-        else:
-            token = token[0].token
+        token = os.getenv("KHOJ_API_KEY")
+        if not token:
+            logger.error("KHOJ_API_KEY is required to run automations when anonymous mode is disabled")
+            return None
         headers["Authorization"] = f"Bearer {token}"
 
     # Call the chat API endpoint with authenticated user token and query
@@ -2323,23 +1966,42 @@ class MessageProcessor:
         self.references = {}
         self.usage = {}
         self.raw_response = ""
-        self.generated_images = []
-        self.generated_files = []
-        self.generated_mermaidjs_diagram = []
         self.vault_actions = []
 
     def convert_message_chunk_to_json(self, raw_chunk: str) -> Dict[str, Any]:
-        if raw_chunk.startswith("{") and raw_chunk.endswith("}"):
-            try:
-                json_chunk = json.loads(raw_chunk)
-                if "type" not in json_chunk:
-                    json_chunk = {"type": "message", "data": json_chunk}
-                return json_chunk
-            except json.JSONDecodeError:
-                return {"type": "message", "data": raw_chunk}
-        elif raw_chunk:
-            return {"type": "message", "data": raw_chunk}
-        return {"type": "", "data": ""}
+        if not raw_chunk:
+            return {"type": "", "data": ""}
+        try:
+            event = json.loads(raw_chunk)
+        except json.JSONDecodeError as error:
+            raise ValueError("Invalid chat stream event: expected a JSON envelope.") from error
+        if not isinstance(event, dict) or set(event) != {"type", "data"} or not isinstance(event["type"], str):
+            raise ValueError("Invalid chat stream event: expected exactly type and data.")
+        try:
+            event_type = ChatEvent(event["type"])
+        except ValueError as error:
+            raise ValueError(f"Invalid chat stream event type: {event['type']}") from error
+        text_event_types = {
+            ChatEvent.START_LLM_RESPONSE,
+            ChatEvent.END_LLM_RESPONSE,
+            ChatEvent.END_RESPONSE,
+            ChatEvent.STATUS,
+            ChatEvent.THOUGHT,
+            ChatEvent.MESSAGE,
+        }
+        object_event_types = {
+            ChatEvent.REFERENCES,
+            ChatEvent.VAULT_ACTIONS,
+            ChatEvent.METADATA,
+            ChatEvent.USAGE,
+        }
+        if event_type not in text_event_types | object_event_types:
+            raise ValueError(f"Invalid chat stream event type: {event_type.value}")
+        if event_type in text_event_types and not isinstance(event["data"], str):
+            raise ValueError(f"Invalid {event_type.value} chat stream event data.")
+        if event_type in object_event_types and not isinstance(event["data"], dict):
+            raise ValueError(f"Invalid {event_type.value} chat stream event data.")
+        return event
 
     def process_message_chunk(self, raw_chunk: str) -> None:
         chunk = self.convert_message_chunk_to_json(raw_chunk)
@@ -2353,39 +2015,11 @@ class MessageProcessor:
             self.usage = chunk["data"]
         elif chunk_type == ChatEvent.MESSAGE:
             chunk_data = chunk["data"]
-            if isinstance(chunk_data, dict):
-                self.raw_response = self.handle_json_response(chunk_data)
-            elif (
-                isinstance(chunk_data, str) and chunk_data.strip().startswith("{") and chunk_data.strip().endswith("}")
-            ):
-                try:
-                    json_data = json.loads(chunk_data.strip())
-                    self.raw_response = self.handle_json_response(json_data)
-                except json.JSONDecodeError:
-                    self.raw_response += chunk_data
-            else:
-                self.raw_response += chunk_data
-        elif chunk_type == ChatEvent.GENERATED_ASSETS:
-            chunk_data = chunk["data"]
-            if isinstance(chunk_data, dict):
-                for key in chunk_data:
-                    if key == "images":
-                        self.generated_images = chunk_data[key]
-                    elif key == "files":
-                        self.generated_files = chunk_data[key]
-                    elif key == "mermaidjsDiagram":
-                        self.generated_mermaidjs_diagram = chunk_data[key]
+            self.raw_response += chunk_data
         elif chunk_type == ChatEvent.VAULT_ACTIONS:
             chunk_data = chunk["data"]
             if isinstance(chunk_data, dict) and isinstance(chunk_data.get("actions"), list):
                 self.vault_actions = chunk_data["actions"]
-
-    def handle_json_response(self, json_data: Dict[str, str]) -> str | Dict[str, str]:
-        if "image" in json_data or "details" in json_data:
-            return json_data
-        if "response" in json_data:
-            return json_data["response"]
-        return json_data
 
 
 async def read_chat_stream(response_iterator: AsyncGenerator[str, None]) -> Dict[str, Any]:
@@ -2412,9 +2046,6 @@ async def read_chat_stream(response_iterator: AsyncGenerator[str, None]) -> Dict
         "response": processor.raw_response,
         "references": processor.references,
         "usage": processor.usage,
-        "images": processor.generated_images,
-        "files": processor.generated_files,
-        "mermaidjsDiagram": processor.generated_mermaidjs_diagram,
         "vaultActions": processor.vault_actions,
     }
 
@@ -2494,8 +2125,6 @@ def get_user_config(user: KhojUser, request: Request, is_detailed: bool = False)
         else selected_chat_model_config.id
         if selected_chat_model_config
         else None,
-        "paint_model_options": [],
-        "selected_paint_model_config": None,
         # server settings
         "khoj_version": state.khoj_version,
         "anonymous_mode": state.anonymous_mode,
@@ -2585,408 +2214,3 @@ def configure_content(
         state.query_cache[user.uuid] = LRU()
 
     return success
-
-
-async def view_file_content(
-    path: str,
-    start_line: Optional[int] = None,
-    end_line: Optional[int] = None,
-    user: KhojUser = None,
-) -> AsyncGenerator[List[Dict[str, str]], None]:
-    """
-    View the contents of a file from the user's document database with optional line range specification.
-    """
-    query = f"View file: {path}"
-    if start_line and end_line:
-        query += f" (lines {start_line}-{end_line})"
-
-    try:
-        local_kb_root = get_local_kb_root()
-        if local_kb_root:
-            try:
-                local_file = kb_read(path, start_line=start_line, end_line=end_line, max_lines=80)
-                yield [{"query": query, "file": local_file.path, "uri": local_file.path, "compiled": local_file.text}]
-                return
-            except LocalKBError as e:
-                logger.warning("Local KB file read blocked: %s", e)
-                yield [{"query": query, "file": path, "uri": path, "compiled": str(e)}]
-                return
-
-        # Get the file object from the database by name
-        file_objects = await FileObjectAdapters.aget_file_objects_by_name(user, path)
-
-        if not file_objects:
-            error_msg = f"File '{path}' not found in user documents"
-            logger.warning(error_msg)
-            yield [{"query": query, "file": path, "compiled": error_msg}]
-            return
-
-        # Use the first file object if multiple exist
-        file_object = file_objects[0]
-        raw_text = file_object.raw_text
-
-        # Apply line range filtering if specified
-        lines = raw_text.split("\n")
-        start_line = start_line or 1
-        end_line = end_line or len(lines)
-
-        # Validate line range
-        if start_line < 1 or end_line < 1 or start_line > end_line:
-            error_msg = f"Invalid line range: {start_line}-{end_line}"
-            logger.warning(error_msg)
-            yield [{"query": query, "file": path, "compiled": error_msg}]
-            return
-        if start_line > len(lines):
-            error_msg = f"Start line {start_line} exceeds total number of lines {len(lines)}"
-            logger.warning(error_msg)
-            yield [{"query": query, "file": path, "compiled": error_msg}]
-            return
-
-        # Convert from 1-based to 0-based indexing and ensure bounds
-        start_idx = max(0, start_line - 1)
-        end_idx = min(len(lines), end_line)
-
-        # Limit to first 50 lines if more than 50 lines are requested
-        truncation_message = ""
-        if end_idx - start_idx > 50:
-            truncation_message = "\n\n[Truncated after 50 lines! Use narrower line range to view complete section.]"
-            end_idx = start_idx + 50
-
-        selected_lines = lines[start_idx:end_idx]
-        filtered_text = "\n".join(selected_lines) + truncation_message
-
-        # Format the result as a document reference
-        document_results = [
-            {
-                "query": query,
-                "file": path,
-                "uri": path,
-                "compiled": filtered_text,
-            }
-        ]
-
-        yield document_results
-
-    except Exception as e:
-        error_msg = f"Error viewing file {path}: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-
-        # Return an error result in the expected format
-        yield [{"query": query, "file": path, "uri": path, "compiled": error_msg}]
-
-
-async def grep_files(
-    regex_pattern: str,
-    path_prefix: Optional[str] = None,
-    lines_before: Optional[int] = None,
-    lines_after: Optional[int] = None,
-    user: KhojUser = None,
-):
-    """
-    Search for a regex pattern in files with an optional path prefix and context lines.
-    """
-
-    # Construct the query string based on provided parameters
-    def _generate_query(line_count, doc_count, path, pattern, lines_before, lines_after, max_results=1000):
-        query = f"**Found {line_count} matches for '{pattern}' in {doc_count} documents**"
-        if path:
-            query += f" in {path}"
-        if lines_before or lines_after or line_count > max_results:
-            query += " Showing"
-        if lines_before or lines_after:
-            context_info = []
-            if lines_before:
-                context_info.append(f"{lines_before} lines before")
-            if lines_after:
-                context_info.append(f"{lines_after} lines after")
-            query += f" {' and '.join(context_info)}"
-        if line_count > max_results:
-            if lines_before or lines_after:
-                query += " for"
-            query += f" first {max_results} results"
-        return query
-
-    # Validate regex pattern
-    path_prefix = path_prefix or ""
-    lines_before = lines_before or 0
-    lines_after = lines_after or 0
-
-    try:
-        regex = re.compile(regex_pattern, re.IGNORECASE | re.MULTILINE)
-    except re.error as e:
-        yield {
-            "query": _generate_query(0, 0, path_prefix, regex_pattern, lines_before, lines_after),
-            "file": path_prefix,
-            "compiled": f"Invalid regex pattern: {e}",
-        }
-        return
-
-    try:
-        local_kb_root = get_local_kb_root()
-        if local_kb_root:
-            try:
-                local_result = kb_grep(
-                    regex_pattern,
-                    path_prefix=path_prefix,
-                    mode="regex",
-                    before=lines_before,
-                    after=lines_after,
-                    max_results=1000,
-                )
-                if local_result.lines:
-                    query = _generate_query(
-                        local_result.line_count,
-                        local_result.document_count,
-                        path_prefix,
-                        regex_pattern,
-                        lines_before,
-                        lines_after,
-                    )
-                    yield {
-                        "query": query,
-                        "file": path_prefix,
-                        "uri": path_prefix,
-                        "compiled": "\n".join(local_result.lines),
-                    }
-                    return
-                query = _generate_query(0, 0, path_prefix, regex_pattern, lines_before, lines_after)
-                yield {"query": query, "file": path_prefix, "uri": path_prefix, "compiled": "No matches found."}
-                return
-            except LocalKBError as e:
-                logger.warning("Local KB grep blocked: %s", e)
-                yield {
-                    "query": _generate_query(0, 0, path_prefix, regex_pattern, lines_before, lines_after),
-                    "file": path_prefix,
-                    "uri": path_prefix,
-                    "compiled": str(e),
-                }
-                return
-
-        # Make db pushdown filters more permissive by removing line anchors
-        # The precise line-anchored matching will be done in Python stage
-        db_pattern = regex_pattern
-        db_pattern = re.sub(r"\(\?\w*\)", "", db_pattern)  # Remove inline flags like (?i), (?m), (?im)
-        db_pattern = re.sub(r"^\^", "", db_pattern)  # Remove ^ at regex pattern start
-        db_pattern = re.sub(r"\$$", "", db_pattern)  # Remove $ at regex pattern end
-
-        file_matches = await FileObjectAdapters.aget_file_objects_by_regex(user, db_pattern, path_prefix)
-
-        line_matches = []
-        line_matches_count = 0
-        for file_object in file_matches:
-            lines = file_object.raw_text.split("\n")
-            matched_line_numbers = []
-
-            # Find all matching line numbers first
-            for i, line in enumerate(lines, 1):
-                if regex.search(line):
-                    matched_line_numbers.append(i)
-            line_matches_count += len(matched_line_numbers)
-
-            # Build context for each match
-            for line_num in matched_line_numbers:
-                context_lines = []
-
-                # Calculate start and end indices for context (0-based)
-                start_idx = max(0, line_num - 1 - lines_before)
-                end_idx = min(len(lines), line_num + lines_after)
-
-                # Add context lines with line numbers
-                for idx in range(start_idx, end_idx):
-                    current_line_num = idx + 1
-                    line_content = lines[idx]
-
-                    if current_line_num == line_num:
-                        # This is the matching line, mark it
-                        context_lines.append(f"{file_object.file_name}:{current_line_num}: {line_content}")
-                    else:
-                        # This is a context line
-                        context_lines.append(f"{file_object.file_name}-{current_line_num}-  {line_content}")
-
-                # Add separator between matches if showing context
-                if lines_before > 0 or lines_after > 0:
-                    context_lines.append("--")
-
-                line_matches.extend(context_lines)
-
-        # Remove the last separator if it exists
-        if line_matches and line_matches[-1] == "--":
-            line_matches.pop()
-
-        # Check if no results found
-        max_results = 1000
-        query = _generate_query(
-            line_matches_count,
-            len(file_matches),
-            path_prefix,
-            regex_pattern,
-            lines_before,
-            lines_after,
-            max_results,
-        )
-        if not line_matches:
-            yield {"query": query, "file": path_prefix, "uri": path_prefix, "compiled": "No matches found."}
-            return
-
-        # Truncate matched lines list if too long
-        if len(line_matches) > max_results:
-            line_matches = line_matches[:max_results] + [
-                f"... {len(line_matches) - max_results} more results found. Use stricter regex or path to narrow down results."
-            ]
-
-        yield {"query": query, "file": path_prefix, "uri": path_prefix, "compiled": "\n".join(line_matches)}
-
-    except Exception as e:
-        error_msg = f"Error using grep files tool: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        yield [
-            {
-                "query": _generate_query(0, 0, path_prefix or "", regex_pattern, lines_before, lines_after),
-                "file": path_prefix,
-                "uri": path_prefix,
-                "compiled": error_msg,
-            }
-        ]
-
-
-async def list_files(
-    path: Optional[str] = None,
-    pattern: Optional[str] = None,
-    user: KhojUser = None,
-):
-    """
-    List files under a given path or glob pattern from the user's document database.
-    """
-
-    # Construct the query string based on provided parameters
-    def _generate_query(doc_count, path, pattern):
-        query = f"**Found {doc_count} files**"
-        if path:
-            query += f" in {path}"
-        if pattern:
-            query += f" filtered by {pattern}"
-        return query
-
-    try:
-        local_kb_root = get_local_kb_root()
-        if local_kb_root:
-            try:
-                local_list = kb_list(path, pattern, limit=100)
-                if local_list.items:
-                    display_items = [
-                        f"{item['path']}/" if item["type"] == "directory" else item["path"] for item in local_list.items
-                    ]
-                    if local_list.truncated:
-                        display_items.append(
-                            f"... {local_list.total - len(local_list.items)} more files found. Use glob pattern to narrow down results."
-                        )
-                    query = _generate_query(local_list.total, path, pattern)
-                    yield {"query": query, "file": path, "uri": path, "compiled": "\n- ".join(display_items)}
-                    return
-                yield {
-                    "query": _generate_query(0, path, pattern),
-                    "file": path,
-                    "uri": path,
-                    "compiled": "No files found.",
-                }
-                return
-            except LocalKBError as e:
-                logger.warning("Local KB list blocked: %s", e)
-                yield {"query": _generate_query(0, path, pattern), "file": path, "uri": path, "compiled": str(e)}
-                return
-
-        # Get user files by path prefix when specified
-        path = path or ""
-        if path in ["", "/", ".", "./", "~", "~/"]:
-            file_objects = await FileObjectAdapters.aget_all_file_objects(user, limit=10000)
-        else:
-            file_objects = await FileObjectAdapters.aget_file_objects_by_path_prefix(user, path)
-
-        if not file_objects:
-            yield {"query": _generate_query(0, path, pattern), "file": path, "uri": path, "compiled": "No files found."}
-            return
-
-        # Extract file names from file objects
-        files = [f.file_name for f in file_objects]
-        # Convert to relative file path (similar to ls)
-        if path:
-            files = [f[len(path) :] for f in files]
-
-        # Apply glob pattern filtering if specified
-        if pattern:
-            files = [f for f in files if fnmatch.fnmatch(f, pattern)]
-
-        query = _generate_query(len(files), path, pattern)
-        if not files:
-            yield {"query": query, "file": path, "uri": path, "compiled": "No files found."}
-            return
-
-        # Truncate the list if it's too long
-        max_files = 100
-        if len(files) > max_files:
-            files = files[:max_files] + [
-                f"... {len(files) - max_files} more files found. Use glob pattern to narrow down results."
-            ]
-
-        yield {"query": query, "file": path, "uri": path, "compiled": "\n- ".join(files)}
-
-    except Exception as e:
-        error_msg = f"Error listing files in {path}: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        yield {"query": query, "file": path, "uri": path, "compiled": error_msg}
-
-
-async def view_kb_headings(path: str, user: KhojUser = None):
-    query = f"View headings: {path}"
-    try:
-        if not get_local_kb_root():
-            yield {"query": query, "file": path, "uri": path, "compiled": "Local knowledge base is not configured."}
-            return
-        result = kb_headings(path)
-        if not result.headings:
-            yield {"query": query, "file": result.path, "uri": result.path, "compiled": "No Markdown headings found."}
-            return
-        compiled = "\n".join(
-            f"{'#' * heading['level']} {heading['title']} (L{heading['start_line']}-L{heading['end_line']})"
-            for heading in result.headings
-        )
-        yield {"query": query, "file": result.path, "uri": result.path, "compiled": compiled}
-    except LocalKBError as e:
-        logger.warning("Local KB headings blocked: %s", e)
-        yield {"query": query, "file": path, "uri": path, "compiled": str(e)}
-    except Exception as e:
-        error_msg = f"Error viewing headings for {path}: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        yield {"query": query, "file": path, "uri": path, "compiled": error_msg}
-
-
-async def resolve_kb_link(from_path: str, link: str, user: KhojUser = None):
-    query = f"Resolve link: {link} from {from_path}"
-    try:
-        if not get_local_kb_root():
-            yield {
-                "query": query,
-                "file": from_path,
-                "uri": from_path,
-                "compiled": "Local knowledge base is not configured.",
-            }
-            return
-        result = kb_resolve_link(from_path, link)
-        if result.status == "resolved":
-            compiled = f"Resolved to {result.resolved}"
-            if result.anchor:
-                compiled += f"#{result.anchor}"
-        elif result.status == "ambiguous":
-            compiled = "Ambiguous link candidates:\n- " + "\n- ".join(result.candidates)
-        else:
-            compiled = f"Link {result.status}."
-        yield {
-            "query": query,
-            "file": result.resolved or from_path,
-            "uri": result.resolved or from_path,
-            "compiled": compiled,
-        }
-    except Exception as e:
-        error_msg = f"Error resolving link {link}: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        yield {"query": query, "file": from_path, "uri": from_path, "compiled": error_msg}

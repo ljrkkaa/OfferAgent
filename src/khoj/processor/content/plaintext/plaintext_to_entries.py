@@ -49,12 +49,9 @@ class PlaintextToEntries(TextToEntries):
         return num_new_entries, num_deleted_entries
 
     @staticmethod
-    def extract_html_content(markup_content: str, markup_type: str):
+    def extract_html_content(markup_content: str):
         "Extract content from HTML"
-        if markup_type == "xml":
-            soup = BeautifulSoup(markup_content, "xml")
-        else:
-            soup = BeautifulSoup(markup_content, "html.parser")
+        soup = BeautifulSoup(markup_content, "html.parser")
         return soup.get_text(strip=True, separator="\n")
 
     @staticmethod
@@ -83,8 +80,10 @@ class PlaintextToEntries(TextToEntries):
         entries: List[str],
         entry_to_file_map: List[Tuple[str, str]],
     ) -> Tuple[List[str], List[Tuple[str, str]]]:
-        if text_file.endswith(("html", "htm", "xml")):
-            text_content = PlaintextToEntries.extract_html_content(text_content, text_file.split(".")[-1])
+        if text_file.lower().endswith(".xml"):
+            raise ValueError("XML files are not supported.")
+        if text_file.lower().endswith((".html", ".htm")):
+            text_content = PlaintextToEntries.extract_html_content(text_content)
         entry_to_file_map += [(text_content, text_file)]
         entries.extend([text_content])
         return entries, entry_to_file_map

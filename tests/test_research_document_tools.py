@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from khoj.processor.conversation import knowledge_workspace
 from khoj.routers import helpers, research
 from khoj.routers.research import _document_research_tools
 from khoj.utils.helpers import ConversationCommand
@@ -55,8 +56,10 @@ async def test_local_kb_headings_and_resolve_link_helpers(tmp_path, monkeypatch)
     (interview / "java.md").write_text("# Java\nbody\n## HashMap\nnotes\n", encoding="utf-8")
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
 
-    headings = [item async for item in helpers.view_kb_headings("interview/java.md")]
-    resolved = [item async for item in helpers.resolve_kb_link("index.md", "[Java](interview/java.md)")]
+    headings = [item async for item in knowledge_workspace.view_workspace_headings("interview/java.md")]
+    resolved = [
+        item async for item in knowledge_workspace.resolve_workspace_link("index.md", "[Java](interview/java.md)")
+    ]
 
     assert "# Java (L1-L4)" in headings[0]["compiled"]
     assert "## HashMap (L3-L4)" in headings[0]["compiled"]

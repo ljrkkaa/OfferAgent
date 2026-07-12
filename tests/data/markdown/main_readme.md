@@ -25,7 +25,6 @@ pip install khoj
 
 ### **Khoj via API**
 - Query: `GET` [http://localhost:42110/api/search?q="What is the meaning of life"](http://localhost:42110/api/search?q=%22what%20is%20the%20meaning%20of%20life%22)
-- Update Index: `GET` [http://localhost:42110/api/update](http://localhost:42110/api/update)
 - [Khoj API Docs](http://localhost:42110/docs)
 
 ### *Khoj via Web*

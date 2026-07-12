@@ -4,18 +4,16 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
 
+from asgiref.sync import sync_to_async
 from fastapi import (
     APIRouter,
-    Body,
     Depends,
     HTTPException,
-    Query,
     Request,
     WebSocket,
     WebSocketDisconnect,
@@ -30,19 +28,29 @@ from khoj.database.adapters import (
     AgentAdapters,
     ConversationAdapters,
     EntryAdapters,
-    FileObjectAdapters,
     aget_user_name,
 )
 from khoj.database.models import Agent, KhojUser
-from khoj.processor.conversation import prompts
 from khoj.processor.conversation.agent_tool_loop import collect_agent_context_and_actions
-from khoj.processor.conversation.notes_tool_loop import collect_notes_evidence_with_tools
-from khoj.processor.conversation.offeragent_intent_router import RouteDecision, route_offeragent_intent
+from khoj.processor.conversation.conversation_turn import ConversationTurn, persist_conversation_turn
+from khoj.processor.conversation.knowledge_workspace import (
+    dedupe_workspace_evidence,
+    get_workspace_sources,
+    search_indexed_evidence,
+)
+from khoj.processor.conversation.offeragent_intent_router import route_offeragent_intent
 from khoj.processor.conversation.prompts import no_entries_found
 from khoj.processor.conversation.utils import (
     ResponseWithThought,
     defilter_query,
-    save_to_conversation_log,
+)
+from khoj.processor.conversation.vault_actions import (
+    VaultActionError,
+    VaultActionTurnConflict,
+    create_vault_action_batch,
+    delete_conversations_with_vault_protection,
+    serialize_vault_action_batch,
+    web_vault_write_enabled,
 )
 from khoj.processor.conversation.vault_policy import load_vault_policy
 from khoj.processor.tools.online_search import (
@@ -50,7 +58,6 @@ from khoj.processor.tools.online_search import (
     read_webpages,
     search_online,
 )
-from khoj.processor.tools.run_code import run_code
 from khoj.routers.helpers import (
     ApiImageRateLimiter,
     ApiUserRateLimiter,
@@ -62,14 +69,12 @@ from khoj.routers.helpers import (
     WebSocketConnectionManager,
     acreate_title_from_history,
     agenerate_chat_response,
-    execute_search,
     gather_raw_query_files,
-    generate_mermaidjs_diagram,
     generate_summary_from_files,
-    get_conversation_command,
     get_message_from_queue,
     is_query_empty,
     is_ready_to_chat,
+    parse_conversation_command,
     read_chat_stream,
     select_offeragent_memories,
     send_message_to_model_wrapper,
@@ -84,18 +89,8 @@ from khoj.utils.helpers import (
     convert_image_to_webp,
     get_country_code_from_timezone,
     get_country_name_from_timezone,
-    is_code_sandbox_enabled,
     is_none_or_empty,
     is_web_search_enabled,
-)
-from khoj.utils.local_kb import get_local_kb_root
-from khoj.utils.openkb import (
-    OpenKBError,
-    dedupe_references,
-    get_kb_engine,
-    openkb_is_ready,
-    save_exploration,
-    wants_openkb_exploration_save,
 )
 from khoj.utils.rawconfig import (
     FileFilterRequest,
@@ -108,54 +103,83 @@ logger = logging.getLogger(__name__)
 conversation_command_rate_limiter = ConversationCommandRateLimiter(rate_limit=20, slug="command")
 
 api_chat = APIRouter()
+WEBSOCKET_INTERRUPT_GRACE_SECONDS = 5.0
 
 
-async def search_indexed_notes(
-    user: KhojUser, query: str, agent: Optional[Agent], limit: int = 8
-) -> list[dict[str, Any]]:
-    if not getattr(user, "uuid", None):
-        return []
-    searchable_agent = agent if getattr(agent, "pk", None) else None
-    results = await execute_search(user=user, q=query, n=limit * 5, agent=searchable_agent)
+def _enqueue_interrupt_signal(
+    interrupt_queue: asyncio.Queue | None,
+    item: Any,
+    *,
+    replace_pending: bool = False,
+) -> bool:
+    """Enqueue without blocking; hard interrupts may replace stale pending signals."""
 
-    unique_results = []
-    seen_files = set()
-    for result in results:
-        file_name = (result.additional or {}).get("file") or result.corpus_id
-        if file_name in seen_files:
-            continue
-        seen_files.add(file_name)
-        unique_results.append(result)
-        if len(unique_results) >= limit:
+    if interrupt_queue is None:
+        return False
+    try:
+        interrupt_queue.put_nowait(item)
+        return True
+    except asyncio.QueueFull:
+        if not replace_pending:
+            return False
+
+    while True:
+        try:
+            interrupt_queue.get_nowait()
+        except asyncio.QueueEmpty:
             break
+        interrupt_queue.task_done()
 
-    file_names = [(result.additional or {}).get("file") for result in unique_results]
-    file_objects = await FileObjectAdapters.aget_file_objects_by_names(user, [name for name in file_names if name])
-    raw_text_by_file = {file_object.file_name: file_object.raw_text for file_object in file_objects}
-
-    references: list[dict[str, Any]] = []
-    for result in unique_results:
-        additional = result.additional or {}
-        file_name = additional.get("file")
-        raw_text = raw_text_by_file.get(file_name)
-        references.append(
-            {
-                "query": additional.get("query") or query,
-                "file": file_name,
-                "uri": additional.get("uri") or file_name,
-                "compiled": f"# {file_name}\n{raw_text}" if raw_text else result.entry,
-                "score": result.score,
-                "source": additional.get("source") or "indexed",
-                "heading": additional.get("heading"),
-            }
-        )
-    return references
+    try:
+        interrupt_queue.put_nowait(item)
+        return True
+    except asyncio.QueueFull:
+        return False
 
 
-def _client_supports_vault_actions(body: ChatRequestBody, client: Any) -> bool:
-    client_name = str(client or "").lower()
+async def _wait_for_http_disconnect(request: Request, shutdown_event: asyncio.Event) -> bool:
+    """Wait for disconnect or shutdown and always reap both watcher tasks."""
+
+    receive_task = asyncio.create_task(request.receive())
+    shutdown_task = asyncio.create_task(shutdown_event.wait())
+    watcher_tasks = {receive_task, shutdown_task}
+    try:
+        done, _ = await asyncio.wait(watcher_tasks, return_when=asyncio.FIRST_COMPLETED)
+        return receive_task in done and receive_task.result().get("type") == "http.disconnect"
+    finally:
+        for watcher_task in watcher_tasks:
+            if not watcher_task.done():
+                watcher_task.cancel()
+        await asyncio.gather(*watcher_tasks, return_exceptions=True)
+
+
+async def _shutdown_monitor_task(monitor_task: asyncio.Task | None, shutdown_event: asyncio.Event) -> None:
+    """Ask a monitor to finish, only cancelling after a bounded grace period."""
+
+    shutdown_event.set()
+    if monitor_task is None:
+        return
+    if monitor_task.done():
+        await asyncio.gather(monitor_task, return_exceptions=True)
+        return
+    done, _ = await asyncio.wait({monitor_task}, timeout=WEBSOCKET_INTERRUPT_GRACE_SECONDS)
+    if done:
+        await asyncio.gather(monitor_task, return_exceptions=True)
+        return
+
+    monitor_task.cancel()
+    await asyncio.gather(monitor_task, return_exceptions=True)
+
+
+def _vault_action_mode(body: ChatRequestBody, client: str | None) -> str:
     capabilities = body.client_capabilities or {}
-    return "obsidian" in client_name and bool(capabilities.get("vaultActions"))
+    if capabilities.get("vaultActions") is not True:
+        return "disabled"
+    if client == "obsidian":
+        return "client_actions"
+    if client == "web" and web_vault_write_enabled():
+        return "server_review"
+    return "disabled"
 
 
 def _collect_vault_actions(references: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -168,8 +192,8 @@ def _collect_vault_actions(references: list[dict[str, Any]]) -> list[dict[str, A
 
 
 NON_STREAM_STRUCTURED_EVENTS = {
+    ChatEvent.MESSAGE,
     ChatEvent.REFERENCES,
-    ChatEvent.GENERATED_ASSETS,
     ChatEvent.VAULT_ACTIONS,
     ChatEvent.METADATA,
     ChatEvent.USAGE,
@@ -193,22 +217,6 @@ def is_allowed_websocket_origin(origin: str | None, host: str | None) -> bool:
     origin_host = _hostname(origin)
     host_name = _hostname(host)
     return bool(origin_host and (origin_host in ALLOWED_HOSTS or origin_host == host_name))
-
-
-@api_chat.get("/stats", response_class=Response)
-@requires(["authenticated"])
-def chat_stats(request: Request, common: CommonQueryParams) -> Response:
-    num_conversations = ConversationAdapters.get_num_conversations(request.user.object)
-    return Response(
-        content=json.dumps({"num_conversations": num_conversations}), media_type="application/json", status_code=200
-    )
-
-
-@api_chat.get("/export", response_class=Response)
-@requires(["authenticated"])
-def export_conversation(request: Request, common: CommonQueryParams, page: int = Query(0, ge=0)) -> Response:
-    all_conversations = ConversationAdapters.get_all_conversations_for_export(request.user.object, page=page)
-    return Response(content=json.dumps(all_conversations), media_type="application/json", status_code=200)
 
 
 @api_chat.get("/conversation/file-filters/{conversation_id}", response_class=Response)
@@ -283,17 +291,6 @@ def remove_file_filter(request: Request, filter: FileFilterRequest) -> Response:
     return Response(content=json.dumps(file_filters), media_type="application/json", status_code=200)
 
 
-@api_chat.get("/starters", response_class=Response)
-@requires(["authenticated"])
-async def chat_starters(
-    request: Request,
-    common: CommonQueryParams,
-) -> Response:
-    user: KhojUser = request.user.object
-    starter_questions = await ConversationAdapters.aget_conversation_starters(user)
-    return Response(content=json.dumps(starter_questions), media_type="application/json", status_code=200)
-
-
 @api_chat.get("/history")
 @requires(["authenticated"])
 def chat_history(
@@ -306,9 +303,7 @@ def chat_history(
     validate_chat_model(user)
 
     # Load Conversation History
-    conversation = ConversationAdapters.get_conversation_by_user(
-        user=user, client_application=request.user.client_app, conversation_id=conversation_id
-    )
+    conversation = ConversationAdapters.get_conversation_by_user(user=user, conversation_id=conversation_id)
 
     if conversation is None:
         return Response(
@@ -316,20 +311,13 @@ def chat_history(
             status_code=404,
         )
 
-    agent_metadata = None
-    if conversation.agent:
-        if not conversation.agent.managed_by_admin and conversation.agent.creator != user:
-            conversation.agent = None
-        else:
-            agent_metadata = {
-                "slug": conversation.agent.slug,
-                "name": conversation.agent.name,
-                "is_creator": conversation.agent.creator == user,
-                "color": conversation.agent.style_color,
-                "icon": conversation.agent.style_icon,
-                "persona": conversation.agent.personality,
-                "is_hidden": conversation.agent.is_hidden,
-            }
+    agent_metadata = {
+        "slug": AgentAdapters.DEFAULT_AGENT_SLUG,
+        "name": AgentAdapters.DEFAULT_AGENT_NAME,
+        "color": "orange",
+        "icon": "Lightbulb",
+        "persona": conversation.agent.personality if conversation.agent else "",
+    }
 
     meta_log = conversation.conversation_log
     meta_log.update(
@@ -368,10 +356,13 @@ async def clear_chat_history(
             status_code=404,
         )
 
-    # Clear Conversation History
-    deleted_count, _ = await ConversationAdapters.adelete_conversation_by_user(
-        user, request.user.client_app, target_conversation_id
-    )
+    try:
+        deleted_count, _ = await sync_to_async(delete_conversations_with_vault_protection, thread_sensitive=True)(
+            user=user,
+            conversation_id=target_conversation_id,
+        )
+    except VaultActionError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     if target_conversation_id and deleted_count == 0:
         return Response(
             content=json.dumps({"status": "error", "message": "Conversation not found"}),
@@ -392,7 +383,7 @@ def chat_sessions(
     user = request.user.object
 
     # Load Conversation Sessions
-    conversations = ConversationAdapters.get_conversation_sessions(user, request.user.client_app)
+    conversations = ConversationAdapters.get_conversation_sessions(user)
     if recent:
         conversations = conversations[:8]
 
@@ -400,25 +391,19 @@ def chat_sessions(
         "id",
         "slug",
         "title",
-        "agent__slug",
-        "agent__name",
         "created_at",
         "updated_at",
-        "agent__style_icon",
-        "agent__style_color",
-        "agent__is_hidden",
     )
 
     session_values = [
         {
             "conversation_id": str(session[0]),
             "slug": session[2] or session[1],
-            "agent_name": session[4],
-            "created": session[5].strftime("%Y-%m-%d %H:%M:%S"),
-            "updated": session[6].strftime("%Y-%m-%d %H:%M:%S"),
-            "agent_icon": session[7],
-            "agent_color": session[8],
-            "agent_is_hidden": session[9],
+            "agent_name": AgentAdapters.DEFAULT_AGENT_NAME,
+            "created": session[3].strftime("%Y-%m-%d %H:%M:%S"),
+            "updated": session[4].strftime("%Y-%m-%d %H:%M:%S"),
+            "agent_icon": "Lightbulb",
+            "agent_color": "orange",
         }
         for session in sessions
     ]
@@ -431,17 +416,10 @@ def chat_sessions(
 async def create_chat_session(
     request: Request,
     common: CommonQueryParams,
-    agent_slug: Optional[str] = None,
-    body: Optional[Dict[str, Any]] = Body(default=None),
-    # Add parameters here to create a custom hidden agent on the fly
 ):
     user = request.user.object
-    requested_agent_slug = agent_slug or str((body or {}).get("agent_slug") or "").strip() or None
 
-    # Create new Conversation Session
-    conversation = await ConversationAdapters.acreate_conversation_session(
-        user, request.user.client_app, requested_agent_slug
-    )
+    conversation = await ConversationAdapters.acreate_conversation_session(user)
 
     response = {"conversation_id": str(conversation.id)}
 
@@ -456,8 +434,6 @@ async def chat_options(
     cmd_options = {}
     for cmd in ConversationCommand:
         if cmd in [ConversationCommand.Online, ConversationCommand.Webpage] and not is_web_search_enabled():
-            continue
-        if cmd == ConversationCommand.Code and not is_code_sandbox_enabled():
             continue
         if cmd in command_descriptions:
             cmd_options[cmd.value] = command_descriptions[cmd]
@@ -477,9 +453,7 @@ async def set_conversation_title(
     title = title.strip()[:200]
 
     # Set Conversation Title
-    conversation = await ConversationAdapters.aset_conversation_title(
-        user, request.user.client_app, conversation_id, title
-    )
+    conversation = await ConversationAdapters.aset_conversation_title(user, conversation_id, title)
 
     success = True if conversation else False
 
@@ -508,7 +482,7 @@ async def generate_chat_title(
     new_title = await acreate_title_from_history(request.user.object, conversation=conversation)
     conversation.slug = clean_text_for_db(new_title[:200])
 
-    await conversation.asave()
+    await conversation.asave(update_fields=["slug", "updated_at"])
 
     return {"status": "ok", "title": new_title}
 
@@ -526,13 +500,48 @@ def delete_message(request: Request, delete_request: DeleteMessageRequestBody) -
         return Response(content=json.dumps({"status": "error", "message": "Message not found"}), status_code=404)
 
 
-async def event_generator(
+async def run_conversation_turn(
     body: ChatRequestBody,
     user_scope: Any,
     common: CommonQueryParams,
     headers: Headers,
     request_obj: Request | WebSocket,
     parent_interrupt_queue: asyncio.Queue = None,
+):
+    shutdown_event = asyncio.Event()
+    monitor_tasks: list[asyncio.Task] = []
+    iterator = _run_conversation_turn_impl(
+        body,
+        user_scope,
+        common,
+        headers,
+        request_obj,
+        parent_interrupt_queue,
+        shutdown_event=shutdown_event,
+        monitor_tasks=monitor_tasks,
+    )
+    try:
+        async for event in iterator:
+            yield event
+    finally:
+        shutdown_event.set()
+        try:
+            await iterator.aclose()
+        finally:
+            for monitor_task in monitor_tasks:
+                await _shutdown_monitor_task(monitor_task, shutdown_event)
+
+
+async def _run_conversation_turn_impl(
+    body: ChatRequestBody,
+    user_scope: Any,
+    common: CommonQueryParams,
+    headers: Headers,
+    request_obj: Request | WebSocket,
+    parent_interrupt_queue: asyncio.Queue = None,
+    *,
+    shutdown_event: asyncio.Event,
+    monitor_tasks: list[asyncio.Task],
 ):
     # Access the parameters from the body
     q = body.q
@@ -582,112 +591,107 @@ async def event_generator(
 
     research_results: List[ResearchIteration] = []
     online_results: Dict = dict()
-    code_results: Dict = dict()
     compiled_references: List[Any] = []
     inferred_queries: List[Any] = []
     attached_file_context = gather_raw_query_files(query_files)
 
-    generated_images: List[str] = []
-    generated_mermaidjs_diagram: str = None
-    generated_asset_results: Dict = dict()
     vault_actions: list[dict[str, Any]] = []
+    vault_action_event_payload: dict[str, Any] | None = None
     conversation_commands: List[ConversationCommand] = []
     program_execution_context: List[str] = []
     user_message_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    relevant_memories = []
+    full_response = ""
+    used_workspace_tools = False
+    workspace_has_evidence = False
+    workspace_tools_failed = False
+
+    turn = ConversationTurn(
+        user=user,
+        user_message=q,
+        turn_id=turn_id,
+        conversation_id=conversation_id,
+        user_message_time=user_message_time,
+        compiled_references=compiled_references,
+        online_results=online_results,
+        research_results=research_results,
+        inferred_queries=inferred_queries,
+        query_images=uploaded_images,
+        raw_query_files=raw_query_files or [],
+        train_of_thought=train_of_thought,
+        tracer=tracer,
+        writer=persist_conversation_turn,
+    )
+
+    def sync_turn_state() -> None:
+        turn.user_message = q
+        turn.conversation_id = conversation_id
+        turn.response = full_response
+        turn.used_workspace_tools = used_workspace_tools
 
     # Create a task to monitor for disconnections
     disconnect_monitor_task = None
 
     async def monitor_disconnection():
         nonlocal q, defiltered_query
-        if isinstance(request_obj, Request):
-            try:
-                msg = await request_obj.receive()
-                if msg["type"] == "http.disconnect":
+        interrupt_acknowledged: asyncio.Event | None = None
+        try:
+            if isinstance(request_obj, Request):
+                if await _wait_for_http_disconnect(request_obj, shutdown_event):
                     logger.debug(f"Request cancelled. User {user} disconnected from {common.client} client.")
                     cancellation_event.set()
-                    # ensure partial chat state saved on interrupt
-                    # shield the save against task cancellation
-                    if conversation:
-                        await asyncio.shield(
-                            save_to_conversation_log(
-                                q,
-                                chat_response="",
-                                user=user,
-                                compiled_references=compiled_references,
-                                online_results=online_results,
-                                code_results=code_results,
-                                research_results=research_results,
-                                inferred_queries=inferred_queries,
-                                client_application=user_scope.client_app,
-                                conversation_id=conversation_id,
-                                query_images=uploaded_images,
-                                train_of_thought=train_of_thought,
-                                raw_query_files=raw_query_files,
-                                generated_images=generated_images,
-                                generated_mermaidjs_diagram=generated_mermaidjs_diagram,
-                                user_message_time=user_message_time,
-                                tracer=tracer,
+            elif isinstance(request_obj, WebSocket):
+                while not cancellation_event.is_set() and not shutdown_event.is_set():
+                    if request_obj.client_state != WebSocketState.CONNECTED:
+                        cancellation_event.set()
+                        break
+                    queued_message = get_message_from_queue(parent_interrupt_queue)
+                    if queued_message:
+                        if (
+                            isinstance(queued_message, tuple)
+                            and len(queued_message) == 2
+                            and isinstance(queued_message[1], asyncio.Event)
+                        ):
+                            interrupt_query, interrupt_acknowledged = queued_message
+                        else:
+                            interrupt_query = queued_message
+                        if interrupt_query == ChatEvent.END_EVENT.value:
+                            cancellation_event.set()
+                            logger.debug(f"Chat cancelled by user {user} via interrupt queue.")
+                        elif interrupt_query == ChatEvent.INTERRUPT.value:
+                            cancellation_event.set()
+                            logger.debug("Chat interrupted.")
+                        else:
+                            logger.info(f"Continuing chat with the new instruction: {interrupt_query}")
+                            _enqueue_interrupt_signal(
+                                child_interrupt_queue,
+                                interrupt_query,
+                                replace_pending=True,
                             )
-                        )
-            except Exception as e:
-                logger.error(f"Error in disconnect monitor: {e}")
-        elif isinstance(request_obj, WebSocket):
-            while request_obj.client_state == WebSocketState.CONNECTED and not cancellation_event.is_set():
-                await asyncio.sleep(1)
+                            q += f"\n\n{interrupt_query}"
+                            defiltered_query += f"\n\n{defilter_query(interrupt_query)}"
+                    await asyncio.sleep(0.1)
 
-                # Check if any interrupt query is received
-                if interrupt_query := get_message_from_queue(parent_interrupt_queue):
-                    if interrupt_query == ChatEvent.END_EVENT.value:
-                        cancellation_event.set()
-                        logger.debug(f"Chat cancelled by user {user} via interrupt queue.")
-                    elif interrupt_query == ChatEvent.INTERRUPT.value:
-                        cancellation_event.set()
-                        logger.debug("Chat interrupted.")
-                    else:
-                        # Pass the interrupt query to child tasks
-                        logger.info(f"Continuing chat with the new instruction: {interrupt_query}")
-                        await child_interrupt_queue.put(interrupt_query)
-                        # Append the interrupt query to the main query
-                        q += f"\n\n{interrupt_query}"
-                        defiltered_query += f"\n\n{defilter_query(interrupt_query)}"
-
-            logger.debug(f"WebSocket disconnected or chat cancelled by user {user} from {common.client} client.")
-            if conversation and cancellation_event.is_set():
-                await asyncio.shield(
-                    save_to_conversation_log(
-                        q,
-                        chat_response="",
-                        user=user,
-                        compiled_references=compiled_references,
-                        online_results=online_results,
-                        code_results=code_results,
-                        research_results=research_results,
-                        inferred_queries=inferred_queries,
-                        client_application=user_scope.client_app,
-                        conversation_id=conversation_id,
-                        query_images=uploaded_images,
-                        train_of_thought=train_of_thought,
-                        raw_query_files=raw_query_files,
-                        generated_images=generated_images,
-                        generated_mermaidjs_diagram=generated_mermaidjs_diagram,
-                        user_message_time=user_message_time,
-                        tracer=tracer,
-                    )
-                )
+                logger.debug(f"WebSocket disconnected or chat cancelled by user {user} from {common.client} client.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.error(f"Error in disconnect monitor: {error}", exc_info=True)
+        finally:
+            if conversation and (cancellation_event.is_set() or shutdown_event.is_set()):
+                sync_turn_state()
+                await turn.persist(interrupted=True, update_memory=False)
+            if interrupt_acknowledged:
+                interrupt_acknowledged.set()
 
     # Cancel the disconnect monitor task if it is still running
     async def cancel_disconnect_monitor():
         if disconnect_monitor_task and not disconnect_monitor_task.done():
-            logger.debug(f"Cancelling disconnect monitor task for user {user}")
-            disconnect_monitor_task.cancel()
-            try:
-                await disconnect_monitor_task
-            except asyncio.CancelledError:
-                pass
+            logger.debug(f"Stopping disconnect monitor task for user {user}")
+        await _shutdown_monitor_task(disconnect_monitor_task, shutdown_event)
 
     async def send_event(event_type: ChatEvent, data: str | dict):
-        nonlocal ttft, train_of_thought
+        nonlocal ttft
         if cancellation_event.is_set():
             return
         try:
@@ -709,10 +713,8 @@ async def event_generator(
                 else:
                     train_of_thought.append({"type": event_type.value, "data": data})
 
-            if event_type == ChatEvent.MESSAGE:
-                yield data
-            elif _should_emit_structured_event(event_type, stream):
-                yield json.dumps({"type": event_type.value, "data": data}, ensure_ascii=False)
+            if _should_emit_structured_event(event_type, stream):
+                yield json.dumps({"type": event_type.value, "data": data})
         except Exception as e:
             if not cancellation_event.is_set():
                 logger.error(
@@ -727,6 +729,7 @@ async def event_generator(
                 await cancel_disconnect_monitor()
 
     async def send_llm_response(response: str, usage: dict = None):
+        nonlocal full_response
         # Check if the client is still connected
         if cancellation_event.is_set():
             return
@@ -741,6 +744,10 @@ async def event_generator(
         if usage:
             async for event in send_event(ChatEvent.USAGE, usage):
                 yield event
+        if conversation:
+            full_response = response
+            sync_turn_state()
+            await turn.persist(update_memory=False)
         async for result in send_event(ChatEvent.END_RESPONSE, ""):
             yield result
 
@@ -754,24 +761,31 @@ async def event_generator(
 
     # Start the disconnect monitor in the background
     disconnect_monitor_task = asyncio.create_task(monitor_disconnection())
+    monitor_tasks.append(disconnect_monitor_task)
 
     if is_query_empty(q):
         async for result in send_llm_response("Please ask your query to get started.", tracer.get("usage")):
             yield result
         return
 
-    # Automated tasks are handled before to allow mixing them with other conversation commands
+    # Automated task execution is an exact transport marker, not a semantic intent guess.
     cmds_to_rate_limit = []
-    if q.startswith("/automated_task"):
-        q = q.replace("/automated_task", "").lstrip()
+    automation_parts = q.lstrip().split(maxsplit=1)
+    if automation_parts and automation_parts[0] == "/automated_task":
+        q = automation_parts[1] if len(automation_parts) > 1 else ""
         cmds_to_rate_limit += [ConversationCommand.AutomatedTask]
 
-    # Extract conversation command from query
-    conversation_commands = [get_conversation_command(query=q)]
+    # Explicit slash commands are exact first-token routes, never semantic guesses.
+    try:
+        conversation_command, q, explicit_command = parse_conversation_command(q)
+    except ValueError as error:
+        async for result in send_llm_response(str(error), tracer.get("usage")):
+            yield result
+        return
+    conversation_commands = [conversation_command]
 
     conversation = await ConversationAdapters.aget_conversation_by_user(
         user,
-        client_application=user_scope.client_app,
         conversation_id=conversation_id,
         title=title,
         create_new=body.create_new,
@@ -781,6 +795,7 @@ async def event_generator(
             yield result
         return
     conversation_id = str(conversation.id)
+    turn.conversation_id = conversation_id
 
     async for event in send_event(ChatEvent.METADATA, {"conversationId": conversation_id, "turnId": turn_id}):
         yield event
@@ -792,7 +807,7 @@ async def event_generator(
 
     if not conversation.agent:
         conversation.agent = default_agent
-        await conversation.asave()
+        await conversation.asave(update_fields=["agent", "updated_at"])
         agent = default_agent
 
     await is_ready_to_chat(user)
@@ -800,62 +815,67 @@ async def event_generator(
     location = None
     if city or region or country or country_code:
         location = LocationData(city=city, region=region, country=country, country_code=country_code)
-    chat_history = conversation.messages
-
-    relevant_memories = []
     if await ConversationAdapters.ais_memory_enabled(user):
-        relevant_memories = await select_offeragent_memories(user, q, agent, tracer=tracer)
+        relevant_memories.extend(await select_offeragent_memories(user, q, agent, tracer=tracer))
 
-    local_kb_root = get_local_kb_root()
-    kb_engine = get_kb_engine()
-    notes_local_source_available = local_kb_root is not None and kb_engine in {"file_first", "hybrid"}
-    notes_openkb_source_available = kb_engine in {"openkb", "hybrid"} and openkb_is_ready()
-    vault_policy = load_vault_policy(local_kb_root)
-    vault_actions_supported = _client_supports_vault_actions(body, common.client)
+    workspace_sources = get_workspace_sources()
+    notes_local_source_available = workspace_sources.local_enabled
+    notes_openkb_source_available = workspace_sources.openkb_enabled
+    vault_policy = load_vault_policy(workspace_sources.local_root if workspace_sources.local_enabled else None)
+    vault_action_mode = _vault_action_mode(body, common.client)
+    vault_actions_supported = vault_action_mode != "disabled"
 
     # If interrupted message in DB
-    if last_message := await conversation.pop_message(interrupted=True):
+    if last_message := await ConversationAdapters.apop_message(
+        user,
+        conversation_id,
+        interrupted=True,
+    ):
         # Populate context from interrupted message
-        online_results = {key: val.model_dump() for key, val in last_message.onlineContext.items() or []}
-        code_results = {key: val.model_dump() for key, val in last_message.codeContext.items() or []}
-        compiled_references = [ref.model_dump() for ref in last_message.context or []]
-        research_results = [
+        online_results.update({key: val.model_dump() for key, val in last_message.onlineContext.items() or []})
+        compiled_references.extend(ref.model_dump() for ref in last_message.context or [])
+        research_results.extend(
             ResearchIteration(**iter_dict)
             for iter_dict in last_message.researchContext or []
             if iter_dict.get("summarizedResult")
-        ]
-        train_of_thought = [thought.model_dump() for thought in last_message.trainOfThought or []]
+        )
+        train_of_thought.extend(thought.model_dump() for thought in last_message.trainOfThought or [])
         logger.info(f"Loaded interrupted partial context from conversation {conversation_id}.")
 
-    explicit_command = q.lstrip().startswith("/")
-    route_decision: RouteDecision | None = None
-    if conversation_commands == [ConversationCommand.Default] and not explicit_command:
-        async def router_send_message(**kwargs):
-            return await send_message_to_model_wrapper(
-                user=user,
-                query_files=attached_file_context,
-                query_images=uploaded_images,
-                relevant_memories=relevant_memories,
-                tracer=tracer,
-                **kwargs,
-            )
+    await conversation.arefresh_from_db(fields=["conversation_log"])
+    chat_history = conversation.messages
 
-        route_decision = await route_offeragent_intent(
-            q,
-            chat_history,
-            send_message=router_send_message,
-            vault_policy=vault_policy,
-            client_app=common.client,
-            client_capabilities=body.client_capabilities,
+    requires_write_action = False
+
+    async def router_send_message(**kwargs):
+        return await send_message_to_model_wrapper(
+            user=user,
+            query_files=attached_file_context,
+            query_images=uploaded_images,
+            relevant_memories=relevant_memories,
+            tracer=tracer,
+            **kwargs,
         )
-        if route_decision.needs_confirmation and route_decision.question:
+
+    route_decision = await route_offeragent_intent(
+        q,
+        chat_history,
+        send_message=router_send_message,
+    )
+    if route_decision.needs_clarification:
+        if not explicit_command:
             async for result in send_llm_response(route_decision.question, tracer.get("usage")):
                 yield result
             return
-        try:
-            routed_command = ConversationCommand(route_decision.command)
-        except ValueError:
-            routed_command = ConversationCommand.Default
+        program_execution_context.append(
+            "The explicit command fixed the route, but write intent classification was inconclusive. "
+            "Do not claim a file change unless a write tool result confirms it."
+        )
+    else:
+        requires_write_action = route_decision.requires_vault_write
+
+    if conversation_commands == [ConversationCommand.Default] and not explicit_command:
+        routed_command = ConversationCommand(route_decision.route)
         if routed_command != ConversationCommand.Default:
             conversation_commands = [routed_command]
             inferred_queries.append(f"router:{route_decision.intent}:{route_decision.route}")
@@ -864,6 +884,20 @@ async def event_generator(
                 f"**Routed by intent:** {route_decision.route}",
             ):
                 yield result
+
+    if requires_write_action and not vault_actions_supported:
+        program_execution_context.append(
+            "The user explicitly requested a persistent file change, but this client cannot prepare reviewed "
+            "VaultActions. No file change is pending or applied; the final answer must report that exact state."
+        )
+    elif requires_write_action and conversation_commands not in (
+        [ConversationCommand.Default],
+        [ConversationCommand.Notes],
+    ):
+        program_execution_context.append(
+            "The selected specialized command does not prepare reviewed VaultActions. No file change is pending or "
+            "applied; the final answer must not claim the requested write succeeded."
+        )
 
     if conversation_commands == [ConversationCommand.Default]:
         try:
@@ -896,20 +930,22 @@ async def event_generator(
                 send_message=agent_runtime_send_message,
                 send_status=status_messages.append,
                 before_tool_call=check_agent_tool_rate_limit,
-                client_app=user_scope.client_app,
+                client_app=common.client,
                 allow_local_kb=notes_local_source_available,
                 allow_openkb=notes_openkb_source_available,
                 allow_web=is_web_search_enabled(),
                 conversation_id=conversation_id,
-                write_mode="client_actions" if vault_actions_supported else "server",
+                write_mode="client_actions" if vault_actions_supported else "disabled",
                 vault_policy=vault_policy,
                 location=location,
                 query_images=uploaded_images,
                 query_files=attached_file_context,
                 relevant_memories=relevant_memories,
                 tracer=tracer,
+                require_write_action=requires_write_action and vault_actions_supported,
             )
             compiled_references.extend(agent_result.references)
+            used_workspace_tools = used_workspace_tools or agent_result.used_workspace_tools
             vault_actions.extend(_collect_vault_actions(agent_result.references))
             inferred_queries.extend(agent_result.inferred_queries)
             online_results.update(agent_result.online_results)
@@ -927,6 +963,11 @@ async def event_generator(
             return
         except Exception as e:
             logger.error(f"Error running unified agent runtime: {e}. Falling back to general response.", exc_info=True)
+            if requires_write_action:
+                program_execution_context.append(
+                    "The write-capable agent runtime failed before confirming a VaultAction. No file change is "
+                    "pending or applied; the final answer must report that exact state."
+                )
             async for result in send_event(
                 ChatEvent.STATUS, "Unified agent runtime failed. I'll answer without tool results."
             ):
@@ -942,7 +983,6 @@ async def event_generator(
     for cmd in cmds_to_rate_limit:
         try:
             await conversation_command_rate_limiter.update_and_check_if_valid(request_obj, cmd)
-            q = q.replace(f"/{cmd.value}", "").strip()
         except HTTPException as e:
             async for result in send_llm_response(str(e.detail), tracer.get("usage")):
                 yield result
@@ -998,8 +1038,6 @@ async def event_generator(
                 if research_result.summarizedResult:
                     if research_result.onlineContext:
                         online_results.update(research_result.onlineContext)
-                    if research_result.codeContext:
-                        code_results.update(research_result.codeContext)
                     if research_result.context:
                         compiled_references.extend(research_result.context)
                 if not research_results or research_results[-1] is not research_result:
@@ -1013,20 +1051,17 @@ async def event_generator(
 
     # Gather Context
     ## Gather Document References
-    used_notes_tool_loop = False
-    notes_tool_loop_has_evidence = False
-    notes_tool_loop_failed = False
     notes_requested = ConversationCommand.Notes in conversation_commands
 
     async def collect_notes_evidence():
-        nonlocal used_notes_tool_loop, notes_tool_loop_has_evidence, notes_tool_loop_failed
+        nonlocal used_workspace_tools, workspace_has_evidence, workspace_tools_failed
         allow_local_kb = notes_local_source_available
         allow_openkb = notes_openkb_source_available
-        if used_notes_tool_loop or not (allow_local_kb or allow_openkb):
+        if used_workspace_tools or not (allow_local_kb or allow_openkb):
             return
         status_messages = []
 
-        used_notes_tool_loop = True
+        used_workspace_tools = True
         try:
             agent_chat_model = (
                 AgentAdapters.get_agent_chat_model(agent, user)
@@ -1045,53 +1080,53 @@ async def event_generator(
                     **kwargs,
                 )
 
-            notes_result = await collect_notes_evidence_with_tools(
+            notes_result = await collect_agent_context_and_actions(
                 q,
                 chat_history,
-                user,
-                agent,
+                user=user,
+                agent=agent,
                 send_message=notes_send_message,
                 send_status=status_messages.append,
-                client_app=user_scope.client_app,
+                client_app=common.client,
                 allow_local_kb=allow_local_kb,
                 allow_openkb=allow_openkb,
+                allow_web=False,
                 conversation_id=conversation_id,
-                write_mode="client_actions" if vault_actions_supported else "server",
+                write_mode="client_actions" if vault_actions_supported else "disabled",
                 vault_policy=vault_policy,
+                require_notes_evidence=True,
+                require_write_action=requires_write_action and vault_actions_supported,
             )
             compiled_references.extend(notes_result.references)
             vault_actions.extend(_collect_vault_actions(notes_result.references))
             inferred_queries.extend(notes_result.inferred_queries)
-            notes_tool_loop_has_evidence = not is_none_or_empty(notes_result.references)
-            for reference in notes_result.references:
-                if reference.get("action") in {"append_note", "propose_edit"}:
-                    write_result = {
-                        "action": reference.get("action"),
-                        "status": reference.get("status"),
-                        "file": reference.get("file"),
-                        "changed": reference.get("changed"),
-                        "result": reference.get("compiled", ""),
-                    }
-                    write_instruction = "Final answer must report this exact Notes write tool result."
-                    if reference.get("status") == "written":
-                        write_instruction += " Do not say writing is unavailable."
-                    elif reference.get("status") == "action_prepared":
-                        write_instruction = "Final answer should say a local vault action was prepared for the client to apply."
-                    program_execution_context.append(
-                        "Notes write tool result: "
-                        f"{json.dumps(write_result, ensure_ascii=False, default=str)}. "
-                        f"{write_instruction}"
-                    )
+            program_execution_context.extend(notes_result.program_context)
+            if notes_result.errors:
+                program_execution_context.append("Notes tool errors: " + "; ".join(notes_result.errors[:8]))
+            if notes_result.planner_failed:
+                workspace_tools_failed = True
+                async for result in send_event(
+                    ChatEvent.STATUS,
+                    "Notes evidence tools failed. I did not read or modify the local knowledge base",
+                ):
+                    yield result
+                return
+            workspace_has_evidence = not is_none_or_empty(notes_result.references)
             for message in status_messages:
                 async for result in send_event(ChatEvent.STATUS, message):
                     yield result
-            if not notes_tool_loop_has_evidence and notes_result.searched:
+            if not workspace_has_evidence and notes_result.searched:
                 program_execution_context.append(
                     "No Notes evidence found. Tools used: " + ", ".join(notes_result.searched[:8])
                 )
         except Exception as e:
-            notes_tool_loop_failed = True
+            workspace_tools_failed = True
             logger.error(f"Error using Notes evidence tools: {e}", exc_info=True)
+            if requires_write_action:
+                program_execution_context.append(
+                    "The Notes runtime failed before confirming a VaultAction. No file change is pending or applied; "
+                    "the final answer must report that exact state."
+                )
             async for result in send_event(
                 ChatEvent.STATUS, "Notes evidence tools failed. I did not read or modify the local knowledge base"
             ):
@@ -1101,22 +1136,22 @@ async def event_generator(
         async for result in collect_notes_evidence():
             yield result
 
-        compiled_references[:] = dedupe_references(compiled_references)
+        compiled_references[:] = dedupe_workspace_evidence(compiled_references)
 
     if (
         (conversation_commands == [ConversationCommand.General] or notes_requested)
         and is_none_or_empty(compiled_references)
-        and not used_notes_tool_loop
-        and not notes_tool_loop_failed
+        and not used_workspace_tools
+        and not workspace_tools_failed
     ):
-        indexed_references = await search_indexed_notes(user, defiltered_query, agent)
+        indexed_references = await search_indexed_evidence(user, defiltered_query, agent)
         if indexed_references:
             compiled_references.extend(indexed_references)
             inferred_queries.append(defiltered_query)
             async for result in send_event(ChatEvent.STATUS, "Searched synced knowledge base"):
                 yield result
 
-    if notes_requested and notes_tool_loop_failed:
+    if notes_requested and workspace_tools_failed:
         async for result in send_llm_response(
             "Notes evidence tools failed, so I did not read or modify the local knowledge base.",
             tracer.get("usage"),
@@ -1128,23 +1163,23 @@ async def event_generator(
         notes_requested
         and is_none_or_empty(compiled_references)
         and conversation_commands == [ConversationCommand.Notes]
-        and (used_notes_tool_loop or not (notes_local_source_available or notes_openkb_source_available))
+        and (used_workspace_tools or not (notes_local_source_available or notes_openkb_source_available))
     ):
         message = (
             "I couldn't find enough local knowledge base evidence to answer that."
-            if used_notes_tool_loop
+            if used_workspace_tools
             else f"{no_entries_found.format()}"
         )
         async for result in send_llm_response(message, tracer.get("usage")):
             yield result
         return
 
-    compiled_references[:] = dedupe_references(compiled_references)
+    compiled_references[:] = dedupe_workspace_evidence(compiled_references)
 
     if (
         ConversationCommand.Notes in conversation_commands
         and is_none_or_empty(compiled_references)
-        and not used_notes_tool_loop
+        and not used_workspace_tools
     ):
         conversation_commands.remove(ConversationCommand.Notes)
 
@@ -1168,7 +1203,8 @@ async def event_generator(
                 if isinstance(result, dict) and ChatEvent.STATUS in result:
                     yield result[ChatEvent.STATUS]
                 else:
-                    online_results = result
+                    online_results.clear()
+                    online_results.update(result)
         except Exception as e:
             error_message = f"Error searching online: {e}. Attempting to respond without online results"
             logger.warning(error_message)
@@ -1218,33 +1254,61 @@ async def event_generator(
             ):
                 yield result
 
-    ## Run Code
-    if ConversationCommand.Code in conversation_commands:
+    if vault_actions and vault_action_mode == "server_review":
+        batch = None
+        turn_conflict = False
         try:
-            context = f"# Iteration 1:\n#---\nNotes:\n{compiled_references}\n\nOnline Results:{online_results}"
-            async for result in run_code(
-                defiltered_query,
-                chat_history,
-                context,
-                location,
-                user,
-                partial(send_event, ChatEvent.STATUS),
-                query_images=uploaded_images,
-                query_files=attached_file_context,
-                relevant_memories=relevant_memories,
-                agent=agent,
-                tracer=tracer,
-            ):
-                if isinstance(result, dict) and ChatEvent.STATUS in result:
-                    yield result[ChatEvent.STATUS]
-                else:
-                    code_results = result
-        except ValueError as e:
-            program_execution_context.append("Failed to run code")
-            logger.warning(
-                f"Failed to use code tool: {e}. Attempting to respond without code results",
-                exc_info=True,
+            batch = await sync_to_async(create_vault_action_batch, thread_sensitive=True)(
+                user=user,
+                conversation=conversation,
+                turn_id=turn_id,
+                actions=vault_actions,
             )
+        except VaultActionTurnConflict as error:
+            batch = error.batch
+            turn_conflict = True
+            compiled_references[:] = [
+                reference for reference in compiled_references if not reference.get("vault_action")
+            ]
+            logger.warning("Reusing existing VaultAction batch %s for repeated turn", batch.id)
+        except Exception as error:
+            logger.error("Failed to create Web VaultAction batch", exc_info=True)
+            compiled_references[:] = [
+                reference for reference in compiled_references if not reference.get("vault_action")
+            ]
+            vault_actions.clear()
+            program_execution_context.append(
+                f"Web VaultAction batch creation failed: {error}. "
+                "Final answer must say no file change is pending or applied."
+            )
+
+        if batch is not None:
+            vault_action_event_payload = serialize_vault_action_batch(batch)
+            paths = [action.get("path") for action in batch.actions if action.get("path")]
+            compiled_references.append(
+                {
+                    "query": "vault_action_batch",
+                    "uri": f"vault-action://{batch.id}",
+                    "compiled": f"VaultAction batch {batch.id} has status {batch.status}.",
+                    "action": "vault_action_batch",
+                    "status": batch.status,
+                    "batch_id": str(batch.id),
+                    "files": paths,
+                }
+            )
+            if batch.status == "pending":
+                qualifier = "Existing conflicting turn batch" if turn_conflict else "Web VaultAction batch"
+                program_execution_context.append(
+                    f"{qualifier} {batch.id} is pending review for: {', '.join(paths)}. "
+                    "Final answer must say these changes are waiting for user confirmation, not already written."
+                )
+            else:
+                program_execution_context.append(
+                    f"Existing Web VaultAction batch {batch.id} has status {batch.status} for: {', '.join(paths)}. "
+                    "Final answer must report this exact state and must not claim a new batch was created."
+                )
+    elif vault_actions and vault_action_mode == "client_actions":
+        vault_action_event_payload = {"actions": vault_actions}
 
     ## Send Gathered References
     unique_online_results = deduplicate_organic_results(online_results)
@@ -1254,58 +1318,9 @@ async def event_generator(
             "inferredQueries": inferred_queries,
             "context": compiled_references,
             "onlineContext": unique_online_results,
-            "codeContext": code_results,
         },
     ):
         yield result
-
-    # Generate Output
-    if ConversationCommand.Diagram in conversation_commands:
-        async for result in send_event(ChatEvent.STATUS, "Creating diagram"):
-            yield result
-
-        inferred_queries = []
-        async for result in generate_mermaidjs_diagram(
-            q=defiltered_query,
-            chat_history=chat_history,
-            location_data=location,
-            note_references=compiled_references,
-            online_results=online_results,
-            query_images=uploaded_images,
-            query_files=attached_file_context,
-            relevant_memories=relevant_memories,
-            user=user,
-            agent=agent,
-            send_status_func=partial(send_event, ChatEvent.STATUS),
-            tracer=tracer,
-        ):
-            if isinstance(result, dict) and ChatEvent.STATUS in result:
-                yield result[ChatEvent.STATUS]
-            else:
-                better_diagram_description_prompt, mermaidjs_diagram_description = result
-                if better_diagram_description_prompt and mermaidjs_diagram_description:
-                    inferred_queries.append(better_diagram_description_prompt)
-                    generated_mermaidjs_diagram = mermaidjs_diagram_description
-
-                    generated_asset_results["diagrams"] = {
-                        "query": better_diagram_description_prompt,
-                    }
-
-                    async for result in send_event(
-                        ChatEvent.GENERATED_ASSETS,
-                        {
-                            "mermaidjsDiagram": mermaidjs_diagram_description,
-                        },
-                    ):
-                        yield result
-                else:
-                    error_message = "Failed to generate diagram. Please try again later."
-                    program_execution_context.append(
-                        prompts.failed_diagram_generation.format(attempted_diagram=better_diagram_description_prompt)
-                    )
-
-                    async for result in send_event(ChatEvent.STATUS, error_message):
-                        yield result
 
     # Check if the user has disconnected
     if cancellation_event.is_set():
@@ -1314,8 +1329,8 @@ async def event_generator(
         await cancel_disconnect_monitor()
         return
 
-    if vault_actions:
-        async for result in send_event(ChatEvent.VAULT_ACTIONS, {"actions": vault_actions}):
+    if vault_action_event_payload:
+        async for result in send_event(ChatEvent.VAULT_ACTIONS, vault_action_event_payload):
             yield result
 
     ## Generate Text Output
@@ -1328,7 +1343,6 @@ async def event_generator(
         conversation,
         compiled_references,
         online_results,
-        code_results,
         research_results,
         user,
         location,
@@ -1337,11 +1351,9 @@ async def event_generator(
         attached_file_context,
         relevant_memories,
         program_execution_context,
-        generated_asset_results,
         tracer,
     )
 
-    full_response = ""
     message_start = True
     async for item in llm_response:
         # Should not happen with async generator. Skip.
@@ -1377,50 +1389,9 @@ async def event_generator(
         await cancel_disconnect_monitor()
         return
 
-    if wants_openkb_exploration_save(q):
-        try:
-            save_result = save_exploration(
-                q,
-                full_response,
-                compiled_references,
-                conversation_id=str(conversation.id),
-                client_app=user_scope.client_app,
-            )
-        except OpenKBError as e:
-            save_message = f"Could not save exploration: {e}"
-            program_execution_context.append(save_message)
-        else:
-            save_message = save_result.message
-            if save_result.path:
-                compiled_references.append(save_result.to_reference(q))
-                compiled_references[:] = dedupe_references(compiled_references)
-            program_execution_context.append(f"Exploration save result: {save_result.status}. {save_message}")
-        async for result in send_event(ChatEvent.STATUS, save_message):
-            yield result
-
-    # Save conversation once finish streaming
-    asyncio.create_task(
-        save_to_conversation_log(
-            q,
-            chat_response=full_response,
-            user=user,
-            compiled_references=compiled_references,
-            online_results=online_results,
-            code_results=code_results,
-            research_results=research_results,
-            inferred_queries=inferred_queries,
-            client_application=user_scope.client_app,
-            conversation_id=str(conversation.id),
-            query_images=uploaded_images,
-            train_of_thought=train_of_thought,
-            raw_query_files=raw_query_files,
-            relevant_memories=relevant_memories,
-            generated_images=generated_images,
-            generated_mermaidjs_diagram=generated_mermaidjs_diagram,
-            used_notes_tool_loop=used_notes_tool_loop,
-            tracer=tracer,
-        )
-    )
+    # Disconnect and normal completion share one exactly-once persistence boundary.
+    sync_turn_state()
+    await turn.persist()
 
     # Signal end of LLM response after the loop finishes
     async for result in send_event(ChatEvent.END_LLM_RESPONSE, ""):
@@ -1436,6 +1407,37 @@ async def event_generator(
 
     # Cancel the disconnect monitor task if it is still running
     await cancel_disconnect_monitor()
+
+
+async def _interrupt_chat_task(task: asyncio.Task | None, interrupt_queue: asyncio.Queue | None) -> None:
+    if task is None:
+        return
+    if not task.done():
+        if interrupt_queue is not None:
+            acknowledged = asyncio.Event()
+            queued = _enqueue_interrupt_signal(
+                interrupt_queue,
+                (ChatEvent.INTERRUPT.value, acknowledged),
+                replace_pending=True,
+            )
+            if queued:
+                acknowledgement_task = asyncio.create_task(acknowledged.wait())
+                await asyncio.wait(
+                    {task, acknowledgement_task},
+                    timeout=WEBSOCKET_INTERRUPT_GRACE_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not acknowledgement_task.done():
+                    acknowledgement_task.cancel()
+                    await asyncio.gather(acknowledgement_task, return_exceptions=True)
+        if not task.done():
+            task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.warning("Previous WebSocket chat task failed while being interrupted.", exc_info=True)
 
 
 @api_chat.websocket("/ws")
@@ -1470,9 +1472,8 @@ async def chat_ws(
     rate_limiter_per_day = ApiUserRateLimiter(requests=100, window=60 * 60 * 24, slug="chat_day")
     image_rate_limiter = ApiImageRateLimiter(max_images=10, max_combined_size_mb=20)
 
-    # Shared interrupt queue for communicating interrupts to ongoing research
-    interrupt_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
-    current_task = None
+    current_interrupt_queue: asyncio.Queue | None = None
+    current_task: asyncio.Task | None = None
 
     try:
         while True:
@@ -1481,17 +1482,20 @@ async def chat_ws(
             # Check if this is an interrupt message
             if data.get("type") == "interrupt":
                 if current_task and not current_task.done():
-                    # Send interrupt signal to the ongoing task
-                    await interrupt_queue.put(data.get("query") or ChatEvent.END_EVENT.value)
-                    logger.info(
-                        f"Interrupt signal sent to ongoing task for user {websocket.scope['user'].object.id} with query: {data.get('query')}"
-                    )
-                    if data.get("query"):
+                    interrupt_query = data.get("query")
+                    if interrupt_query:
+                        queued = _enqueue_interrupt_signal(current_interrupt_queue, interrupt_query)
+                        if not queued:
+                            await websocket.send_text(json.dumps({"error": "Interrupt queue is busy"}))
+                            continue
                         ack_type = "interrupt_message_acknowledged"
-                        await websocket.send_text(json.dumps({"type": ack_type}))
                     else:
+                        await _interrupt_chat_task(current_task, current_interrupt_queue)
                         ack_type = "interrupt_acknowledged"
-                        await websocket.send_text(json.dumps({"type": ack_type}))
+                    logger.info(
+                        f"Interrupt signal handled for user {websocket.scope['user'].object.id} with query: {interrupt_query}"
+                    )
+                    await websocket.send_text(json.dumps({"type": ack_type}))
                 else:
                     ack_type = "interrupt_acknowledged"
                     await websocket.send_text(json.dumps({"type": ack_type}))
@@ -1515,26 +1519,21 @@ async def chat_ws(
                 continue
 
             # Cancel any ongoing task before starting a new one
-            if current_task and not current_task.done():
-                current_task.cancel()
-                try:
-                    await current_task
-                except asyncio.CancelledError:
-                    pass
+            if current_task:
+                await _interrupt_chat_task(current_task, current_interrupt_queue)
 
             # Create a new task for processing the chat request
-            current_task = asyncio.create_task(process_chat_request(websocket, body, common, interrupt_queue))
+            current_interrupt_queue = asyncio.Queue(maxsize=10)
+            current_task = asyncio.create_task(process_chat_request(websocket, body, common, current_interrupt_queue))
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for user {websocket.scope['user'].object.id}")
-        if current_task and not current_task.done():
-            interrupt_queue.put_nowait(ChatEvent.INTERRUPT.value)
     except Exception as e:
         logger.error(f"Error in websocket chat: {e}", exc_info=True)
-        if current_task and not current_task.done():
-            current_task.cancel()
-        await websocket.close(code=1011, reason="Internal Server Error")
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.close(code=1011, reason="Internal Server Error")
     finally:
+        await _interrupt_chat_task(current_task, current_interrupt_queue)
         # Always unregister the connection on disconnect
         await connection_manager.unregister_connection(user, connection_id)
 
@@ -1547,135 +1546,18 @@ async def process_chat_request(
 ):
     """Process a single chat request with interrupt support"""
 
-    # Server-side message buffering for better streaming performance
-    @dataclass
-    class MessageBuffer:
-        """Buffer for managing streamed chat messages with timing control."""
-
-        content: str = ""
-        timeout: Optional[asyncio.Task] = None
-        last_flush: float = 0.0
-
-        def __post_init__(self):
-            """Initialize last_flush with current time if not provided."""
-            if self.last_flush == 0.0:
-                self.last_flush = time.perf_counter()
-
-    message_buffer = MessageBuffer()
-    thought_buffer = MessageBuffer()
-    BUFFER_FLUSH_INTERVAL = 0.1  # 100ms buffer interval
-    BUFFER_MAX_SIZE = 512  # Flush if buffer reaches this size
-
-    async def flush_message_buffer():
-        """Flush the accumulated message buffer to the client"""
-        nonlocal message_buffer
-        if message_buffer.content:
-            buffered_content = message_buffer.content
-            message_buffer.content = ""
-            message_buffer.last_flush = time.perf_counter()
-            if message_buffer.timeout:
-                message_buffer.timeout.cancel()
-                message_buffer.timeout = None
-            yield buffered_content
-
-    async def flush_thought_buffer():
-        """Flush the accumulated thought buffer to the client"""
-        nonlocal thought_buffer
-        if thought_buffer.content:
-            thought_event = json.dumps({"type": ChatEvent.THOUGHT.value, "data": thought_buffer.content})
-            thought_buffer.content = ""
-            thought_buffer.last_flush = time.perf_counter()
-            if thought_buffer.timeout:
-                thought_buffer.timeout.cancel()
-                thought_buffer.timeout = None
-            yield thought_event
-
     try:
-        # Since we are using websockets, we can ignore the stream parameter and always stream
-        response_iterator = event_generator(
+        async for event in run_conversation_turn(
             body,
             websocket.scope["user"],
             common,
             websocket.headers,
             websocket,
             interrupt_queue,
-        )
-        async for event in response_iterator:
-            if not event:
-                continue
-            elif event.startswith("{") and event.endswith("}"):
-                evt_json = json.loads(event)
-                if evt_json["type"] == ChatEvent.END_LLM_RESPONSE.value:
-                    thought_event = "".join([chunk async for chunk in flush_thought_buffer()])
-                    if thought_event:
-                        await websocket.send_text(thought_event)
-                        await websocket.send_text(ChatEvent.END_EVENT.value)
-                    # Flush remaining buffer content on end llm response event
-                    chunks = "".join([chunk async for chunk in flush_message_buffer()])
-                    if chunks:
-                        await websocket.send_text(chunks)
-                    await websocket.send_text(ChatEvent.END_EVENT.value)
-                elif evt_json["type"] == ChatEvent.THOUGHT.value:
-                    # Buffer THOUGHT events for better streaming performance
-                    thought_buffer.content += str(evt_json.get("data", ""))
-
-                    # Flush if buffer is too large or enough time has passed
-                    current_time = time.perf_counter()
-                    should_flush_time = (current_time - thought_buffer.last_flush) >= BUFFER_FLUSH_INTERVAL
-                    should_flush_size = len(thought_buffer.content) >= BUFFER_MAX_SIZE
-
-                    if should_flush_size or should_flush_time:
-                        thought_event = "".join([chunk async for chunk in flush_thought_buffer()])
-                        await websocket.send_text(thought_event)
-                        await websocket.send_text(ChatEvent.END_EVENT.value)
-                    else:
-                        # Cancel any previous timeout tasks to reset the flush timer
-                        if thought_buffer.timeout:
-                            thought_buffer.timeout.cancel()
-
-                        async def delayed_thought_flush():
-                            """Flush thought buffer if no new messages arrive within debounce interval."""
-                            await asyncio.sleep(BUFFER_FLUSH_INTERVAL)
-                            # Check if there's still content to flush
-                            thought_event = "".join([chunk async for chunk in flush_thought_buffer()])
-                            if thought_event:
-                                await websocket.send_text(thought_event)
-                                await websocket.send_text(ChatEvent.END_EVENT.value)
-
-                        # Flush buffer if no new thoughts arrive within debounce interval
-                        thought_buffer.timeout = asyncio.create_task(delayed_thought_flush())
-                    continue
+        ):
+            if event and event != ChatEvent.END_EVENT.value:
                 await websocket.send_text(event)
                 await websocket.send_text(ChatEvent.END_EVENT.value)
-            elif event != ChatEvent.END_EVENT.value:
-                # Buffer MESSAGE events for better streaming performance
-                message_buffer.content += str(event)
-
-                # Flush if buffer is too large or enough time has passed
-                current_time = time.perf_counter()
-                should_flush_time = (current_time - message_buffer.last_flush) >= BUFFER_FLUSH_INTERVAL
-                should_flush_size = len(message_buffer.content) >= BUFFER_MAX_SIZE
-
-                if should_flush_size or should_flush_time:
-                    chunks = "".join([chunk async for chunk in flush_message_buffer()])
-                    await websocket.send_text(chunks)
-                    await websocket.send_text(ChatEvent.END_EVENT.value)
-                else:
-                    # Cancel any previous timeout tasks to reset the flush timer
-                    if message_buffer.timeout:
-                        message_buffer.timeout.cancel()
-
-                    async def delayed_flush():
-                        """Flush message buffer if no new messages arrive within debounce interval."""
-                        await asyncio.sleep(BUFFER_FLUSH_INTERVAL)
-                        # Check if there's still content to flush
-                        chunks = "".join([chunk async for chunk in flush_message_buffer()])
-                        if chunks:
-                            await websocket.send_text(chunks)
-                            await websocket.send_text(ChatEvent.END_EVENT.value)
-
-                    # Flush buffer if no new messages arrive within debounce interval
-                    message_buffer.timeout = asyncio.create_task(delayed_flush())
     except asyncio.CancelledError:
         logger.debug(f"Chat request cancelled for user {websocket.scope['user'].object.id}")
         raise
@@ -1698,7 +1580,6 @@ async def chat(
     if body.conversation_id is not None and not body.create_new:
         conversation = await ConversationAdapters.aget_conversation_by_user(
             request.user.object,
-            request.user.client_app,
             body.conversation_id,
         )
         if conversation is None:
@@ -1706,13 +1587,10 @@ async def chat(
                 "response": f"Conversation {body.conversation_id} not found",
                 "references": {},
                 "usage": {},
-                "images": [],
-                "files": [],
-                "mermaidjsDiagram": [],
             }
             return Response(content=json.dumps(response_data), media_type="application/json", status_code=404)
 
-    response_iterator = event_generator(
+    response_iterator = run_conversation_turn(
         body,
         request.user,
         common,

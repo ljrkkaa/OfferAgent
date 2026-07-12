@@ -3,7 +3,7 @@ from django.db import migrations
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("database", "0005_alter_agent_output_modes"),
+        ("database", "0004_drop_removed_product_surfaces"),
     ]
 
     operations = [

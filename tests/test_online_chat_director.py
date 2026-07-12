@@ -481,7 +481,7 @@ def test_summarize_diff_user_file(chat_client, default_user: KhojUser, pdf_confi
 @pytest.mark.xfail(AssertionError, reason="Chat director not capable of answering time aware questions yet")
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.chatquality
-@freeze_time("2023-04-01", ignore=["transformers"])
+@freeze_time("2023-04-01")
 def test_answer_requires_current_date_awareness(chat_client):
     "Chat actor should be able to answer questions relative to current date using provided notes"
     # Act
@@ -499,7 +499,7 @@ def test_answer_requires_current_date_awareness(chat_client):
 # ----------------------------------------------------------------------------------------------------
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.chatquality
-@freeze_time("2023-04-01", ignore=["transformers"])
+@freeze_time("2023-04-01")
 def test_answer_requires_date_aware_aggregation_across_provided_notes(chat_client):
     "Chat director should be able to answer questions that require date aware aggregation across multiple notes"
     # Act

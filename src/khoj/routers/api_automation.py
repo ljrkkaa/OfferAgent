@@ -102,7 +102,7 @@ def post_automation(
 
     # Create new Conversation Session associated with this new task
     title = f"Automation: {subject}"
-    conversation = ConversationAdapters.create_conversation_session(user, request.user.client_app, title=title)
+    conversation = ConversationAdapters.create_conversation_session(user, title=title)
 
     # Schedule automation with query_to_run, timezone, subject directly provided by user
     try:
@@ -211,7 +211,7 @@ def edit_job(
         title = f"Automation: {subject}"
 
         # Create new Conversation Session associated with this new task
-        created_conversation = ConversationAdapters.create_conversation_session(user, request.user.client_app, title=title)
+        created_conversation = ConversationAdapters.create_conversation_session(user, title=title)
 
         conversation_id = str(created_conversation.id)
         automation_metadata["conversation_id"] = conversation_id

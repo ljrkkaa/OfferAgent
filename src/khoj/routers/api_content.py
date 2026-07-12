@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import math
 from typing import Dict, List, Optional
 
 from asgiref.sync import sync_to_async
@@ -25,7 +24,6 @@ from khoj.database.adapters import (
 from khoj.processor.content.pdf.pdf_to_entries import PdfToEntries
 from khoj.routers.helpers import (
     ApiIndexedDataLimiter,
-    CommonQueryParams,
     configure_content,
     get_file_content,
 )
@@ -141,18 +139,6 @@ async def delete_content_file(
         await FileObjectAdapters.adelete_file_object_by_name(user, file)
 
     return {"status": "ok", "deleted_count": deleted_count}
-
-
-@api_content.get("/size", response_model=Dict[str, int])
-@requires(["authenticated"])
-async def get_content_size(request: Request, common: CommonQueryParams, client: Optional[str] = None):
-    user = request.user.object
-    indexed_data_size_in_mb = await sync_to_async(EntryAdapters.get_size_of_indexed_data_in_mb)(user)
-    return Response(
-        content=json.dumps({"indexed_data_size_in_mb": math.ceil(indexed_data_size_in_mb)}),
-        media_type="application/json",
-        status_code=200,
-    )
 
 
 @api_content.get("/types", response_model=List[str])

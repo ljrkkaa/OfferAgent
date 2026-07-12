@@ -1,96 +1,80 @@
 import json
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Literal
 
-from khoj.processor.conversation.utils import ResponseWithThought, load_complex_json
-from khoj.processor.conversation.vault_policy import compact_policy_for_prompt
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from khoj.processor.conversation.utils import ResponseWithThought
 
 logger = logging.getLogger(__name__)
 
+CLARIFICATION_QUESTION = "我还不能确定你希望我直接处理还是进行深度研究。请说明期望的结果。"
+
 ROUTER_SYSTEM_PROMPT = """
-You are OfferAgent's routing layer.
+You are OfferAgent's semantic intent router. Return only one JSON object and never answer the user.
 
-Classify the user's request and return only a JSON object. Do not answer the user.
-Use semantic intent, not keyword matching. The route decision should say which subsystem
-should handle the request and whether a local vault action may be needed.
+Choose exactly one route from the meaning and conversation context:
+- default: normal conversation and all ordinary tools, including web, vault search, and vault writes.
+- research: an explicitly deep, multi-step research workflow is required.
 
-Routes:
-- default: normal assistant conversation or broad multi-tool agent work.
-- general: direct answer without local vault evidence.
-- notes: read, create, append, or edit the user's knowledge-base files.
-- online: current web information is required.
-- research: deeper multi-step research is required.
-- code: code execution or sandboxed computation is required.
-- image: image generation or image understanding is requested.
+Do not route ordinary web or knowledge-base work away from default; the main tool planner owns it.
+Set requires_vault_write=true only when the user explicitly asks to persist, create, append, or modify a note or
+file inside the personal knowledge-base vault through reviewed VaultActions. It is false for a downloadable file,
+plan, or draft the user did not ask to save in the vault.
+Any request with requires_vault_write=true must use route=default because the main tool planner owns reviewed writes.
+Do not use keywords, string matching, or guesses. If the intended outcome or specialized route is unclear,
+set needs_clarification=true, route=default, and ask one short concrete question.
 
-For vault file operations, use the supplied vault policy to infer paths, source priorities,
-existence policies, and confirmation rules. If the policy does not identify a safe target,
-set needs_confirmation=true and ask a short clarification question.
-
-Return this JSON shape:
+Return exactly:
 {
-  "route": "default|general|notes|online|research|code|image",
+  "route": "default|research",
   "intent": "short_snake_case",
-  "confidence": 0.0,
-  "needs_confirmation": false,
-  "question": "",
-  "target": {"path": "", "exists_policy": "create_only|append|replace|none"},
-  "required_sources": [],
-  "rationale": "brief"
+  "requires_vault_write": false,
+  "needs_clarification": false,
+  "question": ""
 }
 """.strip()
 
 
-@dataclass(frozen=True)
-class RouteDecision:
-    route: str = "default"
-    intent: str = "conversation"
-    confidence: float = 0.0
-    needs_confirmation: bool = False
-    question: str = ""
-    target: dict[str, Any] = field(default_factory=dict)
-    required_sources: list[str] = field(default_factory=list)
-    rationale: str = ""
+class RouteDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    @property
-    def command(self) -> str:
-        return self.route.strip().lower()
+    route: Literal["default", "research"]
+    intent: str = Field(pattern=r"^[a-z][a-z0-9_]{0,79}$")
+    requires_vault_write: bool
+    needs_clarification: bool
+    question: str = Field(max_length=300)
+
+    @model_validator(mode="after")
+    def validate_clarification(self):
+        if self.requires_vault_write and self.route != "default":
+            raise ValueError("requires_vault_write=true requires route=default")
+        if self.needs_clarification:
+            if self.route != "default" or self.requires_vault_write or not self.question.strip():
+                raise ValueError(
+                    "clarification requires route=default, requires_vault_write=false, and a non-empty question"
+                )
+        elif self.question.strip():
+            raise ValueError("question must be empty when clarification is not required")
+        return self
 
 
-def _coerce_float(value: Any, default: float = 0.0) -> float:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return default
-    return max(0.0, min(1.0, parsed))
+def clarification_decision(question: str = CLARIFICATION_QUESTION) -> RouteDecision:
+    return RouteDecision(
+        route="default",
+        intent="clarify_request",
+        requires_vault_write=False,
+        needs_clarification=True,
+        question=question,
+    )
 
 
 def parse_route_decision(value: Any) -> RouteDecision:
-    if isinstance(value, str):
-        value = load_complex_json(value)
-    if not isinstance(value, dict):
-        return RouteDecision(rationale="router returned a non-object payload")
-
-    route = str(value.get("route") or "default").strip().lower()
-    if route not in {"default", "general", "notes", "online", "research", "code", "image"}:
-        route = "default"
-
-    target = value.get("target") if isinstance(value.get("target"), dict) else {}
-    required_sources = value.get("required_sources")
-    if not isinstance(required_sources, list):
-        required_sources = []
-
-    return RouteDecision(
-        route=route,
-        intent=str(value.get("intent") or "conversation").strip()[:80],
-        confidence=_coerce_float(value.get("confidence")),
-        needs_confirmation=bool(value.get("needs_confirmation")),
-        question=str(value.get("question") or "").strip(),
-        target={str(k): v for k, v in target.items()},
-        required_sources=[str(item) for item in required_sources if isinstance(item, str)],
-        rationale=str(value.get("rationale") or "").strip()[:500],
-    )
+    try:
+        payload = json.loads(value) if isinstance(value, str) else value
+        return RouteDecision.model_validate(payload)
+    except (json.JSONDecodeError, TypeError, ValueError, ValidationError):
+        return clarification_decision()
 
 
 async def route_offeragent_intent(
@@ -98,28 +82,19 @@ async def route_offeragent_intent(
     chat_history: list,
     *,
     send_message: Callable[..., Awaitable[ResponseWithThought]],
-    vault_policy: dict[str, Any],
-    client_app: Any = None,
-    client_capabilities: Optional[dict[str, Any]] = None,
 ) -> RouteDecision:
-    capabilities = client_capabilities or {}
-    prompt = (
-        f"Client: {client_app}\n"
-        f"Client capabilities: {json.dumps(capabilities, ensure_ascii=False, default=str)}\n\n"
-        f"Vault policy:\n{compact_policy_for_prompt(vault_policy)}\n\n"
-        f"User request:\n{query}\n"
-    )
     try:
         response = await send_message(
-            query=prompt,
+            query=f"User request:\n{query}",
             chat_history=chat_history,
             system_message=ROUTER_SYSTEM_PROMPT,
             response_type="json_object",
+            response_schema=RouteDecision,
             fast_model=True,
             deepthought=False,
         )
-    except Exception as exc:
-        logger.warning("OfferAgent intent router failed; falling back to default route: %s", exc, exc_info=True)
-        return RouteDecision(rationale=f"router_error: {exc}")
+    except Exception:
+        logger.warning("OfferAgent semantic intent router failed", exc_info=True)
+        return clarification_decision("意图识别暂时失败。请明确说明你希望得到的结果，我再继续。")
 
     return parse_route_decision(getattr(response, "text", "") or "")

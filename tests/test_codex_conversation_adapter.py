@@ -1,5 +1,7 @@
+import asyncio
 import base64
 import json
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -384,6 +386,28 @@ async def test_codex_message_wrapper_skips_database_chat_models(monkeypatch):
     result = await router_helpers.send_message_to_model_wrapper(query="hello")
 
     assert result["model"] == "gpt-test-codex"
+
+
+@pytest.mark.asyncio
+async def test_message_wrapper_keeps_event_loop_responsive_during_slow_model_call(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_model_call(**_kwargs):
+        started.set()
+        release.wait(timeout=0.2)
+        return ResponseWithThought(text="done")
+
+    monkeypatch.setenv("KHOJ_CONVERSATION_RUNTIME", "codex")
+    monkeypatch.setattr(router_helpers, "send_message_to_model", slow_model_call)
+
+    request = asyncio.create_task(router_helpers.send_message_to_model_wrapper(query="hello"))
+    await asyncio.sleep(0)
+    assert await asyncio.wait_for(asyncio.to_thread(started.wait, 0.5), timeout=0.6)
+    assert not request.done()
+
+    release.set()
+    assert (await request).text == "done"
 
 
 def test_cloudflare_challenge_is_classified():

@@ -2,25 +2,20 @@ import json
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import Response
 from starlette.authentication import requires
 
-from khoj.configure import initialize_content
-from khoj.database import adapters
 from khoj.database.adapters import get_user_photo
 from khoj.database.models import KhojUser, UserConversationConfig
+from khoj.processor.conversation.knowledge_workspace import search_workspace
 from khoj.routers.helpers import (
     CommonQueryParams,
     ConversationCommandRateLimiter,
     get_user_config,
     has_user_document_source,
 )
-from khoj.search_type import text_search
 from khoj.utils import state
-from khoj.utils.lexical import query_terms
-from khoj.utils.local_kb import LocalKBError, get_local_kb_root, kb_grep, kb_read
-from khoj.utils.openkb import dedupe_references, get_kb_engine, openkb_is_ready, wiki_search_documents
 from khoj.utils.rawconfig import SearchResponse
 from khoj.utils.state import SearchType
 
@@ -28,60 +23,6 @@ from khoj.utils.state import SearchType
 api = APIRouter()
 logger = logging.getLogger(__name__)
 conversation_command_rate_limiter = ConversationCommandRateLimiter(rate_limit=2, slug="command")
-
-
-def _local_kb_search(q: str, limit: int) -> list[SearchResponse]:
-    results: list[SearchResponse] = []
-    seen: set[tuple[str, int]] = set()
-    terms = query_terms(q, max_terms=6, cjk_sizes=(4, 3, 2), ignore_prefixes=("file:", "dt:"))
-
-    for term in terms:
-        try:
-            grep_result = kb_grep(term, mode="literal", before=1, after=2, max_results=max(limit * 2, 1))
-        except LocalKBError:
-            continue
-
-        for match in grep_result.matches:
-            key = (str(match.get("path") or ""), int(match.get("line") or 0))
-            if key in seen:
-                continue
-            seen.add(key)
-            try:
-                read_result = kb_read(
-                    key[0],
-                    start_line=max(1, key[1] - 2),
-                    end_line=key[1] + 4,
-                    max_lines=80,
-                )
-            except LocalKBError:
-                continue
-
-            uri = f"local-kb://{read_result.path}#L{read_result.start_line}-L{read_result.end_line}"
-            results.append(
-                SearchResponse(
-                    entry=read_result.text,
-                    score=float(len(results)),
-                    additional={
-                        "file": read_result.path,
-                        "uri": uri,
-                        "query": term,
-                        "source": "local_kb",
-                    },
-                    corpus_id=uri,
-                )
-            )
-            if len(results) >= limit:
-                return results
-
-    return results
-
-
-@api.delete("/self")
-@requires(["authenticated"])
-def delete_self(request: Request):
-    user = request.user.object
-    user.delete()
-    return {"status": "ok"}
 
 
 @api.get("/search", response_model=List[SearchResponse])
@@ -94,66 +35,7 @@ async def search(
     t: Optional[SearchType] = SearchType.All,
 ):
     user = request.user.object
-    limit = n
-    searchable_types = {SearchType.All, SearchType.Markdown, SearchType.Plaintext, SearchType.Pdf}
-
-    results: list[SearchResponse] = []
-    if not q.strip():
-        return results
-
-    if t in searchable_types:
-        engine = get_kb_engine()
-        uses_evidence_source = False
-
-        if get_local_kb_root() is not None and engine in {"file_first", "hybrid"}:
-            uses_evidence_source = True
-            results.extend(_local_kb_search(q, limit - len(results)))
-
-        if len(results) < limit and engine in {"openkb", "hybrid"} and openkb_is_ready():
-            uses_evidence_source = True
-            refs, _, _ = await wiki_search_documents(q, limit - len(results), user, [], "api-search")
-            refs = dedupe_references(refs)
-            results.extend(
-                SearchResponse(
-                    entry=str(ref.get("compiled") or ""),
-                    score=float(index),
-                    additional={
-                        "file": ref.get("file"),
-                        "uri": ref.get("uri"),
-                        "query": ref.get("query"),
-                        "source": "openkb",
-                    },
-                    corpus_id=str(ref.get("uri") or ref.get("file") or index),
-                )
-                for index, ref in enumerate(refs[: limit - len(results)])
-            )
-
-        if not uses_evidence_source:
-            indexed_hits = await text_search.query(q, user, t)
-            results.extend(list(text_search.collate_results(indexed_hits))[:limit])
-
-    return results
-
-
-@api.get("/update")
-@requires(["authenticated"])
-def update(
-    request: Request,
-    common: CommonQueryParams,
-    t: Optional[SearchType] = None,
-    force: Optional[bool] = False,
-):
-    user = request.user.object
-    try:
-        initialize_content(user=user, regenerate=force, search_type=t)
-    except Exception as e:
-        error_msg = f"🚨 Failed to update server indexed content via API: {e}"
-        logger.error(error_msg, exc_info=True)
-        raise HTTPException(status_code=500, detail=error_msg)
-    else:
-        logger.info("📪 Server indexed content updated via API")
-
-    return {"status": "ok", "message": "khoj reloaded"}
+    return await search_workspace(q, user, limit=n, search_type=t or SearchType.All)
 
 
 @api.get("/settings", response_class=Response)
@@ -165,31 +47,6 @@ def get_settings(request: Request, detailed: Optional[bool] = False) -> Response
 
     # Return config data as a JSON response
     return Response(content=json.dumps(user_config), media_type="application/json", status_code=200)
-
-
-@api.patch("/user/name", status_code=200)
-@requires(["authenticated"])
-def set_user_name(
-    request: Request,
-    name: str,
-    client: Optional[str] = None,
-):
-    user = request.user.object
-
-    split_name = name.split(" ")
-
-    if len(split_name) > 2:
-        raise HTTPException(status_code=400, detail="Name must be in the format: Firstname Lastname")
-
-    if len(split_name) == 1:
-        first_name = split_name[0]
-        last_name = ""
-    else:
-        first_name, last_name = split_name[0], split_name[-1]
-
-    adapters.set_user_name(user, first_name, last_name)
-
-    return {"status": "ok"}
 
 
 @api.patch("/user/memory", status_code=200)

@@ -1,5 +1,6 @@
 import logging
 import os
+import secrets
 from enum import Enum
 from functools import wraps
 from typing import Optional
@@ -16,6 +17,7 @@ from django.db import (
 )
 from fastapi import HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
+from fastapi.security.utils import get_authorization_scheme_param
 from starlette.authentication import (
     AuthCredentials,
     AuthenticationBackend,
@@ -39,7 +41,7 @@ from khoj.database.adapters import (
     delete_user_requests,
     get_all_users,
 )
-from khoj.database.models import ClientApplication, KhojUser, ProcessLock
+from khoj.database.models import KhojUser, ProcessLock
 from khoj.routers.api_content import configure_content
 from khoj.utils import state
 from khoj.utils.config import SearchType
@@ -48,9 +50,8 @@ logger = logging.getLogger(__name__)
 
 
 class AuthenticatedKhojUser(SimpleUser):
-    def __init__(self, user, client_app: Optional[ClientApplication] = None):
+    def __init__(self, user):
         self.object = user
-        self.client_app = client_app
         super().__init__(user.username)
 
 
@@ -95,18 +96,41 @@ class UserAuthenticationBackend(AuthenticationBackend):
         super().__init__()
 
     def _initialize_default_user(self):
-        if not self.khojuser_manager.filter(username="default").exists():
-            self.khojuser_manager.create_user(
+        default_user = self.khojuser_manager.filter(username="default").first()
+        if default_user is None:
+            default_user = self.khojuser_manager.create_user(
                 username="default",
                 email="default@example.com",
-                password="default",
+                password=None,
             )
+        bootstrap_token = os.getenv("KHOJ_API_KEY")
+        if bootstrap_token is None:
+            self.khojapiuser_manager.all().delete()
+            return
+        if (
+            not bootstrap_token.startswith("kk-")
+            or len(bootstrap_token) <= 3
+            or len(bootstrap_token) > 50
+            or any(
+                not character.isascii() or (not character.isalnum() and character not in "-_")
+                for character in bootstrap_token[3:]
+            )
+        ):
+            raise ValueError("KHOJ_API_KEY must use the kk- prefix, URL-safe characters, and at most 50 characters.")
+        self.khojapiuser_manager.exclude(token=bootstrap_token).delete()
+        api_user, _ = self.khojapiuser_manager.get_or_create(
+            token=bootstrap_token,
+            defaults={"user": default_user, "name": "Local bootstrap"},
+        )
+        if api_user.user_id != default_user.id:
+            raise ValueError("KHOJ_API_KEY is already assigned to another user.")
 
     async def authenticate(self, request: HTTPConnection):
-        # Request from Obsidian or local API clients
-        if len(request.headers.get("Authorization", "").split("Bearer ")) == 2:
-            # Get bearer token from header
-            bearer_token = request.headers["Authorization"].split("Bearer ")[1]
+        authorization = request.headers.get("Authorization")
+        if authorization:
+            scheme, bearer_token = get_authorization_scheme_param(authorization)
+            if scheme.lower() != "bearer" or not bearer_token:
+                return AuthCredentials(), UnauthenticatedUser()
             # Get user owning token
             try:
                 user_with_token = (
@@ -120,6 +144,9 @@ class UserAuthenticationBackend(AuthenticationBackend):
                 )
             if user_with_token:
                 return AuthCredentials(["authenticated"]), AuthenticatedKhojUser(user_with_token.user)
+            return AuthCredentials(), UnauthenticatedUser()
+
+        if not state.anonymous_mode:
             return AuthCredentials(), UnauthenticatedUser()
 
         try:
@@ -171,6 +198,13 @@ def initialize_server():
     except Exception as e:
         logger.error(f"Failed to load some search models: {e}", exc_info=True)
 
+    try:
+        from khoj.processor.conversation.vault_actions import recover_incomplete_vault_action_batches
+
+        recover_incomplete_vault_action_batches()
+    except Exception:
+        logger.error("Failed to recover incomplete vault action batches", exc_info=True)
+
 
 def setup_default_agent():
     AgentAdapters.create_default_agent()
@@ -195,23 +229,21 @@ def initialize_content(user: KhojUser, regenerate: bool, search_type: Optional[S
 def configure_routes(app):
     # Import APIs here to setup search types before while configuring server
     from khoj.routers.api import api
-    from khoj.routers.api_agents import api_agents
     from khoj.routers.api_automation import api_automation
     from khoj.routers.api_chat import api_chat
     from khoj.routers.api_content import api_content
     from khoj.routers.api_memories import api_memories
     from khoj.routers.api_model import api_model
-    from khoj.routers.auth import auth_router
+    from khoj.routers.api_vault import api_vault
     from khoj.routers.web_client import web_client
 
     app.include_router(api, prefix="/api")
     app.include_router(api_chat, prefix="/api/chat")
-    app.include_router(api_agents, prefix="/api/agents")
     app.include_router(api_automation, prefix="/api/automation")
     app.include_router(api_model, prefix="/api/model")
     app.include_router(api_memories, prefix="/api/memories")
     app.include_router(api_content, prefix="/api/content")
-    app.include_router(auth_router, prefix="/auth")
+    app.include_router(api_vault, prefix="/api/vault")
     app.include_router(web_client)
 
 
@@ -261,7 +293,10 @@ def configure_middleware(app, ssl_enabled: bool = False):
     app.add_middleware(AuthenticationMiddleware, backend=UserAuthenticationBackend())
     app.add_middleware(ServerErrorMiddleware)  # Add after AuthenticationMiddleware to catch its exceptions
     app.add_middleware(NextJsMiddleware)
-    app.add_middleware(SessionMiddleware, secret_key=os.environ.get("KHOJ_DJANGO_SECRET_KEY", "!secret"))
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=os.environ.get("KHOJ_DJANGO_SECRET_KEY") or secrets.token_urlsafe(32),
+    )
 
 
 def update_content_index():
@@ -295,6 +330,14 @@ def delete_old_user_requests():
     num_ratelimit_requests = delete_ratelimit_records()
     if state.verbose > 2:
         logger.debug(f"🗑️ Deleted {num_user_ratelimit_requests + num_ratelimit_requests} stale rate limit requests")
+
+
+@schedule.repeat(schedule.every(1).minutes)
+@clean_connections
+def recover_incomplete_vault_actions():
+    from khoj.processor.conversation.vault_actions import recover_incomplete_vault_action_batches
+
+    recover_incomplete_vault_action_batches()
 
 
 @schedule.repeat(schedule.every(17).minutes)

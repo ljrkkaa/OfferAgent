@@ -1,13 +1,12 @@
 import logging
-from typing import List, Optional, Tuple, Type
+from typing import List, Tuple, Type
 
 from asgiref.sync import sync_to_async
 
 from khoj.database.adapters import EntryAdapters
-from khoj.database.models import Agent, KhojUser
 from khoj.database.models import Entry as DbEntry
+from khoj.database.models import KhojUser
 from khoj.processor.content.text_to_entries import TextToEntries
-from khoj.utils import state
 from khoj.utils.helpers import timer
 from khoj.utils.jsonl import load_jsonl
 from khoj.utils.lexical import query_terms
@@ -61,7 +60,6 @@ async def query(
     user: KhojUser,
     type: SearchType = SearchType.All,
     max_distance: float = None,
-    agent: Optional[Agent] = None,
 ) -> Tuple[List[dict], List[Entry]]:
     "Search for entries that answer the query"
 
@@ -69,7 +67,7 @@ async def query(
     terms = query_terms(raw_query, ignore_prefixes=("file:", "dt:"))
 
     def lexical_lookup():
-        filtered_entries = EntryAdapters.apply_filters(user, raw_query, file_type_filter=file_type, agent=agent)
+        filtered_entries = EntryAdapters.apply_filters(user, raw_query, file_type_filter=file_type)
         scored_hits = []
         for entry in filtered_entries:
             distance = _lexical_distance(entry, raw_query, terms)
@@ -80,7 +78,7 @@ async def query(
         scored_hits.sort(key=lambda hit: (hit.distance, hit.file_path or "", hit.id))
         return scored_hits[:LEXICAL_TOP_K]
 
-    with timer("Lexical Search Time", logger, state.device):
+    with timer("Lexical Search Time", logger):
         return await sync_to_async(lexical_lookup)()
 
 

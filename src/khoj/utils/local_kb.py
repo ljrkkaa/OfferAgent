@@ -1,10 +1,8 @@
-import difflib
 import fnmatch
 import hashlib
 import logging
 import os
 import re
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 LOCAL_KB_ENV = "KHOJ_LOCAL_KB_PATH"
 OBSIDIAN_VAULT_ENV = "KHOJ_OBSIDIAN_VAULT_PATH"
-ALLOW_VAULT_WRITE_ENV = "KHOJ_ALLOW_VAULT_WRITE"
 ALLOWED_SUFFIXES = {".md", ".txt"}
 ROOT_ALIASES = {"", "/", ".", "./", "~", "~/"}
 
@@ -83,11 +80,6 @@ class LocalKBWriteResult:
     status: str
     changed: bool
     message: str
-    diff: str = ""
-    start_line: int = 0
-    end_line: int = 0
-    mtime: float = 0
-    checksum: str = ""
 
 
 def get_local_kb_root() -> Optional[Path]:
@@ -100,18 +92,6 @@ def get_local_kb_root() -> Optional[Path]:
         logger.warning("Local KB path is not a directory: %s", root)
         return None
     return root
-
-
-def is_local_kb_write_allowed() -> bool:
-    return os.getenv(ALLOW_VAULT_WRITE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, str(default))
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
 
 
 def resolve_local_kb_path(path: Optional[str] = None, *, root: Optional[Path] = None) -> Path:
@@ -201,68 +181,6 @@ def _read_lines(path: Path) -> List[str]:
 def _range_checksum(lines: List[str]) -> str:
     digest = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:16]
     return f"sha256:{digest}"
-
-
-def _write_text_atomic(path: Path, text: str) -> None:
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
-            tmp.write(text)
-        os.replace(tmp_name, path)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
-        raise
-
-
-def _prepare_writable_file(path: str, *, root: Optional[Path] = None) -> Path:
-    root = root or get_local_kb_root()
-    target = resolve_local_kb_path(path, root=root)
-    if target.exists() and (not target.is_file() or not _allowed_file(target, root)):
-        raise LocalKBError(f"File '{path}' is not a supported local knowledge base text file.")
-    if not target.exists() and not _allowed_file(target, root):
-        raise LocalKBError(f"File '{path}' cannot be created in the local knowledge base.")
-    if target.parent.exists() and not target.parent.is_dir():
-        raise LocalKBError(f"File '{path}' cannot be created in the local knowledge base.")
-    return target
-
-
-def _insert_append_block(existing: str, content: str, heading: Optional[str]) -> tuple[str, int, int]:
-    block = content.strip()
-    if not block:
-        raise LocalKBError("Append content cannot be empty.")
-
-    lines = existing.splitlines()
-    if not heading:
-        prefix = "\n\n" if existing and not existing.endswith("\n\n") else ""
-        start_line = len(lines) + (2 if prefix == "\n\n" else 1)
-        new_text = existing + prefix + block + "\n"
-        return new_text, start_line, start_line + len(block.splitlines()) - 1
-
-    heading_pattern = re.compile(rf"^(#{{1,6}})\s+{re.escape(heading.strip())}\s*$")
-    for idx, line in enumerate(lines):
-        if not heading_pattern.match(line):
-            continue
-        end = len(lines)
-        current_level = len(line) - len(line.lstrip("#"))
-        for next_idx in range(idx + 1, len(lines)):
-            next_line = lines[next_idx]
-            match = re.match(r"^(#{1,6})\s+", next_line)
-            if match and len(match.group(1)) <= current_level:
-                end = next_idx
-                break
-        insert = ["", block]
-        new_lines = lines[:end] + insert + lines[end:]
-        start_line = end + 2
-        return "\n".join(new_lines).rstrip() + "\n", start_line, start_line + len(block.splitlines()) - 1
-
-    heading_block = f"## {heading.strip()}\n{block}"
-    prefix = "\n\n" if existing and not existing.endswith("\n\n") else ""
-    start_line = len(lines) + (2 if prefix == "\n\n" else 1)
-    new_text = existing + prefix + heading_block + "\n"
-    return new_text, start_line, start_line + len(heading_block.splitlines()) - 1
 
 
 def kb_list(
@@ -386,107 +304,6 @@ def kb_read(
     )
 
 
-def append_local_kb_note(path: str, content: str, heading: Optional[str] = None) -> LocalKBWriteResult:
-    root = get_local_kb_root()
-    if root is None:
-        raise LocalKBError("Local knowledge base is not configured.", kind="not_configured")
-    target = _prepare_writable_file(path, root=root)
-    relpath = local_kb_relative_path(target, root=root)
-    if not is_local_kb_write_allowed():
-        return LocalKBWriteResult(
-            action="append_note",
-            path=relpath,
-            status="disabled",
-            changed=False,
-            message=f"{ALLOW_VAULT_WRITE_ENV} is not enabled; no file was modified.",
-        )
-
-    existing = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
-    new_text, start_line, end_line = _insert_append_block(existing, content, heading)
-    if new_text == existing:
-        return LocalKBWriteResult(
-            action="append_note",
-            path=relpath,
-            status="unchanged",
-            changed=False,
-            message="No file change was needed.",
-        )
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if not _allowed_directory(target.parent, root):
-        raise LocalKBError(f"File '{path}' cannot be created in the local knowledge base.")
-    _write_text_atomic(target, new_text)
-    written_lines = new_text.splitlines()[start_line - 1 : end_line]
-    return LocalKBWriteResult(
-        action="append_note",
-        path=relpath,
-        status="written",
-        changed=True,
-        message=f"Appended {len(written_lines)} lines to {relpath}.",
-        start_line=start_line,
-        end_line=end_line,
-        mtime=target.stat().st_mtime,
-        checksum=_range_checksum(written_lines),
-    )
-
-
-def propose_local_kb_edit(path: str, find: str, replace: str, reason: Optional[str] = None) -> LocalKBWriteResult:
-    root = get_local_kb_root()
-    if root is None:
-        raise LocalKBError("Local knowledge base is not configured.", kind="not_configured")
-    target = resolve_local_kb_path(path, root=root)
-    relpath = local_kb_relative_path(target, root=root)
-    if not target.exists() or not target.is_file() or not _allowed_file(target, root):
-        raise LocalKBError(f"File '{path}' is not a supported local knowledge base text file.")
-    if not find:
-        raise LocalKBError("Edit proposal find text cannot be empty.")
-
-    existing = target.read_text(encoding="utf-8", errors="replace")
-    match_count = existing.count(find)
-    if match_count == 0:
-        return LocalKBWriteResult(
-            action="propose_edit",
-            path=relpath,
-            status="find_not_found",
-            changed=False,
-            message=f"Could not find the requested text in {relpath}; no file was modified.",
-        )
-    if match_count > 1:
-        return LocalKBWriteResult(
-            action="propose_edit",
-            path=relpath,
-            status="ambiguous_match",
-            changed=False,
-            message=(
-                f"Requested edit text matched {match_count} times in {relpath}; no file was modified. "
-                "Retry with a longer find block that uniquely identifies the target."
-            ),
-        )
-
-    proposed = existing.replace(find, replace, 1)
-    diff = "".join(
-        difflib.unified_diff(
-            existing.splitlines(keepends=True),
-            proposed.splitlines(keepends=True),
-            fromfile=relpath,
-            tofile=relpath,
-        )
-    )
-    message = f"Prepared edit proposal for {relpath}; no file was modified."
-    if reason:
-        message += f" Reason: {reason.strip()}"
-    return LocalKBWriteResult(
-        action="propose_edit",
-        path=relpath,
-        status="proposed",
-        changed=False,
-        message=message,
-        diff=diff,
-        mtime=target.stat().st_mtime,
-        checksum=_range_checksum(existing.splitlines()),
-    )
-
-
 def kb_grep(
     query: str,
     *,
@@ -512,8 +329,8 @@ def kb_grep(
     return _grep_local_kb_regex(
         regex,
         path_prefix=path_prefix,
-        lines_before=max(0, min(before, 5)),
-        lines_after=max(0, min(after, 5)),
+        lines_before=max(0, min(before, 20)),
+        lines_after=max(0, min(after, 20)),
         max_results=max(1, min(max_results, 200)),
         started_at=time.monotonic(),
     )
@@ -722,128 +539,3 @@ def kb_resolve_link(from_path: str, link: str) -> LocalKBResolveResult:
     if len(safe_candidates) > 1:
         return LocalKBResolveResult(link=link, status="ambiguous", anchor=anchor, candidates=safe_candidates)
     return LocalKBResolveResult(link=link, status="not_found", anchor=anchor)
-
-
-def list_local_kb_files(
-    path: Optional[str] = None,
-    pattern: Optional[str] = None,
-    *,
-    limit: int = 100,
-) -> tuple[List[str], int]:
-    result = kb_list(path, pattern, limit=limit)
-    return [item["path"] for item in result.items if item["type"] == "file"], result.total
-
-
-def read_local_kb_file(
-    path: str,
-    *,
-    start_line: Optional[int] = None,
-    end_line: Optional[int] = None,
-    max_lines: int = 80,
-) -> LocalKBReadResult:
-    return kb_read(path, start_line=start_line, end_line=end_line, max_lines=max_lines)
-
-
-def grep_local_kb_files(
-    regex: Pattern[str],
-    *,
-    path_prefix: Optional[str] = None,
-    lines_before: int = 0,
-    lines_after: int = 0,
-    max_results: int = 1000,
-) -> LocalKBGrepResult:
-    return _grep_local_kb_regex(
-        regex,
-        path_prefix=path_prefix,
-        lines_before=lines_before,
-        lines_after=lines_after,
-        max_results=max_results,
-    )
-
-
-def load_local_kb_profile_references(max_files: int = 24, max_chars: int = 12000) -> List[Dict[str, str]]:
-    root = get_local_kb_root()
-    if root is None:
-        return []
-
-    max_files = _env_int("KHOJ_LOCAL_KB_PROFILE_MAX_FILES", max_files)
-    max_chars = _env_int("KHOJ_LOCAL_KB_PROFILE_MAX_CHARS", max_chars)
-
-    candidates = _profile_candidates(root)
-    references: List[Dict[str, str]] = []
-    remaining_chars = max_chars
-
-    for path in candidates[:max_files]:
-        text = path.read_text(encoding="utf-8", errors="replace").strip()
-        if not text:
-            continue
-        relpath = local_kb_relative_path(path, root=root)
-        compiled = f"# {relpath}\n\n{text[:remaining_chars].rstrip()}"
-        references.append({"query": "local_kb_profile", "compiled": compiled, "file": relpath, "uri": relpath})
-        remaining_chars -= len(compiled)
-        if remaining_chars <= 0:
-            break
-
-    return references
-
-
-def _profile_candidates(root: Path) -> List[Path]:
-    candidates: List[Path] = []
-
-    def add(path: Path) -> None:
-        if path.exists() and path.is_file() and _allowed_file(path, root) and path not in candidates:
-            candidates.append(path)
-
-    for name in ("AGENTS.md", "agents.md", "agent.md", "index.md", "README.md"):
-        add(root / name)
-
-    for child in sorted(
-        (p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")), key=lambda p: p.name.lower()
-    ):
-        add(child / "index.md")
-        add(child / "README.md")
-
-    for path in sorted((p for p in root.iterdir() if p.is_file()), key=lambda p: p.name.lower()):
-        add(path)
-
-    for path in list(candidates):
-        for linked in _linked_markdown_files(path, root):
-            add(linked)
-
-    return candidates
-
-
-def _linked_markdown_files(path: Path, root: Path) -> List[Path]:
-    text = path.read_text(encoding="utf-8", errors="replace")
-    links: List[Path] = []
-
-    for raw in re.findall(r"\[\[([^\]]+)\]\]", text):
-        links.extend(_resolve_profile_link(raw.split("|", 1)[0].split("#", 1)[0], path.parent, root))
-
-    for raw in re.findall(r"\[[^\]]+\]\(([^)]+)\)", text):
-        if re.match(r"^[a-z]+://", raw) or raw.startswith("#"):
-            continue
-        links.extend(_resolve_profile_link(raw.split("#", 1)[0], path.parent, root))
-
-    return links
-
-
-def _resolve_profile_link(raw: str, base: Path, root: Path) -> List[Path]:
-    value = raw.strip().replace("\\ ", " ")
-    if not value:
-        return []
-
-    candidate = Path(value).expanduser()
-    if not candidate.is_absolute():
-        candidate = base / candidate
-    candidate = candidate.resolve(strict=False)
-    if not candidate.is_relative_to(root):
-        return []
-
-    options = [candidate]
-    if candidate.suffix == "":
-        options.extend([candidate.with_suffix(".md"), candidate / "index.md", candidate / "README.md"])
-    elif candidate.is_dir():
-        options.extend([candidate / "index.md", candidate / "README.md"])
-
-    return [path for path in options if path.exists() and path.is_file() and _allowed_file(path, root)]

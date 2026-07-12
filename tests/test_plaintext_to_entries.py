@@ -54,6 +54,13 @@ def test_parse_html_plaintext_file(tmp_path):
     assert "<div>" not in entries[1][0].raw
 
 
+def test_xml_plaintext_file_is_rejected():
+    file_to_text, entries = PlaintextToEntries.extract_plaintext_entries({"test.xml": "<note>text</note>"})
+
+    assert file_to_text == {}
+    assert entries == []
+
+
 def test_large_plaintext_file_split_into_multiple_entries(tmp_path):
     "Convert files with no heading to jsonl."
     # Arrange

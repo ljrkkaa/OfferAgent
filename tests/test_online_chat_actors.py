@@ -1,7 +1,6 @@
 import os
 from datetime import datetime
 
-import freezegun
 import pytest
 from freezegun import freeze_time
 
@@ -25,8 +24,6 @@ if api_key is None or not os.getenv("KHOJ_TEST_CHAT_PROVIDER"):
         reason="Set OPENAI_API_KEY, GEMINI_API_KEY or ANTHROPIC_API_KEY environment variable to run tests below.",
         allow_module_level=True,
     )
-
-freezegun.configure(extend_ignore_list=["transformers"])
 
 
 def converse_openai_for_test(
@@ -66,7 +63,7 @@ def converse_openai_for_test(
 @pytest.mark.chatquality
 @pytest.mark.anyio
 @pytest.mark.django_db(transaction=True)
-@freeze_time("1984-04-02", ignore=["transformers"])
+@freeze_time("1984-04-02")
 async def test_extract_question_with_date_filter_from_relative_day(chat_client, default_user2):
     # Act
     response = await extract_questions("Where did I go for dinner yesterday?", default_user2)
@@ -86,7 +83,7 @@ async def test_extract_question_with_date_filter_from_relative_day(chat_client, 
 @pytest.mark.chatquality
 @pytest.mark.anyio
 @pytest.mark.django_db(transaction=True)
-@freeze_time("1984-04-02", ignore=["transformers"])
+@freeze_time("1984-04-02")
 async def test_extract_question_with_date_filter_from_relative_month(chat_client, default_user2):
     # Act
     response = await extract_questions("Which countries did I visit last month?", default_user2)
@@ -105,7 +102,7 @@ async def test_extract_question_with_date_filter_from_relative_month(chat_client
 @pytest.mark.chatquality
 @pytest.mark.anyio
 @pytest.mark.django_db(transaction=True)
-@freeze_time("1984-04-02", ignore=["transformers"])
+@freeze_time("1984-04-02")
 async def test_extract_question_with_date_filter_from_relative_year(chat_client, default_user2):
     # Act
     response = await extract_questions("Which countries have I visited this year?", default_user2)
@@ -568,7 +565,7 @@ async def test_agent_prompt_should_be_used(openai_agent):
 # ----------------------------------------------------------------------------------------------------
 @pytest.mark.anyio
 @pytest.mark.django_db(transaction=True)
-@freeze_time("2024-04-04", ignore=["transformers"])
+@freeze_time("2024-04-04")
 async def test_websearch_with_operators(chat_client, default_user2):
     # Arrange
     user_query = "Share popular posts on r/worldnews this month"
