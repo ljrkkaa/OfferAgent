@@ -2,19 +2,6 @@
 
 Khoj uses Django as the backend framework primarily for its powerful ORM and the admin interface. The Django app is located in the `src/app` directory. We have one installed app, under the `/database/` directory. This app is responsible for all the database related operations and holds all of our models. You can find the extensive Django documentation [here](https://docs.djangoproject.com/en/4.2/) 🌈.
 
-## Setup (Docker)
-
-### Prerequisites
-1. Ensure you have [Docker](https://docs.docker.com/get-docker/) installed.
-2. Ensure you have [Docker Compose](https://docs.docker.com/compose/install/) installed.
-
-### Run
-
-Using the `docker-compose.yml` file in the root directory, you can run the Khoj app using the following command:
-```bash
-docker-compose up
-```
-
 ## Setup (Local)
 
 ### Install Postgres

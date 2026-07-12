@@ -57,8 +57,7 @@ COPY . .
 RUN cd src && python3 khoj/manage.py collectstatic --noinput
 
 # Run the Application
-# There are more arguments required for the application to run,
-# but those should be passed in through the docker-compose.yml file.
+# Pass required arguments and credentials through the container runtime.
 ARG PORT=42110
 EXPOSE ${PORT}
 ENTRYPOINT ["python3", "src/khoj/main.py"]
