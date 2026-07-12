@@ -1,20 +1,29 @@
-# Obsidian Development
+# OfferAgent for Obsidian
 
-You can use the [Obsidian Khoj plugin](https://obsidian.md/plugins?id=khoj) to share your Obsidian knowledge base with your AI assistant. The plugin will index your notes and make them searchable by your AI assistant.
+OfferAgent connects an Obsidian vault to the local OfferAgent server. It supports vault sync and search, streamed chat with conversation history, Agent selection, cited answers, and review-before-apply VaultActions.
 
 ## Development
 
-In `src/interface/obsidian`, run:
+From `src/interface/obsidian`:
 
 ```bash
 yarn install
+yarn test
 yarn build
 ```
 
-You'll want to link the built plugin to your Obsidian vault. You can do this by symlinking the built folder to your Obsidian vault's plugins folder. For example:
+Install `main.js`, `manifest.json`, and `styles.css` under:
 
-```bash
-ln -s /path/to/khoj-assistant/src/interface/obsidian /path/to/obsidian-vault/.obsidian/plugins/obsidian-assistant
+```text
+<vault>/.obsidian/plugins/offeragent/
 ```
 
-Now, once you reload your Obsidian, you should see your updated plugin code running.
+The default server is `http://127.0.0.1:42110`. Anonymous access is intended for a loopback server, including a forwarded localhost port. For LAN access, start the server with explicit credentials and a bootstrap token, then enter the same token in the plugin's API key setting:
+
+```bash
+KHOJ_HOST=0.0.0.0 \
+KHOJ_ADMIN_EMAIL=you@example.com \
+KHOJ_ADMIN_PASSWORD='a-unique-password' \
+KHOJ_API_KEY='kk-your-url-safe-secret' \
+bash scripts/run_local.sh
+```

@@ -1,30 +1,11 @@
-import { App, SuggestModal, request, MarkdownRenderer, Instruction, Platform, Notice } from 'obsidian';
+import { App, SuggestModal, MarkdownRenderer, Instruction, Platform, Notice } from 'obsidian';
 import { KhojSetting } from 'src/settings';
 import { supportedBinaryFileTypes, createNoteAndCloseModal, getFileFromPath, getLinkToEntry } from 'src/utils';
+import { OfferAgentServer } from './api';
 
 export interface SearchResult {
     entry: string;
     file: string;
-}
-
-interface SearchApiResult {
-    entry: string;
-    additional: {
-        file: string;
-    };
-}
-
-function isSearchApiResult(value: unknown): value is SearchApiResult {
-    if (typeof value !== "object" || value === null) return false;
-    const result = value as { entry?: unknown; additional?: { file?: unknown } };
-    return typeof result.entry === "string" && typeof result.additional?.file === "string";
-}
-
-function parseSearchResults(value: unknown): SearchApiResult[] {
-    if (!Array.isArray(value) || !value.every(isSearchApiResult)) {
-        throw new Error("Invalid search response");
-    }
-    return value;
 }
 
 export class KhojSearchModal extends SuggestModal<SearchResult> {
@@ -41,7 +22,12 @@ export class KhojSearchModal extends SuggestModal<SearchResult> {
     private allFiles: Array<{path: string, inVault: boolean}> = [];
     private resultsTitle: HTMLDivElement;
 
-    constructor(app: App, setting: KhojSetting, find_similar_notes: boolean = false) {
+    constructor(
+        app: App,
+        setting: KhojSetting,
+        private readonly server: OfferAgentServer,
+        find_similar_notes: boolean = false,
+    ) {
         super(app);
         this.app = app;
         this.setting = setting;
@@ -206,24 +192,12 @@ export class KhojSearchModal extends SuggestModal<SearchResult> {
             // Create a new controller for this request
             this.currentController = new AbortController();
 
-            // Setup Query Khoj backend for search results
-            let encodedQuery = encodeURIComponent(query);
-            let searchUrl = `${this.setting.khojUrl}/api/search?q=${encodedQuery}&n=${this.setting.resultsCount}&r=${this.rerank}&client=obsidian`;
-            let headers = {
-                'Authorization': `Bearer ${this.setting.khojApiKey}`,
-            }
-
-            // Get search results from Khoj backend
-            const response = await fetch(searchUrl, {
-                headers: headers,
-                signal: this.currentController.signal
-            });
-
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
-            }
-
-            const data = parseSearchResults(await response.json());
+            const data = await this.server.search(
+                query,
+                this.setting.resultsCount,
+                this.rerank,
+                this.currentController.signal,
+            );
             const activePath = this.app.workspace.getActiveFile()?.path;
 
             // Parse search results and update allFiles with any new non-vault files

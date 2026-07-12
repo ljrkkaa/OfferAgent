@@ -25,7 +25,7 @@ export abstract class KhojPaneView extends ItemView {
 
         // Setup the header pane
         const viewType = this.getViewType();
-        await populateHeaderPane(headerEl, this.setting, viewType);
+        await populateHeaderPane(headerEl, this.setting, viewType, this.plugin.server);
 
         // Set the active nav pane based on the current view's type
         if (viewType === KhojView.CHAT) {

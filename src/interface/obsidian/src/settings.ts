@@ -1,27 +1,11 @@
 import { App, Notice, PluginSettingTab, Setting, TFile, SuggestModal } from 'obsidian';
 import Khoj from 'src/main';
-import { canConnectToBackend, fetchChatModels, fetchUserServerSettings, getBackendStatusMessage, updateContentIndex, updateServerChatModel } from './utils';
-
-export interface UserInfo {
-    username?: string;
-    photo?: string;
-    has_documents?: boolean;
-    email?: string;
-}
+import { ModelOption, UserInfo } from './api';
+import { getBackendStatusMessage, updateContentIndex } from './utils';
 
 interface SyncFileTypes {
     markdown: boolean;
     pdf: boolean;
-}
-
-export interface ModelOption {
-    id: string;
-    name: string;
-}
-
-export interface ServerUserConfig {
-    selected_chat_model_config?: number; // This is the ID from the server
-    // Add other fields from UserConfig if needed by the plugin elsewhere
 }
 
 export interface KhojSetting {
@@ -64,8 +48,6 @@ export const DEFAULT_SETTINGS: KhojSetting = {
 export class KhojSettingTab extends PluginSettingTab {
     plugin: Khoj;
     private chatModelSetting: Setting | null = null;
-    private storageProgressEl: HTMLProgressElement | null = null;
-    private storageProgressText: HTMLSpanElement | null = null;
 
     constructor(app: App, plugin: Khoj) {
         super(app, plugin);
@@ -82,7 +64,6 @@ export class KhojSettingTab extends PluginSettingTab {
             this.plugin.settings.connectedToBackend,
             this.plugin.settings.userInfo?.email,
             this.plugin.settings.khojUrl,
-            this.plugin.settings.khojApiKey
         );
 
         const connectHeaderEl = containerEl.createEl('h3', { title: backendStatusMessage });
@@ -118,31 +99,18 @@ export class KhojSettingTab extends PluginSettingTab {
                 .setValue(`${this.plugin.settings.khojApiKey}`)
                 .onChange(async (value) => {
                     this.plugin.settings.khojApiKey = value.trim();
-                    ({
-                        connectedToBackend: this.plugin.settings.connectedToBackend,
-                        userInfo: this.plugin.settings.userInfo,
-                        statusMessage: backendStatusMessage,
-                    } = await canConnectToBackend(this.plugin.settings.khojUrl, this.plugin.settings.khojApiKey));
+                    backendStatusMessage = await this.refreshConnectionState();
 
                     if (!this.plugin.settings.connectedToBackend) {
                         this.plugin.settings.availableChatModels = [];
                         this.plugin.settings.selectedChatModelId = null;
                     }
-                    await this.plugin.saveSettings();
                     backendStatusEl.setText(this.connectStatusIcon())
                     connectHeaderEl.title = backendStatusMessage;
                     await this.refreshModelsAndServerPreference();
                 }));
 
-        // Add API key setting description with link to get API key
-        apiKeySetting.descEl.createEl('span', {
-            text: 'Optional for anonymous local OfferAgent. Required for authenticated servers. ',
-        });
-        apiKeySetting.descEl.createEl('a', {
-            text: 'Get your API Key',
-            href: `${this.plugin.settings.khojUrl}/settings#clients`,
-            attr: { target: '_blank' }
-        });
+        apiKeySetting.setDesc('Use the server KHOJ_API_KEY value, or leave empty in anonymous local mode.');
 
         new Setting(containerEl)
             .setName('OfferAgent URL')
@@ -151,17 +119,12 @@ export class KhojSettingTab extends PluginSettingTab {
                 .setValue(`${this.plugin.settings.khojUrl}`)
                 .onChange(async (value) => {
                     this.plugin.settings.khojUrl = value.trim().replace(/\/$/, '');
-                    ({
-                        connectedToBackend: this.plugin.settings.connectedToBackend,
-                        userInfo: this.plugin.settings.userInfo,
-                        statusMessage: backendStatusMessage,
-                    } = await canConnectToBackend(this.plugin.settings.khojUrl, this.plugin.settings.khojApiKey));
+                    backendStatusMessage = await this.refreshConnectionState();
 
                     if (!this.plugin.settings.connectedToBackend) {
                         this.plugin.settings.availableChatModels = [];
                         this.plugin.settings.selectedChatModelId = null;
                     }
-                    await this.plugin.saveSettings();
                     backendStatusEl.setText(this.connectStatusIcon())
                     connectHeaderEl.title = backendStatusMessage;
                     await this.refreshModelsAndServerPreference();
@@ -215,7 +178,6 @@ export class KhojSettingTab extends PluginSettingTab {
                 .onChange(async (value) => {
                     this.plugin.settings.syncFileType.markdown = value;
                     await this.plugin.saveSettings();
-                    this.refreshStorageDisplay();
                 }));
 
         // Add setting to sync PDFs
@@ -227,7 +189,6 @@ export class KhojSettingTab extends PluginSettingTab {
                 .onChange(async (value) => {
                     this.plugin.settings.syncFileType.pdf = value;
                     await this.plugin.saveSettings();
-                    this.refreshStorageDisplay();
                 }));
 
         // Add setting for sync interval
@@ -265,7 +226,6 @@ export class KhojSettingTab extends PluginSettingTab {
                             this.plugin.settings.syncFolders.push(folder);
                             await this.plugin.saveSettings();
                             this.updateIncludeFolderList(includeFolderListEl);
-                            this.refreshStorageDisplay();
                         }
                     });
                     modal.open();
@@ -293,7 +253,6 @@ export class KhojSettingTab extends PluginSettingTab {
                             this.plugin.settings.excludeFolders.push(folder);
                             await this.plugin.saveSettings();
                             this.updateExcludeFolderList(excludeFolderListEl);
-                            this.refreshStorageDisplay();
                         }
                     });
                     modal.open();
@@ -361,7 +320,13 @@ export class KhojSettingTab extends PluginSettingTab {
 
                     try {
                         this.plugin.settings.lastSync = await updateContentIndex(
-                            this.app.vault, this.plugin.settings, this.plugin.settings.lastSync, true, true, onProgress
+                            this.app.vault,
+                            this.plugin.settings,
+                            this.plugin.server,
+                            this.plugin.settings.lastSync,
+                            true,
+                            true,
+                            onProgress,
                         );
                     } finally {
                         // Cleanup: hide sync progress UI
@@ -369,8 +334,6 @@ export class KhojSettingTab extends PluginSettingTab {
                         const txt = document.getElementById('khoj-sync-progress-text') as HTMLElement | null;
                         if (el) el.style.display = 'none';
                         if (txt) txt.style.display = 'none';
-                        this.refreshStorageDisplay();
-
                         // Reset button state
                         window.clearInterval(progress_indicator);
                         button.setButtonText('Update');
@@ -379,22 +342,6 @@ export class KhojSettingTab extends PluginSettingTab {
                     }
                 })
             );
-        // Estimated Cloud Storage (client-side)
-        const storageSetting = new Setting(containerEl)
-            .setName('Estimated Cloud Storage')
-            .setDesc('Estimated storage usage based on files configured for sync. This is a client-side estimation.')
-            .then(() => { });
-
-        // Create custom elements: progress and text for storage estimation
-        this.storageProgressEl = document.createElement('progress');
-        this.storageProgressEl.value = 0;
-        this.storageProgressEl.max = 1;
-        this.storageProgressEl.style.width = '100%';
-        this.storageProgressText = document.createElement('span');
-        this.storageProgressText.textContent = 'Calculating...';
-        storageSetting.descEl.appendChild(this.storageProgressEl);
-        storageSetting.descEl.appendChild(this.storageProgressText);
-
         // Create progress bar for Force Sync operation (hidden by default)
         const syncProgressEl = document.createElement('progress');
         syncProgressEl.id = 'khoj-sync-progress';
@@ -406,11 +353,8 @@ export class KhojSettingTab extends PluginSettingTab {
         syncProgressText.id = 'khoj-sync-progress-text';
         syncProgressText.textContent = '';
         syncProgressText.style.display = 'none';
-        storageSetting.descEl.appendChild(syncProgressEl);
-        storageSetting.descEl.appendChild(syncProgressText);
-
-        // Call initial update
-        this.refreshStorageDisplay();
+        indexVaultSetting.descEl.appendChild(syncProgressEl);
+        indexVaultSetting.descEl.appendChild(syncProgressText);
     }
 
     private connectStatusIcon() {
@@ -422,55 +366,45 @@ export class KhojSettingTab extends PluginSettingTab {
             return '🔴';
     }
 
-    private async refreshStorageDisplay() {
-        if (!this.storageProgressEl || !this.storageProgressText) return;
-
-        // Show calculating state
-        this.storageProgressEl.removeAttribute('value');
-        this.storageProgressText.textContent = 'Calculating...';
-        try {
-            const { calculateVaultSyncMetrics } = await import('./utils');
-            const metrics = await calculateVaultSyncMetrics(this.app.vault, this.plugin.settings);
-            const usedMB = (metrics.usedBytes / (1024 * 1024));
-            const totalMB = (metrics.totalBytes / (1024 * 1024));
-            const usedStr = `${usedMB.toFixed(1)} MB`;
-            const totalStr = `${totalMB.toFixed(0)} MB`;
-            this.storageProgressEl.value = metrics.usedBytes;
-            this.storageProgressEl.max = metrics.totalBytes;
-            this.storageProgressText.textContent = `${usedStr} / ${totalStr}`;
-        } catch (err) {
-            console.error('OfferAgent: Failed to update storage display', err);
-            this.storageProgressText.textContent = 'Estimation unavailable';
-        }
+    private async refreshConnectionState(): Promise<string> {
+        this.plugin.server.configure(this.plugin.settings.khojUrl, this.plugin.settings.khojApiKey);
+        const connection = await this.plugin.server.probe();
+        this.plugin.settings.connectedToBackend = connection.connected;
+        this.plugin.settings.userInfo = connection.user;
+        await this.plugin.saveSettings();
+        return getBackendStatusMessage(
+            connection.connected,
+            connection.user?.email,
+            this.plugin.settings.khojUrl,
+        );
     }
 
     private async refreshModelsAndServerPreference() {
         let serverSelectedModelId: string | null = null;
         if (this.plugin.settings.connectedToBackend) {
-            const [availableModels, serverConfig] = await Promise.all([
-                fetchChatModels(this.plugin.settings),
-                fetchUserServerSettings(this.plugin.settings)
-            ]);
+            try {
+                const [availableModels, serverConfig] = await Promise.all([
+                    this.plugin.server.getChatModels(),
+                    this.plugin.server.getUserSettings(),
+                ]);
 
-            this.plugin.settings.availableChatModels = availableModels;
+                this.plugin.settings.availableChatModels = availableModels;
 
-            if (serverConfig && serverConfig.selected_chat_model_config !== undefined && serverConfig.selected_chat_model_config !== null) {
-                const serverModelIdStr = serverConfig.selected_chat_model_config.toString();
-                // Ensure the server's selected model is actually in the available list
-                if (this.plugin.settings.availableChatModels.some(m => m.id === serverModelIdStr)) {
-                    serverSelectedModelId = serverModelIdStr;
-                } else {
-                    // Server has a selection, but it's not in the options list (e.g. model removed, or different set of models)
-                    // In this case, we might fall back to null (OfferAgent Default)
-                    console.warn(`OfferAgent: Server's selected model ID ${serverModelIdStr} not in available models. Falling back to default.`);
-                    serverSelectedModelId = null;
+                if (serverConfig.selected_chat_model_config !== undefined) {
+                    const serverModelIdStr = serverConfig.selected_chat_model_config.toString();
+                    if (this.plugin.settings.availableChatModels.some(m => m.id === serverModelIdStr)) {
+                        serverSelectedModelId = serverModelIdStr;
+                    } else {
+                        console.warn(`OfferAgent: Server model ${serverModelIdStr} is not available. Using default.`);
+                    }
                 }
-            } else {
-                // No specific model configured on the server, or it's explicitly null
-                serverSelectedModelId = null;
+                this.plugin.settings.selectedChatModelId = serverSelectedModelId;
+            } catch (error) {
+                console.error("OfferAgent: Failed to load model settings", error);
+                this.plugin.settings.availableChatModels = [];
+                this.plugin.settings.selectedChatModelId = null;
+                this.plugin.settings.connectedToBackend = false;
             }
-            this.plugin.settings.selectedChatModelId = serverSelectedModelId;
-
         } else {
             this.plugin.settings.availableChatModels = [];
             this.plugin.settings.selectedChatModelId = null; // Clear selection if disconnected
@@ -518,17 +452,15 @@ export class KhojSettingTab extends PluginSettingTab {
             dropdown
                 .setValue(this.plugin.settings.selectedChatModelId || '')
                 .onChange(async (value) => {
-                    // Attempt to update the server
-                    const success = await updateServerChatModel(value, this.plugin.settings);
-                    if (success) {
+                    try {
+                        await this.plugin.server.updateChatModel(value);
+                        this.plugin.settings.selectedChatModelId = value;
                         await this.plugin.saveSettings();
-                    } else {
-                        // Server update failed, revert dropdown to the current setting value
-                        // to avoid UI mismatch.
+                    } catch (error) {
+                        console.error("OfferAgent: Failed to update chat model", error);
+                        new Notice("Failed to update chat model on the OfferAgent server.");
                         dropdown.setValue(this.plugin.settings.selectedChatModelId || '');
                     }
-                    // Potentially re-render or refresh if needed, though setValue should update UI.
-                    // this.refreshModelsAndServerPreference(); // Could be called to ensure full sync, but might be too much
                 });
         });
     }
@@ -543,7 +475,6 @@ export class KhojSettingTab extends PluginSettingTab {
                 this.plugin.settings.syncFolders = this.plugin.settings.syncFolders.filter(f => f !== folder);
                 await this.plugin.saveSettings();
                 this.updateIncludeFolderList(containerEl);
-                this.refreshStorageDisplay();
             }
         );
     }
@@ -558,7 +489,6 @@ export class KhojSettingTab extends PluginSettingTab {
                 this.plugin.settings.excludeFolders = this.plugin.settings.excludeFolders.filter(f => f !== folder);
                 await this.plugin.saveSettings();
                 this.updateExcludeFolderList(containerEl);
-                this.refreshStorageDisplay();
             }
         );
     }

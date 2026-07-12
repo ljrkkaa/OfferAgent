@@ -1,1157 +1,298 @@
 import { App, MarkdownView, TFile, TFolder } from 'obsidian';
-import { diffWords } from 'diff';
 
-/**
- * Interface representing a block of edit instructions for modifying files
- */
-export interface EditBlock {
-    file: string;       // Target file name [Required]
-    find: string;       // Content to find in file [Required]
-    replace: string;    // Content to replace with in file [Required]
-    note?: string;      // Brief explanation of edit [Optional]
-    hasError?: boolean; // Flag to indicate parsing error [Optional]
-    error?: {
-        type: 'missing_field' | 'invalid_format' | 'preprocessing' | 'unknown';
-        message: string;
-        details?: string;
-    };
-}
-
-export interface VaultAction {
-    op: 'create_file' | 'append_file' | 'replace_text';
-    path: string;
-    content?: string;
-    heading?: string;
-    mode?: string;
-    find?: string;
-    replace?: string;
-    reason?: string;
-}
+export type VaultAction =
+    | { op: 'create_file'; path: string; content: string; mode: 'create_only' }
+    | { op: 'append_file'; path: string; content: string; heading?: string; mode: 'append' }
+    | { op: 'replace_text'; path: string; find: string; replace: string; mode: 'replace'; reason?: string };
 
 export interface VaultActionResult {
     action: VaultAction;
     success: boolean;
+    status: 'applied' | 'rolled_back' | 'not_applied' | 'manual_review_required';
     path: string;
     error?: string;
 }
 
-/**
- * Interface representing the result of parsing a Khoj edit block
- */
-export interface ParsedEditBlock {
-    editData: EditBlock | null;
-    cleanContent: string;
-    inProgress?: boolean;
-    error?: {
-        type: 'missing_field' | 'invalid_format' | 'preprocessing' | 'unknown';
-        message: string;
-        details?: string;
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null;
+}
+
+function hasExactKeys(value: Record<string, unknown>, required: string[], optional: string[] = []): boolean {
+    const allowed = new Set([...required, ...optional]);
+    return required.every(key => Object.prototype.hasOwnProperty.call(value, key))
+        && Object.keys(value).every(key => allowed.has(key));
+}
+
+function isVaultAction(value: unknown): value is VaultAction {
+    if (!isRecord(value) || typeof value.op !== 'string' || typeof value.path !== 'string') return false;
+    if (value.op === 'create_file') {
+        return hasExactKeys(value, ['op', 'path', 'content', 'mode'])
+            && typeof value.content === 'string'
+            && value.mode === 'create_only';
+    }
+    if (value.op === 'append_file') {
+        return hasExactKeys(value, ['op', 'path', 'content', 'mode'], ['heading'])
+            && typeof value.content === 'string'
+            && value.mode === 'append'
+            && (value.heading === undefined || typeof value.heading === 'string');
+    }
+    return value.op === 'replace_text'
+        && hasExactKeys(value, ['op', 'path', 'find', 'replace', 'mode'], ['reason'])
+        && typeof value.find === 'string'
+        && value.find.length > 0
+        && typeof value.replace === 'string'
+        && value.mode === 'replace'
+        && (value.reason === undefined || typeof value.reason === 'string');
+}
+
+export function parseVaultActions(value: unknown): VaultAction[] | null {
+    if (!isRecord(value)
+        || !hasExactKeys(value, ['actions'])
+        || !Array.isArray(value.actions)
+        || !value.actions.every(isVaultAction)) return null;
+    return value.actions;
+}
+
+export function vaultActionReview(action: VaultAction): { summary: string; details: string } {
+    const summary = `${action.op}: ${action.path}`;
+    if (action.op === 'create_file') return { summary, details: `Content:\n${action.content}` };
+    if (action.op === 'append_file') {
+        const heading = action.heading ? `Heading: ${action.heading}\n\n` : '';
+        return { summary, details: `${heading}Content:\n${action.content}` };
+    }
+    const reason = action.reason ? `Reason: ${action.reason}\n\n` : '';
+    return {
+        summary,
+        details: `${reason}Find:\n${action.find}\n\nReplace with:\n${action.replace}`,
     };
 }
 
-/**
- * Interface representing the result of processing an edit block
- */
-interface ProcessedEditResult {
-    preview: string; // The content with diff markers to be inserted
-    newContent: string; // The new content after replacement
-    error?: string;  // Error message if processing failed (e.g., 'find' text not found)
-}
-
-/**
- * Interface representing the result of detecting a partial edit block
- */
-interface PartialEditBlockResult {
+interface PlannedFile {
+    path: string;
+    original: string | null;
     content: string;
-    isComplete: boolean;
+    exists: boolean;
 }
 
-/**
- * Class that handles file operations for the Khoj plugin
- */
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
 export class FileInteractions {
-    private app: App;
-    private readonly EDIT_BLOCK_START = '<khoj_edit>';
-    private readonly EDIT_BLOCK_END = '</khoj_edit>';
     private readonly CONTEXT_FILES_LIMIT = 3;
 
-    /**
-     * Constructor for FileInteractions
-     *
-     * @param app - The Obsidian App instance
-     */
-    constructor(app: App) {
-        this.app = app;
-    }
+    constructor(private app: App) {}
 
-    /**
-     * Get N open, recently viewed markdown files.
-     */
-    private getRecentActiveMarkdownFiles(N: number): TFile[] {
+    private getRecentActiveMarkdownFiles(limit: number): TFile[] {
         const seen = new Set<string>();
-        const recentActiveFiles = this.app.workspace.getLeavesOfType('markdown')
-            .sort((a, b) => (b as any).activeTime - (a as any).activeTime) // Sort by leaf activeTime (note: undocumented prop)
+        return this.app.workspace.getLeavesOfType('markdown')
+            .sort((a, b) => (b as any).activeTime - (a as any).activeTime)
             .map(leaf => (leaf.view as MarkdownView)?.file)
-            // Dedupe by file path
             .filter((file): file is TFile => {
                 if (!file || seen.has(file.path)) return false;
                 seen.add(file.path);
                 return true;
             })
-            .slice(0, N);
-
-        console.log(`Using ${recentActiveFiles.length} recently viewed md files for context: ${recentActiveFiles.map(file => file.path).join(', ')}`);
-        return recentActiveFiles;
+            .slice(0, limit);
     }
 
-    /**
-     * Gets the content of all open files
-     *
-     * @param fileAccessMode - The access mode ('none', 'read', or 'write')
-     * @returns A string containing the content of all open files
-     */
     public async getOpenFilesContent(fileAccessMode: 'none' | 'read' | 'write'): Promise<string> {
-        // Only proceed if we have read or write access
         if (fileAccessMode === 'none') return '';
 
-        // Get recently viewed markdown files
-        const recentFiles = this.getRecentActiveMarkdownFiles(this.CONTEXT_FILES_LIMIT);
-        if (recentFiles.length === 0 && fileAccessMode === 'read') return '';
+        const files = this.getRecentActiveMarkdownFiles(this.CONTEXT_FILES_LIMIT);
+        if (files.length === 0) return '';
 
-        // Instructions in write access mode
-        let editInstructions: string = '';
-        if (fileAccessMode === 'write') {
-            editInstructions = `
-If the user requests, you can suggest edits to files provided in the WORKING_FILE_SET provided below.
-Once you understand the user request you MUST:
-
-1. Decide if you need to propose *SEARCH/REPLACE* edits to any files that haven't been added to the chat.
-
-If you need to propose edits to existing files not already added to the chat, you *MUST* tell the user their full path names and ask them to *add the files to the chat*.
-End your reply and wait for their approval.
-You can keep asking if you then decide you need to edit more files.
-
-2. Think step-by-step and explain the needed changes in a few short sentences before each EDIT block.
-
-3. Describe each change with a *SEARCH/REPLACE block* like the examples below.
-
-All changes to files must use this *SEARCH/REPLACE block* format.
-ONLY EVER RETURN EDIT TEXT IN A *SEARCH/REPLACE BLOCK*!
-
-# *SEARCH/REPLACE block* Rules:
-
-Every *SEARCH/REPLACE block* must use this format:
-1. The opening fence: \`${this.EDIT_BLOCK_START}\`
-2. The *FULL* file path alone on a line, verbatim. No bold asterisks, no quotes around it, no escaping of characters, etc.
-3. The start of search block: <<<<<<< SEARCH
-4. A contiguous chunk of lines to search for in the source file
-5. The dividing line: =======
-6. The lines to replace into the source file
-7. The end of the replace block: >>>>>>> REPLACE
-8. The closing fence: \`${this.EDIT_BLOCK_END}\`
-
-Use the *FULL* file path, as shown to you by the user.
-
-Every *SEARCH* section must *EXACTLY MATCH* the existing file content, character for character, including all comments, docstrings, etc.
-If the file contains code or other data wrapped/escaped in json/xml/quotes or other containers, you need to propose edits to the literal contents of the file, including the container markup.
-
-*SEARCH/REPLACE* blocks will *only* replace the first match occurrence.
-Including multiple unique *SEARCH/REPLACE* blocks if needed.
-Include enough lines in each SEARCH section to uniquely match each set of lines that need to change.
-
-Keep *SEARCH/REPLACE* blocks concise.
-Break large *SEARCH/REPLACE* blocks into a series of smaller blocks that each change a small portion of the file.
-Include just the changing lines, and a few surrounding lines if needed for uniqueness.
-Do not include long runs of unchanging lines in *SEARCH/REPLACE* blocks.
-
-Only create *SEARCH/REPLACE* blocks for files that the user has added to the chat, unless the user explicitly asks you to create a new markdown file.
-
-To move text within a file, use 2 *SEARCH/REPLACE* blocks: 1 to delete it from its current location, 1 to insert it in the new location.
-
-Pay attention to which filenames the user wants you to edit, especially if they are asking you to create a new file.
-
-If you want to put text in a new file, use a *SEARCH/REPLACE block* with:
-- A safe relative new file path ending in .md, including dir name if needed
-- An empty \`SEARCH\` section
-- The new file's contents in the \`REPLACE\` section
-
-ONLY EVER RETURN EDIT TEXT IN A *SEARCH/REPLACE BLOCK*!
-
-<EDIT_INSTRUCTIONS>
-Suggest edits using targeted modifications. Use multiple edit blocks to make precise changes rather than rewriting entire sections.
-
-Here's how to use the *SEARCH/REPLACE block* format:
-
-${this.EDIT_BLOCK_START}
-target-filename
-<<<<<<< SEARCH
-from flask import Flask
-=======
-import math
-from flask import Flask
->>>>>>> REPLACE
-${this.EDIT_BLOCK_END}
-
-Important:
-- The target-filename parameter is required. It must be a full open-file path, or a safe relative new .md path when creating a file.
-- The XML format ${this.EDIT_BLOCK_START}...${this.EDIT_BLOCK_END} ensures reliable parsing.
-- The SEARCH block content must completely and uniquely identify the section to edit.
-- The REPLACE block content will replace the first SEARCH block match in the specified \`target-filename\`.
-
-📝 Example note:
-
-\`\`\`
----
-date: 2024-01-20
-tags: meeting, planning
-status: active
----
-# file: Meeting Notes.md
-
-Action items from today:
-- Review Q4 metrics
-- Schedule follow-up with marketing team about new campaign launch
-- Update project timeline and milestones for Q1 2024
-
-Next steps:
-- Send summary to team
-- Book conference room for next week
-\`\`\`
-
-Examples of targeted edits:
-
-1. Using just a few words to identify long text (notice how "campaign launch" is kept in content):
-
-Add deadline and specificity to the marketing team follow-up.
-${this.EDIT_BLOCK_START}
-Meeting Notes.md
-<<<<<<< SEARCH
-- Schedule follow-up with marketing team about new campaign launch
-=======
-- Schedule follow-up with marketing team by Wednesday to discuss Q1 campaign launch
->>>>>>> REPLACE
-${this.EDIT_BLOCK_END}
-
-2. Multiple targeted changes with escaped characters:
-
-Add HIGH priority flag with code reference to Q4 metrics review"
-${this.EDIT_BLOCK_START}
-Meeting Notes.md
-<<<<<<< SEARCH
-- Review Q4 metrics
-=======
-- [HIGH] Review Q4 metrics (see "metrics.ts" and \`calculateQ4Metrics()\`)
->>>>>>> REPLACE
-${this.EDIT_BLOCK_END}
-
-Add resource allocation to project timeline task
-${this.EDIT_BLOCK_START}
-Meeting Notes.md
-<<<<<<< SEARCH
-- Update project timeline and milestones for Q1 2024
-=======
-- Update project timeline and add resource allocation for Q1 2024
->>>>>>> REPLACE
-${this.EDIT_BLOCK_END}
-
-3. Adding new content between sections:
-Insert a new section for discussion points after the action items section:
-${this.EDIT_BLOCK_START}
-Meeting Notes.md
-<<<<<<< SEARCH
-Action items from today:
-- Review Q4 metrics
-- Schedule follow-up with marketing team about new campaign launch
-- Update project timeline and milestones for Q1 2024
-=======
-Action items from today:
-- Review Q4 metrics
-- Schedule follow-up
-- Update timeline
-
-Discussion Points:
-- Budget review
-- Team feedback
->>>>>>> REPLACE
-${this.EDIT_BLOCK_END}
-
-4. Completely replacing a file content (preserving frontmatter):
-Replace entire file content while keeping frontmatter metadata
-${this.EDIT_BLOCK_START}
-Meeting Notes.md
-<<<<<<< SEARCH
-=======
-# Project Overview
-
-## Goals
-- Increase user engagement by 25%
-- Launch mobile app by Q3
-- Expand to 3 new markets
-
-## Timeline
-1. Q1: Research & Planning
-2. Q2: Development
-3. Q3: Testing & Launch
-4. Q4: Market Expansion
->>>>>>> REPLACE
-${this.EDIT_BLOCK_END}
-
-- The SEARCH block must uniquely identify the section to edit
-- The REPLACE block content replaces the first SEARCH block match in the specified file
-- Frontmatter metadata (between --- markers at top of file) cannot be modified
-- Use an empty SEARCH block to replace entire file content with content in REPLACE block (while preserving frontmatter).
-- Remember to escape special characters: use \" for quotes in content
-- Each edit block must be fenced in ${this.EDIT_BLOCK_START}...${this.EDIT_BLOCK_END} XML tags
-
-</EDIT_INSTRUCTIONS>
-`;
-        }
-
-        let openFilesContent = `
-For context, the user is currently working on the following files:
-<WORKING_FILE_SET>
-
-`;
-
-        if (recentFiles.length === 0) {
-            openFilesContent += "No Markdown files are currently open. You may still create a new safe relative .md file if the user explicitly asks.\n\n";
-        }
-
-        for (const file of recentFiles) {
-            // Read file content
-            let fileContent: string;
+        const sections: string[] = [];
+        for (const file of files) {
             try {
-                fileContent = await this.app.vault.read(file);
+                sections.push(`<OPEN_FILE>\n# file: ${file.path}\n\n${await this.app.vault.read(file)}\n</OPEN_FILE>`);
             } catch (error) {
                 console.error(`Error reading file ${file.path}:`, error);
-                continue;
             }
-
-            openFilesContent += `<OPEN_FILE>\n# file: ${file.path}\n\n${fileContent}\n</OPEN_FILE>\n\n`;
         }
-
-        openFilesContent += "</WORKING_FILE_SET>\n";
-
-        // Collate open files content with instructions
-        let context: string;
-        if (fileAccessMode === 'write') {
-             context = `\n\n<SYSTEM>${editInstructions + openFilesContent}</SYSTEM>`;
-        } else {
-             context = `\n\n<SYSTEM>${openFilesContent}</SYSTEM>`;
-        }
-
-        return context;
-    }
-
-    /**
-     * Finds the target file from a list of files based on an exact path or unambiguous file name.
-     *
-     * @param targetName - The name to match against
-     * @param files - Array of TFile objects to search
-     * @returns The matching TFile or null if no unique match is found
-     */
-    public findBestMatchingFile(targetName: string, files: TFile[]): TFile | null {
-        const target = targetName.trim();
-        const pathMatch = files.find(file => file.path === target);
-        if (pathMatch) {
-            return pathMatch;
-        }
-
-        const nameMatches = files.filter(file => file.name === target || file.basename === target);
-        return nameMatches.length === 1 ? nameMatches[0] : null;
-    }
-
-    private getSafeNewMarkdownPath(filePath: string): string | null {
-        const target = filePath.trim().replace(/\\/g, "/");
-        if (!target || target.startsWith("/") || target.endsWith("/") || !target.endsWith(".md")) return null;
-        if (target.split("/").some(part => !part || part === "." || part === "..")) return null;
-        return target;
+        if (sections.length === 0) return '';
+        return `\n\n<SYSTEM>\nFor context, the user is currently working on these files. Vault changes must use the structured vault tools.\n<WORKING_FILE_SET>\n${sections.join('\n\n')}\n</WORKING_FILE_SET>\n</SYSTEM>`;
     }
 
     private getSafeVaultActionPath(filePath: string): string | null {
-        const target = filePath.trim().replace(/\\/g, "/");
-        if (!target || target.startsWith("/") || target.endsWith("/")) return null;
-        if (!target.endsWith(".md") && !target.endsWith(".txt")) return null;
-        if (target.split("/").some(part => !part || part === "." || part === "..")) return null;
+        const target = filePath.trim().replace(/\\/g, '/');
+        if (!target || target.startsWith('/') || target.endsWith('/')) return null;
+        if (!target.endsWith('.md') && !target.endsWith('.txt')) return null;
+        if (target.split('/').some(part => !part || part === '.' || part === '..')) return null;
         return target;
     }
 
     private appendContent(existing: string, content: string, heading?: string): string {
-        const normalizedContent = content.endsWith("\n") ? content : `${content}\n`;
+        const normalizedContent = content.endsWith('\n') ? content : `${content}\n`;
         if (!heading) {
-            const separator = existing.endsWith("\n") || existing.length === 0 ? "" : "\n";
+            const separator = existing.endsWith('\n') || existing.length === 0 ? '' : '\n';
             return `${existing}${separator}${normalizedContent}`;
         }
 
-        const lines = existing.split("\n");
-        const headingPattern = new RegExp(`^(#{1,6})\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`);
+        const lines = existing.split('\n');
+        const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const headingPattern = new RegExp(`^(#{1,6})\\s+${escapedHeading}\\s*$`);
         const headingIndex = lines.findIndex(line => headingPattern.test(line));
         if (headingIndex === -1) {
-            const separator = existing.endsWith("\n") || existing.length === 0 ? "" : "\n";
+            const separator = existing.endsWith('\n') || existing.length === 0 ? '' : '\n';
             return `${existing}${separator}\n## ${heading}\n\n${normalizedContent}`;
         }
 
-        const headingLevel = (lines[headingIndex].match(/^#+/)?.[0].length) ?? 1;
+        const headingLevel = lines[headingIndex].match(/^#+/)?.[0].length ?? 1;
         let insertIndex = lines.length;
-        for (let i = headingIndex + 1; i < lines.length; i++) {
-            const match = lines[i].match(/^(#{1,6})\s+/);
+        for (let index = headingIndex + 1; index < lines.length; index++) {
+            const match = lines[index].match(/^(#{1,6})\s+/);
             if (match && match[1].length <= headingLevel) {
-                insertIndex = i;
+                insertIndex = index;
                 break;
             }
         }
 
-        const insertion = normalizedContent.trimEnd().split("\n");
         const before = lines.slice(0, insertIndex);
-        const after = lines.slice(insertIndex);
-        if (before.length > 0 && before[before.length - 1].trim() !== "") {
-            before.push("");
+        if (before.length > 0 && before[before.length - 1].trim() !== '') before.push('');
+        return [...before, ...normalizedContent.trimEnd().split('\n'), ...lines.slice(insertIndex)]
+            .join('\n')
+            .replace(/\n?$/, '\n');
+    }
+
+    private async planVaultActions(actions: VaultAction[]): Promise<{ files: PlannedFile[]; paths: string[] }> {
+        const files = new Map<string, PlannedFile>();
+        const paths: string[] = [];
+
+        for (const action of actions) {
+            const safePath = this.getSafeVaultActionPath(action.path);
+            if (!safePath) throw new Error(`Unsafe vault action path: ${action.path}`);
+            paths.push(safePath);
+
+            let planned = files.get(safePath);
+            if (!planned) {
+                const existing = this.app.vault.getAbstractFileByPath(safePath);
+                if (existing && !(existing instanceof TFile)) {
+                    throw new Error(`Vault action target is not a file: ${safePath}`);
+                }
+                const original = existing instanceof TFile ? await this.app.vault.read(existing) : null;
+                planned = { path: safePath, original, content: original ?? '', exists: original !== null };
+                files.set(safePath, planned);
+            }
+
+            if (action.op === 'create_file') {
+                if (planned.exists) throw new Error(`File already exists: ${safePath}`);
+                planned.content = action.content;
+                planned.exists = true;
+            } else if (action.op === 'append_file') {
+                if (!planned.exists) throw new Error(`File does not exist: ${safePath}`);
+                planned.content = this.appendContent(planned.content, action.content, action.heading);
+            } else {
+                if (!planned.exists) throw new Error(`File does not exist: ${safePath}`);
+                if (!action.find) throw new Error('replace_text requires a non-empty find value');
+                const matches = planned.content.split(action.find).length - 1;
+                if (matches !== 1) {
+                    throw new Error(`replace_text expected exactly one match in ${safePath}, found ${matches}`);
+                }
+                planned.content = planned.content.replace(action.find, action.replace);
+            }
         }
-        return [...before, ...insertion, ...after].join("\n").replace(/\n?$/, "\n");
+
+        return { files: [...files.values()], paths };
     }
 
     public async applyVaultActions(actions: VaultAction[]): Promise<VaultActionResult[]> {
-        const results: VaultActionResult[] = [];
+        if (actions.length === 0) return [];
 
-        for (const action of actions) {
-            const path = this.getSafeVaultActionPath(action.path);
-            if (!path) {
-                results.push({ action, success: false, path: action.path, error: "Unsafe vault action path" });
-                continue;
-            }
-
-            try {
-                const existing = this.app.vault.getAbstractFileByPath(path);
-                if (action.op === "create_file") {
-                    if (existing) {
-                        throw new Error(`File already exists: ${path}`);
-                    }
-                    await this.ensureParentFolders(path);
-                    await this.app.vault.create(path, action.content ?? "");
-                } else if (action.op === "append_file") {
-                    if (!(existing instanceof TFile)) {
-                        throw new Error(`File does not exist: ${path}`);
-                    }
-                    const current = await this.app.vault.read(existing);
-                    await this.app.vault.modify(existing, this.appendContent(current, action.content ?? "", action.heading));
-                } else if (action.op === "replace_text") {
-                    if (!(existing instanceof TFile)) {
-                        throw new Error(`File does not exist: ${path}`);
-                    }
-                    const find = action.find ?? "";
-                    if (!find) {
-                        throw new Error("replace_text requires a non-empty find value");
-                    }
-                    const current = await this.app.vault.read(existing);
-                    const matches = current.split(find).length - 1;
-                    if (matches !== 1) {
-                        throw new Error(`replace_text expected exactly one match, found ${matches}`);
-                    }
-                    await this.app.vault.modify(existing, current.replace(find, action.replace ?? ""));
-                } else {
-                    throw new Error(`Unsupported vault action: ${(action as any).op}`);
-                }
-                results.push({ action, success: true, path });
-            } catch (error) {
-                results.push({ action, success: false, path, error: error.message });
-            }
+        let plan: { files: PlannedFile[]; paths: string[] };
+        try {
+            plan = await this.planVaultActions(actions);
+        } catch (error) {
+            const message = errorMessage(error);
+            return actions.map(action => ({
+                action,
+                success: false,
+                status: 'not_applied',
+                path: action.path,
+                error: message,
+            }));
         }
 
-        return results;
+        const modified: PlannedFile[] = [];
+        const createdFiles: PlannedFile[] = [];
+        const createdFolders: string[] = [];
+        try {
+            for (const file of plan.files) {
+                const current = this.app.vault.getAbstractFileByPath(file.path);
+                if (file.original === null) {
+                    if (current) throw new Error(`File appeared before apply: ${file.path}`);
+                    createdFolders.push(...await this.ensureParentFolders(file.path));
+                    await this.app.vault.create(file.path, file.content);
+                    createdFiles.push(file);
+                } else {
+                    if (!(current instanceof TFile)) throw new Error(`File disappeared before apply: ${file.path}`);
+                    await this.app.vault.process(current, content => {
+                        if (content !== file.original) throw new Error(`File changed before apply: ${file.path}`);
+                        return file.content;
+                    });
+                    modified.push(file);
+                }
+            }
+        } catch (error) {
+            const rollbackErrors = await this.rollback(modified);
+            const preservedPaths = [
+                ...createdFiles.map(file => file.path),
+                ...createdFolders,
+            ];
+            if (preservedPaths.length > 0) {
+                rollbackErrors.push(`manual review required: preserved created paths: ${preservedPaths.join(', ')}`);
+            }
+            const status = rollbackErrors.length > 0
+                ? 'manual_review_required'
+                : modified.length > 0
+                    ? 'rolled_back'
+                    : 'not_applied';
+            const message = [errorMessage(error), ...rollbackErrors].join('; ');
+            return actions.map(action => ({ action, success: false, status, path: action.path, error: message }));
+        }
+
+        return actions.map((action, index) => ({
+            action,
+            success: true,
+            status: 'applied',
+            path: plan.paths[index],
+        }));
     }
 
     private async ensureParentFolders(filePath: string): Promise<string[]> {
-        const folders = filePath.split("/").slice(0, -1);
-        const createdFolders: string[] = [];
-        let currentPath = "";
-
-        for (const folder of folders) {
+        const created: string[] = [];
+        let currentPath = '';
+        for (const folder of filePath.split('/').slice(0, -1)) {
             currentPath = currentPath ? `${currentPath}/${folder}` : folder;
-            const existingPath = this.app.vault.getAbstractFileByPath(currentPath);
-            if (!existingPath) {
+            const existing = this.app.vault.getAbstractFileByPath(currentPath);
+            if (!existing) {
                 await this.app.vault.createFolder(currentPath);
-                createdFolders.push(currentPath);
-            } else if (!(existingPath instanceof TFolder)) {
+                created.push(currentPath);
+            } else if (!(existing instanceof TFolder)) {
                 throw new Error(`Cannot create folder "${currentPath}" because a file already exists there`);
             }
         }
-
-        return createdFolders;
+        return created;
     }
 
-    private async deleteEmptyFolders(folderPaths: string[]): Promise<void> {
-        for (const path of [...folderPaths].reverse()) {
-            const folder = this.app.vault.getAbstractFileByPath(path);
-            if (folder instanceof TFolder && folder.children.length === 0) {
-                await this.app.vault.delete(folder);
-            }
-        }
-    }
-
-    /**
-     * Parses a text edit block from the content string
-     * Enhanced to handle incomplete blocks and extract partial information
-     *
-     * @param content - The content from which to parse edit blocks
-     * @param isComplete - Whether the edit block is complete (has closing tag)
-     * @returns Object with the parsed edit data and cleaned content
-     */
-    public parseEditBlock(content: string, isComplete: boolean = true): ParsedEditBlock {
-        let cleanContent = '';
-        try {
-            // Normalize line breaks and clean control characters, but preserve empty lines
-            cleanContent = content
-                .replace(/\r\n/g, '\n')
-                .replace(/\r/g, '\n')
-                .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
-                .trim();
-
-            // For incomplete blocks, try to extract partial information
-            if (!isComplete) {
-                // Initialize with basic structure
-                const partialData: EditBlock = {
-                    file: "",
-                    find: "",
-                    replace: ""
-                };
-
-                // Try to extract file name from the first line
-                const firstLineMatch = cleanContent.match(/^([^\n]+)/);
-                if (firstLineMatch) {
-                    partialData.file = firstLineMatch[1].trim();
-                }
-
-                // Try to extract search content field
-                const searchStartMatch = cleanContent.match(/<<<<<<< SEARCH\n([\s\S]*)/);
-                if (searchStartMatch) {
-                    partialData.find = searchStartMatch[1];
-                    if (!partialData.file) { // If file not on first line, try line before SEARCH
-                        const lines = cleanContent.split('\n');
-                        const searchIndex = lines.findIndex(line => line.startsWith("<<<<<<< SEARCH"));
-                        if (searchIndex > 0) {
-                            partialData.file = lines[searchIndex - 1].trim();
-                        }
-                    }
-                }
-
-                return {
-                    editData: partialData,
-                    cleanContent,
-                    inProgress: true
-                };
-            }
-
-            // Try parse SEARCH/REPLACE format for complete edit blocks
-            // Supports empty SEARCH (new file / replace whole file) and empty REPLACE (deletion)
-            // Regex structure:
-            //   file_path               (group 1)
-            //   <<<<<<< SEARCH          literal marker
-            //   search_content          (group 2, can be empty)
-            //   =======                 divider
-            //   replacement_content     (group 3, can be empty => deletion)
-            //   >>>>>>> REPLACE         end marker
-            // Note: The trailing newline before the end marker is optional to allow zero-length replacement
-            const newFormatRegex = /^([^\n]+)\n<<<<<<< SEARCH\n([\s\S]*?)\n?=======\n([\s\S]*?)\n?>>>>>>> REPLACE\s*$/;
-            const newFormatMatch = newFormatRegex.exec(cleanContent);
-
-            let editData: EditBlock | null = null;
-            if (newFormatMatch) {
-                editData = {
-                    file: newFormatMatch[1].trim(),
-                    find: newFormatMatch[2],
-                    replace: newFormatMatch[3],
-                };
-            }
-
-            // Validate required fields
-            let error: { type: 'missing_field' | 'invalid_format' | 'preprocessing' | 'unknown', message: string, details?: string } | null = null;
-            if (editData && !editData.file) {
-                error = {
-                    type: 'missing_field',
-                    message: 'Missing "file" field in edit block',
-                    details: 'The "file" field is required and should contain the target file name'
-                };
-            }
-            else if (editData && (editData.find === undefined || editData.find === null)) {
-                error = {
-                    type: 'missing_field',
-                    message: 'Missing "find" field markers',
-                    details: 'The "find" field is required. It should contain the content to find in the file or be empty for new files'
-                };
-            }
-            else if (editData && editData.replace === undefined) {
-                error = {
-                    type: 'missing_field',
-                    message: 'Missing "replace" field in edit block',
-                    details: 'The "replace" field is required. It should contain the content to replace or be empty to indicate deletion'
-                };
-            }
-
-            return error
-            ? { editData, cleanContent, error }
-            : { editData, cleanContent };
-        } catch (error) {
-            console.error("Error parsing edit block:", error);
-            console.error("Content causing error:", content);
-            return {
-                editData: null,
-                cleanContent,
-                error: {
-                    type: 'invalid_format',
-                    message: 'Invalid JSON format in edit block',
-                    details: error.message
-                }
-            };
-        }
-    }
-
-    /**
-     * Parses all edit blocks from a message
-     *
-     * @param message - The message containing text edit blocks in XML format
-     * @returns Array of EditBlock objects
-     */
-    public parseEditBlocks(message: string): EditBlock[] {
-        const editBlocks: EditBlock[] = [];
-        // Set regex to match edit blocks based on Edit Start, End XML tags in the message
-        const editBlockRegex = new RegExp(`${this.EDIT_BLOCK_START}([\\s\\S]*?)${this.EDIT_BLOCK_END}`, 'g');
-
-        let match;
-        while ((match = editBlockRegex.exec(message)) !== null) {
-            const { editData, cleanContent, error } = this.parseEditBlock(match[1]);
-
-            if (error) {
-                console.error("Failed to parse edit block:", error);
-                console.debug("Content causing error:", match[1]);
-                editBlocks.push({
-                    file: "unknown", // Fallback value when editData is null
-                    find: "",
-                    replace: `Error: ${error.message}\nOriginal content:\n${match[1]}`,
-                    note: "Error parsing edit block",
-                    hasError: true,
-                    error: error
-                });
-                continue;
-            }
-
-            if (!editData) {
-                console.debug("No edit data parsed");
-                continue;
-            }
-
-            editBlocks.push({
-                note: "Suggested edit",
-                file: editData.file,
-                find: editData.find,
-                replace: editData.replace,
-                hasError: !!error,
-                error: error || undefined
-            });
-        }
-
-        return editBlocks;
-    }
-
-    /**
-     * Creates a preview with differences highlighted
-     *
-     * @param originalText - The original text
-     * @param newText - The modified text
-     * @returns A string with differences highlighted
-     */
-    public createPreviewWithDiff(originalText: string, newText: string): string {
-        // Define unique tokens to temporarily replace existing formatting markers
-        const HIGHLIGHT_TOKEN = "___KHOJ_HIGHLIGHT_MARKER___";
-        const STRIKETHROUGH_TOKEN = "___KHOJ_STRIKETHROUGH_MARKER___";
-
-        // Function to preserve existing formatting markers by replacing them with tokens
-        const preserveFormatting = (text: string): string => {
-            // Replace existing highlight markers with non-greedy pattern
-            let processed = text.replace(/==(.*?)==/g, `${HIGHLIGHT_TOKEN}$1${HIGHLIGHT_TOKEN}`);
-            // Replace existing strikethrough markers with non-greedy pattern
-            processed = processed.replace(/~~(.*?)~~/g, `${STRIKETHROUGH_TOKEN}$1${STRIKETHROUGH_TOKEN}`);
-            return processed;
-        };
-
-        // Function to restore original formatting markers
-        const restoreFormatting = (text: string): string => {
-            // Restore highlight markers
-            let processed = text.replace(new RegExp(HIGHLIGHT_TOKEN + "(.*?)" + HIGHLIGHT_TOKEN, "g"), "==$1==");
-            // Restore strikethrough markers
-            processed = processed.replace(new RegExp(STRIKETHROUGH_TOKEN + "(.*?)" + STRIKETHROUGH_TOKEN, "g"), "~~$1~~");
-            return processed;
-        };
-
-        // Preserve existing formatting in both texts
-        const preservedOriginal = preserveFormatting(originalText);
-        const preservedNew = preserveFormatting(newText);
-
-        // Find common prefix and suffix
-        let prefixLength = 0;
-        const minLength = Math.min(preservedOriginal.length, preservedNew.length);
-        while (prefixLength < minLength && preservedOriginal[prefixLength] === preservedNew[prefixLength]) {
-            prefixLength++;
-        }
-
-        let suffixLength = 0;
-        while (
-            suffixLength < minLength - prefixLength &&
-            preservedOriginal[preservedOriginal.length - 1 - suffixLength] === preservedNew[preservedNew.length - 1 - suffixLength]
-        ) {
-            suffixLength++;
-        }
-
-        // Extract the parts
-        const commonPrefix = preservedOriginal.slice(0, prefixLength);
-        const commonSuffix = preservedOriginal.slice(preservedOriginal.length - suffixLength);
-        const originalDiff = preservedOriginal.slice(prefixLength, preservedOriginal.length - suffixLength);
-        const newDiff = preservedNew.slice(prefixLength, preservedNew.length - suffixLength);
-
-        // Format the differences
-        const formatLines = (text: string, marker: string): string => {
-            if (!text) return '';
-            return text.split('\n')
-                .map(line => {
-                    line = line.trim();
-                    if (!line) {
-                        return marker === '==' ? '' : '~~';
-                    }
-                    return `${marker}${line}${marker}`;
-                })
-                .filter(line => line !== '~~')
-                .join('\n');
-        };
-
-        // Create the diff preview with preserved formatting tokens
-        const diffPreview = commonPrefix +
-            (originalDiff ? formatLines(originalDiff, '~~') : '') +
-            (newDiff ? formatLines(newDiff, '==') : '') +
-            commonSuffix;
-
-        // Restore original formatting markers in the final result
-        return restoreFormatting(diffPreview);
-    }
-
-    private processSingleEdit(
-        rawFindText: string,
-        replaceText: string,
-        rawCurrentFileContent: string,
-        frontmatterEndIndex: number
-    ): ProcessedEditResult {
-        let startIndex = -1;
-        let endIndex = -1;
-        const findText = rawFindText;
-        const currentFileContent = rawCurrentFileContent;
-
-        if (findText === "") {
-            // Empty search means replace entire content after frontmatter
-            startIndex = frontmatterEndIndex;
-            endIndex = currentFileContent.length;
-        } else {
-            startIndex = currentFileContent.indexOf(findText, frontmatterEndIndex);
-            if (startIndex !== -1) {
-                endIndex = startIndex + findText.length;
-            }
-        }
-
-        if (startIndex === -1 || endIndex === -1 || startIndex > endIndex) {
-            return {
-                preview: "",
-                newContent: currentFileContent,
-                error: `No matching text found in file.`
-
-            };
-        }
-
-        const textToReplace = currentFileContent.substring(startIndex, endIndex);
-        const newText = replaceText;
-        const preview = this.createPreviewWithDiff(textToReplace, newText);
-        const newContent =
-            currentFileContent.substring(0, startIndex) +
-            newText +
-            currentFileContent.substring(endIndex);
-
-        return { preview, newContent };
-    }
-
-    /**
-     * Applies edit blocks to modify files
-     *
-     * @param editBlocks - Array of EditBlock objects to apply
-     * @param addConfirmationButtons - Optional callback to add confirmation UI elements
-     * @returns Object containing edit results and file backups
-     */
-    public async applyEditBlocks(
-        editBlocks: EditBlock[],
-        onRetryNeeded?: (blockToRetry: EditBlock) => void
-    ): Promise<{
-        editResults: { block: EditBlock, success: boolean, error?: string }[],
-        fileBackups: Map<string, string>,
-        createdFiles: string[],
-        createdFolders: string[],
-    }> {
-        // Check for parsing errors first
-        if (editBlocks.length === 0) {
-            return { editResults: [], fileBackups: new Map(), createdFiles: [], createdFolders: [] };
-        }
-
-        // Store original content for each file in case we need to cancel
-        const fileBackups = new Map<string, string>();
-        const createdFiles: string[] = [];
-        const createdFolders: string[] = [];
-
-        // Track current content for each file as we apply edits
-        const currentFileContents = new Map<string, string>();
-
-        // Get recently viewed markdown file(s) to edit
-        const files = this.getRecentActiveMarkdownFiles(this.CONTEXT_FILES_LIMIT);
-
-        // Track success/failure for each edit
-        const editResults: { block: EditBlock, success: boolean, error?: string }[] = [];
-        const blocksNeedingRetry: EditBlock[] = [];
-
-        // PHASE 1: Validation - Check all blocks before applying any changes
-        const validationResults: {
-            block: EditBlock,
-            valid: boolean,
-            error?: string,
-            targetFile?: TFile,
-            targetPath?: string,
-            isNewFile?: boolean,
-        }[] = [];
-
-        for (const block of editBlocks) {
+    private async rollback(modified: PlannedFile[]): Promise<string[]> {
+        const errors: string[] = [];
+        for (const file of [...modified].reverse()) {
             try {
-                // Skip blocks with parsing errors
-                if (block.hasError) {
-                    validationResults.push({
-                        block,
-                        valid: false,
-                        error: block.error?.message || 'Parsing error'
-                    });
-                    continue;
+                const current = this.app.vault.getAbstractFileByPath(file.path);
+                if (!(current instanceof TFile) || file.original === null) {
+                    throw new Error(`rollback conflict: file disappeared: ${file.path}`);
                 }
-
-                const targetFile = this.findBestMatchingFile(block.file, files);
-                let targetPath = targetFile?.path;
-                let isNewFile = false;
-
-                if (!targetFile) {
-                    const newFilePath = this.getSafeNewMarkdownPath(block.file);
-                    const existingFile = newFilePath ? this.app.vault.getAbstractFileByPath(newFilePath) : null;
-
-                    if (!newFilePath || existingFile) {
-                        validationResults.push({
-                            block,
-                            valid: false,
-                            error: `No matching open file found for "${block.file}"`
-                        });
-                        continue;
+                await this.app.vault.process(current, content => {
+                    if (content !== file.content) {
+                        throw new Error(`rollback conflict: file changed after apply: ${file.path}`);
                     }
-                    if (block.find !== "" && !currentFileContents.has(newFilePath)) {
-                        validationResults.push({
-                            block,
-                            valid: false,
-                            error: `New file "${block.file}" requires an empty SEARCH block`
-                        });
-                        continue;
-                    }
-
-                    targetPath = newFilePath;
-                    isNewFile = true;
-                    currentFileContents.set(targetPath, currentFileContents.get(targetPath) ?? "");
-                }
-
-                if (!targetPath) {
-                    validationResults.push({
-                        block,
-                        valid: false,
-                        error: `No matching file found for "${block.file}"`
-                    });
-                    continue;
-                }
-
-                // Read the file content if not already backed up
-                if (targetFile && !fileBackups.has(targetFile.path)) {
-                    const content = await this.app.vault.read(targetFile);
-                    fileBackups.set(targetFile.path, content);
-                    currentFileContents.set(targetFile.path, content);
-                }
-
-                // Use current content (which may have been modified by previous validations)
-                const currentContent = currentFileContents.get(targetPath)!;
-
-                // Find frontmatter boundaries
-                const frontmatterMatch = currentContent.match(/^---\n[\s\S]*?\n---\n/);
-                const frontmatterEndIndex = frontmatterMatch ? frontmatterMatch[0].length : 0;
-
-                const processedEdit = this.processSingleEdit(block.find, block.replace, currentContent, frontmatterEndIndex);
-
-                if (processedEdit.error) {
-                    validationResults.push({ block, valid: false, error: processedEdit.error });
-                    continue;
-                }
-
-                // Validation passed
-                validationResults.push({ block, valid: true, targetFile: targetFile ?? undefined, targetPath, isNewFile });
-
-                // Update the current content for this file for subsequent validations
-                currentFileContents.set(targetPath, processedEdit.newContent);
-
-            } catch (error) {
-                validationResults.push({ block, valid: false, error: error.message });
-            }
-        }
-
-        // Check if all blocks are valid
-        const allValid = validationResults.every(result => result.valid);
-
-        // If any block is invalid, don't apply any changes
-        if (!allValid) {
-            // Reset current file contents
-            currentFileContents.clear();
-
-            // Add all invalid blocks to retry list
-            for (const result of validationResults) {
-                if (!result.valid) {
-                    blocksNeedingRetry.push({
-                        ...result.block,
-                        hasError: true,
-                        error: {
-                            type: 'invalid_format',
-                            message: result.error || 'Validation failed',
-                            details: result.error || 'Could not validate edit'
-                        }
-                    });
-
-                    editResults.push({
-                        block: result.block,
-                        success: false,
-                        error: result.error || 'Validation failed'
-                    });
-                } else {
-                    // Even valid blocks are considered failed in atomic mode if any block fails
-                    editResults.push({
-                        block: result.block,
-                        success: false,
-                        error: 'Other edits in the group failed validation'
-                    });
-                }
-            }
-
-            // Trigger retry for the first failed block
-            if (blocksNeedingRetry.length > 0 && onRetryNeeded) {
-                onRetryNeeded(blocksNeedingRetry[0]);
-            }
-
-            return { editResults, fileBackups, createdFiles, createdFolders };
-        }
-
-        // PHASE 2: Application - Apply all changes since all blocks are valid
-        try {
-            // Reset current file contents to original state
-            currentFileContents.clear();
-            for (const [path, content] of fileBackups.entries()) {
-                currentFileContents.set(path, content);
-            }
-
-            // Apply all edits
-            for (const result of validationResults) {
-                const block = result.block;
-                const targetPath = result.targetPath!;
-
-                // Use current content (which may have been modified by previous edits)
-                const content = currentFileContents.get(targetPath) ?? "";
-
-                // Find frontmatter boundaries
-                const frontmatterMatch = content.match(/^---\n[\s\S]*?\n---\n/);
-                const frontmatterEndIndex = frontmatterMatch ? frontmatterMatch[0].length : 0;
-
-                // Find the text to replace in original content
-                // Recalculate based on the current state of the file content for this phase
-                const processedEdit = this.processSingleEdit(block.find, block.replace, content, frontmatterEndIndex);
-
-                if (processedEdit.error) {
-                     throw new Error(`Failed to re-locate edit markers for file "${targetPath}" during application. Content may have shifted.`);
-                }
-
-                const existingTarget = this.app.vault.getAbstractFileByPath(targetPath);
-                if (result.isNewFile) {
-                    if (!existingTarget) {
-                        createdFolders.push(...await this.ensureParentFolders(targetPath));
-                        await this.app.vault.create(targetPath, processedEdit.newContent);
-                        createdFiles.push(targetPath);
-                    } else if (createdFiles.includes(targetPath) && existingTarget instanceof TFile) {
-                        await this.app.vault.modify(existingTarget, processedEdit.newContent);
-                    } else {
-                        throw new Error(`File already exists for new file edit "${targetPath}"`);
-                    }
-                } else {
-                    const targetFile = result.targetFile || existingTarget;
-                    if (!(targetFile instanceof TFile)) {
-                        throw new Error(`No editable file found for "${targetPath}"`);
-                    }
-                    await this.app.vault.modify(targetFile, processedEdit.newContent);
-                }
-
-                // Update the current content for this file for subsequent edits
-                currentFileContents.set(targetPath, processedEdit.newContent);
-
-                editResults.push({ block: {...block, replace: processedEdit.preview}, success: true });
-            }
-        } catch (error) {
-            console.error(`Error applying edits:`, error);
-
-            // Restore all files to their original state
-            for (const [path, content] of fileBackups.entries()) {
-                const file = this.app.vault.getAbstractFileByPath(path);
-                if (file && file instanceof TFile) {
-                    await this.app.vault.modify(file, content);
-                }
-            }
-            for (const path of createdFiles) {
-                const file = this.app.vault.getAbstractFileByPath(path);
-                if (file && file instanceof TFile) {
-                    await this.app.vault.delete(file);
-                }
-            }
-            await this.deleteEmptyFolders(createdFolders);
-
-            // Mark all blocks as failed
-            editResults.length = 0;
-            for (const block of editBlocks) {
-                blocksNeedingRetry.push(block);
-                editResults.push({
-                    block,
-                    success: false,
-                    error: `Failed to apply edits: ${error.message}`
+                    return file.original as string;
                 });
-            }
-
-            // Trigger retry for the first block
-            if (blocksNeedingRetry.length > 0 && onRetryNeeded) {
-                onRetryNeeded(blocksNeedingRetry[0]);
+            } catch (error) {
+                errors.push(errorMessage(error));
             }
         }
-
-        return { editResults, fileBackups, createdFiles, createdFolders };
-    }
-
-    /**
-     * Transforms content edit blocks in a message to HTML for display
-     *
-     * @param message - The message containing content edit blocks in XML format
-     * @returns The transformed message with HTML for edit blocks
-     */
-    public transformEditBlocks(message: string): string {
-        // Get all open markdown files
-        const files = this.app.workspace.getLeavesOfType('markdown')
-            .map(leaf => (leaf.view as any)?.file)
-            .filter(file => file && file.extension === 'md');
-
-        // Detect all edit blocks, including partial ones
-        const partialBlocks = this.detectPartialEditBlocks(message);
-
-        // Process each detected block
-        let transformedMessage = message;
-        for (const block of partialBlocks) {
-            const isComplete = block.isComplete;
-            const content = block.content;
-
-            // Parse the block content
-            const { editData, cleanContent, error, inProgress } = this.parseEditBlock(content, isComplete);
-            if (!editData && !error) {
-                // If no edit data and no error, skip this block
-                continue;
-            }
-
-            // Escape content for HTML display
-            const diff = diffWords(editData?.find || '', editData?.replace || '');
-            let diffContent = diff.map(part => {
-                if (part.added) {
-                    return `<span class="cm-positive">${part.value}</span>`;
-                } else if (part.removed) {
-                    return `<span class="cm-negative"><s>${part.value}</s></span>`;
-                } else {
-                    return `<span>${part.value}</span>`;
-                }
-            }
-            ).join('').trim();
-
-            let htmlRender = '';
-            if (error) {
-                // Error block
-                console.error("Error parsing khoj-edit block:", error);
-                console.error("Content causing error:", content);
-
-                const errorTitle = `Error: ${error?.message || 'Parse error'}`;
-                const errorDetails = `Failed to parse edit block. Please check the JSON format and ensure all required fields are present.`;
-
-                htmlRender = `<details class="khoj-edit-accordion error">
-                    <summary>${errorTitle}</summary>
-                    <div class="khoj-edit-content">
-                        <p class="khoj-edit-error-message">${errorDetails}</p>
-                        <pre><code class="language-md error">${diffContent}</code></pre>
-                    </div>
-                </details>`;
-            } else if (editData && inProgress) {
-                // In-progress block
-                htmlRender = `<details class="khoj-edit-accordion in-progress">
-                    <summary>📄 ${editData.file} <span class="khoj-edit-status">In Progress</span></summary>
-                    <div class="khoj-edit-content">
-                        <pre><code class="language-md">${diffContent}</code></pre>
-                    </div>
-                </details>`;
-            } else if (editData) {
-                // Success block
-                // Find the actual file that will be modified
-                const targetFile = this.findBestMatchingFile(editData.file, files);
-                const displayFileName = targetFile ? `${targetFile.basename}.${targetFile.extension}` : editData.file;
-
-                htmlRender = `<details class="khoj-edit-accordion success">
-                    <summary>📄 ${displayFileName}</summary>
-                    <div class="khoj-edit-content">
-                        <div>${diffContent}</div>
-                    </div>
-                </details>`;
-            }
-
-            // Replace the block in the message
-            if (isComplete) {
-                transformedMessage = transformedMessage.replace(`${this.EDIT_BLOCK_START}${content}${this.EDIT_BLOCK_END}`, htmlRender);
-            } else {
-                transformedMessage = transformedMessage.replace(`${this.EDIT_BLOCK_START}${content}`, htmlRender);
-            }
-        }
-
-        return transformedMessage;
-    }
-
-    /**
-     * Detects partial edit blocks in a message
-     * This allows for early detection of edit blocks before they are complete
-     *
-     * @param message - The message to search for partial edit blocks
-     * @returns An array of detected blocks with their content and completion status
-     */
-    public detectPartialEditBlocks(message: string): PartialEditBlockResult[] {
-        const results: PartialEditBlockResult[] = [];
-
-        // This regex captures both complete and incomplete edit blocks
-        // It looks for EDIT_BLOCK_START tag followed by any content, and then either EDIT_BLOCK_END or the end of the string
-        const regex = new RegExp(`${this.EDIT_BLOCK_START}([\\s\\S]*?)(?:${this.EDIT_BLOCK_END}|$)`, 'g');
-
-        let match;
-        while ((match = regex.exec(message)) !== null) {
-            const content = match[1];
-            const isComplete = match[0].endsWith(this.EDIT_BLOCK_END);
-
-            results.push({
-                content,
-                isComplete
-            });
-        }
-
-        return results;
+        return errors;
     }
 }

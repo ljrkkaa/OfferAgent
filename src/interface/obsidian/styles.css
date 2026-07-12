@@ -717,13 +717,6 @@ div.khoj-logo:hover {
         max-width: 70%;
     }
 
-    .khoj-edit-accordion summary {
-        padding: 8px 10px;
-    }
-
-    .khoj-edit-content pre {
-        padding: 8px;
-    }
 }
 
 /* Additional media query for very narrow screens */
@@ -1382,285 +1375,68 @@ img.copy-icon {
     color: var(--text-accent);
 }
 
-/* Edit Confirmation Buttons */
-.edit-confirmation-buttons {
-    display: flex;
-    gap: 8px;
-    margin-top: 8px;
-    justify-content: flex-end;
+/* Structured vault action review */
+.vault-action-confirmation,
+.vault-action-result {
+    margin-top: 10px;
+    padding: 10px;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 6px;
+    background: var(--background-secondary);
+    white-space: pre-wrap;
 }
 
-.edit-confirm-button {
+.vault-action-summary {
+    font-weight: 600;
+}
+
+.vault-action-list {
+    margin: 8px 0;
+    color: var(--text-muted);
+    font-family: var(--font-monospace);
+    font-size: var(--font-ui-small);
+}
+
+.vault-action-item + .vault-action-item {
+    margin-top: 6px;
+}
+
+.vault-action-payload {
+    max-height: 240px;
+    margin: 6px 0 0;
+    padding: 8px;
+    overflow: auto;
+    white-space: pre-wrap;
+    color: var(--text-normal);
+    background: var(--background-primary);
+}
+
+.vault-action-buttons {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.vault-action-button {
     padding: 4px 12px;
     border-radius: 4px;
     cursor: pointer;
-    font-size: 14px;
-    transition: background-color 0.2s ease;
 }
 
-.edit-apply-button {
-    background-color: rgba(52, 199, 89, 0.1);
-    border: 1px solid rgb(52, 199, 89);
-    color: rgb(52, 199, 89);
+.vault-action-apply,
+.vault-action-result.success {
+    border-color: var(--color-green);
+    color: var(--color-green);
 }
 
-.edit-apply-button:hover {
-    background-color: rgba(52, 199, 89, 0.2);
+.vault-action-cancel,
+.vault-action-result.error {
+    border-color: var(--color-red);
+    color: var(--color-red);
 }
 
-.edit-cancel-button {
-    background-color: rgba(239, 154, 154, 0.1);
-    border: 1px solid #ef9a9a;
-    color: #d32f2f;
-}
-
-.edit-cancel-button:hover {
-    background-color: rgba(239, 154, 154, 0.2);
-}
-
-.edit-status-container {
-    display: flex;
-    justify-content: center;
-    width: 100%;
-    margin-top: 12px;
-    margin-bottom: 8px;
-}
-
-.edit-status-summary {
-    margin-top: 0;
-    padding: 6px 10px;
-    border-radius: 4px;
-    font-size: 15px;
-    font-weight: 450;
-    animation: fadeIn 0.3s ease;
-    text-align: center;
-    width: fit-content;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
-    background-color: var(--background-secondary);
-    color: var(--text-normal);
-    border: 1px solid var(--background-modifier-border);
-}
-
-.edit-status-summary.success {
-    background-color: rgba(52, 199, 89, 0.1);
-    color: rgb(52, 199, 89);
-    border: 1px solid rgb(52, 199, 89);
-}
-
-.edit-status-summary.error {
-    background-color: rgba(239, 154, 154, 0.1);
-    color: #d32f2f;
-    border: 1px solid #ef9a9a;
-}
-
-@keyframes fadeIn {
-    from {
-        opacity: 0;
-        transform: translateY(-10px);
-    }
-
-    to {
-        opacity: 1;
-        transform: translateY(0);
-    }
-}
-
-/* Khoj Edit Accordion Styles */
-.khoj-edit-accordion {
-    margin: 1em 0;
-    border: 1px solid var(--background-modifier-border);
-    border-radius: 4px;
-    overflow: hidden;
-    transition: all 0.2s ease;
-}
-
-.khoj-edit-accordion summary {
-    padding: 8px 12px;
-    background-color: var(--background-secondary);
-    cursor: pointer;
-    user-select: none;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-
-/* Success state */
-.khoj-edit-accordion.success {
-    border-color: rgba(52, 199, 89, 0.5);
-    background-color: rgba(52, 199, 89, 0.05);
-}
-
-.khoj-edit-accordion.success summary {
-    background-color: rgba(52, 199, 89, 0.1);
-    color: rgb(39, 149, 67);
-}
-
-.khoj-edit-file {
-    margin-left: auto;
-    font-size: 0.9em;
-    opacity: 0.8;
-    font-style: italic;
-}
-
-/* Error state */
-.khoj-edit-accordion.error {
-    border-color: rgba(239, 68, 68, 0.5);
-    background-color: rgba(239, 68, 68, 0.05);
-}
-
-.khoj-edit-accordion.error summary {
-    background-color: rgba(239, 68, 68, 0.15);
-    color: rgb(185, 28, 28);
-}
-
-/* Hover effects */
-.khoj-edit-accordion.success:hover {
-    border-color: rgba(52, 199, 89, 0.8);
-    background-color: rgba(52, 199, 89, 0.1);
-}
-
-.khoj-edit-accordion.error:hover {
-    border-color: rgba(239, 68, 68, 0.8);
-    background-color: rgba(239, 68, 68, 0.1);
-}
-
-/* Content area */
-.khoj-edit-content {
-    padding: 12px;
-    background-color: var(--background-primary);
-}
-
-.khoj-edit-content pre {
-    margin: 0;
-    padding: 12px;
-    background-color: var(--background-secondary);
-    border-radius: 4px;
-    max-width: 100%;
-    overflow-x: auto;
-    white-space: pre-wrap;
-    font-size: 0.95em;
-}
-
-.khoj-edit-content code.error {
-    color: rgb(185, 28, 28);
-}
-
-/* Animations */
-.khoj-edit-accordion[open] summary {
-    border-bottom: 1px solid var(--background-modifier-border);
-}
-
-.khoj-edit-accordion:not([open]) summary:hover {
-    background-color: var(--background-modifier-hover);
-}
-
-.khoj-edit-accordion[open] .khoj-edit-content {
-    animation: slideDown 0.2s ease-out;
-}
-
-@keyframes slideDown {
-    from {
-        opacity: 0;
-        transform: translateY(-10px);
-    }
-
-    to {
-        opacity: 1;
-        transform: translateY(0);
-    }
-}
-
-/* Khoj Edit Block in Chat */
-.khoj-chat-message-text .khoj-edit-accordion {
-    margin: 0.3em 0;
-    border: 1px solid rgba(147, 112, 219, 0.3);
-    border-radius: 4px;
-    background-color: rgba(147, 112, 219, 0.05);
-}
-
-.khoj-chat-message-text .khoj-edit-accordion summary {
-    cursor: pointer;
-    padding: 0.5em;
-    font-weight: 500;
+.vault-action-result.cancelled {
     color: var(--text-muted);
-    display: flex;
-    align-items: center;
-    user-select: none;
-}
-
-.khoj-chat-message-text .khoj-edit-accordion summary:hover {
-    background-color: rgba(147, 112, 219, 0.1);
-}
-
-.khoj-chat-message-text .khoj-edit-content {
-    padding: 0.5em;
-    margin: 0;
-    background-color: var(--background-primary);
-    border-top: 1px solid rgba(147, 112, 219, 0.3);
-}
-
-.khoj-chat-message-text .khoj-edit-content pre {
-    margin: 0;
-    padding: 0;
-    background-color: transparent;
-}
-
-.khoj-chat-message-text .khoj-edit-content code {
-    display: block;
-    white-space: pre-wrap;
-    font-family: var(--font-monospace);
-    font-size: 0.95em;
-}
-
-/* Retry badge container */
-.khoj-retry-container {
-    display: flex;
-    justify-content: center;
-    width: 100%;
-    margin-top: 20px;
-    margin-bottom: 12px;
-}
-
-/* Retry badge styles */
-.khoj-retry-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    background-color: var(--background-modifier-error);
-    color: var(--text-on-accent);
-    padding: 4px 10px;
-    border-radius: 16px;
-    margin: 0;
-    font-size: 0.8em;
-    font-weight: 500;
-    animation: slideIn 0.3s ease-out;
-    box-shadow: 0 3px 6px rgba(0, 0, 0, 0.15);
-    width: fit-content;
-}
-
-.khoj-retry-badge .retry-icon {
-    font-size: 0.9em;
-}
-
-.khoj-retry-badge .retry-count {
-    background: rgba(255, 255, 255, 0.25);
-    padding: 2px 10px;
-    border-radius: 12px;
-    font-size: 0.75em;
-    font-weight: 600;
-    margin-left: auto;
-}
-
-@keyframes slideIn {
-    from {
-        transform: translateY(-10px);
-        opacity: 0;
-    }
-
-    to {
-        transform: translateY(0);
-        opacity: 1;
-    }
 }
 
 /* Improved references */

@@ -1,15 +1,7 @@
-import { FileSystemAdapter, Notice, Vault, Modal, TFile, request, setIcon, Editor, WorkspaceLeaf } from 'obsidian';
-import { KhojSetting, ModelOption, ServerUserConfig, UserInfo } from 'src/settings'
-import { deleteContentByType, uploadContentBatch } from './api';
+import { Notice, Vault, Modal, TFile, setIcon, Editor, WorkspaceLeaf } from 'obsidian';
+import { KhojSetting } from 'src/settings'
+import { OfferAgentServer } from './api';
 import { KhojSearchModal } from './search_modal';
-
-export function getVaultAbsolutePath(vault: Vault): string {
-    let adaptor = vault.adapter;
-    if (adaptor instanceof FileSystemAdapter) {
-        return adaptor.getBasePath();
-    }
-    return '';
-}
 
 function fileExtensionToMimeType(extension: string): string {
     switch (extension) {
@@ -34,26 +26,6 @@ function filenameToMimeType(filename: TFile): string {
             console.warn(`Unknown file type: ${filename.extension}. Defaulting to text/plain.`);
             return 'text/plain';
     }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === "object" && value !== null;
-}
-
-function isChatModelResponse(value: unknown): value is { id: string | number; name: string } {
-    return (
-        isRecord(value) &&
-        (typeof value.id === "string" || typeof value.id === "number") &&
-        typeof value.name === "string"
-    );
-}
-
-function parseServerUserConfig(value: unknown): ServerUserConfig | null {
-    if (!isRecord(value)) return null;
-    const selectedModel = value.selected_chat_model_config;
-    if (selectedModel === undefined || selectedModel === null) return {};
-    if (typeof selectedModel !== "number") return null;
-    return { selected_chat_model_config: selectedModel };
 }
 
 export const fileTypeToExtension = {
@@ -105,6 +77,7 @@ export function getFilesToSync(vault: Vault, setting: KhojSetting): TFile[] {
 export async function updateContentIndex(
     vault: Vault,
     setting: KhojSetting,
+    server: OfferAgentServer,
     lastSync: Map<TFile, number>,
     regenerate: boolean = false,
     userTriggered: boolean = false,
@@ -186,7 +159,7 @@ export async function updateContentIndex(
 
         try {
             for (const contentType of contentTypesToDelete) {
-                await deleteContentByType(setting.khojUrl, setting.khojApiKey, contentType);
+                await server.deleteContentByType(contentType);
             }
         } catch (err) {
             console.error('OfferAgent: Error deleting content types:', err);
@@ -207,7 +180,7 @@ export async function updateContentIndex(
 
     for (const batch of fileData) {
         try {
-            const resultText = await uploadContentBatch(setting.khojUrl, setting.khojApiKey, batch);
+            const resultText = await server.uploadContentBatch(batch);
             responses.push(resultText);
             processedFiles += batch.length;
             if (onProgress) {
@@ -250,12 +223,6 @@ export async function updateContentIndex(
     return lastSync;
 }
 
-export async function openKhojPluginSettings(): Promise<void> {
-    const setting = this.app.setting;
-    await setting.open();
-    setting.openTabById('offeragent');
-}
-
 export async function createNote(name: string, newLeaf = false): Promise<void> {
     try {
         let pathPrefix: string
@@ -288,45 +255,15 @@ export async function createNoteAndCloseModal(query: string, modal: Modal, opt?:
     modal.close();
 }
 
-export async function canConnectToBackend(
-    khojUrl: string,
-    khojApiKey: string,
-    showNotice: boolean = false
-): Promise<{ connectedToBackend: boolean; statusMessage: string, userInfo: UserInfo | null }> {
-    let connectedToBackend = false;
-    let userInfo: UserInfo | null = null;
-
-    if (!!khojUrl) {
-        let headers = !!khojApiKey ? { "Authorization": `Bearer ${khojApiKey}` } : undefined;
-        try {
-            let response = await request({ url: `${khojUrl}/api/v1/user`, method: "GET", headers: headers })
-            connectedToBackend = true;
-            userInfo = JSON.parse(response);
-        } catch (error) {
-            connectedToBackend = false;
-            console.log(`OfferAgent connection error:\n\n${error}`);
-        };
-    }
-
-    let statusMessage: string = getBackendStatusMessage(connectedToBackend, userInfo?.email, khojUrl, khojApiKey);
-    if (showNotice) new Notice(statusMessage);
-    return { connectedToBackend, statusMessage, userInfo };
-}
-
 export function getBackendStatusMessage(
     connectedToServer: boolean,
     userEmail: string | undefined,
-    khojUrl: string,
-    khojApiKey: string
+    serverUrl: string,
 ): string {
-    // Welcome message with default settings. OfferAgent cloud always expects an API key.
-    if (!khojApiKey && khojUrl === 'https://app.khoj.dev')
-        return `Welcome to OfferAgent. Get your API key from ${khojUrl}/settings#clients and set it in the OfferAgent plugin settings on Obsidian`;
-
     if (!connectedToServer)
-        return `Could not connect to OfferAgent at ${khojUrl}. Ensure you can access it`;
+        return `Could not connect to OfferAgent at ${serverUrl}. Check the URL, port forwarding, and API key.`;
     else if (!userEmail)
-        return `Connected to OfferAgent. Get a valid API key from ${khojUrl}/settings#clients to log in`;
+        return `Connected to OfferAgent. Configure the client with the server KHOJ_API_KEY value.`;
     else if (userEmail === 'default@example.com')
         // Logged in as default user in anonymous mode
         return `Welcome back to OfferAgent`;
@@ -334,11 +271,16 @@ export function getBackendStatusMessage(
         return `Welcome back to OfferAgent, ${userEmail}`;
 }
 
-export async function populateHeaderPane(headerEl: Element, setting: KhojSetting, viewType: string): Promise<void> {
-    let userInfo: UserInfo | null = null;
+export async function populateHeaderPane(
+    headerEl: Element,
+    setting: KhojSetting,
+    viewType: string,
+    server: OfferAgentServer,
+): Promise<void> {
     try {
-        const { userInfo: extractedUserInfo } = await canConnectToBackend(setting.khojUrl, setting.khojApiKey, false);
-        userInfo = extractedUserInfo;
+        const connection = await server.probe();
+        setting.connectedToBackend = connection.connected;
+        setting.userInfo = connection.user;
     } catch (error) {
         console.error("Could not connect to OfferAgent");
     }
@@ -433,20 +375,20 @@ export async function populateHeaderPane(headerEl: Element, setting: KhojSetting
     // Chat link event listener
     chatLink.addEventListener('click', () => {
         // Get the activateView method from the plugin instance
-        const khojPlugin = this.app.plugins.plugins.offeragent ?? this.app.plugins.plugins.khoj;
+        const khojPlugin = this.app.plugins.plugins.offeragent;
         khojPlugin?.activateView(KhojView.CHAT, getCurrentKhojLeaf());
     });
 
     // Search link event listener
     searchLink.addEventListener('click', () => {
         // Open the search modal
-        new KhojSearchModal(this.app, setting).open();
+        new KhojSearchModal(this.app, setting, server).open();
     });
 
     // Similar link event listener
     similarLink.addEventListener('click', () => {
         // Get the activateView method from the plugin instance
-        const khojPlugin = this.app.plugins.plugins.offeragent ?? this.app.plugins.plugins.khoj;
+        const khojPlugin = this.app.plugins.plugins.offeragent;
         khojPlugin?.activateView(KhojView.SIMILAR, getCurrentKhojLeaf());
     });
 
@@ -459,19 +401,8 @@ export async function populateHeaderPane(headerEl: Element, setting: KhojSetting
     headerEl.appendChild(titlePaneEl);
 
     if (viewType === KhojView.CHAT) {
-        // Create subtitle pane for New Chat button and agent selector
+        // Create subtitle pane for New Chat button
         const newChatEl = headerEl.createDiv("khoj-header-right-container");
-
-        // Add agent selector container
-        const agentContainer = newChatEl.createDiv("khoj-header-agent-container");
-
-        // Add agent selector
-        agentContainer.createEl("select", {
-            attr: {
-                class: "khoj-header-agent-select",
-                id: "khoj-header-agent-select"
-            }
-        });
 
         // Add New Chat button
         const newChatButton = newChatEl.createEl('button');
@@ -482,7 +413,7 @@ export async function populateHeaderPane(headerEl: Element, setting: KhojSetting
 
         // Add event listener to the New Chat button
         newChatButton.addEventListener('click', () => {
-            const khojPlugin = this.app.plugins.plugins.offeragent ?? this.app.plugins.plugins.khoj;
+            const khojPlugin = this.app.plugins.plugins.offeragent;
             if (khojPlugin) {
                 // First activate the chat view
                 khojPlugin.activateView(KhojView.CHAT).then(() => {
@@ -561,20 +492,8 @@ function copyParentText(event: MouseEvent, message: string, originalButton: stri
 
 export function createCopyParentText(message: string, originalButton: string = 'copy-plus') {
     return function (event: MouseEvent) {
-        let markdownMessage = copyParentText(event, message, originalButton);
-        // Convert edit blocks back to markdown format before pasting
-        const editRegex = /<details class="khoj-edit-accordion">[\s\S]*?<pre><code class="language-khoj-edit">([\s\S]*?)<\/code><\/pre>[\s\S]*?<\/details>/g;
-        markdownMessage = markdownMessage?.replace(editRegex, (_, content) => {
-            return `<khoj-edit>\n${content}\n</khoj-edit>`;
-        });
-        return markdownMessage;
+        return copyParentText(event, message, originalButton);
     }
-}
-
-export function jumpToPreviousView() {
-    const editor: Editor = this.app.workspace.getActiveFileView()?.editor
-    if (!editor) return;
-    editor.focus();
 }
 
 export function pasteTextAtCursor(text: string | undefined) {
@@ -613,101 +532,5 @@ export function getLinkToEntry(sourceFiles: TFile[], chosenFile: string, chosenE
         let linkToEntry = resultHeading.startsWith('#') ? `${fileMatch.path}${resultHeading}` : fileMatch.path;
         console.log(`Link: ${linkToEntry}, File: ${fileMatch.path}, Heading: ${resultHeading}`);
         return linkToEntry;
-    }
-}
-
-/**
- * Calculate estimated vault sync metrics (used and total bytes).
- * This is a client-side estimation based on the configured sync file types and folders.
- * The storage limit is a single backend-compatible limit.
- */
-export async function calculateVaultSyncMetrics(vault: Vault, setting: KhojSetting): Promise<{ usedBytes: number, totalBytes: number }> {
-    try {
-        const files = getFilesToSync(vault, setting);
-        const usedBytes = files.reduce((acc, file) => acc + (file.stat?.size ?? 0), 0);
-        const totalBytes = 50 * 1024 * 1024;
-
-        return { usedBytes, totalBytes };
-    } catch (err) {
-        console.error('OfferAgent: Error calculating vault sync metrics:', err);
-        return { usedBytes: 0, totalBytes: 10 * 1024 * 1024 };
-    }
-}
-
-export async function fetchChatModels(settings: KhojSetting): Promise<ModelOption[]> {
-    if (!settings.connectedToBackend || !settings.khojUrl) {
-        return [];
-    }
-    try {
-        const response = await fetch(`${settings.khojUrl}/api/model/chat/options`, {
-            method: 'GET',
-            headers: settings.khojApiKey ? { 'Authorization': `Bearer ${settings.khojApiKey}` } : {},
-        });
-        if (response.ok) {
-            const modelsData = await response.json();
-            if (!Array.isArray(modelsData) || !modelsData.every(isChatModelResponse)) {
-                throw new Error("Invalid chat models response");
-            }
-            return modelsData.map((model) => ({
-                id: model.id.toString(),
-                name: model.name,
-            }));
-        } else {
-            console.warn("OfferAgent: Failed to fetch chat models:", response.statusText);
-        }
-    } catch (error) {
-        console.error("OfferAgent: Error fetching chat models:", error);
-    }
-    return [];
-}
-
-export async function fetchUserServerSettings(settings: KhojSetting): Promise<ServerUserConfig | null> {
-    if (!settings.connectedToBackend || !settings.khojUrl) {
-        return null;
-    }
-    try {
-        const response = await fetch(`${settings.khojUrl}/api/settings?detailed=true`, {
-            method: 'GET',
-            headers: settings.khojApiKey ? { 'Authorization': `Bearer ${settings.khojApiKey}` } : {},
-        });
-        if (response.ok) {
-            const config = parseServerUserConfig(await response.json());
-            if (!config) {
-                throw new Error("Invalid server settings response");
-            }
-            return config;
-        } else {
-            console.warn("OfferAgent: Failed to fetch user server settings:", response.statusText);
-        }
-    } catch (error) {
-        console.error("OfferAgent: Error fetching user server settings:", error);
-    }
-    return null;
-}
-
-export async function updateServerChatModel(modelId: string, settings: KhojSetting): Promise<boolean> {
-    if (!settings.connectedToBackend || !settings.khojUrl) {
-        new Notice("️⛔️ Connect to OfferAgent to update chat model.");
-        return false;
-    }
-
-    try {
-        const response = await fetch(`${settings.khojUrl}/api/model/chat?id=${encodeURIComponent(modelId)}`, {
-            method: 'POST', // As per web app's updateModel function
-            headers: settings.khojApiKey ? { 'Authorization': `Bearer ${settings.khojApiKey}` } : {},
-        });
-        if (response.ok) {
-            settings.selectedChatModelId = modelId; // Update local mirror
-            return true;
-        } else {
-            const errorData = await response.text();
-            new Notice(`️⛔️ Failed to update chat model on server: ${response.status} ${errorData}`);
-            console.error("OfferAgent: Failed to update chat model:", response.status, errorData);
-            return false;
-        }
-    } catch (error) {
-        new Notice("️⛔️ Error updating chat model on server. See console.");
-        console.error("OfferAgent: Error updating chat model:", error);
-        return false;
     }
 }

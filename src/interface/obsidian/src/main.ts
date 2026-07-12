@@ -3,12 +3,14 @@ import { KhojSetting, KhojSettingTab, DEFAULT_SETTINGS } from 'src/settings'
 import { KhojSearchModal } from 'src/search_modal'
 import { KhojChatView } from 'src/chat_view'
 import { KhojSimilarView } from 'src/similar_view'
-import { updateContentIndex, canConnectToBackend, KhojView, fileTypeToExtension } from 'src/utils';
+import { updateContentIndex, KhojView, fileTypeToExtension } from 'src/utils';
 import { KhojPaneView } from 'src/pane_view';
+import { OfferAgentServer } from './api';
 
 
 export default class Khoj extends Plugin {
     settings: KhojSetting;
+    server: OfferAgentServer;
     indexingTimer: NodeJS.Timeout;
     syncDebounceTimer: NodeJS.Timeout | null = null;
     syncInProgress = false;
@@ -22,7 +24,7 @@ export default class Khoj extends Plugin {
             id: 'search',
             name: 'Search',
             hotkeys: [{ modifiers: ["Ctrl", "Alt"], key: "S" }],
-            callback: () => { new KhojSearchModal(this.app, this.settings).open(); }
+            callback: () => { new KhojSearchModal(this.app, this.settings, this.server).open(); }
         });
 
         // Add similar notes command. It can only be triggered from the editor
@@ -89,27 +91,27 @@ export default class Khoj extends Plugin {
             callback: async () => this.syncNow("manual", true)
         });
 
-        // Add edit confirmation commands
+        // Add vault write confirmation commands
         this.addCommand({
-            id: 'apply-edits',
-            name: 'Apply pending edits',
+            id: 'apply-vault-actions',
+            name: 'Apply pending vault changes',
             hotkeys: [{ modifiers: ["Ctrl", "Shift"], key: "Enter" }],
             callback: () => {
                 const chatView = this.app.workspace.getActiveViewOfType(KhojChatView);
                 if (chatView) {
-                    chatView.applyPendingEdits();
+                    chatView.applyPendingVaultActions();
                 }
             }
         });
 
         this.addCommand({
-            id: 'cancel-edits',
-            name: 'Cancel pending edits',
+            id: 'cancel-vault-actions',
+            name: 'Cancel pending vault changes',
             hotkeys: [{ modifiers: ["Ctrl", "Shift"], key: "Backspace" }],
             callback: () => {
                 const chatView = this.app.workspace.getActiveViewOfType(KhojChatView);
                 if (chatView) {
-                    chatView.cancelPendingEdits();
+                    chatView.cancelPendingVaultActions();
                 }
             }
         });
@@ -189,6 +191,7 @@ export default class Khoj extends Plugin {
                 this.settings.lastSync = await updateContentIndex(
                     this.app.vault,
                     this.settings,
+                    this.server,
                     this.settings.lastSync,
                     false,
                     userTriggered
@@ -210,13 +213,15 @@ export default class Khoj extends Plugin {
     async loadSettings() {
         // Load khoj obsidian plugin settings
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        this.server = new OfferAgentServer(this.settings.khojUrl, this.settings.khojApiKey);
 
-        // Check if can connect to khoj server
-        ({ connectedToBackend: this.settings.connectedToBackend } =
-            await canConnectToBackend(this.settings.khojUrl, this.settings.khojApiKey, true));
+        const connection = await this.server.probe();
+        this.settings.connectedToBackend = connection.connected;
+        this.settings.userInfo = connection.user;
     }
 
     async saveSettings() {
+        this.server.configure(this.settings.khojUrl, this.settings.khojApiKey);
         await this.saveData(this.settings);
     }
 
