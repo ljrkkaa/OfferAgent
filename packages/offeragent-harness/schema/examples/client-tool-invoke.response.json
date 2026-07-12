@@ -1,0 +1,24 @@
+{
+  "id": "rpc_88",
+  "jsonrpc": "2.0",
+  "result": {
+    "actualOperations": [
+      {
+        "afterHash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "applied": true,
+        "beforeHash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "kind": "patch",
+        "operationId": "op_01",
+        "path": "raw/xxx.md",
+        "summary": "已应用经审批的 patch。"
+      }
+    ],
+    "afterHash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "artifactIds": [
+      "art_diff_01"
+    ],
+    "beforeHash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "status": "succeeded",
+    "workspaceRevision": 104
+  }
+}

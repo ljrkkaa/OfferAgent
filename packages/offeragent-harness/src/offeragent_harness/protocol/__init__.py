@@ -1,0 +1,139 @@
+"""OfferAgent protocol v1 public API.
+
+The package is intentionally independent from the Agent domain and every adapter;
+it may be imported by Named Pipe, loopback, schema tooling, and conformance tests.
+"""
+
+# Re-exporting the generated DTO surface is the purpose of this aggregator.
+# ruff: noqa: F401, F403
+
+from . import ids as _ids
+from . import messages as _messages
+from ._base import EmptyParams, EmptyResult, JsonArray, JsonObject, JsonScalar, WireModel, validate_wire
+from .capabilities import (
+    CapabilityName,
+    CapabilitySet,
+    NegotiatedProtocol,
+    ProtocolRange,
+    negotiate_protocol,
+)
+from .content import (
+    ArtifactContentBlock,
+    ArtifactRef,
+    ArtifactSensitivity,
+    ArtifactSourceRef,
+    ArtifactState,
+    ContentBlock,
+    ContentFormat,
+    FileContentBlock,
+    FileRef,
+    Freshness,
+    ImageContentBlock,
+    McpSourceRef,
+    MemorySourceRef,
+    RelativeVaultPath,
+    SourceRef,
+    TextContentBlock,
+    VaultSourceRef,
+    WebSourceRef,
+)
+from .errors import ErrorCode, ErrorEnvelope, ProtocolViolation, protocol_error
+from .events import EVENT_REGISTRY, EventEnvelope, EventPayload, EventType, parse_event
+from .framing import (
+    DEFAULT_MAX_MESSAGE_BYTES,
+    LENGTH_PREFIX_BYTES,
+    LengthPrefixedJsonRpcDecoder,
+    canonical_json_bytes,
+    encode_frame,
+)
+from .ids import *
+from .jsonrpc import (
+    BidirectionalRequestIds,
+    EventNotification,
+    JsonRpcError,
+    JsonRpcErrorCode,
+    JsonRpcErrorResponse,
+    JsonRpcMessage,
+    JsonRpcNotification,
+    JsonRpcRequest,
+    JsonRpcSuccessResponse,
+    RequestDirection,
+    ValidatedRequest,
+    ValidatedResponse,
+    decode_json_document,
+    make_error_response,
+    parse_jsonrpc_message,
+    validate_request,
+    validate_response,
+)
+from .messages import *
+from .messages import ALL_METHOD_REGISTRY, COMMAND_REGISTRY, REVERSE_REQUEST_REGISTRY
+
+_PUBLIC_NAMES = [
+    "ALL_METHOD_REGISTRY",
+    "COMMAND_REGISTRY",
+    "DEFAULT_MAX_MESSAGE_BYTES",
+    "EVENT_REGISTRY",
+    "LENGTH_PREFIX_BYTES",
+    "REVERSE_REQUEST_REGISTRY",
+    "ArtifactContentBlock",
+    "ArtifactRef",
+    "ArtifactSensitivity",
+    "ArtifactSourceRef",
+    "ArtifactState",
+    "BidirectionalRequestIds",
+    "CapabilityName",
+    "CapabilitySet",
+    "ContentBlock",
+    "ContentFormat",
+    "EmptyParams",
+    "EmptyResult",
+    "ErrorCode",
+    "ErrorEnvelope",
+    "EventEnvelope",
+    "EventNotification",
+    "EventPayload",
+    "EventType",
+    "FileContentBlock",
+    "FileRef",
+    "Freshness",
+    "ImageContentBlock",
+    "JsonArray",
+    "JsonObject",
+    "JsonRpcError",
+    "JsonRpcErrorCode",
+    "JsonRpcErrorResponse",
+    "JsonRpcMessage",
+    "JsonRpcNotification",
+    "JsonRpcRequest",
+    "JsonRpcSuccessResponse",
+    "JsonScalar",
+    "LengthPrefixedJsonRpcDecoder",
+    "McpSourceRef",
+    "MemorySourceRef",
+    "NegotiatedProtocol",
+    "ProtocolRange",
+    "ProtocolViolation",
+    "RelativeVaultPath",
+    "RequestDirection",
+    "SourceRef",
+    "TextContentBlock",
+    "ValidatedRequest",
+    "ValidatedResponse",
+    "VaultSourceRef",
+    "WebSourceRef",
+    "WireModel",
+    "canonical_json_bytes",
+    "decode_json_document",
+    "encode_frame",
+    "make_error_response",
+    "negotiate_protocol",
+    "parse_event",
+    "parse_jsonrpc_message",
+    "protocol_error",
+    "validate_request",
+    "validate_response",
+    "validate_wire",
+]
+
+__all__ = sorted(set(_PUBLIC_NAMES + _ids.__all__ + _messages.__all__))

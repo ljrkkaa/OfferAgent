@@ -60,6 +60,11 @@ src/interface/android/local.properties
 INTERVIEW_PERSONAL_KB_AGENT.md
 
 docs/
+!docs/
+docs/*
+!docs/WINDOWS_LOCAL_BASELINE.md
+!docs/architecture/
+!docs/architecture/**
 demos
 reference/
 AGENTS.md

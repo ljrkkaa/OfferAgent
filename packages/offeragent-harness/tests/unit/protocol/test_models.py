@@ -1,0 +1,328 @@
+from __future__ import annotations
+
+import copy
+import json
+from types import MappingProxyType
+from typing import cast
+
+import pytest
+from pydantic import TypeAdapter, ValidationError
+
+from offeragent_harness.protocol._base import WireModel
+from offeragent_harness.protocol.capabilities import (
+    CapabilityName,
+    CapabilitySet,
+    ProtocolRange,
+    negotiate_protocol,
+)
+from offeragent_harness.protocol.content import (
+    ContentBlock,
+    FileRef,
+    RelativeVaultPath,
+    TextContentBlock,
+    VaultSourceRef,
+)
+from offeragent_harness.protocol.errors import ErrorCode, ProtocolViolation
+from offeragent_harness.protocol.events import EVENT_REGISTRY, EventEnvelope, EventType, ToolCompletedPayload
+from offeragent_harness.protocol.ids import Rfc3339DateTime, Sha256Digest, WorkspaceId
+from offeragent_harness.protocol.jsonrpc import (
+    BidirectionalRequestIds,
+    JsonRpcRequest,
+    RequestDirection,
+    decode_json_document,
+    parse_jsonrpc_message,
+    validate_request,
+)
+from offeragent_harness.protocol.messages import (
+    ALL_METHOD_REGISTRY,
+    COMMAND_REGISTRY,
+    REVERSE_REQUEST_REGISTRY,
+    InitializeParams,
+    TurnStartParams,
+    validate_command_params,
+)
+from offeragent_harness.protocol.schemas import build_examples
+
+EXPECTED_COMMANDS = {
+    "initialize",
+    "runtime/ping",
+    "runtime/status",
+    "config/get",
+    "config/update",
+    "models/list",
+    "models/health",
+    "session/create",
+    "session/list",
+    "session/get",
+    "session/rename",
+    "session/delete",
+    "session/fork",
+    "session/compact",
+    "turn/start",
+    "turn/get",
+    "turn/cancel",
+    "turn/retry",
+    "turn/steer",
+    "approval/resolve",
+    "workspace/didChange",
+    "workspace/rescan",
+    "workspace/contextChanged",
+    "agent/status",
+    "agent/result",
+    "agent/cancel",
+    "events/replay",
+    "artifact/read",
+    "diagnostics/get",
+    "shutdown",
+}
+
+EXPECTED_REVERSE_REQUESTS = {
+    "client/context/get",
+    "client/tool/invoke",
+    "client/tool/cancel",
+    "client/approval/present",
+}
+
+
+def _object(value: object) -> dict[str, object]:
+    assert isinstance(value, dict)
+    assert all(isinstance(key, str) for key in value)
+    return cast(dict[str, object], value)
+
+
+def test_command_registry_is_complete_and_immutable() -> None:
+    assert isinstance(COMMAND_REGISTRY, MappingProxyType)
+    assert isinstance(REVERSE_REQUEST_REGISTRY, MappingProxyType)
+    assert set(COMMAND_REGISTRY) == EXPECTED_COMMANDS
+    assert set(REVERSE_REQUEST_REGISTRY) == EXPECTED_REVERSE_REQUESTS
+    assert set(ALL_METHOD_REGISTRY) == EXPECTED_COMMANDS | EXPECTED_REVERSE_REQUESTS
+    with pytest.raises(TypeError):
+        COMMAND_REGISTRY["not/allowed"] = COMMAND_REGISTRY["initialize"]  # type: ignore[index]
+
+
+def test_every_registered_dto_uses_the_closed_frozen_strict_base() -> None:
+    for spec in ALL_METHOD_REGISTRY.values():
+        for model in (spec.params_model, spec.result_model):
+            assert issubclass(model, WireModel)
+            assert model.model_config["extra"] == "forbid"
+            assert model.model_config["frozen"] is True
+            assert model.model_config["strict"] is True
+            assert model.model_config["alias_generator"] is not None
+
+
+def test_unknown_command_field_is_rejected_before_dispatch() -> None:
+    example = build_examples()["turn-start.request.json"]
+    params = dict(_object(example["params"]))
+    params["futureUnsafeFlag"] = True
+    with pytest.raises(ProtocolViolation) as caught:
+        validate_command_params("turn/start", params)
+    assert caught.value.error.code == ErrorCode.PROTOCOL_INVALID_PARAMS
+    violations = caught.value.error.details.get("violations")
+    assert isinstance(violations, list)
+    first_violation = violations[0]
+    assert isinstance(first_violation, dict)
+    assert first_violation.get("type") == "extra_forbidden"
+
+
+def test_models_are_frozen_and_emit_camel_case_wire_names() -> None:
+    params = validate_command_params(
+        "initialize",
+        build_examples()["initialize.request.json"]["params"],
+    )
+    assert isinstance(params, InitializeParams)
+    assert "protocolVersion" in params.to_wire()
+    assert "protocol_version" not in params.to_wire()
+    with pytest.raises(ValidationError):
+        params.protocol_version = "1.1"
+
+
+@pytest.mark.parametrize(
+    ("adapter", "valid", "invalid"),
+    [
+        (TypeAdapter(WorkspaceId), "ws_alpha-01", "session_alpha"),
+        (TypeAdapter(Sha256Digest), "sha256:" + "0" * 64, "sha256:ABC"),
+        (TypeAdapter(Rfc3339DateTime), "2026-07-12T10:00:00+08:00", "2026-07-12 10:00:00"),
+    ],
+)
+def test_named_wire_primitives_validate_without_coercion(
+    adapter: TypeAdapter[object], valid: str, invalid: str
+) -> None:
+    assert adapter.validate_json(f'"{valid}"') == valid
+    with pytest.raises(ValidationError):
+        adapter.validate_json(f'"{invalid}"')
+    with pytest.raises(ValidationError):
+        adapter.validate_python(123, strict=True)
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "2026-02-30T10:00:00Z",
+        "2026-07-12T25:00:00Z",
+        "2026-07-12T10:00:00",
+        "2026-07-12t10:00:00z",
+    ],
+)
+def test_rfc3339_timestamp_rejects_invalid_calendar_or_offset(timestamp: str) -> None:
+    with pytest.raises(ValidationError):
+        TypeAdapter(Rfc3339DateTime).validate_json(f'"{timestamp}"')
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["../secret.md", "raw/../secret.md", "/absolute.md", "C:/vault/a.md", "note.md:secret", "a\\b.md"],
+)
+def test_relative_vault_path_rejects_escape_and_windows_special_paths(path: str) -> None:
+    with pytest.raises(ValidationError):
+        TypeAdapter(RelativeVaultPath).validate_json(f'"{path}"')
+
+
+def test_content_blocks_and_source_refs_are_discriminated_and_closed() -> None:
+    block: ContentBlock = TypeAdapter(ContentBlock).validate_json(
+        """
+        {
+          "type": "text",
+          "text": "有来源的答案",
+          "references": [{
+            "type": "vault",
+            "file": {"workspaceId": "ws_main", "path": "notes/Agent.md"},
+            "freshness": "fresh"
+          }]
+        }
+        """
+    )
+    assert isinstance(block, TextContentBlock)
+    source = block.references[0]
+    assert isinstance(source, VaultSourceRef)
+    assert source.file.path == "notes/Agent.md"
+    with pytest.raises(ValidationError):
+        TypeAdapter(ContentBlock).validate_json('{"type":"text","text":"x","unexpected":true}')
+
+
+def test_file_ref_requires_an_ordered_line_range() -> None:
+    with pytest.raises(ValidationError):
+        FileRef.model_validate_json('{"workspaceId":"ws_main","path":"a.md","lineStart":9,"lineEnd":3}')
+
+
+def test_event_registry_is_complete_concrete_and_immutable() -> None:
+    assert isinstance(EVENT_REGISTRY, MappingProxyType)
+    assert set(EVENT_REGISTRY) == set(EventType)
+    assert len(EVENT_REGISTRY) == 38
+    assert all(issubclass(payload, WireModel) for payload in EVENT_REGISTRY.values())
+    assert EVENT_REGISTRY[EventType.TOOL_COMPLETED] is ToolCompletedPayload
+    with pytest.raises(TypeError):
+        EVENT_REGISTRY[EventType.TOOL_COMPLETED] = WireModel  # type: ignore[index]
+
+
+def test_event_type_and_payload_cannot_be_mismatched_or_extended() -> None:
+    raw = _object(build_examples()["tool-completed.event.json"]["params"])
+    event = EventEnvelope.model_validate_json(json.dumps(raw))
+    assert isinstance(event.payload, ToolCompletedPayload)
+
+    mismatched = dict(raw)
+    mismatched["type"] = "assistant.delta"
+    with pytest.raises(ValidationError):
+        EventEnvelope.model_validate_json(json.dumps(mismatched))
+
+    extended = copy.deepcopy(raw)
+    extended_payload = _object(extended["payload"])
+    extended_payload["unknown"] = True
+    with pytest.raises(ValidationError):
+        EventEnvelope.model_validate_json(json.dumps(extended))
+
+    wrong_terminal_kind = copy.deepcopy(raw)
+    wrong_terminal_kind["type"] = "tool.failed"
+    with pytest.raises(ValidationError):
+        EventEnvelope.model_validate_json(json.dumps(wrong_terminal_kind))
+
+
+def test_capability_negotiation_selects_highest_common_minor_and_intersection() -> None:
+    result = negotiate_protocol(
+        client_preferred="1.4",
+        client_range=ProtocolRange(minimum="1.1", maximum="1.4"),
+        client_capabilities=CapabilitySet(client_tools=True, event_replay=True, shell=True),
+        client_required_capabilities=[CapabilityName.CLIENT_TOOLS],
+        client_schema_hash="sha256:" + "a" * 64,
+        server_preferred="1.3",
+        server_range=ProtocolRange(minimum="1.0", maximum="1.3"),
+        server_capabilities=CapabilitySet(client_tools=True, event_replay=True),
+        server_schema_hash="sha256:" + "a" * 64,
+    )
+    assert result.protocol_version == "1.3"
+    assert result.capabilities.client_tools is True
+    assert result.capabilities.shell is False
+    assert result.disabled_optional_capabilities == [CapabilityName.SHELL]
+
+
+@pytest.mark.parametrize(
+    ("change", "code"),
+    [
+        (
+            {"server_preferred": "2.0", "server_range": ProtocolRange(minimum="2.0", maximum="2.1")},
+            ErrorCode.PROTOCOL_INCOMPATIBLE_VERSION,
+        ),
+        ({"server_schema_hash": "sha256:" + "b" * 64}, ErrorCode.PROTOCOL_SCHEMA_MISMATCH),
+        ({"client_required_capabilities": [CapabilityName.SHELL]}, ErrorCode.PROTOCOL_MISSING_CAPABILITY),
+    ],
+)
+def test_capability_negotiation_fails_closed(change: dict[str, object], code: ErrorCode) -> None:
+    arguments: dict[str, object] = {
+        "client_preferred": "1.0",
+        "client_range": None,
+        "client_capabilities": CapabilitySet(client_tools=True, shell=True),
+        "client_required_capabilities": [],
+        "client_schema_hash": "sha256:" + "a" * 64,
+        "server_preferred": "1.0",
+        "server_range": ProtocolRange(minimum="1.0", maximum="1.2"),
+        "server_capabilities": CapabilitySet(client_tools=True),
+        "server_schema_hash": "sha256:" + "a" * 64,
+    }
+    arguments.update(change)
+    with pytest.raises(ProtocolViolation) as caught:
+        negotiate_protocol(**arguments)  # type: ignore[arg-type]
+    assert caught.value.error.code == code
+
+
+def test_json_parser_rejects_duplicate_members_nonfinite_numbers_and_unknown_envelope_fields() -> None:
+    with pytest.raises(ProtocolViolation) as duplicate:
+        decode_json_document(b'{"jsonrpc":"2.0","jsonrpc":"2.0"}')
+    assert duplicate.value.error.code == ErrorCode.PROTOCOL_INVALID_JSON
+
+    with pytest.raises(ProtocolViolation) as nan:
+        decode_json_document(b'{"jsonrpc":"2.0","id":NaN}')
+    assert nan.value.error.code == ErrorCode.PROTOCOL_INVALID_JSON
+
+    with pytest.raises(ProtocolViolation) as unknown:
+        parse_jsonrpc_message({"jsonrpc": "2.0", "id": 1, "method": "runtime/status", "params": {}, "extra": 1})
+    assert unknown.value.error.code == ErrorCode.PROTOCOL_INVALID_REQUEST
+
+    with pytest.raises(ProtocolViolation) as missing_receipt:
+        parse_jsonrpc_message({"jsonrpc": "2.0", "method": "runtime/status", "params": {}})
+    assert missing_receipt.value.error.code == ErrorCode.PROTOCOL_INVALID_REQUEST
+
+
+def test_request_validation_is_method_aware() -> None:
+    raw = build_examples()["turn-start.request.json"]
+    message = parse_jsonrpc_message(raw)
+    assert isinstance(message, JsonRpcRequest)
+    validated = validate_request(message)
+    assert isinstance(validated.params, TurnStartParams)
+
+    unknown_method = JsonRpcRequest.model_validate_json(
+        '{"jsonrpc":"2.0","id":1,"method":"model/directCall","params":{}}'
+    )
+    with pytest.raises(ProtocolViolation) as caught:
+        validate_request(unknown_method)
+    assert caught.value.error.code == ErrorCode.PROTOCOL_METHOD_NOT_FOUND
+
+
+def test_bidirectional_request_ids_are_independent_and_detect_duplicates() -> None:
+    pending = BidirectionalRequestIds()
+    pending.register(RequestDirection.LOCAL, "rpc_1")
+    pending.register(RequestDirection.REMOTE, "rpc_1")
+    with pytest.raises(ProtocolViolation) as caught:
+        pending.register(RequestDirection.LOCAL, "rpc_1")
+    assert caught.value.error.code == ErrorCode.PROTOCOL_DUPLICATE_REQUEST_ID
+    assert pending.complete(RequestDirection.LOCAL, "rpc_1") is True
+    assert pending.contains(RequestDirection.REMOTE, "rpc_1") is True
+    assert pending.complete(RequestDirection.LOCAL, "missing") is False

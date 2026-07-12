@@ -1,0 +1,25 @@
+{
+  "id": 12,
+  "jsonrpc": "2.0",
+  "method": "turn/start",
+  "params": {
+    "clientContext": {
+      "activeFile": "raw/xxx.md",
+      "selectionRevision": 8
+    },
+    "idempotencyKey": "turn_01",
+    "input": [
+      {
+        "text": "整理当前笔记并补充相关链接",
+        "type": "text"
+      }
+    ],
+    "runConfig": {
+      "model": "gpt-5.5",
+      "permissionMode": "normal",
+      "reasoningEffort": "high"
+    },
+    "sessionId": "ses_01",
+    "turnId": "turn_01"
+  }
+}

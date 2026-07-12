@@ -1,0 +1,41 @@
+{
+  "jsonrpc": "2.0",
+  "method": "event",
+  "params": {
+    "eventId": "evt_17",
+    "parentRunId": null,
+    "payload": {
+      "result": {
+        "data": {
+          "path": "raw/xxx.md"
+        },
+        "sourceRefs": [
+          {
+            "file": {
+              "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "path": "raw/xxx.md",
+              "workspaceId": "ws_xxx"
+            },
+            "freshness": "fresh",
+            "type": "vault",
+            "workspaceRevision": 103
+          }
+        ],
+        "status": "succeeded",
+        "summary": "已读取目标笔记。",
+        "toolCallId": "call_04"
+      }
+    },
+    "protocolVersion": "1.0",
+    "rootRunId": "run_01",
+    "runId": "run_01",
+    "schemaVersion": "1",
+    "sequence": 17,
+    "sessionId": "ses_01",
+    "timestamp": "2026-07-12T10:00:00Z",
+    "traceId": "trace_17",
+    "turnId": "turn_01",
+    "type": "tool.completed",
+    "workspaceId": "ws_xxx"
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "buildCommit": "0123456789abcdef0123456789abcdef01234567",
+    "capabilities": {
+      "approvals": true,
+      "artifacts": true,
+      "cancellation": true,
+      "clientTools": true,
+      "contentBlocks": true,
+      "diagnostics": true,
+      "eventReplay": true,
+      "mcp": true,
+      "multiSession": true,
+      "reverseRequests": true,
+      "shell": true,
+      "subagents": true,
+      "workspaceChanges": true
+    },
+    "coreVersion": "2.0.0",
+    "hostPid": 12000,
+    "protocolVersion": "1.0",
+    "runtimeArch": "win-x64",
+    "runtimeVersion": "2.0.0",
+    "schemaHash": "sha256:4974063a92f1134a4a10b42cbcdfab38043a84b82eb590dd4765c6b704db94c7",
+    "supportedProtocolRange": {
+      "maximum": "1.0",
+      "minimum": "1.0"
+    },
+    "transport": "windows-named-pipe",
+    "workerPid": 12042,
+    "workspaceId": "ws_xxx",
+    "workspaceInstanceId": "wsi_xxx"
+  }
+}

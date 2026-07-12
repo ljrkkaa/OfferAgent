@@ -1,0 +1,6691 @@
+{
+  "$defs": {
+    "AgentCancelParams": {
+      "additionalProperties": false,
+      "properties": {
+        "cascade": {
+          "default": true,
+          "title": "Cascade",
+          "type": "boolean"
+        },
+        "reason": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "runId",
+        "reason"
+      ],
+      "title": "AgentCancelParams",
+      "type": "object"
+    },
+    "AgentCancelResult": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "title": "Accepted",
+          "type": "boolean"
+        },
+        "descendantRunIds": {
+          "items": {
+            "$ref": "#/$defs/RunId"
+          },
+          "maxItems": 10000,
+          "title": "Descendantrunids",
+          "type": "array"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "runId",
+        "accepted"
+      ],
+      "title": "AgentCancelResult",
+      "type": "object"
+    },
+    "AgentResultParams": {
+      "additionalProperties": false,
+      "properties": {
+        "include": {
+          "items": {
+            "enum": [
+              "summary",
+              "findings",
+              "evidence",
+              "artifacts",
+              "proposedActions",
+              "usage"
+            ],
+            "type": "string"
+          },
+          "maxItems": 6,
+          "title": "Include",
+          "type": "array"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "runId"
+      ],
+      "title": "AgentResultParams",
+      "type": "object"
+    },
+    "AgentResultResult": {
+      "additionalProperties": false,
+      "properties": {
+        "result": {
+          "$ref": "#/$defs/SubagentResult"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "AgentResultResult",
+      "type": "object"
+    },
+    "AgentStatusParams": {
+      "additionalProperties": false,
+      "properties": {
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "runId"
+      ],
+      "title": "AgentStatusParams",
+      "type": "object"
+    },
+    "AgentStatusResult": {
+      "additionalProperties": false,
+      "properties": {
+        "childRunIds": {
+          "items": {
+            "$ref": "#/$defs/RunId"
+          },
+          "maxItems": 10000,
+          "title": "Childrunids",
+          "type": "array"
+        },
+        "run": {
+          "$ref": "#/$defs/RunSnapshot"
+        }
+      },
+      "required": [
+        "run"
+      ],
+      "title": "AgentStatusResult",
+      "type": "object"
+    },
+    "ApprovalDecision": {
+      "enum": [
+        "deny",
+        "allow_once",
+        "allow_run",
+        "allow_session",
+        "allow_persistent"
+      ],
+      "title": "ApprovalDecision",
+      "type": "string"
+    },
+    "ApprovalDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "approvalId": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "diffArtifact": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "expectedStateHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "expiresAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "includeDescendants": {
+          "default": false,
+          "title": "Includedescendants",
+          "type": "boolean"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "status": {
+          "$ref": "#/$defs/ApprovalStatus"
+        },
+        "toolCall": {
+          "$ref": "#/$defs/ToolCallDescriptor"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "approvalId",
+        "status",
+        "toolCall",
+        "workspaceId",
+        "runId",
+        "expiresAt"
+      ],
+      "title": "ApprovalDescriptor",
+      "type": "object"
+    },
+    "ApprovalExpiredPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "approvalId": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "expiredAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "reason": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "approvalId",
+        "expiredAt",
+        "reason"
+      ],
+      "title": "ApprovalExpiredPayload",
+      "type": "object"
+    },
+    "ApprovalId": {
+      "maxLength": 128,
+      "minLength": 5,
+      "pattern": "^apr_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "ApprovalRequiredPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "approval": {
+          "$ref": "#/$defs/ApprovalDescriptor"
+        },
+        "explanation": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "title": "Explanation",
+          "type": "string"
+        }
+      },
+      "required": [
+        "approval",
+        "explanation"
+      ],
+      "title": "ApprovalRequiredPayload",
+      "type": "object"
+    },
+    "ApprovalResolveParams": {
+      "additionalProperties": false,
+      "properties": {
+        "approvalId": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "comment": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Comment"
+        },
+        "decision": {
+          "$ref": "#/$defs/ApprovalDecision"
+        },
+        "expectedArgsHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "includeDescendants": {
+          "default": false,
+          "title": "Includedescendants",
+          "type": "boolean"
+        },
+        "scope": {
+          "$ref": "#/$defs/ApprovalScope"
+        }
+      },
+      "required": [
+        "approvalId",
+        "decision",
+        "scope",
+        "expectedArgsHash"
+      ],
+      "title": "ApprovalResolveParams",
+      "type": "object"
+    },
+    "ApprovalResolveResult": {
+      "additionalProperties": false,
+      "properties": {
+        "approvalId": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "resumed": {
+          "title": "Resumed",
+          "type": "boolean"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "status": {
+          "enum": [
+            "approved",
+            "denied",
+            "expired",
+            "cancelled",
+            "already_resolved"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "approvalId",
+        "status",
+        "runId",
+        "resumed"
+      ],
+      "title": "ApprovalResolveResult",
+      "type": "object"
+    },
+    "ApprovalResolvedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "approvalId": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "decision": {
+          "$ref": "#/$defs/ApprovalDecision"
+        },
+        "resolvedAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "resolvedBy": {
+          "enum": [
+            "user",
+            "policy",
+            "system"
+          ],
+          "title": "Resolvedby",
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/ApprovalScope"
+        }
+      },
+      "required": [
+        "approvalId",
+        "decision",
+        "scope",
+        "resolvedAt",
+        "resolvedBy"
+      ],
+      "title": "ApprovalResolvedPayload",
+      "type": "object"
+    },
+    "ApprovalScope": {
+      "enum": [
+        "once",
+        "run",
+        "session",
+        "persistent"
+      ],
+      "title": "ApprovalScope",
+      "type": "string"
+    },
+    "ApprovalStatus": {
+      "enum": [
+        "pending",
+        "approved",
+        "denied",
+        "expired",
+        "cancelled"
+      ],
+      "title": "ApprovalStatus",
+      "type": "string"
+    },
+    "ArtifactContentBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "preview": {
+          "anyOf": [
+            {
+              "maxLength": 32768,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Preview"
+        },
+        "type": {
+          "const": "artifact",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "artifact"
+      ],
+      "title": "ArtifactContentBlock",
+      "type": "object"
+    },
+    "ArtifactCreatedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "ownerId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Ownerid",
+          "type": "string"
+        },
+        "ownerType": {
+          "enum": [
+            "run",
+            "tool",
+            "approval",
+            "subagent",
+            "index"
+          ],
+          "title": "Ownertype",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact",
+        "ownerType",
+        "ownerId"
+      ],
+      "title": "ArtifactCreatedPayload",
+      "type": "object"
+    },
+    "ArtifactEncoding": {
+      "enum": [
+        "utf8",
+        "base64"
+      ],
+      "title": "ArtifactEncoding",
+      "type": "string"
+    },
+    "ArtifactId": {
+      "maxLength": 128,
+      "minLength": 5,
+      "pattern": "^art_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "ArtifactReadParams": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactId": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "maxBytes": {
+          "default": 262144,
+          "maximum": 1048576,
+          "minimum": 1,
+          "title": "Maxbytes",
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Offset",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "artifactId"
+      ],
+      "title": "ArtifactReadParams",
+      "type": "object"
+    },
+    "ArtifactReadResult": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "content": {
+          "maxLength": 1398104,
+          "title": "Content",
+          "type": "string"
+        },
+        "encoding": {
+          "$ref": "#/$defs/ArtifactEncoding"
+        },
+        "eof": {
+          "title": "Eof",
+          "type": "boolean"
+        },
+        "nextOffset": {
+          "minimum": 0,
+          "title": "Nextoffset",
+          "type": "integer"
+        },
+        "offset": {
+          "minimum": 0,
+          "title": "Offset",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "artifact",
+        "offset",
+        "nextOffset",
+        "encoding",
+        "content",
+        "eof"
+      ],
+      "title": "ArtifactReadResult",
+      "type": "object"
+    },
+    "ArtifactRef": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactId": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "contentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "mediaType": {
+          "maxLength": 255,
+          "minLength": 3,
+          "pattern": "^[^/\\s]+/[^/\\s]+$",
+          "title": "Mediatype",
+          "type": "string"
+        },
+        "sensitivity": {
+          "$ref": "#/$defs/ArtifactSensitivity"
+        },
+        "sizeBytes": {
+          "minimum": 0,
+          "title": "Sizebytes",
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/ArtifactState",
+          "default": "complete"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        }
+      },
+      "required": [
+        "artifactId",
+        "contentHash",
+        "mediaType",
+        "sizeBytes",
+        "sensitivity"
+      ],
+      "title": "ArtifactRef",
+      "type": "object"
+    },
+    "ArtifactSensitivity": {
+      "enum": [
+        "public",
+        "workspace",
+        "private",
+        "secret"
+      ],
+      "title": "ArtifactSensitivity",
+      "type": "string"
+    },
+    "ArtifactSourceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "type": {
+          "const": "artifact",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "artifact"
+      ],
+      "title": "ArtifactSourceRef",
+      "type": "object"
+    },
+    "ArtifactState": {
+      "enum": [
+        "complete",
+        "partial",
+        "unverified",
+        "cancelled",
+        "failed"
+      ],
+      "title": "ArtifactState",
+      "type": "string"
+    },
+    "AssistantCompletedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Content",
+          "type": "array"
+        },
+        "finishReason": {
+          "enum": [
+            "stop",
+            "length",
+            "cancelled",
+            "interrupted"
+          ],
+          "title": "Finishreason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "finishReason"
+      ],
+      "title": "AssistantCompletedPayload",
+      "type": "object"
+    },
+    "AssistantDeltaPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "blockIndex": {
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Blockindex",
+          "type": "integer"
+        },
+        "delta": {
+          "maxLength": 65536,
+          "minLength": 1,
+          "title": "Delta",
+          "type": "string"
+        },
+        "offset": {
+          "minimum": 0,
+          "title": "Offset",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "blockIndex",
+        "offset",
+        "delta"
+      ],
+      "title": "AssistantDeltaPayload",
+      "type": "object"
+    },
+    "BudgetSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "maxArtifactBytes": {
+          "minimum": 0,
+          "title": "Maxartifactbytes",
+          "type": "integer"
+        },
+        "maxCostMicros": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxcostmicros"
+        },
+        "maxInputTokens": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxinputtokens"
+        },
+        "maxModelRounds": {
+          "maximum": 1024,
+          "minimum": 1,
+          "title": "Maxmodelrounds",
+          "type": "integer"
+        },
+        "maxOutputTokens": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxoutputtokens"
+        },
+        "maxParallelReads": {
+          "maximum": 256,
+          "minimum": 1,
+          "title": "Maxparallelreads",
+          "type": "integer"
+        },
+        "maxToolCalls": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Maxtoolcalls",
+          "type": "integer"
+        },
+        "maxWallTimeMs": {
+          "maximum": 604800000,
+          "minimum": 1,
+          "title": "Maxwalltimems",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "maxModelRounds",
+        "maxToolCalls",
+        "maxParallelReads",
+        "maxWallTimeMs",
+        "maxArtifactBytes"
+      ],
+      "title": "BudgetSnapshot",
+      "type": "object"
+    },
+    "CapabilityName": {
+      "enum": [
+        "clientTools",
+        "eventReplay",
+        "multiSession",
+        "approvals",
+        "mcp",
+        "shell",
+        "subagents",
+        "artifacts",
+        "workspaceChanges",
+        "loopbackWeb",
+        "reverseRequests",
+        "contentBlocks",
+        "cancellation",
+        "diagnostics"
+      ],
+      "title": "CapabilityName",
+      "type": "string"
+    },
+    "CapabilitySet": {
+      "additionalProperties": false,
+      "properties": {
+        "approvals": {
+          "default": false,
+          "title": "Approvals",
+          "type": "boolean"
+        },
+        "artifacts": {
+          "default": false,
+          "title": "Artifacts",
+          "type": "boolean"
+        },
+        "cancellation": {
+          "default": false,
+          "title": "Cancellation",
+          "type": "boolean"
+        },
+        "clientTools": {
+          "default": false,
+          "title": "Clienttools",
+          "type": "boolean"
+        },
+        "contentBlocks": {
+          "default": false,
+          "title": "Contentblocks",
+          "type": "boolean"
+        },
+        "diagnostics": {
+          "default": false,
+          "title": "Diagnostics",
+          "type": "boolean"
+        },
+        "eventReplay": {
+          "default": false,
+          "title": "Eventreplay",
+          "type": "boolean"
+        },
+        "loopbackWeb": {
+          "default": false,
+          "title": "Loopbackweb",
+          "type": "boolean"
+        },
+        "mcp": {
+          "default": false,
+          "title": "Mcp",
+          "type": "boolean"
+        },
+        "multiSession": {
+          "default": false,
+          "title": "Multisession",
+          "type": "boolean"
+        },
+        "reverseRequests": {
+          "default": false,
+          "title": "Reverserequests",
+          "type": "boolean"
+        },
+        "shell": {
+          "default": false,
+          "title": "Shell",
+          "type": "boolean"
+        },
+        "subagents": {
+          "default": false,
+          "title": "Subagents",
+          "type": "boolean"
+        },
+        "workspaceChanges": {
+          "default": false,
+          "title": "Workspacechanges",
+          "type": "boolean"
+        }
+      },
+      "title": "CapabilitySet",
+      "type": "object"
+    },
+    "ClientActualOperation": {
+      "additionalProperties": false,
+      "properties": {
+        "afterHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "applied": {
+          "title": "Applied",
+          "type": "boolean"
+        },
+        "beforeHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "destinationPath": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RelativeVaultPath"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "kind": {
+          "enum": [
+            "create",
+            "append",
+            "patch",
+            "replace",
+            "rename",
+            "trash",
+            "editor_insert",
+            "editor_open",
+            "editor_reveal"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "operationId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Operationid",
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/RelativeVaultPath"
+        },
+        "summary": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operationId",
+        "kind",
+        "path",
+        "applied",
+        "summary"
+      ],
+      "title": "ClientActualOperation",
+      "type": "object"
+    },
+    "ClientApprovalPresentParams": {
+      "additionalProperties": false,
+      "properties": {
+        "approvalId": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "diffArtifact": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "expiresAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "explanation": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "title": "Explanation",
+          "type": "string"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "title": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "approvalId",
+        "runId",
+        "title",
+        "explanation",
+        "expiresAt"
+      ],
+      "title": "ClientApprovalPresentParams",
+      "type": "object"
+    },
+    "ClientApprovalPresentResult": {
+      "additionalProperties": false,
+      "properties": {
+        "approvalId": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "presented": {
+          "title": "Presented",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "approvalId",
+        "presented"
+      ],
+      "title": "ClientApprovalPresentResult",
+      "type": "object"
+    },
+    "ClientContextGetParams": {
+      "additionalProperties": false,
+      "properties": {
+        "deadline": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "fields": {
+          "items": {
+            "enum": [
+              "activeFile",
+              "selection",
+              "cursor",
+              "metadata",
+              "backlinks",
+              "unsavedState"
+            ],
+            "type": "string"
+          },
+          "maxItems": 6,
+          "minItems": 1,
+          "title": "Fields",
+          "type": "array"
+        },
+        "requestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "requestId",
+        "runId",
+        "fields",
+        "deadline"
+      ],
+      "title": "ClientContextGetParams",
+      "type": "object"
+    },
+    "ClientContextGetResult": {
+      "additionalProperties": false,
+      "properties": {
+        "capturedAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "context": {
+          "$ref": "#/$defs/ClientContextSnapshot"
+        }
+      },
+      "required": [
+        "context",
+        "capturedAt"
+      ],
+      "title": "ClientContextGetResult",
+      "type": "object"
+    },
+    "ClientContextSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "activeFile": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RelativeVaultPath"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "activeFileHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "activeFileRevision": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Activefilerevision"
+        },
+        "cursorOffset": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursoroffset"
+        },
+        "hasUnsavedChanges": {
+          "default": false,
+          "title": "Hasunsavedchanges",
+          "type": "boolean"
+        },
+        "metadataCacheRevision": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Metadatacacherevision"
+        },
+        "selection": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EditorSelection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "selectionRevision": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Selectionrevision"
+        }
+      },
+      "title": "ClientContextSnapshot",
+      "type": "object"
+    },
+    "ClientToolCancelParams": {
+      "additionalProperties": false,
+      "properties": {
+        "invocationId": {
+          "$ref": "#/$defs/InvocationId"
+        },
+        "reason": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "invocationId",
+        "runId",
+        "reason"
+      ],
+      "title": "ClientToolCancelParams",
+      "type": "object"
+    },
+    "ClientToolCancelResult": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "title": "Accepted",
+          "type": "boolean"
+        },
+        "alreadyTerminal": {
+          "title": "Alreadyterminal",
+          "type": "boolean"
+        },
+        "invocationId": {
+          "$ref": "#/$defs/InvocationId"
+        }
+      },
+      "required": [
+        "invocationId",
+        "accepted",
+        "alreadyTerminal"
+      ],
+      "title": "ClientToolCancelResult",
+      "type": "object"
+    },
+    "ClientToolInvokeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "argsHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "arguments": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Arguments",
+          "type": "object"
+        },
+        "deadline": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "idempotencyKey": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Idempotencykey",
+          "type": "string"
+        },
+        "invocationId": {
+          "$ref": "#/$defs/InvocationId"
+        },
+        "name": {
+          "maxLength": 256,
+          "minLength": 3,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "toolCallId": {
+          "$ref": "#/$defs/ToolCallId"
+        },
+        "traceId": {
+          "$ref": "#/$defs/TraceId"
+        }
+      },
+      "required": [
+        "invocationId",
+        "toolCallId",
+        "runId",
+        "name",
+        "arguments",
+        "argsHash",
+        "idempotencyKey",
+        "deadline",
+        "traceId"
+      ],
+      "title": "ClientToolInvokeParams",
+      "type": "object"
+    },
+    "ClientToolInvokeResult": {
+      "additionalProperties": false,
+      "properties": {
+        "actualOperations": {
+          "items": {
+            "$ref": "#/$defs/ClientActualOperation"
+          },
+          "maxItems": 1024,
+          "title": "Actualoperations",
+          "type": "array"
+        },
+        "afterHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "artifactIds": {
+          "items": {
+            "$ref": "#/$defs/ArtifactId"
+          },
+          "maxItems": 256,
+          "title": "Artifactids",
+          "type": "array"
+        },
+        "beforeHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorEnvelope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "status": {
+          "$ref": "#/$defs/ToolCallStatus"
+        },
+        "workspaceRevision": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Workspacerevision"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "title": "ClientToolInvokeResult",
+      "type": "object"
+    },
+    "CompactBoundaryId": {
+      "maxLength": 128,
+      "minLength": 5,
+      "pattern": "^cmp_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "ConfigFieldError": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Code",
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "code",
+        "message"
+      ],
+      "title": "ConfigFieldError",
+      "type": "object"
+    },
+    "ConfigGetParams": {
+      "additionalProperties": false,
+      "properties": {
+        "scope": {
+          "$ref": "#/$defs/ConfigScope",
+          "default": "workspace"
+        },
+        "sessionId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "ConfigGetParams",
+      "type": "object"
+    },
+    "ConfigScope": {
+      "enum": [
+        "user",
+        "workspace",
+        "session"
+      ],
+      "title": "ConfigScope",
+      "type": "string"
+    },
+    "ConfigSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "restartPending": {
+          "default": false,
+          "title": "Restartpending",
+          "type": "boolean"
+        },
+        "revision": {
+          "minimum": 0,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "scope": {
+          "$ref": "#/$defs/ConfigScope"
+        },
+        "values": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Values",
+          "type": "object"
+        }
+      },
+      "required": [
+        "scope",
+        "revision",
+        "values"
+      ],
+      "title": "ConfigSnapshot",
+      "type": "object"
+    },
+    "ConfigUpdateParams": {
+      "additionalProperties": false,
+      "properties": {
+        "expectedRevision": {
+          "minimum": 0,
+          "title": "Expectedrevision",
+          "type": "integer"
+        },
+        "patch": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Patch",
+          "type": "object"
+        },
+        "scope": {
+          "$ref": "#/$defs/ConfigScope",
+          "default": "workspace"
+        },
+        "sessionId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "expectedRevision",
+        "patch"
+      ],
+      "title": "ConfigUpdateParams",
+      "type": "object"
+    },
+    "ConfigUpdateResult": {
+      "additionalProperties": false,
+      "properties": {
+        "fieldErrors": {
+          "items": {
+            "$ref": "#/$defs/ConfigFieldError"
+          },
+          "maxItems": 256,
+          "title": "Fielderrors",
+          "type": "array"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/ConfigSnapshot"
+        },
+        "status": {
+          "enum": [
+            "applied",
+            "restart_required",
+            "rejected"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "snapshot"
+      ],
+      "title": "ConfigUpdateResult",
+      "type": "object"
+    },
+    "ContentBlock": {
+      "discriminator": {
+        "mapping": {
+          "artifact": "#/$defs/ArtifactContentBlock",
+          "file": "#/$defs/FileContentBlock",
+          "image": "#/$defs/ImageContentBlock",
+          "text": "#/$defs/TextContentBlock"
+        },
+        "propertyName": "type"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/TextContentBlock"
+        },
+        {
+          "$ref": "#/$defs/FileContentBlock"
+        },
+        {
+          "$ref": "#/$defs/ImageContentBlock"
+        },
+        {
+          "$ref": "#/$defs/ArtifactContentBlock"
+        }
+      ]
+    },
+    "ContentFormat": {
+      "enum": [
+        "plain",
+        "markdown"
+      ],
+      "title": "ContentFormat",
+      "type": "string"
+    },
+    "ContextCompactedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "boundaryId": {
+          "$ref": "#/$defs/CompactBoundaryId"
+        },
+        "model": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Model",
+          "type": "string"
+        },
+        "replacedSequenceEnd": {
+          "minimum": 1,
+          "title": "Replacedsequenceend",
+          "type": "integer"
+        },
+        "replacedSequenceStart": {
+          "minimum": 1,
+          "title": "Replacedsequencestart",
+          "type": "integer"
+        },
+        "summaryArtifact": {
+          "$ref": "#/$defs/ArtifactRef"
+        }
+      },
+      "required": [
+        "boundaryId",
+        "replacedSequenceStart",
+        "replacedSequenceEnd",
+        "summaryArtifact",
+        "model"
+      ],
+      "title": "ContextCompactedPayload",
+      "type": "object"
+    },
+    "DiagnosticProcessSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "owned": {
+          "title": "Owned",
+          "type": "boolean"
+        },
+        "pid": {
+          "minimum": 1,
+          "title": "Pid",
+          "type": "integer"
+        },
+        "role": {
+          "enum": [
+            "host",
+            "worker",
+            "shell",
+            "mcp",
+            "parser"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "state": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "pid",
+        "state",
+        "owned"
+      ],
+      "title": "DiagnosticProcessSnapshot",
+      "type": "object"
+    },
+    "DiagnosticsGetParams": {
+      "additionalProperties": false,
+      "properties": {
+        "includePaths": {
+          "default": false,
+          "title": "Includepaths",
+          "type": "boolean"
+        },
+        "includeRecentErrors": {
+          "default": true,
+          "title": "Includerecenterrors",
+          "type": "boolean"
+        }
+      },
+      "title": "DiagnosticsGetParams",
+      "type": "object"
+    },
+    "DiagnosticsGetResult": {
+      "additionalProperties": false,
+      "properties": {
+        "generatedAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "logArtifact": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "processes": {
+          "items": {
+            "$ref": "#/$defs/DiagnosticProcessSnapshot"
+          },
+          "maxItems": 10000,
+          "title": "Processes",
+          "type": "array"
+        },
+        "recentErrors": {
+          "items": {
+            "$ref": "#/$defs/ErrorEnvelope"
+          },
+          "maxItems": 1000,
+          "title": "Recenterrors",
+          "type": "array"
+        },
+        "runtime": {
+          "$ref": "#/$defs/RuntimeStatusResult"
+        }
+      },
+      "required": [
+        "generatedAt",
+        "runtime",
+        "processes"
+      ],
+      "title": "DiagnosticsGetResult",
+      "type": "object"
+    },
+    "EditorSelection": {
+      "additionalProperties": false,
+      "properties": {
+        "anchorOffset": {
+          "minimum": 0,
+          "title": "Anchoroffset",
+          "type": "integer"
+        },
+        "headOffset": {
+          "minimum": 0,
+          "title": "Headoffset",
+          "type": "integer"
+        },
+        "text": {
+          "maxLength": 262144,
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "anchorOffset",
+        "headOffset"
+      ],
+      "title": "EditorSelection",
+      "type": "object"
+    },
+    "ErrorCode": {
+      "enum": [
+        "protocol.invalid_json",
+        "protocol.invalid_utf8",
+        "protocol.invalid_request",
+        "protocol.method_not_found",
+        "protocol.invalid_params",
+        "protocol.message_too_large",
+        "protocol.duplicate_request_id",
+        "protocol.schema_mismatch",
+        "protocol.incompatible_version",
+        "protocol.missing_capability",
+        "protocol.internal_error",
+        "runtime.not_ready",
+        "runtime.shutting_down",
+        "runtime.interrupted",
+        "request.cancelled",
+        "request.deadline_exceeded",
+        "resource.not_found",
+        "resource.conflict",
+        "policy.denied",
+        "approval.expired",
+        "tool.failed",
+        "tool.unknown_outcome",
+        "provider.unreachable",
+        "provider.auth_required",
+        "internal.error"
+      ],
+      "title": "ErrorCode",
+      "type": "string"
+    },
+    "ErrorEnvelope": {
+      "additionalProperties": false,
+      "description": "Provider-neutral error details used by every transport adapter.",
+      "properties": {
+        "cancelled": {
+          "title": "Cancelled",
+          "type": "boolean"
+        },
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "details": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Details",
+          "type": "object"
+        },
+        "retryAfterMs": {
+          "anyOf": [
+            {
+              "maximum": 86400000,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Retryafterms"
+        },
+        "retryable": {
+          "title": "Retryable",
+          "type": "boolean"
+        },
+        "traceId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TraceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "userVisibleMessage": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Uservisiblemessage",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "retryable",
+        "cancelled",
+        "userVisibleMessage"
+      ],
+      "title": "ErrorEnvelope",
+      "type": "object"
+    },
+    "EventEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "eventId": {
+          "$ref": "#/$defs/EventId"
+        },
+        "parentRunId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "payload": {
+          "$ref": "#/$defs/EventPayload"
+        },
+        "protocolVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "rootRunId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "runId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "schemaVersion": {
+          "$ref": "#/$defs/SchemaVersion"
+        },
+        "sequence": {
+          "minimum": 1,
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "sessionId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "timestamp": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "traceId": {
+          "$ref": "#/$defs/TraceId"
+        },
+        "turnId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "type": {
+          "$ref": "#/$defs/EventType"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "schemaVersion",
+        "eventId",
+        "sequence",
+        "timestamp",
+        "traceId",
+        "workspaceId",
+        "type",
+        "payload"
+      ],
+      "title": "EventEnvelope",
+      "type": "object"
+    },
+    "EventId": {
+      "maxLength": 128,
+      "minLength": 5,
+      "pattern": "^evt_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "EventNotification": {
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0",
+          "title": "Jsonrpc",
+          "type": "string"
+        },
+        "method": {
+          "const": "event",
+          "title": "Method",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/$defs/EventEnvelope"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ],
+      "title": "EventNotification",
+      "type": "object"
+    },
+    "EventPayload": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TurnStartedPayload"
+        },
+        {
+          "$ref": "#/$defs/PhaseChangedPayload"
+        },
+        {
+          "$ref": "#/$defs/ReasoningSummaryPayload"
+        },
+        {
+          "$ref": "#/$defs/AssistantDeltaPayload"
+        },
+        {
+          "$ref": "#/$defs/AssistantCompletedPayload"
+        },
+        {
+          "$ref": "#/$defs/ToolQueuedPayload"
+        },
+        {
+          "$ref": "#/$defs/ToolStartedPayload"
+        },
+        {
+          "$ref": "#/$defs/ToolProgressPayload"
+        },
+        {
+          "$ref": "#/$defs/ToolCompletedPayload"
+        },
+        {
+          "$ref": "#/$defs/ToolFailedPayload"
+        },
+        {
+          "$ref": "#/$defs/ApprovalRequiredPayload"
+        },
+        {
+          "$ref": "#/$defs/ApprovalResolvedPayload"
+        },
+        {
+          "$ref": "#/$defs/ApprovalExpiredPayload"
+        },
+        {
+          "$ref": "#/$defs/ReferencesUpdatedPayload"
+        },
+        {
+          "$ref": "#/$defs/ArtifactCreatedPayload"
+        },
+        {
+          "$ref": "#/$defs/UsageUpdatedPayload"
+        },
+        {
+          "$ref": "#/$defs/ContextCompactedPayload"
+        },
+        {
+          "$ref": "#/$defs/SessionUpdatedPayload"
+        },
+        {
+          "$ref": "#/$defs/SubagentQueuedPayload"
+        },
+        {
+          "$ref": "#/$defs/SubagentStartedPayload"
+        },
+        {
+          "$ref": "#/$defs/SubagentProgressPayload"
+        },
+        {
+          "$ref": "#/$defs/SubagentMessageReceivedPayload"
+        },
+        {
+          "$ref": "#/$defs/SubagentWaitingPayload"
+        },
+        {
+          "$ref": "#/$defs/SubagentResultAvailablePayload"
+        },
+        {
+          "$ref": "#/$defs/SubagentCompletedPayload"
+        },
+        {
+          "$ref": "#/$defs/SubagentFailedPayload"
+        },
+        {
+          "$ref": "#/$defs/SubagentCancelRequestedPayload"
+        },
+        {
+          "$ref": "#/$defs/SubagentCancelledPayload"
+        },
+        {
+          "$ref": "#/$defs/SubagentInterruptedPayload"
+        },
+        {
+          "$ref": "#/$defs/SubagentOrphanedPayload"
+        },
+        {
+          "$ref": "#/$defs/SubagentRecoveredPayload"
+        },
+        {
+          "$ref": "#/$defs/TurnCompletedPayload"
+        },
+        {
+          "$ref": "#/$defs/TurnCancelledPayload"
+        },
+        {
+          "$ref": "#/$defs/TurnFailedPayload"
+        },
+        {
+          "$ref": "#/$defs/RuntimeWarningPayload"
+        },
+        {
+          "$ref": "#/$defs/IndexStartedPayload"
+        },
+        {
+          "$ref": "#/$defs/IndexProgressPayload"
+        },
+        {
+          "$ref": "#/$defs/IndexCompletedPayload"
+        }
+      ]
+    },
+    "EventType": {
+      "enum": [
+        "turn.started",
+        "phase.changed",
+        "reasoning.summary",
+        "assistant.delta",
+        "assistant.completed",
+        "tool.queued",
+        "tool.started",
+        "tool.progress",
+        "tool.completed",
+        "tool.failed",
+        "approval.required",
+        "approval.resolved",
+        "approval.expired",
+        "references.updated",
+        "artifact.created",
+        "usage.updated",
+        "context.compacted",
+        "session.updated",
+        "subagent.queued",
+        "subagent.started",
+        "subagent.progress",
+        "subagent.message_received",
+        "subagent.waiting",
+        "subagent.result_available",
+        "subagent.completed",
+        "subagent.failed",
+        "subagent.cancel_requested",
+        "subagent.cancelled",
+        "subagent.interrupted",
+        "subagent.orphaned",
+        "subagent.recovered",
+        "turn.completed",
+        "turn.cancelled",
+        "turn.failed",
+        "runtime.warning",
+        "index.started",
+        "index.progress",
+        "index.completed"
+      ],
+      "title": "EventType",
+      "type": "string"
+    },
+    "EventsReplayParams": {
+      "additionalProperties": false,
+      "properties": {
+        "afterSequence": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Aftersequence",
+          "type": "integer"
+        },
+        "limit": {
+          "default": 1000,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "runId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "sessionId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "types": {
+          "items": {
+            "$ref": "#/$defs/EventType"
+          },
+          "maxItems": 128,
+          "title": "Types",
+          "type": "array"
+        }
+      },
+      "title": "EventsReplayParams",
+      "type": "object"
+    },
+    "EventsReplayResult": {
+      "additionalProperties": false,
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/$defs/EventEnvelope"
+          },
+          "maxItems": 10000,
+          "title": "Events",
+          "type": "array"
+        },
+        "hasMore": {
+          "title": "Hasmore",
+          "type": "boolean"
+        },
+        "lastSequence": {
+          "minimum": 0,
+          "title": "Lastsequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "events",
+        "lastSequence",
+        "hasMore"
+      ],
+      "title": "EventsReplayResult",
+      "type": "object"
+    },
+    "FileContentBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "excerpt": {
+          "anyOf": [
+            {
+              "maxLength": 262144,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Excerpt"
+        },
+        "file": {
+          "$ref": "#/$defs/FileRef"
+        },
+        "truncated": {
+          "default": false,
+          "title": "Truncated",
+          "type": "boolean"
+        },
+        "type": {
+          "const": "file",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "file"
+      ],
+      "title": "FileContentBlock",
+      "type": "object"
+    },
+    "FileRef": {
+      "additionalProperties": false,
+      "properties": {
+        "blockId": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Blockid"
+        },
+        "contentHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "heading": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Heading"
+        },
+        "lineEnd": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lineend"
+        },
+        "lineStart": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Linestart"
+        },
+        "path": {
+          "$ref": "#/$defs/RelativeVaultPath"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "path"
+      ],
+      "title": "FileRef",
+      "type": "object"
+    },
+    "Finding": {
+      "additionalProperties": false,
+      "properties": {
+        "confidence": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Confidence"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          },
+          "maxItems": 256,
+          "title": "Evidence",
+          "type": "array"
+        },
+        "summary": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "summary"
+      ],
+      "title": "Finding",
+      "type": "object"
+    },
+    "Freshness": {
+      "enum": [
+        "fresh",
+        "stale",
+        "partial",
+        "unknown"
+      ],
+      "title": "Freshness",
+      "type": "string"
+    },
+    "ImageContentBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "altText": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Alttext"
+        },
+        "artifact": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "type": {
+          "const": "image",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "artifact"
+      ],
+      "title": "ImageContentBlock",
+      "type": "object"
+    },
+    "IndexCompletedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "chunkCount": {
+          "minimum": 0,
+          "title": "Chunkcount",
+          "type": "integer"
+        },
+        "documentCount": {
+          "minimum": 0,
+          "title": "Documentcount",
+          "type": "integer"
+        },
+        "durationMs": {
+          "minimum": 0,
+          "title": "Durationms",
+          "type": "integer"
+        },
+        "failedDocumentCount": {
+          "minimum": 0,
+          "title": "Faileddocumentcount",
+          "type": "integer"
+        },
+        "generation": {
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "partial": {
+          "title": "Partial",
+          "type": "boolean"
+        },
+        "workspaceRevision": {
+          "minimum": 0,
+          "title": "Workspacerevision",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "generation",
+        "workspaceRevision",
+        "documentCount",
+        "chunkCount",
+        "failedDocumentCount",
+        "partial",
+        "durationMs"
+      ],
+      "title": "IndexCompletedPayload",
+      "type": "object"
+    },
+    "IndexProgressPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "completedDocuments": {
+          "minimum": 0,
+          "title": "Completeddocuments",
+          "type": "integer"
+        },
+        "currentPath": {
+          "anyOf": [
+            {
+              "maxLength": 1024,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currentpath"
+        },
+        "failedDocuments": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Faileddocuments",
+          "type": "integer"
+        },
+        "generation": {
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "totalDocuments": {
+          "minimum": 0,
+          "title": "Totaldocuments",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "generation",
+        "completedDocuments",
+        "totalDocuments"
+      ],
+      "title": "IndexProgressPayload",
+      "type": "object"
+    },
+    "IndexStartedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "generation": {
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        },
+        "reason": {
+          "enum": [
+            "initial",
+            "manual",
+            "change",
+            "overflow",
+            "corruption",
+            "model_changed"
+          ],
+          "title": "Reason",
+          "type": "string"
+        },
+        "totalDocuments": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Totaldocuments"
+        }
+      },
+      "required": [
+        "generation",
+        "reason"
+      ],
+      "title": "IndexStartedPayload",
+      "type": "object"
+    },
+    "IndexStatusSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "documentCount": {
+          "minimum": 0,
+          "title": "Documentcount",
+          "type": "integer"
+        },
+        "generation": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Generation"
+        },
+        "lastError": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorEnvelope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "pendingChanges": {
+          "minimum": 0,
+          "title": "Pendingchanges",
+          "type": "integer"
+        },
+        "state": {
+          "enum": [
+            "not_started",
+            "indexing",
+            "ready",
+            "stale",
+            "failed"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "workspaceRevision": {
+          "minimum": 0,
+          "title": "Workspacerevision",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "workspaceRevision",
+        "state",
+        "documentCount",
+        "pendingChanges"
+      ],
+      "title": "IndexStatusSnapshot",
+      "type": "object"
+    },
+    "InitializeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/CapabilitySet"
+        },
+        "clientVersion": {
+          "$ref": "#/$defs/SemanticVersion"
+        },
+        "protocolVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "requiredCapabilities": {
+          "items": {
+            "$ref": "#/$defs/CapabilityName"
+          },
+          "maxItems": 32,
+          "title": "Requiredcapabilities",
+          "type": "array"
+        },
+        "schemaHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "supportedProtocolRange": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProtocolRange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "clientVersion",
+        "workspaceId",
+        "capabilities"
+      ],
+      "title": "InitializeParams",
+      "type": "object"
+    },
+    "InitializeResult": {
+      "additionalProperties": false,
+      "properties": {
+        "buildCommit": {
+          "maxLength": 64,
+          "minLength": 7,
+          "pattern": "^[0-9a-f]{7,64}$",
+          "title": "Buildcommit",
+          "type": "string"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/CapabilitySet"
+        },
+        "coreVersion": {
+          "$ref": "#/$defs/SemanticVersion"
+        },
+        "hostPid": {
+          "minimum": 1,
+          "title": "Hostpid",
+          "type": "integer"
+        },
+        "protocolVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "runtimeArch": {
+          "$ref": "#/$defs/RuntimeArch"
+        },
+        "runtimeVersion": {
+          "$ref": "#/$defs/SemanticVersion"
+        },
+        "schemaHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "supportedProtocolRange": {
+          "$ref": "#/$defs/ProtocolRange"
+        },
+        "transport": {
+          "$ref": "#/$defs/TransportKind"
+        },
+        "workerPid": {
+          "minimum": 1,
+          "title": "Workerpid",
+          "type": "integer"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        },
+        "workspaceInstanceId": {
+          "$ref": "#/$defs/WorkspaceInstanceId"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "supportedProtocolRange",
+        "runtimeVersion",
+        "coreVersion",
+        "schemaHash",
+        "workspaceId",
+        "workspaceInstanceId",
+        "hostPid",
+        "workerPid",
+        "transport",
+        "runtimeArch",
+        "capabilities",
+        "buildCommit"
+      ],
+      "title": "InitializeResult",
+      "type": "object"
+    },
+    "InvocationId": {
+      "maxLength": 128,
+      "minLength": 5,
+      "pattern": "^inv_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "JsonRpcError": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/JsonRpcErrorCode"
+        },
+        "data": {
+          "$ref": "#/$defs/ErrorEnvelope"
+        },
+        "message": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "data"
+      ],
+      "title": "JsonRpcError",
+      "type": "object"
+    },
+    "JsonRpcErrorCode": {
+      "enum": [
+        -32700,
+        -32600,
+        -32601,
+        -32602,
+        -32603,
+        -32000
+      ],
+      "title": "JsonRpcErrorCode",
+      "type": "integer"
+    },
+    "JsonRpcErrorResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/JsonRpcError"
+        },
+        "id": {
+          "$ref": "#/$defs/RpcResponseId"
+        },
+        "jsonrpc": {
+          "const": "2.0",
+          "title": "Jsonrpc",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "error"
+      ],
+      "title": "JsonRpcErrorResponse",
+      "type": "object"
+    },
+    "JsonRpcNotification": {
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0",
+          "title": "Jsonrpc",
+          "type": "string"
+        },
+        "method": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[A-Za-z][A-Za-z0-9_.-]*(?:/[A-Za-z][A-Za-z0-9_.-]*)*$",
+          "title": "Method",
+          "type": "string"
+        },
+        "params": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Params",
+          "type": "object"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method"
+      ],
+      "title": "JsonRpcNotification",
+      "type": "object"
+    },
+    "JsonRpcRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/RpcId"
+        },
+        "jsonrpc": {
+          "const": "2.0",
+          "title": "Jsonrpc",
+          "type": "string"
+        },
+        "method": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[A-Za-z][A-Za-z0-9_.-]*(?:/[A-Za-z][A-Za-z0-9_.-]*)*$",
+          "title": "Method",
+          "type": "string"
+        },
+        "params": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Params",
+          "type": "object"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method"
+      ],
+      "title": "JsonRpcRequest",
+      "type": "object"
+    },
+    "JsonRpcSuccessResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/RpcResponseId"
+        },
+        "jsonrpc": {
+          "const": "2.0",
+          "title": "Jsonrpc",
+          "type": "string"
+        },
+        "result": {
+          "$ref": "#/$defs/JsonValue"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "result"
+      ],
+      "title": "JsonRpcSuccessResponse",
+      "type": "object"
+    },
+    "JsonValue": {},
+    "McpSourceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "contentHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "resourceUri": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Resourceuri",
+          "type": "string"
+        },
+        "serverId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "title": "Serverid",
+          "type": "string"
+        },
+        "type": {
+          "const": "mcp",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "serverId",
+        "resourceUri"
+      ],
+      "title": "McpSourceRef",
+      "type": "object"
+    },
+    "MemorySourceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "memoryId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^mem_[A-Za-z0-9][A-Za-z0-9_-]*$",
+          "title": "Memoryid",
+          "type": "string"
+        },
+        "scope": {
+          "enum": [
+            "session",
+            "workspace",
+            "profile"
+          ],
+          "title": "Scope",
+          "type": "string"
+        },
+        "type": {
+          "const": "memory",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "memoryId",
+        "scope"
+      ],
+      "title": "MemorySourceRef",
+      "type": "object"
+    },
+    "MessageId": {
+      "maxLength": 128,
+      "minLength": 5,
+      "pattern": "^msg_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "ModelDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "available": {
+          "title": "Available",
+          "type": "boolean"
+        },
+        "displayName": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Displayname",
+          "type": "string"
+        },
+        "local": {
+          "title": "Local",
+          "type": "boolean"
+        },
+        "maxContextTokens": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxcontexttokens"
+        },
+        "model": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Model",
+          "type": "string"
+        },
+        "provider": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Provider",
+          "type": "string"
+        },
+        "supportsStreaming": {
+          "title": "Supportsstreaming",
+          "type": "boolean"
+        },
+        "supportsStructuredOutput": {
+          "title": "Supportsstructuredoutput",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "provider",
+        "model",
+        "displayName",
+        "local",
+        "supportsStreaming",
+        "supportsStructuredOutput",
+        "available"
+      ],
+      "title": "ModelDescriptor",
+      "type": "object"
+    },
+    "ModelsHealthParams": {
+      "additionalProperties": false,
+      "properties": {
+        "deadline": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Rfc3339DateTime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "model": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "provider": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Provider",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider"
+      ],
+      "title": "ModelsHealthParams",
+      "type": "object"
+    },
+    "ModelsHealthResult": {
+      "additionalProperties": false,
+      "properties": {
+        "checkedAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorEnvelope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "latencyMs": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Latencyms"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "provider": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Provider",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "healthy",
+            "degraded",
+            "unreachable",
+            "auth_required",
+            "unsupported"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "status",
+        "checkedAt"
+      ],
+      "title": "ModelsHealthResult",
+      "type": "object"
+    },
+    "ModelsListParams": {
+      "additionalProperties": false,
+      "properties": {
+        "includeUnavailable": {
+          "default": false,
+          "title": "Includeunavailable",
+          "type": "boolean"
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provider"
+        }
+      },
+      "title": "ModelsListParams",
+      "type": "object"
+    },
+    "ModelsListResult": {
+      "additionalProperties": false,
+      "properties": {
+        "configRevision": {
+          "minimum": 0,
+          "title": "Configrevision",
+          "type": "integer"
+        },
+        "models": {
+          "items": {
+            "$ref": "#/$defs/ModelDescriptor"
+          },
+          "maxItems": 4096,
+          "title": "Models",
+          "type": "array"
+        }
+      },
+      "required": [
+        "models",
+        "configRevision"
+      ],
+      "title": "ModelsListResult",
+      "type": "object"
+    },
+    "NonEmptyText": {
+      "maxLength": 1048576,
+      "minLength": 1,
+      "type": "string"
+    },
+    "PermissionMode": {
+      "enum": [
+        "read-only",
+        "normal",
+        "trusted-workspace",
+        "plan",
+        "bypass"
+      ],
+      "title": "PermissionMode",
+      "type": "string"
+    },
+    "PhaseChangedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "phase": {
+          "$ref": "#/$defs/RunPhase"
+        },
+        "previousPhase": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunPhase"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        }
+      },
+      "required": [
+        "phase"
+      ],
+      "title": "PhaseChangedPayload",
+      "type": "object"
+    },
+    "ProposedAction": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactId": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "description": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "targetFiles": {
+          "items": {
+            "$ref": "#/$defs/FileRef"
+          },
+          "maxItems": 256,
+          "title": "Targetfiles",
+          "type": "array"
+        }
+      },
+      "required": [
+        "description",
+        "artifactId"
+      ],
+      "title": "ProposedAction",
+      "type": "object"
+    },
+    "ProtocolRange": {
+      "additionalProperties": false,
+      "properties": {
+        "maximum": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "minimum": {
+          "$ref": "#/$defs/ProtocolVersion"
+        }
+      },
+      "required": [
+        "minimum",
+        "maximum"
+      ],
+      "title": "ProtocolRange",
+      "type": "object"
+    },
+    "ProtocolVersion": {
+      "maxLength": 15,
+      "minLength": 3,
+      "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "ReasoningEffort": {
+      "enum": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "title": "ReasoningEffort",
+      "type": "string"
+    },
+    "ReasoningSummaryPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "partial": {
+          "default": false,
+          "title": "Partial",
+          "type": "boolean"
+        },
+        "summary": {
+          "maxLength": 65536,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "summary"
+      ],
+      "title": "ReasoningSummaryPayload",
+      "type": "object"
+    },
+    "ReferencesUpdatedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "references": {
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          },
+          "maxItems": 1024,
+          "title": "References",
+          "type": "array"
+        },
+        "replace": {
+          "default": false,
+          "title": "Replace",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "references"
+      ],
+      "title": "ReferencesUpdatedPayload",
+      "type": "object"
+    },
+    "RelativeVaultPath": {
+      "maxLength": 1024,
+      "minLength": 1,
+      "type": "string"
+    },
+    "RequestId": {
+      "maxLength": 128,
+      "minLength": 5,
+      "pattern": "^req_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "Rfc3339DateTime": {
+      "maxLength": 40,
+      "minLength": 20,
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+      "type": "string"
+    },
+    "RpcId": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "$ref": "#/$defs/RpcStringId"
+        }
+      ]
+    },
+    "RpcResponseId": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RpcId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "RpcStringId": {
+      "maxLength": 128,
+      "minLength": 1,
+      "type": "string"
+    },
+    "RunConfigSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "budgets": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BudgetSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "enabledMcpServers": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Enabledmcpservers",
+          "type": "array"
+        },
+        "enabledSkills": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Enabledskills",
+          "type": "array"
+        },
+        "model": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Model",
+          "type": "string"
+        },
+        "permissionMode": {
+          "$ref": "#/$defs/PermissionMode",
+          "default": "normal"
+        },
+        "provider": {
+          "default": "codex",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Provider",
+          "type": "string"
+        },
+        "reasoningEffort": {
+          "$ref": "#/$defs/ReasoningEffort",
+          "default": "medium"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "title": "RunConfigSnapshot",
+      "type": "object"
+    },
+    "RunId": {
+      "maxLength": 128,
+      "minLength": 5,
+      "pattern": "^run_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "RunPhase": {
+      "enum": [
+        "created",
+        "loading_context",
+        "selecting_memory",
+        "planning",
+        "validating_calls",
+        "checking_policy",
+        "awaiting_approval",
+        "executing_tools",
+        "recording_results",
+        "waiting_children",
+        "composing",
+        "persisting",
+        "cancelling",
+        "terminal"
+      ],
+      "title": "RunPhase",
+      "type": "string"
+    },
+    "RunSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "agentName": {
+          "default": "root",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Agentname",
+          "type": "string"
+        },
+        "completedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Rfc3339DateTime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "depth": {
+          "default": 0,
+          "maximum": 32,
+          "minimum": 0,
+          "title": "Depth",
+          "type": "integer"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorEnvelope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "lastSequence": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Lastsequence",
+          "type": "integer"
+        },
+        "parentRunId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "phase": {
+          "$ref": "#/$defs/RunPhase"
+        },
+        "rootRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "startedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Rfc3339DateTime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "status": {
+          "$ref": "#/$defs/RunStatus"
+        },
+        "terminationReason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TerminationReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "turnId": {
+          "$ref": "#/$defs/TurnId"
+        },
+        "usage": {
+          "$ref": "#/$defs/UsageSnapshot"
+        }
+      },
+      "required": [
+        "runId",
+        "rootRunId",
+        "sessionId",
+        "turnId",
+        "status",
+        "phase",
+        "usage"
+      ],
+      "title": "RunSnapshot",
+      "type": "object"
+    },
+    "RunStatus": {
+      "enum": [
+        "created",
+        "queued",
+        "running",
+        "awaiting_approval",
+        "waiting_children",
+        "completed",
+        "cancel_requested",
+        "cancelled",
+        "failed",
+        "interrupted",
+        "orphaned"
+      ],
+      "title": "RunStatus",
+      "type": "string"
+    },
+    "RuntimeArch": {
+      "enum": [
+        "win-x64",
+        "win-arm64"
+      ],
+      "title": "RuntimeArch",
+      "type": "string"
+    },
+    "RuntimePingParams": {
+      "additionalProperties": false,
+      "properties": {
+        "nonce": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "required": [
+        "nonce"
+      ],
+      "title": "RuntimePingParams",
+      "type": "object"
+    },
+    "RuntimePingResult": {
+      "additionalProperties": false,
+      "properties": {
+        "nonce": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "timestamp": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "workerPid": {
+          "minimum": 1,
+          "title": "Workerpid",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "nonce",
+        "timestamp",
+        "workerPid"
+      ],
+      "title": "RuntimePingResult",
+      "type": "object"
+    },
+    "RuntimeState": {
+      "enum": [
+        "cold",
+        "starting",
+        "indexing",
+        "ready",
+        "busy",
+        "idle",
+        "degraded",
+        "recovering",
+        "stopping"
+      ],
+      "title": "RuntimeState",
+      "type": "string"
+    },
+    "RuntimeStatusParams": {
+      "additionalProperties": false,
+      "properties": {},
+      "title": "RuntimeStatusParams",
+      "type": "object"
+    },
+    "RuntimeStatusResult": {
+      "additionalProperties": false,
+      "properties": {
+        "activeRunIds": {
+          "items": {
+            "$ref": "#/$defs/RunId"
+          },
+          "maxItems": 1024,
+          "title": "Activerunids",
+          "type": "array"
+        },
+        "coreVersion": {
+          "$ref": "#/$defs/SemanticVersion"
+        },
+        "databaseIdentity": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "hostPid": {
+          "minimum": 1,
+          "title": "Hostpid",
+          "type": "integer"
+        },
+        "index": {
+          "$ref": "#/$defs/IndexStatusSnapshot"
+        },
+        "protocolVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "runtimeVersion": {
+          "$ref": "#/$defs/SemanticVersion"
+        },
+        "schemaHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "state": {
+          "$ref": "#/$defs/RuntimeState"
+        },
+        "warnings": {
+          "items": {
+            "$ref": "#/$defs/ErrorEnvelope"
+          },
+          "maxItems": 256,
+          "title": "Warnings",
+          "type": "array"
+        },
+        "workerPid": {
+          "minimum": 1,
+          "title": "Workerpid",
+          "type": "integer"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        },
+        "workspaceInstanceId": {
+          "$ref": "#/$defs/WorkspaceInstanceId"
+        }
+      },
+      "required": [
+        "state",
+        "workspaceId",
+        "workspaceInstanceId",
+        "hostPid",
+        "workerPid",
+        "runtimeVersion",
+        "coreVersion",
+        "protocolVersion",
+        "schemaHash",
+        "databaseIdentity",
+        "index"
+      ],
+      "title": "RuntimeStatusResult",
+      "type": "object"
+    },
+    "RuntimeWarningPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_.-]*$",
+          "title": "Code",
+          "type": "string"
+        },
+        "disabledCapabilities": {
+          "items": {
+            "$ref": "#/$defs/CapabilityName"
+          },
+          "maxItems": 32,
+          "title": "Disabledcapabilities",
+          "type": "array"
+        },
+        "message": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "recommendedAction": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Recommendedaction"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "title": "RuntimeWarningPayload",
+      "type": "object"
+    },
+    "SchemaVersion": {
+      "maxLength": 16,
+      "minLength": 1,
+      "pattern": "^(?:0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "SemanticVersion": {
+      "maxLength": 64,
+      "minLength": 5,
+      "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$",
+      "type": "string"
+    },
+    "SessionCompactParams": {
+      "additionalProperties": false,
+      "properties": {
+        "force": {
+          "default": false,
+          "title": "Force",
+          "type": "boolean"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "throughTurnId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "title": "SessionCompactParams",
+      "type": "object"
+    },
+    "SessionCompactResult": {
+      "additionalProperties": false,
+      "properties": {
+        "boundaryArtifact": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "compacted": {
+          "title": "Compacted",
+          "type": "boolean"
+        },
+        "replacedTurnCount": {
+          "minimum": 0,
+          "title": "Replacedturncount",
+          "type": "integer"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "compacted",
+        "replacedTurnCount"
+      ],
+      "title": "SessionCompactResult",
+      "type": "object"
+    },
+    "SessionCreateParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        }
+      },
+      "required": [
+        "clientRequestId"
+      ],
+      "title": "SessionCreateParams",
+      "type": "object"
+    },
+    "SessionCreateResult": {
+      "additionalProperties": false,
+      "properties": {
+        "created": {
+          "title": "Created",
+          "type": "boolean"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionSummary"
+        }
+      },
+      "required": [
+        "session",
+        "created"
+      ],
+      "title": "SessionCreateResult",
+      "type": "object"
+    },
+    "SessionDeleteParams": {
+      "additionalProperties": false,
+      "properties": {
+        "hardDelete": {
+          "default": false,
+          "title": "Harddelete",
+          "type": "boolean"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "title": "SessionDeleteParams",
+      "type": "object"
+    },
+    "SessionDeleteResult": {
+      "additionalProperties": false,
+      "properties": {
+        "activeRunsCancelRequested": {
+          "items": {
+            "$ref": "#/$defs/RunId"
+          },
+          "maxItems": 1024,
+          "title": "Activerunscancelrequested",
+          "type": "array"
+        },
+        "deleted": {
+          "title": "Deleted",
+          "type": "boolean"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "deleted"
+      ],
+      "title": "SessionDeleteResult",
+      "type": "object"
+    },
+    "SessionDetail": {
+      "additionalProperties": false,
+      "properties": {
+        "summary": {
+          "$ref": "#/$defs/SessionSummary"
+        },
+        "turns": {
+          "items": {
+            "$ref": "#/$defs/TurnSnapshot"
+          },
+          "maxItems": 10000,
+          "title": "Turns",
+          "type": "array"
+        }
+      },
+      "required": [
+        "summary"
+      ],
+      "title": "SessionDetail",
+      "type": "object"
+    },
+    "SessionForkParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "forkRunId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "forkTurnId": {
+          "$ref": "#/$defs/TurnId"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        }
+      },
+      "required": [
+        "sessionId",
+        "forkTurnId",
+        "clientRequestId"
+      ],
+      "title": "SessionForkParams",
+      "type": "object"
+    },
+    "SessionForkResult": {
+      "additionalProperties": false,
+      "properties": {
+        "forkTurnId": {
+          "$ref": "#/$defs/TurnId"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionSummary"
+        },
+        "sourceSessionId": {
+          "$ref": "#/$defs/SessionId"
+        }
+      },
+      "required": [
+        "session",
+        "sourceSessionId",
+        "forkTurnId"
+      ],
+      "title": "SessionForkResult",
+      "type": "object"
+    },
+    "SessionGetParams": {
+      "additionalProperties": false,
+      "properties": {
+        "includeTurns": {
+          "default": true,
+          "title": "Includeturns",
+          "type": "boolean"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "title": "SessionGetParams",
+      "type": "object"
+    },
+    "SessionGetResult": {
+      "additionalProperties": false,
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionDetail"
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "title": "SessionGetResult",
+      "type": "object"
+    },
+    "SessionId": {
+      "maxLength": 128,
+      "minLength": 5,
+      "pattern": "^ses_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "SessionListParams": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "anyOf": [
+            {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cursor"
+        },
+        "includeDeleted": {
+          "default": false,
+          "title": "Includedeleted",
+          "type": "boolean"
+        },
+        "limit": {
+          "default": 50,
+          "maximum": 500,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        }
+      },
+      "title": "SessionListParams",
+      "type": "object"
+    },
+    "SessionListResult": {
+      "additionalProperties": false,
+      "properties": {
+        "nextCursor": {
+          "anyOf": [
+            {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Nextcursor"
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/SessionSummary"
+          },
+          "maxItems": 500,
+          "title": "Sessions",
+          "type": "array"
+        }
+      },
+      "required": [
+        "sessions"
+      ],
+      "title": "SessionListResult",
+      "type": "object"
+    },
+    "SessionRenameParams": {
+      "additionalProperties": false,
+      "properties": {
+        "expectedUpdatedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Rfc3339DateTime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "title": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "title"
+      ],
+      "title": "SessionRenameParams",
+      "type": "object"
+    },
+    "SessionRenameResult": {
+      "additionalProperties": false,
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionSummary"
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "title": "SessionRenameResult",
+      "type": "object"
+    },
+    "SessionSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "activeRunId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "createdAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "deleted": {
+          "default": false,
+          "title": "Deleted",
+          "type": "boolean"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "title": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "turnCount": {
+          "minimum": 0,
+          "title": "Turncount",
+          "type": "integer"
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "workspaceId",
+        "title",
+        "createdAt",
+        "updatedAt",
+        "turnCount"
+      ],
+      "title": "SessionSummary",
+      "type": "object"
+    },
+    "SessionUpdatedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "changedFields": {
+          "items": {
+            "enum": [
+              "title",
+              "activeRunId",
+              "turnCount",
+              "updatedAt",
+              "deleted",
+              "compaction"
+            ],
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Changedfields",
+          "type": "array"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionSummary"
+        }
+      },
+      "required": [
+        "session",
+        "changedFields"
+      ],
+      "title": "SessionUpdatedPayload",
+      "type": "object"
+    },
+    "Sha256Digest": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "ShutdownParams": {
+      "additionalProperties": false,
+      "properties": {
+        "gracePeriodMs": {
+          "default": 30000,
+          "maximum": 300000,
+          "minimum": 0,
+          "title": "Graceperiodms",
+          "type": "integer"
+        },
+        "reason": {
+          "enum": [
+            "user",
+            "plugin_disabled",
+            "upgrade",
+            "system_shutdown",
+            "idle_timeout"
+          ],
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "title": "ShutdownParams",
+      "type": "object"
+    },
+    "ShutdownResult": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "title": "Accepted",
+          "type": "boolean"
+        },
+        "activeRunsCancelRequested": {
+          "items": {
+            "$ref": "#/$defs/RunId"
+          },
+          "maxItems": 10000,
+          "title": "Activerunscancelrequested",
+          "type": "array"
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "title": "ShutdownResult",
+      "type": "object"
+    },
+    "SideEffect": {
+      "additionalProperties": false,
+      "properties": {
+        "afterHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "beforeHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "confirmed": {
+          "title": "Confirmed",
+          "type": "boolean"
+        },
+        "kind": {
+          "enum": [
+            "file_created",
+            "file_modified",
+            "file_renamed",
+            "file_trashed",
+            "process",
+            "network"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "resource": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Resource",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "resource",
+        "confirmed"
+      ],
+      "title": "SideEffect",
+      "type": "object"
+    },
+    "SourceRef": {
+      "discriminator": {
+        "mapping": {
+          "artifact": "#/$defs/ArtifactSourceRef",
+          "mcp": "#/$defs/McpSourceRef",
+          "memory": "#/$defs/MemorySourceRef",
+          "vault": "#/$defs/VaultSourceRef",
+          "web": "#/$defs/WebSourceRef"
+        },
+        "propertyName": "type"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/VaultSourceRef"
+        },
+        {
+          "$ref": "#/$defs/WebSourceRef"
+        },
+        {
+          "$ref": "#/$defs/ArtifactSourceRef"
+        },
+        {
+          "$ref": "#/$defs/MemorySourceRef"
+        },
+        {
+          "$ref": "#/$defs/McpSourceRef"
+        }
+      ]
+    },
+    "SubagentCancelRequestedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "cascade": {
+          "title": "Cascade",
+          "type": "boolean"
+        },
+        "childRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "reason": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "childRunId",
+        "reason",
+        "cascade"
+      ],
+      "title": "SubagentCancelRequestedPayload",
+      "type": "object"
+    },
+    "SubagentCancelledPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "childRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "reason": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/UsageSnapshot"
+        }
+      },
+      "required": [
+        "childRunId",
+        "reason",
+        "usage"
+      ],
+      "title": "SubagentCancelledPayload",
+      "type": "object"
+    },
+    "SubagentCompletedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "result": {
+          "$ref": "#/$defs/SubagentResult"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "SubagentCompletedPayload",
+      "type": "object"
+    },
+    "SubagentFailedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "childRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "error": {
+          "$ref": "#/$defs/ErrorEnvelope"
+        },
+        "usage": {
+          "$ref": "#/$defs/UsageSnapshot"
+        }
+      },
+      "required": [
+        "childRunId",
+        "error",
+        "usage"
+      ],
+      "title": "SubagentFailedPayload",
+      "type": "object"
+    },
+    "SubagentInterruptedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "childRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "error": {
+          "$ref": "#/$defs/ErrorEnvelope"
+        },
+        "safeCheckpointAvailable": {
+          "title": "Safecheckpointavailable",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "childRunId",
+        "error",
+        "safeCheckpointAvailable"
+      ],
+      "title": "SubagentInterruptedPayload",
+      "type": "object"
+    },
+    "SubagentMessageReceivedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "childRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "content": {
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Content",
+          "type": "array"
+        },
+        "messageId": {
+          "$ref": "#/$defs/MessageId"
+        },
+        "mode": {
+          "enum": [
+            "append",
+            "steer"
+          ],
+          "title": "Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "childRunId",
+        "messageId",
+        "mode",
+        "content"
+      ],
+      "title": "SubagentMessageReceivedPayload",
+      "type": "object"
+    },
+    "SubagentOrphanedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "childRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "leaseExpiredAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        }
+      },
+      "required": [
+        "childRunId",
+        "leaseExpiredAt"
+      ],
+      "title": "SubagentOrphanedPayload",
+      "type": "object"
+    },
+    "SubagentProgressPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "childRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "completedUnits": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Completedunits"
+        },
+        "message": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/$defs/RunPhase"
+        },
+        "totalUnits": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Totalunits"
+        }
+      },
+      "required": [
+        "childRunId",
+        "phase",
+        "message"
+      ],
+      "title": "SubagentProgressPayload",
+      "type": "object"
+    },
+    "SubagentQueuedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "agentName": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Agentname",
+          "type": "string"
+        },
+        "childRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "depth": {
+          "maximum": 32,
+          "minimum": 1,
+          "title": "Depth",
+          "type": "integer"
+        },
+        "parentRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "task": {
+          "maxLength": 32768,
+          "minLength": 1,
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "childRunId",
+        "parentRunId",
+        "agentName",
+        "task",
+        "depth"
+      ],
+      "title": "SubagentQueuedPayload",
+      "type": "object"
+    },
+    "SubagentRecoveredPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "checkpointSequence": {
+          "minimum": 0,
+          "title": "Checkpointsequence",
+          "type": "integer"
+        },
+        "childRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "previousStatus": {
+          "$ref": "#/$defs/RunStatus"
+        }
+      },
+      "required": [
+        "childRunId",
+        "previousStatus",
+        "checkpointSequence"
+      ],
+      "title": "SubagentRecoveredPayload",
+      "type": "object"
+    },
+    "SubagentResult": {
+      "additionalProperties": false,
+      "properties": {
+        "artifacts": {
+          "items": {
+            "$ref": "#/$defs/ArtifactRef"
+          },
+          "maxItems": 256,
+          "title": "Artifacts",
+          "type": "array"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorEnvelope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/Finding"
+          },
+          "maxItems": 512,
+          "title": "Findings",
+          "type": "array"
+        },
+        "proposedActions": {
+          "items": {
+            "$ref": "#/$defs/ProposedAction"
+          },
+          "maxItems": 256,
+          "title": "Proposedactions",
+          "type": "array"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "status": {
+          "$ref": "#/$defs/RunStatus"
+        },
+        "summary": {
+          "maxLength": 16384,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "unresolvedQuestions": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Unresolvedquestions",
+          "type": "array"
+        },
+        "usage": {
+          "$ref": "#/$defs/UsageSnapshot"
+        }
+      },
+      "required": [
+        "runId",
+        "status",
+        "summary",
+        "usage"
+      ],
+      "title": "SubagentResult",
+      "type": "object"
+    },
+    "SubagentResultAvailablePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "childRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "resultArtifactId": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "summary": {
+          "maxLength": 16384,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "childRunId",
+        "resultArtifactId",
+        "summary"
+      ],
+      "title": "SubagentResultAvailablePayload",
+      "type": "object"
+    },
+    "SubagentStartedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "agentName": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Agentname",
+          "type": "string"
+        },
+        "budget": {
+          "$ref": "#/$defs/BudgetSnapshot"
+        },
+        "childRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "contextMode": {
+          "enum": [
+            "none",
+            "summary",
+            "selected",
+            "full"
+          ],
+          "title": "Contextmode",
+          "type": "string"
+        },
+        "parentRunId": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "childRunId",
+        "parentRunId",
+        "agentName",
+        "contextMode",
+        "budget"
+      ],
+      "title": "SubagentStartedPayload",
+      "type": "object"
+    },
+    "SubagentWaitingPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "childRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "reason": {
+          "enum": [
+            "tool",
+            "approval",
+            "children",
+            "mailbox",
+            "provider"
+          ],
+          "title": "Reason",
+          "type": "string"
+        },
+        "waitingOnIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Waitingonids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "childRunId",
+        "reason"
+      ],
+      "title": "SubagentWaitingPayload",
+      "type": "object"
+    },
+    "TerminationReason": {
+      "enum": [
+        "completed",
+        "cancelled_by_user",
+        "budget_exhausted",
+        "model_error",
+        "tool_error",
+        "approval_expired",
+        "runtime_interrupted",
+        "provider_unreachable"
+      ],
+      "title": "TerminationReason",
+      "type": "string"
+    },
+    "TextContentBlock": {
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "$ref": "#/$defs/ContentFormat",
+          "default": "markdown"
+        },
+        "references": {
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          },
+          "maxItems": 256,
+          "title": "References",
+          "type": "array"
+        },
+        "text": {
+          "$ref": "#/$defs/NonEmptyText"
+        },
+        "type": {
+          "const": "text",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "text"
+      ],
+      "title": "TextContentBlock",
+      "type": "object"
+    },
+    "ToolCallDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "agentLineage": {
+          "items": {
+            "$ref": "#/$defs/RunId"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Agentlineage",
+          "type": "array"
+        },
+        "argsHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "arguments": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Arguments",
+          "type": "object"
+        },
+        "idempotencyKey": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Idempotencykey",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 256,
+          "minLength": 3,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "risk": {
+          "$ref": "#/$defs/ToolRisk"
+        },
+        "toolCallId": {
+          "$ref": "#/$defs/ToolCallId"
+        },
+        "version": {
+          "maxLength": 32,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "toolCallId",
+        "name",
+        "version",
+        "arguments",
+        "argsHash",
+        "idempotencyKey",
+        "risk",
+        "agentLineage"
+      ],
+      "title": "ToolCallDescriptor",
+      "type": "object"
+    },
+    "ToolCallId": {
+      "maxLength": 128,
+      "minLength": 6,
+      "pattern": "^call_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "ToolCallStatus": {
+      "enum": [
+        "queued",
+        "running",
+        "succeeded",
+        "failed",
+        "denied",
+        "cancelled",
+        "timed_out",
+        "conflict",
+        "partial",
+        "unknown_outcome"
+      ],
+      "title": "ToolCallStatus",
+      "type": "string"
+    },
+    "ToolCompletedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "result": {
+          "$ref": "#/$defs/ToolResultDescriptor"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "ToolCompletedPayload",
+      "type": "object"
+    },
+    "ToolFailedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "result": {
+          "$ref": "#/$defs/ToolResultDescriptor"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "ToolFailedPayload",
+      "type": "object"
+    },
+    "ToolProgressPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "completedUnits": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Completedunits"
+        },
+        "message": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "toolCallId": {
+          "$ref": "#/$defs/ToolCallId"
+        },
+        "totalUnits": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Totalunits"
+        }
+      },
+      "required": [
+        "toolCallId",
+        "message"
+      ],
+      "title": "ToolProgressPayload",
+      "type": "object"
+    },
+    "ToolQueuedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "call": {
+          "$ref": "#/$defs/ToolCallDescriptor"
+        },
+        "ordinal": {
+          "minimum": 0,
+          "title": "Ordinal",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "call",
+        "ordinal"
+      ],
+      "title": "ToolQueuedPayload",
+      "type": "object"
+    },
+    "ToolResultDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactRefs": {
+          "items": {
+            "$ref": "#/$defs/ArtifactRef"
+          },
+          "maxItems": 256,
+          "title": "Artifactrefs",
+          "type": "array"
+        },
+        "data": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Data",
+          "type": "object"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorEnvelope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "retryable": {
+          "default": false,
+          "title": "Retryable",
+          "type": "boolean"
+        },
+        "sideEffects": {
+          "items": {
+            "$ref": "#/$defs/SideEffect"
+          },
+          "maxItems": 256,
+          "title": "Sideeffects",
+          "type": "array"
+        },
+        "sourceRefs": {
+          "items": {
+            "$ref": "#/$defs/SourceRef"
+          },
+          "maxItems": 512,
+          "title": "Sourcerefs",
+          "type": "array"
+        },
+        "status": {
+          "$ref": "#/$defs/ToolCallStatus"
+        },
+        "summary": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "toolCallId": {
+          "$ref": "#/$defs/ToolCallId"
+        }
+      },
+      "required": [
+        "toolCallId",
+        "status",
+        "summary"
+      ],
+      "title": "ToolResultDescriptor",
+      "type": "object"
+    },
+    "ToolRisk": {
+      "enum": [
+        "read",
+        "network",
+        "write",
+        "execute",
+        "destructive",
+        "external_path",
+        "secret_access"
+      ],
+      "title": "ToolRisk",
+      "type": "string"
+    },
+    "ToolStartedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt": {
+          "default": 1,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "call": {
+          "$ref": "#/$defs/ToolCallDescriptor"
+        }
+      },
+      "required": [
+        "call"
+      ],
+      "title": "ToolStartedPayload",
+      "type": "object"
+    },
+    "TraceId": {
+      "maxLength": 128,
+      "minLength": 7,
+      "pattern": "^trace_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "TransactionId": {
+      "maxLength": 128,
+      "minLength": 4,
+      "pattern": "^tx_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "TransportKind": {
+      "enum": [
+        "windows-named-pipe",
+        "loopback-http",
+        "loopback-websocket",
+        "stdio-dev"
+      ],
+      "title": "TransportKind",
+      "type": "string"
+    },
+    "TurnCancelParams": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "runId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "turnId": {
+          "$ref": "#/$defs/TurnId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "turnId",
+        "reason"
+      ],
+      "title": "TurnCancelParams",
+      "type": "object"
+    },
+    "TurnCancelResult": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "title": "Accepted",
+          "type": "boolean"
+        },
+        "alreadyTerminal": {
+          "title": "Alreadyterminal",
+          "type": "boolean"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "runId",
+        "accepted",
+        "alreadyTerminal"
+      ],
+      "title": "TurnCancelResult",
+      "type": "object"
+    },
+    "TurnCancelledPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "partialContent": {
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "maxItems": 256,
+          "title": "Partialcontent",
+          "type": "array"
+        },
+        "reason": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/UsageSnapshot"
+        }
+      },
+      "required": [
+        "reason",
+        "usage"
+      ],
+      "title": "TurnCancelledPayload",
+      "type": "object"
+    },
+    "TurnCompletedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "assistantContent": {
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Assistantcontent",
+          "type": "array"
+        },
+        "reason": {
+          "$ref": "#/$defs/TerminationReason"
+        },
+        "usage": {
+          "$ref": "#/$defs/UsageSnapshot"
+        }
+      },
+      "required": [
+        "reason",
+        "assistantContent",
+        "usage"
+      ],
+      "title": "TurnCompletedPayload",
+      "type": "object"
+    },
+    "TurnFailedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/ErrorEnvelope"
+        },
+        "partialContent": {
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "maxItems": 256,
+          "title": "Partialcontent",
+          "type": "array"
+        },
+        "usage": {
+          "$ref": "#/$defs/UsageSnapshot"
+        }
+      },
+      "required": [
+        "error",
+        "usage"
+      ],
+      "title": "TurnFailedPayload",
+      "type": "object"
+    },
+    "TurnGetParams": {
+      "additionalProperties": false,
+      "properties": {
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "turnId": {
+          "$ref": "#/$defs/TurnId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "turnId"
+      ],
+      "title": "TurnGetParams",
+      "type": "object"
+    },
+    "TurnGetResult": {
+      "additionalProperties": false,
+      "properties": {
+        "turn": {
+          "$ref": "#/$defs/TurnSnapshot"
+        }
+      },
+      "required": [
+        "turn"
+      ],
+      "title": "TurnGetResult",
+      "type": "object"
+    },
+    "TurnId": {
+      "maxLength": 128,
+      "minLength": 6,
+      "pattern": "^turn_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "TurnRetryParams": {
+      "additionalProperties": false,
+      "properties": {
+        "idempotencyKey": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Idempotencykey",
+          "type": "string"
+        },
+        "runConfig": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunConfigSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "sourceRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "turnId": {
+          "$ref": "#/$defs/TurnId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "turnId",
+        "sourceRunId",
+        "idempotencyKey"
+      ],
+      "title": "TurnRetryParams",
+      "type": "object"
+    },
+    "TurnRetryResult": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "title": "Accepted",
+          "type": "boolean"
+        },
+        "duplicate": {
+          "default": false,
+          "title": "Duplicate",
+          "type": "boolean"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "turnId": {
+          "$ref": "#/$defs/TurnId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "turnId",
+        "runId",
+        "accepted"
+      ],
+      "title": "TurnRetryResult",
+      "type": "object"
+    },
+    "TurnSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "assistantContent": {
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "maxItems": 256,
+          "title": "Assistantcontent",
+          "type": "array"
+        },
+        "createdAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "input": {
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Input",
+          "type": "array"
+        },
+        "runs": {
+          "items": {
+            "$ref": "#/$defs/RunSnapshot"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Runs",
+          "type": "array"
+        },
+        "selectedRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "status": {
+          "$ref": "#/$defs/TurnStatus"
+        },
+        "turnId": {
+          "$ref": "#/$defs/TurnId"
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        }
+      },
+      "required": [
+        "turnId",
+        "sessionId",
+        "status",
+        "input",
+        "runs",
+        "selectedRunId",
+        "createdAt",
+        "updatedAt"
+      ],
+      "title": "TurnSnapshot",
+      "type": "object"
+    },
+    "TurnStartParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientContext": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientContextSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "deadline": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Rfc3339DateTime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "idempotencyKey": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Idempotencykey",
+          "type": "string"
+        },
+        "input": {
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Input",
+          "type": "array"
+        },
+        "runConfig": {
+          "$ref": "#/$defs/RunConfigSnapshot"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "turnId": {
+          "$ref": "#/$defs/TurnId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "turnId",
+        "idempotencyKey",
+        "input",
+        "runConfig"
+      ],
+      "title": "TurnStartParams",
+      "type": "object"
+    },
+    "TurnStartResult": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "title": "Accepted",
+          "type": "boolean"
+        },
+        "duplicate": {
+          "default": false,
+          "title": "Duplicate",
+          "type": "boolean"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "turnId": {
+          "$ref": "#/$defs/TurnId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "turnId",
+        "runId",
+        "accepted"
+      ],
+      "title": "TurnStartResult",
+      "type": "object"
+    },
+    "TurnStartedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt": {
+          "default": 1,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "clientContext": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientContextSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "input": {
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Input",
+          "type": "array"
+        },
+        "runConfig": {
+          "$ref": "#/$defs/RunConfigSnapshot"
+        }
+      },
+      "required": [
+        "input",
+        "runConfig"
+      ],
+      "title": "TurnStartedPayload",
+      "type": "object"
+    },
+    "TurnStatus": {
+      "enum": [
+        "created",
+        "running",
+        "completed",
+        "cancelled",
+        "failed",
+        "interrupted"
+      ],
+      "title": "TurnStatus",
+      "type": "string"
+    },
+    "TurnSteerParams": {
+      "additionalProperties": false,
+      "properties": {
+        "input": {
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Input",
+          "type": "array"
+        },
+        "messageId": {
+          "$ref": "#/$defs/MessageId"
+        },
+        "mode": {
+          "default": "steer",
+          "enum": [
+            "append",
+            "steer"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "runId",
+        "messageId",
+        "input"
+      ],
+      "title": "TurnSteerParams",
+      "type": "object"
+    },
+    "TurnSteerResult": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "title": "Accepted",
+          "type": "boolean"
+        },
+        "applyAfterSequence": {
+          "minimum": 0,
+          "title": "Applyaftersequence",
+          "type": "integer"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "runId",
+        "accepted",
+        "applyAfterSequence"
+      ],
+      "title": "TurnSteerResult",
+      "type": "object"
+    },
+    "UsageSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "cachedInputTokens": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Cachedinputtokens",
+          "type": "integer"
+        },
+        "costMicros": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Costmicros"
+        },
+        "inputTokens": {
+          "minimum": 0,
+          "title": "Inputtokens",
+          "type": "integer"
+        },
+        "modelCalls": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Modelcalls",
+          "type": "integer"
+        },
+        "outputTokens": {
+          "minimum": 0,
+          "title": "Outputtokens",
+          "type": "integer"
+        },
+        "reasoningTokens": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Reasoningtokens",
+          "type": "integer"
+        },
+        "toolCalls": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Toolcalls",
+          "type": "integer"
+        },
+        "wallTimeMs": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Walltimems",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "inputTokens",
+        "outputTokens"
+      ],
+      "title": "UsageSnapshot",
+      "type": "object"
+    },
+    "UsageUpdatedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "scope": {
+          "enum": [
+            "model_call",
+            "run",
+            "turn",
+            "agent_tree"
+          ],
+          "title": "Scope",
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/UsageSnapshot"
+        }
+      },
+      "required": [
+        "usage",
+        "scope"
+      ],
+      "title": "UsageUpdatedPayload",
+      "type": "object"
+    },
+    "VaultSourceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/FileRef"
+        },
+        "freshness": {
+          "$ref": "#/$defs/Freshness",
+          "default": "unknown"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "type": {
+          "const": "vault",
+          "title": "Type",
+          "type": "string"
+        },
+        "workspaceRevision": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Workspacerevision"
+        }
+      },
+      "required": [
+        "type",
+        "file"
+      ],
+      "title": "VaultSourceRef",
+      "type": "object"
+    },
+    "WebSourceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "contentHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "retrievedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Rfc3339DateTime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "type": {
+          "const": "web",
+          "title": "Type",
+          "type": "string"
+        },
+        "url": {
+          "format": "uri",
+          "minLength": 1,
+          "title": "Url",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "url"
+      ],
+      "title": "WebSourceRef",
+      "type": "object"
+    },
+    "WorkspaceChange": {
+      "additionalProperties": false,
+      "properties": {
+        "changeId": {
+          "$ref": "#/$defs/EventId"
+        },
+        "contentHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "kind": {
+          "$ref": "#/$defs/WorkspaceChangeKind"
+        },
+        "mtimeNs": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mtimens"
+        },
+        "path": {
+          "$ref": "#/$defs/RelativeVaultPath"
+        },
+        "previousPath": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RelativeVaultPath"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "sizeBytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sizebytes"
+        },
+        "transactionId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TransactionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "changeId",
+        "kind",
+        "path"
+      ],
+      "title": "WorkspaceChange",
+      "type": "object"
+    },
+    "WorkspaceChangeKind": {
+      "enum": [
+        "create",
+        "modify",
+        "delete",
+        "rename"
+      ],
+      "title": "WorkspaceChangeKind",
+      "type": "string"
+    },
+    "WorkspaceContextChangedParams": {
+      "additionalProperties": false,
+      "properties": {
+        "context": {
+          "$ref": "#/$defs/ClientContextSnapshot"
+        },
+        "contextRevision": {
+          "minimum": 1,
+          "title": "Contextrevision",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "contextRevision",
+        "context"
+      ],
+      "title": "WorkspaceContextChangedParams",
+      "type": "object"
+    },
+    "WorkspaceContextChangedResult": {
+      "additionalProperties": false,
+      "properties": {
+        "acceptedRevision": {
+          "minimum": 0,
+          "title": "Acceptedrevision",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "acceptedRevision"
+      ],
+      "title": "WorkspaceContextChangedResult",
+      "type": "object"
+    },
+    "WorkspaceDidChangeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "baseRevision": {
+          "minimum": 0,
+          "title": "Baserevision",
+          "type": "integer"
+        },
+        "changes": {
+          "items": {
+            "$ref": "#/$defs/WorkspaceChange"
+          },
+          "maxItems": 10000,
+          "minItems": 1,
+          "title": "Changes",
+          "type": "array"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "baseRevision",
+        "revision",
+        "changes"
+      ],
+      "title": "WorkspaceDidChangeParams",
+      "type": "object"
+    },
+    "WorkspaceDidChangeResult": {
+      "additionalProperties": false,
+      "properties": {
+        "acceptedRevision": {
+          "minimum": 0,
+          "title": "Acceptedrevision",
+          "type": "integer"
+        },
+        "duplicateChangeIds": {
+          "items": {
+            "$ref": "#/$defs/EventId"
+          },
+          "maxItems": 10000,
+          "title": "Duplicatechangeids",
+          "type": "array"
+        },
+        "rescanRequired": {
+          "title": "Rescanrequired",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "acceptedRevision",
+        "rescanRequired"
+      ],
+      "title": "WorkspaceDidChangeResult",
+      "type": "object"
+    },
+    "WorkspaceId": {
+      "maxLength": 128,
+      "minLength": 4,
+      "pattern": "^ws_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "WorkspaceInstanceId": {
+      "maxLength": 128,
+      "minLength": 5,
+      "pattern": "^wsi_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "WorkspaceRescanParams": {
+      "additionalProperties": false,
+      "properties": {
+        "full": {
+          "default": false,
+          "title": "Full",
+          "type": "boolean"
+        },
+        "reason": {
+          "enum": [
+            "user",
+            "revision_gap",
+            "watcher_overflow",
+            "corruption",
+            "policy_changed"
+          ],
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "title": "WorkspaceRescanParams",
+      "type": "object"
+    },
+    "WorkspaceRescanResult": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "title": "Accepted",
+          "type": "boolean"
+        },
+        "generation": {
+          "minimum": 1,
+          "title": "Generation",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "accepted",
+        "generation"
+      ],
+      "title": "WorkspaceRescanResult",
+      "type": "object"
+    }
+  },
+  "$id": "urn:offeragent:protocol:1.0",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "commands": {
+    "agent/cancel": {
+      "params": {
+        "$ref": "#/$defs/AgentCancelParams"
+      },
+      "requiredCapability": "subagents",
+      "result": {
+        "$ref": "#/$defs/AgentCancelResult"
+      }
+    },
+    "agent/result": {
+      "params": {
+        "$ref": "#/$defs/AgentResultParams"
+      },
+      "requiredCapability": "subagents",
+      "result": {
+        "$ref": "#/$defs/AgentResultResult"
+      }
+    },
+    "agent/status": {
+      "params": {
+        "$ref": "#/$defs/AgentStatusParams"
+      },
+      "requiredCapability": "subagents",
+      "result": {
+        "$ref": "#/$defs/AgentStatusResult"
+      }
+    },
+    "approval/resolve": {
+      "params": {
+        "$ref": "#/$defs/ApprovalResolveParams"
+      },
+      "requiredCapability": "approvals",
+      "result": {
+        "$ref": "#/$defs/ApprovalResolveResult"
+      }
+    },
+    "artifact/read": {
+      "params": {
+        "$ref": "#/$defs/ArtifactReadParams"
+      },
+      "requiredCapability": "artifacts",
+      "result": {
+        "$ref": "#/$defs/ArtifactReadResult"
+      }
+    },
+    "config/get": {
+      "params": {
+        "$ref": "#/$defs/ConfigGetParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ConfigSnapshot"
+      }
+    },
+    "config/update": {
+      "params": {
+        "$ref": "#/$defs/ConfigUpdateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ConfigUpdateResult"
+      }
+    },
+    "diagnostics/get": {
+      "params": {
+        "$ref": "#/$defs/DiagnosticsGetParams"
+      },
+      "requiredCapability": "diagnostics",
+      "result": {
+        "$ref": "#/$defs/DiagnosticsGetResult"
+      }
+    },
+    "events/replay": {
+      "params": {
+        "$ref": "#/$defs/EventsReplayParams"
+      },
+      "requiredCapability": "eventReplay",
+      "result": {
+        "$ref": "#/$defs/EventsReplayResult"
+      }
+    },
+    "initialize": {
+      "params": {
+        "$ref": "#/$defs/InitializeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/InitializeResult"
+      }
+    },
+    "models/health": {
+      "params": {
+        "$ref": "#/$defs/ModelsHealthParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ModelsHealthResult"
+      }
+    },
+    "models/list": {
+      "params": {
+        "$ref": "#/$defs/ModelsListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ModelsListResult"
+      }
+    },
+    "runtime/ping": {
+      "params": {
+        "$ref": "#/$defs/RuntimePingParams"
+      },
+      "result": {
+        "$ref": "#/$defs/RuntimePingResult"
+      }
+    },
+    "runtime/status": {
+      "params": {
+        "$ref": "#/$defs/RuntimeStatusParams"
+      },
+      "result": {
+        "$ref": "#/$defs/RuntimeStatusResult"
+      }
+    },
+    "session/compact": {
+      "params": {
+        "$ref": "#/$defs/SessionCompactParams"
+      },
+      "requiredCapability": "multiSession",
+      "result": {
+        "$ref": "#/$defs/SessionCompactResult"
+      }
+    },
+    "session/create": {
+      "params": {
+        "$ref": "#/$defs/SessionCreateParams"
+      },
+      "requiredCapability": "multiSession",
+      "result": {
+        "$ref": "#/$defs/SessionCreateResult"
+      }
+    },
+    "session/delete": {
+      "params": {
+        "$ref": "#/$defs/SessionDeleteParams"
+      },
+      "requiredCapability": "multiSession",
+      "result": {
+        "$ref": "#/$defs/SessionDeleteResult"
+      }
+    },
+    "session/fork": {
+      "params": {
+        "$ref": "#/$defs/SessionForkParams"
+      },
+      "requiredCapability": "multiSession",
+      "result": {
+        "$ref": "#/$defs/SessionForkResult"
+      }
+    },
+    "session/get": {
+      "params": {
+        "$ref": "#/$defs/SessionGetParams"
+      },
+      "requiredCapability": "multiSession",
+      "result": {
+        "$ref": "#/$defs/SessionGetResult"
+      }
+    },
+    "session/list": {
+      "params": {
+        "$ref": "#/$defs/SessionListParams"
+      },
+      "requiredCapability": "multiSession",
+      "result": {
+        "$ref": "#/$defs/SessionListResult"
+      }
+    },
+    "session/rename": {
+      "params": {
+        "$ref": "#/$defs/SessionRenameParams"
+      },
+      "requiredCapability": "multiSession",
+      "result": {
+        "$ref": "#/$defs/SessionRenameResult"
+      }
+    },
+    "shutdown": {
+      "params": {
+        "$ref": "#/$defs/ShutdownParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ShutdownResult"
+      }
+    },
+    "turn/cancel": {
+      "params": {
+        "$ref": "#/$defs/TurnCancelParams"
+      },
+      "requiredCapability": "cancellation",
+      "result": {
+        "$ref": "#/$defs/TurnCancelResult"
+      }
+    },
+    "turn/get": {
+      "params": {
+        "$ref": "#/$defs/TurnGetParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TurnGetResult"
+      }
+    },
+    "turn/retry": {
+      "params": {
+        "$ref": "#/$defs/TurnRetryParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TurnRetryResult"
+      }
+    },
+    "turn/start": {
+      "params": {
+        "$ref": "#/$defs/TurnStartParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TurnStartResult"
+      }
+    },
+    "turn/steer": {
+      "params": {
+        "$ref": "#/$defs/TurnSteerParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TurnSteerResult"
+      }
+    },
+    "workspace/contextChanged": {
+      "params": {
+        "$ref": "#/$defs/WorkspaceContextChangedParams"
+      },
+      "requiredCapability": "clientTools",
+      "result": {
+        "$ref": "#/$defs/WorkspaceContextChangedResult"
+      }
+    },
+    "workspace/didChange": {
+      "params": {
+        "$ref": "#/$defs/WorkspaceDidChangeParams"
+      },
+      "requiredCapability": "workspaceChanges",
+      "result": {
+        "$ref": "#/$defs/WorkspaceDidChangeResult"
+      }
+    },
+    "workspace/rescan": {
+      "params": {
+        "$ref": "#/$defs/WorkspaceRescanParams"
+      },
+      "requiredCapability": "workspaceChanges",
+      "result": {
+        "$ref": "#/$defs/WorkspaceRescanResult"
+      }
+    }
+  },
+  "description": "Canonical DTO schema shared by the Windows Named Pipe and loopback adapters. All object schemas are closed and wire fields use camelCase.",
+  "envelopes": {
+    "error": {
+      "$ref": "#/$defs/ErrorEnvelope"
+    },
+    "errorResponse": {
+      "$ref": "#/$defs/JsonRpcErrorResponse"
+    },
+    "event": {
+      "$ref": "#/$defs/EventEnvelope"
+    },
+    "eventNotification": {
+      "$ref": "#/$defs/EventNotification"
+    },
+    "notification": {
+      "$ref": "#/$defs/JsonRpcNotification"
+    },
+    "request": {
+      "$ref": "#/$defs/JsonRpcRequest"
+    },
+    "successResponse": {
+      "$ref": "#/$defs/JsonRpcSuccessResponse"
+    }
+  },
+  "events": {
+    "approval.expired": {
+      "payload": {
+        "$ref": "#/$defs/ApprovalExpiredPayload"
+      }
+    },
+    "approval.required": {
+      "payload": {
+        "$ref": "#/$defs/ApprovalRequiredPayload"
+      }
+    },
+    "approval.resolved": {
+      "payload": {
+        "$ref": "#/$defs/ApprovalResolvedPayload"
+      }
+    },
+    "artifact.created": {
+      "payload": {
+        "$ref": "#/$defs/ArtifactCreatedPayload"
+      }
+    },
+    "assistant.completed": {
+      "payload": {
+        "$ref": "#/$defs/AssistantCompletedPayload"
+      }
+    },
+    "assistant.delta": {
+      "payload": {
+        "$ref": "#/$defs/AssistantDeltaPayload"
+      }
+    },
+    "context.compacted": {
+      "payload": {
+        "$ref": "#/$defs/ContextCompactedPayload"
+      }
+    },
+    "index.completed": {
+      "payload": {
+        "$ref": "#/$defs/IndexCompletedPayload"
+      }
+    },
+    "index.progress": {
+      "payload": {
+        "$ref": "#/$defs/IndexProgressPayload"
+      }
+    },
+    "index.started": {
+      "payload": {
+        "$ref": "#/$defs/IndexStartedPayload"
+      }
+    },
+    "phase.changed": {
+      "payload": {
+        "$ref": "#/$defs/PhaseChangedPayload"
+      }
+    },
+    "reasoning.summary": {
+      "payload": {
+        "$ref": "#/$defs/ReasoningSummaryPayload"
+      }
+    },
+    "references.updated": {
+      "payload": {
+        "$ref": "#/$defs/ReferencesUpdatedPayload"
+      }
+    },
+    "runtime.warning": {
+      "payload": {
+        "$ref": "#/$defs/RuntimeWarningPayload"
+      }
+    },
+    "session.updated": {
+      "payload": {
+        "$ref": "#/$defs/SessionUpdatedPayload"
+      }
+    },
+    "subagent.cancel_requested": {
+      "payload": {
+        "$ref": "#/$defs/SubagentCancelRequestedPayload"
+      }
+    },
+    "subagent.cancelled": {
+      "payload": {
+        "$ref": "#/$defs/SubagentCancelledPayload"
+      }
+    },
+    "subagent.completed": {
+      "payload": {
+        "$ref": "#/$defs/SubagentCompletedPayload"
+      }
+    },
+    "subagent.failed": {
+      "payload": {
+        "$ref": "#/$defs/SubagentFailedPayload"
+      }
+    },
+    "subagent.interrupted": {
+      "payload": {
+        "$ref": "#/$defs/SubagentInterruptedPayload"
+      }
+    },
+    "subagent.message_received": {
+      "payload": {
+        "$ref": "#/$defs/SubagentMessageReceivedPayload"
+      }
+    },
+    "subagent.orphaned": {
+      "payload": {
+        "$ref": "#/$defs/SubagentOrphanedPayload"
+      }
+    },
+    "subagent.progress": {
+      "payload": {
+        "$ref": "#/$defs/SubagentProgressPayload"
+      }
+    },
+    "subagent.queued": {
+      "payload": {
+        "$ref": "#/$defs/SubagentQueuedPayload"
+      }
+    },
+    "subagent.recovered": {
+      "payload": {
+        "$ref": "#/$defs/SubagentRecoveredPayload"
+      }
+    },
+    "subagent.result_available": {
+      "payload": {
+        "$ref": "#/$defs/SubagentResultAvailablePayload"
+      }
+    },
+    "subagent.started": {
+      "payload": {
+        "$ref": "#/$defs/SubagentStartedPayload"
+      }
+    },
+    "subagent.waiting": {
+      "payload": {
+        "$ref": "#/$defs/SubagentWaitingPayload"
+      }
+    },
+    "tool.completed": {
+      "payload": {
+        "$ref": "#/$defs/ToolCompletedPayload"
+      }
+    },
+    "tool.failed": {
+      "payload": {
+        "$ref": "#/$defs/ToolFailedPayload"
+      }
+    },
+    "tool.progress": {
+      "payload": {
+        "$ref": "#/$defs/ToolProgressPayload"
+      }
+    },
+    "tool.queued": {
+      "payload": {
+        "$ref": "#/$defs/ToolQueuedPayload"
+      }
+    },
+    "tool.started": {
+      "payload": {
+        "$ref": "#/$defs/ToolStartedPayload"
+      }
+    },
+    "turn.cancelled": {
+      "payload": {
+        "$ref": "#/$defs/TurnCancelledPayload"
+      }
+    },
+    "turn.completed": {
+      "payload": {
+        "$ref": "#/$defs/TurnCompletedPayload"
+      }
+    },
+    "turn.failed": {
+      "payload": {
+        "$ref": "#/$defs/TurnFailedPayload"
+      }
+    },
+    "turn.started": {
+      "payload": {
+        "$ref": "#/$defs/TurnStartedPayload"
+      }
+    },
+    "usage.updated": {
+      "payload": {
+        "$ref": "#/$defs/UsageUpdatedPayload"
+      }
+    }
+  },
+  "protocolVersion": "1.0",
+  "reverseRequests": {
+    "client/approval/present": {
+      "params": {
+        "$ref": "#/$defs/ClientApprovalPresentParams"
+      },
+      "requiredCapability": "approvals",
+      "result": {
+        "$ref": "#/$defs/ClientApprovalPresentResult"
+      }
+    },
+    "client/context/get": {
+      "params": {
+        "$ref": "#/$defs/ClientContextGetParams"
+      },
+      "requiredCapability": "clientTools",
+      "result": {
+        "$ref": "#/$defs/ClientContextGetResult"
+      }
+    },
+    "client/tool/cancel": {
+      "params": {
+        "$ref": "#/$defs/ClientToolCancelParams"
+      },
+      "requiredCapability": "cancellation",
+      "result": {
+        "$ref": "#/$defs/ClientToolCancelResult"
+      }
+    },
+    "client/tool/invoke": {
+      "params": {
+        "$ref": "#/$defs/ClientToolInvokeParams"
+      },
+      "requiredCapability": "clientTools",
+      "result": {
+        "$ref": "#/$defs/ClientToolInvokeResult"
+      }
+    }
+  },
+  "schemaVersion": "1",
+  "title": "OfferAgent Local Harness Protocol v1"
+}

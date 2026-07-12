@@ -1,0 +1,19 @@
+{
+  "id": "rpc_88",
+  "jsonrpc": "2.0",
+  "method": "client/tool/invoke",
+  "params": {
+    "argsHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "arguments": {
+      "operations": [],
+      "transactionId": "tx_01"
+    },
+    "deadline": "2026-07-12T10:01:00Z",
+    "idempotencyKey": "inv_01",
+    "invocationId": "inv_01",
+    "name": "obsidian.vault.transaction",
+    "runId": "run_01",
+    "toolCallId": "call_04",
+    "traceId": "trace_88"
+  }
+}

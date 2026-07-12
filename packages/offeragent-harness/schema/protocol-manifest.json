@@ -1,0 +1,72 @@
+{
+  "examples": {
+    "examples/client-tool-invoke.request.json": {
+      "kind": "request",
+      "method": "client/tool/invoke"
+    },
+    "examples/client-tool-invoke.response.json": {
+      "kind": "response",
+      "method": "client/tool/invoke"
+    },
+    "examples/initialize.request.json": {
+      "kind": "request",
+      "method": "initialize"
+    },
+    "examples/initialize.response.json": {
+      "kind": "response",
+      "method": "initialize"
+    },
+    "examples/tool-completed.event.json": {
+      "kind": "event",
+      "method": "event"
+    },
+    "examples/turn-start.request.json": {
+      "kind": "request",
+      "method": "turn/start"
+    },
+    "examples/turn-start.response.json": {
+      "kind": "response",
+      "method": "turn/start"
+    }
+  },
+  "files": {
+    "examples/client-tool-invoke.request.json": {
+      "sha256": "sha256:5a0bd7bb1147541a6074a08396782896b20ceb94aa5e319aba31c8d578a3dcd7",
+      "sizeBytes": 488
+    },
+    "examples/client-tool-invoke.response.json": {
+      "sha256": "sha256:d93c5bfc59af9ae759a6c5e21fb393c9ddf235f1ca363cd4aa8eb6dacfa89e4f",
+      "sizeBytes": 755
+    },
+    "examples/initialize.request.json": {
+      "sha256": "sha256:979f24c0d648155c6063cbf881b6b5c0fed3a3c096fa1f6fb870fb3ba7c71b6f",
+      "sizeBytes": 302
+    },
+    "examples/initialize.response.json": {
+      "sha256": "sha256:a77f35b70d939356bad0add4cf3854437325e56224ff222d3f4d76aea341d5e2",
+      "sizeBytes": 937
+    },
+    "examples/tool-completed.event.json": {
+      "sha256": "sha256:1e746018acd376da089ecfbf6cee748a844af1937994d405e578b88f0ef966d2",
+      "sizeBytes": 1011
+    },
+    "examples/turn-start.request.json": {
+      "sha256": "sha256:6051aafa63a79577bc09ae85b3d368d1ada8fa9d2d76f4a1df5fa96dd9e40cee",
+      "sizeBytes": 495
+    },
+    "examples/turn-start.response.json": {
+      "sha256": "sha256:9ba30042ddf17b1cee7fd0ff5a79876a29ba06792f0ae4d682b1c7e9401480b0",
+      "sizeBytes": 150
+    },
+    "offeragent-protocol-v1.schema.json": {
+      "sha256": "sha256:4974063a92f1134a4a10b42cbcdfab38043a84b82eb590dd4765c6b704db94c7",
+      "sizeBytes": 151303
+    }
+  },
+  "generatorVersion": "1",
+  "manifestVersion": 1,
+  "protocolVersion": "1.0",
+  "schemaBundle": "offeragent-protocol-v1.schema.json",
+  "schemaHash": "sha256:4974063a92f1134a4a10b42cbcdfab38043a84b82eb590dd4765c6b704db94c7",
+  "schemaVersion": "1"
+}

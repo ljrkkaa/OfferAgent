@@ -1,0 +1,42 @@
+[importlinter]
+root_package = offeragent_harness
+include_external_packages = True
+
+[importlinter:contract:domain-does-not-depend-on-runtime]
+name = Domain modules do not depend on runtime or protocol transport
+type = forbidden
+source_modules =
+    offeragent_harness.agent
+    offeragent_harness.tools
+    offeragent_harness.permissions
+    offeragent_harness.sessions
+    offeragent_harness.subagents
+forbidden_modules =
+    offeragent_harness.runtime
+    offeragent_harness.protocol
+
+[importlinter:contract:production-does-not-use-testing]
+name = Production code never imports test fakes
+type = forbidden
+source_modules =
+    offeragent_harness.agent
+    offeragent_harness.models
+    offeragent_harness.permissions
+    offeragent_harness.ports
+    offeragent_harness.protocol
+    offeragent_harness.runtime
+    offeragent_harness.sessions
+    offeragent_harness.subagents
+    offeragent_harness.tools
+forbidden_modules =
+    offeragent_harness.testing
+
+[importlinter:contract:models-have-no-tool-implementation]
+name = Model boundary cannot depend on tools or process implementation
+type = forbidden
+source_modules =
+    offeragent_harness.models
+forbidden_modules =
+    offeragent_harness.tools
+    offeragent_harness.runtime
+
