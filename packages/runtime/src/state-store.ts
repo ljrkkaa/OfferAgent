@@ -8,6 +8,7 @@ import {
   type AgentRunStatus,
   type ConversationMessage,
   type ConversationSummary,
+  type HostedWebSearchCapability,
   type LocalToolResultPayload,
   type ProviderErrorCode,
   type ToolCallRecord,
@@ -18,7 +19,7 @@ import {
 } from "@offeragent/protocol";
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.js";
 
-const CURRENT_SCHEMA_VERSION = 7;
+const CURRENT_SCHEMA_VERSION = 8;
 
 function persistedToolArguments(name: ToolCallRecord["name"], arguments_: unknown): unknown {
   if (name !== "vault_propose_changes" || !arguments_ || typeof arguments_ !== "object") {
@@ -372,6 +373,98 @@ const MIGRATIONS = [
         ON vault_change_batches(state, updated_at);
     `,
   },
+  {
+    version: 8,
+    sql: `
+      CREATE TABLE tool_calls_v8 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        name TEXT NOT NULL CHECK (name IN (
+          'agent_contract_read', 'hosted_web_search_probe', 'skill_read', 'vault_list', 'vault_propose_changes',
+          'vault_read', 'vault_search', 'web_read'
+        )),
+        arguments_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('requested', 'completed', 'failed')),
+        error_code TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO tool_calls_v8
+        (id, conversation_id, agent_run_id, name, arguments_json, status,
+         error_code, error_message, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, name, arguments_json, status,
+             error_code, error_message, created_at, updated_at
+      FROM tool_calls;
+      CREATE TABLE evidence_snapshots_v8 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v8(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        line_start INTEGER NOT NULL,
+        line_end INTEGER NOT NULL,
+        modified_version TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        is_stale INTEGER NOT NULL DEFAULT 0 CHECK (is_stale IN (0, 1)),
+        stale_detected_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO evidence_snapshots_v8
+        (id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+         modified_version, content_hash, content, is_stale, stale_detected_at, created_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+             modified_version, content_hash, content, is_stale, stale_detected_at, created_at
+      FROM evidence_snapshots;
+      CREATE TABLE vault_change_batches_v8 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v8(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        task TEXT NOT NULL,
+        target_paths_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+          'pending', 'applying', 'applied', 'rejected', 'failed', 'rolled_back',
+          'recovery_failed', 'undone', 'expired'
+        )),
+        checkpoint_ref TEXT,
+        before_hashes_json TEXT,
+        after_hashes_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO vault_change_batches_v8
+        (id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+         target_paths_json, state, checkpoint_ref, before_hashes_json,
+         after_hashes_json, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+             target_paths_json, state, checkpoint_ref, before_hashes_json,
+             after_hashes_json, created_at, updated_at
+      FROM vault_change_batches;
+      DROP TABLE evidence_snapshots;
+      DROP TABLE vault_change_batches;
+      DROP TABLE tool_calls;
+      ALTER TABLE tool_calls_v8 RENAME TO tool_calls;
+      ALTER TABLE evidence_snapshots_v8 RENAME TO evidence_snapshots;
+      ALTER TABLE vault_change_batches_v8 RENAME TO vault_change_batches;
+      CREATE INDEX tool_calls_by_run ON tool_calls(agent_run_id, created_at);
+      CREATE INDEX evidence_by_run ON evidence_snapshots(agent_run_id, created_at);
+      CREATE INDEX evidence_by_source ON evidence_snapshots(path, content_hash, is_stale);
+      CREATE INDEX vault_change_batches_by_run ON vault_change_batches(agent_run_id, created_at);
+      CREATE INDEX vault_change_batches_by_state ON vault_change_batches(state, updated_at);
+      CREATE TABLE IF NOT EXISTS provider_capabilities (
+        backend_id TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        capability TEXT NOT NULL CHECK (capability = 'hosted_web_search'),
+        status TEXT NOT NULL CHECK (status IN ('unknown', 'available', 'unavailable')),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (backend_id, model_id, capability)
+      );
+    `,
+  },
 ] as const;
 
 interface ConversationSnapshot {
@@ -477,6 +570,53 @@ export class RuntimeStateStore {
   async hasConversation(conversationId: string): Promise<boolean> {
     await this.#writeTail;
     return valueAt(this.#database, "SELECT 1 FROM conversations WHERE id = ?", [conversationId]) === 1;
+  }
+
+  async getProviderCapability(
+    backendId: string,
+    modelId: string,
+    capability: "hosted_web_search",
+  ): Promise<HostedWebSearchCapability> {
+    await this.#writeTail;
+    const status = valueAt(
+      this.#database,
+      `SELECT status FROM provider_capabilities
+       WHERE backend_id = ? AND model_id = ? AND capability = ?`,
+      [backendId, modelId, capability],
+    );
+    return status === "available" || status === "unavailable" ? status : "unknown";
+  }
+
+  async setProviderCapability(
+    backendId: string,
+    modelId: string,
+    capability: "hosted_web_search",
+    status: HostedWebSearchCapability,
+  ): Promise<void> {
+    await this.#write(() => {
+      this.#database.run(
+        `INSERT INTO provider_capabilities
+          (backend_id, model_id, capability, status, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(backend_id, model_id, capability)
+         DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at`,
+        [backendId, modelId, capability, status, now()],
+      );
+    });
+  }
+
+  async resetProviderCapability(
+    backendId: string,
+    modelId: string,
+    capability: "hosted_web_search",
+  ): Promise<void> {
+    await this.#write(() => {
+      this.#database.run(
+        `DELETE FROM provider_capabilities
+         WHERE backend_id = ? AND model_id = ? AND capability = ?`,
+        [backendId, modelId, capability],
+      );
+    });
   }
 
   async beginAgentRun(
@@ -629,6 +769,13 @@ export class RuntimeStateStore {
       if (this.#database.getRowsModified() !== 1) {
         throw new Error(`Agent Run '${agentRunId}' cannot advance to sequence ${sequence}.`);
       }
+    });
+  }
+
+  async recordAgentRunEvent(event: AgentRunEvent): Promise<void> {
+    await this.#write(() => {
+      this.#requiredRun(event.agentRunId);
+      this.#recordEvent(event);
     });
   }
 
@@ -966,7 +1113,7 @@ export class RuntimeStateStore {
     if (!conversationRow) throw new Error(`Conversation '${conversationId}' does not exist.`);
     const messageRows =
       this.#database.exec(
-        `SELECT id, agent_run_id, role, text, sequence
+        `SELECT id, agent_run_id, role, text, sequence, citations_json
          FROM messages WHERE conversation_id = ? ORDER BY sequence`,
         [conversationId],
       )[0]?.values ?? [];
@@ -993,12 +1140,15 @@ export class RuntimeStateStore {
         title: conversationRow[1] as string,
         modelId: conversationRow[2] as string,
       },
-      messages: messageRows.map(([id, agentRunId, role, text, sequence]) => ({
+      messages: messageRows.map(([id, agentRunId, role, text, sequence, citationsJson]) => ({
         id: id as string,
         agentRunId: agentRunId as string,
         role: role as "assistant" | "user",
         text: text as string,
         sequence: sequence as number,
+        ...((JSON.parse(citationsJson as string) as unknown[]).length > 0
+          ? { citations: JSON.parse(citationsJson as string) }
+          : {}),
       })),
       agentRuns: runRows.map(([id, modelId, status]) => ({
         id: id as string,
@@ -1090,9 +1240,17 @@ export class RuntimeStateStore {
       const sequence = this.#nextMessageSequence(run.conversationId);
       this.#database.run(
         `INSERT INTO messages
-          (id, conversation_id, agent_run_id, role, text, sequence, created_at)
-         VALUES (?, ?, ?, 'assistant', ?, ?, ?)`,
-        [messageId, run.conversationId, agentRunId, output, sequence, timestamp],
+          (id, conversation_id, agent_run_id, role, text, sequence, citations_json, created_at)
+         VALUES (?, ?, ?, 'assistant', ?, ?, ?, ?)`,
+        [
+          messageId,
+          run.conversationId,
+          agentRunId,
+          output,
+          sequence,
+          JSON.stringify(completedEvent?.output.citations ?? []),
+          timestamp,
+        ],
       );
       this.#database.run(
         `UPDATE agent_runs
@@ -1230,6 +1388,7 @@ export class RuntimeStateStore {
       try {
         this.#database.run(migration.sql);
         if (migration.version === 7) this.#scrubPersistedVaultChangeArguments();
+        if (migration.version === 8) this.#ensureCitationsColumn();
         const timestamp = now();
         this.#database.run(
           "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
@@ -1301,6 +1460,13 @@ export class RuntimeStateStore {
           [id],
         );
       }
+    }
+  }
+
+  #ensureCitationsColumn(): void {
+    const columns = this.#database.exec("PRAGMA table_info(messages)")[0]?.values ?? [];
+    if (!columns.some((column) => column[1] === "citations_json")) {
+      this.#database.run("ALTER TABLE messages ADD COLUMN citations_json TEXT NOT NULL DEFAULT '[]'");
     }
   }
 

@@ -1,7 +1,7 @@
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { LocalToolName, ModelDescriptor } from "@offeragent/protocol";
 import { EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
 import {
@@ -21,6 +21,16 @@ function boundedToolArguments(encoded: string): string {
     );
   }
   return encoded;
+}
+
+function isHttpUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 2_048) return false;
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") && !url.username && !url.password;
+  } catch {
+    return false;
+  }
 }
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -94,6 +104,10 @@ export class CodexSubscriptionProvider implements ModelProvider {
   readonly #authPath: string;
   readonly #baseUrl: string;
   readonly #fetch: typeof fetch;
+
+  get backendId(): string {
+    return `codex:${createHash("sha256").update(this.#baseUrl).digest("hex").slice(0, 24)}`;
+  }
 
   constructor(options: CodexSubscriptionProviderOptions = {}) {
     this.#authPath =
@@ -173,13 +187,17 @@ export class CodexSubscriptionProvider implements ModelProvider {
           model: request.model,
           instructions: request.instructions,
           input: request.input.map(encodeConversationItem),
-          tools: request.tools.map((tool) => ({
-            type: "function",
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.parameters,
-            strict: false,
-          })),
+          tools: request.tools.map((tool) =>
+            tool.kind === "hosted"
+              ? { type: "web_search" }
+              : {
+                  type: "function",
+                  name: tool.name,
+                  description: tool.description,
+                  parameters: tool.parameters,
+                  strict: false,
+                },
+          ),
           tool_choice: "auto",
           reasoning: { effort: "low", summary: "auto" },
           store: false,
@@ -240,7 +258,56 @@ export class CodexSubscriptionProvider implements ModelProvider {
               const item = event.item;
               if (item && typeof item === "object") {
                 const call = item as Record<string, unknown>;
-                if (
+                if (call.type === "web_search_call" && typeof call.id === "string") {
+                  const action = call.action && typeof call.action === "object"
+                    ? call.action as Record<string, unknown>
+                    : {};
+                  const sources = Array.isArray(action.sources)
+                    ? action.sources.slice(0, 20).flatMap((candidate) => {
+                        if (!candidate || typeof candidate !== "object") return [];
+                        const source = candidate as Record<string, unknown>;
+                        if (!isHttpUrl(source.url)) return [];
+                        return [{
+                          url: source.url,
+                          ...(typeof source.title === "string" &&
+                          Buffer.byteLength(source.title, "utf8") <= 512
+                            ? { title: source.title }
+                            : {}),
+                        }];
+                      })
+                    : [];
+                  yield { type: "hosted_web_search_call", callId: call.id, sources };
+                } else if (call.type === "message" && Array.isArray(call.content)) {
+                  for (const content of call.content) {
+                    if (!content || typeof content !== "object") continue;
+                    const output = content as Record<string, unknown>;
+                    if (!Array.isArray(output.annotations)) continue;
+                    for (const candidate of output.annotations) {
+                      if (!candidate || typeof candidate !== "object") continue;
+                      const annotation = candidate as Record<string, unknown>;
+                      if (
+                        annotation.type === "url_citation" &&
+                        isHttpUrl(annotation.url) &&
+                        typeof annotation.title === "string" &&
+                        Buffer.byteLength(annotation.title, "utf8") <= 512 &&
+                        typeof annotation.start_index === "number" &&
+                        typeof annotation.end_index === "number" &&
+                        annotation.start_index >= 0 &&
+                        annotation.end_index >= annotation.start_index
+                      ) {
+                        yield {
+                          type: "url_citation",
+                          citation: {
+                            url: annotation.url,
+                            title: annotation.title,
+                            startIndex: annotation.start_index,
+                            endIndex: annotation.end_index,
+                          },
+                        };
+                      }
+                    }
+                  }
+                } else if (
                   call.type === "function_call" &&
                   typeof call.call_id === "string" &&
                   isLocalToolName(call.name)
@@ -277,6 +344,12 @@ export class CodexSubscriptionProvider implements ModelProvider {
               event.type === "response.failed" ||
               event.type === "error"
             ) {
+              if (/web_search/i.test(JSON.stringify(event)) && /(unsupported|unknown|invalid|parameter|tool)/i.test(JSON.stringify(event))) {
+                throw new ModelProviderError(
+                  "unsupported_capability",
+                  "This Codex backend does not support hosted Web Search.",
+                );
+              }
               throw new ModelProviderError(
                 "provider_error",
                 "Codex could not complete this Agent Run.",
@@ -394,6 +467,17 @@ export class CodexSubscriptionProvider implements ModelProvider {
     if (
       context === "agent_run" &&
       (response.status === 400 || response.status === 404) &&
+      /web_search/i.test(detail) &&
+      /(unsupported|unknown|invalid|not allowed|unrecognized|parameter|tool)/i.test(detail)
+    ) {
+      throw new ModelProviderError(
+        "unsupported_capability",
+        "This Codex backend does not support hosted Web Search.",
+      );
+    }
+    if (
+      context === "agent_run" &&
+      (response.status === 400 || response.status === 404) &&
       /model/i.test(detail) &&
       /(not supported|unavailable|unknown|does not exist|invalid)/i.test(detail)
     ) {
@@ -412,10 +496,12 @@ export class CodexSubscriptionProvider implements ModelProvider {
 function isLocalToolName(value: unknown): value is LocalToolName {
   return (
     value === "skill_read" ||
+    value === "hosted_web_search_probe" ||
     value === "vault_list" ||
     value === "vault_propose_changes" ||
     value === "vault_read" ||
-    value === "vault_search"
+    value === "vault_search" ||
+    value === "web_read"
   );
 }
 

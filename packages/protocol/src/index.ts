@@ -37,10 +37,25 @@ export interface ConversationSummary {
 
 export interface ConversationMessage {
   agentRunId: string;
+  citations?: WebCitation[];
   id: string;
   role: "assistant" | "user";
   sequence: number;
   text: string;
+}
+
+export type HostedWebSearchCapability = "available" | "unavailable" | "unknown";
+
+export interface WebCitation {
+  endIndex: number;
+  startIndex: number;
+  title: string;
+  url: string;
+}
+
+export interface WebSearchSource {
+  title?: string;
+  url: string;
 }
 
 export interface AgentRunRecord {
@@ -51,11 +66,13 @@ export interface AgentRunRecord {
 
 export type LocalToolName =
   | "agent_contract_read"
+  | "hosted_web_search_probe"
   | "skill_read"
   | "vault_list"
   | "vault_propose_changes"
   | "vault_read"
-  | "vault_search";
+  | "vault_search"
+  | "web_read";
 
 export type VaultToolErrorCode =
   | "invalid_path"
@@ -65,8 +82,12 @@ export type VaultToolErrorCode =
   | "permission_denied"
   | "plugin_disconnected"
   | "request_too_large"
+  | "response_too_large"
+  | "redirect_error"
   | "stale_evidence"
   | "tool_error"
+  | "unreadable_content"
+  | "unsafe_url"
   | "undo_conflict";
 
 export interface VaultListResult {
@@ -105,6 +126,21 @@ export interface VaultSearchResult {
   }>;
   truncated: boolean;
   type: "vault_search";
+}
+
+export interface WebReadResult {
+  content: string;
+  contentType: string;
+  finalUrl: string;
+  sourceTitle?: string;
+  truncated: boolean;
+  type: "web_read";
+  url: string;
+}
+
+export interface HostedWebSearchProbeResult {
+  status: HostedWebSearchCapability;
+  type: "hosted_web_search_probe";
 }
 
 export interface AgentContractResult {
@@ -226,11 +262,13 @@ export type LocalToolResultPayload =
       ok: true;
       value:
         | AgentContractResult
+        | HostedWebSearchProbeResult
         | SkillReadResult
         | VaultListResult
         | VaultChangeResult
         | VaultReadResult
-        | VaultSearchResult;
+        | VaultSearchResult
+        | WebReadResult;
     }
   | { ok: false; error: { code: VaultToolErrorCode; message: string } };
 
@@ -294,12 +332,18 @@ export interface RuntimeModels {
   models: ModelDescriptor[];
 }
 
+export interface RuntimeHostedWebSearchCapability {
+  modelId: string;
+  status: HostedWebSearchCapability;
+}
+
 export type ProviderErrorCode =
   | "auth_required"
   | "instruction_error"
   | "model_unavailable"
   | "provider_error"
-  | "transport_error";
+  | "transport_error"
+  | "unsupported_capability";
 
 export interface AgentRunStart {
   agentRunId: string;
@@ -353,23 +397,28 @@ interface AgentRunEventBase {
 export type AgentRunEvent =
   | (AgentRunEventBase & { type: "agent_run.started"; model: string })
   | (AgentRunEventBase & { type: "agent_run.delta"; delta: string })
+  | (AgentRunEventBase & {
+      type: "hosted_web_search.completed";
+      searchCallId: string;
+      sources: WebSearchSource[];
+    })
   | (AgentRunEventBase & { type: "agent_run.cancelled" })
   | (AgentRunEventBase & { type: "agent_run.interrupted" })
   | (AgentRunEventBase & {
       type: "tool_call.requested";
       toolCallId: string;
-      tool: { arguments: unknown; kind: "local"; name: LocalToolName };
+      tool: { arguments: unknown; kind: "local" | "runtime"; name: LocalToolName };
     })
   | (AgentRunEventBase & {
       type: "tool_call.completed";
       toolCallId: string;
-      tool: { kind: "local"; name: LocalToolName };
+      tool: { kind: "local" | "runtime"; name: LocalToolName };
       status: "completed" | "failed";
       error?: { code: VaultToolErrorCode; message: string };
     })
   | (AgentRunEventBase & {
       type: "agent_run.completed";
-      output: { role: "assistant"; text: string };
+      output: { citations?: WebCitation[]; role: "assistant"; text: string };
     })
   | (AgentRunEventBase & {
       type: "agent_run.failed";

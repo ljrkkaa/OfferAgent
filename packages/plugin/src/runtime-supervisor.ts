@@ -24,6 +24,7 @@ import {
   type RuntimeError,
   type RuntimeHandshake,
   type RuntimeHealth,
+  type RuntimeHostedWebSearchCapability,
   type RuntimeModels,
   type RuntimeShutdown,
   type ToolCallRecord,
@@ -154,6 +155,7 @@ function isAgentRunEventEnvelope(value: unknown): value is AgentRunEvent {
       "agent_run.interrupted",
       "agent_run.completed",
       "agent_run.failed",
+      "hosted_web_search.completed",
       "tool_call.requested",
       "tool_call.completed",
     ].includes(event.type) &&
@@ -491,6 +493,22 @@ export class RuntimeSupervisor implements RuntimeClient {
     return response.models;
   }
 
+  async getHostedWebSearchCapability(modelId: string): Promise<RuntimeHostedWebSearchCapability> {
+    return callRuntime<RuntimeHostedWebSearchCapability>(
+      this.#requiredConnection(),
+      "GET",
+      `/capabilities/web-search?model=${encodeURIComponent(modelId)}`,
+    );
+  }
+
+  async reprobeHostedWebSearch(modelId: string): Promise<RuntimeHostedWebSearchCapability> {
+    return callRuntime<RuntimeHostedWebSearchCapability>(
+      this.#requiredConnection(),
+      "POST",
+      `/capabilities/web-search?model=${encodeURIComponent(modelId)}`,
+    );
+  }
+
   async listVaultChangeBatches(
     states: VaultChangeTransactionState[],
   ): Promise<VaultChangeJournalRecord[]> {
@@ -810,7 +828,7 @@ export class RuntimeSupervisor implements RuntimeClient {
       channel.events.push(event);
       channel.wake?.();
       channel.wake = undefined;
-      if (event.type === "tool_call.requested") {
+      if (event.type === "tool_call.requested" && event.tool.kind === "local") {
         void this.#executeLocalTool(socket, event);
       }
     });

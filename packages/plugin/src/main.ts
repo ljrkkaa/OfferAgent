@@ -59,6 +59,32 @@ class OfferAgentSettingTab extends PluginSettingTab {
             await this.#owner.setVaultPermissionMode(permissionMode(value));
           }),
       );
+    const hostedSearch = new Setting(this.containerEl)
+      .setName("Hosted Web Search")
+      .setDesc("Capability status: unknown. Status is discovered from the active backend and model.")
+      .addButton((button) =>
+        button.setButtonText("Reprobe").onClick(async () => {
+          button.setDisabled(true);
+          hostedSearch.setDesc("Capability status: probing…");
+          try {
+            const result = await this.#owner.reprobeHostedWebSearch();
+            hostedSearch.setDesc(`Capability status for ${result.modelId}: ${result.status}.`);
+          } catch (error) {
+            hostedSearch.setDesc(
+              `Capability probe failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          } finally {
+            button.setDisabled(false);
+          }
+        }),
+      );
+    void this.#owner.getHostedWebSearchCapability().then((result) => {
+      hostedSearch.setDesc(`Capability status for ${result.modelId}: ${result.status}.`);
+    }).catch((error: unknown) => {
+      hostedSearch.setDesc(
+        `Capability status unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
   }
 }
 
@@ -176,10 +202,22 @@ class OfferAgentSidebarView extends ItemView {
       });
     } else {
       for (const message of viewModel.conversation.messages) {
-        transcript.createDiv({
+        const messageElement = transcript.createDiv({
           cls: `offeragent-sidebar__message offeragent-sidebar__message--${message.role}`,
           text: message.text,
         });
+        if (message.citations?.length) {
+          const sources = messageElement.createDiv({ cls: "offeragent-sidebar__citations" });
+          for (const [index, citation] of message.citations.entries()) {
+            const link = sources.createEl("a", {
+              cls: "offeragent-sidebar__citation",
+              text: `[${index + 1}] ${citation.title}`,
+            });
+            link.href = citation.url;
+            link.target = "_blank";
+            link.rel = "noopener noreferrer";
+          }
+        }
       }
     }
 
@@ -306,6 +344,7 @@ class OfferAgentSidebarView extends ItemView {
 
 export default class OfferAgentPlugin extends Plugin {
   #controller?: SidebarController;
+  #runtime?: RuntimeSupervisor;
   #settings: OfferAgentPluginSettings = { ...DEFAULT_SETTINGS };
 
   async onload(): Promise<void> {
@@ -344,6 +383,7 @@ export default class OfferAgentPlugin extends Plugin {
             : readTools.execute(event),
       },
     });
+    this.#runtime = runtime;
     this.#controller = new SidebarController(runtime, changeCoordinator);
 
     this.registerView(
@@ -378,6 +418,20 @@ export default class OfferAgentPlugin extends Plugin {
 
   getVaultPermissionMode(): VaultPermissionMode {
     return this.#settings.vaultPermissionMode;
+  }
+
+  async getHostedWebSearchCapability() {
+    const modelId = this.#controller?.getViewModel().conversation.selectedModelId;
+    if (!modelId) throw new Error("Select a model before checking Hosted Web Search.");
+    if (!this.#runtime) throw new Error("OfferAgent Runtime is not connected.");
+    return this.#runtime.getHostedWebSearchCapability(modelId);
+  }
+
+  async reprobeHostedWebSearch() {
+    const modelId = this.#controller?.getViewModel().conversation.selectedModelId;
+    if (!modelId) throw new Error("Select a model before probing Hosted Web Search.");
+    if (!this.#runtime) throw new Error("OfferAgent Runtime is not connected.");
+    return this.#runtime.reprobeHostedWebSearch(modelId);
   }
 
   async setVaultPermissionMode(vaultPermissionMode: VaultPermissionMode): Promise<void> {

@@ -217,6 +217,26 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
       configure(dropdown);
       return this;
     }
+
+    addButton(configure) {
+      const buttonEl = this.settingEl.createEl("button", { cls: "setting-item-button" });
+      const button = {
+        onClick(listener) {
+          buttonEl.addEventListener("click", listener);
+          return button;
+        },
+        setButtonText(text) {
+          buttonEl.text = text;
+          return button;
+        },
+        setDisabled(disabled) {
+          buttonEl.disabled = disabled;
+          return button;
+        },
+      };
+      configure(button);
+      return this;
+    }
   }
 
   class Notice {
@@ -362,6 +382,25 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "OfferAgent did not render its model selector",
   );
   assert.equal(modelSelect.value, "fake-interview-model");
+  plugin.settingTabs[0].display();
+  const capabilityStatus = await waitUntil(
+    () => plugin.settingTabs[0].containerEl
+      .findAllByClass("setting-item-description")
+      .find((description) => description.text.includes("fake-interview-model: unknown")),
+    "OfferAgent settings did not show the unknown Hosted Web Search capability",
+  );
+  assert.match(capabilityStatus.text, /unknown/);
+  const reprobe = plugin.settingTabs[0].containerEl
+    .findAllByClass("setting-item-button")
+    .find((button) => button.text === "Reprobe");
+  assert.ok(reprobe);
+  reprobe.dispatch("click");
+  await waitUntil(
+    () => reprobe.disabled === false && plugin.settingTabs[0].containerEl
+      .findAllByClass("setting-item-description")
+      .some((description) => description.text.includes("fake-interview-model: available")),
+    "OfferAgent settings did not complete a Hosted Web Search reprobe",
+  );
   const composer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const input = activeView.contentEl.findByClass("offeragent-sidebar__input");
   assert.ok(composer);
@@ -707,6 +746,23 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "OfferAgent did not undo the applied batch",
   );
   await assert.rejects(readFile(path.join(temporaryVault, "notes", "applied.md"), "utf8"));
+
+  const citationComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
+  const citationInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  citationInput.value = "hosted_search_demo";
+  citationComposer.dispatch("submit");
+  const citation = await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__citation"),
+    "OfferAgent did not render the hosted search citation",
+  );
+  assert.equal(citation.text, "[1] Example source");
+  assert.equal(citation.href, "https://example.com/source");
+  assert.equal(citation.target, "_blank");
+  assert.equal(citation.rel, "noopener noreferrer");
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
+    "Hosted search citation Agent Run did not finish",
+  );
 
   await plugin.onunload();
   plugin = undefined;

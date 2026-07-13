@@ -17,11 +17,13 @@ import {
   type RuntimeError,
   type RuntimeHandshake,
   type RuntimeHealth,
+  type RuntimeHostedWebSearchCapability,
   type RuntimeModels,
   type RuntimeShutdown,
   type ToolResultCommand,
   type VaultChangeApplyingRequest,
   type VaultChangeStateRequest,
+  type WebCitation,
 } from "@offeragent/protocol";
 import { FakeModelProvider } from "./fake-model-provider";
 import { CodexSubscriptionProvider } from "./codex-subscription-provider";
@@ -34,6 +36,8 @@ import {
   type ModelProvider,
 } from "./model-provider";
 import { RuntimeStateStore } from "./state-store";
+import { WebReader } from "./web-read";
+import { CapabilityGatedModelProvider } from "./capability-gated-provider";
 
 interface RuntimeOptions {
   parentPid: number;
@@ -45,6 +49,22 @@ interface RuntimeOptions {
 
 const LOCAL_TOOLS: LocalToolDefinition[] = [
   {
+    kind: "local",
+    name: "web_read",
+    description:
+      "Read bounded extracted text from a user-supplied public HTTP or HTTPS page. This remains available even when hosted Web Search is unavailable.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        url: { type: "string", minLength: 1, maxLength: 2_048 },
+        maxBytes: { type: "integer", minimum: 1, maximum: 65_536 },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    kind: "local",
     name: "vault_list",
     description: "List bounded Markdown or text files available in the connected Obsidian Vault.",
     parameters: {
@@ -57,6 +77,7 @@ const LOCAL_TOOLS: LocalToolDefinition[] = [
     },
   },
   {
+    kind: "local",
     name: "vault_search",
     description:
       "Search the connected Obsidian Vault for bounded keyword or exact-phrase candidates. Use vault_read before treating a candidate as evidence.",
@@ -74,6 +95,7 @@ const LOCAL_TOOLS: LocalToolDefinition[] = [
     },
   },
   {
+    kind: "local",
     name: "skill_read",
     description:
       "Load one registered Local Skill's SKILL.md or a directly referenced resource. Skills provide bounded workflow guidance only and cannot add tools or permissions.",
@@ -88,6 +110,7 @@ const LOCAL_TOOLS: LocalToolDefinition[] = [
     },
   },
   {
+    kind: "local",
     name: "vault_propose_changes",
     description:
       "Propose one atomic, user-visible Vault Change Batch. This never writes directly; the plugin validates and applies or rejects the whole batch.",
@@ -122,6 +145,7 @@ const LOCAL_TOOLS: LocalToolDefinition[] = [
     },
   },
   {
+    kind: "local",
     name: "vault_read",
     description: "Read an exact bounded line range from one Vault Markdown or text file.",
     parameters: {
@@ -136,6 +160,21 @@ const LOCAL_TOOLS: LocalToolDefinition[] = [
     },
   },
 ];
+
+const HOSTED_WEB_SEARCH_PROBE_TOOL: LocalToolDefinition = {
+  kind: "local",
+  name: "hosted_web_search_probe",
+  description:
+    "Use only when the user needs internet search and no supplied URL can be read directly. This probes whether the current backend/model supports hosted Web Search; after an available result, request the hosted web_search tool on the next step.",
+  parameters: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      query: { type: "string", minLength: 1, maxLength: 512 },
+    },
+    required: ["query"],
+  },
+};
 
 const MODEL_DEFAULT_INSTRUCTIONS =
   "You are OfferAgent, an interview preparation assistant. Answer the user's request directly and clearly.";
@@ -605,8 +644,8 @@ async function startRuntime({
   token,
 }: RuntimeOptions): Promise<void> {
   const instanceId = randomUUID();
-  const provider = createProvider(providerName);
   const store = await RuntimeStateStore.open(statePath);
+  const provider = new CapabilityGatedModelProvider(createProvider(providerName), store);
   const activeRuns = new Map<
     string,
     {
@@ -706,6 +745,42 @@ async function startRuntime({
       return;
     }
 
+    if (requestUrl.pathname === "/capabilities/web-search") {
+      const model = requestUrl.searchParams.get("model");
+      if (!model || model.length > 256) {
+        sendJson(response, 400, { code: "not_found", message: "A valid model is required." });
+        return;
+      }
+      if (request.method === "GET") {
+        void provider.getHostedWebSearchCapability(model).then(
+          (status) => sendJson(response, 200, {
+            modelId: model,
+            status,
+          } satisfies RuntimeHostedWebSearchCapability),
+          (error: unknown) => sendJson(response, 500, {
+            code: "storage_error",
+            message: error instanceof Error ? error.message : "Capability status could not be read.",
+          }),
+        );
+        return;
+      }
+      if (request.method === "POST") {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 30_000);
+        void provider.reprobeHostedWebSearch(model, controller.signal).then(
+          (status) => sendJson(response, 200, {
+            modelId: model,
+            status,
+          } satisfies RuntimeHostedWebSearchCapability),
+          (error: unknown) => {
+            const providerError = asModelProviderError(error);
+            sendJson(response, 502, { code: providerError.code, message: providerError.message });
+          },
+        ).finally(() => clearTimeout(timeout));
+        return;
+      }
+    }
+
     if (request.method === "GET" && request.url === "/models") {
       void provider.listModels().then(
         (models) => sendJson(response, 200, { models }),
@@ -732,6 +807,7 @@ async function startRuntime({
     });
   });
   const sockets = new Set<WebSocket>();
+  const webReader = new WebReader();
   const webSockets = new WebSocketServer({ noServer: true });
 
   server.on("upgrade", (request, socket, head) => {
@@ -852,6 +928,7 @@ async function startRuntime({
       void (async () => {
         let sequence = 1;
         let output = "";
+        const citations: WebCitation[] = [];
         const base = {
           protocolVersion: PROTOCOL_VERSION,
           conversationId: message.conversationId,
@@ -893,6 +970,7 @@ async function startRuntime({
           const requiredRereads = new Set<string>();
           const canonicalReadPaths = new Map<string, string>();
           let agentContract: string | undefined;
+          let hostedWebSearchProbeAttempted = false;
           const localSkills = new Map<string, string>();
           const executeLocalTool = async (
             name: LocalToolName,
@@ -907,36 +985,75 @@ async function startRuntime({
               eventId: randomUUID(),
               sequence: requestedSequence,
               toolCallId,
-              tool: { kind: "local", name, arguments: arguments_ },
+              tool: {
+                kind:
+                  name === "web_read" || name === "hosted_web_search_probe"
+                    ? "runtime"
+                    : "local",
+                name,
+                arguments: arguments_,
+              },
             };
             await store.requestToolCall(message.agentRunId, requestedEvent);
-            const resultPromise = new Promise<LocalToolResultPayload>((resolve, reject) => {
-              pendingToolResults.set(toolCallId, {
-                agentRunId: message.agentRunId,
-                conversationId: message.conversationId,
-                reject,
-                resolve,
-                sequence: requestedSequence,
-                socket,
-              });
-            });
-            const abortToolCall = (): void => {
-              const pending = pendingToolResults.get(toolCallId);
-              if (!pending) return;
-              pendingToolResults.delete(toolCallId);
-              completedToolResults.add(toolCallId);
-              pending.reject(new Error("The Agent Run was interrupted during a local tool call."));
-            };
-            controller.signal.addEventListener("abort", abortToolCall, { once: true });
             sendEvent(socket, requestedEvent);
             sequence += 1;
             let result: LocalToolResultPayload;
-            try {
-              if (controller.signal.aborted) abortToolCall();
-              result = await resultPromise;
-            } finally {
-              pendingToolResults.delete(toolCallId);
-              controller.signal.removeEventListener("abort", abortToolCall);
+            if (name === "web_read") {
+              result = await webReader.execute(arguments_, controller.signal);
+            } else if (name === "hosted_web_search_probe") {
+              if (hostedWebSearchProbeAttempted) {
+                result = {
+                  ok: false,
+                  error: {
+                    code: "tool_error",
+                    message: "Hosted Web Search probing already failed during this Agent Run.",
+                  },
+                };
+              } else {
+                hostedWebSearchProbeAttempted = true;
+                try {
+                  const status = await provider.reprobeHostedWebSearch(
+                    message.model,
+                    controller.signal,
+                  );
+                  result = { ok: true, value: { type: "hosted_web_search_probe", status } };
+                } catch {
+                  result = {
+                    ok: false,
+                    error: {
+                      code: "tool_error",
+                      message:
+                        "Hosted Web Search capability could not be probed. Continue without hosted search; direct web_read remains available for supplied URLs.",
+                    },
+                  };
+                }
+              }
+            } else {
+              const resultPromise = new Promise<LocalToolResultPayload>((resolve, reject) => {
+                pendingToolResults.set(toolCallId, {
+                  agentRunId: message.agentRunId,
+                  conversationId: message.conversationId,
+                  reject,
+                  resolve,
+                  sequence: requestedSequence,
+                  socket,
+                });
+              });
+              const abortToolCall = (): void => {
+                const pending = pendingToolResults.get(toolCallId);
+                if (!pending) return;
+                pendingToolResults.delete(toolCallId);
+                completedToolResults.add(toolCallId);
+                pending.reject(new Error("The Agent Run was interrupted during a local tool call."));
+              };
+              controller.signal.addEventListener("abort", abortToolCall, { once: true });
+              try {
+                if (controller.signal.aborted) abortToolCall();
+                result = await resultPromise;
+              } finally {
+                pendingToolResults.delete(toolCallId);
+                controller.signal.removeEventListener("abort", abortToolCall);
+              }
             }
             const completedEvent: Extract<AgentRunEvent, { type: "tool_call.completed" }> = {
               ...base,
@@ -944,7 +1061,13 @@ async function startRuntime({
               eventId: randomUUID(),
               sequence,
               toolCallId,
-              tool: { kind: "local", name },
+              tool: {
+                kind:
+                  name === "web_read" || name === "hosted_web_search_probe"
+                    ? "runtime"
+                    : "local",
+                name,
+              },
               status: result.ok ? "completed" : "failed",
               ...(result.ok ? {} : { error: result.error }),
             };
@@ -974,13 +1097,19 @@ async function startRuntime({
           let finished = false;
           for (let step = 0; step < 8; step += 1) {
             output = "";
+            citations.length = 0;
             let requestedTool = false;
+            const hostedWebSearchCapability =
+              await provider.getHostedWebSearchCapability(message.model);
             for await (const providerEvent of provider.stream({
               model: message.model,
               input,
               instructions: composeInstructions(agentContract, localSkills),
               signal: controller.signal,
-              tools: LOCAL_TOOLS,
+              tools:
+                hostedWebSearchCapability === "unknown"
+                  ? [...LOCAL_TOOLS, HOSTED_WEB_SEARCH_PROBE_TOOL]
+                  : LOCAL_TOOLS,
             })) {
               if (providerEvent.type === "output_text.delta") {
                 output += providerEvent.delta;
@@ -993,6 +1122,30 @@ async function startRuntime({
                   delta: providerEvent.delta,
                 });
                 sequence += 1;
+                continue;
+              }
+              if (providerEvent.type === "hosted_web_search_call") {
+                const searchEvent: Extract<AgentRunEvent, { type: "hosted_web_search.completed" }> = {
+                  ...base,
+                  type: "hosted_web_search.completed",
+                  eventId: randomUUID(),
+                  sequence,
+                  searchCallId: providerEvent.callId,
+                  sources: providerEvent.sources,
+                };
+                await store.recordAgentRunEvent(searchEvent);
+                sendEvent(socket, searchEvent);
+                sequence += 1;
+                continue;
+              }
+              if (providerEvent.type === "url_citation") {
+                if (citations.length < 50 && !citations.some((candidate) =>
+                  candidate.url === providerEvent.citation.url &&
+                  candidate.startIndex === providerEvent.citation.startIndex &&
+                  candidate.endIndex === providerEvent.citation.endIndex
+                )) {
+                  citations.push(providerEvent.citation);
+                }
                 continue;
               }
 
@@ -1111,7 +1264,13 @@ async function startRuntime({
               type: "agent_run.completed",
               eventId: randomUUID(),
               sequence,
-              output: { role: "assistant", text: output },
+              output: {
+                role: "assistant",
+                text: output,
+                ...(citations.some((citation) => citation.endIndex <= output.length)
+                  ? { citations: citations.filter((citation) => citation.endIndex <= output.length) }
+                  : {}),
+              },
             };
             await store.completeAgentRun(message.agentRunId, output, completedEvent);
             sendEvent(socket, completedEvent);

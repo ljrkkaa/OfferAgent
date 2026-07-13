@@ -12,6 +12,7 @@ import type {
   VaultUndoConflict,
   LocalToolResultPayload,
   VaultToolErrorCode,
+  WebCitation,
 } from "@offeragent/protocol";
 import { RuntimeRequestError, type RuntimeClient } from "./runtime-supervisor";
 
@@ -23,7 +24,7 @@ export interface SidebarViewModel {
     agentRuns: AgentRunRecord[];
     conversations: ConversationSummary[];
     error?: { code: ProviderErrorCode | VaultToolErrorCode; message: string };
-    messages: Array<{ role: "assistant" | "user"; text: string }>;
+    messages: Array<{ citations?: WebCitation[]; role: "assistant" | "user"; text: string }>;
     models: ModelDescriptor[];
     runState: "idle" | "streaming";
     selectedModelId?: string;
@@ -170,7 +171,11 @@ export class SidebarController {
       ...this.#viewModel.conversation,
       activeConversationId: snapshot.conversation.id,
       agentRuns: snapshot.agentRuns,
-      messages: snapshot.messages.map(({ role, text }) => ({ role, text })),
+      messages: snapshot.messages.map(({ role, text, citations }) => ({
+        role,
+        text,
+        ...(citations ? { citations } : {}),
+      })),
       runState: "idle",
       selectedModelId: snapshot.conversation.modelId,
       toolCalls: snapshot.toolCalls ?? [],

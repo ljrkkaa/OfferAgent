@@ -12,6 +12,7 @@ const MODEL: ModelDescriptor = {
 };
 
 export class FakeModelProvider implements ModelProvider {
+  readonly backendId = "fake";
   #toolCallSequence = 0;
 
   async listModels(): Promise<ModelDescriptor[]> {
@@ -29,6 +30,51 @@ export class FakeModelProvider implements ModelProvider {
       );
     }
     const userInput = request.input.find((item) => item.type === "user_message")?.text ?? "";
+    if (userInput.trim() === "hosted_search_demo") {
+      yield {
+        type: "hosted_web_search_call",
+        callId: "fake-hosted-search",
+        sources: [{ url: "https://example.com/source", title: "Example source" }],
+      };
+      yield { type: "output_text.delta", delta: "A cited answer [1]" };
+      yield {
+        type: "url_citation",
+        citation: {
+          url: "https://example.com/source",
+          title: "Example source",
+          startIndex: 15,
+          endIndex: 18,
+        },
+      };
+      return;
+    }
+    if (userInput.trim() === "citation_then_tool") {
+      const toolResult = [...request.input].reverse().find(
+        (item) => item.type === "local_tool_result" && item.callId.startsWith("fake-citation-read-"),
+      );
+      if (!toolResult) {
+        this.#toolCallSequence += 1;
+        yield { type: "output_text.delta", delta: "Old cited [1]" };
+        yield {
+          type: "url_citation",
+          citation: {
+            url: "https://example.com/old",
+            title: "Old source",
+            startIndex: 10,
+            endIndex: 13,
+          },
+        };
+        yield {
+          type: "local_tool_call",
+          callId: `fake-citation-read-${this.#toolCallSequence}`,
+          name: "vault_read",
+          arguments: { path: "notes/citation.md", lineStart: 1, lineEnd: 1 },
+        };
+        return;
+      }
+      yield { type: "output_text.delta", delta: "Final answer without a citation" };
+      return;
+    }
     const staleFlow = /^stale_evidence_flow\s+([^\s]+)$/i.exec(userInput.trim());
     if (staleFlow) {
       const calls = request.input.filter((item) => item.type === "local_tool_call");
@@ -111,6 +157,10 @@ export class FakeModelProvider implements ModelProvider {
 }
 
 function fakeToolRequest(input: string): { name: LocalToolName; arguments: unknown } | undefined {
+  const webRead = /^web_read\s+(.+)$/i.exec(input.trim());
+  if (webRead) {
+    return { name: "web_read", arguments: { url: webRead[1].trim() } };
+  }
   const change = /^vault_propose_changes\s+([\s\S]+)$/i.exec(input.trim());
   if (change) {
     try {

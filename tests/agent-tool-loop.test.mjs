@@ -58,7 +58,7 @@ function runWithToolPeer(socket, requestPayload, resultForCall) {
       const event = JSON.parse(data.toString("utf8"));
       if (event.agentRunId !== requestPayload.agentRunId) return;
       events.push(event);
-      if (event.type === "tool_call.requested") {
+      if (event.type === "tool_call.requested" && event.tool.kind === "local") {
         const result =
           event.tool.name === "agent_contract_read"
             ? {
@@ -208,6 +208,62 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
     "failed",
   );
   assert.equal(failedToolEvents.at(-1).type, "agent_run.completed");
+
+  const webReadEvents = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "web-read-run-start",
+      conversationId: "tool-conversation",
+      agentRunId: "web-read-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "web_read file:///etc/passwd" },
+    },
+    () => { throw new Error("Runtime-owned web_read must not reach the plugin peer."); },
+  );
+  const webReadRequest = webReadEvents.find(
+    (event) => event.type === "tool_call.requested" && event.tool.name === "web_read",
+  );
+  const webReadResult = webReadEvents.find(
+    (event) => event.type === "tool_call.completed" && event.tool.name === "web_read",
+  );
+  assert.ok(webReadRequest, JSON.stringify(webReadEvents));
+  assert.ok(webReadResult, JSON.stringify(webReadEvents));
+  assert.equal(webReadRequest.tool.kind, "runtime");
+  assert.equal(webReadResult.status, "failed");
+  assert.equal(webReadResult.error.code, "unsafe_url");
+  assert.equal(webReadEvents.at(-1).type, "agent_run.completed");
+
+  const citationLifecycleEvents = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "citation-lifecycle-start",
+      conversationId: "tool-conversation",
+      agentRunId: "citation-lifecycle-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "citation_then_tool" },
+    },
+    () => ({
+      ok: true,
+      value: {
+        type: "vault_read",
+        path: "notes/citation.md",
+        lineStart: 1,
+        lineEnd: 1,
+        modifiedVersion: "mtime:2:size:4",
+        contentHash: "sha256:citation-evidence",
+        content: "fact",
+        truncated: false,
+      },
+    }),
+  );
+  assert.equal(citationLifecycleEvents.at(-1).output.text, "Final answer without a citation");
+  assert.equal("citations" in citationLifecycleEvents.at(-1).output, false);
 
   const searchEvents = await runWithToolPeer(
     socket,
@@ -441,6 +497,8 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
     [
       { name: "vault_read", status: "completed" },
       { name: "vault_read", status: "failed" },
+      { name: "web_read", status: "failed" },
+      { name: "vault_read", status: "completed" },
       { name: "vault_search", status: "completed" },
       { name: "skill_read", status: "completed" },
       { name: "skill_read", status: "completed" },
@@ -456,7 +514,7 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
     database.exec(
       "SELECT status FROM tool_calls WHERE name IN ('vault_read', 'vault_search') ORDER BY agent_run_id",
     )[0].values,
-    [["failed"], ["completed"], ["completed"]],
+    [["completed"], ["failed"], ["completed"], ["completed"]],
   );
   assert.equal(
     database.exec("SELECT COUNT(*) FROM tool_calls WHERE name = 'skill_read' AND status = 'completed'")[0]
@@ -482,11 +540,14 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
     database.exec(
       `SELECT path, line_start, line_end, modified_version, content_hash, content,
               is_stale, stale_detected_at IS NOT NULL
-       FROM evidence_snapshots`,
+       FROM evidence_snapshots ORDER BY path`,
     )[0].values,
-    [["notes/interview.md", 2, 3, "mtime:1234:size:25", "sha256:source-hash", "second\nthird", 0, 0]],
+    [
+      ["notes/citation.md", 1, 1, "mtime:2:size:4", "sha256:citation-evidence", "fact", 0, 0],
+      ["notes/interview.md", 2, 3, "mtime:1234:size:25", "sha256:source-hash", "second\nthird", 0, 0],
+    ],
   );
-  assert.equal(database.exec("SELECT COUNT(*) FROM evidence_snapshots")[0].values[0][0], 1);
+  assert.equal(database.exec("SELECT COUNT(*) FROM evidence_snapshots")[0].values[0][0], 2);
   assert.equal(
     (await readFile(statePath)).includes(Buffer.from("first\nsecond\nthird\nfourth")),
     false,

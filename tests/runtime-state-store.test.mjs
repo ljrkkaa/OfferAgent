@@ -262,6 +262,69 @@ test("populated v3 tool and evidence tables survive the current control-tool reb
   upgraded.close();
 });
 
+test("hosted Web Search capability is persisted per backend and model", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-capability-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  let store = await RuntimeStateStore.open(statePath);
+  assert.equal(await store.getProviderCapability("codex:test", "model-a", "hosted_web_search"), "unknown");
+  await store.setProviderCapability("codex:test", "model-a", "hosted_web_search", "available");
+  assert.equal(await store.getProviderCapability("codex:test", "model-a", "hosted_web_search"), "available");
+  assert.equal(await store.getProviderCapability("codex:test", "model-b", "hosted_web_search"), "unknown");
+  await store.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  assert.equal(await store.getProviderCapability("codex:test", "model-a", "hosted_web_search"), "available");
+  await store.resetProviderCapability("codex:test", "model-a", "hosted_web_search");
+  assert.equal(await store.getProviderCapability("codex:test", "model-a", "hosted_web_search"), "unknown");
+
+  await store.beginAgentRun("web-conversation", "web-run", "model-a", "read web");
+  await store.requestToolCall("web-run", {
+    type: "tool_call.requested",
+    protocolVersion: 1,
+    eventId: "web-read-requested",
+    conversationId: "web-conversation",
+    agentRunId: "web-run",
+    sequence: 2,
+    toolCallId: "web-read-call",
+    tool: { kind: "runtime", name: "web_read", arguments: { url: "https://example.com" } },
+  });
+  await store.completeToolCall("web-run", {
+    ok: false,
+    error: { code: "unreadable_content", message: "Page unavailable" },
+  }, {
+    type: "tool_call.completed",
+    protocolVersion: 1,
+    eventId: "web-read-completed",
+    conversationId: "web-conversation",
+    agentRunId: "web-run",
+    sequence: 3,
+    toolCallId: "web-read-call",
+    tool: { kind: "runtime", name: "web_read" },
+    status: "failed",
+    error: { code: "unreadable_content", message: "Page unavailable" },
+  });
+  const citation = {
+    url: "https://example.com/source",
+    title: "Source",
+    startIndex: 7,
+    endIndex: 10,
+  };
+  await store.completeAgentRun("web-run", "Answer [1]", {
+    type: "agent_run.completed",
+    protocolVersion: 1,
+    eventId: "web-run-completed",
+    conversationId: "web-conversation",
+    agentRunId: "web-run",
+    sequence: 4,
+    output: { role: "assistant", text: "Answer [1]", citations: [citation] },
+  });
+  const snapshot = await store.getConversation("web-conversation");
+  assert.equal(snapshot.toolCalls[0].name, "web_read");
+  assert.deepEqual(snapshot.messages.at(-1).citations, [citation]);
+  await store.close();
+});
+
 test("Runtime State rolls back a failed write and serves consistent concurrent reads", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-transactions-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
@@ -587,7 +650,7 @@ test("the v7 migration purges legacy Vault Change bodies from tables and databas
     FROM vault_change_batches_v7_fixture;
     DROP TABLE vault_change_batches_v7_fixture;
     CREATE INDEX vault_change_batches_by_run ON vault_change_batches(agent_run_id, created_at);
-    DELETE FROM schema_migrations WHERE version = 7;
+    DELETE FROM schema_migrations WHERE version >= 7;
     UPDATE settings_metadata SET value = '6' WHERE key = 'schema_version';
     PRAGMA user_version = 6;
   `);

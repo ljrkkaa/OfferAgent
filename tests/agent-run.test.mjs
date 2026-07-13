@@ -49,6 +49,28 @@ function getJson(port, token, pathname) {
   });
 }
 
+function postJson(port, token, pathname) {
+  return new Promise((resolve, reject) => {
+    const outgoing = request(
+      {
+        host: "127.0.0.1",
+        port,
+        path: pathname,
+        method: "POST",
+        headers: { authorization: `Bearer ${token}` },
+      },
+      (response) => {
+        let body = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => (body += chunk));
+        response.on("end", () => resolve({ statusCode: response.statusCode, body: JSON.parse(body) }));
+      },
+    );
+    outgoing.once("error", reject);
+    outgoing.end();
+  });
+}
+
 function collectRunEvents(socket, agentRunId) {
   return new Promise((resolve, reject) => {
     const events = [];
@@ -231,7 +253,55 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
       }
       if (incoming.url === "/responses") {
         const requestPayload = JSON.parse(body);
+        if (
+          responseMode === "unsupported" &&
+          requestPayload.tools.some((tool) => tool.type === "web_search")
+        ) {
+          response.writeHead(400, { "content-type": "application/json" });
+          response.end(JSON.stringify({
+            error: { message: "Unsupported tool parameter: web_search" },
+          }));
+          return;
+        }
+        if (
+          responseMode === "probe-failure" &&
+          requestPayload.tools.some((tool) => tool.type === "web_search")
+        ) {
+          response.writeHead(503, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: { message: "Temporary upstream outage" } }));
+          return;
+        }
         response.writeHead(200, { "content-type": "text/event-stream" });
+        if (responseMode === "probe-failure") {
+          if (requestPayload.input.some((item) => item.type === "function_call_output")) {
+            response.end(
+              'data: {"type":"response.output_text.delta","delta":"Continued without hosted search"}\r\n\r\n' +
+              'data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n',
+            );
+          } else {
+            response.end(
+              `data: ${JSON.stringify({
+                type: "response.output_item.done",
+                item: {
+                  type: "function_call",
+                  id: "item-failed-web-probe",
+                  call_id: "codex-failed-web-probe",
+                  name: "hosted_web_search_probe",
+                  arguments: JSON.stringify({ query: "current changes" }),
+                },
+              })}\r\n\r\n` +
+              'data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n',
+            );
+          }
+          return;
+        }
+        if (responseMode === "unsupported") {
+          response.end(
+            'data: {"type":"response.output_text.delta","delta":"Fallback without hosted search"}\r\n\r\n' +
+            'data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n',
+          );
+          return;
+        }
         if (responseMode === "oversized-arguments") {
           response.end(
             `data: ${JSON.stringify({
@@ -279,6 +349,58 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
               'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"item-vault-read","call_id":"codex-vault-call","name":"vault_read","arguments":"{\\"path\\":\\"notes/a.md\\",\\"lineStart\\":1,\\"lineEnd\\":2}"}}\r\n\r\n',
             );
           }
+          response.end('data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n');
+          return;
+        }
+        if (responseMode === "web") {
+          if (requestPayload.input[0]?.content?.[0]?.text === "Reply OK.") {
+            response.end(
+              'data: {"type":"response.output_text.delta","delta":"OK"}\r\n\r\n' +
+              'data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n',
+            );
+            return;
+          }
+          if (!requestPayload.tools.some((tool) => tool.type === "web_search")) {
+            response.end(
+              `data: ${JSON.stringify({
+                type: "response.output_item.done",
+                item: {
+                  type: "function_call",
+                  id: "item-web-probe",
+                  call_id: "codex-web-probe",
+                  name: "hosted_web_search_probe",
+                  arguments: JSON.stringify({ query: "current changes" }),
+                },
+              })}\r\n\r\n` +
+              'data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n',
+            );
+            return;
+          }
+          response.write('data: {"type":"response.output_text.delta","delta":"Current answer [1]"}\r\n\r\n');
+          const webSources = [
+            { type: "url", url: "https://example.com/source", title: "Primary source" },
+            { type: "url", url: "https://example.com/no-title", title: "x".repeat(600) },
+            { type: "url", url: `https://example.com/${"x".repeat(2_100)}`, title: "Invalid URL" },
+            ...Array.from({ length: 22 }, (_, index) => ({
+              type: "url",
+              url: `https://example.com/source-${index}`,
+              title: `Source ${index}`,
+            })),
+          ];
+          response.write(
+            `data: ${JSON.stringify({
+              type: "response.output_item.done",
+              item: {
+                type: "web_search_call",
+                id: "web-search-1",
+                status: "completed",
+                action: { type: "search", sources: webSources },
+              },
+            })}\r\n\r\n`,
+          );
+          response.write(
+            'data: {"type":"response.output_item.done","item":{"type":"message","id":"message-web","content":[{"type":"output_text","text":"Current answer [1]","annotations":[{"type":"url_citation","url":"https://example.com/source","title":"Primary source","start_index":15,"end_index":18}]}]}}\r\n\r\n',
+          );
           response.end('data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n');
           return;
         }
@@ -378,14 +500,130 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   assert.equal(responseRequest.stream, true);
   assert.equal(responseRequest.input[0].content[0].text, "Prepare me.");
   assert.match(responseRequest.instructions, /CONTRACT_RULE/);
-  assert.deepEqual(responseRequest.tools.map((tool) => tool.name), [
+  assert.deepEqual(responseRequest.tools.filter((tool) => tool.type === "function").map((tool) => tool.name), [
+    "web_read",
     "vault_list",
     "vault_search",
     "skill_read",
     "vault_propose_changes",
     "vault_read",
+    "hosted_web_search_probe",
   ]);
-  assert.ok(responseRequest.tools.every((tool) => tool.strict === false));
+  assert.equal(responseRequest.tools.some((tool) => tool.type === "web_search"), false);
+  assert.ok(responseRequest.tools.filter((tool) => tool.type === "function").every((tool) => tool.strict === false));
+
+  assert.deepEqual(await getJson(
+    handshake.port,
+    token,
+    "/capabilities/web-search?model=gpt-5.4",
+  ), {
+    statusCode: 200,
+    body: { modelId: "gpt-5.4", status: "unknown" },
+  });
+
+  responseMode = "probe-failure";
+  const failedProbeStart = upstreamRequests.length;
+  const failedProbeRun = collectRunEvents(socket, "agent-run-codex-probe-failure");
+  socket.send(JSON.stringify({
+    type: "agent_run.start",
+    protocolVersion: 1,
+    eventId: "client-codex-probe-failure",
+    conversationId: "conversation-codex-probe-failure",
+    agentRunId: "agent-run-codex-probe-failure",
+    sequence: 0,
+    model: "gpt-5.4",
+    input: { role: "user", text: "Search despite a temporary outage." },
+  }));
+  const failedProbeEvents = await failedProbeRun;
+  assert.equal(failedProbeEvents.at(-1).type, "agent_run.completed");
+  assert.equal(failedProbeEvents.at(-1).output.text, "Continued without hosted search");
+  const failedProbeTool = failedProbeEvents.find(
+    (event) => event.type === "tool_call.completed" && event.tool.name === "hosted_web_search_probe",
+  );
+  assert.equal(failedProbeTool.status, "failed");
+  assert.equal(failedProbeTool.error.code, "tool_error");
+  assert.equal(
+    upstreamRequests.slice(failedProbeStart).filter((candidate) => candidate.url === "/responses").length,
+    3,
+  );
+  assert.deepEqual(await getJson(
+    handshake.port,
+    token,
+    "/capabilities/web-search?model=gpt-5.4",
+  ), {
+    statusCode: 200,
+    body: { modelId: "gpt-5.4", status: "unknown" },
+  });
+
+  responseMode = "web";
+  const webRun = collectRunEvents(socket, "agent-run-codex-web");
+  socket.send(JSON.stringify({
+    type: "agent_run.start",
+    protocolVersion: 1,
+    eventId: "client-codex-web",
+    conversationId: "conversation-codex-web",
+    agentRunId: "agent-run-codex-web",
+    sequence: 0,
+    model: "gpt-5.4",
+    input: { role: "user", text: "Search the web." },
+  }));
+  const webEvents = await webRun;
+  const boundedSources = webEvents.find(
+    (event) => event.type === "hosted_web_search.completed",
+  ).sources;
+  assert.equal(boundedSources.length, 19);
+  assert.deepEqual(boundedSources[0], {
+    url: "https://example.com/source",
+    title: "Primary source",
+  });
+  assert.deepEqual(boundedSources[1], { url: "https://example.com/no-title" });
+  assert.equal(boundedSources.every(({ url, title }) => url.length <= 2_048 && (!title || title.length <= 512)), true);
+  assert.deepEqual(webEvents.at(-1).output.citations, [{
+    url: "https://example.com/source",
+    title: "Primary source",
+    startIndex: 15,
+    endIndex: 18,
+  }]);
+  assert.deepEqual(await postJson(
+    handshake.port,
+    token,
+    "/capabilities/web-search?model=gpt-5.4",
+  ), {
+    statusCode: 200,
+    body: { modelId: "gpt-5.4", status: "available" },
+  });
+
+  responseMode = "unsupported";
+  const unsupportedStart = upstreamRequests.length;
+  const fallbackRun = collectRunEvents(socket, "agent-run-codex-fallback");
+  socket.send(JSON.stringify({
+    type: "agent_run.start",
+    protocolVersion: 1,
+    eventId: "client-codex-fallback",
+    conversationId: "conversation-codex-fallback",
+    agentRunId: "agent-run-codex-fallback",
+    sequence: 0,
+    model: "gpt-5.4",
+    input: { role: "user", text: "Search if supported." },
+  }));
+  const fallbackEvents = await fallbackRun;
+  assert.equal(fallbackEvents.at(-1).output.text, "Fallback without hosted search");
+  const fallbackRequests = upstreamRequests
+    .slice(unsupportedStart)
+    .filter((candidate) => candidate.url === "/responses")
+    .map((candidate) => JSON.parse(candidate.body));
+  assert.equal(fallbackRequests.length, 2);
+  assert.equal(fallbackRequests[0].tools.some((tool) => tool.type === "web_search"), true);
+  assert.equal(fallbackRequests[1].tools.some((tool) => tool.type === "web_search"), false);
+  assert.equal(fallbackRequests[1].tools.some((tool) => tool.name === "web_read"), true);
+  assert.deepEqual(await getJson(
+    handshake.port,
+    token,
+    "/capabilities/web-search?model=gpt-5.4",
+  ), {
+    statusCode: 200,
+    body: { modelId: "gpt-5.4", status: "unavailable" },
+  });
 
   responseMode = "tool";
   const toolRunEvents = [];
@@ -552,9 +790,12 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   assert.ok(finalInstructions.indexOf("SKILL_WORKFLOW") < finalInstructions.indexOf("Model defaults"));
   assert.match(finalInstructions, /cannot add tools, grant permissions, create sub-agents/);
   assert.deepEqual(
-    instructionRequests[2].tools.map((tool) => tool.name),
-    ["vault_list", "vault_search", "skill_read", "vault_propose_changes", "vault_read"],
+    instructionRequests[2].tools
+      .filter((tool) => tool.type === "function")
+      .map((tool) => tool.name),
+    ["web_read", "vault_list", "vault_search", "skill_read", "vault_propose_changes", "vault_read"],
   );
+  assert.equal(instructionRequests[2].tools.some((tool) => tool.type === "web_search"), false);
   assert.equal(instructionRequests[2].tools.some((tool) => tool.name === "shell"), false);
 
   responseMode = "truncated";

@@ -1,4 +1,11 @@
-import type { LocalToolName, LocalToolResultPayload, ModelDescriptor, ProviderErrorCode } from "@offeragent/protocol";
+import type {
+  LocalToolName,
+  LocalToolResultPayload,
+  ModelDescriptor,
+  ProviderErrorCode,
+  WebCitation,
+  WebSearchSource,
+} from "@offeragent/protocol";
 
 export const MAX_LOCAL_TOOL_ARGUMENT_BYTES = 8_192;
 
@@ -9,23 +16,34 @@ export type ModelConversationItem =
 
 export type ModelStreamEvent =
   | { type: "output_text.delta"; delta: string }
-  | { type: "local_tool_call"; callId: string; name: LocalToolName; arguments: unknown };
+  | { type: "local_tool_call"; callId: string; name: LocalToolName; arguments: unknown }
+  | { type: "hosted_web_search_call"; callId: string; sources: WebSearchSource[] }
+  | { type: "url_citation"; citation: WebCitation };
 
 export interface LocalToolDefinition {
+  kind: "local";
   description: string;
   name: LocalToolName;
   parameters: Record<string, unknown>;
 }
+
+export interface HostedToolDefinition {
+  kind: "hosted";
+  name: "web_search";
+}
+
+export type ModelToolDefinition = HostedToolDefinition | LocalToolDefinition;
 
 export interface ModelRequest {
   input: ModelConversationItem[];
   instructions: string;
   model: string;
   signal: AbortSignal;
-  tools: LocalToolDefinition[];
+  tools: ModelToolDefinition[];
 }
 
 export interface ModelProvider {
+  readonly backendId: string;
   listModels(): Promise<ModelDescriptor[]>;
   stream(request: ModelRequest): AsyncIterable<ModelStreamEvent>;
 }
