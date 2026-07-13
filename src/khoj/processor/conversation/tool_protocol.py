@@ -18,15 +18,17 @@ class PlannedToolCall(BaseModel):
 class ToolPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    requires_write_action: bool
     calls: list[PlannedToolCall]
 
 
-def parse_tool_plan(text: str) -> list[ToolCall]:
+def parse_tool_plan(text: str) -> tuple[bool, list[ToolCall]]:
     try:
         plan = ToolPlan.model_validate(json.loads(text))
     except (json.JSONDecodeError, TypeError, ValueError, ValidationError) as error:
         raise ValueError(f"invalid tool plan: {error}") from None
-    return [ToolCall(name=call.name, args=call.args, id=call.id) for call in plan.calls]
+    calls = [ToolCall(name=call.name, args=call.args, id=call.id) for call in plan.calls]
+    return plan.requires_write_action, calls
 
 
 def validate_tool_arguments(tool: ToolDefinition, args: dict[str, Any]) -> None:

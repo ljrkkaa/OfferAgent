@@ -214,9 +214,6 @@ export const stepTwoSuggestion: { [key: string]: StepTwoSuggestion[] } = {
     ],
     [SuggestionType.Learning]: [
         {
-            prompt: "/research look up how Alpha Fold works and explain it to me.",
-        },
-        {
             prompt: "Explain the key equations of general relativity.",
         },
         {
@@ -224,9 +221,6 @@ export const stepTwoSuggestion: { [key: string]: StepTwoSuggestion[] } = {
         },
         {
             prompt: "What are the key principles of Stoicism?",
-        },
-        {
-            prompt: "/research what are the causes behind the breakthroughs in AI in the last 5 years.",
         },
     ],
     [SuggestionType.Language]: [

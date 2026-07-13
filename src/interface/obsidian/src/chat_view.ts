@@ -4,7 +4,6 @@ import {
 	Scope,
 	WorkspaceLeaf,
 	setIcon,
-	Platform,
 	sanitizeHTMLToDom,
 } from "obsidian";
 import { KhojPaneView } from "src/pane_view";
@@ -56,13 +55,6 @@ interface RenderMessageOptions {
 	isSystemMessage?: boolean;
 }
 
-interface ChatMode {
-	value: string;
-	label: string;
-	iconName: string;
-	command: string;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
@@ -74,53 +66,15 @@ export class KhojChatView extends KhojPaneView {
 		timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
 	};
 	keyPressTimeout: NodeJS.Timeout | null = null;
-	userMessages: string[] = []; // Store user sent messages for input history cycling
-	currentMessageIndex: number = -1; // Track current message index in userMessages array
-	private currentUserInput: string = ""; // Stores the current user input that is being typed in chat
 	private startingMessage: string = this.getLearningMoment();
 	chatMessageState: ChatMessageState;
 	private fileAccessMode: "none" | "read" | "write" = "read"; // Track the current file access mode
-	// TODO: Only show modes available on server and to current agent
-	private chatModes: ChatMode[] = [
-		{
-			value: "default",
-			label: "Default",
-			iconName: "target",
-			command: "/default",
-		},
-		{
-			value: "general",
-			label: "General",
-			iconName: "message-circle",
-			command: "/general",
-		},
-		{
-			value: "notes",
-			label: "Notes",
-			iconName: "file-text",
-			command: "/notes",
-		},
-		{
-			value: "online",
-			label: "Online",
-			iconName: "globe",
-			command: "/online",
-		},
-		{
-			value: "research",
-			label: "Research",
-			iconName: "microscope",
-			command: "/research",
-		},
-	];
 	private fileInteractions: FileInteractions;
 	private runtime: ChatRuntime;
 	private pendingVaultActions: VaultAction[] = [];
 	private pendingVaultActionConversationId: string | null = null;
 	private pendingVaultActionMessage: Element | null = null;
 	private pendingVaultActionButtons: HTMLDivElement | null = null;
-	private modeDropdown: HTMLElement | null = null;
-	private selectedOptionIndex: number = -1;
 	private isStreaming: boolean = false; // Flag to track streaming state
 
 	constructor(leaf: WorkspaceLeaf, plugin: Khoj) {
@@ -181,35 +135,6 @@ export class KhojChatView extends KhojPaneView {
 
 		// Store the message in the array if it's not empty
 		if (user_message) {
-			// Get the selected mode
-			const selectedMode = this.chatModes.find((mode) =>
-				this.contentEl.querySelector(
-					`#khoj-mode-${mode.value}:checked`,
-				),
-			);
-
-			// Check if message starts with a mode command
-			const modeMatch = this.chatModes.find((mode) =>
-				user_message.startsWith(mode.command),
-			);
-
-			let displayMessage = user_message;
-			let apiMessage = user_message;
-
-			if (modeMatch) {
-				// If message starts with a mode command, replace it with the icon in display
-				// We'll use a generic marker since we can't display SVG icons in messages
-				displayMessage = user_message.replace(
-					modeMatch.command,
-					`[${modeMatch.label}]`,
-				);
-			} else if (selectedMode) {
-				// If no mode in message but mode selected, add the mode command for API
-				displayMessage = `[${selectedMode.label}] ${user_message}`;
-				apiMessage = `${selectedMode.command} ${user_message}`;
-			}
-
-			this.userMessages.push(user_message);
 			// Update starting message after sending a new message
 			this.startingMessage = this.getLearningMoment();
 			input_el.placeholder = this.startingMessage;
@@ -219,7 +144,7 @@ export class KhojChatView extends KhojPaneView {
 			this.autoResize();
 
 			// Get and render chat response to user message
-			await this.getChatResponse(apiMessage, displayMessage);
+			await this.getChatResponse(user_message, user_message);
 		}
 	}
 
@@ -317,7 +242,6 @@ export class KhojChatView extends KhojPaneView {
 		});
 		chatInput.addEventListener("keydown", (event) => {
 			this.incrementalChat(event);
-			this.handleArrowKeys(event);
 		});
 
 		let send = inputRow.createEl("button", {
@@ -861,18 +785,7 @@ export class KhojChatView extends KhojPaneView {
 	}
 
 	getLearningMoment(): string {
-		const modifierKey = Platform.isMacOS ? "⌘" : "^";
-		const learningMoments = ["Type '/' to select response mode."];
-		if (this.userMessages.length > 0) {
-			learningMoments.push(
-				`Load previous messages with ${modifierKey}+↑/↓`,
-			);
-		}
-
-		// Return a random learning moment
-		return learningMoments[
-			Math.floor(Math.random() * learningMoments.length)
-		];
+		return "Ask about your notes or anything else.";
 	}
 
 	async createNewConversation() {
@@ -883,7 +796,6 @@ export class KhojChatView extends KhojPaneView {
 		chatBodyEl.dataset.conversationId = "";
 		chatBodyEl.dataset.conversationTitle = "";
 		this.selectConversation(null);
-		this.userMessages = [];
 		this.startingMessage = this.getLearningMoment();
 
 		// Update the placeholder of the chat input
@@ -921,7 +833,6 @@ export class KhojChatView extends KhojPaneView {
 	}
 
 	async toggleChatSessions(forceShow: boolean = false): Promise<boolean> {
-		this.userMessages = []; // clear user previous message history
 		let chatBodyEl = this.contentEl.getElementsByClassName(
 			"khoj-chat-body",
 		)[0] as HTMLElement;
@@ -1202,13 +1113,6 @@ export class KhojChatView extends KhojPaneView {
 				chatHistory.slug || `New conversation 🌱`;
 
 			chatHistory.chat.forEach((chatLog) => {
-				// Convert commands to emojis for user messages
-				if (chatLog.by === "you") {
-					chatLog.message = this.convertCommandsToEmojis(
-						chatLog.message,
-					);
-				}
-
 				this.renderMessageWithReferences(
 					chatBodyEl,
 					chatLog.message,
@@ -1219,10 +1123,6 @@ export class KhojChatView extends KhojPaneView {
 					chatLog.created ? new Date(chatLog.created) : undefined,
 					chatLog.by === "you" ? chatLog.images : undefined,
 				);
-				// push the user messages to the chat history
-				if (chatLog.by === "you") {
-					this.userMessages.push(chatLog.message);
-				}
 			});
 
 			// Update starting message after loading history
@@ -1384,24 +1284,7 @@ export class KhojChatView extends KhojPaneView {
 		// Get open files content if we have access
 		const openFilesContent = await this.getOpenFilesContent();
 
-		// Extract mode command if present
-		const firstToken = query.trimStart().split(/\s+/, 1)[0];
-		const modeMatch = this.chatModes.find(
-			(mode) => mode.command === firstToken,
-		);
-		const modeCommand = modeMatch
-			? query.substring(0, modeMatch.command.length)
-			: "";
-		const queryWithoutMode = modeMatch
-			? query.substring(modeMatch.command.length).trim()
-			: query;
-
-		// Combine mode, query and files content
-		const finalQuery =
-			modeCommand +
-			(modeCommand ? " " : "") +
-			queryWithoutMode +
-			openFilesContent;
+		const finalQuery = query.trim() + openFilesContent;
 
 		const body: Omit<ChatRequest, "conversation_id"> = {
 			q: finalQuery,
@@ -1509,72 +1392,13 @@ export class KhojChatView extends KhojPaneView {
 	}
 
 	incrementalChat(event: KeyboardEvent) {
-		// If dropdown is visible and Enter is pressed, select the current option
-		if (
-			this.modeDropdown &&
-			this.modeDropdown.style.display !== "none" &&
-			event.key === "Enter"
-		) {
-			event.preventDefault();
-
-			const options = this.modeDropdown.querySelectorAll<HTMLElement>(
-				".khoj-mode-dropdown-option",
-			);
-			const visibleOptions = Array.from(options).filter(
-				(option) => option.style.display !== "none",
-			);
-
-			// If any option is selected, use that one
-			if (
-				this.selectedOptionIndex >= 0 &&
-				this.selectedOptionIndex < visibleOptions.length
-			) {
-				const selectedOption = visibleOptions[this.selectedOptionIndex];
-				const index = parseInt(
-					selectedOption.getAttribute("data-index") || "0",
-				);
-				const chatInput = <HTMLTextAreaElement>(
-					this.contentEl.getElementsByClassName("khoj-chat-input")[0]
-				);
-
-				chatInput.value = this.chatModes[index].command + " ";
-				chatInput.focus();
-				this.currentUserInput = chatInput.value;
-				this.hideModeDropdown();
-			}
-			// If no option is selected but there's exactly one visible option, use that
-			else if (visibleOptions.length === 1) {
-				const onlyOption = visibleOptions[0];
-				const index = parseInt(
-					onlyOption.getAttribute("data-index") || "0",
-				);
-				const chatInput = <HTMLTextAreaElement>(
-					this.contentEl.getElementsByClassName("khoj-chat-input")[0]
-				);
-
-				chatInput.value = this.chatModes[index].command + " ";
-				chatInput.focus();
-				this.currentUserInput = chatInput.value;
-				this.hideModeDropdown();
-			}
-			return;
-		}
-
 		const chatInput = <HTMLTextAreaElement>(
 			this.contentEl.getElementsByClassName("khoj-chat-input")[0]
 		);
 		const trimmedValue = chatInput.value.trim();
 
-		// Check if value is empty or just a mode command
-		const isOnlyModeCommand = this.chatModes.some(
-			(mode) =>
-				trimmedValue === mode.command ||
-				trimmedValue === mode.command + " ",
-		);
-
 		if (event.key === "Enter" && !event.shiftKey) {
-			// If message is empty or just a mode command, don't send
-			if (!trimmedValue || isOnlyModeCommand) {
+			if (!trimmedValue) {
 				event.preventDefault();
 				return;
 			}
@@ -1590,20 +1414,6 @@ export class KhojChatView extends KhojPaneView {
 			this.contentEl.getElementsByClassName("khoj-chat-input")[0]
 		);
 		chatInput.value = chatInput.value.trimStart();
-		this.currentMessageIndex = -1;
-
-		// Store the current input
-		this.currentUserInput = chatInput.value;
-
-		// Check if input starts with "/" and show dropdown
-		if (chatInput.value.startsWith("/")) {
-			this.showModeDropdown(chatInput);
-			this.selectedOptionIndex = -1; // Reset selected index
-		} else if (this.modeDropdown) {
-			// Hide dropdown if input doesn't start with "/"
-			this.hideModeDropdown();
-		}
-
 		this.autoResize();
 	}
 
@@ -1631,15 +1441,6 @@ export class KhojChatView extends KhojPaneView {
 			chatInput.style.overflowY = "hidden";
 		}
 
-		// Update dropdown position if it exists and is visible
-		if (this.modeDropdown && this.modeDropdown.style.display !== "none") {
-			const inputRect = chatInput.getBoundingClientRect();
-			const containerRect = this.contentEl.getBoundingClientRect();
-
-			this.modeDropdown.style.left = `${inputRect.left - containerRect.left}px`;
-			this.modeDropdown.style.top = `${inputRect.top - containerRect.top - 4}px`; // Position above with small gap
-			this.modeDropdown.style.width = `${inputRect.width}px`;
-		}
 	}
 
 	scrollChatToBottom() {
@@ -1780,115 +1581,6 @@ export class KhojChatView extends KhojPaneView {
 		return referencesDiv;
 	}
 
-	// function to loop through the user's past messages
-	handleArrowKeys(event: KeyboardEvent) {
-		const chatInput = <HTMLTextAreaElement>(
-			this.contentEl.getElementsByClassName("khoj-chat-input")[0]
-		);
-
-		// Handle dropdown navigation with arrow keys
-		if (this.modeDropdown && this.modeDropdown.style.display !== "none") {
-			const options = this.modeDropdown.querySelectorAll<HTMLElement>(
-				".khoj-mode-dropdown-option",
-			);
-			// Only consider visible options
-			const visibleOptions = Array.from(options).filter(
-				(option) => option.style.display !== "none",
-			);
-
-			if (visibleOptions.length === 0) {
-				this.hideModeDropdown();
-				return;
-			}
-
-			switch (event.key) {
-				case "ArrowDown":
-					event.preventDefault();
-					if (this.selectedOptionIndex < 0) {
-						this.selectedOptionIndex = 0;
-					} else {
-						this.selectedOptionIndex = Math.min(
-							this.selectedOptionIndex + 1,
-							visibleOptions.length - 1,
-						);
-					}
-					this.highlightVisibleOption(visibleOptions);
-					break;
-
-				case "ArrowUp":
-					event.preventDefault();
-					if (this.selectedOptionIndex < 0) {
-						this.selectedOptionIndex = visibleOptions.length - 1;
-					} else {
-						this.selectedOptionIndex = Math.max(
-							this.selectedOptionIndex - 1,
-							0,
-						);
-					}
-					this.highlightVisibleOption(visibleOptions);
-					break;
-
-				case "Enter":
-					// We handle Enter in incrementalChat now
-					break;
-
-				case "Escape":
-					event.preventDefault();
-					this.hideModeDropdown();
-					break;
-			}
-
-			// Don't process arrow keys for history navigation if dropdown is open
-			if (event.key === "ArrowUp" || event.key === "ArrowDown") {
-				return;
-			}
-		}
-
-		// Original arrow key handling for message history
-		// (Le code existant pour gérer les touches fléchées)
-	}
-
-	/**
-	 * Highlights the selected option among visible options
-	 * @param {HTMLElement[]} visibleOptions - Array of visible dropdown options
-	 */
-	private highlightVisibleOption(visibleOptions: HTMLElement[]) {
-		const allOptions = this.modeDropdown?.querySelectorAll<HTMLElement>(
-			".khoj-mode-dropdown-option",
-		);
-		if (!allOptions) return;
-
-		// Clear highlighting on all options first
-		allOptions.forEach((option) => {
-			option.classList.remove("khoj-mode-dropdown-option-selected");
-		});
-
-		// Add highlighting to the selected visible option
-		if (
-			this.selectedOptionIndex >= 0 &&
-			this.selectedOptionIndex < visibleOptions.length
-		) {
-			const selectedOption = visibleOptions[this.selectedOptionIndex];
-			selectedOption.classList.add("khoj-mode-dropdown-option-selected");
-
-			// Scroll to selected option if needed
-			if (this.modeDropdown) {
-				const container = this.modeDropdown;
-				if (selectedOption.offsetTop < container.scrollTop) {
-					container.scrollTop = selectedOption.offsetTop;
-				} else if (
-					selectedOption.offsetTop + selectedOption.offsetHeight >
-					container.scrollTop + container.offsetHeight
-				) {
-					container.scrollTop =
-						selectedOption.offsetTop +
-						selectedOption.offsetHeight -
-						container.offsetHeight;
-				}
-			}
-		}
-	}
-
 	private async deleteTurnFromBackend(turnId: string): Promise<boolean> {
 		const chatBodyEl = this.contentEl.getElementsByClassName(
 			"khoj-chat-body",
@@ -1911,17 +1603,14 @@ export class KhojChatView extends KhojPaneView {
 		return true;
 	}
 
-	// Add this new method to handle message deletion
 	async deleteMessage(
 		messageEl: HTMLElement,
 		skipPaired: boolean = false,
 		skipBackend: boolean = false,
 	): Promise<boolean> {
-		// Find parent message container
 		const messageContainer = messageEl.closest(".khoj-chat-message");
 		if (!messageContainer) return false;
 
-		// Get paired message to delete if needed
 		let pairedMessageContainer: Element | null = null;
 		if (!skipPaired) {
 			const messages = Array.from(
@@ -1931,15 +1620,12 @@ export class KhojChatView extends KhojPaneView {
 				messageContainer as HTMLElement,
 			);
 
-			// If we're deleting a user message, also delete the subsequent khoj message (if any)
 			if (
 				messageContainer.classList.contains("you") &&
 				currentIndex < messages.length - 1
 			) {
 				pairedMessageContainer = messages[currentIndex + 1];
-			}
-			// If we're deleting a khoj message, also delete the preceding user message (if any)
-			else if (
+			} else if (
 				messageContainer.classList.contains("khoj") &&
 				currentIndex > 0
 			) {
@@ -1947,7 +1633,6 @@ export class KhojChatView extends KhojPaneView {
 			}
 		}
 
-		// Add animation class
 		messageContainer.classList.add("deleting");
 		if (pairedMessageContainer) {
 			pairedMessageContainer.classList.add("deleting");
@@ -1962,16 +1647,14 @@ export class KhojChatView extends KhojPaneView {
 			}
 		}
 
-		// Wait for animation to complete
 		setTimeout(() => {
 			messageContainer.remove();
 			pairedMessageContainer?.remove();
-		}, 300); // Matches the animation duration
+		}, 300);
 
 		return true;
 	}
 
-	// Add this new method after the class declaration
 	private async getOpenFilesContent(): Promise<string> {
 		return this.fileInteractions.getOpenFilesContent(this.fileAccessMode);
 	}
@@ -2111,135 +1794,4 @@ export class KhojChatView extends KhojPaneView {
 		return `${status}:\n${details.join("\n")}`;
 	}
 
-	private convertCommandsToEmojis(message: string): string {
-		const modeMatch = this.chatModes.find((mode) =>
-			message.startsWith(mode.command),
-		);
-		if (modeMatch) {
-			return message.replace(modeMatch.command, `[${modeMatch.label}]`);
-		}
-		return message;
-	}
-
-	private showModeDropdown(inputEl: HTMLTextAreaElement) {
-		// Create dropdown if it doesn't exist
-		if (!this.modeDropdown) {
-			this.modeDropdown = this.contentEl.createDiv({
-				cls: "khoj-mode-dropdown",
-			});
-
-			// Position the dropdown ABOVE the input (instead of below)
-			const inputRect = inputEl.getBoundingClientRect();
-			const containerRect = this.contentEl.getBoundingClientRect();
-
-			this.modeDropdown.style.position = "absolute";
-			this.modeDropdown.style.left = `${inputRect.left - containerRect.left}px`;
-			this.modeDropdown.style.top = `${inputRect.top - containerRect.top - 4}px`; // Position above with small gap
-			this.modeDropdown.style.width = `${inputRect.width}px`;
-			this.modeDropdown.style.zIndex = "1000";
-			this.modeDropdown.style.transform = "translateY(-100%)"; // Move up by 100% of its height
-
-			// Add mode options to dropdown - we'll create all initially then show/hide based on filter
-			this.chatModes.forEach((mode, index) => {
-				const option = this.modeDropdown!.createDiv({
-					cls: "khoj-mode-dropdown-option",
-					attr: {
-						"data-index": index.toString(),
-						"data-command": mode.command,
-					},
-				});
-
-				// Create emoji span and label span for better styling control
-				const emojiSpan = option.createSpan({
-					cls: "khoj-mode-dropdown-emoji",
-				});
-				setIcon(emojiSpan, mode.iconName);
-
-				option.createSpan({
-					cls: "khoj-mode-dropdown-label",
-					text: ` ${mode.label} `,
-				});
-
-				option.createSpan({
-					cls: "khoj-mode-dropdown-command",
-					text: `(${mode.command})`,
-				});
-
-				// Select mode on click
-				option.addEventListener("click", () => {
-					inputEl.value = mode.command + " ";
-					inputEl.focus();
-					this.currentUserInput = inputEl.value;
-					this.hideModeDropdown();
-				});
-			});
-
-			// Close dropdown when clicking outside
-			document.addEventListener("click", (e) => {
-				if (
-					this.modeDropdown &&
-					!this.modeDropdown.contains(e.target as Node) &&
-					e.target !== inputEl
-				) {
-					this.hideModeDropdown();
-				}
-			});
-		} else {
-			// Show the dropdown if it already exists
-			this.modeDropdown.style.display = "block";
-		}
-
-		// Filter options based on current input
-		this.filterDropdownOptions(inputEl.value);
-	}
-
-	/**
-	 * Filters dropdown options based on user input
-	 * @param {string} inputValue - Current input value from textarea
-	 */
-	private filterDropdownOptions(inputValue: string) {
-		if (!this.modeDropdown) return;
-
-		// Get all options
-		const options = this.modeDropdown.querySelectorAll<HTMLElement>(
-			".khoj-mode-dropdown-option",
-		);
-		let visibleOptionsCount = 0;
-
-		options.forEach((option) => {
-			const command = option.getAttribute("data-command") || "";
-
-			// If input starts with "/" and has additional characters, filter based on that
-			if (inputValue.startsWith("/") && inputValue.length > 1) {
-				// Check if command starts with the input value
-				if (
-					command.toLowerCase().startsWith(inputValue.toLowerCase())
-				) {
-					option.style.display = "flex";
-					visibleOptionsCount++;
-				} else {
-					option.style.display = "none";
-				}
-			} else {
-				// Show all options if just "/" is typed
-				option.style.display = "flex";
-				visibleOptionsCount++;
-			}
-		});
-
-		// Hide dropdown if no matches
-		if (visibleOptionsCount === 0) {
-			this.hideModeDropdown();
-		}
-
-		// Reset selection since we filtered the options
-		this.selectedOptionIndex = -1;
-	}
-
-	private hideModeDropdown() {
-		if (this.modeDropdown) {
-			this.modeDropdown.style.display = "none";
-			this.selectedOptionIndex = -1;
-		}
-	}
 }

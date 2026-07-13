@@ -36,11 +36,11 @@ async def test_planner_uses_json_object_without_strict_tool_plan_schema():
 
     async def send_message(**kwargs):
         captured.append(kwargs)
-        return ResponseWithThought(text='{"calls":[]}')
+        return ResponseWithThought(text='{"requires_write_action":false,"calls":[]}')
 
     response = await _send_planner_message(send_message, "plan", [])
 
-    assert response.text == '{"calls":[]}'
+    assert response.text == '{"requires_write_action":false,"calls":[]}'
     assert captured[0]["response_type"] == "json_object"
     assert "response_schema" not in captured[0]
 
@@ -208,9 +208,15 @@ async def test_default_agent_loop_can_search_web_then_write(tmp_path, monkeypatc
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
     responses = iter(
         [
-            json.dumps({"calls": [{"name": "web_search", "args": {"query": "agent evaluation"}, "id": "1"}]}),
             json.dumps(
                 {
+                    "requires_write_action": False,
+                    "calls": [{"name": "web_search", "args": {"query": "agent evaluation"}, "id": "1"}],
+                }
+            ),
+            json.dumps(
+                {
+                    "requires_write_action": False,
                     "calls": [
                         {
                             "name": "append_note",
@@ -222,10 +228,10 @@ async def test_default_agent_loop_can_search_web_then_write(tmp_path, monkeypatc
                             },
                             "id": "2",
                         }
-                    ]
+                    ],
                 }
             ),
-            json.dumps({"calls": []}),
+            json.dumps({"requires_write_action": False, "calls": []}),
         ]
     )
 
@@ -275,9 +281,10 @@ async def test_required_write_cannot_stop_before_preparing_an_action(tmp_path, m
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
     responses = iter(
         [
-            json.dumps({"calls": []}),
+            json.dumps({"requires_write_action": True, "calls": []}),
             json.dumps(
                 {
+                    "requires_write_action": False,
                     "calls": [
                         {
                             "name": "append_note",
@@ -289,10 +296,10 @@ async def test_required_write_cannot_stop_before_preparing_an_action(tmp_path, m
                             },
                             "id": "1",
                         }
-                    ]
+                    ],
                 }
             ),
-            json.dumps({"calls": []}),
+            json.dumps({"requires_write_action": False, "calls": []}),
         ]
     )
     prompts = []
@@ -324,7 +331,6 @@ async def test_required_write_cannot_stop_before_preparing_an_action(tmp_path, m
         allow_openkb=False,
         allow_web=False,
         write_mode="client_actions",
-        require_write_action=True,
     )
 
     assert len(prompts) == 3
@@ -352,7 +358,6 @@ async def test_required_write_reports_truthful_failure_when_planner_retry_fails(
         allow_openkb=False,
         allow_web=False,
         write_mode="client_actions",
-        require_write_action=True,
     )
 
     assert calls == 2
@@ -365,10 +370,21 @@ async def test_required_write_reserves_final_iterations_for_write_tools(tmp_path
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
     responses = iter(
         [
-            json.dumps({"calls": [{"name": "view_file", "args": {"path": "source.md"}, "id": "1"}]}),
-            json.dumps({"calls": [{"name": "view_file", "args": {"path": "extra.md"}, "id": "2"}]}),
             json.dumps(
                 {
+                    "requires_write_action": True,
+                    "calls": [{"name": "view_file", "args": {"path": "source.md"}, "id": "1"}],
+                }
+            ),
+            json.dumps(
+                {
+                    "requires_write_action": False,
+                    "calls": [{"name": "view_file", "args": {"path": "extra.md"}, "id": "2"}],
+                }
+            ),
+            json.dumps(
+                {
+                    "requires_write_action": False,
                     "calls": [
                         {
                             "name": "append_note",
@@ -380,7 +396,7 @@ async def test_required_write_reserves_final_iterations_for_write_tools(tmp_path
                             },
                             "id": "3",
                         }
-                    ]
+                    ],
                 }
             ),
         ]
@@ -415,7 +431,6 @@ async def test_required_write_reserves_final_iterations_for_write_tools(tmp_path
         allow_openkb=False,
         allow_web=False,
         write_mode="client_actions",
-        require_write_action=True,
         max_iterations=3,
     )
 
@@ -439,9 +454,9 @@ async def test_rejected_write_result_keeps_completion_phase_open_for_retry(tmp_p
     }
     responses = iter(
         [
-            json.dumps({"calls": [{**append_call, "id": "1"}]}),
-            json.dumps({"calls": [{**append_call, "id": "2"}]}),
-            json.dumps({"calls": []}),
+            json.dumps({"requires_write_action": True, "calls": [{**append_call, "id": "1"}]}),
+            json.dumps({"requires_write_action": False, "calls": [{**append_call, "id": "2"}]}),
+            json.dumps({"requires_write_action": False, "calls": []}),
         ]
     )
     attempts = 0
@@ -475,7 +490,6 @@ async def test_rejected_write_result_keeps_completion_phase_open_for_retry(tmp_p
         allow_openkb=False,
         allow_web=False,
         write_mode="client_actions",
-        require_write_action=True,
         max_iterations=3,
     )
 
@@ -493,6 +507,7 @@ async def test_disabled_write_mode_rejects_planner_write_call(tmp_path, monkeypa
         [
             json.dumps(
                 {
+                    "requires_write_action": True,
                     "calls": [
                         {
                             "name": "append_note",
@@ -504,10 +519,10 @@ async def test_disabled_write_mode_rejects_planner_write_call(tmp_path, monkeypa
                             },
                             "id": "1",
                         }
-                    ]
+                    ],
                 }
             ),
-            json.dumps({"calls": []}),
+            json.dumps({"requires_write_action": False, "calls": []}),
         ]
     )
 
@@ -524,11 +539,15 @@ async def test_disabled_write_mode_rejects_planner_write_call(tmp_path, monkeypa
         allow_openkb=False,
         allow_web=False,
         write_mode="disabled",
+        max_iterations=2,
     )
 
     assert target.read_text(encoding="utf-8") == "original\n"
     assert result.references == []
-    assert result.errors == ["Agent runtime tool is not available: append_note"]
+    assert result.errors == [
+        "Agent runtime tool is not available: append_note",
+        "Planner exhausted its tool budget without preparing the explicitly requested file change.",
+    ]
 
 
 @pytest.mark.asyncio
@@ -537,7 +556,7 @@ async def test_default_agent_loop_injects_runtime_facts(monkeypatch):
 
     async def fake_send_message(**kwargs):
         captured["query"] = kwargs["query"]
-        return ResponseWithThought(text=json.dumps({"calls": []}))
+        return ResponseWithThought(text=json.dumps({"requires_write_action": False, "calls": []}))
 
     await collect_agent_context_and_actions(
         "hello",
@@ -568,7 +587,7 @@ async def test_default_agent_loop_retries_planner_once(monkeypatch):
         calls += 1
         if calls == 1:
             raise RuntimeError("temporary planner failure")
-        return ResponseWithThought(text=json.dumps({"calls": []}))
+        return ResponseWithThought(text=json.dumps({"requires_write_action": False, "calls": []}))
 
     result = await collect_agent_context_and_actions(
         "hello",
@@ -586,89 +605,17 @@ async def test_default_agent_loop_retries_planner_once(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_explicit_notes_uses_same_planner_and_requires_a_tool(tmp_path, monkeypatch):
-    (tmp_path / "notes.md").write_text("Redis evidence", encoding="utf-8")
+async def test_tool_arguments_are_validated_before_execution(tmp_path, monkeypatch):
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
     responses = iter(
         [
-            json.dumps({"calls": []}),
-            json.dumps({"calls": [{"name": "view_file", "args": {"path": "notes.md"}, "id": "1"}]}),
-            json.dumps({"calls": []}),
+            json.dumps({"requires_write_action": False, "calls": [{"name": "view_file", "args": {}, "id": "1"}]}),
+            json.dumps({"requires_write_action": False, "calls": []}),
         ]
     )
-    prompts = []
-
-    async def fake_send_message(**kwargs):
-        prompts.append(kwargs["query"])
-        return ResponseWithThought(text=next(responses))
-
-    result = await collect_agent_context_and_actions(
-        "Redis",
-        [],
-        user=object(),
-        agent=None,
-        send_message=fake_send_message,
-        allow_local_kb=True,
-        allow_openkb=False,
-        allow_web=False,
-        require_notes_evidence=True,
-    )
-
-    assert len(prompts) == 3
-    assert "explicit Notes request" in prompts[1]
-    assert result.references[0]["uri"] == "local-kb://notes.md#L1-L1"
-
-
-@pytest.mark.asyncio
-async def test_explicit_notes_requires_exact_read_after_discovery(tmp_path, monkeypatch):
-    (tmp_path / "notes.md").write_text("alpha\nRedis evidence\nomega\n", encoding="utf-8")
-    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
-    responses = iter(
-        [
-            json.dumps({"calls": [{"name": "regex_search_files", "args": {"regex_pattern": "Redis"}, "id": "1"}]}),
-            json.dumps({"calls": []}),
-            json.dumps({"calls": [{"name": "view_file", "args": {"path": "notes.md"}, "id": "2"}]}),
-            json.dumps({"calls": []}),
-        ]
-    )
-    prompts = []
-
-    async def fake_send_message(**kwargs):
-        prompts.append(kwargs["query"])
-        return ResponseWithThought(text=next(responses))
-
-    result = await collect_agent_context_and_actions(
-        "Redis",
-        [],
-        user=object(),
-        agent=None,
-        send_message=fake_send_message,
-        allow_local_kb=True,
-        allow_openkb=False,
-        allow_web=False,
-        require_notes_evidence=True,
-    )
-
-    assert "No exact Notes evidence" in prompts[2]
-    assert result.references[0]["uri"] == "local-kb://notes.md#L1-L3"
-
-
-@pytest.mark.asyncio
-async def test_tool_arguments_are_validated_before_permission_and_execution(tmp_path, monkeypatch):
-    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
-    responses = iter(
-        [
-            json.dumps({"calls": [{"name": "view_file", "args": {}, "id": "1"}]}),
-            json.dumps({"calls": []}),
-        ]
-    )
-    permission_checks = []
 
     async def fake_send_message(**kwargs):
         return ResponseWithThought(text=next(responses))
-
-    async def before_tool_call(command):
-        permission_checks.append(command)
 
     result = await collect_agent_context_and_actions(
         "read",
@@ -676,13 +623,11 @@ async def test_tool_arguments_are_validated_before_permission_and_execution(tmp_
         user=object(),
         agent=None,
         send_message=fake_send_message,
-        before_tool_call=before_tool_call,
         allow_local_kb=True,
         allow_openkb=False,
         allow_web=False,
     )
 
-    assert permission_checks == []
     assert result.errors == ["required argument missing for view_file: path"]
 
 
@@ -692,13 +637,14 @@ async def test_default_agent_loop_runs_consecutive_read_tools_concurrently(monke
         [
             json.dumps(
                 {
+                    "requires_write_action": False,
                     "calls": [
                         {"name": "web_search", "args": {"query": "first"}, "id": "1"},
                         {"name": "web_search", "args": {"query": "second"}, "id": "2"},
-                    ]
+                    ],
                 }
             ),
-            json.dumps({"calls": []}),
+            json.dumps({"requires_write_action": False, "calls": []}),
         ]
     )
     active = 0
@@ -741,6 +687,7 @@ async def test_default_agent_loop_does_not_move_read_tool_before_write(tmp_path,
         [
             json.dumps(
                 {
+                    "requires_write_action": False,
                     "calls": [
                         {
                             "name": "append_note",
@@ -753,10 +700,10 @@ async def test_default_agent_loop_does_not_move_read_tool_before_write(tmp_path,
                             "id": "1",
                         },
                         {"name": "web_search", "args": {"query": "after"}, "id": "2"},
-                    ]
+                    ],
                 }
             ),
-            json.dumps({"calls": []}),
+            json.dumps({"requires_write_action": False, "calls": []}),
         ]
     )
     events = []
@@ -808,13 +755,14 @@ async def test_default_agent_loop_keeps_successful_sibling_when_concurrent_tool_
         [
             json.dumps(
                 {
+                    "requires_write_action": False,
                     "calls": [
                         {"name": "web_search", "args": {"query": "bad"}, "id": "1"},
                         {"name": "web_search", "args": {"query": "good"}, "id": "2"},
-                    ]
+                    ],
                 }
             ),
-            json.dumps({"calls": []}),
+            json.dumps({"requires_write_action": False, "calls": []}),
         ]
     )
 
@@ -851,13 +799,14 @@ async def test_default_agent_loop_remaps_concurrent_artifact_ids(monkeypatch):
         [
             json.dumps(
                 {
+                    "requires_write_action": False,
                     "calls": [
                         {"name": "web_search", "args": {"query": "first"}, "id": "1"},
                         {"name": "web_search", "args": {"query": "second"}, "id": "2"},
-                    ]
+                    ],
                 }
             ),
-            json.dumps({"calls": []}),
+            json.dumps({"requires_write_action": False, "calls": []}),
         ]
     )
 
@@ -921,9 +870,15 @@ async def test_default_agent_loop_writes_content_grounded_in_web_tool_result(tmp
 
     responses = iter(
         [
-            json.dumps({"calls": [{"name": "web_search", "args": {"query": "agent evaluation"}, "id": "1"}]}),
             json.dumps(
                 {
+                    "requires_write_action": False,
+                    "calls": [{"name": "web_search", "args": {"query": "agent evaluation"}, "id": "1"}],
+                }
+            ),
+            json.dumps(
+                {
+                    "requires_write_action": False,
                     "calls": [
                         {
                             "name": "append_note",
@@ -935,11 +890,11 @@ async def test_default_agent_loop_writes_content_grounded_in_web_tool_result(tmp
                             },
                             "id": "2",
                         }
-                    ]
+                    ],
                 }
             ),
             json.dumps({"grounded": True, "reason": "grounded in web search result"}),
-            json.dumps({"calls": []}),
+            json.dumps({"requires_write_action": False, "calls": []}),
         ]
     )
 

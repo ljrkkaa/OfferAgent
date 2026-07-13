@@ -95,7 +95,6 @@ class ChatMessageModel(PydanticBaseModel):
     trainOfThought: List[TrainOfThought] = []
     context: List[Context] = []
     onlineContext: Dict[str, OnlineContext] = {}
-    researchContext: Optional[List] = None
     created: Optional[str] = None
     images: Optional[List[str]] = None
     queryFiles: Optional[List[Dict]] = None
@@ -462,12 +461,3 @@ class RateLimitRecord(DbBaseModel):
 
     def __str__(self):
         return f"{self.slug} - {self.identifier} at {self.created_at}"
-
-
-class McpServer(DbBaseModel):
-    name = models.CharField(max_length=50, unique=True)
-    path = models.CharField(max_length=200, unique=True)
-    api_key = models.CharField(max_length=4000, blank=True, null=True)
-
-    def __str__(self):
-        return self.name

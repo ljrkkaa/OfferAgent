@@ -40,7 +40,6 @@ from khoj.database.models import (
     Entry,
     FileObject,
     KhojUser,
-    McpServer,
     ProcessLock,
     RateLimitRecord,
     ServerChatSettings,
@@ -1347,15 +1346,3 @@ class AutomationAdapters:
 
         automation.remove()
         return automation_metadata
-
-
-class McpServerAdapters:
-    @staticmethod
-    async def aget_all_mcp_servers() -> List[McpServer]:
-        """Asynchronously retrieve all McpServer objects from the database."""
-        servers: List[McpServer] = []
-        try:
-            servers = [server async for server in McpServer.objects.all()]
-        except Exception as e:
-            logger.error(f"Error retrieving MCP servers: {e}", exc_info=True)
-        return servers

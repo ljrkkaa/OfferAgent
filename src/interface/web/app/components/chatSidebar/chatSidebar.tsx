@@ -24,6 +24,7 @@ interface ChatSideBarProps {
     isOpen: boolean;
     isMobileWidth?: boolean;
     onOpenChange: (open: boolean) => void;
+    onSummarizeSelected: () => void;
 }
 
 interface FastModeData {
@@ -111,6 +112,7 @@ function ChatSidebarInternal(props: ChatSideBarProps) {
                             conversationId={props.conversationId}
                             uploadedFiles={[]}
                             isMobileWidth={props.isMobileWidth ?? false}
+                            onSummarizeSelected={props.onSummarizeSelected}
                         />
                     </SidebarGroupContent>
                 </SidebarGroup>

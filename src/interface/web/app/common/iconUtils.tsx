@@ -26,13 +26,7 @@ import {
     Wallet,
     PencilLine,
     Chalkboard,
-    Gps,
-    Question,
-    Browser,
     Notebook,
-    ChatsTeardrop,
-    GlobeSimple,
-    ArrowRight,
     Cigarette,
     CraneTower,
     Heart,
@@ -46,10 +40,8 @@ import {
     Oven,
     Gavel,
     Broadcast,
-    KeyReturn,
     FilePdf,
     FileMd,
-    Microscope,
 } from "@phosphor-icons/react";
 
 interface IconMap {
@@ -172,59 +164,6 @@ const iconMap: IconMap = {
         <File className={`${width} ${height} ${color} mr-2`} />
     ),
 };
-
-export function getIconForSlashCommand(command: string, customClassName: string | null = null) {
-    const className = customClassName ?? "h-4 w-4";
-    if (command.includes("summarize")) {
-        return <Gps className={className} />;
-    }
-
-    if (command.includes("help")) {
-        return <Question className={className} />;
-    }
-
-    if (command.includes("automation")) {
-        return <Robot className={className} />;
-    }
-
-    if (command.includes("webpage")) {
-        return <Browser className={className} />;
-    }
-
-    if (command.includes("notes")) {
-        return <Notebook className={className} />;
-    }
-
-    if (command.includes("image")) {
-        return <ImageIcon className={className} />;
-    }
-
-    if (command.includes("default")) {
-        return <KeyReturn className={className} />;
-    }
-
-    if (command.includes("general")) {
-        return <ChatsTeardrop className={className} />;
-    }
-
-    if (command.includes("online")) {
-        return <GlobeSimple className={className} />;
-    }
-
-    if (command.includes("text")) {
-        return <PencilLine className={className} />;
-    }
-
-    if (command.includes("code")) {
-        return <Code className={className} />;
-    }
-
-    if (command.includes("research")) {
-        return <Microscope className={className} />;
-    }
-
-    return <ArrowRight className={className} />;
-}
 
 function getIconFromIconName(
     iconName: string,

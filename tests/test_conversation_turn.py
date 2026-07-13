@@ -33,6 +33,16 @@ def test_chat_message_model_preserves_artifacts():
     assert message.model_dump()["artifacts"][0]["id"] == "assistant:turn-1"
 
 
+def test_chat_message_ignores_removed_research_context():
+    message = ChatMessageModel(
+        by="khoj",
+        message="saved answer",
+        researchContext=[{"legacy": True}],
+    )
+
+    assert "researchContext" not in message.model_dump()
+
+
 @pytest.mark.asyncio
 async def test_persist_conversation_turn_adds_assistant_artifact(monkeypatch):
     captured = {}

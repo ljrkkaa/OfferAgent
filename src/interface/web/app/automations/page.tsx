@@ -177,7 +177,7 @@ const suggestedAutomationsMetadata: AutomationsData[] = [
     {
         subject: "Weekly Newsletter",
         scheduling_request:
-            "/research Compile a message including: 1. A recap of news from last week 2. An at-home workout I can do before work 3. A quote to inspire me for the week ahead",
+            "Compile a message including: 1. A recap of news from last week 2. An at-home workout I can do before work 3. A quote to inspire me for the week ahead",
         schedule: "9AM every Monday",
         next: "Next run at 9AM on Monday",
         crontime: "0 9 * * 1",
@@ -187,7 +187,7 @@ const suggestedAutomationsMetadata: AutomationsData[] = [
     {
         subject: "Front Page of Hacker News",
         scheduling_request:
-            "/research Summarize the top 5 posts from https://news.ycombinator.com/best and share them with me, including links",
+            "Summarize the top 5 posts from https://news.ycombinator.com/best and share them with me, including links",
         schedule: "9PM on every Wednesday",
         next: "Next run at 9PM on Wednesday",
         crontime: "0 21 * * 3",
@@ -197,7 +197,7 @@ const suggestedAutomationsMetadata: AutomationsData[] = [
     {
         subject: "Market Summary",
         scheduling_request:
-            "/research Get the market summary for today and share it with me. Focus on tech stocks and the S&P 500.",
+            "Get the market summary for today and share it with me. Focus on tech stocks and the S&P 500.",
         schedule: "9AM on every weekday",
         next: "Next run at 9AM on Monday",
         crontime: "0 9 * * *",
@@ -216,7 +216,7 @@ const suggestedAutomationsMetadata: AutomationsData[] = [
     {
         subject: "Round-up of research papers about AI in healthcare",
         scheduling_request:
-            "/research Summarize the top 3 research papers about AI in healthcare that were published in the last week. Include links to the full papers.",
+            "Summarize the top 3 research papers about AI in healthcare that were published in the last week. Include links to the full papers.",
         schedule: "9AM every Friday",
         next: "Next run at 9AM on Friday",
         crontime: "0 9 * * 5",

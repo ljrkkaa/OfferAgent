@@ -11,7 +11,6 @@ from khoj.database.models import KhojUser, UserConversationConfig
 from khoj.processor.conversation.knowledge_workspace import search_workspace
 from khoj.routers.helpers import (
     CommonQueryParams,
-    ConversationCommandRateLimiter,
     get_user_config,
     has_user_document_source,
 )
@@ -22,7 +21,6 @@ from khoj.utils.state import SearchType
 # Initialize Router
 api = APIRouter()
 logger = logging.getLogger(__name__)
-conversation_command_rate_limiter = ConversationCommandRateLimiter(rate_limit=2, slug="command")
 
 
 @api.get("/search", response_model=List[SearchResponse])

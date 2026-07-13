@@ -14,7 +14,6 @@ from typing import (
     Annotated,
     Any,
     AsyncGenerator,
-    Callable,
     Dict,
     List,
     Optional,
@@ -78,10 +77,7 @@ from khoj.processor.conversation.google.gemini_chat import (
     converse_gemini,
     gemini_send_message_to_model,
 )
-from khoj.processor.conversation.knowledge_workspace import (
-    get_workspace_sources,
-    read_workspace_document,
-)
+from khoj.processor.conversation.knowledge_workspace import get_workspace_sources
 from khoj.processor.conversation.offeragent_memory import (
     MemorySelection,
     MemoryWriteDecision,
@@ -98,7 +94,6 @@ from khoj.processor.conversation.openai.gpt import (
 )
 from khoj.processor.conversation.utils import (
     ChatEvent,
-    ResearchIteration,
     ResponseWithThought,
     RetryableModelError,
     clean_json,
@@ -114,7 +109,6 @@ from khoj.search_type import text_search
 from khoj.utils import state
 from khoj.utils.helpers import (
     LRU,
-    ConversationCommand,
     ToolDefinition,
     get_file_type,
     in_debug_mode,
@@ -218,26 +212,15 @@ def get_next_url(request: Request) -> str:
     return next_url
 
 
-EXPLICIT_CONVERSATION_COMMANDS = {
-    "/default": ConversationCommand.Default,
-    "/notes": ConversationCommand.Notes,
-    "/general": ConversationCommand.General,
-    "/online": ConversationCommand.Online,
-    "/webpage": ConversationCommand.Webpage,
-    "/summarize": ConversationCommand.Summarize,
-    "/research": ConversationCommand.Research,
-}
-
-
-def parse_conversation_command(query: str) -> tuple[ConversationCommand, str, bool]:
+def parse_summary_command(query: str) -> tuple[str, bool]:
     parts = query.lstrip().split(maxsplit=1)
     token = parts[0] if parts else ""
-    command = EXPLICIT_CONVERSATION_COMMANDS.get(token)
-    if command is None:
-        if token.startswith("/"):
-            raise ValueError(f"Unknown conversation command: {token}")
-        return ConversationCommand.Default, query, False
-    return command, parts[1] if len(parts) > 1 else "", True
+    if token == "/summarize":
+        summary_query = parts[1] if len(parts) > 1 else "Create a general summary of the selected files."
+        return summary_query, True
+    if token.startswith("/"):
+        raise ValueError(f"Unknown conversation command: {token}")
+    return query, False
 
 
 def gather_raw_query_files(
@@ -569,111 +552,6 @@ async def extract_relevant_info(
         tracer=tracer,
     )
     return response.text.strip()
-
-
-async def extract_relevant_summary(
-    q: str,
-    corpus: str,
-    chat_history: List[ChatMessageModel] = [],
-    query_images: List[str] = None,
-    user: KhojUser = None,
-    agent: Agent = None,
-    tracer: dict = {},
-) -> Union[str, None]:
-    """
-    Extract relevant information for a given query from the target corpus
-    """
-
-    if is_none_or_empty(corpus) or is_none_or_empty(q):
-        return None
-
-    personality_context = (
-        prompts.personality_context.format(personality=agent.personality) if agent and agent.personality else ""
-    )
-
-    chat_history_str = construct_chat_history(chat_history)
-
-    extract_relevant_information = prompts.extract_relevant_summary.format(
-        query=q,
-        chat_history=chat_history_str,
-        corpus=corpus.strip(),
-        personality_context=personality_context,
-    )
-
-    agent_chat_model = AgentAdapters.get_agent_chat_model(agent, user) if agent else None
-
-    with timer("Chat actor: Extract relevant information from data", logger):
-        response = await send_message_to_model_wrapper(
-            extract_relevant_information,
-            query_images=query_images,
-            system_message=prompts.system_prompt_extract_relevant_summary,
-            fast_model=True,
-            agent_chat_model=agent_chat_model,
-            user=user,
-            tracer=tracer,
-        )
-    return response.text.strip()
-
-
-async def generate_summary_from_files(
-    q: str,
-    user: KhojUser,
-    file_filters: List[str],
-    chat_history: List[ChatMessageModel] = [],
-    query_images: List[str] = None,
-    query_files: str = None,
-    agent: Agent = None,
-    send_status_func: Optional[Callable] = None,
-    tracer: dict = {},
-):
-    try:
-        local_file_names = []
-        local_context = []
-        if file_filters:
-            for file_filter in file_filters:
-                document = await read_workspace_document(file_filter, user, max_lines=200)
-                if document is None:
-                    yield f"File '{file_filter}' not found in the knowledge workspace."
-                    return
-                file_name, text = document
-                local_file_names.append(file_name)
-                local_context.append(f"File: {file_name}\n\n{text}")
-        if not local_context and not query_files:
-            response_log = "Sorry, I couldn't find anything to summarize."
-            yield response_log
-            return
-
-        contextual_data = " ".join(local_context)
-
-        if query_files:
-            contextual_data += f"\n\n{query_files}"
-
-        if not q:
-            q = "Create a general summary of the file"
-
-        all_file_names = ""
-
-        for file_name in local_file_names:
-            all_file_names += f"- {file_name}\n"
-
-        async for result in send_status_func(f"**Constructing Summary Using:**\n{all_file_names}"):
-            yield {ChatEvent.STATUS: result}
-
-        response = await extract_relevant_summary(
-            q,
-            contextual_data,
-            chat_history=chat_history,
-            query_images=query_images,
-            user=user,
-            agent=agent,
-            tracer=tracer,
-        )
-
-        yield str(response)
-    except Exception as e:
-        response_log = "Error summarizing file. Please try again, or contact support."
-        logger.error(f"Error summarizing file for {user.email}: {e}", exc_info=True)
-        yield response_log
 
 
 async def select_offeragent_memories(
@@ -1293,7 +1171,6 @@ async def agenerate_chat_response(
     conversation: Conversation,
     compiled_references: List[Dict] = [],
     online_results: Dict[str, Dict] = {},
-    research_results: List[ResearchIteration] = [],
     user: KhojUser = None,
     location_data: LocationData = None,
     user_name: Optional[str] = None,
@@ -1313,13 +1190,6 @@ async def agenerate_chat_response(
         codex_runtime = use_codex_runtime()
         query_to_run = q
         deepthought = False
-        if research_results:
-            compiled_research = "".join([r.summarizedResult for r in research_results if r.summarizedResult])
-            if compiled_research:
-                query_to_run = f"<query>{q}</query>\n<collected_research>\n{compiled_research}\n</collected_research>"
-            compiled_references = []
-            online_results = {}
-            deepthought = True
 
         if codex_runtime:
             chat_model = _get_codex_formatting_chat_model()
@@ -1602,40 +1472,6 @@ class WebSocketConnectionManager:
         await UserRequests.objects.filter(
             user=user, slug__startswith=self.connection_slug_prefix, created_at__lt=cutoff
         ).adelete()
-
-
-class ConversationCommandRateLimiter:
-    def __init__(self, rate_limit: int, slug: str):
-        self.slug = slug
-        self.rate_limit = rate_limit
-        self.restricted_commands = [ConversationCommand.Research]
-
-    async def update_and_check_if_valid(self, request: Request | WebSocket, conversation_command: ConversationCommand):
-        if not request.user.is_authenticated:
-            return
-
-        if conversation_command not in self.restricted_commands:
-            return
-
-        user: KhojUser = request.user.object
-
-        # Remove requests outside of the 24-hr time window
-        cutoff = django_timezone.now() - timedelta(seconds=60 * 60 * 24)
-        command_slug = f"{self.slug}_{conversation_command.value}"
-        count_requests = await UserRequests.objects.filter(
-            user=user, created_at__gte=cutoff, slug=command_slug
-        ).acount()
-
-        if count_requests >= self.rate_limit:
-            logger.info(
-                f"Rate limit: {count_requests}/{self.rate_limit} requests not allowed in 24 hours for user: {user}."
-            )
-            raise HTTPException(
-                status_code=429,
-                detail=f"I'm glad you're enjoying interacting with me! You've unfortunately exceeded your `/{conversation_command.value}` command usage limit for today. Maybe we can talk about something else for today?",
-            )
-        await UserRequests.objects.acreate(user=user, slug=command_slug)
-        return
 
 
 class ApiIndexedDataLimiter:

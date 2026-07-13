@@ -14,7 +14,7 @@ from khoj.database.adapters import FileObjectAdapters
 from khoj.processor.conversation.utils import ToolCall
 from khoj.processor.conversation.vault_policy import compact_policy_for_prompt
 from khoj.search_type import text_search
-from khoj.utils.helpers import ConversationCommand, ToolDefinition, tools_for_research_llm
+from khoj.utils.helpers import AgentToolName, ToolDefinition, agent_tool_definitions
 from khoj.utils.lexical import query_terms
 from khoj.utils.local_kb import (
     LocalKBError,
@@ -530,10 +530,6 @@ SOURCE_REF_SCHEMA = {
 WORKSPACE_PLANNER_INSTRUCTIONS = """
 You collect evidence from the user's personal knowledge base for the main chat answer.
 
-For Notes requests, your first response should normally be a JSON tool call, not prose.
-If the user asks for a knowledge-base file operation, return a JSON tool call instead of plain prose.
-Do not claim an operation cannot be done until the relevant tool has returned an error.
-
 Use tools instead of guessing. Prefer this workflow:
 1. list_files or regex_search_files to find candidate notes.
 2. kb_headings to locate useful sections in large Markdown files.
@@ -541,23 +537,16 @@ Use tools instead of guessing. Prefer this workflow:
 4. kb_resolve_link when a read note points to a related note.
 
 Only exact view_file or OpenKB evidence becomes final references. Use append_note only when the
-user clearly asks to create or append note content. append_note can create a new .md/.txt file under an
-existing folder. Use propose_edit for replace/delete/overwrite-style requests.
-When VaultActions are enabled, calling a write tool only prepares a reviewed action; it does not apply it.
-An explicit user request to write is sufficient to prepare that action. Do not ask a second confirmation,
-including when append_note will create a missing file; the client review UI is the confirmation boundary.
+user clearly asks to create or append note content. Use propose_edit for replace/delete/overwrite requests.
+When VaultActions are enabled, write tools only prepare reviewed actions; they do not apply them.
+An explicit write request is sufficient to prepare an action. Do not ask for a second confirmation.
 For append_note, always include write_intent and source_refs. Use
-source_refs=[{"type":"current_user_request"}] when the content comes directly from the current request.
-When the needed content exists in Recent conversation artifacts, prefer artifact_id or
-source_refs=[{"type":"artifact","id":"..."}] over re-copying from raw chat history.
-If append_note says source_refs_required or source_mismatch, retry with concrete source_refs and
-content grounded in those sources instead of summarizing unrelated conversation history.
-For requests like "add X to section Y in file Z", read or inspect file Z, then call append_note with
-path=Z and heading=Y. Do not stop with plain text before trying an available tool.
-If project instructions, vault policy, or a matching skill covers the task, follow them before writing.
-To call tools, return only a json object like:
-{"calls":[{"name":"view_file","args":{"path":"notes.md"},"id":"1"}]}
-When enough evidence has been collected, return {"calls":[]}.
+source_refs=[{"type":"current_user_request"}] when content comes directly from the current request.
+When content exists in Recent conversation artifacts, prefer artifact_id or
+source_refs=[{"type":"artifact","id":"..."}] over copying raw chat history.
+If append_note reports source_refs_required or source_mismatch, retry with concrete, grounded sources.
+For "add X to section Y in file Z", inspect file Z, then call append_note with path=Z and heading=Y.
+Follow applicable project instructions, vault policy, and skills before preparing a write.
 """.strip()
 
 
@@ -1022,7 +1011,7 @@ def _edit_source_error(
         return "edit_source_required: Could not find the proposed edit text in source_refs. Read the target file and retry."
 
     for item in reversed(tool_transcript):
-        if item.get("tool") != ConversationCommand.ViewFile.value:
+        if item.get("tool") != AgentToolName.ViewFile.value:
             continue
         item_args = item.get("args") if isinstance(item.get("args"), dict) else {}
         if path and str(item_args.get("path") or "").strip() != path:
@@ -1101,11 +1090,11 @@ def _notes_tools(*, allow_local_kb: bool, allow_openkb: bool, allow_skills: bool
     if allow_local_kb:
         tools.extend(
             [
-                tools_for_research_llm[ConversationCommand.ListFiles],
-                tools_for_research_llm[ConversationCommand.RegexSearchFiles],
-                tools_for_research_llm[ConversationCommand.KbHeadings],
-                tools_for_research_llm[ConversationCommand.ViewFile],
-                tools_for_research_llm[ConversationCommand.KbResolveLink],
+                agent_tool_definitions[AgentToolName.ListFiles],
+                agent_tool_definitions[AgentToolName.RegexSearchFiles],
+                agent_tool_definitions[AgentToolName.KbHeadings],
+                agent_tool_definitions[AgentToolName.ViewFile],
+                agent_tool_definitions[AgentToolName.KbResolveLink],
                 APPEND_NOTE_TOOL,
                 PROPOSE_EDIT_TOOL,
             ]
@@ -1196,7 +1185,7 @@ async def execute_workspace_tool_calls(
             return {"error": message}
 
         try:
-            if call.name == ConversationCommand.ListFiles.value:
+            if call.name == AgentToolName.ListFiles.value:
                 listing = kb_list(args.get("path"), args.get("pattern"), limit=80)
                 return {
                     "path": listing.path,
@@ -1204,7 +1193,7 @@ async def execute_workspace_tool_calls(
                     "total": listing.total,
                     "truncated": listing.truncated,
                 }
-            if call.name == ConversationCommand.RegexSearchFiles.value:
+            if call.name == AgentToolName.RegexSearchFiles.value:
                 grep = kb_grep(
                     args.get("regex_pattern") or "",
                     path_prefix=args.get("path_prefix"),
@@ -1220,14 +1209,14 @@ async def execute_workspace_tool_calls(
                     "matches": grep.matches,
                     "truncated": grep.truncated,
                 }
-            if call.name == ConversationCommand.KbHeadings.value:
+            if call.name == AgentToolName.KbHeadings.value:
                 headings = kb_headings(args.get("path") or "")
                 return {
                     "path": headings.path,
                     "headings": headings.headings,
                     "total_lines": headings.total_lines,
                 }
-            if call.name == ConversationCommand.KbResolveLink.value:
+            if call.name == AgentToolName.KbResolveLink.value:
                 resolved = kb_resolve_link(args.get("from_path") or "", args.get("link") or "")
                 return {
                     "link": resolved.link,
@@ -1236,7 +1225,7 @@ async def execute_workspace_tool_calls(
                     "anchor": resolved.anchor,
                     "candidates": resolved.candidates,
                 }
-            if call.name == ConversationCommand.ViewFile.value:
+            if call.name == AgentToolName.ViewFile.value:
                 item = kb_read(
                     args.get("path") or "",
                     start_line=args.get("start_line"),

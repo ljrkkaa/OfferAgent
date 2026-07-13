@@ -256,16 +256,7 @@ def create_tool_definition(
     return ToolDefinition(name=name, description=description, schema=compiled_schema)
 
 
-class ConversationCommand(str, Enum):
-    Default = "default"
-    General = "general"
-    Notes = "notes"
-    Online = "online"
-    Webpage = "webpage"
-    Text = "text"
-    AutomatedTask = "automated_task"
-    Summarize = "summarize"
-    Research = "research"
+class AgentToolName(str, Enum):
     ViewFile = "view_file"
     ListFiles = "list_files"
     KbHeadings = "kb_headings"
@@ -275,24 +266,8 @@ class ConversationCommand(str, Enum):
     ReadWebpage = "read_webpage"
 
 
-command_descriptions = {
-    ConversationCommand.General: "Only talk about information that relies on OfferAgent's general knowledge, not your personal knowledge base.",
-    ConversationCommand.Notes: "Only talk about information that is available in your knowledge base.",
-    ConversationCommand.Online: "Search for information on the internet.",
-    ConversationCommand.Webpage: "Get information from webpage suggested by you.",
-    ConversationCommand.Research: "Do deep research on a topic. This will take longer than usual, but give a more detailed, comprehensive answer.",
-}
-
-command_descriptions_for_agent = {
-    ConversationCommand.General: "Agent can use its own knowledge base and general knowledge.",
-    ConversationCommand.Notes: "Agent can search the personal knowledge base for information, as well as its own.",
-    ConversationCommand.Online: "Agent can search the internet for information.",
-    ConversationCommand.Webpage: "Agent can read suggested web pages for information.",
-    ConversationCommand.Research: "Agent can do deep research on a topic.",
-}
-
-tools_for_research_llm = {
-    ConversationCommand.SearchWeb: ToolDefinition(
+agent_tool_definitions = {
+    AgentToolName.SearchWeb: ToolDefinition(
         name="search_web",
         description=dedent(
             """
@@ -313,7 +288,7 @@ tools_for_research_llm = {
             "required": ["query"],
         },
     ),
-    ConversationCommand.ReadWebpage: ToolDefinition(
+    AgentToolName.ReadWebpage: ToolDefinition(
         name="read_webpage",
         description=dedent(
             """
@@ -343,7 +318,7 @@ tools_for_research_llm = {
             "required": ["urls", "query"],
         },
     ),
-    ConversationCommand.ViewFile: ToolDefinition(
+    AgentToolName.ViewFile: ToolDefinition(
         name="view_file",
         description=dedent(
             """
@@ -377,7 +352,7 @@ tools_for_research_llm = {
             "required": ["path"],
         },
     ),
-    ConversationCommand.ListFiles: ToolDefinition(
+    AgentToolName.ListFiles: ToolDefinition(
         name="list_files",
         description=dedent(
             """
@@ -401,7 +376,7 @@ tools_for_research_llm = {
             },
         },
     ),
-    ConversationCommand.KbHeadings: ToolDefinition(
+    AgentToolName.KbHeadings: ToolDefinition(
         name="kb_headings",
         description=dedent(
             """
@@ -420,7 +395,7 @@ tools_for_research_llm = {
             "required": ["path"],
         },
     ),
-    ConversationCommand.KbResolveLink: ToolDefinition(
+    AgentToolName.KbResolveLink: ToolDefinition(
         name="kb_resolve_link",
         description=dedent(
             """
@@ -445,7 +420,7 @@ tools_for_research_llm = {
             "required": ["from_path", "link"],
         },
     ),
-    ConversationCommand.RegexSearchFiles: ToolDefinition(
+    AgentToolName.RegexSearchFiles: ToolDefinition(
         name="regex_search_files",
         description=dedent(
             """

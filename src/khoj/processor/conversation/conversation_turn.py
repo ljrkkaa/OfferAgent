@@ -33,7 +33,6 @@ class ConversationTurn:
     response: str = ""
     compiled_references: list[dict[str, Any]] = field(default_factory=list)
     online_results: dict[str, Any] = field(default_factory=dict)
-    research_results: list[Any] = field(default_factory=list)
     inferred_queries: list[str] = field(default_factory=list)
     query_images: list[str] = field(default_factory=list)
     raw_query_files: list[FileAttachment] = field(default_factory=list)
@@ -118,9 +117,6 @@ async def persist_conversation_turn(turn: ConversationTurn, *, update_memory: bo
         "context": turn.compiled_references,
         "intent": {"inferred-queries": turn.inferred_queries, "type": "remember"},
         "onlineContext": turn.online_results,
-        "researchContext": [result.to_dict() for result in turn.research_results]
-        if turn.research_results and not turn.response
-        else None,
         "trainOfThought": turn.train_of_thought,
         "turnId": turn.turn_id,
     }

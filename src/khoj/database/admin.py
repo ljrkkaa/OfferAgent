@@ -19,7 +19,6 @@ from khoj.database.models import (
     Conversation,
     Entry,
     KhojUser,
-    McpServer,
     ProcessLock,
     RateLimitRecord,
     ServerChatSettings,
@@ -122,16 +121,6 @@ admin.site.register(KhojUser, KhojUserAdmin)
 admin.site.register(ProcessLock, unfold_admin.ModelAdmin)
 admin.site.register(UserRequests, unfold_admin.ModelAdmin)
 admin.site.register(RateLimitRecord, unfold_admin.ModelAdmin)
-
-
-@admin.register(McpServer)
-class McpServerAdmin(unfold_admin.ModelAdmin):
-    list_display = (
-        "id",
-        "name",
-        "path",
-    )
-    search_fields = ("id", "name", "path")
 
 
 @admin.register(Entry)

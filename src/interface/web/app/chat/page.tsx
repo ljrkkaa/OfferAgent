@@ -9,7 +9,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import Loading from "../components/loading/loading";
 
-import { fetchChatOptions, generateNewTitle, processMessageChunk } from "../common/chatFunctions";
+import { generateNewTitle, processMessageChunk } from "../common/chatFunctions";
 import {
     fetchVaultActionCapability,
     listVaultActionBatches,
@@ -22,11 +22,7 @@ import "katex/dist/katex.min.css";
 
 import { Context, OnlineContext, StreamMessage } from "../components/chatMessage/chatMessage";
 import { useIsMobileWidth, welcomeConsole } from "../common/utils";
-import {
-    AttachedFileText,
-    ChatInputArea,
-    ChatOptions,
-} from "../components/chatInputArea/chatInputArea";
+import { AttachedFileText, ChatInputArea } from "../components/chatInputArea/chatInputArea";
 import { useAuthenticatedData } from "../common/auth";
 import { AgentData } from "@/app/common/agent";
 import { ChatSessionActionMenu } from "../components/allConversations/allConversations";
@@ -40,7 +36,6 @@ import { useToast } from "@/components/ui/use-toast";
 import { ChatSidebar } from "../components/chatSidebar/chatSidebar";
 
 interface ChatBodyDataProps {
-    chatOptionsData: ChatOptions | null;
     setTitle: (title: string) => void;
     onConversationIdChange?: (conversationId: string) => void;
     setQueryToProcess: (query: string, attachments?: QueuedQueryAttachments) => void;
@@ -86,7 +81,6 @@ function ChatBodyData(props: ChatBodyDataProps) {
     const [images, setImages] = useState<string[]>([]);
     const [processingMessage, setProcessingMessage] = useState(false);
     const [agentMetadata, setAgentMetadata] = useState<AgentData | null>(null);
-    const [isInResearchMode, setIsInResearchMode] = useState(false);
     const chatInputRef = useRef<HTMLTextAreaElement>(null);
     const processedInitialQueryRef = useRef<string | null>(null);
 
@@ -143,10 +137,6 @@ function ChatBodyData(props: ChatBodyDataProps) {
             localStorage.removeItem("message");
             setProcessingMessage(true);
             setQueryToProcess(messageToProcess, { images: encodedImages, uploadedFiles });
-
-            if (messageToProcess.trim().startsWith("/research")) {
-                setIsInResearchMode(true);
-            }
 
             if (initialQuery && typeof window !== "undefined") {
                 const params = new URLSearchParams(window.location.search);
@@ -222,12 +212,9 @@ function ChatBodyData(props: ChatBodyDataProps) {
                         sendMessage={queueMessage}
                         sendImage={(image) => setImages((prevImages) => [...prevImages, image])}
                         sendDisabled={props.isParentProcessing || false}
-                        chatOptionsData={props.chatOptionsData}
-                        conversationId={conversationId}
                         isMobileWidth={props.isMobileWidth}
                         setUploadedFiles={setUploadedFiles}
                         ref={chatInputRef}
-                        isResearchModeEnabled={isInResearchMode}
                         setTriggeredAbort={props.setTriggeredAbort}
                     />
                 </div>
@@ -238,6 +225,7 @@ function ChatBodyData(props: ChatBodyDataProps) {
                     isOpen={props.isChatSideBarOpen}
                     onOpenChange={props.setIsChatSideBarOpen}
                     isMobileWidth={props.isMobileWidth}
+                    onSummarizeSelected={() => queueMessage("/summarize")}
                 />
             </div>
         </div>
@@ -246,8 +234,6 @@ function ChatBodyData(props: ChatBodyDataProps) {
 
 export default function Chat() {
     const defaultTitle = "OfferAgent - Chat";
-    const [chatOptionsData, setChatOptionsData] = useState<ChatOptions | null>(null);
-    const [isLoading, setLoading] = useState(true);
     const [title, setTitle] = useState(defaultTitle);
     const [conversationId, setConversationID] = useState<string | null>(null);
     const [messages, setMessages] = useState<StreamMessage[]>([]);
@@ -508,28 +494,7 @@ export default function Chat() {
     }, [lastMessage, setMessages, conversationId, resetIdleTimer, toast]);
 
     useEffect(() => {
-        let cancelled = false;
-        async function loadChatOptions() {
-            try {
-                const data = await fetchChatOptions();
-                if (!cancelled) {
-                    setChatOptionsData(data);
-                }
-            } catch (err) {
-                console.error(err);
-            } finally {
-                if (!cancelled) {
-                    setLoading(false);
-                }
-            }
-        }
-
-        loadChatOptions();
-
         welcomeConsole();
-        return () => {
-            cancelled = true;
-        };
     }, []);
 
     useEffect(() => {
@@ -726,7 +691,7 @@ export default function Chat() {
         return true;
     };
 
-    if (isLoading || authenticationLoading || !vaultActionCapabilityLoaded) return <Loading />;
+    if (authenticationLoading || !vaultActionCapabilityLoaded) return <Loading />;
 
     return (
         <SidebarProvider>
@@ -785,7 +750,6 @@ export default function Chat() {
                                     isLoggedIn={authenticatedData ? true : false}
                                     streamedMessages={messages}
                                     setStreamedMessages={setMessages}
-                                    chatOptionsData={chatOptionsData}
                                     setTitle={setTitle}
                                     setQueryToProcess={queueQueryToProcess}
                                     setUploadedFiles={setUploadedFiles}

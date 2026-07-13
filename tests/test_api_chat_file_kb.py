@@ -6,9 +6,9 @@ from types import SimpleNamespace
 import pytest
 from starlette.datastructures import Headers
 
+from khoj.database.models import Context
 from khoj.processor.conversation import knowledge_workspace
 from khoj.processor.conversation.agent_tool_loop import AgentToolLoopResult
-from khoj.processor.conversation.offeragent_intent_router import RouteDecision
 from khoj.processor.conversation.utils import ResponseWithThought
 from khoj.routers import api_chat
 from khoj.routers.helpers import CommonQueryParamsClass
@@ -16,11 +16,11 @@ from khoj.utils.rawconfig import ChatRequestBody
 
 
 class FakeConversation:
-    def __init__(self):
+    def __init__(self, file_filters=None):
         self.id = "conversation-id"
         self.agent = None
         self.messages = []
-        self.file_filters = []
+        self.file_filters = file_filters or []
 
     async def asave(self, **kwargs):
         return None
@@ -49,6 +49,7 @@ async def run_chat(
     *,
     client_app="web",
     client_capabilities=None,
+    file_filters=None,
     generate_response=ok_response,
     **patched,
 ):
@@ -57,7 +58,7 @@ async def run_chat(
     agent = SimpleNamespace(slug="khoj", name="OfferAgent", personality=None)
 
     async def fake_conversation(*args, **kwargs):
-        return FakeConversation()
+        return FakeConversation(file_filters)
 
     async def fake_default_agent():
         return agent
@@ -77,21 +78,8 @@ async def run_chat(
     monkeypatch.setattr(api_chat, "aget_user_name", fake_user_name)
     monkeypatch.setattr(api_chat.ConversationAdapters, "ais_memory_enabled", fake_memory_disabled)
     monkeypatch.setattr(api_chat.ConversationAdapters, "apop_message", fake_pop_message)
-    monkeypatch.setattr(api_chat.conversation_command_rate_limiter, "update_and_check_if_valid", noop_async)
     monkeypatch.setattr(api_chat, "agenerate_chat_response", generate_response)
     monkeypatch.setattr(api_chat, "persist_conversation_turn", noop_async)
-    if "route_offeragent_intent" not in patched:
-
-        async def fake_default_router(*args, **kwargs):
-            return RouteDecision(
-                route="default",
-                intent="conversation",
-                requires_vault_write=False,
-                needs_clarification=False,
-                question="",
-            )
-
-        monkeypatch.setattr(api_chat, "route_offeragent_intent", fake_default_router)
     for name, value in patched.items():
         monkeypatch.setattr(api_chat, name, value)
 
@@ -134,7 +122,7 @@ def fake_notes_model(*responses):
     async def send_message_to_model_wrapper(**kwargs):
         response = calls.pop(0) if calls else "done"
         if response == "done":
-            response = json.dumps({"calls": []})
+            response = json.dumps({"requires_write_action": False, "calls": []})
         return ResponseWithThought(text=response)
 
     return send_message_to_model_wrapper
@@ -176,8 +164,11 @@ async def test_search_indexed_evidence_dedupes_files_and_prefers_raw_text(monkey
 async def test_default_chat_uses_unified_agent_runtime(monkeypatch):
     captured = {}
     persisted = []
+    agent_calls = 0
 
     async def fake_agent_runtime(*args, **kwargs):
+        nonlocal agent_calls
+        agent_calls += 1
         captured["runtime_kwargs"] = kwargs
         return AgentToolLoopResult(
             references=[{"query": "append_note", "status": "written", "file": "agent.md", "action": "append_note"}],
@@ -196,7 +187,6 @@ async def test_default_chat_uses_unified_agent_runtime(monkeypatch):
         conversation,
         compiled_references,
         online_results,
-        research_results,
         user,
         location,
         user_name,
@@ -232,33 +222,64 @@ async def test_default_chat_uses_unified_agent_runtime(monkeypatch):
     assert "Notes write tool result" in "\n".join(captured["program_execution_context"])
     assert events_of_type(events, "references")[0]["data"]["inferredQueries"] == ["agent evaluation"]
     assert persisted == [(True, True)]
+    assert agent_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_clarification_response_uses_same_turn_persistence_boundary(monkeypatch):
-    persisted = []
-
-    async def fake_router(*args, **kwargs):
-        return RouteDecision(
-            route="default",
-            intent="ambiguous_request",
-            requires_vault_write=False,
-            needs_clarification=True,
-            question="你希望我读取资料，还是修改笔记？",
-        )
-
-    async def fake_persist(turn, *, update_memory):
-        persisted.append((turn.response, update_memory))
+async def test_removed_chat_command_stops_before_agent(monkeypatch):
+    async def fail_agent_runtime(*args, **kwargs):
+        raise AssertionError("removed command must not invoke the agent")
 
     events = await run_chat(
         monkeypatch,
-        "帮我处理一下",
-        route_offeragent_intent=fake_router,
-        persist_conversation_turn=fake_persist,
+        "/general hello",
+        collect_agent_context_and_actions=fail_agent_runtime,
     )
 
-    assert persisted == [("你希望我读取资料，还是修改笔记？", False)]
-    assert events_of_type(events, "message")[0]["data"] == "你希望我读取资料，还是修改笔记？"
+    assert "Unknown conversation command: /general" in "".join(events)
+
+
+@pytest.mark.asyncio
+async def test_summarize_preloads_selected_files_into_unified_agent(monkeypatch):
+    captured = {}
+
+    async def fake_read(path, user, *, max_lines):
+        captured.setdefault("reads", []).append((path, max_lines))
+        return path, f"CONTENT FROM {path}"
+
+    async def fake_collect(query, *args, **kwargs):
+        captured["query"] = query
+        captured["query_files"] = kwargs["query_files"]
+        return AgentToolLoopResult()
+
+    events = await run_chat(
+        monkeypatch,
+        "/summarize focus on decisions",
+        file_filters=["notes/one.md", "notes/two.md"],
+        read_workspace_document=fake_read,
+        collect_agent_context_and_actions=fake_collect,
+    )
+
+    assert captured["reads"] == [("notes/one.md", 200), ("notes/two.md", 200)]
+    assert captured["query"] == "focus on decisions"
+    assert "File: notes/one.md\n\nCONTENT FROM notes/one.md" in captured["query_files"]
+    assert "File: notes/two.md\n\nCONTENT FROM notes/two.md" in captured["query_files"]
+    references = events_of_type(events, "references")[0]["data"]["context"]
+    assert [reference["file"] for reference in references] == ["notes/one.md", "notes/two.md"]
+
+
+@pytest.mark.asyncio
+async def test_summarize_requires_selected_or_attached_files(monkeypatch):
+    async def fail_collect(*args, **kwargs):
+        raise AssertionError("agent should not run without files to summarize")
+
+    events = await run_chat(
+        monkeypatch,
+        "/summarize",
+        collect_agent_context_and_actions=fail_collect,
+    )
+
+    assert "No files selected for summarization" in "".join(events)
 
 
 @pytest.mark.asyncio
@@ -279,27 +300,18 @@ async def test_message_delimiter_is_escaped_inside_stream_envelope(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_obsidian_router_notes_write_returns_vault_actions(tmp_path, monkeypatch):
+async def test_obsidian_note_write_returns_vault_actions(tmp_path, monkeypatch):
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
-
-    async def fake_router(*args, **kwargs):
-        return RouteDecision(
-            route="default",
-            intent="create_daily_plan",
-            requires_vault_write=True,
-            needs_clarification=False,
-            question="",
-        )
 
     events = await run_chat(
         monkeypatch,
         "帮我创建 daily/2026-07-09.md，内容是：# 2026-07-09 每日计划",
         client_app="obsidian",
         client_capabilities={"vaultActions": True},
-        route_offeragent_intent=fake_router,
         send_message_to_model_wrapper=fake_notes_model(
             json.dumps(
                 {
+                    "requires_write_action": True,
                     "calls": [
                         {
                             "name": "append_note",
@@ -311,7 +323,7 @@ async def test_obsidian_router_notes_write_returns_vault_actions(tmp_path, monke
                             },
                             "id": "1",
                         }
-                    ]
+                    ],
                 }
             ),
             json.dumps({"grounded": True, "reason": "content comes from the current request"}),
@@ -329,74 +341,6 @@ async def test_obsidian_router_notes_write_returns_vault_actions(tmp_path, monke
             "mode": "create_only",
         }
     ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("query", ["/notes 写入 daily/test.md", "/default 写入 daily/test.md"])
-async def test_explicit_write_capable_commands_preserve_required_write_outcome(tmp_path, monkeypatch, query):
-    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
-    captured = {}
-
-    async def fake_router(*args, **kwargs):
-        return RouteDecision(
-            route="default",
-            intent="write_note",
-            requires_vault_write=True,
-            needs_clarification=False,
-            question="",
-        )
-
-    async def fake_collect(*args, **kwargs):
-        captured["require_write_action"] = kwargs["require_write_action"]
-        return AgentToolLoopResult(used_workspace_tools=True)
-
-    await run_chat(
-        monkeypatch,
-        query,
-        client_app="obsidian",
-        client_capabilities={"vaultActions": True},
-        route_offeragent_intent=fake_router,
-        collect_agent_context_and_actions=fake_collect,
-    )
-
-    assert captured["require_write_action"] is True
-
-
-@pytest.mark.asyncio
-async def test_disabled_client_keeps_truthful_no_write_context(monkeypatch):
-    captured = {}
-
-    async def fake_router(*args, **kwargs):
-        return RouteDecision(
-            route="default",
-            intent="write_note",
-            requires_vault_write=True,
-            needs_clarification=False,
-            question="",
-        )
-
-    async def fake_collect(*args, **kwargs):
-        captured["require_write_action"] = kwargs["require_write_action"]
-        return AgentToolLoopResult(used_workspace_tools=True)
-
-    async def capture_response(*args, **kwargs):
-        captured["program_context"] = args[12]
-
-        async def stream():
-            yield ResponseWithThought(text="not written")
-
-        return stream(), {}
-
-    await run_chat(
-        monkeypatch,
-        "写入 daily/test.md",
-        route_offeragent_intent=fake_router,
-        collect_agent_context_and_actions=fake_collect,
-        generate_response=capture_response,
-    )
-
-    assert captured["require_write_action"] is False
-    assert any("cannot prepare reviewed VaultActions" in item for item in captured["program_context"])
 
 
 @pytest.mark.asyncio
@@ -427,7 +371,6 @@ async def test_capable_client_can_search_web_then_prepare_vault_action(tmp_path,
         conversation,
         compiled_references,
         online_results,
-        research_results,
         user,
         location,
         user_name,
@@ -454,9 +397,15 @@ async def test_capable_client_can_search_web_then_prepare_vault_action(tmp_path,
         client_capabilities={"vaultActions": True},
         is_web_search_enabled=lambda: True,
         send_message_to_model_wrapper=fake_notes_model(
-            json.dumps({"calls": [{"name": "web_search", "args": {"query": "agent evaluation"}, "id": "1"}]}),
             json.dumps(
                 {
+                    "requires_write_action": False,
+                    "calls": [{"name": "web_search", "args": {"query": "agent evaluation"}, "id": "1"}],
+                }
+            ),
+            json.dumps(
+                {
+                    "requires_write_action": True,
                     "calls": [
                         {
                             "name": "append_note",
@@ -468,11 +417,11 @@ async def test_capable_client_can_search_web_then_prepare_vault_action(tmp_path,
                             },
                             "id": "2",
                         }
-                    ]
+                    ],
                 }
             ),
             json.dumps({"grounded": True, "reason": "grounded in web result"}),
-            json.dumps({"calls": []}),
+            json.dumps({"requires_write_action": False, "calls": []}),
         ),
         generate_response=fake_generate_response,
     )
@@ -485,15 +434,20 @@ async def test_capable_client_can_search_web_then_prepare_vault_action(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_chat_notes_local_kb_uses_main_tool_loop(tmp_path, monkeypatch):
+async def test_note_question_uses_main_tool_loop(tmp_path, monkeypatch):
     (tmp_path / "notes.md").write_text("Redis evidence", encoding="utf-8")
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
 
     events = await run_chat(
         monkeypatch,
-        "/notes Redis",
+        "读取 notes.md 里的 Redis 内容",
         send_message_to_model_wrapper=fake_notes_model(
-            json.dumps({"calls": [{"name": "view_file", "args": {"path": "notes.md"}, "id": "1"}]}),
+            json.dumps(
+                {
+                    "requires_write_action": False,
+                    "calls": [{"name": "view_file", "args": {"path": "notes.md"}, "id": "1"}],
+                }
+            ),
             "done",
         ),
     )
@@ -550,87 +504,7 @@ async def test_default_chat_uses_synced_index_when_no_local_kb(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_notes_chat_uses_synced_index_when_no_local_kb(monkeypatch):
-    monkeypatch.delenv("KHOJ_LOCAL_KB_PATH", raising=False)
-    captured = {}
-
-    async def fake_indexed_notes(*args, **kwargs):
-        return [
-            {
-                "query": "daily",
-                "file": "daily/2026-07-06.md",
-                "uri": "daily/2026-07-06.md",
-                "compiled": "2026-07-06 daily evidence",
-                "source": "indexed",
-            }
-        ]
-
-    async def fake_generate_response(
-        q,
-        chat_history,
-        conversation,
-        compiled_references,
-        *args,
-        **kwargs,
-    ):
-        captured["compiled_references"] = compiled_references
-
-        async def stream():
-            yield ResponseWithThought(text="ok")
-
-        return stream(), {}
-
-    events = await run_chat(
-        monkeypatch,
-        "/notes daily",
-        search_indexed_evidence=fake_indexed_notes,
-        generate_response=fake_generate_response,
-    )
-
-    assert captured["compiled_references"][0]["file"] == "daily/2026-07-06.md"
-    assert events_of_type(events, "references")[0]["data"]["context"][0]["source"] == "indexed"
-
-
-@pytest.mark.asyncio
-async def test_chat_notes_local_kb_miss_returns_insufficient_evidence(tmp_path, monkeypatch):
-    (tmp_path / "notes.md").write_text("Redis evidence", encoding="utf-8")
-    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
-
-    async def fail_generate_response(*args, **kwargs):
-        raise AssertionError("final generator should not run without local evidence")
-
-    events = await run_chat(
-        monkeypatch,
-        "/notes no such thing",
-        send_message_to_model_wrapper=fake_notes_model("done"),
-        generate_response=fail_generate_response,
-    )
-
-    assert "couldn't find enough local knowledge base evidence" in "".join(events)
-
-
-@pytest.mark.asyncio
-async def test_chat_notes_openkb_not_ready_with_local_root_does_not_fall_back_to_general(tmp_path, monkeypatch):
-    (tmp_path / "notes.md").write_text("Redis evidence", encoding="utf-8")
-    monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
-    monkeypatch.setenv("KHOJ_KB_ENGINE", "openkb")
-    monkeypatch.setenv("KHOJ_ENABLE_OPENKB", "true")
-    monkeypatch.setenv("KHOJ_OPENKB_ROOT", str(tmp_path / "missing-openkb"))
-
-    async def fail_generate_response(*args, **kwargs):
-        raise AssertionError("notes-only chat should not fall back to a general response without evidence")
-
-    events = await run_chat(
-        monkeypatch,
-        "/notes Redis",
-        generate_response=fail_generate_response,
-    )
-
-    assert "haven't synced any notes yet" in "".join(events)
-
-
-@pytest.mark.asyncio
-async def test_chat_notes_openkb_engine_uses_wiki_evidence(tmp_path, monkeypatch):
+async def test_note_question_uses_openkb_wiki_evidence(tmp_path, monkeypatch):
     monkeypatch.setenv("KHOJ_KB_ENGINE", "openkb")
     monkeypatch.setenv("KHOJ_ENABLE_OPENKB", "true")
     monkeypatch.setenv("KHOJ_OPENKB_ROOT", str(tmp_path))
@@ -662,9 +536,14 @@ async def test_chat_notes_openkb_engine_uses_wiki_evidence(tmp_path, monkeypatch
     )
     events = await run_chat(
         monkeypatch,
-        "/notes Redis",
+        "从知识库查找 Redis",
         send_message_to_model_wrapper=fake_notes_model(
-            json.dumps({"calls": [{"name": "wiki_search_documents", "args": {"query": "Redis", "n": 1}, "id": "1"}]}),
+            json.dumps(
+                {
+                    "requires_write_action": False,
+                    "calls": [{"name": "wiki_search_documents", "args": {"query": "Redis", "n": 1}, "id": "1"}],
+                }
+            ),
             "done",
         ),
     )
@@ -674,7 +553,7 @@ async def test_chat_notes_openkb_engine_uses_wiki_evidence(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_chat_notes_write_request_prepares_vault_action(tmp_path, monkeypatch):
+async def test_note_write_request_prepares_vault_action(tmp_path, monkeypatch):
     (tmp_path / "notes.md").write_text("# 复盘\n", encoding="utf-8")
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
 
@@ -686,7 +565,6 @@ async def test_chat_notes_write_request_prepares_vault_action(tmp_path, monkeypa
         conversation,
         compiled_references,
         online_results,
-        research_results,
         user,
         location,
         user_name,
@@ -707,12 +585,13 @@ async def test_chat_notes_write_request_prepares_vault_action(tmp_path, monkeypa
 
     events = await run_chat(
         monkeypatch,
-        "/notes 写进 `notes.md`：HashMap 扩容要讲清楚",
+        "写进 `notes.md`：HashMap 扩容要讲清楚",
         client_app="obsidian",
         client_capabilities={"vaultActions": True},
         send_message_to_model_wrapper=fake_notes_model(
             json.dumps(
                 {
+                    "requires_write_action": True,
                     "calls": [
                         {
                             "name": "append_note",
@@ -725,7 +604,7 @@ async def test_chat_notes_write_request_prepares_vault_action(tmp_path, monkeypa
                             },
                             "id": "1",
                         }
-                    ]
+                    ],
                 }
             ),
             json.dumps({"grounded": True, "reason": "content comes from the current request"}),
@@ -746,7 +625,7 @@ async def test_chat_notes_write_request_prepares_vault_action(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_web_notes_write_creates_persistent_review_batch(tmp_path, monkeypatch):
+async def test_web_note_write_creates_persistent_review_batch(tmp_path, monkeypatch):
     target = tmp_path / "notes.md"
     target.write_text("# 复盘\n", encoding="utf-8")
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
@@ -777,7 +656,6 @@ async def test_web_notes_write_creates_persistent_review_batch(tmp_path, monkeyp
         conversation,
         compiled_references,
         online_results,
-        research_results,
         user,
         location,
         user_name,
@@ -798,13 +676,14 @@ async def test_web_notes_write_creates_persistent_review_batch(tmp_path, monkeyp
 
     events = await run_chat(
         monkeypatch,
-        "/notes 写进 `notes.md`：HashMap 扩容要讲清楚",
+        "写进 `notes.md`：HashMap 扩容要讲清楚",
         client_app="web",
         client_capabilities={"vaultActions": True},
         create_vault_action_batch=fake_create_batch,
         send_message_to_model_wrapper=fake_notes_model(
             json.dumps(
                 {
+                    "requires_write_action": True,
                     "calls": [
                         {
                             "name": "append_note",
@@ -817,7 +696,7 @@ async def test_web_notes_write_creates_persistent_review_batch(tmp_path, monkeyp
                             },
                             "id": "1",
                         }
-                    ]
+                    ],
                 }
             ),
             json.dumps({"grounded": True, "reason": "content comes from the current request"}),
@@ -833,6 +712,7 @@ async def test_web_notes_write_creates_persistent_review_batch(tmp_path, monkeyp
     assert payload["previews"][0]["path"] == "notes.md"
     assert captured["batch_args"]["actions"] == payload["actions"]
     assert captured["compiled_references"][-1]["query"] == "vault_action_batch"
+    Context.model_validate(captured["compiled_references"][-1])
     assert "pending review" in "\n".join(captured["program_execution_context"])
 
 
@@ -860,9 +740,16 @@ async def test_daily_plan_request_reads_matching_skill_and_template_before_web_b
     captured = {}
     planner_responses = iter(
         [
-            {"calls": [{"name": "read_skill", "args": {"name": "daily-planner"}, "id": "1"}]},
-            {"calls": [{"name": "view_file", "args": {"path": "templates/daily-template.md"}, "id": "2"}]},
             {
+                "requires_write_action": False,
+                "calls": [{"name": "read_skill", "args": {"name": "daily-planner"}, "id": "1"}],
+            },
+            {
+                "requires_write_action": False,
+                "calls": [{"name": "view_file", "args": {"path": "templates/daily-template.md"}, "id": "2"}],
+            },
+            {
+                "requires_write_action": True,
                 "calls": [
                     {
                         "name": "append_note",
@@ -874,9 +761,9 @@ async def test_daily_plan_request_reads_matching_skill_and_template_before_web_b
                         },
                         "id": "3",
                     }
-                ]
+                ],
             },
-            {"calls": []},
+            {"requires_write_action": False, "calls": []},
         ]
     )
 
@@ -926,38 +813,57 @@ async def test_daily_plan_request_reads_matching_skill_and_template_before_web_b
 
 
 @pytest.mark.asyncio
-async def test_chat_notes_tool_failure_stops_before_final_response(tmp_path, monkeypatch):
+async def test_agent_planner_failure_continues_with_truthful_final_context(tmp_path, monkeypatch):
     (tmp_path / "notes.md").write_text("# 复盘\n", encoding="utf-8")
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
 
     async def fail_notes_model(**kwargs):
         raise ValueError("Empty response returned by Codex backend")
 
-    async def fail_generate_response(*args, **kwargs):
-        raise AssertionError("final generator should not run when Notes tools fail")
+    captured = {}
+
+    async def capture_response(*args, **kwargs):
+        captured["program_context"] = args[11]
+
+        async def stream():
+            yield ResponseWithThought(text="No file change was made.")
+
+        return stream(), {}
 
     events = await run_chat(
         monkeypatch,
-        "/notes 写进 `notes.md`：HashMap 扩容要讲清楚",
+        "写进 `notes.md`：HashMap 扩容要讲清楚",
         send_message_to_model_wrapper=fail_notes_model,
-        generate_response=fail_generate_response,
+        generate_response=capture_response,
     )
 
     assert (tmp_path / "notes.md").read_text(encoding="utf-8") == "# 复盘\n"
-    assert "did not read or modify the local knowledge base" in "".join(events)
+    assert "No file change was made" in "".join(events)
+    assert any("planner failed" in item for item in captured["program_context"])
 
 
 @pytest.mark.asyncio
-async def test_chat_notes_without_vault_capability_cannot_write(tmp_path, monkeypatch):
+async def test_note_write_without_vault_capability_cannot_write(tmp_path, monkeypatch):
     (tmp_path / "notes.md").write_text("# 复盘\n", encoding="utf-8")
     monkeypatch.setenv("KHOJ_LOCAL_KB_PATH", str(tmp_path))
+    captured = {}
+
+    async def capture_response(*args, **kwargs):
+        captured["program_context"] = args[11]
+
+        async def stream():
+            yield ResponseWithThought(text="not written")
+
+        return stream(), {}
+
     events = await run_chat(
         monkeypatch,
-        "/notes 写进 notes.md：HashMap 扩容要讲清楚",
+        "写进 notes.md：HashMap 扩容要讲清楚",
         client_app="unsupported-client",
         send_message_to_model_wrapper=fake_notes_model(
             json.dumps(
                 {
+                    "requires_write_action": True,
                     "calls": [
                         {
                             "name": "append_note",
@@ -969,13 +875,14 @@ async def test_chat_notes_without_vault_capability_cannot_write(tmp_path, monkey
                             },
                             "id": "1",
                         }
-                    ]
+                    ],
                 }
             ),
             "done",
         ),
+        generate_response=capture_response,
     )
 
     assert (tmp_path / "notes.md").read_text(encoding="utf-8") == "# 复盘\n"
     assert events_of_type(events, "vault_actions") == []
-    assert "couldn't find enough local knowledge base evidence" in "".join(events)
+    assert any("no file change is pending or applied" in item for item in captured["program_context"])

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from io import BytesIO
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import PIL.Image
@@ -21,10 +21,7 @@ from google.genai import errors as gerrors
 from langchain_core.messages.chat import ChatMessage
 from pydantic import ConfigDict, ValidationError
 
-from khoj.database.models import (
-    ChatMessageModel,
-    Intent,
-)
+from khoj.database.models import ChatMessageModel
 from khoj.processor.conversation import prompts
 from khoj.processor.conversation.offeragent_memory import (
     OfferAgentMemory,
@@ -35,7 +32,6 @@ from khoj.search_filter.date_filter import DateFilter
 from khoj.search_filter.file_filter import FileFilter
 from khoj.search_filter.word_filter import WordFilter
 from khoj.utils.helpers import (
-    ConversationCommand,
     count_tokens,
     get_encoder,
     is_none_or_empty,
@@ -161,114 +157,6 @@ class ToolCall:
         self.id = id
 
 
-class ResearchIteration:
-    def __init__(
-        self,
-        query: ToolCall | dict | str,
-        context: list = None,
-        onlineContext: dict = None,
-        summarizedResult: str = None,
-        warning: str = None,
-        raw_response: list = None,
-    ):
-        self.query = ToolCall(**query) if isinstance(query, dict) else query
-        self.context = context
-        self.onlineContext = onlineContext
-        self.summarizedResult = summarizedResult
-        self.warning = warning
-        self.raw_response = raw_response
-
-    def to_dict(self) -> dict:
-        data = vars(self).copy()
-        data["query"] = self.query.__dict__ if isinstance(self.query, ToolCall) else self.query
-        return data
-
-
-def construct_iteration_history(
-    previous_iterations: List[ResearchIteration],
-    query: str = None,
-    query_images: List[str] = None,
-    query_files: str = None,
-) -> list[ChatMessageModel]:
-    iteration_history: list[ChatMessageModel] = []
-    query_message_content = construct_structured_message(query, query_images, attached_file_context=query_files)
-    if query_message_content:
-        iteration_history.append(ChatMessageModel(by="you", message=query_message_content))
-
-    # Group iterations: parallel tool calls share the same raw_response (only first has it)
-    # We need to group them so one assistant message has all tool_use blocks and
-    # one user message has all tool_results
-    current_group_raw_response = None
-    current_group_tool_results = []
-
-    def flush_group():
-        """Output the current group as assistant message + user message with tool results"""
-        nonlocal current_group_raw_response, current_group_tool_results
-        if current_group_raw_response and current_group_tool_results:
-            iteration_history.append(
-                ChatMessageModel(
-                    by="khoj",
-                    message=current_group_raw_response,
-                    intent=Intent(type="tool_call", query=query),
-                )
-            )
-            iteration_history.append(
-                ChatMessageModel(
-                    by="you",
-                    intent=Intent(type="tool_result"),
-                    message=current_group_tool_results,
-                )
-            )
-        current_group_raw_response = None
-        current_group_tool_results = []
-
-    for iteration in previous_iterations:
-        if not iteration.query or isinstance(iteration.query, str):
-            # Flush any pending group before adding non-tool message
-            flush_group()
-            iteration_history.append(
-                ChatMessageModel(
-                    by="you",
-                    message=iteration.summarizedResult
-                    or iteration.warning
-                    or "Please specify what you want to do next.",
-                )
-            )
-            continue
-
-        # If this iteration has raw_response, it starts a new group of parallel tool calls
-        if iteration.raw_response:
-            # Flush previous group if exists
-            flush_group()
-            current_group_raw_response = iteration.raw_response
-
-        # If no raw_response and no current group, create a fallback single-tool response
-        elif not current_group_raw_response:
-            current_group_raw_response = [
-                {
-                    "type": "tool_use",
-                    "id": iteration.query.id,
-                    "name": iteration.query.name,
-                    "input": iteration.query.args,
-                }
-            ]
-
-        # Add tool result to current group
-        current_group_tool_results.append(
-            {
-                "type": "tool_result",
-                "id": iteration.query.id,
-                "name": iteration.query.name,
-                "content": iteration.summarizedResult,
-            }
-        )
-
-    # Flush any remaining group
-    flush_group()
-
-    return iteration_history
-
-
 def construct_chat_history(chat_history: list[ChatMessageModel], n: int = 4, agent_name="AI") -> str:
     chat_history_str = ""
     for chat in chat_history[-n:]:
@@ -332,66 +220,6 @@ def construct_question_history(
             original_query = None
 
     return history_parts
-
-
-def construct_tool_chat_history(
-    previous_iterations: List[ResearchIteration], tool: ConversationCommand = None
-) -> List[ChatMessageModel]:
-    """
-    Construct chat history from previous iterations for a specific tool
-
-    If a tool is provided, only the inferred queries for that tool is added.
-    If no tool is provided inferred query for all tools used are added.
-    """
-    chat_history: list = []
-
-    def base_extractor(iteration: ResearchIteration) -> List[str]:
-        return []
-
-    extract_inferred_query_map: Dict[ConversationCommand, Callable[[ResearchIteration], List[str]]] = {
-        ConversationCommand.SearchWeb: (
-            lambda iteration: list(iteration.onlineContext.keys()) if iteration.onlineContext else []
-        ),
-        ConversationCommand.ReadWebpage: (
-            lambda iteration: list(iteration.onlineContext.keys()) if iteration.onlineContext else []
-        ),
-    }
-    for iteration in previous_iterations:
-        if not iteration.query or isinstance(iteration.query, str):
-            chat_history.append(
-                ChatMessageModel(
-                    by="you",
-                    message=iteration.summarizedResult
-                    or iteration.warning
-                    or "Please specify what you want to do next.",
-                )
-            )
-            continue
-
-        # If a tool is provided use the inferred query extractor for that tool if available
-        # If no tool is provided, use inferred query extractor for the tool used in the iteration
-        # Fallback to base extractor if the tool does not have an inferred query extractor
-        inferred_query_extractor = extract_inferred_query_map.get(
-            tool or ConversationCommand(iteration.query.name), base_extractor
-        )
-        chat_history += [
-            ChatMessageModel(
-                by="you",
-                message=yaml.dump(iteration.query.args, default_flow_style=False),
-            ),
-            ChatMessageModel(
-                by="khoj",
-                intent=Intent(
-                    type="remember",
-                    query=yaml.dump(iteration.query.args, default_flow_style=False),
-                    inferred_queries=inferred_query_extractor(iteration),
-                    memory_type="notes",
-                ),
-                message=iteration.summarizedResult,
-            ),
-        ]
-
-    return chat_history
 
 
 class ChatEvent(Enum):

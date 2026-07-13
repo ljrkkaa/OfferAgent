@@ -49,7 +49,7 @@ def test_chat_with_no_chat_history_or_retrieved_content(chat_client):
 @pytest.mark.django_db(transaction=True)
 def test_chat_with_online_content(chat_client):
     # Act
-    q = "/online give me the link to paul graham's essay how to do great work"
+    q = "give me the link to paul graham's essay how to do great work"
     response = chat_client.post("/api/chat?", json={"q": q})
     response_message = response.json()["response"]
 
@@ -69,7 +69,7 @@ def test_chat_with_online_content(chat_client):
 @pytest.mark.django_db(transaction=True)
 def test_chat_with_online_webpage_content(chat_client):
     # Act
-    q = "/online how many firefighters were involved in the great chicago fire and which year did it take place?"
+    q = "how many firefighters were involved in the great chicago fire and which year did it take place?"
     response = chat_client.post("/api/chat", json={"q": q})
     response_message = response.json()["response"]
 
@@ -225,7 +225,7 @@ def test_no_answer_in_chat_history_or_retrieved_content(chat_client, default_use
 @pytest.mark.chatquality
 def test_answer_using_general_command(chat_client, default_user2: KhojUser):
     # Arrange
-    query = "/general Where was Xi Li born?"
+    query = "Where was Xi Li born?"
     message_list = []
     create_conversation(message_list, default_user2)
 
@@ -243,7 +243,7 @@ def test_answer_using_general_command(chat_client, default_user2: KhojUser):
 @pytest.mark.chatquality
 def test_answer_from_retrieved_content_using_notes_command(chat_client, default_user2: KhojUser):
     # Arrange
-    query = "/notes Where was Xi Li born?"
+    query = "Where was Xi Li born?"
     message_list = []
     create_conversation(message_list, default_user2)
 
@@ -261,7 +261,7 @@ def test_answer_from_retrieved_content_using_notes_command(chat_client, default_
 @pytest.mark.chatquality
 def test_answer_not_known_using_notes_command(chat_client_no_background, default_user2: KhojUser):
     # Arrange
-    query = "/notes Where was Testatron born?"
+    query = "Where was Testatron born?"
     message_list = []
     create_conversation(message_list, default_user2)
 
@@ -618,7 +618,7 @@ def test_answer_in_chat_history_by_conversation_id(chat_client, default_user2: K
     create_conversation(message_list2, default_user2)
 
     # Act
-    query = "/general What is my favorite color?"
+    query = "What is my favorite color?"
     response = chat_client.post("/api/chat", json={"q": query, "conversation_id": str(conversation.id), "stream": True})
     response_message = response.content.decode("utf-8")
 
@@ -651,7 +651,7 @@ def test_answer_in_chat_history_by_conversation_id_with_agent(
     conversation = create_conversation(message_list, default_user2, openai_agent)
 
     # Act
-    query = "/general What did I buy for breakfast?"
+    query = "What did I buy for breakfast?"
     response = chat_client.post("/api/chat", json={"q": query, "conversation_id": str(conversation.id)})
     response_message = response.json()["response"]
 
