@@ -59,7 +59,13 @@ src/interface/android/local.properties
 
 INTERVIEW_PERSONAL_KB_AGENT.md
 
-docs/
+docs/*
+!docs/adr/
+docs/adr/*
+!docs/adr/*.md
+!docs/specs/
+docs/specs/*
+!docs/specs/*.md
 demos
 reference/
 AGENTS.md
