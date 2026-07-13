@@ -30,10 +30,11 @@ import {
   type ToolCallRecord,
   type ToolResultCommand,
   type VaultChangeApplyingRequest,
+  type VaultChangeCommand,
+  type VaultChangeEvent,
   type VaultChangeJournalRecord,
   type VaultChangeStateRequest,
   type VaultChangeTransactionState,
-  type RuntimeVaultChangeBatches,
 } from "@offeragent/protocol";
 
 const NODE_DIAGNOSTIC =
@@ -92,19 +93,34 @@ interface RuntimeConnection extends RuntimeHandshake {
 type RuntimeChild = ChildProcessByStdio<null, Readable, Readable>;
 
 interface RunChannel {
+  allowReplaySequenceGaps: boolean;
   conversationId: string;
   events: AgentRunEvent[];
   expectedSequence: number;
   failure?: Error;
+  processedEventIds: Set<string>;
+  seenEventIds: Set<string>;
+  start: AgentRunStart;
   wake?: () => void;
 }
 
 interface ConversationChannel {
+  command: ConversationCommand;
   conversationId: string;
   expectedSequence: number;
   reject: (error: Error) => void;
   requestEventId: string;
   resolve: (event: ConversationEvent) => void;
+  timeout: NodeJS.Timeout;
+}
+
+interface VaultChangeChannel {
+  command: VaultChangeCommand;
+  conversationId: string;
+  expectedSequence: number;
+  reject: (error: Error) => void;
+  requestEventId: string;
+  resolve: (event: VaultChangeEvent) => void;
   timeout: NodeJS.Timeout;
 }
 
@@ -124,6 +140,23 @@ const CONVERSATION_EVENT_TYPES = new Set([
   "conversation.updated",
 ]);
 
+const VAULT_CHANGE_EVENT_TYPES = new Set([
+  "vault_changes.applying_stored",
+  "vault_changes.error",
+  "vault_changes.listed",
+  "vault_changes.state_stored",
+]);
+
+const MAX_RECENT_PROTOCOL_EVENT_IDS = 4_096;
+
+function rememberEventId(eventIds: Set<string>, eventId: string): void {
+  eventIds.delete(eventId);
+  eventIds.add(eventId);
+  if (eventIds.size <= MAX_RECENT_PROTOCOL_EVENT_IDS) return;
+  const oldest = eventIds.values().next().value as string | undefined;
+  if (oldest) eventIds.delete(oldest);
+}
+
 export function isExpectedConversationEvent(
   value: unknown,
   expected: ExpectedConversationEvent,
@@ -141,6 +174,55 @@ export function isExpectedConversationEvent(
     event.agentRunId === expected.requestId &&
     event.sequence === expected.expectedSequence
   );
+}
+
+export function isExpectedVaultChangeEvent(
+  value: unknown,
+  expected: ExpectedConversationEvent & { command: VaultChangeCommand },
+): value is VaultChangeEvent {
+  if (!value || typeof value !== "object") return false;
+  const event = value as Partial<VaultChangeEvent>;
+  const validEnvelope = (
+    typeof event.type === "string" &&
+    VAULT_CHANGE_EVENT_TYPES.has(event.type) &&
+    event.protocolVersion === PROTOCOL_VERSION &&
+    typeof event.eventId === "string" &&
+    event.eventId.length > 0 &&
+    event.eventId !== expected.requestEventId &&
+    event.conversationId === expected.conversationId &&
+    event.agentRunId === expected.requestId &&
+    event.sequence === expected.expectedSequence
+  );
+  if (!validEnvelope) return false;
+  if (event.type === "vault_changes.listed") {
+    return expected.command.type === "vault_changes.list" &&
+      Array.isArray(event.batches) &&
+      event.batches.every(
+        (batch) =>
+          typeof batch?.batchId === "string" &&
+          typeof batch.checkpointRef === "string" &&
+          typeof batch.state === "string" &&
+          Array.isArray(batch.targets) &&
+          batch.targets.every(
+            (target) =>
+              typeof target?.path === "string" &&
+              typeof target.beforeHash === "string" &&
+              typeof target.afterHash === "string",
+          ),
+      );
+  }
+  if (event.type === "vault_changes.applying_stored") {
+    return expected.command.type === "vault_changes.applying" &&
+      event.batchId === expected.command.batchId;
+  }
+  if (event.type === "vault_changes.state_stored") {
+    return expected.command.type === "vault_changes.state" &&
+      event.batchId === expected.command.batchId &&
+      event.state === expected.command.state;
+  }
+  return event.type === "vault_changes.error" &&
+    event.error?.code === "storage_error" &&
+    typeof event.error.message === "string";
 }
 
 function isAgentRunEventEnvelope(value: unknown): value is AgentRunEvent {
@@ -166,6 +248,27 @@ function isAgentRunEventEnvelope(value: unknown): value is AgentRunEvent {
     typeof event.agentRunId === "string" &&
     typeof event.sequence === "number"
   );
+}
+
+function isDurableAgentRunEvent(event: AgentRunEvent): boolean {
+  return event.type !== "agent_run.delta";
+}
+
+function isTerminalAgentRunEvent(event: AgentRunEvent): boolean {
+  return event.type === "agent_run.cancelled" ||
+    event.type === "agent_run.completed" ||
+    event.type === "agent_run.failed" ||
+    event.type === "agent_run.interrupted";
+}
+
+export function isAcceptableAgentRunSequence(
+  event: AgentRunEvent,
+  expectedSequence: number,
+  allowReplaySequenceGaps: boolean,
+): boolean {
+  if (event.sequence === expectedSequence) return true;
+  if (event.sequence < expectedSequence) return false;
+  return allowReplaySequenceGaps && isDurableAgentRunEvent(event);
 }
 
 export class RuntimeRequestError extends Error {
@@ -365,7 +468,9 @@ export class RuntimeSupervisor implements RuntimeClient {
   #eventSocket?: WebSocket;
   #healthCheckInFlight = false;
   #healthTimer?: NodeJS.Timeout;
+  #reconnectPromise?: Promise<void>;
   readonly #conversationChannels = new Map<string, ConversationChannel>();
+  readonly #vaultChangeChannels = new Map<string, VaultChangeChannel>();
   readonly #pendingReplayEvents = new Map<string, AgentRunEvent>();
   readonly #processedEventIds = new Set<string>();
   readonly #reconciledConversations = new Set<string>();
@@ -436,6 +541,10 @@ export class RuntimeSupervisor implements RuntimeClient {
       ) {
         throw new Error("OfferAgent Runtime health response did not match its startup handshake.");
       }
+      this.#pendingReplayEvents.clear();
+      this.#processedEventIds.clear();
+      this.#reconciledConversations.clear();
+      this.#seenEventIds.clear();
       await this.#openEventSocket(child, connection);
       this.#connection = connection;
       this.#startHealthMonitor(child, connection);
@@ -512,13 +621,9 @@ export class RuntimeSupervisor implements RuntimeClient {
   async listVaultChangeBatches(
     states: VaultChangeTransactionState[],
   ): Promise<VaultChangeJournalRecord[]> {
-    const connection = this.#requiredConnection();
-    const response = await callRuntime<RuntimeVaultChangeBatches>(
-      connection,
-      "GET",
-      `/vault-changes?states=${encodeURIComponent(states.join(","))}`,
-    );
-    return response.batches;
+    const event = await this.#requestVaultChange({ type: "vault_changes.list", states });
+    if (event.type !== "vault_changes.listed") throw new Error("Unexpected Vault Change response.");
+    return event.batches;
   }
 
   async markVaultChangeApplying(
@@ -526,18 +631,22 @@ export class RuntimeSupervisor implements RuntimeClient {
     checkpointRef: string,
     targets: VaultChangeApplyingRequest["targets"],
   ): Promise<void> {
-    const connection = this.#requiredConnection();
     const request: VaultChangeApplyingRequest = { batchId, checkpointRef, targets };
-    await callRuntime(connection, "POST", "/vault-changes/applying", request);
+    const event = await this.#requestVaultChange({ type: "vault_changes.applying", ...request });
+    if (event.type !== "vault_changes.applying_stored") {
+      throw new Error("Unexpected Vault Change response.");
+    }
   }
 
   async markVaultChangeState(
     batchId: string,
     state: VaultChangeStateRequest["state"],
   ): Promise<void> {
-    const connection = this.#requiredConnection();
     const request: VaultChangeStateRequest = { batchId, state };
-    await callRuntime(connection, "POST", "/vault-changes/state", request);
+    const event = await this.#requestVaultChange({ type: "vault_changes.state", ...request });
+    if (event.type !== "vault_changes.state_stored") {
+      throw new Error("Unexpected Vault Change response.");
+    }
   }
 
   async listConversations(): Promise<ConversationSummary[]> {
@@ -614,13 +723,6 @@ export class RuntimeSupervisor implements RuntimeClient {
     if (this.#runChannels.has(request.agentRunId)) {
       throw new Error(`Agent Run '${request.agentRunId}' is already active.`);
     }
-    const channel: RunChannel = {
-      conversationId: request.conversationId,
-      events: [],
-      expectedSequence: 1,
-    };
-    this.#runChannels.set(request.agentRunId, channel);
-
     const start: AgentRunStart = {
       type: "agent_run.start",
       protocolVersion: PROTOCOL_VERSION,
@@ -631,6 +733,16 @@ export class RuntimeSupervisor implements RuntimeClient {
       model: request.model,
       input: { role: "user", text: request.input },
     };
+    const channel: RunChannel = {
+      allowReplaySequenceGaps: false,
+      conversationId: request.conversationId,
+      events: [],
+      expectedSequence: 1,
+      processedEventIds: new Set<string>(),
+      seenEventIds: new Set<string>(),
+      start,
+    };
+    this.#runChannels.set(request.agentRunId, channel);
     try {
       socket.send(JSON.stringify(start));
     } catch (error) {
@@ -660,15 +772,17 @@ export class RuntimeSupervisor implements RuntimeClient {
           typeof event.eventId !== "string" ||
           event.conversationId !== request.conversationId ||
           event.agentRunId !== request.agentRunId ||
-          event.sequence !== expectedSequence
+          !isAcceptableAgentRunSequence(event, expectedSequence, true)
         ) {
-          throw new Error("OfferAgent Runtime returned an out-of-sequence Agent Run event.");
+          throw new Error(
+            `OfferAgent Runtime sequence gap: expected ${expectedSequence}, received ${event.sequence}.`,
+          );
         }
-        expectedSequence += 1;
+        expectedSequence = event.sequence + 1;
         lastDeliveredEvent = event;
         yield event;
-        this.#processedEventIds.add(event.eventId);
-        this.#acknowledgeEvent(socket, event);
+        channel.processedEventIds.add(event.eventId);
+        this.#acknowledgeEvent(this.#eventSocket ?? socket, event);
         lastDeliveredEvent = undefined;
         if (
           event.type === "agent_run.cancelled" ||
@@ -688,15 +802,20 @@ export class RuntimeSupervisor implements RuntimeClient {
           lastDeliveredEvent.type === "agent_run.failed" ||
           lastDeliveredEvent.type === "agent_run.interrupted")
       ) {
-        this.#processedEventIds.add(lastDeliveredEvent.eventId);
-        this.#acknowledgeEvent(socket, lastDeliveredEvent);
+        channel.processedEventIds.add(lastDeliveredEvent.eventId);
+        this.#acknowledgeEvent(this.#eventSocket ?? socket, lastDeliveredEvent);
         terminal = true;
+      }
+      for (const eventId of channel.seenEventIds) {
+        rememberEventId(this.#seenEventIds, eventId);
+      }
+      for (const eventId of channel.processedEventIds) {
+        rememberEventId(this.#processedEventIds, eventId);
       }
       this.#runChannels.delete(request.agentRunId);
       if (
         !terminal &&
-        this.#eventSocket === socket &&
-        socket.readyState === WebSocket.OPEN
+        this.#eventSocket?.readyState === WebSocket.OPEN
       ) {
         const cancel: AgentRunCancel = {
           type: "agent_run.cancel",
@@ -706,12 +825,15 @@ export class RuntimeSupervisor implements RuntimeClient {
           agentRunId: request.agentRunId,
           sequence: expectedSequence,
         };
-        socket.send(JSON.stringify(cancel));
+        this.#eventSocket.send(JSON.stringify(cancel));
       }
     }
   }
 
-  async #openEventSocket(child: RuntimeChild, connection: RuntimeConnection): Promise<void> {
+  async #openEventSocket(
+    child: RuntimeChild,
+    connection: RuntimeConnection,
+  ): Promise<void> {
     const socket = new WebSocket(`ws://127.0.0.1:${connection.port}/events`, {
       headers: { authorization: `Bearer ${connection.token}` },
     });
@@ -738,10 +860,6 @@ export class RuntimeSupervisor implements RuntimeClient {
       socket.once("close", onClose);
     });
 
-    this.#pendingReplayEvents.clear();
-    this.#processedEventIds.clear();
-    this.#reconciledConversations.clear();
-    this.#seenEventIds.clear();
     this.#eventSocket = socket;
     socket.on("message", (data) => {
       let event: unknown;
@@ -762,7 +880,44 @@ export class RuntimeSupervisor implements RuntimeClient {
         );
         return;
       }
+      if ((event as { protocolVersion?: unknown }).protocolVersion !== PROTOCOL_VERSION) {
+        this.#handleEventSocketFailure(
+          child,
+          socket,
+          new Error(
+            `OfferAgent protocol version mismatch: plugin ${PROTOCOL_VERSION}, Runtime event ${(event as { protocolVersion?: unknown }).protocolVersion ?? "missing"}.`,
+          ),
+        );
+        return;
+      }
       const eventRecord = event as { agentRunId: string; type?: unknown };
+      if (typeof eventRecord.type === "string" && eventRecord.type.startsWith("vault_changes.")) {
+        const channel = this.#vaultChangeChannels.get(eventRecord.agentRunId);
+        if (!channel) return;
+        if (
+          !isExpectedVaultChangeEvent(event, {
+            command: channel.command,
+            conversationId: channel.conversationId,
+            expectedSequence: channel.expectedSequence,
+            requestEventId: channel.requestEventId,
+            requestId: eventRecord.agentRunId,
+          }) ||
+          this.#seenEventIds.has(event.eventId)
+        ) {
+          this.#handleEventSocketFailure(
+            child,
+            socket,
+            new Error("OfferAgent Runtime returned an invalid Vault Change event."),
+          );
+          return;
+        }
+        rememberEventId(this.#seenEventIds, event.eventId);
+        clearTimeout(channel.timeout);
+        this.#vaultChangeChannels.delete(event.agentRunId);
+        if (event.type === "vault_changes.error") channel.reject(new Error(event.error.message));
+        else channel.resolve(event);
+        return;
+      }
       if (typeof eventRecord.type === "string" && eventRecord.type.startsWith("conversation.")) {
         const channel = this.#conversationChannels.get(eventRecord.agentRunId);
         if (!channel) return;
@@ -782,7 +937,7 @@ export class RuntimeSupervisor implements RuntimeClient {
           );
           return;
         }
-        this.#seenEventIds.add(event.eventId);
+        rememberEventId(this.#seenEventIds, event.eventId);
         clearTimeout(channel.timeout);
         this.#conversationChannels.delete(event.agentRunId);
         if (event.type === "conversation.error") channel.reject(new Error(event.error.message));
@@ -798,15 +953,17 @@ export class RuntimeSupervisor implements RuntimeClient {
         return;
       }
       const channel = this.#runChannels.get(event.agentRunId);
-      if (this.#seenEventIds.has(event.eventId)) {
-        if (this.#processedEventIds.has(event.eventId)) this.#acknowledgeEvent(socket, event);
+      const seenEventIds = channel?.seenEventIds ?? this.#seenEventIds;
+      const processedEventIds = channel?.processedEventIds ?? this.#processedEventIds;
+      if (seenEventIds.has(event.eventId)) {
+        if (processedEventIds.has(event.eventId)) this.#acknowledgeEvent(socket, event);
         return;
       }
       if (!channel) {
         this.#pendingReplayEvents.set(event.eventId, event);
         if (this.#reconciledConversations.has(event.conversationId)) {
-          this.#processedEventIds.add(event.eventId);
-          this.#seenEventIds.add(event.eventId);
+          rememberEventId(this.#processedEventIds, event.eventId);
+          rememberEventId(this.#seenEventIds, event.eventId);
           this.#pendingReplayEvents.delete(event.eventId);
           this.#acknowledgeEvent(socket, event);
         }
@@ -814,17 +971,23 @@ export class RuntimeSupervisor implements RuntimeClient {
       }
       if (
         event.conversationId !== channel.conversationId ||
-        event.sequence !== channel.expectedSequence
+        !isAcceptableAgentRunSequence(
+          event,
+          channel.expectedSequence,
+          channel.allowReplaySequenceGaps,
+        )
       ) {
         this.#handleEventSocketFailure(
           child,
           socket,
-          new Error("OfferAgent Runtime returned an out-of-sequence Agent Run event."),
+          new Error(
+            `OfferAgent Runtime sequence gap: expected ${channel.expectedSequence}, received ${event.sequence}.`,
+          ),
         );
         return;
       }
-      channel.expectedSequence += 1;
-      this.#seenEventIds.add(event.eventId);
+      channel.expectedSequence = event.sequence + 1;
+      channel.seenEventIds.add(event.eventId);
       channel.events.push(event);
       channel.wake?.();
       channel.wake = undefined;
@@ -846,10 +1009,19 @@ export class RuntimeSupervisor implements RuntimeClient {
         new Error("OfferAgent Runtime event connection closed unexpectedly."),
       );
     });
+    for (const channel of this.#conversationChannels.values()) {
+      socket.send(JSON.stringify(channel.command));
+    }
+    for (const channel of this.#vaultChangeChannels.values()) {
+      socket.send(JSON.stringify(channel.command));
+    }
+    for (const channel of this.#runChannels.values()) {
+      socket.send(JSON.stringify(channel.start));
+    }
   }
 
   #acknowledgeEvent(socket: WebSocket, event: AgentRunEvent): void {
-    if (socket.readyState !== WebSocket.OPEN) return;
+    if (!isDurableAgentRunEvent(event) || socket.readyState !== WebSocket.OPEN) return;
     const acknowledgement: DurableEventAck = {
       type: "event.ack",
       protocolVersion: PROTOCOL_VERSION,
@@ -907,8 +1079,8 @@ export class RuntimeSupervisor implements RuntimeClient {
     for (const [eventId, event] of this.#pendingReplayEvents) {
       if (event.conversationId !== conversationId) continue;
       this.#pendingReplayEvents.delete(eventId);
-      this.#seenEventIds.add(eventId);
-      this.#processedEventIds.add(eventId);
+      rememberEventId(this.#seenEventIds, eventId);
+      rememberEventId(this.#processedEventIds, eventId);
       this.#acknowledgeEvent(socket, event);
     }
   }
@@ -916,16 +1088,40 @@ export class RuntimeSupervisor implements RuntimeClient {
   #handleEventSocketFailure(child: RuntimeChild, socket: WebSocket, error: Error): void {
     if (this.#eventSocket !== socket) return;
     this.#eventSocket = undefined;
-    this.#failRunChannels(error);
+    for (const channel of this.#runChannels.values()) {
+      channel.allowReplaySequenceGaps = true;
+    }
     if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
       socket.close();
     }
-    if (!this.#stopping) {
+    if (this.#stopping || this.#reconnectPromise) return;
+    const connection = this.#connection;
+    if (!connection || this.#child !== child) {
+      this.#failRunChannels(error);
+      return;
+    }
+    this.#reconnectPromise = (async () => {
+      let lastError = error;
+      for (let attempt = 1; attempt <= 5; attempt += 1) {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, attempt * 100).unref();
+        });
+        if (this.#stopping || this.#child !== child) return;
+        try {
+          await this.#openEventSocket(child, connection);
+          return;
+        } catch (reconnectError) {
+          lastError = reconnectError instanceof Error ? reconnectError : lastError;
+        }
+      }
+      this.#failRunChannels(lastError);
       this.#markUnavailable(
         child,
-        "OfferAgent Runtime event connection failed. Restart the plugin to reconnect.",
+        "OfferAgent Runtime event connection could not be re-established after five attempts.",
       );
-    }
+    })().finally(() => {
+      this.#reconnectPromise = undefined;
+    });
   }
 
   #closeEventSocket(error: Error): void {
@@ -951,6 +1147,55 @@ export class RuntimeSupervisor implements RuntimeClient {
       channel.reject(error);
       this.#conversationChannels.delete(requestId);
     }
+    for (const [requestId, channel] of this.#vaultChangeChannels) {
+      clearTimeout(channel.timeout);
+      channel.reject(error);
+      this.#vaultChangeChannels.delete(requestId);
+    }
+  }
+
+  #requestVaultChange(
+    input:
+      | { type: "vault_changes.list"; states: VaultChangeTransactionState[] }
+      | ({ type: "vault_changes.applying" } & VaultChangeApplyingRequest)
+      | ({ type: "vault_changes.state" } & VaultChangeStateRequest),
+  ): Promise<VaultChangeEvent> {
+    const socket = this.#eventSocket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("OfferAgent Runtime event connection is unavailable."));
+    }
+    const requestId = randomUUID();
+    const command = {
+      ...input,
+      protocolVersion: PROTOCOL_VERSION,
+      eventId: randomUUID(),
+      conversationId: "vault-change-management",
+      agentRunId: requestId,
+      sequence: 0,
+    } as VaultChangeCommand;
+    return new Promise<VaultChangeEvent>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.#vaultChangeChannels.delete(requestId);
+        reject(new Error("OfferAgent Runtime Vault Change request timed out."));
+      }, 5_000);
+      timeout.unref();
+      this.#vaultChangeChannels.set(requestId, {
+        command,
+        conversationId: command.conversationId,
+        expectedSequence: command.sequence + 1,
+        reject,
+        requestEventId: command.eventId,
+        resolve,
+        timeout,
+      });
+      try {
+        socket.send(JSON.stringify(command));
+      } catch (error) {
+        clearTimeout(timeout);
+        this.#vaultChangeChannels.delete(requestId);
+        reject(error);
+      }
+    });
   }
 
   #requestConversation(
@@ -978,6 +1223,7 @@ export class RuntimeSupervisor implements RuntimeClient {
       }, 5_000);
       timeout.unref();
       this.#conversationChannels.set(requestId, {
+        command,
         conversationId: command.conversationId,
         expectedSequence: command.sequence + 1,
         reject,

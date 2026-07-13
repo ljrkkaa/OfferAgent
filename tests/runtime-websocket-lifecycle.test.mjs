@@ -12,11 +12,13 @@ const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 const require = createRequire(import.meta.url);
 const ActualWebSocket = require("ws");
 let connectionCount = 0;
+const trackedSockets = [];
 
 class TrackingWebSocket extends ActualWebSocket {
   constructor(...arguments_) {
     super(...arguments_);
     connectionCount += 1;
+    trackedSockets.push(this);
   }
 }
 
@@ -26,9 +28,16 @@ Module._load = function loadWithTrackedWebSocket(request, parent, isMain) {
   return originalLoad.call(this, request, parent, isMain);
 };
 let RuntimeSupervisor;
+let isAcceptableAgentRunSequence;
 let isExpectedConversationEvent;
+let isExpectedVaultChangeEvent;
 try {
-  ({ RuntimeSupervisor, isExpectedConversationEvent } = require(
+  ({
+    RuntimeSupervisor,
+    isAcceptableAgentRunSequence,
+    isExpectedConversationEvent,
+    isExpectedVaultChangeEvent,
+  } = require(
     path.join(repositoryRoot, "packages", "plugin", "dist", "runtime-supervisor.js"),
   ));
 } finally {
@@ -84,6 +93,71 @@ test("Conversation responses require the expected protocol identity and ordering
   }
 });
 
+test("Vault Change responses must match their pending command payload", () => {
+  const command = {
+    type: "vault_changes.state",
+    protocolVersion: 1,
+    eventId: "vault-request-event",
+    conversationId: "vault-change-management",
+    agentRunId: "vault-request-one",
+    sequence: 0,
+    batchId: "batch-one",
+    state: "applied",
+  };
+  const expected = {
+    command,
+    conversationId: command.conversationId,
+    expectedSequence: 1,
+    requestEventId: command.eventId,
+    requestId: command.agentRunId,
+  };
+  const valid = {
+    type: "vault_changes.state_stored",
+    protocolVersion: 1,
+    eventId: "vault-response-event",
+    conversationId: command.conversationId,
+    agentRunId: command.agentRunId,
+    sequence: 1,
+    batchId: command.batchId,
+    state: command.state,
+  };
+  assert.equal(isExpectedVaultChangeEvent(valid, expected), true);
+  for (const malformed of [
+    { ...valid, batchId: "batch-two" },
+    { ...valid, state: "rolled_back" },
+    { ...valid, type: "vault_changes.applying_stored" },
+  ]) {
+    assert.equal(isExpectedVaultChangeEvent(malformed, expected), false);
+  }
+});
+
+test("only replay mode permits forward gaps to later durable Agent Run events", () => {
+  const event = {
+    type: "tool_call.requested",
+    protocolVersion: 1,
+    eventId: "replayed-tool-request",
+    conversationId: "sequence-conversation",
+    agentRunId: "sequence-run",
+    sequence: 5,
+    toolCallId: "sequence-tool",
+    tool: { kind: "local", name: "vault_read", arguments: { path: "notes/a.md" } },
+  };
+  assert.equal(isAcceptableAgentRunSequence(event, 4, false), false);
+  assert.equal(isAcceptableAgentRunSequence(event, 4, true), true);
+  assert.equal(isAcceptableAgentRunSequence({ ...event, sequence: 3 }, 4, true), false);
+  assert.equal(
+    isAcceptableAgentRunSequence({ ...event, type: "agent_run.delta", delta: "lost" }, 4, true),
+    false,
+  );
+  const terminal = {
+    ...event,
+    type: "agent_run.completed",
+    output: { role: "assistant", text: "done" },
+  };
+  assert.equal(isAcceptableAgentRunSequence(terminal, 4, false), false);
+  assert.equal(isAcceptableAgentRunSequence(terminal, 4, true), true);
+});
+
 async function completeRun(supervisor, suffix) {
   const events = [];
   for await (const event of supervisor.runAgent({
@@ -112,6 +186,109 @@ test("RuntimeSupervisor keeps one WebSocket across sequential Agent Runs", async
   await completeRun(supervisor, "one");
   await completeRun(supervisor, "two");
   assert.equal(connectionCount, 1);
+});
+
+test("RuntimeSupervisor reconnects and delivers the durable interruption after a socket drop", async (t) => {
+  connectionCount = 0;
+  trackedSockets.length = 0;
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-reconnect-"));
+  let releaseRead;
+  let contractExecutions = 0;
+  let vaultReadExecutions = 0;
+  const delayedRead = new Promise((resolve) => (releaseRead = resolve));
+  const supervisor = new RuntimeSupervisor({
+    nodeCandidates: [process.execPath],
+    parentPid: process.pid,
+    provider: "fake",
+    runtimePath: runtimeEntry,
+    statePath: path.join(temporaryDirectory, "state.db"),
+    toolExecutor: {
+      execute: async (event) => {
+        if (event.tool.name === "agent_contract_read") {
+          contractExecutions += 1;
+          return contractResult();
+        }
+        vaultReadExecutions += 1;
+        return delayedRead;
+      },
+    },
+  });
+  t.after(async () => {
+    releaseRead?.({ ok: false, error: { code: "tool_error", message: "released" } });
+    await supervisor.stop();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+
+  await supervisor.start();
+  const iterator = supervisor.runAgent({
+    conversationId: "reconnect-conversation",
+    agentRunId: "reconnect-run",
+    model: "fake-interview-model",
+    input: "vault_read notes/reconnect.md",
+  })[Symbol.asyncIterator]();
+  assert.equal((await iterator.next()).value.type, "agent_run.started");
+  assert.equal((await iterator.next()).value.tool.name, "agent_contract_read");
+  assert.equal((await iterator.next()).value.type, "tool_call.completed");
+  assert.equal((await iterator.next()).value.tool.name, "vault_read");
+  trackedSockets[0].terminate();
+
+  const afterDrop = [];
+  while (true) {
+    const next = await Promise.race([
+      iterator.next(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Reconnect timed out")), 5_000)),
+    ]);
+    if (next.done) break;
+    afterDrop.push(next.value);
+    if (next.value.type === "agent_run.interrupted") break;
+  }
+  assert.equal(afterDrop.at(-1).type, "agent_run.interrupted");
+  assert.equal(connectionCount, 2);
+  assert.equal(contractExecutions, 1);
+  assert.equal(vaultReadExecutions, 1);
+  releaseRead({ ok: false, error: { code: "tool_error", message: "late result" } });
+  await completeRun(supervisor, "after-reconnect");
+});
+
+test("RuntimeSupervisor resends a stable Run start dropped before durable receipt", async (t) => {
+  connectionCount = 0;
+  trackedSockets.length = 0;
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-start-reconnect-"));
+  const supervisor = new RuntimeSupervisor({
+    nodeCandidates: [process.execPath],
+    parentPid: process.pid,
+    provider: "fake",
+    runtimePath: runtimeEntry,
+    statePath: path.join(temporaryDirectory, "state.db"),
+    toolExecutor: contractToolExecutor,
+  });
+  t.after(async () => {
+    await supervisor.stop();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+
+  await supervisor.start();
+  const iterator = supervisor.runAgent({
+    conversationId: "dropped-start-conversation",
+    agentRunId: "dropped-start-run",
+    model: "fake-interview-model",
+    input: "dropped start",
+  })[Symbol.asyncIterator]();
+  const firstEvent = iterator.next();
+  trackedSockets[0].terminate();
+  const first = await Promise.race([
+    firstEvent,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Run start replay timed out")), 5_000)),
+  ]);
+  assert.equal(first.value.type, "agent_run.started");
+  let terminal = first.value;
+  while (!["agent_run.completed", "agent_run.interrupted"].includes(terminal.type)) {
+    const next = await iterator.next();
+    if (next.done) break;
+    terminal = next.value;
+  }
+  assert.ok(["agent_run.completed", "agent_run.interrupted"].includes(terminal.type));
+  assert.equal(connectionCount, 2);
 });
 
 test("a consumed failed terminal event is durably acknowledged before iterator return", async (t) => {

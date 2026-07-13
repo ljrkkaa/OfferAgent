@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -19,7 +19,7 @@ import {
 } from "@offeragent/protocol";
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.js";
 
-const CURRENT_SCHEMA_VERSION = 8;
+const CURRENT_SCHEMA_VERSION = 9;
 
 function persistedToolArguments(name: ToolCallRecord["name"], arguments_: unknown): unknown {
   if (name !== "vault_propose_changes" || !arguments_ || typeof arguments_ !== "object") {
@@ -49,6 +49,21 @@ function persistedToolArguments(name: ToolCallRecord["name"], arguments_: unknow
         })
       : [],
   };
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function protocolRequestHash(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
 
 const MIGRATIONS = [
@@ -465,6 +480,25 @@ const MIGRATIONS = [
       );
     `,
   },
+  {
+    version: 9,
+    sql: `
+      CREATE TABLE IF NOT EXISTS protocol_responses (
+        request_event_id TEXT PRIMARY KEY,
+        request_type TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        agent_run_id TEXT NOT NULL,
+        owner_conversation_id TEXT,
+        request_hash TEXT NOT NULL,
+        response_json TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS protocol_responses_by_conversation
+        ON protocol_responses(conversation_id);
+      CREATE INDEX IF NOT EXISTS protocol_responses_by_owner
+        ON protocol_responses(owner_conversation_id);
+    `,
+  },
 ] as const;
 
 interface ConversationSnapshot {
@@ -546,6 +580,16 @@ export class RuntimeStateStore {
     conversation: ConversationSummary,
   ): Promise<ConversationSummary> {
     return this.#write(() => {
+      const existing = firstRow(
+        this.#database,
+        "SELECT title, model_id FROM conversations WHERE id = ?",
+        [conversation.id],
+      );
+      if (existing) {
+        if (existing[0] === conversation.title && existing[1] === conversation.modelId) {
+          return conversation;
+        }
+      }
       const timestamp = now();
       this.#database.run(
         `INSERT INTO conversations (id, title, model_id, created_at, updated_at)
@@ -619,15 +663,126 @@ export class RuntimeStateStore {
     });
   }
 
+  async getProtocolResponse(
+    requestEventId: string,
+    requestType: string,
+    conversationId: string,
+    agentRunId: string,
+    request: unknown,
+  ): Promise<unknown | undefined> {
+    await this.#writeTail;
+    const row = firstRow(
+      this.#database,
+      `SELECT request_type, conversation_id, agent_run_id, request_hash, response_json
+       FROM protocol_responses WHERE request_event_id = ?`,
+      [requestEventId],
+    );
+    if (!row) return undefined;
+    if (
+      row[0] !== requestType ||
+      row[1] !== conversationId ||
+      row[2] !== agentRunId ||
+      row[3] !== protocolRequestHash(request)
+    ) {
+      throw new Error(`Protocol event '${requestEventId}' was reused with conflicting identity.`);
+    }
+    if (row[4] === null) {
+      throw new Error(`Protocol event '${requestEventId}' was invalidated after resource deletion.`);
+    }
+    return JSON.parse(row[4] as string) as unknown;
+  }
+
+  async storeProtocolResponse(
+    requestEventId: string,
+    requestType: string,
+    conversationId: string,
+    agentRunId: string,
+    request: unknown,
+    response: unknown,
+    ownerConversationId?: string,
+  ): Promise<unknown> {
+    return this.#write(() => {
+      const existing = firstRow(
+        this.#database,
+        `SELECT request_type, conversation_id, agent_run_id, request_hash, response_json
+         FROM protocol_responses WHERE request_event_id = ?`,
+        [requestEventId],
+      );
+      if (existing) {
+        if (
+          existing[0] !== requestType ||
+          existing[1] !== conversationId ||
+          existing[2] !== agentRunId ||
+          existing[3] !== protocolRequestHash(request)
+        ) {
+          throw new Error(`Protocol event '${requestEventId}' was reused with conflicting identity.`);
+        }
+        if (existing[4] === null) {
+          throw new Error(`Protocol event '${requestEventId}' was invalidated after resource deletion.`);
+        }
+        return JSON.parse(existing[4] as string) as unknown;
+      }
+      this.#database.run(
+        `INSERT INTO protocol_responses
+          (request_event_id, request_type, conversation_id, agent_run_id,
+           owner_conversation_id, request_hash, response_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          requestEventId,
+          requestType,
+          conversationId,
+          agentRunId,
+          ownerConversationId ?? null,
+          protocolRequestHash(request),
+          JSON.stringify(response),
+          now(),
+        ],
+      );
+      return response;
+    });
+  }
+
   async beginAgentRun(
     conversationId: string,
     agentRunId: string,
     modelId: string,
     input: string,
     startedEvent?: Extract<AgentRunEvent, { type: "agent_run.started" }>,
-  ): Promise<void> {
-    await this.#write(() => {
+    startEventId?: string,
+  ): Promise<boolean> {
+    return this.#write(() => {
       const timestamp = now();
+      const existing = firstRow(
+        this.#database,
+        `SELECT agent_runs.conversation_id, agent_runs.model_id, agent_runs.start_event_id,
+                messages.text
+         FROM agent_runs
+         LEFT JOIN messages ON messages.id = agent_runs.user_message_id
+         WHERE agent_runs.id = ?`,
+        [agentRunId],
+      );
+      if (existing) {
+        if (
+          startEventId &&
+          existing[0] === conversationId &&
+          existing[1] === modelId &&
+          existing[2] === startEventId &&
+          existing[3] === input
+        ) {
+          return false;
+        }
+        throw new Error(`Agent Run '${agentRunId}' already exists with different identity.`);
+      }
+      if (
+        startEventId &&
+        firstRow(
+          this.#database,
+          "SELECT id FROM agent_runs WHERE start_event_id = ?",
+          [startEventId],
+        )
+      ) {
+        throw new Error(`Protocol event '${startEventId}' was reused with conflicting identity.`);
+      }
       const messageId = randomUUID();
       this.#database.run(
         `INSERT OR IGNORE INTO conversations (id, title, model_id, created_at, updated_at)
@@ -637,9 +792,9 @@ export class RuntimeStateStore {
       const sequence = this.#nextMessageSequence(conversationId);
       this.#database.run(
         `INSERT INTO agent_runs
-          (id, conversation_id, model_id, status, created_at, updated_at)
-         VALUES (?, ?, ?, 'running', ?, ?)`,
-        [agentRunId, conversationId, modelId, timestamp, timestamp],
+          (id, conversation_id, model_id, status, start_event_id, created_at, updated_at)
+         VALUES (?, ?, ?, 'running', ?, ?, ?)`,
+        [agentRunId, conversationId, modelId, startEventId ?? null, timestamp, timestamp],
       );
       this.#database.run(
         `INSERT INTO messages
@@ -663,6 +818,7 @@ export class RuntimeStateStore {
         },
       );
       this.#touchConversation(conversationId, timestamp);
+      return true;
     });
   }
 
@@ -749,12 +905,32 @@ export class RuntimeStateStore {
     eventId: string,
     conversationId: string,
     agentRunId: string,
+    sequence?: number,
   ): Promise<void> {
     await this.#write(() => {
+      const acknowledgedSequence = sequence ?? valueAt(
+        this.#database,
+        `SELECT sequence FROM durable_events
+         WHERE id = ? AND conversation_id = ? AND agent_run_id = ?`,
+        [eventId, conversationId, agentRunId],
+      );
+      const numericSequence = Number(acknowledgedSequence);
+      if (
+        !Number.isInteger(numericSequence) ||
+        valueAt(
+          this.#database,
+          `SELECT 1 FROM durable_events
+           WHERE id = ? AND conversation_id = ? AND agent_run_id = ? AND sequence = ?`,
+          [eventId, conversationId, agentRunId, numericSequence],
+        ) !== 1
+      ) {
+        throw new Error("Durable event acknowledgement does not match a persisted event.");
+      }
       this.#database.run(
         `UPDATE durable_events SET acknowledged_at = ?
-         WHERE id = ? AND conversation_id = ? AND agent_run_id = ? AND acknowledged_at IS NULL`,
-        [now(), eventId, conversationId, agentRunId],
+         WHERE conversation_id = ? AND agent_run_id = ? AND sequence <= ?
+           AND acknowledged_at IS NULL`,
+        [now(), conversationId, agentRunId, numericSequence],
       );
     });
   }
@@ -779,12 +955,14 @@ export class RuntimeStateStore {
     });
   }
 
-  async listUnacknowledgedEvents(): Promise<AgentRunEvent[]> {
+  async listUnacknowledgedEvents(agentRunId?: string): Promise<AgentRunEvent[]> {
     await this.#writeTail;
     const rows =
       this.#database.exec(
         `SELECT payload_json FROM durable_events
-         WHERE acknowledged_at IS NULL ORDER BY rowid`,
+         WHERE acknowledged_at IS NULL${agentRunId ? " AND agent_run_id = ?" : ""}
+         ORDER BY rowid`,
+        agentRunId ? [agentRunId] : [],
       )[0]?.values ?? [];
     return rows.map(([payload]) => JSON.parse(payload as string) as AgentRunEvent);
   }
@@ -994,10 +1172,24 @@ export class RuntimeStateStore {
     );
   }
 
+  async getVaultChangeConversationId(batchId: string): Promise<string> {
+    await this.#writeTail;
+    const conversationId = valueAt(
+      this.#database,
+      "SELECT conversation_id FROM vault_change_batches WHERE id = ?",
+      [batchId],
+    );
+    if (typeof conversationId !== "string") {
+      throw new Error(`Vault Change Batch '${batchId}' does not exist.`);
+    }
+    return conversationId;
+  }
+
   async completeToolCall(
     agentRunId: string,
     result: LocalToolResultPayload,
     event: Extract<AgentRunEvent, { type: "tool_call.completed" }>,
+    resultEventId?: string,
   ): Promise<string[]> {
     return this.#write(() => {
       const run = this.#requiredRun(agentRunId);
@@ -1005,12 +1197,15 @@ export class RuntimeStateStore {
       const stalePaths: string[] = [];
       this.#database.run(
         `UPDATE tool_calls
-         SET status = ?, error_code = ?, error_message = ?, updated_at = ?
+         SET status = ?, error_code = ?, error_message = ?, result_event_id = ?,
+             result_json = ?, updated_at = ?
          WHERE id = ? AND agent_run_id = ? AND status = 'requested'`,
         [
           result.ok ? "completed" : "failed",
           result.ok ? null : result.error.code,
           result.ok ? null : result.error.message,
+          resultEventId ?? null,
+          JSON.stringify(result),
           timestamp,
           event.toolCallId,
           agentRunId,
@@ -1101,6 +1296,25 @@ export class RuntimeStateStore {
       this.#touchConversation(run.conversationId, timestamp);
       return stalePaths;
     });
+  }
+
+  async isDuplicateToolResult(
+    toolCallId: string,
+    eventId: string,
+    result: LocalToolResultPayload,
+  ): Promise<boolean> {
+    await this.#writeTail;
+    const row = firstRow(
+      this.#database,
+      `SELECT result_event_id, result_json, status FROM tool_calls WHERE id = ?`,
+      [toolCallId],
+    );
+    return Boolean(
+      row &&
+      row[0] === eventId &&
+      row[1] === JSON.stringify(result) &&
+      (row[2] === "completed" || row[2] === "failed"),
+    );
   }
 
   async getConversation(conversationId: string): Promise<ConversationSnapshot> {
@@ -1212,10 +1426,12 @@ export class RuntimeStateStore {
 
   async deleteConversation(conversationId: string): Promise<void> {
     await this.#write(() => {
+      this.#database.run(
+        `UPDATE protocol_responses SET response_json = NULL
+         WHERE conversation_id = ? OR owner_conversation_id = ?`,
+        [conversationId, conversationId],
+      );
       this.#database.run("DELETE FROM conversations WHERE id = ?", [conversationId]);
-      if (this.#database.getRowsModified() !== 1) {
-        throw new Error(`Conversation '${conversationId}' does not exist.`);
-      }
     });
   }
 
@@ -1386,6 +1602,7 @@ export class RuntimeStateStore {
       if (migration.version <= version) continue;
       this.#database.run("BEGIN IMMEDIATE");
       try {
+        if (migration.version === 9) this.#ensureProtocolColumns();
         this.#database.run(migration.sql);
         if (migration.version === 7) this.#scrubPersistedVaultChangeArguments();
         if (migration.version === 8) this.#ensureCitationsColumn();
@@ -1461,6 +1678,52 @@ export class RuntimeStateStore {
         );
       }
     }
+  }
+
+  #ensureProtocolColumns(): void {
+    const runColumns = new Set(
+      (this.#database.exec("PRAGMA table_info(agent_runs)")[0]?.values ?? [])
+        .map((column) => column[1]),
+    );
+    if (!runColumns.has("start_event_id")) {
+      this.#database.run("ALTER TABLE agent_runs ADD COLUMN start_event_id TEXT");
+    }
+    const toolColumns = new Set(
+      (this.#database.exec("PRAGMA table_info(tool_calls)")[0]?.values ?? [])
+        .map((column) => column[1]),
+    );
+    if (!toolColumns.has("result_event_id")) {
+      this.#database.run("ALTER TABLE tool_calls ADD COLUMN result_event_id TEXT");
+    }
+    if (!toolColumns.has("result_json")) {
+      this.#database.run("ALTER TABLE tool_calls ADD COLUMN result_json TEXT");
+    }
+    const responseColumns = new Set(
+      (this.#database.exec("PRAGMA table_info(protocol_responses)")[0]?.values ?? [])
+        .map((column) => column[1]),
+    );
+    if (responseColumns.size > 0 && !responseColumns.has("owner_conversation_id")) {
+      this.#database.run("ALTER TABLE protocol_responses ADD COLUMN owner_conversation_id TEXT");
+    }
+    if (responseColumns.size > 0 && !responseColumns.has("request_hash")) {
+      this.#database.run("ALTER TABLE protocol_responses ADD COLUMN request_hash TEXT");
+    }
+    if (responseColumns.size > 0) {
+      this.#database.run(
+        "CREATE INDEX IF NOT EXISTS protocol_responses_by_conversation ON protocol_responses(conversation_id)",
+      );
+      this.#database.run(
+        "CREATE INDEX IF NOT EXISTS protocol_responses_by_owner ON protocol_responses(owner_conversation_id)",
+      );
+    }
+    this.#database.run(
+      `CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_by_start_event
+       ON agent_runs(start_event_id) WHERE start_event_id IS NOT NULL`,
+    );
+    this.#database.run(
+      `CREATE UNIQUE INDEX IF NOT EXISTS tool_calls_by_result_event
+       ON tool_calls(result_event_id) WHERE result_event_id IS NOT NULL`,
+    );
   }
 
   #ensureCitationsColumn(): void {

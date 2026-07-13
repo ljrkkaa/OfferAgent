@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
@@ -22,6 +22,8 @@ import {
   type RuntimeShutdown,
   type ToolResultCommand,
   type VaultChangeApplyingRequest,
+  type VaultChangeCommand,
+  type VaultChangeEvent,
   type VaultChangeStateRequest,
   type WebCitation,
 } from "@offeragent/protocol";
@@ -431,28 +433,6 @@ function sendJson(
   response.end(JSON.stringify(body));
 }
 
-function readJsonBody(request: IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    request.setEncoding("utf8");
-    request.on("data", (chunk: string) => {
-      body += chunk;
-      if (Buffer.byteLength(body, "utf8") > 64 * 1024) {
-        reject(new Error("Runtime journal request exceeds its size limit."));
-        request.destroy();
-      }
-    });
-    request.on("end", () => {
-      try {
-        resolve(JSON.parse(body) as unknown);
-      } catch {
-        reject(new Error("Runtime journal request must contain valid JSON."));
-      }
-    });
-    request.on("error", reject);
-  });
-}
-
 function isVaultChangeApplyingRequest(value: unknown): value is VaultChangeApplyingRequest {
   if (!value || typeof value !== "object") return false;
   const request = value as Partial<VaultChangeApplyingRequest>;
@@ -508,6 +488,47 @@ function sendEvent(socket: WebSocket, event: AgentRunEvent): void {
   socket.send(JSON.stringify(event));
 }
 
+function isProtocolIdentifier(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 128;
+}
+
+function isProtocolSequence(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function canonicalProtocolMessage(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalProtocolMessage(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+    return `{${entries.map(([key, item]) =>
+      `${JSON.stringify(key)}:${canonicalProtocolMessage(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function rememberProtocolIdentity(
+  identities: Map<string, string>,
+  eventId: string,
+  identity: string,
+): void {
+  identities.delete(eventId);
+  identities.set(eventId, identity);
+  if (identities.size <= 4_096) return;
+  const oldest = identities.keys().next().value as string | undefined;
+  if (oldest) identities.delete(oldest);
+}
+
+function isProtocolIdentityConflict(error: unknown): boolean {
+  return error instanceof Error &&
+    /conflicting identity|already exists with different identity|invalidated after resource deletion/i.test(
+      error.message,
+    );
+}
+
 function isAgentRunStart(value: unknown): value is AgentRunStart {
   if (!value || typeof value !== "object") return false;
   const message = value as Partial<AgentRunStart>;
@@ -515,9 +536,9 @@ function isAgentRunStart(value: unknown): value is AgentRunStart {
     message.type === "agent_run.start" &&
     message.protocolVersion === PROTOCOL_VERSION &&
     message.sequence === 0 &&
-    typeof message.eventId === "string" &&
-    typeof message.conversationId === "string" &&
-    typeof message.agentRunId === "string" &&
+    isProtocolIdentifier(message.eventId) &&
+    isProtocolIdentifier(message.conversationId) &&
+    isProtocolIdentifier(message.agentRunId) &&
     typeof message.model === "string" &&
     message.input?.role === "user" &&
     typeof message.input.text === "string"
@@ -530,10 +551,10 @@ function isAgentRunCancel(value: unknown): value is AgentRunCancel {
   return (
     message.type === "agent_run.cancel" &&
     message.protocolVersion === PROTOCOL_VERSION &&
-    typeof message.eventId === "string" &&
-    typeof message.conversationId === "string" &&
-    typeof message.agentRunId === "string" &&
-    typeof message.sequence === "number"
+    isProtocolIdentifier(message.eventId) &&
+    isProtocolIdentifier(message.conversationId) &&
+    isProtocolIdentifier(message.agentRunId) &&
+    isProtocolSequence(message.sequence)
   );
 }
 
@@ -543,11 +564,11 @@ function isDurableEventAck(value: unknown): value is DurableEventAck {
   return (
     message.type === "event.ack" &&
     message.protocolVersion === PROTOCOL_VERSION &&
-    typeof message.eventId === "string" &&
-    typeof message.acknowledgedEventId === "string" &&
-    typeof message.conversationId === "string" &&
-    typeof message.agentRunId === "string" &&
-    typeof message.sequence === "number"
+    isProtocolIdentifier(message.eventId) &&
+    isProtocolIdentifier(message.acknowledgedEventId) &&
+    isProtocolIdentifier(message.conversationId) &&
+    isProtocolIdentifier(message.agentRunId) &&
+    isProtocolSequence(message.sequence)
   );
 }
 
@@ -557,11 +578,11 @@ function isToolResultCommand(value: unknown): value is ToolResultCommand {
   return (
     message.type === "tool_result" &&
     message.protocolVersion === PROTOCOL_VERSION &&
-    typeof message.eventId === "string" &&
-    typeof message.conversationId === "string" &&
-    typeof message.agentRunId === "string" &&
-    typeof message.toolCallId === "string" &&
-    typeof message.sequence === "number" &&
+    isProtocolIdentifier(message.eventId) &&
+    isProtocolIdentifier(message.conversationId) &&
+    isProtocolIdentifier(message.agentRunId) &&
+    isProtocolIdentifier(message.toolCallId) &&
+    isProtocolSequence(message.sequence) &&
     isLocalToolResultPayload(message.result)
   );
 }
@@ -571,22 +592,59 @@ function isConversationCommand(value: unknown): value is ConversationCommand {
   const message = value as Partial<ConversationCommand>;
   if (
     message.protocolVersion !== PROTOCOL_VERSION ||
-    typeof message.eventId !== "string" ||
-    typeof message.conversationId !== "string" ||
-    typeof message.agentRunId !== "string" ||
-    typeof message.sequence !== "number"
+    !isProtocolIdentifier(message.eventId) ||
+    !isProtocolIdentifier(message.conversationId) ||
+    !isProtocolIdentifier(message.agentRunId) ||
+    !isProtocolSequence(message.sequence)
   ) {
     return false;
   }
   if (message.type === "conversation.create") {
-    return typeof message.title === "string" && typeof message.model === "string";
+    return typeof message.title === "string" &&
+      message.title.length <= 512 &&
+      typeof message.model === "string" &&
+      message.model.length > 0 &&
+      message.model.length <= 128;
   }
-  if (message.type === "conversation.update") return typeof message.model === "string";
+  if (message.type === "conversation.update") {
+    return typeof message.model === "string" &&
+      message.model.length > 0 &&
+      message.model.length <= 128;
+  }
   return (
     message.type === "conversation.delete" ||
     message.type === "conversation.list" ||
     message.type === "conversation.open"
   );
+}
+
+const VAULT_CHANGE_STATES = new Set([
+  "pending", "applying", "applied", "rejected", "failed", "rolled_back",
+  "recovery_failed", "undone", "expired",
+]);
+
+function isVaultChangeCommand(value: unknown): value is VaultChangeCommand {
+  if (!value || typeof value !== "object") return false;
+  const message = value as Partial<VaultChangeCommand>;
+  if (
+    message.protocolVersion !== PROTOCOL_VERSION ||
+    !isProtocolIdentifier(message.eventId) ||
+    !isProtocolIdentifier(message.conversationId) ||
+    !isProtocolIdentifier(message.agentRunId) ||
+    !isProtocolSequence(message.sequence)
+  ) {
+    return false;
+  }
+  if (message.type === "vault_changes.list") {
+    return Array.isArray(message.states) &&
+      message.states.length > 0 &&
+      message.states.length <= VAULT_CHANGE_STATES.size &&
+      new Set(message.states).size === message.states.length &&
+      message.states.every((state) => typeof state === "string" && VAULT_CHANGE_STATES.has(state));
+  }
+  if (message.type === "vault_changes.applying") return isVaultChangeApplyingRequest(message);
+  if (message.type === "vault_changes.state") return isVaultChangeStateRequest(message);
+  return false;
 }
 
 function sendConversationEvent(socket: WebSocket, event: ConversationEvent): void {
@@ -598,6 +656,20 @@ async function handleConversationCommand(
   command: ConversationCommand,
   store: RuntimeStateStore,
 ): Promise<void> {
+  const cacheable = command.type !== "conversation.open" && command.type !== "conversation.list";
+  if (cacheable) {
+    const cached = await store.getProtocolResponse(
+      command.eventId,
+      command.type,
+      command.conversationId,
+      command.agentRunId,
+      command,
+    );
+    if (cached) {
+      sendConversationEvent(socket, cached as ConversationEvent);
+      return;
+    }
+  }
   const base = {
     protocolVersion: PROTOCOL_VERSION,
     eventId: randomUUID(),
@@ -605,35 +677,105 @@ async function handleConversationCommand(
     agentRunId: command.agentRunId,
     sequence: command.sequence + 1,
   };
+  let event: ConversationEvent;
   if (command.type === "conversation.create") {
     const conversation = await store.createConversation({
       id: command.conversationId,
       title: command.title,
       modelId: command.model,
     });
-    sendConversationEvent(socket, { ...base, type: "conversation.created", conversation });
-    return;
-  }
-  if (command.type === "conversation.open") {
+    event = { ...base, type: "conversation.created", conversation };
+  } else if (command.type === "conversation.open") {
     const snapshot = await store.getConversation(command.conversationId);
-    sendConversationEvent(socket, { ...base, type: "conversation.snapshot", ...snapshot });
-    return;
-  }
-  if (command.type === "conversation.list") {
+    event = { ...base, type: "conversation.snapshot", ...snapshot };
+  } else if (command.type === "conversation.list") {
     const conversations = await store.listConversations();
-    sendConversationEvent(socket, { ...base, type: "conversation.list", conversations });
-    return;
-  }
-  if (command.type === "conversation.update") {
+    event = { ...base, type: "conversation.list", conversations };
+  } else if (command.type === "conversation.update") {
     const conversation = await store.updateConversationModel(
       command.conversationId,
       command.model,
     );
-    sendConversationEvent(socket, { ...base, type: "conversation.updated", conversation });
-    return;
+    event = { ...base, type: "conversation.updated", conversation };
+  } else {
+    await store.deleteConversation(command.conversationId);
+    event = { ...base, type: "conversation.deleted" };
   }
-  await store.deleteConversation(command.conversationId);
-  sendConversationEvent(socket, { ...base, type: "conversation.deleted" });
+  if (cacheable) {
+    const persisted = await store.storeProtocolResponse(
+      command.eventId,
+      command.type,
+      command.conversationId,
+      command.agentRunId,
+      command,
+      event,
+      command.conversationId,
+    );
+    sendConversationEvent(socket, persisted as ConversationEvent);
+  } else {
+    sendConversationEvent(socket, event);
+  }
+}
+
+async function handleVaultChangeCommand(
+  socket: WebSocket,
+  command: VaultChangeCommand,
+  store: RuntimeStateStore,
+): Promise<void> {
+  const cacheable = command.type !== "vault_changes.list";
+  if (cacheable) {
+    const cached = await store.getProtocolResponse(
+      command.eventId,
+      command.type,
+      command.conversationId,
+      command.agentRunId,
+      command,
+    );
+    if (cached) {
+      if (socket.readyState === 1) socket.send(JSON.stringify(cached));
+      return;
+    }
+  }
+  const base = {
+    protocolVersion: PROTOCOL_VERSION,
+    eventId: randomUUID(),
+    conversationId: command.conversationId,
+    agentRunId: command.agentRunId,
+    sequence: command.sequence + 1,
+  };
+  const ownerConversationId = cacheable
+    ? await store.getVaultChangeConversationId(command.batchId)
+    : undefined;
+  let event: VaultChangeEvent;
+  if (command.type === "vault_changes.list") {
+    const batches = await store.listVaultChangeBatches(command.states);
+    event = { ...base, type: "vault_changes.listed", batches };
+  } else if (command.type === "vault_changes.applying") {
+    await store.markVaultChangeApplying(command.batchId, command.checkpointRef, command.targets);
+    event = { ...base, type: "vault_changes.applying_stored", batchId: command.batchId };
+  } else {
+    await store.markVaultChangeState(command.batchId, command.state);
+    event = {
+      ...base,
+      type: "vault_changes.state_stored",
+      batchId: command.batchId,
+      state: command.state,
+    };
+  }
+  if (cacheable) {
+    const persisted = await store.storeProtocolResponse(
+      command.eventId,
+      command.type,
+      command.conversationId,
+      command.agentRunId,
+      command,
+      event,
+      ownerConversationId,
+    );
+    if (socket.readyState === 1) socket.send(JSON.stringify(persisted));
+  } else if (socket.readyState === 1) {
+    socket.send(JSON.stringify(event));
+  }
 }
 
 async function startRuntime({
@@ -652,6 +794,9 @@ async function startRuntime({
       cancelRequested: boolean;
       controller: AbortController;
       conversationId: string;
+      input: string;
+      model: string;
+      startEventId: string;
       socket: WebSocket;
     }
   >();
@@ -661,12 +806,17 @@ async function startRuntime({
       agentRunId: string;
       conversationId: string;
       reject: (error: Error) => void;
-      resolve: (result: LocalToolResultPayload) => void;
+      resolve: (value: { eventId?: string; result: LocalToolResultPayload }) => void;
       sequence: number;
       socket: WebSocket;
     }
   >();
-  const completedToolResults = new Set<string>();
+  const completedToolResults = new Map<
+    string,
+    { eventId?: string; result?: LocalToolResultPayload }
+  >();
+  const activeProtocolCommands = new Map<string, { count: number; identity: string }>();
+  const recentProtocolCommands = new Map<string, string>();
   let exiting = false;
 
   const server = createServer((request, response) => {
@@ -679,62 +829,6 @@ async function startRuntime({
     }
 
     const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
-
-    if (request.method === "GET" && requestUrl.pathname === "/vault-changes") {
-      const states = (requestUrl.searchParams.get("states") ?? "")
-        .split(",")
-        .filter(Boolean);
-      const allowed = new Set([
-        "pending", "applying", "applied", "rejected", "failed", "rolled_back",
-        "recovery_failed", "undone", "expired",
-      ]);
-      if (states.length === 0 || states.some((state) => !allowed.has(state))) {
-        sendJson(response, 400, { code: "not_found", message: "Vault Change states are invalid." });
-        return;
-      }
-      void store.listVaultChangeBatches(states as never).then(
-        (batches) => sendJson(response, 200, { batches }),
-        (error: unknown) => sendJson(response, 500, {
-          code: "storage_error",
-          message: error instanceof Error ? error.message : "Vault Change journal read failed.",
-        }),
-      );
-      return;
-    }
-
-    if (request.method === "POST" && requestUrl.pathname === "/vault-changes/applying") {
-      void readJsonBody(request).then(async (body) => {
-        if (!isVaultChangeApplyingRequest(body)) {
-          sendJson(response, 400, { code: "not_found", message: "Applying metadata is invalid." });
-          return;
-        }
-        await store.markVaultChangeApplying(body.batchId, body.checkpointRef, body.targets);
-        sendJson(response, 200, { status: "applying" });
-      }).catch((error: unknown) => {
-        sendJson(response, 409, {
-          code: "storage_error",
-          message: error instanceof Error ? error.message : "Applying metadata could not be stored.",
-        });
-      });
-      return;
-    }
-
-    if (request.method === "POST" && requestUrl.pathname === "/vault-changes/state") {
-      void readJsonBody(request).then(async (body) => {
-        if (!isVaultChangeStateRequest(body)) {
-          sendJson(response, 400, { code: "not_found", message: "Vault Change state is invalid." });
-          return;
-        }
-        await store.markVaultChangeState(body.batchId, body.state);
-        sendJson(response, 200, { status: body.state });
-      }).catch((error: unknown) => {
-        sendJson(response, 409, {
-          code: "storage_error",
-          message: error instanceof Error ? error.message : "Vault Change state could not be stored.",
-        });
-      });
-      return;
-    }
 
     if (request.method === "GET" && request.url === "/health") {
       sendJson(response, 200, {
@@ -807,8 +901,11 @@ async function startRuntime({
     });
   });
   const sockets = new Set<WebSocket>();
+  const publishEvent = (event: AgentRunEvent): void => {
+    for (const subscriber of sockets) sendEvent(subscriber, event);
+  };
   const webReader = new WebReader();
-  const webSockets = new WebSocketServer({ noServer: true });
+  const webSockets = new WebSocketServer({ maxPayload: 1_048_576, noServer: true });
 
   server.on("upgrade", (request, socket, head) => {
     if (
@@ -834,12 +931,14 @@ async function startRuntime({
       for (const [toolCallId, pending] of pendingToolResults) {
         if (pending.socket !== socket) continue;
         pendingToolResults.delete(toolCallId);
-        completedToolResults.add(toolCallId);
+        completedToolResults.set(toolCallId, {});
         pending.resolve({
-          ok: false,
-          error: {
-            code: "plugin_disconnected",
-            message: "The Obsidian plugin disconnected during the Vault tool call.",
+          result: {
+            ok: false,
+            error: {
+              code: "plugin_disconnected",
+              message: "The Obsidian plugin disconnected during the Vault tool call.",
+            },
           },
         });
       }
@@ -855,11 +954,40 @@ async function startRuntime({
         socket.close(1003, "Messages must be JSON.");
         return;
       }
+      if (
+        message &&
+        typeof message === "object" &&
+        "protocolVersion" in message &&
+        (message as { protocolVersion?: unknown }).protocolVersion !== PROTOCOL_VERSION
+      ) {
+        socket.close(1002, `Protocol version mismatch: Runtime requires ${PROTOCOL_VERSION}.`);
+        return;
+      }
       if (isToolResultCommand(message)) {
         const pending = pendingToolResults.get(message.toolCallId);
-        if (!pending && completedToolResults.has(message.toolCallId)) return;
+        const completed = completedToolResults.get(message.toolCallId);
+        if (!pending && completed) {
+          if (
+            completed.eventId === undefined ||
+            (completed.eventId === message.eventId &&
+              JSON.stringify(completed.result) === JSON.stringify(message.result))
+          ) {
+            return;
+          }
+          socket.close(1008, "Conflicting duplicate Tool Result.");
+          return;
+        }
+        if (!pending) {
+          void store.isDuplicateToolResult(
+            message.toolCallId,
+            message.eventId,
+            message.result,
+          ).then((duplicate) => {
+            if (!duplicate) socket.close(1008, "Unexpected or conflicting Tool Result.");
+          });
+          return;
+        }
         if (
-          !pending ||
           pending.socket !== socket ||
           pending.agentRunId !== message.agentRunId ||
           pending.conversationId !== message.conversationId ||
@@ -869,8 +997,11 @@ async function startRuntime({
           return;
         }
         pendingToolResults.delete(message.toolCallId);
-        completedToolResults.add(message.toolCallId);
-        pending.resolve(message.result);
+        completedToolResults.set(message.toolCallId, {
+          eventId: message.eventId,
+          result: message.result,
+        });
+        pending.resolve({ eventId: message.eventId, result: message.result });
         return;
       }
       if (isDurableEventAck(message)) {
@@ -878,7 +1009,8 @@ async function startRuntime({
           message.acknowledgedEventId,
           message.conversationId,
           message.agentRunId,
-        );
+          message.sequence,
+        ).catch(() => socket.close(1008, "Invalid durable event acknowledgement."));
         return;
       }
       if (isAgentRunCancel(message)) {
@@ -894,28 +1026,111 @@ async function startRuntime({
         return;
       }
       if (isConversationCommand(message)) {
-        void handleConversationCommand(socket, message, store).catch((error: unknown) => {
-          sendConversationEvent(socket, {
-            type: "conversation.error",
-            protocolVersion: PROTOCOL_VERSION,
-            eventId: randomUUID(),
-            conversationId: message.conversationId,
-            agentRunId: message.agentRunId,
-            sequence: message.sequence + 1,
-            error: {
-              code: "storage_error",
-              message: error instanceof Error ? error.message : "Runtime State operation failed.",
-            },
+        const identity = canonicalProtocolMessage(message);
+        const recentIdentity = recentProtocolCommands.get(message.eventId);
+        if (recentIdentity && recentIdentity !== identity) {
+          socket.close(1008, "Conflicting duplicate protocol event identity.");
+          return;
+        }
+        const activeCommand = activeProtocolCommands.get(message.eventId);
+        if (activeCommand) {
+          if (activeCommand.identity !== identity) {
+            socket.close(1008, "Conflicting duplicate protocol event identity.");
+            return;
+          }
+          activeCommand.count += 1;
+        } else {
+          activeProtocolCommands.set(message.eventId, { count: 1, identity });
+        }
+        void handleConversationCommand(socket, message, store)
+          .catch((error: unknown) => {
+            if (isProtocolIdentityConflict(error)) {
+              socket.close(1008, "Conflicting duplicate protocol event identity.");
+              return;
+            }
+            sendConversationEvent(socket, {
+              type: "conversation.error",
+              protocolVersion: PROTOCOL_VERSION,
+              eventId: randomUUID(),
+              conversationId: message.conversationId,
+              agentRunId: message.agentRunId,
+              sequence: message.sequence + 1,
+              error: {
+                code: "storage_error",
+                message: error instanceof Error ? error.message : "Runtime State operation failed.",
+              },
+            });
+          })
+          .finally(() => {
+            rememberProtocolIdentity(recentProtocolCommands, message.eventId, identity);
+            const current = activeProtocolCommands.get(message.eventId);
+            if (!current || current.identity !== identity) return;
+            current.count -= 1;
+            if (current.count === 0) activeProtocolCommands.delete(message.eventId);
           });
-        });
+        return;
+      }
+      if (isVaultChangeCommand(message)) {
+        const identity = canonicalProtocolMessage(message);
+        const recentIdentity = recentProtocolCommands.get(message.eventId);
+        if (recentIdentity && recentIdentity !== identity) {
+          socket.close(1008, "Conflicting duplicate protocol event identity.");
+          return;
+        }
+        const activeCommand = activeProtocolCommands.get(message.eventId);
+        if (activeCommand) {
+          if (activeCommand.identity !== identity) {
+            socket.close(1008, "Conflicting duplicate protocol event identity.");
+            return;
+          }
+          activeCommand.count += 1;
+        } else {
+          activeProtocolCommands.set(message.eventId, { count: 1, identity });
+        }
+        void handleVaultChangeCommand(socket, message, store)
+          .catch((error: unknown) => {
+            if (isProtocolIdentityConflict(error)) {
+              socket.close(1008, "Conflicting duplicate protocol event identity.");
+              return;
+            }
+            const event: VaultChangeEvent = {
+              type: "vault_changes.error",
+              protocolVersion: PROTOCOL_VERSION,
+              eventId: randomUUID(),
+              conversationId: message.conversationId,
+              agentRunId: message.agentRunId,
+              sequence: message.sequence + 1,
+              error: {
+                code: "storage_error",
+                message: error instanceof Error ? error.message : "Vault Change operation failed.",
+              },
+            };
+            if (socket.readyState === 1) socket.send(JSON.stringify(event));
+          })
+          .finally(() => {
+            rememberProtocolIdentity(recentProtocolCommands, message.eventId, identity);
+            const current = activeProtocolCommands.get(message.eventId);
+            if (!current || current.identity !== identity) return;
+            current.count -= 1;
+            if (current.count === 0) activeProtocolCommands.delete(message.eventId);
+          });
         return;
       }
       if (!isAgentRunStart(message)) {
         socket.close(1008, "Unsupported protocol message.");
         return;
       }
-      if (activeRuns.has(message.agentRunId)) {
-        socket.close(1008, "Agent Run identifiers must be unique.");
+      const activeRun = activeRuns.get(message.agentRunId);
+      if (activeRun) {
+        if (
+          activeRun.startEventId === message.eventId &&
+          activeRun.conversationId === message.conversationId &&
+          activeRun.model === message.model &&
+          activeRun.input === message.input.text
+        ) {
+          return;
+        }
+        socket.close(1008, "Conflicting duplicate Agent Run start.");
         return;
       }
       const controller = new AbortController();
@@ -923,6 +1138,9 @@ async function startRuntime({
         cancelRequested: false,
         controller,
         conversationId: message.conversationId,
+        input: message.input.text,
+        model: message.model,
+        startEventId: message.eventId,
         socket,
       });
       void (async () => {
@@ -942,14 +1160,27 @@ async function startRuntime({
           model: message.model,
         };
         try {
-          await store.beginAgentRun(
+          const began = await store.beginAgentRun(
             message.conversationId,
             message.agentRunId,
             message.model,
             message.input.text,
             startedEvent,
+            message.eventId,
           );
+          if (!began) {
+            for (const event of await store.listUnacknowledgedEvents(message.agentRunId)) {
+              sendEvent(socket, event);
+            }
+            activeRuns.delete(message.agentRunId);
+            return;
+          }
         } catch (error) {
+          if (isProtocolIdentityConflict(error)) {
+            socket.close(1008, "Conflicting duplicate Agent Run start.");
+            activeRuns.delete(message.agentRunId);
+            return;
+          }
           const providerError = asModelProviderError(error);
           sendEvent(socket, {
             ...base,
@@ -961,7 +1192,7 @@ async function startRuntime({
           activeRuns.delete(message.agentRunId);
           return;
         }
-        sendEvent(socket, startedEvent);
+        publishEvent(startedEvent);
         sequence += 1;
         try {
           let input: ModelConversationItem[] = [
@@ -995,9 +1226,10 @@ async function startRuntime({
               },
             };
             await store.requestToolCall(message.agentRunId, requestedEvent);
-            sendEvent(socket, requestedEvent);
+            publishEvent(requestedEvent);
             sequence += 1;
             let result: LocalToolResultPayload;
+            let resultEventId: string | undefined;
             if (name === "web_read") {
               result = await webReader.execute(arguments_, controller.signal);
             } else if (name === "hosted_web_search_probe") {
@@ -1029,7 +1261,10 @@ async function startRuntime({
                 }
               }
             } else {
-              const resultPromise = new Promise<LocalToolResultPayload>((resolve, reject) => {
+              const resultPromise = new Promise<{
+                eventId?: string;
+                result: LocalToolResultPayload;
+              }>((resolve, reject) => {
                 pendingToolResults.set(toolCallId, {
                   agentRunId: message.agentRunId,
                   conversationId: message.conversationId,
@@ -1043,13 +1278,15 @@ async function startRuntime({
                 const pending = pendingToolResults.get(toolCallId);
                 if (!pending) return;
                 pendingToolResults.delete(toolCallId);
-                completedToolResults.add(toolCallId);
+                completedToolResults.set(toolCallId, {});
                 pending.reject(new Error("The Agent Run was interrupted during a local tool call."));
               };
               controller.signal.addEventListener("abort", abortToolCall, { once: true });
               try {
                 if (controller.signal.aborted) abortToolCall();
-                result = await resultPromise;
+                const received = await resultPromise;
+                result = received.result;
+                resultEventId = received.eventId;
               } finally {
                 pendingToolResults.delete(toolCallId);
                 controller.signal.removeEventListener("abort", abortToolCall);
@@ -1075,8 +1312,10 @@ async function startRuntime({
               message.agentRunId,
               result,
               completedEvent,
+              resultEventId,
             );
-            sendEvent(socket, completedEvent);
+            completedToolResults.delete(toolCallId);
+            publishEvent(completedEvent);
             sequence += 1;
             return { result, stalePaths };
           };
@@ -1114,7 +1353,7 @@ async function startRuntime({
               if (providerEvent.type === "output_text.delta") {
                 output += providerEvent.delta;
                 await store.advanceAgentRunSequence(message.agentRunId, sequence);
-                sendEvent(socket, {
+                publishEvent({
                   ...base,
                   type: "agent_run.delta",
                   eventId: randomUUID(),
@@ -1134,7 +1373,7 @@ async function startRuntime({
                   sources: providerEvent.sources,
                 };
                 await store.recordAgentRunEvent(searchEvent);
-                sendEvent(socket, searchEvent);
+                publishEvent(searchEvent);
                 sequence += 1;
                 continue;
               }
@@ -1273,7 +1512,7 @@ async function startRuntime({
               },
             };
             await store.completeAgentRun(message.agentRunId, output, completedEvent);
-            sendEvent(socket, completedEvent);
+            publishEvent(completedEvent);
             finished = true;
             break;
           }
@@ -1293,7 +1532,7 @@ async function startRuntime({
             const transitioned = cancelled
               ? await store.cancelAgentRun(message.agentRunId, terminalEvent as Extract<AgentRunEvent, { type: "agent_run.cancelled" }>)
               : await store.interruptAgentRun(message.agentRunId, terminalEvent as Extract<AgentRunEvent, { type: "agent_run.interrupted" }>);
-            if (transitioned) sendEvent(socket, terminalEvent);
+            if (transitioned) publishEvent(terminalEvent);
             return;
           }
           const providerError = asModelProviderError(error);
@@ -1310,7 +1549,7 @@ async function startRuntime({
             providerError.message,
             failedEvent,
           );
-          sendEvent(socket, failedEvent);
+          publishEvent(failedEvent);
         } finally {
           activeRuns.delete(message.agentRunId);
         }

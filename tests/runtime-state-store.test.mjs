@@ -204,7 +204,10 @@ test("populated v3 tool and evidence tables survive the current control-tool reb
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
-    INSERT INTO tool_calls_v3_fixture SELECT * FROM tool_calls;
+    INSERT INTO tool_calls_v3_fixture
+      SELECT id, conversation_id, agent_run_id, name, arguments_json, status,
+             error_code, error_message, created_at, updated_at
+      FROM tool_calls;
     CREATE TABLE evidence_snapshots_v3_fixture (
       id TEXT PRIMARY KEY,
       conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,

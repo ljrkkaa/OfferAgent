@@ -224,9 +224,37 @@ export interface VaultChangeStateRequest {
   >;
 }
 
-export interface RuntimeVaultChangeBatches {
-  batches: VaultChangeJournalRecord[];
+interface ProtocolCommandBase {
+  agentRunId: string;
+  conversationId: string;
+  eventId: string;
+  protocolVersion: typeof PROTOCOL_VERSION;
+  sequence: number;
 }
+
+export type VaultChangeCommand =
+  | (ProtocolCommandBase & {
+      type: "vault_changes.list";
+      states: VaultChangeTransactionState[];
+    })
+  | (ProtocolCommandBase & VaultChangeApplyingRequest & { type: "vault_changes.applying" })
+  | (ProtocolCommandBase & VaultChangeStateRequest & { type: "vault_changes.state" });
+
+export type VaultChangeEvent =
+  | (ProtocolCommandBase & {
+      type: "vault_changes.listed";
+      batches: VaultChangeJournalRecord[];
+    })
+  | (ProtocolCommandBase & { type: "vault_changes.applying_stored"; batchId: string })
+  | (ProtocolCommandBase & {
+      type: "vault_changes.state_stored";
+      batchId: string;
+      state: VaultChangeStateRequest["state"];
+    })
+  | (ProtocolCommandBase & {
+      type: "vault_changes.error";
+      error: { code: "storage_error"; message: string };
+    });
 
 export interface VaultUndoConflict {
   appliedHash: string;
@@ -283,12 +311,7 @@ export interface ToolCallRecord {
   vaultChangeState?: VaultChangeTransactionState;
 }
 
-interface ConversationCommandBase {
-  agentRunId: string;
-  conversationId: string;
-  eventId: string;
-  protocolVersion: typeof PROTOCOL_VERSION;
-  sequence: number;
+interface ConversationCommandBase extends ProtocolCommandBase {
 }
 
 export type ConversationCommand =
