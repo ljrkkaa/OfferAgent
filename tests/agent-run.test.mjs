@@ -225,6 +225,8 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
       `${process.pid}`,
       "--provider",
       "codex",
+      "--state-path",
+      path.join(temporaryDirectory, "state.db"),
     ],
     {
       env: {
@@ -336,7 +338,19 @@ test("Codex auth, model, transport, and Provider failures remain typed", async (
   const token = "provider-errors-runtime-token";
   const runtime = spawn(
     process.execPath,
-    [runtimeEntry, "--port", "0", "--token", token, "--parent-pid", `${process.pid}`, "--provider", "codex"],
+    [
+      runtimeEntry,
+      "--port",
+      "0",
+      "--token",
+      token,
+      "--parent-pid",
+      `${process.pid}`,
+      "--provider",
+      "codex",
+      "--state-path",
+      path.join(temporaryDirectory, "state.db"),
+    ],
     {
       env: {
         ...process.env,
@@ -403,7 +417,19 @@ test("closing the Runtime WebSocket aborts an in-flight Codex request", async (t
   const runtimeToken = "abort-runtime-token";
   const runtime = spawn(
     process.execPath,
-    [runtimeEntry, "--port", "0", "--token", runtimeToken, "--parent-pid", `${process.pid}`, "--provider", "codex"],
+    [
+      runtimeEntry,
+      "--port",
+      "0",
+      "--token",
+      runtimeToken,
+      "--parent-pid",
+      `${process.pid}`,
+      "--provider",
+      "codex",
+      "--state-path",
+      path.join(temporaryDirectory, "state.db"),
+    ],
     {
       env: {
         ...process.env,

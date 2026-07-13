@@ -58,6 +58,12 @@ class StubElement {
     return undefined;
   }
 
+  findAllByClass(className) {
+    const matches = this.className.split(" ").includes(className) ? [this] : [];
+    for (const child of this.children) matches.push(...child.findAllByClass(className));
+    return matches;
+  }
+
   #createChild(options, tagName = "div") {
     const child = new StubElement(options.cls ?? "", tagName);
     child.text = options.text ?? "";
@@ -238,6 +244,32 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "OfferAgent did not stream the fake Provider response into the Sidebar",
   );
   assert.equal(assistantMessage.text, "OfferAgent received: Practice my introduction.");
+  const completedRun = await waitUntil(
+    () => {
+      const status = activeView.contentEl.findByClass("offeragent-sidebar__run-status");
+      return status?.dataset.status === "completed" ? status : undefined;
+    },
+    "OfferAgent did not render the completed first Agent Run",
+  );
+  assert.equal(completedRun.dataset.status, "completed");
+
+  const nextComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
+  const nextInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  nextInput.value = "Practice a second answer.";
+  nextComposer.dispatch("submit");
+  const visibleRunStatuses = await waitUntil(
+    () => {
+      const statuses = activeView.contentEl.findAllByClass("offeragent-sidebar__run-status");
+      return statuses.length === 2 && statuses.every((status) => status.dataset.status === "completed")
+        ? statuses
+        : undefined;
+    },
+    "OfferAgent did not keep both Agent Run statuses visible",
+  );
+  assert.deepEqual(
+    visibleRunStatuses.map((status) => status.dataset.status),
+    ["completed", "completed"],
+  );
 
   await plugin.onunload();
   plugin = undefined;

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import Module, { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import initSqlJs from "sql.js/dist/sql-asm.js";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
@@ -25,8 +26,9 @@ Module._load = function loadWithTrackedWebSocket(request, parent, isMain) {
   return originalLoad.call(this, request, parent, isMain);
 };
 let RuntimeSupervisor;
+let isExpectedConversationEvent;
 try {
-  ({ RuntimeSupervisor } = require(
+  ({ RuntimeSupervisor, isExpectedConversationEvent } = require(
     path.join(repositoryRoot, "packages", "plugin", "dist", "runtime-supervisor.js"),
   ));
 } finally {
@@ -34,6 +36,33 @@ try {
 }
 
 const runtimeEntry = path.join(repositoryRoot, "packages", "runtime", "dist", "cli.js");
+
+test("Conversation responses require the expected protocol identity and ordering", () => {
+  const expected = {
+    conversationId: "conversation-one",
+    expectedSequence: 1,
+    requestEventId: "request-event",
+    requestId: "request-one",
+  };
+  const valid = {
+    type: "conversation.deleted",
+    protocolVersion: 1,
+    eventId: "response-event",
+    conversationId: "conversation-one",
+    agentRunId: "request-one",
+    sequence: 1,
+  };
+  assert.equal(isExpectedConversationEvent(valid, expected), true);
+  for (const malformed of [
+    { ...valid, protocolVersion: 2 },
+    { ...valid, eventId: "request-event" },
+    { ...valid, conversationId: "conversation-two" },
+    { ...valid, agentRunId: "request-two" },
+    { ...valid, sequence: 2 },
+  ]) {
+    assert.equal(isExpectedConversationEvent(malformed, expected), false);
+  }
+});
 
 async function completeRun(supervisor, suffix) {
   const events = [];
@@ -62,6 +91,52 @@ test("RuntimeSupervisor keeps one WebSocket across sequential Agent Runs", async
   await completeRun(supervisor, "one");
   await completeRun(supervisor, "two");
   assert.equal(connectionCount, 1);
+});
+
+test("a consumed failed terminal event is durably acknowledged before iterator return", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-terminal-ack-"));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const supervisor = new RuntimeSupervisor({
+    nodeCandidates: [process.execPath],
+    parentPid: process.pid,
+    provider: "fake",
+    runtimePath: runtimeEntry,
+    statePath,
+  });
+  t.after(async () => {
+    await supervisor.stop();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+
+  await supervisor.start();
+  const events = [];
+  for await (const event of supervisor.runAgent({
+    conversationId: "terminal-ack-conversation",
+    agentRunId: "terminal-ack-run",
+    model: "missing-model",
+    input: "Fail with a typed model error",
+  })) {
+    events.push(event);
+    if (event.type === "agent_run.failed") break;
+  }
+  assert.equal(events.at(-1)?.type, "agent_run.failed");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await supervisor.stop();
+
+  const SQL = await initSqlJs();
+  const database = new SQL.Database(await readFile(statePath));
+  assert.deepEqual(
+    database.exec(
+      `SELECT event_type, acknowledged_at IS NOT NULL
+       FROM durable_events ORDER BY sequence`,
+    )[0].values,
+    [["agent_run.started", 1], ["agent_run.failed", 1]],
+  );
+  assert.equal(
+    database.exec("SELECT status FROM agent_runs WHERE id = 'terminal-ack-run'")[0].values[0][0],
+    "failed",
+  );
+  database.close();
 });
 
 test("returning one Agent Run iterator cancels only that run", async (t) => {
@@ -94,6 +169,7 @@ test("returning one Agent Run iterator cancels only that run", async (t) => {
     parentPid: process.pid,
     provider: "codex",
     runtimePath: runtimeEntry,
+    statePath: path.join(temporaryDirectory, "state.db"),
   });
   t.after(async () => {
     await supervisor.stop();

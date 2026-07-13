@@ -70,6 +70,40 @@ class OfferAgentSidebarView extends ItemView {
       });
     }
 
+    const conversationRow = container.createDiv({ cls: "offeragent-sidebar__conversations" });
+    const conversationSelect = conversationRow.createEl("select", {
+      cls: "offeragent-sidebar__conversation-select",
+    });
+    for (const conversation of viewModel.conversation.conversations) {
+      const option = conversationSelect.createEl("option", { text: conversation.title });
+      option.value = conversation.id;
+    }
+    conversationSelect.value = viewModel.conversation.activeConversationId ?? "";
+    conversationSelect.disabled = viewModel.conversation.runState === "streaming";
+    conversationSelect.addEventListener("change", () => {
+      void this.#controller.openConversation(conversationSelect.value);
+    });
+    const newConversation = conversationRow.createEl("button", {
+      cls: "offeragent-sidebar__new-conversation",
+      text: "New",
+    });
+    newConversation.type = "button";
+    newConversation.disabled = viewModel.conversation.runState === "streaming";
+    newConversation.addEventListener("click", () => {
+      void this.#controller.createConversation();
+    });
+    const deleteConversation = conversationRow.createEl("button", {
+      cls: "offeragent-sidebar__delete-conversation",
+      text: "Delete",
+    });
+    deleteConversation.type = "button";
+    deleteConversation.disabled =
+      !viewModel.conversation.activeConversationId ||
+      viewModel.conversation.runState === "streaming";
+    deleteConversation.addEventListener("click", () => {
+      void this.#controller.deleteCurrentConversation();
+    });
+
     const modelRow = container.createDiv({ cls: "offeragent-sidebar__models" });
     modelRow.createEl("label", { text: "Model" });
     const modelSelect = modelRow.createEl("select", {
@@ -84,7 +118,7 @@ class OfferAgentSidebarView extends ItemView {
       viewModel.conversation.models.length === 0 ||
       viewModel.conversation.runState === "streaming";
     modelSelect.addEventListener("change", () => {
-      this.#controller.selectModel(modelSelect.value);
+      void this.#controller.selectModel(modelSelect.value);
     });
 
     const transcript = container.createDiv({ cls: "offeragent-sidebar__transcript" });
@@ -110,6 +144,18 @@ class OfferAgentSidebarView extends ItemView {
       diagnostic.dataset.code = viewModel.conversation.error.code;
     }
 
+    if (viewModel.conversation.agentRuns.length > 0) {
+      const runList = container.createDiv({ cls: "offeragent-sidebar__run-list" });
+      for (const [index, run] of viewModel.conversation.agentRuns.entries()) {
+        const runStatus = runList.createDiv({
+          cls: "offeragent-sidebar__run-status",
+          text: `Run ${index + 1}: ${run.status}`,
+        });
+        runStatus.dataset.agentRunId = run.id;
+        runStatus.dataset.status = run.status;
+      }
+    }
+
     const composer = container.createEl("form", { cls: "offeragent-sidebar__composer" });
     const input = composer.createEl("textarea", { cls: "offeragent-sidebar__input" });
     input.placeholder = "Ask OfferAgent…";
@@ -123,6 +169,14 @@ class OfferAgentSidebarView extends ItemView {
       viewModel.runtime.state !== "connected" ||
       !viewModel.conversation.selectedModelId ||
       viewModel.conversation.runState === "streaming";
+    if (viewModel.conversation.runState === "streaming") {
+      const stop = composer.createEl("button", {
+        cls: "offeragent-sidebar__stop",
+        text: "Stop",
+      });
+      stop.type = "button";
+      stop.addEventListener("click", () => this.#controller.stopAgentRun());
+    }
     composer.addEventListener("submit", (event) => {
       event.preventDefault();
       const text = input.value;

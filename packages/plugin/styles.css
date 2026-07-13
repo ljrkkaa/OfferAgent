@@ -63,6 +63,7 @@
   text-align: center;
 }
 
+.offeragent-sidebar__conversations,
 .offeragent-sidebar__models,
 .offeragent-sidebar__composer {
   display: flex;
@@ -73,6 +74,7 @@
   align-items: center;
 }
 
+.offeragent-sidebar__conversation-select,
 .offeragent-sidebar__model-select,
 .offeragent-sidebar__input {
   flex: 1;
@@ -106,4 +108,14 @@
 .offeragent-sidebar__input {
   min-height: 5rem;
   resize: vertical;
+}
+
+.offeragent-sidebar__run-status {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.offeragent-sidebar__run-list {
+  display: grid;
+  gap: 0.2rem;
 }

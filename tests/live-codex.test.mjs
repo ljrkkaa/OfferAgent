@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
 import { request } from "node:http";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -49,13 +51,30 @@ test(
   "a live Codex subscription streams a real answer",
   { skip: enabled ? false : "set OFFERAGENT_LIVE_CODEX=1 to use the local Codex login" },
   async (t) => {
+    const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-live-state-"));
+    const statePath = path.join(temporaryDirectory, "state.db");
     const token = "offeragent-live-smoke-runtime-token";
     const runtime = spawn(
       process.execPath,
-      [runtimeEntry, "--port", "0", "--token", token, "--parent-pid", `${process.pid}`, "--provider", "codex"],
+      [
+        runtimeEntry,
+        "--port",
+        "0",
+        "--token",
+        token,
+        "--parent-pid",
+        `${process.pid}`,
+        "--provider",
+        "codex",
+        "--state-path",
+        statePath,
+      ],
       { stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
     );
-    t.after(() => runtime.kill());
+    t.after(async () => {
+      runtime.kill();
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    });
     const ready = await handshake(runtime.stdout);
     const models = await getModels(ready.port, token);
     const model = models.find((candidate) => candidate.id === "gpt-5.4") ?? models[0];

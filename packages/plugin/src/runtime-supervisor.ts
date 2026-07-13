@@ -11,7 +11,13 @@ import {
   PROTOCOL_VERSION,
   type AgentRunCancel,
   type AgentRunEvent,
+  type AgentRunRecord,
   type AgentRunStart,
+  type ConversationCommand,
+  type ConversationEvent,
+  type ConversationMessage,
+  type ConversationSummary,
+  type DurableEventAck,
   type ModelDescriptor,
   type ProviderErrorCode,
   type RuntimeError,
@@ -29,6 +35,7 @@ export interface RuntimeSupervisorOptions {
   parentPid?: number;
   provider?: "codex" | "fake";
   runtimePath: string;
+  statePath?: string;
   startupTimeoutMs?: number;
 }
 
@@ -39,12 +46,24 @@ export interface AgentRunRequest {
   model: string;
 }
 
+export interface ConversationSnapshot {
+  agentRuns: AgentRunRecord[];
+  conversation: ConversationSummary;
+  messages: ConversationMessage[];
+}
+
 export interface RuntimeClient {
+  cancelAgentRun(request: Pick<AgentRunRequest, "agentRunId" | "conversationId">): void;
+  createConversation(conversation: ConversationSummary): Promise<ConversationSummary>;
+  deleteConversation(conversationId: string): Promise<void>;
   listModels(): Promise<ModelDescriptor[]>;
+  listConversations(): Promise<ConversationSummary[]>;
   onUnavailable(subscriber: UnavailableSubscriber): () => void;
+  openConversation(conversationId: string): Promise<ConversationSnapshot>;
   runAgent(request: AgentRunRequest): AsyncIterable<AgentRunEvent>;
   start(): Promise<RuntimeHandshake>;
   stop(): Promise<void>;
+  updateConversationModel(conversationId: string, modelId: string): Promise<ConversationSummary>;
 }
 
 type UnavailableSubscriber = (message: string) => void;
@@ -56,9 +75,77 @@ interface RuntimeConnection extends RuntimeHandshake {
 type RuntimeChild = ChildProcessByStdio<null, Readable, Readable>;
 
 interface RunChannel {
+  conversationId: string;
   events: AgentRunEvent[];
+  expectedSequence: number;
   failure?: Error;
   wake?: () => void;
+}
+
+interface ConversationChannel {
+  conversationId: string;
+  expectedSequence: number;
+  reject: (error: Error) => void;
+  requestEventId: string;
+  resolve: (event: ConversationEvent) => void;
+  timeout: NodeJS.Timeout;
+}
+
+interface ExpectedConversationEvent {
+  conversationId: string;
+  expectedSequence: number;
+  requestEventId: string;
+  requestId: string;
+}
+
+const CONVERSATION_EVENT_TYPES = new Set([
+  "conversation.created",
+  "conversation.deleted",
+  "conversation.error",
+  "conversation.list",
+  "conversation.snapshot",
+  "conversation.updated",
+]);
+
+export function isExpectedConversationEvent(
+  value: unknown,
+  expected: ExpectedConversationEvent,
+): value is ConversationEvent {
+  if (!value || typeof value !== "object") return false;
+  const event = value as Partial<ConversationEvent>;
+  return (
+    typeof event.type === "string" &&
+    CONVERSATION_EVENT_TYPES.has(event.type) &&
+    event.protocolVersion === PROTOCOL_VERSION &&
+    typeof event.eventId === "string" &&
+    event.eventId.length > 0 &&
+    event.eventId !== expected.requestEventId &&
+    event.conversationId === expected.conversationId &&
+    event.agentRunId === expected.requestId &&
+    event.sequence === expected.expectedSequence
+  );
+}
+
+function isAgentRunEventEnvelope(value: unknown): value is AgentRunEvent {
+  if (!value || typeof value !== "object") return false;
+  const event = value as Partial<AgentRunEvent>;
+  return (
+    typeof event.type === "string" &&
+    [
+      "agent_run.started",
+      "agent_run.delta",
+      "agent_run.cancelled",
+      "agent_run.interrupted",
+      "agent_run.completed",
+      "agent_run.failed",
+    ].includes(event.type) &&
+    event.protocolVersion === PROTOCOL_VERSION &&
+    typeof event.eventId === "string" &&
+    event.eventId.length > 0 &&
+    typeof event.conversationId === "string" &&
+    typeof event.agentRunId === "string" &&
+    typeof event.sequence === "number"
+  );
 }
 
 export class RuntimeRequestError extends Error {
@@ -239,14 +326,19 @@ function callRuntime<T>(
 export class RuntimeSupervisor implements RuntimeClient {
   readonly #options: Required<
     Pick<RuntimeSupervisorOptions, "parentPid" | "provider" | "runtimePath" | "startupTimeoutMs">
-  > & { nodeCandidates: string[] };
+  > & { nodeCandidates: string[]; statePath?: string };
   readonly #unavailableSubscribers = new Set<UnavailableSubscriber>();
   #child?: RuntimeChild;
   #connection?: RuntimeConnection;
   #eventSocket?: WebSocket;
   #healthCheckInFlight = false;
   #healthTimer?: NodeJS.Timeout;
+  readonly #conversationChannels = new Map<string, ConversationChannel>();
+  readonly #pendingReplayEvents = new Map<string, AgentRunEvent>();
+  readonly #processedEventIds = new Set<string>();
+  readonly #reconciledConversations = new Set<string>();
   readonly #runChannels = new Map<string, RunChannel>();
+  readonly #seenEventIds = new Set<string>();
   #stopping = false;
 
   constructor(options: RuntimeSupervisorOptions) {
@@ -257,6 +349,7 @@ export class RuntimeSupervisor implements RuntimeClient {
         options.provider ??
         (process.env.OFFERAGENT_RUNTIME_PROVIDER === "fake" ? "fake" : "codex"),
       runtimePath: options.runtimePath,
+      statePath: options.statePath,
       startupTimeoutMs: options.startupTimeoutMs ?? 10_000,
     };
   }
@@ -274,19 +367,21 @@ export class RuntimeSupervisor implements RuntimeClient {
 
     const executable = await findNodeExecutable(this.#options.nodeCandidates);
     const token = randomUUID();
+    const arguments_ = [
+      this.#options.runtimePath,
+      "--port",
+      "0",
+      "--token",
+      token,
+      "--parent-pid",
+      `${this.#options.parentPid}`,
+      "--provider",
+      this.#options.provider,
+    ];
+    if (this.#options.statePath) arguments_.push("--state-path", this.#options.statePath);
     const child = spawn(
       executable,
-      [
-        this.#options.runtimePath,
-        "--port",
-        "0",
-        "--token",
-        token,
-        "--parent-pid",
-        `${this.#options.parentPid}`,
-        "--provider",
-        this.#options.provider,
-      ],
+      arguments_,
       {
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
@@ -365,6 +460,70 @@ export class RuntimeSupervisor implements RuntimeClient {
     return response.models;
   }
 
+  async listConversations(): Promise<ConversationSummary[]> {
+    const event = await this.#requestConversation({
+      type: "conversation.list",
+      conversationId: "conversation-management",
+    });
+    if (event.type !== "conversation.list") throw new Error("Unexpected Conversation response.");
+    return event.conversations;
+  }
+
+  async createConversation(conversation: ConversationSummary): Promise<ConversationSummary> {
+    const event = await this.#requestConversation({
+      type: "conversation.create",
+      conversationId: conversation.id,
+      title: conversation.title,
+      model: conversation.modelId,
+    });
+    if (event.type !== "conversation.created") throw new Error("Unexpected Conversation response.");
+    return event.conversation;
+  }
+
+  async openConversation(conversationId: string): Promise<ConversationSnapshot> {
+    const event = await this.#requestConversation({ type: "conversation.open", conversationId });
+    if (event.type !== "conversation.snapshot") throw new Error("Unexpected Conversation response.");
+    const snapshot = {
+      conversation: event.conversation,
+      messages: event.messages,
+      agentRuns: event.agentRuns,
+    };
+    this.#reconcileConversationEvents(conversationId);
+    return snapshot;
+  }
+
+  async deleteConversation(conversationId: string): Promise<void> {
+    const event = await this.#requestConversation({ type: "conversation.delete", conversationId });
+    if (event.type !== "conversation.deleted") throw new Error("Unexpected Conversation response.");
+  }
+
+  async updateConversationModel(
+    conversationId: string,
+    modelId: string,
+  ): Promise<ConversationSummary> {
+    const event = await this.#requestConversation({
+      type: "conversation.update",
+      conversationId,
+      model: modelId,
+    });
+    if (event.type !== "conversation.updated") throw new Error("Unexpected Conversation response.");
+    return event.conversation;
+  }
+
+  cancelAgentRun(request: Pick<AgentRunRequest, "agentRunId" | "conversationId">): void {
+    const socket = this.#eventSocket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    const cancel: AgentRunCancel = {
+      type: "agent_run.cancel",
+      protocolVersion: PROTOCOL_VERSION,
+      eventId: randomUUID(),
+      conversationId: request.conversationId,
+      agentRunId: request.agentRunId,
+      sequence: 1,
+    };
+    socket.send(JSON.stringify(cancel));
+  }
+
   async *runAgent(request: AgentRunRequest): AsyncIterable<AgentRunEvent> {
     this.#requiredConnection();
     const socket = this.#eventSocket;
@@ -374,7 +533,11 @@ export class RuntimeSupervisor implements RuntimeClient {
     if (this.#runChannels.has(request.agentRunId)) {
       throw new Error(`Agent Run '${request.agentRunId}' is already active.`);
     }
-    const channel: RunChannel = { events: [] };
+    const channel: RunChannel = {
+      conversationId: request.conversationId,
+      events: [],
+      expectedSequence: 1,
+    };
     this.#runChannels.set(request.agentRunId, channel);
 
     const start: AgentRunStart = {
@@ -395,6 +558,7 @@ export class RuntimeSupervisor implements RuntimeClient {
     }
 
     let expectedSequence = 1;
+    let lastDeliveredEvent: AgentRunEvent | undefined;
     let terminal = false;
     try {
       while (true) {
@@ -420,13 +584,33 @@ export class RuntimeSupervisor implements RuntimeClient {
           throw new Error("OfferAgent Runtime returned an out-of-sequence Agent Run event.");
         }
         expectedSequence += 1;
+        lastDeliveredEvent = event;
         yield event;
-        if (event.type === "agent_run.completed" || event.type === "agent_run.failed") {
+        this.#processedEventIds.add(event.eventId);
+        this.#acknowledgeEvent(socket, event);
+        lastDeliveredEvent = undefined;
+        if (
+          event.type === "agent_run.cancelled" ||
+          event.type === "agent_run.completed" ||
+          event.type === "agent_run.failed" ||
+          event.type === "agent_run.interrupted"
+        ) {
           terminal = true;
           return;
         }
       }
     } finally {
+      if (
+        lastDeliveredEvent &&
+        (lastDeliveredEvent.type === "agent_run.cancelled" ||
+          lastDeliveredEvent.type === "agent_run.completed" ||
+          lastDeliveredEvent.type === "agent_run.failed" ||
+          lastDeliveredEvent.type === "agent_run.interrupted")
+      ) {
+        this.#processedEventIds.add(lastDeliveredEvent.eventId);
+        this.#acknowledgeEvent(socket, lastDeliveredEvent);
+        terminal = true;
+      }
       this.#runChannels.delete(request.agentRunId);
       if (
         !terminal &&
@@ -473,12 +657,22 @@ export class RuntimeSupervisor implements RuntimeClient {
       socket.once("close", onClose);
     });
 
+    this.#pendingReplayEvents.clear();
+    this.#processedEventIds.clear();
+    this.#reconciledConversations.clear();
+    this.#seenEventIds.clear();
     this.#eventSocket = socket;
     socket.on("message", (data) => {
-      let event: AgentRunEvent;
+      let event: unknown;
       try {
-        event = JSON.parse(data.toString("utf8")) as AgentRunEvent;
-        if (typeof event.agentRunId !== "string") throw new Error("Agent Run id is missing.");
+        event = JSON.parse(data.toString("utf8")) as unknown;
+        if (
+          !event ||
+          typeof event !== "object" ||
+          typeof (event as { agentRunId?: unknown }).agentRunId !== "string"
+        ) {
+          throw new Error("Agent Run id is missing.");
+        }
       } catch (error) {
         this.#handleEventSocketFailure(
           child,
@@ -487,8 +681,69 @@ export class RuntimeSupervisor implements RuntimeClient {
         );
         return;
       }
+      const eventRecord = event as { agentRunId: string; type?: unknown };
+      if (typeof eventRecord.type === "string" && eventRecord.type.startsWith("conversation.")) {
+        const channel = this.#conversationChannels.get(eventRecord.agentRunId);
+        if (!channel) return;
+        if (
+          !isExpectedConversationEvent(event, {
+            conversationId: channel.conversationId,
+            expectedSequence: channel.expectedSequence,
+            requestEventId: channel.requestEventId,
+            requestId: eventRecord.agentRunId,
+          }) ||
+          this.#seenEventIds.has(event.eventId)
+        ) {
+          this.#handleEventSocketFailure(
+            child,
+            socket,
+            new Error("OfferAgent Runtime returned an invalid Conversation event."),
+          );
+          return;
+        }
+        this.#seenEventIds.add(event.eventId);
+        clearTimeout(channel.timeout);
+        this.#conversationChannels.delete(event.agentRunId);
+        if (event.type === "conversation.error") channel.reject(new Error(event.error.message));
+        else channel.resolve(event);
+        return;
+      }
+      if (!isAgentRunEventEnvelope(event)) {
+        this.#handleEventSocketFailure(
+          child,
+          socket,
+          new Error("OfferAgent Runtime returned an invalid Agent Run event."),
+        );
+        return;
+      }
       const channel = this.#runChannels.get(event.agentRunId);
-      if (!channel) return;
+      if (this.#seenEventIds.has(event.eventId)) {
+        if (this.#processedEventIds.has(event.eventId)) this.#acknowledgeEvent(socket, event);
+        return;
+      }
+      if (!channel) {
+        this.#pendingReplayEvents.set(event.eventId, event);
+        if (this.#reconciledConversations.has(event.conversationId)) {
+          this.#processedEventIds.add(event.eventId);
+          this.#seenEventIds.add(event.eventId);
+          this.#pendingReplayEvents.delete(event.eventId);
+          this.#acknowledgeEvent(socket, event);
+        }
+        return;
+      }
+      if (
+        event.conversationId !== channel.conversationId ||
+        event.sequence !== channel.expectedSequence
+      ) {
+        this.#handleEventSocketFailure(
+          child,
+          socket,
+          new Error("OfferAgent Runtime returned an out-of-sequence Agent Run event."),
+        );
+        return;
+      }
+      channel.expectedSequence += 1;
+      this.#seenEventIds.add(event.eventId);
       channel.events.push(event);
       channel.wake?.();
       channel.wake = undefined;
@@ -507,6 +762,33 @@ export class RuntimeSupervisor implements RuntimeClient {
         new Error("OfferAgent Runtime event connection closed unexpectedly."),
       );
     });
+  }
+
+  #acknowledgeEvent(socket: WebSocket, event: AgentRunEvent): void {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    const acknowledgement: DurableEventAck = {
+      type: "event.ack",
+      protocolVersion: PROTOCOL_VERSION,
+      eventId: randomUUID(),
+      acknowledgedEventId: event.eventId,
+      conversationId: event.conversationId,
+      agentRunId: event.agentRunId,
+      sequence: event.sequence,
+    };
+    socket.send(JSON.stringify(acknowledgement));
+  }
+
+  #reconcileConversationEvents(conversationId: string): void {
+    this.#reconciledConversations.add(conversationId);
+    const socket = this.#eventSocket;
+    if (!socket) return;
+    for (const [eventId, event] of this.#pendingReplayEvents) {
+      if (event.conversationId !== conversationId) continue;
+      this.#pendingReplayEvents.delete(eventId);
+      this.#seenEventIds.add(eventId);
+      this.#processedEventIds.add(eventId);
+      this.#acknowledgeEvent(socket, event);
+    }
   }
 
   #handleEventSocketFailure(child: RuntimeChild, socket: WebSocket, error: Error): void {
@@ -542,6 +824,53 @@ export class RuntimeSupervisor implements RuntimeClient {
       channel.wake?.();
       channel.wake = undefined;
     }
+    for (const [requestId, channel] of this.#conversationChannels) {
+      clearTimeout(channel.timeout);
+      channel.reject(error);
+      this.#conversationChannels.delete(requestId);
+    }
+  }
+
+  #requestConversation(
+    input:
+      | { type: "conversation.create"; conversationId: string; title: string; model: string }
+      | { type: "conversation.update"; conversationId: string; model: string }
+      | { type: "conversation.delete" | "conversation.list" | "conversation.open"; conversationId: string },
+  ): Promise<ConversationEvent> {
+    const socket = this.#eventSocket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("OfferAgent Runtime event connection is unavailable."));
+    }
+    const requestId = randomUUID();
+    const command = {
+      ...input,
+      protocolVersion: PROTOCOL_VERSION,
+      eventId: randomUUID(),
+      agentRunId: requestId,
+      sequence: 0,
+    } as ConversationCommand;
+    return new Promise<ConversationEvent>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.#conversationChannels.delete(requestId);
+        reject(new Error("OfferAgent Runtime Conversation request timed out."));
+      }, 5_000);
+      timeout.unref();
+      this.#conversationChannels.set(requestId, {
+        conversationId: command.conversationId,
+        expectedSequence: command.sequence + 1,
+        reject,
+        requestEventId: command.eventId,
+        resolve,
+        timeout,
+      });
+      try {
+        socket.send(JSON.stringify(command));
+      } catch (error) {
+        clearTimeout(timeout);
+        this.#conversationChannels.delete(requestId);
+        reject(error);
+      }
+    });
   }
 
   #requiredConnection(): RuntimeConnection {

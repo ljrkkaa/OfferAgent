@@ -1,0 +1,647 @@
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import path from "node:path";
+import {
+  PROTOCOL_VERSION,
+  type AgentRunEvent,
+  type AgentRunRecord,
+  type AgentRunStatus,
+  type ConversationMessage,
+  type ConversationSummary,
+  type ProviderErrorCode,
+} from "@offeragent/protocol";
+import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.js";
+
+const CURRENT_SCHEMA_VERSION = 2;
+
+const MIGRATIONS = [
+  {
+    version: 1,
+    sql: `
+      CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE agent_runs (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        model_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'failed', 'cancelled', 'interrupted')),
+        user_message_id TEXT,
+        assistant_message_id TEXT,
+        error_code TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE messages (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+        text TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (conversation_id, sequence)
+      );
+      CREATE TABLE durable_events (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT REFERENCES agent_runs(id) ON DELETE CASCADE,
+        event_type TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        acknowledged_at TEXT,
+        UNIQUE (agent_run_id, sequence)
+      );
+      CREATE TABLE run_checkpoints (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        checkpoint_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE settings_metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL
+      );
+      CREATE INDEX messages_by_conversation ON messages(conversation_id, sequence);
+      CREATE INDEX runs_by_conversation ON agent_runs(conversation_id, created_at);
+      CREATE INDEX events_by_run ON durable_events(agent_run_id, sequence);
+    `,
+  },
+  {
+    version: 2,
+    sql: `
+      ALTER TABLE agent_runs
+      ADD COLUMN last_sequence INTEGER NOT NULL DEFAULT 0;
+      UPDATE agent_runs
+      SET last_sequence = COALESCE(
+        (SELECT MAX(sequence) FROM durable_events WHERE agent_run_id = agent_runs.id),
+        0
+      );
+      DELETE FROM durable_events WHERE event_type = 'agent_run.delta';
+    `,
+  },
+] as const;
+
+interface ConversationSnapshot {
+  agentRuns: AgentRunRecord[];
+  conversation: ConversationSummary;
+  messages: ConversationMessage[];
+}
+
+type PersistStateFile = (
+  statePath: string,
+  temporaryPath: string,
+  bytes: Uint8Array,
+) => Promise<void>;
+
+async function persistStateFile(
+  statePath: string,
+  temporaryPath: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  await mkdir(path.dirname(statePath), { recursive: true });
+  await writeFile(temporaryPath, bytes);
+  await rename(temporaryPath, statePath);
+}
+
+function now(): string {
+  return new Date().toISOString();
+}
+
+function firstRow(database: Database, sql: string, parameters: unknown[] = []): unknown[] | undefined {
+  return database.exec(sql, parameters as never)[0]?.values[0];
+}
+
+function valueAt(database: Database, sql: string, parameters: unknown[] = []): unknown {
+  return firstRow(database, sql, parameters)?.[0];
+}
+
+export class RuntimeStateStore {
+  #database: Database;
+  readonly #SQL: SqlJsStatic;
+  readonly #persistStateFile: PersistStateFile;
+  readonly #statePath?: string;
+  #closed = false;
+  #writeTail: Promise<void> = Promise.resolve();
+
+  private constructor(
+    SQL: SqlJsStatic,
+    database: Database,
+    statePath: string | undefined,
+    persistFile: PersistStateFile,
+  ) {
+    this.#SQL = SQL;
+    this.#database = database;
+    this.#statePath = statePath;
+    this.#persistStateFile = persistFile;
+  }
+
+  static async open(
+    statePath?: string,
+    persistFile: PersistStateFile = persistStateFile,
+  ): Promise<RuntimeStateStore> {
+    const SQL = await initSqlJs();
+    let bytes: Uint8Array | undefined;
+    if (statePath) {
+      try {
+        bytes = await readFile(statePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+    const store = new RuntimeStateStore(SQL, new SQL.Database(bytes), statePath, persistFile);
+    store.#database.run("PRAGMA foreign_keys = ON");
+    await store.#migrate();
+    await store.interruptActiveRuns();
+    return store;
+  }
+
+  async createConversation(
+    conversation: ConversationSummary,
+  ): Promise<ConversationSummary> {
+    return this.#write(() => {
+      const timestamp = now();
+      this.#database.run(
+        `INSERT INTO conversations (id, title, model_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        [conversation.id, conversation.title, conversation.modelId, timestamp, timestamp],
+      );
+      return conversation;
+    });
+  }
+
+  async ensureConversation(conversationId: string, modelId: string): Promise<void> {
+    await this.#write(() => {
+      const timestamp = now();
+      this.#database.run(
+        `INSERT OR IGNORE INTO conversations (id, title, model_id, created_at, updated_at)
+         VALUES (?, 'New Conversation', ?, ?, ?)`,
+        [conversationId, modelId, timestamp, timestamp],
+      );
+    });
+  }
+
+  async hasConversation(conversationId: string): Promise<boolean> {
+    await this.#writeTail;
+    return valueAt(this.#database, "SELECT 1 FROM conversations WHERE id = ?", [conversationId]) === 1;
+  }
+
+  async beginAgentRun(
+    conversationId: string,
+    agentRunId: string,
+    modelId: string,
+    input: string,
+    startedEvent?: Extract<AgentRunEvent, { type: "agent_run.started" }>,
+  ): Promise<void> {
+    await this.#write(() => {
+      const timestamp = now();
+      const messageId = randomUUID();
+      this.#database.run(
+        `INSERT OR IGNORE INTO conversations (id, title, model_id, created_at, updated_at)
+         VALUES (?, 'New Conversation', ?, ?, ?)`,
+        [conversationId, modelId, timestamp, timestamp],
+      );
+      const sequence = this.#nextMessageSequence(conversationId);
+      this.#database.run(
+        `INSERT INTO agent_runs
+          (id, conversation_id, model_id, status, created_at, updated_at)
+         VALUES (?, ?, ?, 'running', ?, ?)`,
+        [agentRunId, conversationId, modelId, timestamp, timestamp],
+      );
+      this.#database.run(
+        `INSERT INTO messages
+          (id, conversation_id, agent_run_id, role, text, sequence, created_at)
+         VALUES (?, ?, ?, 'user', ?, ?, ?)`,
+        [messageId, conversationId, agentRunId, input, sequence, timestamp],
+      );
+      this.#database.run("UPDATE agent_runs SET user_message_id = ? WHERE id = ?", [
+        messageId,
+        agentRunId,
+      ]);
+      this.#recordEvent(
+        startedEvent ?? {
+          type: "agent_run.started",
+          protocolVersion: PROTOCOL_VERSION,
+          eventId: randomUUID(),
+          conversationId,
+          agentRunId,
+          sequence: this.#nextAgentRunSequence(agentRunId),
+          model: modelId,
+        },
+      );
+      this.#touchConversation(conversationId, timestamp);
+    });
+  }
+
+  async completeAgentRun(
+    agentRunId: string,
+    output: string,
+    completedEvent?: Extract<AgentRunEvent, { type: "agent_run.completed" }>,
+  ): Promise<void> {
+    await this.#finishRun(agentRunId, "completed", output, completedEvent);
+  }
+
+  async failAgentRun(
+    agentRunId: string,
+    code: string,
+    message: string,
+    failedEvent?: Extract<AgentRunEvent, { type: "agent_run.failed" }>,
+  ): Promise<void> {
+    await this.#write(() => {
+      const run = this.#requiredRun(agentRunId);
+      const timestamp = now();
+      this.#database.run(
+        `UPDATE agent_runs
+         SET status = 'failed', error_code = ?, error_message = ?, updated_at = ?
+         WHERE id = ?`,
+        [code, message, timestamp, agentRunId],
+      );
+      this.#recordEvent(
+        failedEvent ?? {
+          type: "agent_run.failed",
+          protocolVersion: PROTOCOL_VERSION,
+          eventId: randomUUID(),
+          conversationId: run.conversationId,
+          agentRunId,
+          sequence: this.#nextAgentRunSequence(agentRunId),
+          error: { code: code as ProviderErrorCode, message },
+        },
+      );
+      this.#touchConversation(run.conversationId, timestamp);
+    });
+  }
+
+  async cancelAgentRun(
+    agentRunId: string,
+    event?: Extract<AgentRunEvent, { type: "agent_run.cancelled" }>,
+  ): Promise<boolean> {
+    return this.#setRunStatus(agentRunId, "cancelled", event);
+  }
+
+  async interruptAgentRun(
+    agentRunId: string,
+    event?: Extract<AgentRunEvent, { type: "agent_run.interrupted" }>,
+  ): Promise<boolean> {
+    return this.#setRunStatus(agentRunId, "interrupted", event);
+  }
+
+  async interruptActiveRuns(): Promise<AgentRunEvent[]> {
+    return this.#write(() => {
+      const timestamp = now();
+      const running = this.#database.exec(
+        "SELECT id, conversation_id FROM agent_runs WHERE status = 'running' ORDER BY created_at, id",
+      )[0]?.values ?? [];
+      const events: AgentRunEvent[] = [];
+      for (const [agentRunId, conversationId] of running) {
+        this.#database.run(
+          "UPDATE agent_runs SET status = 'interrupted', updated_at = ? WHERE id = ?",
+          [timestamp, agentRunId as string],
+        );
+        const event: AgentRunEvent = {
+          type: "agent_run.interrupted",
+          protocolVersion: PROTOCOL_VERSION,
+          eventId: randomUUID(),
+          conversationId: conversationId as string,
+          agentRunId: agentRunId as string,
+          sequence: this.#nextAgentRunSequence(agentRunId as string),
+        };
+        this.#recordEvent(event);
+        events.push(event);
+      }
+      return events;
+    });
+  }
+
+  async acknowledgeDurableEvent(
+    eventId: string,
+    conversationId: string,
+    agentRunId: string,
+  ): Promise<void> {
+    await this.#write(() => {
+      this.#database.run(
+        `UPDATE durable_events SET acknowledged_at = ?
+         WHERE id = ? AND conversation_id = ? AND agent_run_id = ? AND acknowledged_at IS NULL`,
+        [now(), eventId, conversationId, agentRunId],
+      );
+    });
+  }
+
+  async advanceAgentRunSequence(agentRunId: string, sequence: number): Promise<void> {
+    await this.#write(() => {
+      this.#database.run(
+        `UPDATE agent_runs SET last_sequence = ?
+         WHERE id = ? AND status = 'running' AND last_sequence < ?`,
+        [sequence, agentRunId, sequence],
+      );
+      if (this.#database.getRowsModified() !== 1) {
+        throw new Error(`Agent Run '${agentRunId}' cannot advance to sequence ${sequence}.`);
+      }
+    });
+  }
+
+  async listUnacknowledgedEvents(): Promise<AgentRunEvent[]> {
+    await this.#writeTail;
+    const rows =
+      this.#database.exec(
+        `SELECT payload_json FROM durable_events
+         WHERE acknowledged_at IS NULL ORDER BY rowid`,
+      )[0]?.values ?? [];
+    return rows.map(([payload]) => JSON.parse(payload as string) as AgentRunEvent);
+  }
+
+  async getConversation(conversationId: string): Promise<ConversationSnapshot> {
+    await this.#writeTail;
+    const conversationRow = firstRow(
+      this.#database,
+      "SELECT id, title, model_id FROM conversations WHERE id = ?",
+      [conversationId],
+    );
+    if (!conversationRow) throw new Error(`Conversation '${conversationId}' does not exist.`);
+    const messageRows =
+      this.#database.exec(
+        `SELECT id, agent_run_id, role, text, sequence
+         FROM messages WHERE conversation_id = ? ORDER BY sequence`,
+        [conversationId],
+      )[0]?.values ?? [];
+    const runRows =
+      this.#database.exec(
+        `SELECT id, model_id, status
+         FROM agent_runs WHERE conversation_id = ? ORDER BY created_at, id`,
+        [conversationId],
+      )[0]?.values ?? [];
+    return {
+      conversation: {
+        id: conversationRow[0] as string,
+        title: conversationRow[1] as string,
+        modelId: conversationRow[2] as string,
+      },
+      messages: messageRows.map(([id, agentRunId, role, text, sequence]) => ({
+        id: id as string,
+        agentRunId: agentRunId as string,
+        role: role as "assistant" | "user",
+        text: text as string,
+        sequence: sequence as number,
+      })),
+      agentRuns: runRows.map(([id, modelId, status]) => ({
+        id: id as string,
+        modelId: modelId as string,
+        status: status as AgentRunStatus,
+      })),
+    };
+  }
+
+  async listConversations(): Promise<ConversationSummary[]> {
+    await this.#writeTail;
+    const rows =
+      this.#database.exec(
+        "SELECT id, title, model_id FROM conversations ORDER BY updated_at DESC, id",
+      )[0]?.values ?? [];
+    return rows.map(([id, title, modelId]) => ({
+      id: id as string,
+      title: title as string,
+      modelId: modelId as string,
+    }));
+  }
+
+  async updateConversationModel(
+    conversationId: string,
+    modelId: string,
+  ): Promise<ConversationSummary> {
+    await this.#write(() => {
+      this.#database.run(
+        "UPDATE conversations SET model_id = ?, updated_at = ? WHERE id = ?",
+        [modelId, now(), conversationId],
+      );
+      if (this.#database.getRowsModified() !== 1) {
+        throw new Error(`Conversation '${conversationId}' does not exist.`);
+      }
+    });
+    return (await this.getConversation(conversationId)).conversation;
+  }
+
+  async deleteConversation(conversationId: string): Promise<void> {
+    await this.#write(() => {
+      this.#database.run("DELETE FROM conversations WHERE id = ?", [conversationId]);
+      if (this.#database.getRowsModified() !== 1) {
+        throw new Error(`Conversation '${conversationId}' does not exist.`);
+      }
+    });
+  }
+
+  async close(): Promise<void> {
+    if (this.#closed) return;
+    await this.#writeTail;
+    await this.#persist();
+    this.#database.close();
+    this.#closed = true;
+  }
+
+  async #finishRun(
+    agentRunId: string,
+    status: "completed",
+    output: string,
+    completedEvent?: Extract<AgentRunEvent, { type: "agent_run.completed" }>,
+  ): Promise<void> {
+    await this.#write(() => {
+      const run = this.#requiredRun(agentRunId);
+      const timestamp = now();
+      const messageId = randomUUID();
+      const sequence = this.#nextMessageSequence(run.conversationId);
+      this.#database.run(
+        `INSERT INTO messages
+          (id, conversation_id, agent_run_id, role, text, sequence, created_at)
+         VALUES (?, ?, ?, 'assistant', ?, ?, ?)`,
+        [messageId, run.conversationId, agentRunId, output, sequence, timestamp],
+      );
+      this.#database.run(
+        `UPDATE agent_runs
+         SET status = ?, assistant_message_id = ?, updated_at = ? WHERE id = ?`,
+        [status, messageId, timestamp, agentRunId],
+      );
+      this.#recordEvent(
+        completedEvent ?? {
+          type: "agent_run.completed",
+          protocolVersion: PROTOCOL_VERSION,
+          eventId: randomUUID(),
+          conversationId: run.conversationId,
+          agentRunId,
+          sequence: this.#nextAgentRunSequence(agentRunId),
+          output: { role: "assistant", text: output },
+        },
+      );
+      this.#touchConversation(run.conversationId, timestamp);
+    });
+  }
+
+  async #setRunStatus(
+    agentRunId: string,
+    status: "cancelled" | "interrupted",
+    event?: Extract<AgentRunEvent, { type: "agent_run.cancelled" | "agent_run.interrupted" }>,
+  ): Promise<boolean> {
+    return this.#write(() => {
+      const run = this.#requiredRun(agentRunId);
+      const timestamp = now();
+      this.#database.run(
+        "UPDATE agent_runs SET status = ?, updated_at = ? WHERE id = ? AND status = 'running'",
+        [status, timestamp, agentRunId],
+      );
+      if (this.#database.getRowsModified() !== 1) return false;
+      this.#recordEvent(
+        event ?? {
+          type: status === "cancelled" ? "agent_run.cancelled" : "agent_run.interrupted",
+          protocolVersion: PROTOCOL_VERSION,
+          eventId: randomUUID(),
+          conversationId: run.conversationId,
+          agentRunId,
+          sequence: this.#nextAgentRunSequence(agentRunId),
+        },
+      );
+      this.#touchConversation(run.conversationId, timestamp);
+      return true;
+    });
+  }
+
+  #requiredRun(agentRunId: string): { conversationId: string } {
+    const row = firstRow(
+      this.#database,
+      "SELECT conversation_id FROM agent_runs WHERE id = ?",
+      [agentRunId],
+    );
+    if (!row) throw new Error(`Agent Run '${agentRunId}' does not exist.`);
+    return { conversationId: row[0] as string };
+  }
+
+  #nextMessageSequence(conversationId: string): number {
+    const current = valueAt(
+      this.#database,
+      "SELECT COALESCE(MAX(sequence), 0) FROM messages WHERE conversation_id = ?",
+      [conversationId],
+    );
+    return Number(current) + 1;
+  }
+
+  #recordEvent(event: AgentRunEvent): void {
+    this.#database.run(
+      `INSERT INTO durable_events
+        (id, conversation_id, agent_run_id, event_type, sequence, payload_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        event.eventId,
+        event.conversationId,
+        event.agentRunId,
+        event.type,
+        event.sequence,
+        JSON.stringify(event),
+        now(),
+      ],
+    );
+    this.#database.run(
+      "UPDATE agent_runs SET last_sequence = MAX(last_sequence, ?) WHERE id = ?",
+      [event.sequence, event.agentRunId],
+    );
+  }
+
+  #nextAgentRunSequence(agentRunId: string): number {
+    const current = valueAt(
+      this.#database,
+      "SELECT last_sequence FROM agent_runs WHERE id = ?",
+      [agentRunId],
+    );
+    return Number(current) + 1;
+  }
+
+  #touchConversation(conversationId: string, timestamp: string): void {
+    this.#database.run("UPDATE conversations SET updated_at = ? WHERE id = ?", [
+      timestamp,
+      conversationId,
+    ]);
+  }
+
+  async #migrate(): Promise<void> {
+    const version = Number(valueAt(this.#database, "PRAGMA user_version") ?? 0);
+    if (version > CURRENT_SCHEMA_VERSION) {
+      throw new Error(
+        `Runtime State schema ${version} is newer than supported schema ${CURRENT_SCHEMA_VERSION}.`,
+      );
+    }
+    for (const migration of MIGRATIONS) {
+      if (migration.version <= version) continue;
+      this.#database.run("BEGIN IMMEDIATE");
+      try {
+        this.#database.run(migration.sql);
+        const timestamp = now();
+        this.#database.run(
+          "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+          [migration.version, timestamp],
+        );
+        this.#database.run(
+          `INSERT INTO settings_metadata (key, value, updated_at)
+           VALUES ('schema_version', ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+          [`${migration.version}`, timestamp],
+        );
+        this.#database.run(`PRAGMA user_version = ${migration.version}`);
+        this.#database.run("COMMIT");
+      } catch (error) {
+        this.#database.run("ROLLBACK");
+        throw error;
+      }
+    }
+    await this.#persist();
+  }
+
+  #write<T>(operation: () => T): Promise<T> {
+    if (this.#closed) return Promise.reject(new Error("Runtime State is closed."));
+    const result = this.#writeTail.then(async () => {
+      const snapshot = this.#database.export();
+      this.#database.run("PRAGMA foreign_keys = ON");
+      let committed = false;
+      this.#database.run("BEGIN IMMEDIATE");
+      try {
+        const value = operation();
+        this.#database.run("COMMIT");
+        committed = true;
+        await this.#persist();
+        return value;
+      } catch (error) {
+        if (committed) this.#restore(snapshot);
+        else this.#database.run("ROLLBACK");
+        throw error;
+      }
+    });
+    this.#writeTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  async #persist(): Promise<void> {
+    if (!this.#statePath) return;
+    const temporaryPath = `${this.#statePath}.${process.pid}.tmp`;
+    const bytes = this.#database.export();
+    // sql.js reopens the in-memory database during export, resetting connection PRAGMAs.
+    this.#database.run("PRAGMA foreign_keys = ON");
+    await this.#persistStateFile(this.#statePath, temporaryPath, bytes);
+  }
+
+  #restore(snapshot: Uint8Array): void {
+    this.#database.close();
+    this.#database = new this.#SQL.Database(snapshot);
+    this.#database.run("PRAGMA foreign_keys = ON");
+  }
+}
+
+export { CURRENT_SCHEMA_VERSION };

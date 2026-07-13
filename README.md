@@ -12,10 +12,13 @@ The current implementation includes the product shell and one complete Agent Run
 - a Runtime-owned Model Provider seam with deterministic test and Codex Subscription adapters;
 - model selection plus streamed, single-run conversation in the Sidebar;
 - typed auth, model, transport, and Provider failures over a versioned WebSocket protocol.
+- durable Conversations, Messages, Agent Runs, and schema metadata in Runtime-owned SQLite;
+- persisted Run-boundary events with stable identities, client acknowledgements, and reconnect replay;
+- Conversation create/switch/reopen/delete controls plus visible Run status and cancellation.
 
 The Codex adapter reuses the login cache managed by Codex CLI/desktop. It does not require an
 OpenAI API key and never copies OAuth material into plugin settings or protocol events. Later
-capabilities are tracked in GitHub Issues #4-#16 and are intentionally not exposed early.
+capabilities are tracked in GitHub Issues #5-#16 and are intentionally not exposed early.
 
 ## Requirements
 
@@ -68,3 +71,7 @@ For a local manual smoke test, copy those files to `.obsidian/plugins/offeragent
 - `docs/specs`, `docs/adr`, and `CONTEXT.md`: accepted product specification, decisions, and domain language.
 
 The v1 scope explicitly excludes the legacy Python/Django/Khoj server, Web UI, old Obsidian plugin, Shell tools, arbitrary code execution, vector databases, and multi-agent behavior.
+
+Production Runtime State is stored outside the Vault at `%LOCALAPPDATA%\OfferAgent\state.db`.
+The Runtime is the database's only owner; the plugin accesses it exclusively through the versioned
+local protocol. Fake-Provider tests use isolated in-memory or temporary databases.
