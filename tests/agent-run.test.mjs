@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { request } from "node:http";
 import { createServer } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -196,7 +196,37 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
         return;
       }
       if (incoming.url === "/responses") {
+        const requestPayload = JSON.parse(body);
         response.writeHead(200, { "content-type": "text/event-stream" });
+        if (responseMode === "oversized-arguments") {
+          response.end(
+            `data: ${JSON.stringify({
+              type: "response.output_item.done",
+              item: {
+                type: "function_call",
+                id: "item-oversized",
+                call_id: "call-oversized",
+                name: "vault_read",
+                arguments: JSON.stringify({ path: `notes/${"x".repeat(9_000)}.md` }),
+              },
+            })}\r\n\r\ndata: ${JSON.stringify({
+              type: "response.completed",
+              response: { status: "completed" },
+            })}\r\n\r\n`,
+          );
+          return;
+        }
+        if (responseMode === "tool") {
+          if (requestPayload.input.some((item) => item.type === "function_call_output")) {
+            response.write('data: {"type":"response.output_text.delta","delta":"Used Vault evidence"}\r\n\r\n');
+          } else {
+            response.write(
+              'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"item-vault-read","call_id":"codex-vault-call","name":"vault_read","arguments":"{\\"path\\":\\"notes/a.md\\",\\"lineStart\\":1,\\"lineEnd\\":2}"}}\r\n\r\n',
+            );
+          }
+          response.end('data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n');
+          return;
+        }
         response.write('data: {"type":"response.output_text.delta","delta":"Interview "}\r\n\r\n');
         if (responseMode === "truncated") {
           response.end();
@@ -213,6 +243,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   const upstreamPort = upstream.address().port;
 
   const token = "codex-provider-runtime-token";
+  const statePath = path.join(temporaryDirectory, "state.db");
   const runtime = spawn(
     process.execPath,
     [
@@ -226,7 +257,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
       "--provider",
       "codex",
       "--state-path",
-      path.join(temporaryDirectory, "state.db"),
+      statePath,
     ],
     {
       env: {
@@ -290,6 +321,75 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   assert.equal(responseRequest.store, false);
   assert.equal(responseRequest.stream, true);
   assert.equal(responseRequest.input[0].content[0].text, "Prepare me.");
+  assert.deepEqual(responseRequest.tools.map((tool) => tool.name), ["vault_list", "vault_read"]);
+  assert.ok(responseRequest.tools.every((tool) => tool.strict === false));
+
+  responseMode = "tool";
+  const toolRunEvents = [];
+  const toolRun = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for Codex tool loop")), 5_000);
+    socket.on("message", function onMessage(data) {
+      const event = JSON.parse(data.toString("utf8"));
+      if (event.agentRunId !== "agent-run-codex-tool") return;
+      toolRunEvents.push(event);
+      if (event.type === "tool_call.requested") {
+        socket.send(
+          JSON.stringify({
+            type: "tool_result",
+            protocolVersion: 1,
+            eventId: "codex-tool-result",
+            conversationId: event.conversationId,
+            agentRunId: event.agentRunId,
+            sequence: event.sequence,
+            toolCallId: event.toolCallId,
+            result: {
+              ok: true,
+              value: {
+                type: "vault_read",
+                path: "notes/a.md",
+                lineStart: 1,
+                lineEnd: 2,
+                modifiedVersion: "mtime:1:size:3",
+                contentHash: "sha256:test",
+                content: "A\nB",
+                truncated: false,
+              },
+            },
+          }),
+        );
+      }
+      if (event.type === "agent_run.completed") {
+        clearTimeout(timeout);
+        socket.off("message", onMessage);
+        resolve();
+      }
+      if (event.type === "agent_run.failed") {
+        clearTimeout(timeout);
+        socket.off("message", onMessage);
+        reject(new Error(event.error.message));
+      }
+    });
+  });
+  socket.send(
+    JSON.stringify({
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "client-codex-tool-event",
+      conversationId: "conversation-codex-1",
+      agentRunId: "agent-run-codex-tool",
+      sequence: 0,
+      model: "gpt-5.4",
+      input: { role: "user", text: "Read the Vault note." },
+    }),
+  );
+  await toolRun;
+  assert.equal(toolRunEvents.find((event) => event.type === "tool_call.requested").tool.name, "vault_read");
+  assert.equal(toolRunEvents.at(-1).output.text, "Used Vault evidence");
+  const toolFollowupRequest = JSON.parse(upstreamRequests.at(-1).body);
+  assert.deepEqual(
+    toolFollowupRequest.input.slice(-2).map((item) => item.type),
+    ["function_call", "function_call_output"],
+  );
 
   responseMode = "truncated";
   const truncatedRun = new Promise((resolve) => {
@@ -319,6 +419,36 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   const truncatedTerminal = await truncatedRun;
   assert.equal(truncatedTerminal.type, "agent_run.failed");
   assert.equal(truncatedTerminal.error.code, "transport_error");
+
+  responseMode = "oversized-arguments";
+  const oversizedTerminal = new Promise((resolve) => {
+    socket.on("message", function onMessage(data) {
+      const event = JSON.parse(data.toString("utf8"));
+      if (
+        event.agentRunId === "agent-run-codex-oversized" &&
+        (event.type === "agent_run.failed" || event.type === "tool_call.requested")
+      ) {
+        socket.off("message", onMessage);
+        resolve(event);
+      }
+    });
+  });
+  socket.send(
+    JSON.stringify({
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "client-codex-event-oversized",
+      conversationId: "conversation-codex-1",
+      agentRunId: "agent-run-codex-oversized",
+      sequence: 0,
+      model: "gpt-5.4",
+      input: { role: "user", text: "This tool call is too large." },
+    }),
+  );
+  const oversized = await oversizedTerminal;
+  assert.equal(oversized.type, "agent_run.failed");
+  assert.equal(oversized.error.code, "provider_error");
+  assert.equal((await readFile(statePath)).includes(Buffer.from("x".repeat(9_000))), false);
   socket.close();
 });
 

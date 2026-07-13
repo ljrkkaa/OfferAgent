@@ -8,11 +8,13 @@ import {
   type AgentRunStatus,
   type ConversationMessage,
   type ConversationSummary,
+  type LocalToolResultPayload,
   type ProviderErrorCode,
+  type ToolCallRecord,
 } from "@offeragent/protocol";
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.js";
 
-const CURRENT_SCHEMA_VERSION = 2;
+const CURRENT_SCHEMA_VERSION = 3;
 
 const MIGRATIONS = [
   {
@@ -92,12 +94,45 @@ const MIGRATIONS = [
       DELETE FROM durable_events WHERE event_type = 'agent_run.delta';
     `,
   },
+  {
+    version: 3,
+    sql: `
+      CREATE TABLE tool_calls (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        name TEXT NOT NULL CHECK (name IN ('vault_list', 'vault_read')),
+        arguments_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('requested', 'completed', 'failed')),
+        error_code TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE evidence_snapshots (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        line_start INTEGER NOT NULL,
+        line_end INTEGER NOT NULL,
+        modified_version TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX tool_calls_by_run ON tool_calls(agent_run_id, created_at);
+      CREATE INDEX evidence_by_run ON evidence_snapshots(agent_run_id, created_at);
+    `,
+  },
 ] as const;
 
 interface ConversationSnapshot {
   agentRuns: AgentRunRecord[];
   conversation: ConversationSummary;
   messages: ConversationMessage[];
+  toolCalls: ToolCallRecord[];
 }
 
 type PersistStateFile = (
@@ -361,6 +396,83 @@ export class RuntimeStateStore {
     return rows.map(([payload]) => JSON.parse(payload as string) as AgentRunEvent);
   }
 
+  async requestToolCall(
+    agentRunId: string,
+    event: Extract<AgentRunEvent, { type: "tool_call.requested" }>,
+  ): Promise<void> {
+    await this.#write(() => {
+      const run = this.#requiredRun(agentRunId);
+      const timestamp = now();
+      this.#database.run(
+        `INSERT INTO tool_calls
+          (id, conversation_id, agent_run_id, name, arguments_json, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'requested', ?, ?)`,
+        [
+          event.toolCallId,
+          run.conversationId,
+          agentRunId,
+          event.tool.name,
+          JSON.stringify(event.tool.arguments),
+          timestamp,
+          timestamp,
+        ],
+      );
+      this.#recordEvent(event);
+      this.#touchConversation(run.conversationId, timestamp);
+    });
+  }
+
+  async completeToolCall(
+    agentRunId: string,
+    result: LocalToolResultPayload,
+    event: Extract<AgentRunEvent, { type: "tool_call.completed" }>,
+  ): Promise<void> {
+    await this.#write(() => {
+      const run = this.#requiredRun(agentRunId);
+      const timestamp = now();
+      this.#database.run(
+        `UPDATE tool_calls
+         SET status = ?, error_code = ?, error_message = ?, updated_at = ?
+         WHERE id = ? AND agent_run_id = ? AND status = 'requested'`,
+        [
+          result.ok ? "completed" : "failed",
+          result.ok ? null : result.error.code,
+          result.ok ? null : result.error.message,
+          timestamp,
+          event.toolCallId,
+          agentRunId,
+        ],
+      );
+      if (this.#database.getRowsModified() !== 1) {
+        throw new Error(`Tool Call '${event.toolCallId}' is not pending.`);
+      }
+      if (result.ok && result.value.type === "vault_read") {
+        const evidence = result.value;
+        this.#database.run(
+          `INSERT INTO evidence_snapshots
+            (id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+             modified_version, content_hash, content, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            randomUUID(),
+            run.conversationId,
+            agentRunId,
+            event.toolCallId,
+            evidence.path,
+            evidence.lineStart,
+            evidence.lineEnd,
+            evidence.modifiedVersion,
+            evidence.contentHash,
+            evidence.content,
+            timestamp,
+          ],
+        );
+      }
+      this.#recordEvent(event);
+      this.#touchConversation(run.conversationId, timestamp);
+    });
+  }
+
   async getConversation(conversationId: string): Promise<ConversationSnapshot> {
     await this.#writeTail;
     const conversationRow = firstRow(
@@ -381,6 +493,12 @@ export class RuntimeStateStore {
          FROM agent_runs WHERE conversation_id = ? ORDER BY created_at, id`,
         [conversationId],
       )[0]?.values ?? [];
+    const toolCallRows =
+      this.#database.exec(
+        `SELECT id, agent_run_id, name, arguments_json, status
+         FROM tool_calls WHERE conversation_id = ? ORDER BY created_at, id`,
+        [conversationId],
+      )[0]?.values ?? [];
     return {
       conversation: {
         id: conversationRow[0] as string,
@@ -398,6 +516,13 @@ export class RuntimeStateStore {
         id: id as string,
         modelId: modelId as string,
         status: status as AgentRunStatus,
+      })),
+      toolCalls: toolCallRows.map(([id, agentRunId, name, argumentsJson, status]) => ({
+        id: id as string,
+        agentRunId: agentRunId as string,
+        name: name as ToolCallRecord["name"],
+        arguments: JSON.parse(argumentsJson as string) as unknown,
+        status: status as ToolCallRecord["status"],
       })),
     };
   }
@@ -498,6 +623,19 @@ export class RuntimeStateStore {
         [status, timestamp, agentRunId],
       );
       if (this.#database.getRowsModified() !== 1) return false;
+      this.#database.run(
+        `UPDATE tool_calls
+         SET status = 'failed', error_code = ?, error_message = ?, updated_at = ?
+         WHERE agent_run_id = ? AND status = 'requested'`,
+        [
+          status === "cancelled" ? "tool_error" : "plugin_disconnected",
+          status === "cancelled"
+            ? "The Agent Run was cancelled during the Vault tool call."
+            : "The Obsidian plugin disconnected during the Vault tool call.",
+          timestamp,
+          agentRunId,
+        ],
+      );
       this.#recordEvent(
         event ?? {
           type: status === "cancelled" ? "agent_run.cancelled" : "agent_run.interrupted",

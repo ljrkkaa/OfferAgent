@@ -1,14 +1,32 @@
-import type { ModelDescriptor, ProviderErrorCode } from "@offeragent/protocol";
+import type { LocalToolName, LocalToolResultPayload, ModelDescriptor, ProviderErrorCode } from "@offeragent/protocol";
+
+export const MAX_LOCAL_TOOL_ARGUMENT_BYTES = 8_192;
+
+export type ModelConversationItem =
+  | { type: "user_message"; text: string }
+  | { type: "local_tool_call"; callId: string; name: LocalToolName; arguments: unknown }
+  | { type: "local_tool_result"; callId: string; result: LocalToolResultPayload };
+
+export type ModelStreamEvent =
+  | { type: "output_text.delta"; delta: string }
+  | { type: "local_tool_call"; callId: string; name: LocalToolName; arguments: unknown };
+
+export interface LocalToolDefinition {
+  description: string;
+  name: LocalToolName;
+  parameters: Record<string, unknown>;
+}
 
 export interface ModelRequest {
-  input: string;
+  input: ModelConversationItem[];
   model: string;
   signal: AbortSignal;
+  tools: LocalToolDefinition[];
 }
 
 export interface ModelProvider {
   listModels(): Promise<ModelDescriptor[]>;
-  stream(request: ModelRequest): AsyncIterable<string>;
+  stream(request: ModelRequest): AsyncIterable<ModelStreamEvent>;
 }
 
 export class ModelProviderError extends Error {

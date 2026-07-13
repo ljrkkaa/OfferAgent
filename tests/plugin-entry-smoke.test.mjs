@@ -193,6 +193,19 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     vault: {
       adapter: new FileSystemAdapter(temporaryVault),
       configDir: ".obsidian",
+      getFiles() {
+        return [
+          {
+            path: "notes/example.md",
+            extension: "md",
+            stat: { mtime: 1234, size: 17 },
+            content: "line one\nline two",
+          },
+        ];
+      },
+      async cachedRead(file) {
+        return file.content;
+      },
     },
     workspace,
   };
@@ -270,6 +283,19 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     visibleRunStatuses.map((status) => status.dataset.status),
     ["completed", "completed"],
   );
+
+  const toolComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
+  const toolInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  toolInput.value = "vault_read notes/example.md 1-2";
+  toolComposer.dispatch("submit");
+  const completedTool = await waitUntil(
+    () => {
+      const activity = activeView.contentEl.findByClass("offeragent-sidebar__tool-activity");
+      return activity?.dataset.status === "completed" ? activity : undefined;
+    },
+    "OfferAgent did not execute and render the Vault tool activity",
+  );
+  assert.match(completedTool.children[0].text, /vault_read · completed/);
 
   await plugin.onunload();
   plugin = undefined;

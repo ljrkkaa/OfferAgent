@@ -85,8 +85,10 @@ test("Runtime State applies explicit schema migrations and rejects newer schemas
       timestamp,
     ],
   );
+  migrated.run("DROP TABLE evidence_snapshots");
+  migrated.run("DROP TABLE tool_calls");
   migrated.run("ALTER TABLE agent_runs DROP COLUMN last_sequence");
-  migrated.run("DELETE FROM schema_migrations WHERE version = 2");
+  migrated.run("DELETE FROM schema_migrations WHERE version >= 2");
   migrated.run("PRAGMA user_version = 1");
   await writeFile(upgradePath, migrated.export());
   migrated.close();

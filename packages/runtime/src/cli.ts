@@ -12,15 +12,23 @@ import {
   type ConversationCommand,
   type ConversationEvent,
   type DurableEventAck,
+  type LocalToolResultPayload,
   type RuntimeError,
   type RuntimeHandshake,
   type RuntimeHealth,
   type RuntimeModels,
   type RuntimeShutdown,
+  type ToolResultCommand,
 } from "@offeragent/protocol";
 import { FakeModelProvider } from "./fake-model-provider";
 import { CodexSubscriptionProvider } from "./codex-subscription-provider";
-import { asModelProviderError, type ModelProvider } from "./model-provider";
+import {
+  asModelProviderError,
+  MAX_LOCAL_TOOL_ARGUMENT_BYTES,
+  type LocalToolDefinition,
+  type ModelConversationItem,
+  type ModelProvider,
+} from "./model-provider";
 import { RuntimeStateStore } from "./state-store";
 
 interface RuntimeOptions {
@@ -29,6 +37,110 @@ interface RuntimeOptions {
   provider: "codex" | "fake";
   statePath?: string;
   token: string;
+}
+
+const LOCAL_TOOLS: LocalToolDefinition[] = [
+  {
+    name: "vault_list",
+    description: "List bounded Markdown or text files available in the connected Obsidian Vault.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        directory: { type: "string", maxLength: 512 },
+        limit: { type: "integer", minimum: 1, maximum: 100 },
+      },
+    },
+  },
+  {
+    name: "vault_read",
+    description: "Read an exact bounded line range from one Vault Markdown or text file.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        path: { type: "string", maxLength: 512 },
+        lineStart: { type: "integer", minimum: 1 },
+        lineEnd: { type: "integer", minimum: 1 },
+      },
+      required: ["path"],
+    },
+  },
+];
+
+function assertBoundedToolArguments(arguments_: unknown): void {
+  let encoded: string;
+  try {
+    encoded = JSON.stringify(arguments_);
+  } catch (error) {
+    throw new Error("The model provider returned non-serializable local tool arguments.", {
+      cause: error,
+    });
+  }
+  if (Buffer.byteLength(encoded, "utf8") > MAX_LOCAL_TOOL_ARGUMENT_BYTES) {
+    throw new Error(
+      `The model provider returned local tool arguments larger than ${MAX_LOCAL_TOOL_ARGUMENT_BYTES} UTF-8 bytes.`,
+    );
+  }
+}
+
+function isBoundedVaultPath(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 512 &&
+    !value.includes("\\") &&
+    !value.startsWith("/") &&
+    !/^[A-Za-z]:/.test(value) &&
+    !value.split("/").some((segment) => !segment || segment === "." || segment === "..")
+  );
+}
+
+function isLocalToolResultPayload(value: unknown): value is LocalToolResultPayload {
+  if (!value || typeof value !== "object") return false;
+  const result = value as Partial<LocalToolResultPayload>;
+  if (result.ok === false) {
+    return Boolean(
+      result.error &&
+      ["invalid_path", "not_found", "plugin_disconnected", "request_too_large", "tool_error"].includes(
+        result.error.code as string,
+      ) &&
+      typeof result.error.message === "string" &&
+      Buffer.byteLength(result.error.message, "utf8") <= 2_048,
+    );
+  }
+  if (result.ok !== true || !result.value || typeof result.value !== "object") return false;
+  if (result.value.type === "vault_list") {
+    return (
+      typeof result.value.truncated === "boolean" &&
+      Array.isArray(result.value.entries) &&
+      result.value.entries.length <= 100 &&
+      result.value.entries.every(
+        (entry) =>
+          isBoundedVaultPath(entry.path) &&
+          typeof entry.modifiedVersion === "string" &&
+          entry.modifiedVersion.length <= 128 &&
+          typeof entry.contentHash === "string" &&
+          entry.contentHash.length <= 128,
+      )
+    );
+  }
+  return (
+    result.value.type === "vault_read" &&
+    isBoundedVaultPath(result.value.path) &&
+    typeof result.value.content === "string" &&
+    Buffer.byteLength(result.value.content, "utf8") <= 32_768 &&
+    Number.isInteger(result.value.lineStart) &&
+    Number.isInteger(result.value.lineEnd) &&
+    result.value.lineStart >= 1 &&
+    result.value.lineEnd >= result.value.lineStart &&
+    result.value.lineEnd - result.value.lineStart + 1 <= 200 &&
+    typeof result.value.modifiedVersion === "string" &&
+    result.value.modifiedVersion.length <= 128 &&
+    typeof result.value.contentHash === "string" &&
+    result.value.contentHash.length <= 128 &&
+    typeof result.value.truncated === "boolean"
+  );
 }
 
 function readOption(name: string): string {
@@ -148,6 +260,21 @@ function isDurableEventAck(value: unknown): value is DurableEventAck {
   );
 }
 
+function isToolResultCommand(value: unknown): value is ToolResultCommand {
+  if (!value || typeof value !== "object") return false;
+  const message = value as Partial<ToolResultCommand>;
+  return (
+    message.type === "tool_result" &&
+    message.protocolVersion === PROTOCOL_VERSION &&
+    typeof message.eventId === "string" &&
+    typeof message.conversationId === "string" &&
+    typeof message.agentRunId === "string" &&
+    typeof message.toolCallId === "string" &&
+    typeof message.sequence === "number" &&
+    isLocalToolResultPayload(message.result)
+  );
+}
+
 function isConversationCommand(value: unknown): value is ConversationCommand {
   if (!value || typeof value !== "object") return false;
   const message = value as Partial<ConversationCommand>;
@@ -237,6 +364,18 @@ async function startRuntime({
       socket: WebSocket;
     }
   >();
+  const pendingToolResults = new Map<
+    string,
+    {
+      agentRunId: string;
+      conversationId: string;
+      reject: (error: Error) => void;
+      resolve: (result: LocalToolResultPayload) => void;
+      sequence: number;
+      socket: WebSocket;
+    }
+  >();
+  const completedToolResults = new Set<string>();
   let exiting = false;
 
   const server = createServer((request, response) => {
@@ -306,6 +445,18 @@ async function startRuntime({
     });
     socket.once("close", () => {
       sockets.delete(socket);
+      for (const [toolCallId, pending] of pendingToolResults) {
+        if (pending.socket !== socket) continue;
+        pendingToolResults.delete(toolCallId);
+        completedToolResults.add(toolCallId);
+        pending.resolve({
+          ok: false,
+          error: {
+            code: "plugin_disconnected",
+            message: "The Obsidian plugin disconnected during the Vault tool call.",
+          },
+        });
+      }
       for (const run of activeRuns.values()) {
         if (run.socket === socket) run.controller.abort();
       }
@@ -316,6 +467,24 @@ async function startRuntime({
         message = JSON.parse(data.toString("utf8"));
       } catch {
         socket.close(1003, "Messages must be JSON.");
+        return;
+      }
+      if (isToolResultCommand(message)) {
+        const pending = pendingToolResults.get(message.toolCallId);
+        if (!pending && completedToolResults.has(message.toolCallId)) return;
+        if (
+          !pending ||
+          pending.socket !== socket ||
+          pending.agentRunId !== message.agentRunId ||
+          pending.conversationId !== message.conversationId ||
+          pending.sequence !== message.sequence
+        ) {
+          socket.close(1008, "Unexpected or out-of-sequence Tool Result.");
+          return;
+        }
+        pendingToolResults.delete(message.toolCallId);
+        completedToolResults.add(message.toolCallId);
+        pending.resolve(message.result);
         return;
       }
       if (isDurableEventAck(message)) {
@@ -408,31 +577,111 @@ async function startRuntime({
         sendEvent(socket, startedEvent);
         sequence += 1;
         try {
-          for await (const delta of provider.stream({
-            model: message.model,
-            input: message.input.text,
-            signal: controller.signal,
-          })) {
-            output += delta;
-            await store.advanceAgentRunSequence(message.agentRunId, sequence);
-            sendEvent(socket, {
+          const input: ModelConversationItem[] = [
+            { type: "user_message", text: message.input.text },
+          ];
+          let finished = false;
+          for (let step = 0; step < 8; step += 1) {
+            output = "";
+            let requestedTool = false;
+            for await (const providerEvent of provider.stream({
+              model: message.model,
+              input,
+              signal: controller.signal,
+              tools: LOCAL_TOOLS,
+            })) {
+              if (providerEvent.type === "output_text.delta") {
+                output += providerEvent.delta;
+                await store.advanceAgentRunSequence(message.agentRunId, sequence);
+                sendEvent(socket, {
+                  ...base,
+                  type: "agent_run.delta",
+                  eventId: randomUUID(),
+                  sequence,
+                  delta: providerEvent.delta,
+                });
+                sequence += 1;
+                continue;
+              }
+
+              requestedTool = true;
+              assertBoundedToolArguments(providerEvent.arguments);
+              input.push(providerEvent);
+              const toolCallId = randomUUID();
+              const requestedSequence = sequence;
+              const requestedEvent: Extract<AgentRunEvent, { type: "tool_call.requested" }> = {
+                ...base,
+                type: "tool_call.requested",
+                eventId: randomUUID(),
+                sequence: requestedSequence,
+                toolCallId,
+                tool: {
+                  kind: "local",
+                  name: providerEvent.name,
+                  arguments: providerEvent.arguments,
+                },
+              };
+              await store.requestToolCall(message.agentRunId, requestedEvent);
+              const resultPromise = new Promise<LocalToolResultPayload>((resolve, reject) => {
+                pendingToolResults.set(toolCallId, {
+                  agentRunId: message.agentRunId,
+                  conversationId: message.conversationId,
+                  reject,
+                  resolve,
+                  sequence: requestedSequence,
+                  socket,
+                });
+              });
+              const abortToolCall = (): void => {
+                const pending = pendingToolResults.get(toolCallId);
+                if (!pending) return;
+                pendingToolResults.delete(toolCallId);
+                completedToolResults.add(toolCallId);
+                pending.reject(new Error("The Agent Run was interrupted during a Vault tool call."));
+              };
+              controller.signal.addEventListener("abort", abortToolCall, { once: true });
+              sendEvent(socket, requestedEvent);
+              sequence += 1;
+              let result: LocalToolResultPayload;
+              try {
+                if (controller.signal.aborted) abortToolCall();
+                result = await resultPromise;
+              } finally {
+                pendingToolResults.delete(toolCallId);
+                controller.signal.removeEventListener("abort", abortToolCall);
+              }
+              const completedEvent: Extract<AgentRunEvent, { type: "tool_call.completed" }> = {
+                ...base,
+                type: "tool_call.completed",
+                eventId: randomUUID(),
+                sequence,
+                toolCallId,
+                tool: { kind: "local", name: providerEvent.name },
+                status: result.ok ? "completed" : "failed",
+                ...(result.ok ? {} : { error: result.error }),
+              };
+              await store.completeToolCall(message.agentRunId, result, completedEvent);
+              sendEvent(socket, completedEvent);
+              sequence += 1;
+              input.push({ type: "local_tool_result", callId: providerEvent.callId, result });
+            }
+            if (requestedTool) continue;
+
+            const completedEvent: Extract<AgentRunEvent, { type: "agent_run.completed" }> = {
               ...base,
-              type: "agent_run.delta",
+              type: "agent_run.completed",
               eventId: randomUUID(),
               sequence,
-              delta,
-            });
-            sequence += 1;
+              output: { role: "assistant", text: output },
+            };
+            await store.completeAgentRun(message.agentRunId, output, completedEvent);
+            sendEvent(socket, completedEvent);
+            finished = true;
+            break;
           }
-          const completedEvent: AgentRunEvent = {
-            ...base,
-            type: "agent_run.completed",
-            eventId: randomUUID(),
-            sequence,
-            output: { role: "assistant", text: output },
-          };
-          await store.completeAgentRun(message.agentRunId, output, completedEvent);
-          sendEvent(socket, completedEvent);
+          if (!finished) {
+            throw new Error("The Agent Run exceeded the maximum of 8 Provider steps.");
+          }
         } catch (error) {
           const run = activeRuns.get(message.agentRunId);
           if (controller.signal.aborted) {

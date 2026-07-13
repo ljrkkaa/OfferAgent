@@ -49,6 +49,48 @@ export interface AgentRunRecord {
   status: AgentRunStatus;
 }
 
+export type LocalToolName = "vault_list" | "vault_read";
+
+export type VaultToolErrorCode =
+  | "invalid_path"
+  | "not_found"
+  | "plugin_disconnected"
+  | "request_too_large"
+  | "tool_error";
+
+export interface VaultListResult {
+  entries: Array<{
+    contentHash: string;
+    modifiedVersion: string;
+    path: string;
+  }>;
+  truncated: boolean;
+  type: "vault_list";
+}
+
+export interface VaultReadResult {
+  content: string;
+  contentHash: string;
+  lineEnd: number;
+  lineStart: number;
+  modifiedVersion: string;
+  path: string;
+  truncated: boolean;
+  type: "vault_read";
+}
+
+export type LocalToolResultPayload =
+  | { ok: true; value: VaultListResult | VaultReadResult }
+  | { ok: false; error: { code: VaultToolErrorCode; message: string } };
+
+export interface ToolCallRecord {
+  agentRunId: string;
+  arguments: unknown;
+  id: string;
+  name: LocalToolName;
+  status: "completed" | "failed" | "requested";
+}
+
 interface ConversationCommandBase {
   agentRunId: string;
   conversationId: string;
@@ -87,6 +129,7 @@ export type ConversationEvent =
       conversation: ConversationSummary;
       messages: ConversationMessage[];
       agentRuns: AgentRunRecord[];
+      toolCalls: ToolCallRecord[];
     })
   | (ConversationCommandBase & {
       type: "conversation.updated";
@@ -133,6 +176,17 @@ export interface DurableEventAck {
   type: "event.ack";
 }
 
+export interface ToolResultCommand {
+  agentRunId: string;
+  conversationId: string;
+  eventId: string;
+  protocolVersion: typeof PROTOCOL_VERSION;
+  result: LocalToolResultPayload;
+  sequence: number;
+  toolCallId: string;
+  type: "tool_result";
+}
+
 interface AgentRunEventBase {
   agentRunId: string;
   conversationId: string;
@@ -146,6 +200,18 @@ export type AgentRunEvent =
   | (AgentRunEventBase & { type: "agent_run.delta"; delta: string })
   | (AgentRunEventBase & { type: "agent_run.cancelled" })
   | (AgentRunEventBase & { type: "agent_run.interrupted" })
+  | (AgentRunEventBase & {
+      type: "tool_call.requested";
+      toolCallId: string;
+      tool: { arguments: unknown; kind: "local"; name: LocalToolName };
+    })
+  | (AgentRunEventBase & {
+      type: "tool_call.completed";
+      toolCallId: string;
+      tool: { kind: "local"; name: LocalToolName };
+      status: "completed" | "failed";
+      error?: { code: VaultToolErrorCode; message: string };
+    })
   | (AgentRunEventBase & {
       type: "agent_run.completed";
       output: { role: "assistant"; text: string };

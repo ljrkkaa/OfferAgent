@@ -2,9 +2,26 @@ import { readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { ModelDescriptor } from "@offeragent/protocol";
+import type { LocalToolName, ModelDescriptor } from "@offeragent/protocol";
 import { EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
-import { ModelProviderError, type ModelProvider, type ModelRequest } from "./model-provider";
+import {
+  MAX_LOCAL_TOOL_ARGUMENT_BYTES,
+  ModelProviderError,
+  type ModelConversationItem,
+  type ModelProvider,
+  type ModelRequest,
+  type ModelStreamEvent,
+} from "./model-provider";
+
+function boundedToolArguments(encoded: string): string {
+  if (Buffer.byteLength(encoded, "utf8") > MAX_LOCAL_TOOL_ARGUMENT_BYTES) {
+    throw new ModelProviderError(
+      "provider_error",
+      `Codex local tool arguments exceed ${MAX_LOCAL_TOOL_ARGUMENT_BYTES} UTF-8 bytes.`,
+    );
+  }
+  return encoded;
+}
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CLIENT_VERSION = "0.135.0";
@@ -141,7 +158,7 @@ export class CodexSubscriptionProvider implements ModelProvider {
     return models;
   }
 
-  async *stream(request: ModelRequest): AsyncIterable<string> {
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     const response = await this.#request(
       `${this.#baseUrl}/responses`,
       {
@@ -156,12 +173,15 @@ export class CodexSubscriptionProvider implements ModelProvider {
           model: request.model,
           instructions:
             "You are OfferAgent, an interview preparation assistant. Answer the user's request directly and clearly.",
-          input: [
-            {
-              role: "user",
-              content: [{ type: "input_text", text: request.input }],
-            },
-          ],
+          input: request.input.map(encodeConversationItem),
+          tools: request.tools.map((tool) => ({
+            type: "function",
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+            strict: false,
+          })),
+          tool_choice: "auto",
           reasoning: { effort: "low", summary: "auto" },
           store: false,
           stream: true,
@@ -184,6 +204,7 @@ export class CodexSubscriptionProvider implements ModelProvider {
     const decoder = new TextDecoder();
     let buffer = "";
     let completed = false;
+    const functionArguments = new Map<string, string>();
     try {
       for await (const chunk of response.body) {
         buffer += decoder.decode(chunk, { stream: true });
@@ -206,7 +227,50 @@ export class CodexSubscriptionProvider implements ModelProvider {
               );
             }
             if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
-              yield event.delta;
+              yield { type: "output_text.delta", delta: event.delta };
+            } else if (
+              event.type === "response.function_call_arguments.delta" &&
+              typeof event.item_id === "string" &&
+              typeof event.delta === "string"
+            ) {
+              functionArguments.set(
+                event.item_id,
+                boundedToolArguments(`${functionArguments.get(event.item_id) ?? ""}${event.delta}`),
+              );
+            } else if (event.type === "response.output_item.done") {
+              const item = event.item;
+              if (item && typeof item === "object") {
+                const call = item as Record<string, unknown>;
+                if (
+                  call.type === "function_call" &&
+                  typeof call.call_id === "string" &&
+                  isLocalToolName(call.name)
+                ) {
+                  const encodedArguments = boundedToolArguments(
+                    typeof call.arguments === "string"
+                      ? call.arguments
+                      : typeof call.id === "string"
+                        ? functionArguments.get(call.id) ?? "{}"
+                        : "{}",
+                  );
+                  let arguments_: unknown;
+                  try {
+                    arguments_ = JSON.parse(encodedArguments);
+                  } catch (error) {
+                    throw new ModelProviderError(
+                      "provider_error",
+                      "Codex returned invalid local tool arguments.",
+                      { cause: error },
+                    );
+                  }
+                  yield {
+                    type: "local_tool_call",
+                    callId: call.call_id,
+                    name: call.name,
+                    arguments: arguments_,
+                  };
+                }
+              }
             } else if (event.type === "response.completed") {
               completed = true;
             } else if (
@@ -344,4 +408,30 @@ export class CodexSubscriptionProvider implements ModelProvider {
       `Codex could not complete the request (HTTP ${response.status}).`,
     );
   }
+}
+
+function isLocalToolName(value: unknown): value is LocalToolName {
+  return value === "vault_list" || value === "vault_read";
+}
+
+function encodeConversationItem(item: ModelConversationItem): Record<string, unknown> {
+  if (item.type === "user_message") {
+    return {
+      role: "user",
+      content: [{ type: "input_text", text: item.text }],
+    };
+  }
+  if (item.type === "local_tool_call") {
+    return {
+      type: "function_call",
+      call_id: item.callId,
+      name: item.name,
+      arguments: JSON.stringify(item.arguments),
+    };
+  }
+  return {
+    type: "function_call_output",
+    call_id: item.callId,
+    output: JSON.stringify(item.result),
+  };
 }

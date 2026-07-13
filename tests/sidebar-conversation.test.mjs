@@ -44,12 +44,24 @@ test("the Sidebar selects a model and renders a streamed Agent Run", async () =>
         conversation: { id: "conversation-a", title: "Conversation A", modelId: "model-a" },
         messages: [],
         agentRuns: [],
+        toolCalls: [],
       };
     },
     async *runAgent(request) {
       assert.equal(request.model, "model-b");
       assert.equal(request.input, "Tell me about yourself.");
       yield { type: "agent_run.started", model: request.model };
+      yield {
+        type: "tool_call.requested",
+        toolCallId: "sidebar-tool-call",
+        tool: { kind: "local", name: "vault_read", arguments: { path: "notes/a.md" } },
+      };
+      yield {
+        type: "tool_call.completed",
+        toolCallId: "sidebar-tool-call",
+        tool: { kind: "local", name: "vault_read" },
+        status: "completed",
+      };
       yield { type: "agent_run.delta", delta: "Strong " };
       yield { type: "agent_run.delta", delta: "answer" };
       yield { type: "agent_run.completed", output: { role: "assistant", text: "Strong answer" } };
@@ -77,6 +89,15 @@ test("the Sidebar selects a model and renders a streamed Agent Run", async () =>
     { role: "assistant", text: "Strong answer" },
   ]);
   assert.equal(final.conversation.agentRuns.at(-1).status, "completed");
+  assert.deepEqual(final.conversation.toolCalls, [
+    {
+      id: "sidebar-tool-call",
+      agentRunId: final.conversation.agentRuns.at(-1).id,
+      name: "vault_read",
+      arguments: { path: "notes/a.md" },
+      status: "completed",
+    },
+  ]);
   assert.ok(
     observed.some(
       (viewModel) =>
@@ -225,6 +246,11 @@ test("stopping an active Sidebar run makes it visibly cancelled", async () => {
     },
     async *runAgent(request) {
       yield { type: "agent_run.started", model: request.model };
+      yield {
+        type: "tool_call.requested",
+        toolCallId: "cancelled-sidebar-tool",
+        tool: { kind: "local", name: "vault_read", arguments: { path: "notes/slow.md" } },
+      };
       await cancelled;
       yield { type: "agent_run.cancelled" };
     },
@@ -242,6 +268,7 @@ test("stopping an active Sidebar run makes it visibly cancelled", async () => {
 
   assert.equal(cancelledRequest.conversationId, "conversation-stop");
   assert.equal(controller.getViewModel().conversation.agentRuns.at(-1).status, "cancelled");
+  assert.equal(controller.getViewModel().conversation.toolCalls.at(-1).status, "failed");
   assert.deepEqual(controller.getViewModel().conversation.messages, [
     { role: "user", text: "Cancel this run." },
   ]);

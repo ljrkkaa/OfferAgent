@@ -6,6 +6,7 @@ import type {
   ConversationSummary,
   ModelDescriptor,
   ProviderErrorCode,
+  ToolCallRecord,
 } from "@offeragent/protocol";
 import { RuntimeRequestError, type RuntimeClient } from "./runtime-supervisor";
 
@@ -21,6 +22,7 @@ export interface SidebarViewModel {
     models: ModelDescriptor[];
     runState: "idle" | "streaming";
     selectedModelId?: string;
+    toolCalls: ToolCallRecord[];
   };
   runtime: {
     message?: string;
@@ -42,6 +44,7 @@ export class SidebarController {
       messages: [],
       models: [],
       runState: "idle",
+      toolCalls: [],
     },
     runtime: { state: "idle" },
   };
@@ -92,6 +95,7 @@ export class SidebarController {
           messages:
             snapshot?.messages.map(({ role, text }) => ({ role, text })) ?? [],
           agentRuns: snapshot?.agentRuns ?? [],
+          toolCalls: snapshot?.toolCalls ?? [],
           error: undefined,
         });
       } catch (error) {
@@ -127,6 +131,7 @@ export class SidebarController {
       messages: [],
       runState: "idle",
       selectedModelId: conversation.modelId,
+      toolCalls: [],
       error: undefined,
     });
   }
@@ -143,6 +148,7 @@ export class SidebarController {
       messages: snapshot.messages.map(({ role, text }) => ({ role, text })),
       runState: "idle",
       selectedModelId: snapshot.conversation.modelId,
+      toolCalls: snapshot.toolCalls ?? [],
       error: undefined,
     });
   }
@@ -164,6 +170,7 @@ export class SidebarController {
       conversations,
       messages: [],
       runState: "idle",
+      toolCalls: [],
       error: undefined,
     });
     if (conversations[0]) await this.openConversation(conversations[0].id);
@@ -245,6 +252,29 @@ export class SidebarController {
         } else if (event.type === "agent_run.completed") {
           messages[messages.length - 1] = event.output;
           this.#setRunStatus(agentRunId, "completed");
+        } else if (event.type === "tool_call.requested") {
+          this.#updateConversation({
+            ...this.#viewModel.conversation,
+            toolCalls: [
+              ...this.#viewModel.conversation.toolCalls,
+              {
+                id: event.toolCallId,
+                agentRunId,
+                name: event.tool.name,
+                arguments: event.tool.arguments,
+                status: "requested",
+              },
+            ],
+          });
+        } else if (event.type === "tool_call.completed") {
+          this.#updateConversation({
+            ...this.#viewModel.conversation,
+            toolCalls: this.#viewModel.conversation.toolCalls.map((call) =>
+              call.id === event.toolCallId
+                ? { ...call, status: event.status }
+                : call,
+            ),
+          });
         } else if (event.type === "agent_run.failed") {
           messages.pop();
           this.#updateConversation({
@@ -260,6 +290,7 @@ export class SidebarController {
             ...this.#viewModel.conversation,
             messages: [...messages],
             runState: "idle",
+            toolCalls: this.#terminalizedToolCalls(agentRunId),
             agentRuns: this.#runsWithStatus(
               agentRunId,
               event.type === "agent_run.cancelled" ? "cancelled" : "interrupted",
@@ -279,6 +310,7 @@ export class SidebarController {
         ...this.#viewModel.conversation,
         messages: [...messages],
         runState: "idle",
+        toolCalls: this.#terminalizedToolCalls(agentRunId),
         agentRuns: this.#runsWithStatus(agentRunId, "interrupted"),
         error: { code: "transport_error", message },
       });
@@ -312,6 +344,14 @@ export class SidebarController {
   ): AgentRunRecord[] {
     return this.#viewModel.conversation.agentRuns.map((run) =>
       run.id === agentRunId ? { ...run, status } : run,
+    );
+  }
+
+  #terminalizedToolCalls(agentRunId: string): ToolCallRecord[] {
+    return this.#viewModel.conversation.toolCalls.map((call) =>
+      call.agentRunId === agentRunId && call.status === "requested"
+        ? { ...call, status: "failed" }
+        : call,
     );
   }
 

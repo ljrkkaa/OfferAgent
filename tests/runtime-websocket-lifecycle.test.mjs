@@ -139,6 +139,36 @@ test("a consumed failed terminal event is durably acknowledged before iterator r
   database.close();
 });
 
+test("a missing connected Vault executor returns a typed tool error and the Run continues", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-tool-disconnected-"));
+  const supervisor = new RuntimeSupervisor({
+    nodeCandidates: [process.execPath],
+    parentPid: process.pid,
+    provider: "fake",
+    runtimePath: runtimeEntry,
+    statePath: path.join(temporaryDirectory, "state.db"),
+  });
+  t.after(async () => {
+    await supervisor.stop();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+
+  await supervisor.start();
+  const events = [];
+  for await (const event of supervisor.runAgent({
+    conversationId: "tool-disconnected-conversation",
+    agentRunId: "tool-disconnected-run",
+    model: "fake-interview-model",
+    input: "vault_read notes/a.md",
+  })) {
+    events.push(event);
+  }
+  const toolResult = events.find((event) => event.type === "tool_call.completed");
+  assert.equal(toolResult.status, "failed");
+  assert.equal(toolResult.error.code, "plugin_disconnected");
+  assert.equal(events.at(-1).type, "agent_run.completed");
+});
+
 test("returning one Agent Run iterator cancels only that run", async (t) => {
   connectionCount = 0;
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-iterator-cancel-"));
@@ -212,4 +242,69 @@ test("returning one Agent Run iterator cancels only that run", async (t) => {
   }
   assert.equal(secondEvents.at(-1)?.type, "agent_run.completed");
   assert.equal(connectionCount, 1);
+});
+
+test("cancelling during a delayed Vault tool call ignores its late result and terminalizes the call", async (t) => {
+  connectionCount = 0;
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-tool-cancel-"));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  let releaseTool;
+  const delayedResult = new Promise((resolve) => (releaseTool = resolve));
+  const supervisor = new RuntimeSupervisor({
+    nodeCandidates: [process.execPath],
+    parentPid: process.pid,
+    provider: "fake",
+    runtimePath: runtimeEntry,
+    statePath,
+    toolExecutor: { execute: async () => delayedResult },
+  });
+  t.after(async () => {
+    await supervisor.stop();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+
+  await supervisor.start();
+  const iterator = supervisor
+    .runAgent({
+      conversationId: "tool-cancel-conversation",
+      agentRunId: "tool-cancel-run",
+      model: "fake-interview-model",
+      input: "vault_read notes/slow.md",
+    })
+    [Symbol.asyncIterator]();
+  assert.equal((await iterator.next()).value.type, "agent_run.started");
+  assert.equal((await iterator.next()).value.type, "tool_call.requested");
+  await iterator.return();
+  releaseTool({
+    ok: true,
+    value: {
+      type: "vault_read",
+      path: "notes/slow.md",
+      lineStart: 1,
+      lineEnd: 1,
+      modifiedVersion: "mtime:1:size:4",
+      contentHash: "sha256:slow",
+      content: "slow",
+      truncated: false,
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  await completeRun(supervisor, "after-tool-cancel");
+  assert.equal(connectionCount, 1);
+  await supervisor.stop();
+
+  const SQL = await initSqlJs();
+  const database = new SQL.Database(await readFile(statePath));
+  assert.deepEqual(
+    database.exec(
+      "SELECT status, error_code FROM tool_calls WHERE agent_run_id = 'tool-cancel-run'",
+    )[0].values,
+    [["failed", "tool_error"]],
+  );
+  assert.equal(
+    database.exec("SELECT status FROM agent_runs WHERE id = 'tool-cancel-run'")[0].values[0][0],
+    "cancelled",
+  );
+  database.close();
 });

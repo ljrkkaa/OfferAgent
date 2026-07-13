@@ -12,6 +12,7 @@ import {
   SidebarController,
   type SidebarViewModel,
 } from "./sidebar-controller";
+import { ObsidianVaultToolAdapter } from "./vault-tool-adapter";
 
 const SIDEBAR_VIEW_TYPE = "offeragent-sidebar";
 
@@ -144,6 +145,22 @@ class OfferAgentSidebarView extends ItemView {
       diagnostic.dataset.code = viewModel.conversation.error.code;
     }
 
+    if (viewModel.conversation.toolCalls.length > 0) {
+      const activities = container.createDiv({ cls: "offeragent-sidebar__tool-activities" });
+      for (const call of viewModel.conversation.toolCalls) {
+        const activity = activities.createEl("details", {
+          cls: "offeragent-sidebar__tool-activity",
+        });
+        activity.dataset.status = call.status;
+        activity.createEl("summary", {
+          text: `${call.name} · ${call.status}`,
+        });
+        activity.createEl("pre", {
+          text: JSON.stringify(call.arguments, null, 2),
+        });
+      }
+    }
+
     if (viewModel.conversation.agentRuns.length > 0) {
       const runList = container.createDiv({ cls: "offeragent-sidebar__run-list" });
       for (const [index, run] of viewModel.conversation.agentRuns.entries()) {
@@ -197,7 +214,10 @@ export default class OfferAgentPlugin extends Plugin {
 
     const runtimePath = this.#runtimePath();
     this.#controller = new SidebarController(
-      new RuntimeSupervisor({ runtimePath }),
+      new RuntimeSupervisor({
+        runtimePath,
+        toolExecutor: new ObsidianVaultToolAdapter(this.app.vault),
+      }),
     );
 
     this.registerView(

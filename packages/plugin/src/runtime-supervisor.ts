@@ -18,6 +18,7 @@ import {
   type ConversationMessage,
   type ConversationSummary,
   type DurableEventAck,
+  type LocalToolResultPayload,
   type ModelDescriptor,
   type ProviderErrorCode,
   type RuntimeError,
@@ -25,6 +26,8 @@ import {
   type RuntimeHealth,
   type RuntimeModels,
   type RuntimeShutdown,
+  type ToolCallRecord,
+  type ToolResultCommand,
 } from "@offeragent/protocol";
 
 const NODE_DIAGNOSTIC =
@@ -37,6 +40,13 @@ export interface RuntimeSupervisorOptions {
   runtimePath: string;
   statePath?: string;
   startupTimeoutMs?: number;
+  toolExecutor?: LocalToolExecutor;
+}
+
+export interface LocalToolExecutor {
+  execute(
+    call: Extract<AgentRunEvent, { type: "tool_call.requested" }>,
+  ): Promise<LocalToolResultPayload>;
 }
 
 export interface AgentRunRequest {
@@ -50,6 +60,7 @@ export interface ConversationSnapshot {
   agentRuns: AgentRunRecord[];
   conversation: ConversationSummary;
   messages: ConversationMessage[];
+  toolCalls: ToolCallRecord[];
 }
 
 export interface RuntimeClient {
@@ -138,6 +149,8 @@ function isAgentRunEventEnvelope(value: unknown): value is AgentRunEvent {
       "agent_run.interrupted",
       "agent_run.completed",
       "agent_run.failed",
+      "tool_call.requested",
+      "tool_call.completed",
     ].includes(event.type) &&
     event.protocolVersion === PROTOCOL_VERSION &&
     typeof event.eventId === "string" &&
@@ -327,6 +340,7 @@ export class RuntimeSupervisor implements RuntimeClient {
   readonly #options: Required<
     Pick<RuntimeSupervisorOptions, "parentPid" | "provider" | "runtimePath" | "startupTimeoutMs">
   > & { nodeCandidates: string[]; statePath?: string };
+  readonly #toolExecutor?: LocalToolExecutor;
   readonly #unavailableSubscribers = new Set<UnavailableSubscriber>();
   #child?: RuntimeChild;
   #connection?: RuntimeConnection;
@@ -352,6 +366,7 @@ export class RuntimeSupervisor implements RuntimeClient {
       statePath: options.statePath,
       startupTimeoutMs: options.startupTimeoutMs ?? 10_000,
     };
+    this.#toolExecutor = options.toolExecutor;
   }
 
   onUnavailable(subscriber: UnavailableSubscriber): () => void {
@@ -487,6 +502,7 @@ export class RuntimeSupervisor implements RuntimeClient {
       conversation: event.conversation,
       messages: event.messages,
       agentRuns: event.agentRuns,
+      toolCalls: event.toolCalls,
     };
     this.#reconcileConversationEvents(conversationId);
     return snapshot;
@@ -747,6 +763,9 @@ export class RuntimeSupervisor implements RuntimeClient {
       channel.events.push(event);
       channel.wake?.();
       channel.wake = undefined;
+      if (event.type === "tool_call.requested") {
+        void this.#executeLocalTool(socket, event);
+      }
     });
     socket.once("error", (error) => {
       this.#handleEventSocketFailure(
@@ -776,6 +795,44 @@ export class RuntimeSupervisor implements RuntimeClient {
       sequence: event.sequence,
     };
     socket.send(JSON.stringify(acknowledgement));
+  }
+
+  async #executeLocalTool(
+    socket: WebSocket,
+    event: Extract<AgentRunEvent, { type: "tool_call.requested" }>,
+  ): Promise<void> {
+    let result: LocalToolResultPayload;
+    try {
+      result = this.#toolExecutor
+        ? await this.#toolExecutor.execute(event)
+        : {
+            ok: false,
+            error: {
+              code: "plugin_disconnected",
+              message: "The connected Obsidian plugin has no Vault tool executor.",
+            },
+          };
+    } catch (error) {
+      result = {
+        ok: false,
+        error: {
+          code: "tool_error",
+          message: error instanceof Error ? error.message : "The Vault tool failed.",
+        },
+      };
+    }
+    if (this.#eventSocket !== socket || socket.readyState !== WebSocket.OPEN) return;
+    const command: ToolResultCommand = {
+      type: "tool_result",
+      protocolVersion: PROTOCOL_VERSION,
+      eventId: randomUUID(),
+      conversationId: event.conversationId,
+      agentRunId: event.agentRunId,
+      sequence: event.sequence,
+      toolCallId: event.toolCallId,
+      result,
+    };
+    socket.send(JSON.stringify(command));
   }
 
   #reconcileConversationEvents(conversationId: string): void {
