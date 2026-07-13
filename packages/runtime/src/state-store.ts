@@ -11,10 +11,43 @@ import {
   type LocalToolResultPayload,
   type ProviderErrorCode,
   type ToolCallRecord,
+  type VaultChangeJournalRecord,
+  type VaultChangeTargetResult,
+  type VaultChangeTransactionState,
 } from "@offeragent/protocol";
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.js";
 
-const CURRENT_SCHEMA_VERSION = 6;
+const CURRENT_SCHEMA_VERSION = 7;
+
+function persistedToolArguments(name: ToolCallRecord["name"], arguments_: unknown): unknown {
+  if (name !== "vault_propose_changes" || !arguments_ || typeof arguments_ !== "object") {
+    return arguments_;
+  }
+  const proposal = arguments_ as {
+    actions?: unknown[];
+    batchId?: unknown;
+    idempotencyKey?: unknown;
+    task?: unknown;
+  };
+  return {
+    batchId: proposal.batchId,
+    idempotencyKey: proposal.idempotencyKey,
+    task: proposal.task,
+    actions: Array.isArray(proposal.actions)
+      ? proposal.actions.map((candidate) => {
+          if (!candidate || typeof candidate !== "object") return {};
+          const action = candidate as Record<string, unknown>;
+          return {
+            actionId: action.actionId,
+            idempotencyKey: action.idempotencyKey,
+            operation: action.operation,
+            path: action.path,
+            expectedVersion: action.expectedVersion,
+          };
+        })
+      : [],
+  };
+}
 
 const MIGRATIONS = [
   {
@@ -299,6 +332,43 @@ const MIGRATIONS = [
       );
       CREATE INDEX vault_change_batches_by_run
         ON vault_change_batches(agent_run_id, created_at);
+    `,
+  },
+  {
+    version: 7,
+    sql: `
+      CREATE TABLE vault_change_batches_v7 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        task TEXT NOT NULL,
+        target_paths_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+          'pending', 'applying', 'applied', 'rejected', 'failed', 'rolled_back',
+          'recovery_failed', 'undone', 'expired'
+        )),
+        checkpoint_ref TEXT,
+        before_hashes_json TEXT,
+        after_hashes_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO vault_change_batches_v7
+        (id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+         target_paths_json, state, checkpoint_ref, before_hashes_json,
+         after_hashes_json, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+             target_paths_json, state, checkpoint_ref, NULL,
+             after_hashes_json, created_at, updated_at
+      FROM vault_change_batches;
+      DROP TABLE vault_change_batches;
+      ALTER TABLE vault_change_batches_v7 RENAME TO vault_change_batches;
+      CREATE INDEX vault_change_batches_by_run
+        ON vault_change_batches(agent_run_id, created_at);
+      CREATE INDEX vault_change_batches_by_state
+        ON vault_change_batches(state, updated_at);
     `,
   },
 ] as const;
@@ -587,7 +657,7 @@ export class RuntimeStateStore {
           run.conversationId,
           agentRunId,
           event.tool.name,
-          JSON.stringify(event.tool.arguments),
+          JSON.stringify(persistedToolArguments(event.tool.name, event.tool.arguments)),
           timestamp,
           timestamp,
         ],
@@ -614,8 +684,8 @@ export class RuntimeStateStore {
           this.#database.run(
             `INSERT INTO vault_change_batches
               (id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
-               proposal_json, target_paths_json, state, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+               target_paths_json, state, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
             [
               proposal.batchId,
               run.conversationId,
@@ -623,7 +693,6 @@ export class RuntimeStateStore {
               event.toolCallId,
               proposal.idempotencyKey,
               proposal.task,
-              JSON.stringify(event.tool.arguments),
               JSON.stringify(proposal.actions.map((action) => action.path)),
               timestamp,
               timestamp,
@@ -631,9 +700,150 @@ export class RuntimeStateStore {
           );
         }
       }
-      this.#recordEvent(event);
+      this.#recordEvent(
+        event.tool.name === "vault_propose_changes"
+          ? {
+              ...event,
+              tool: {
+                ...event.tool,
+                arguments: persistedToolArguments(event.tool.name, event.tool.arguments),
+              },
+            }
+          : event,
+      );
       this.#touchConversation(run.conversationId, timestamp);
     });
+  }
+
+  async markVaultChangeApplying(
+    batchId: string,
+    checkpointRef: string,
+    targets: VaultChangeTargetResult[],
+  ): Promise<void> {
+    await this.#write(() => {
+      const row = firstRow(
+        this.#database,
+        `SELECT state, target_paths_json, checkpoint_ref, before_hashes_json, after_hashes_json
+         FROM vault_change_batches WHERE id = ?`,
+        [batchId],
+      );
+      if (!row) throw new Error(`Vault Change Batch '${batchId}' does not exist.`);
+      const targetPaths = JSON.stringify(targets.map((target) => target.path));
+      if (row[1] !== targetPaths) {
+        throw new Error(`Vault Change Batch '${batchId}' target paths do not match its proposal.`);
+      }
+      const beforeHashes = JSON.stringify(
+        Object.fromEntries(targets.map((target) => [target.path, target.beforeHash])),
+      );
+      const afterHashes = JSON.stringify(
+        Object.fromEntries(targets.map((target) => [target.path, target.afterHash])),
+      );
+      if (row[0] === "applying") {
+        if (row[2] === checkpointRef && row[3] === beforeHashes && row[4] === afterHashes) return;
+        throw new Error(`Vault Change Batch '${batchId}' has conflicting applying metadata.`);
+      }
+      if (row[0] !== "pending") {
+        throw new Error(`Vault Change Batch '${batchId}' cannot enter applying from '${row[0]}'.`);
+      }
+      this.#database.run(
+        `UPDATE vault_change_batches
+         SET state = 'applying', checkpoint_ref = ?, before_hashes_json = ?,
+             after_hashes_json = ?, updated_at = ?
+         WHERE id = ? AND state = 'pending'`,
+        [checkpointRef, beforeHashes, afterHashes, now(), batchId],
+      );
+      if (this.#database.getRowsModified() !== 1) {
+        throw new Error(`Vault Change Batch '${batchId}' could not enter applying.`);
+      }
+    });
+  }
+
+  async markVaultChangeState(
+    batchId: string,
+    state: Extract<
+      VaultChangeTransactionState,
+      "applied" | "expired" | "recovery_failed" | "rolled_back" | "undone"
+    >,
+  ): Promise<void> {
+    await this.#write(() => {
+      const current = valueAt(
+        this.#database,
+        "SELECT state FROM vault_change_batches WHERE id = ?",
+        [batchId],
+      );
+      if (current === state) return;
+      const allowed =
+        (current === "applying" &&
+          (state === "applied" || state === "recovery_failed" || state === "rolled_back")) ||
+        (current === "applied" &&
+          (state === "expired" || state === "recovery_failed" || state === "undone"));
+      if (!allowed) {
+        throw new Error(`Vault Change Batch '${batchId}' cannot transition from '${current}' to '${state}'.`);
+      }
+      this.#database.run(
+        "UPDATE vault_change_batches SET state = ?, updated_at = ? WHERE id = ?",
+        [state, now(), batchId],
+      );
+    });
+  }
+
+  async listVaultChangeBatches(
+    states: VaultChangeTransactionState[],
+  ): Promise<VaultChangeJournalRecord[]> {
+    await this.#writeTail;
+    if (states.length === 0) return [];
+    const rows =
+      this.#database.exec(
+        `SELECT vault_change_batches.id, checkpoint_ref, vault_change_batches.state,
+                target_paths_json, before_hashes_json, after_hashes_json,
+                tool_calls.arguments_json
+         FROM vault_change_batches
+         JOIN tool_calls ON tool_calls.id = vault_change_batches.tool_call_id
+         WHERE vault_change_batches.state IN (${states.map(() => "?").join(", ")})
+         ORDER BY vault_change_batches.created_at, vault_change_batches.id`,
+        states as never,
+      )[0]?.values ?? [];
+    return rows.flatMap(
+      ([
+        batchId,
+        checkpointRef,
+        state,
+        targetPathsJson,
+        beforeHashesJson,
+        afterHashesJson,
+        argumentsJson,
+      ]) => {
+        if (!checkpointRef || !afterHashesJson) return [];
+        const paths = JSON.parse(targetPathsJson as string) as string[];
+        const beforeHashes = beforeHashesJson
+          ? JSON.parse(beforeHashesJson as string) as Record<string, string>
+          : {};
+        const afterHashes = JSON.parse(afterHashesJson as string) as Record<string, string>;
+        let operations = new Map<string, unknown>();
+        try {
+          const metadata = JSON.parse(argumentsJson as string) as {
+            actions?: Array<{ operation?: unknown; path?: unknown }>;
+          };
+          operations = new Map(
+            (metadata.actions ?? []).flatMap((action) =>
+              typeof action.path === "string" ? [[action.path, action.operation] as const] : [],
+            ),
+          );
+        } catch {
+          // Missing legacy metadata is handled conservatively during checkpoint reconciliation.
+        }
+        return [{
+          batchId: batchId as string,
+          checkpointRef: checkpointRef as string,
+          state: state as VaultChangeTransactionState,
+          targets: paths.map((path) => ({
+            path,
+            beforeHash: beforeHashes[path] ?? (operations.get(path) === "create" ? "missing" : ""),
+            afterHash: afterHashes[path],
+          })),
+        }];
+      },
+    );
   }
 
   async completeToolCall(
@@ -665,7 +875,8 @@ export class RuntimeStateStore {
         this.#database.run(
           `UPDATE vault_change_batches
            SET state = ?, checkpoint_ref = ?, after_hashes_json = ?, updated_at = ?
-           WHERE tool_call_id = ?`,
+           WHERE tool_call_id = ?
+             AND state IN ('pending', 'applying', 'applied', 'rejected')`,
           [
             result.value.decision,
             result.value.checkpointRef ?? null,
@@ -681,7 +892,7 @@ export class RuntimeStateStore {
       } else if (!result.ok) {
         this.#database.run(
           `UPDATE vault_change_batches SET state = 'failed', updated_at = ?
-           WHERE tool_call_id = ?`,
+           WHERE tool_call_id = ? AND state = 'pending'`,
           [timestamp, event.toolCallId],
         );
       }
@@ -801,6 +1012,7 @@ export class RuntimeStateStore {
         ...(batchState === "applied" || batchState === "rejected"
           ? { decision: batchState }
           : {}),
+        ...(batchState ? { vaultChangeState: batchState as VaultChangeTransactionState } : {}),
       })),
     };
   }
@@ -914,6 +1126,12 @@ export class RuntimeStateStore {
           agentRunId,
         ],
       );
+      this.#database.run(
+        `UPDATE vault_change_batches
+         SET state = 'failed', updated_at = ?
+         WHERE agent_run_id = ? AND state = 'pending'`,
+        [timestamp, agentRunId],
+      );
       this.#recordEvent(
         event ?? {
           type: status === "cancelled" ? "agent_run.cancelled" : "agent_run.interrupted",
@@ -997,6 +1215,7 @@ export class RuntimeStateStore {
       this.#database.run("BEGIN IMMEDIATE");
       try {
         this.#database.run(migration.sql);
+        if (migration.version === 7) this.#scrubPersistedVaultChangeArguments();
         const timestamp = now();
         this.#database.run(
           "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
@@ -1015,7 +1234,60 @@ export class RuntimeStateStore {
         throw error;
       }
     }
+    if (version < 7) this.#database.run("VACUUM");
     await this.#persist();
+  }
+
+  #scrubPersistedVaultChangeArguments(): void {
+    const rows =
+      this.#database.exec(
+        `SELECT id, arguments_json FROM tool_calls
+         WHERE name = 'vault_propose_changes'`,
+      )[0]?.values ?? [];
+    for (const [id, argumentsJson] of rows) {
+      let arguments_: unknown = {};
+      try {
+        arguments_ = JSON.parse(argumentsJson as string) as unknown;
+      } catch {
+        // Invalid legacy arguments stay represented as empty metadata, never raw source text.
+      }
+      this.#database.run(
+        "UPDATE tool_calls SET arguments_json = ? WHERE id = ?",
+        [JSON.stringify(persistedToolArguments("vault_propose_changes", arguments_)), id],
+      );
+    }
+    const events =
+      this.#database.exec(
+        `SELECT id, payload_json FROM durable_events
+         WHERE event_type = 'tool_call.requested'`,
+      )[0]?.values ?? [];
+    for (const [id, payloadJson] of events) {
+      try {
+        const event = JSON.parse(payloadJson as string) as Extract<
+          AgentRunEvent,
+          { type: "tool_call.requested" }
+        >;
+        if (event.tool?.name !== "vault_propose_changes") continue;
+        this.#database.run(
+          "UPDATE durable_events SET payload_json = ? WHERE id = ?",
+          [
+            JSON.stringify({
+              ...event,
+              tool: {
+                ...event.tool,
+                arguments: persistedToolArguments(event.tool.name, event.tool.arguments),
+              },
+            }),
+            id,
+          ],
+        );
+      } catch {
+        this.#database.run(
+          "UPDATE durable_events SET payload_json = '{}' WHERE id = ?",
+          [id],
+        );
+      }
+    }
   }
 
   #write<T>(operation: () => T): Promise<T> {

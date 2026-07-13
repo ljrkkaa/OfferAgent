@@ -9,7 +9,10 @@ import type {
   LocalToolResultPayload,
   VaultAction,
   VaultChangeBatchProposal,
+  VaultChangeJournalRecord,
   VaultChangeResult,
+  VaultChangeTargetResult,
+  VaultChangeTransactionState,
   VaultToolErrorCode,
   VaultUndoResultPayload,
 } from "@offeragent/protocol";
@@ -35,8 +38,26 @@ export interface VaultChangeFileApi {
 }
 
 export interface CheckpointStore {
+  cleanup?(now?: Date): Promise<string[]>;
   create(batchId: string, existingPaths: string[]): Promise<string>;
   read(checkpointRef: string, vaultPath: string): Promise<string | undefined>;
+  verify?(checkpointRef: string): Promise<boolean>;
+}
+
+export interface VaultChangeJournal {
+  list(states: VaultChangeTransactionState[]): Promise<VaultChangeJournalRecord[]>;
+  markApplying(
+    batchId: string,
+    checkpointRef: string,
+    targets: VaultChangeTargetResult[],
+  ): Promise<void>;
+  markState(
+    batchId: string,
+    state: Extract<
+      VaultChangeTransactionState,
+      "applied" | "expired" | "recovery_failed" | "rolled_back" | "undone"
+    >,
+  ): Promise<void>;
 }
 
 interface PreparedAction {
@@ -59,9 +80,31 @@ interface PendingBatch {
   resolve(result: LocalToolResultPayload): void;
 }
 
-interface AppliedBatch {
-  checkpointRef: string;
-  prepared: PreparedBatch;
+type AppliedBatch = VaultChangeJournalRecord;
+
+const NOOP_JOURNAL: VaultChangeJournal = {
+  async list() {
+    return [];
+  },
+  async markApplying() {},
+  async markState() {},
+};
+
+export class VaultChangeCrashInjectionError extends Error {
+  constructor(point: string) {
+    super(`Injected Vault Change crash after '${point}'.`);
+    this.name = "VaultChangeCrashInjectionError";
+  }
+}
+
+class VaultChangeRestoreError extends Error {
+  readonly rollbackFailed: boolean;
+
+  constructor(message: string, rollbackFailed: boolean) {
+    super(message);
+    this.name = "VaultChangeRestoreError";
+    this.rollbackFailed = rollbackFailed;
+  }
 }
 
 function failure(code: VaultToolErrorCode, message: string): Failure {
@@ -70,6 +113,24 @@ function failure(code: VaultToolErrorCode, message: string): Failure {
 
 function digest(content: string): string {
   return `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
+}
+
+function conflictDiff(
+  vaultPath: string,
+  current: string | undefined,
+  before: string | undefined,
+): string {
+  const currentLines = (current ?? "").split(/\r?\n/).slice(0, 100);
+  const beforeLines = (before ?? "").split(/\r?\n/).slice(0, 100);
+  const lines = [
+    `--- current/${vaultPath}`,
+    `+++ checkpoint/${vaultPath}`,
+    "@@ guarded undo @@",
+    ...currentLines.map((line) => `-${line}`),
+    ...beforeLines.map((line) => `+${line}`),
+  ];
+  const diff = lines.join("\n");
+  return diff.length <= 16_384 ? diff : `${diff.slice(0, 16_370)}\n...truncated`;
 }
 
 function isFailure(value: PreparedBatch | Failure): value is Failure {
@@ -200,6 +261,47 @@ export class GitCheckpointStore implements CheckpointStore {
     }
     return gitCommand(this.#root, ["show", `${checkpointRef}:${vaultPath}`], process.env, false);
   }
+
+  async verify(checkpointRef: string): Promise<boolean> {
+    const match = /^refs\/offeragent\/checkpoints\/([A-Za-z0-9][A-Za-z0-9_-]{0,127})$/.exec(
+      checkpointRef,
+    );
+    if (!match) return false;
+    try {
+      await gitCommand(this.#root, ["cat-file", "-e", `${checkpointRef}^{commit}`]);
+      const subject = await gitCommand(this.#root, ["log", "-1", "--format=%s", checkpointRef]);
+      return subject === `OfferAgent checkpoint ${match[1]}`;
+    } catch {
+      return false;
+    }
+  }
+
+  async cleanup(now = new Date()): Promise<string[]> {
+    const output = await gitCommand(this.#root, [
+      "for-each-ref",
+      "--format=%(refname)%09%(creatordate:unix)",
+      "refs/offeragent/checkpoints/",
+    ]);
+    const entries = output
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => {
+        const [ref, timestamp] = line.split("\t");
+        return { ref, timestamp: Number(timestamp) * 1_000 };
+      })
+      .sort((left, right) => right.timestamp - left.timestamp || left.ref.localeCompare(right.ref));
+    const cutoff = now.getTime() - 30 * 24 * 60 * 60 * 1_000;
+    const deleted = entries
+      .filter(
+        (entry, index) =>
+          index >= 100 || !Number.isFinite(entry.timestamp) || entry.timestamp < cutoff,
+      )
+      .map((entry) => entry.ref);
+    for (const checkpointRef of deleted) {
+      await gitCommand(this.#root, ["update-ref", "-d", checkpointRef]);
+    }
+    return deleted;
+  }
 }
 
 export class ObsidianVaultChangeFileApi implements VaultChangeFileApi {
@@ -259,13 +361,22 @@ export class VaultChangeCoordinator {
   readonly #applied = new Map<string, AppliedBatch>();
   readonly #cancelled = new Set<string>();
   readonly #checkpoints: CheckpointStore;
+  readonly #injectCrash: (point: string) => Promise<void> | void;
+  readonly #journal: VaultChangeJournal;
   readonly #pending = new Map<string, PendingBatch>();
   readonly #preparing = new Map<string, Promise<Failure | PreparedBatch>>();
   readonly #vault: VaultChangeFileApi;
 
-  constructor(vault: VaultChangeFileApi, checkpoints: CheckpointStore) {
+  constructor(
+    vault: VaultChangeFileApi,
+    checkpoints: CheckpointStore,
+    journal: VaultChangeJournal = NOOP_JOURNAL,
+    injectCrash: (point: string) => Promise<void> | void = () => {},
+  ) {
     this.#vault = vault;
     this.#checkpoints = checkpoints;
+    this.#journal = journal;
+    this.#injectCrash = injectCrash;
   }
 
   async execute(event: ChangeToolCall): Promise<LocalToolResultPayload> {
@@ -331,50 +442,142 @@ export class VaultChangeCoordinator {
 
   async undo(batchId: string): Promise<VaultUndoResultPayload> {
     const applied = this.#applied.get(batchId);
-    if (!applied) return failure("not_found", `Applied Vault Change Batch '${batchId}' was not found.`);
-    const current = new Map<string, string>();
-    for (const prepared of applied.prepared.actions) {
-      const file = await this.#vault.read(prepared.action.path);
-      if (!file || digest(file.content) !== prepared.afterHash) {
-        return failure(
-          "undo_conflict",
-          `Vault file '${prepared.action.path}' changed after the batch was applied.`,
-        );
-      }
-      current.set(prepared.action.path, file.content);
+    if (!applied) {
+      return failure("not_found", `Applied Vault Change Batch '${batchId}' was not found.`);
     }
-    const restored = new Map<string, string | undefined>();
-    for (const prepared of applied.prepared.actions) {
-      restored.set(
-        prepared.action.path,
-        await this.#checkpoints.read(applied.checkpointRef, prepared.action.path),
-      );
+    const current = await this.#readCurrent(applied.targets);
+    const checkpoint = await this.#readCheckpoint(applied);
+    const conflicts = applied.targets.flatMap((target) => {
+      const content = current.get(target.path);
+      const currentHash = content === undefined ? "missing" : digest(content);
+      if (currentHash === target.afterHash) return [];
+      return [{
+        path: target.path,
+        appliedHash: target.afterHash,
+        currentHash,
+        diff: conflictDiff(target.path, content, checkpoint?.get(target.path)),
+      }];
+    });
+    if (conflicts.length > 0) {
+      return {
+        ok: false,
+        error: {
+          code: "undo_conflict",
+          message: "One or more Vault files changed after the batch was applied.",
+          conflicts,
+        },
+      };
     }
-    const changed: string[] = [];
+    if (!checkpoint) {
+      return failure("tool_error", `Git Checkpoint '${applied.checkpointRef}' is missing or damaged.`);
+    }
     try {
-      for (const prepared of applied.prepared.actions) {
-        const vaultPath = prepared.action.path;
-        const before = restored.get(vaultPath);
-        if (before === undefined) await this.#vault.remove(vaultPath);
-        else await this.#vault.modify(vaultPath, before);
-        changed.push(vaultPath);
-      }
+      await this.#restoreContents(applied.targets, checkpoint, current);
     } catch (error) {
-      for (const vaultPath of changed.reverse()) {
-        const postApplication = current.get(vaultPath);
-        if (postApplication !== undefined) {
-          const existing = await this.#vault.read(vaultPath);
-          if (existing) await this.#vault.modify(vaultPath, postApplication);
-          else await this.#vault.create(vaultPath, postApplication);
+      if (error instanceof VaultChangeRestoreError && error.rollbackFailed) {
+        try {
+          await this.#markStateWithRetry(batchId, "recovery_failed");
+        } catch {
+          // The mixed file state is still reported; startup will retry journal reconciliation.
         }
+        this.#applied.delete(batchId);
       }
       return failure(
         "tool_error",
-        error instanceof Error ? error.message : "Vault Change undo failed and was rolled back.",
+        error instanceof Error ? error.message : "Vault Change undo failed.",
+      );
+    }
+    try {
+      await this.#markStateWithRetry(batchId, "undone");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Vault Change undo failed.";
+      return failure(
+        "tool_error",
+        `${message} Vault files were restored; startup recovery will confirm the journal state.`,
       );
     }
     this.#applied.delete(batchId);
     return { ok: true, value: { type: "vault_change_undo", batchId, status: "undone" } };
+  }
+
+  async reconcile(): Promise<Array<{ batchId: string; state: VaultChangeTransactionState }>> {
+    const persisted = await this.#journal.list(["applying", "applied"]);
+    const outcomes: Array<{ batchId: string; state: VaultChangeTransactionState }> = [];
+    const records: VaultChangeJournalRecord[] = [];
+    for (const record of persisted) {
+      const normalized = await this.#normalizeLegacyRecord(record);
+      if (normalized) {
+        records.push(normalized);
+        continue;
+      }
+      const state = record.state === "applied" ? "expired" : "recovery_failed";
+      await this.#markStateWithRetry(record.batchId, state);
+      outcomes.push({ batchId: record.batchId, state });
+    }
+    for (const record of records.filter((candidate) => candidate.state === "applied")) {
+      const checkpoint = await this.#readCheckpoint(record);
+      if (!checkpoint) {
+        await this.#markStateWithRetry(record.batchId, "expired");
+        outcomes.push({ batchId: record.batchId, state: "expired" });
+        continue;
+      }
+      const current = await this.#readCurrent(record.targets);
+      const hashes = record.targets.map((target) => {
+        const content = current.get(target.path);
+        return content === undefined ? "missing" : digest(content);
+      });
+      if (hashes.every((hash, index) => hash === record.targets[index].afterHash)) {
+        this.#applied.set(record.batchId, record);
+        outcomes.push({ batchId: record.batchId, state: "applied" });
+      } else if (hashes.every((hash, index) => hash === record.targets[index].beforeHash)) {
+        await this.#markStateWithRetry(record.batchId, "undone");
+        outcomes.push({ batchId: record.batchId, state: "undone" });
+      } else {
+        this.#applied.set(record.batchId, record);
+        outcomes.push({ batchId: record.batchId, state: "applied" });
+      }
+    }
+    for (const record of records.filter((candidate) => candidate.state === "applying")) {
+      const current = await this.#readCurrent(record.targets);
+      const hashes = record.targets.map((target) => {
+        const content = current.get(target.path);
+        return content === undefined ? "missing" : digest(content);
+      });
+      const allBefore = hashes.every((hash, index) => hash === record.targets[index].beforeHash);
+      if (allBefore) {
+        await this.#markStateWithRetry(record.batchId, "rolled_back");
+        outcomes.push({ batchId: record.batchId, state: "rolled_back" });
+        continue;
+      }
+      const checkpoint = await this.#readCheckpoint(record);
+      const knownState = hashes.every(
+        (hash, index) =>
+          hash === record.targets[index].beforeHash || hash === record.targets[index].afterHash,
+      );
+      if (!checkpoint || !knownState) {
+        await this.#markStateWithRetry(record.batchId, "recovery_failed");
+        outcomes.push({ batchId: record.batchId, state: "recovery_failed" });
+        continue;
+      }
+      const allAfter = hashes.every((hash, index) => hash === record.targets[index].afterHash);
+      if (allAfter) {
+        await this.#markStateWithRetry(record.batchId, "applied");
+        const applied = { ...record, state: "applied" as const };
+        this.#applied.set(record.batchId, applied);
+        outcomes.push({ batchId: record.batchId, state: "applied" });
+        continue;
+      }
+      try {
+        await this.#restoreContents(record.targets, checkpoint, current);
+        await this.#markStateWithRetry(record.batchId, "rolled_back");
+        outcomes.push({ batchId: record.batchId, state: "rolled_back" });
+      } catch {
+        await this.#markStateWithRetry(record.batchId, "recovery_failed");
+        outcomes.push({ batchId: record.batchId, state: "recovery_failed" });
+      }
+    }
+    await this.#cleanupCheckpoints(outcomes);
+    return outcomes;
   }
 
   async #finishDecision(
@@ -392,6 +595,7 @@ export class VaultChangeCoordinator {
             }
           : await this.#apply(pending.prepared);
     } catch (error) {
+      if (error instanceof VaultChangeCrashInjectionError) throw error;
       result = failure(
         "tool_error",
         error instanceof Error ? error.message : "The Vault Change Batch could not be applied.",
@@ -413,15 +617,19 @@ export class VaultChangeCoordinator {
       currentPreparation.proposal.batchId,
       existingPaths,
     );
+    const targets = this.#targets(currentPreparation);
+    await this.#journal.markApplying(currentPreparation.proposal.batchId, checkpointRef, targets);
+    await this.#injectCrash("applying");
     const changed: PreparedAction[] = [];
     try {
-      for (const prepared of currentPreparation.actions) {
+      for (const [index, prepared] of currentPreparation.actions.entries()) {
         if (prepared.beforeContent === undefined) {
           await this.#vault.create(prepared.action.path, prepared.afterContent);
         } else {
           await this.#vault.modify(prepared.action.path, prepared.afterContent);
         }
         changed.push(prepared);
+        await this.#injectCrash(`action:${index}`);
       }
       for (const prepared of currentPreparation.actions) {
         const applied = await this.#vault.read(prepared.action.path);
@@ -430,6 +638,7 @@ export class VaultChangeCoordinator {
         }
       }
     } catch (error) {
+      if (error instanceof VaultChangeCrashInjectionError) throw error;
       let rollbackError: unknown;
       for (const prepared of changed.reverse()) {
         try {
@@ -439,18 +648,173 @@ export class VaultChangeCoordinator {
           rollbackError ??= caught;
         }
       }
+      try {
+        await this.#journal.markState(
+          currentPreparation.proposal.batchId,
+          rollbackError ? "recovery_failed" : "rolled_back",
+        );
+      } catch (caught) {
+        rollbackError ??= caught;
+      }
       const message = error instanceof Error ? error.message : "Vault Change application failed.";
       const rollbackMessage = rollbackError instanceof Error ? ` Rollback failed: ${rollbackError.message}` : "";
       return failure("tool_error", `${message}${rollbackMessage}`);
     }
+    try {
+      await this.#markStateWithRetry(currentPreparation.proposal.batchId, "applied");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Vault Change journal update failed.";
+      return failure(
+        "tool_error",
+        `${message} Vault files were applied; startup recovery will confirm the journal state.`,
+      );
+    }
     this.#applied.set(currentPreparation.proposal.batchId, {
+      batchId: currentPreparation.proposal.batchId,
       checkpointRef,
-      prepared: currentPreparation,
+      state: "applied",
+      targets,
     });
+    try {
+      await this.#cleanupCheckpoints();
+    } catch {
+      // Retention is retried during startup reconciliation and every later successful apply.
+    }
+    await this.#injectCrash("applied");
     return {
       ok: true,
       value: this.#result(currentPreparation, "applied", checkpointRef),
     };
+  }
+
+  #targets(prepared: PreparedBatch): VaultChangeTargetResult[] {
+    return prepared.actions.map((item) => ({
+      path: item.action.path,
+      beforeHash: item.beforeHash,
+      afterHash: item.afterHash,
+    }));
+  }
+
+  async #readCurrent(targets: VaultChangeTargetResult[]): Promise<Map<string, string | undefined>> {
+    const current = new Map<string, string | undefined>();
+    for (const target of targets) {
+      current.set(target.path, (await this.#vault.read(target.path))?.content);
+    }
+    return current;
+  }
+
+  async #readCheckpoint(
+    record: Pick<VaultChangeJournalRecord, "checkpointRef" | "targets">,
+  ): Promise<Map<string, string | undefined> | undefined> {
+    if (this.#checkpoints.verify && !(await this.#checkpoints.verify(record.checkpointRef))) {
+      return undefined;
+    }
+    const contents = new Map<string, string | undefined>();
+    for (const target of record.targets) {
+      const content = await this.#checkpoints.read(record.checkpointRef, target.path);
+      const hash = content === undefined ? "missing" : digest(content);
+      if (hash !== target.beforeHash) return undefined;
+      contents.set(target.path, content);
+    }
+    return contents;
+  }
+
+  async #normalizeLegacyRecord(
+    record: VaultChangeJournalRecord,
+  ): Promise<VaultChangeJournalRecord | undefined> {
+    if (record.targets.every((target) => target.beforeHash)) return record;
+    if (this.#checkpoints.verify && !(await this.#checkpoints.verify(record.checkpointRef))) {
+      return undefined;
+    }
+    const targets: VaultChangeTargetResult[] = [];
+    for (const target of record.targets) {
+      if (target.beforeHash) {
+        targets.push(target);
+        continue;
+      }
+      const content = await this.#checkpoints.read(record.checkpointRef, target.path);
+      if (content === undefined) return undefined;
+      targets.push({ ...target, beforeHash: digest(content) });
+    }
+    return { ...record, targets };
+  }
+
+  async #markStateWithRetry(
+    batchId: string,
+    state: Extract<
+      VaultChangeTransactionState,
+      "applied" | "expired" | "recovery_failed" | "rolled_back" | "undone"
+    >,
+  ): Promise<void> {
+    try {
+      await this.#journal.markState(batchId, state);
+    } catch {
+      await this.#journal.markState(batchId, state);
+    }
+  }
+
+  async #cleanupCheckpoints(
+    outcomes?: Array<{ batchId: string; state: VaultChangeTransactionState }>,
+  ): Promise<void> {
+    const deleted = (await this.#checkpoints.cleanup?.()) ?? [];
+    if (deleted.length === 0) return;
+    const applied = await this.#journal.list(["applied"]);
+    for (const record of applied.filter((candidate) => deleted.includes(candidate.checkpointRef))) {
+      await this.#markStateWithRetry(record.batchId, "expired");
+      this.#applied.delete(record.batchId);
+      outcomes?.push({ batchId: record.batchId, state: "expired" });
+    }
+  }
+
+  async #restoreContents(
+    targets: VaultChangeTargetResult[],
+    desired: Map<string, string | undefined>,
+    rollback: Map<string, string | undefined>,
+    expectedHash: "afterHash" | "beforeHash" = "beforeHash",
+  ): Promise<void> {
+    const changed: string[] = [];
+    try {
+      for (const target of targets) {
+        await this.#writeContent(target.path, desired.get(target.path));
+        changed.push(target.path);
+      }
+      const restored = await this.#readCurrent(targets);
+      for (const target of targets) {
+        const content = restored.get(target.path);
+        const hash = content === undefined ? "missing" : digest(content);
+        if (hash !== target[expectedHash]) {
+          throw new Error(`Vault file '${target.path}' did not match its recovered hash.`);
+        }
+      }
+    } catch (error) {
+      let rollbackError: unknown;
+      for (const vaultPath of changed.reverse()) {
+        try {
+          await this.#writeContent(vaultPath, rollback.get(vaultPath));
+        } catch (caught) {
+          rollbackError ??= caught;
+        }
+      }
+      const message = error instanceof Error ? error.message : "Vault Change recovery failed.";
+      if (rollbackError instanceof Error) {
+        throw new VaultChangeRestoreError(
+          `${message} Rollback failed: ${rollbackError.message}`,
+          true,
+        );
+      }
+      throw new VaultChangeRestoreError(message, false);
+    }
+  }
+
+  async #writeContent(vaultPath: string, content: string | undefined): Promise<void> {
+    const current = await this.#vault.read(vaultPath);
+    if (content === undefined) {
+      if (current) await this.#vault.remove(vaultPath);
+    } else if (current) {
+      await this.#vault.modify(vaultPath, content);
+    } else {
+      await this.#vault.create(vaultPath, content);
+    }
   }
 
   #result(

@@ -155,6 +155,49 @@ export interface VaultChangeTargetResult {
   path: string;
 }
 
+export type VaultChangeTransactionState =
+  | "applied"
+  | "applying"
+  | "expired"
+  | "failed"
+  | "pending"
+  | "recovery_failed"
+  | "rejected"
+  | "rolled_back"
+  | "undone";
+
+export interface VaultChangeJournalRecord {
+  batchId: string;
+  checkpointRef: string;
+  state: VaultChangeTransactionState;
+  targets: VaultChangeTargetResult[];
+}
+
+export interface VaultChangeApplyingRequest {
+  batchId: string;
+  checkpointRef: string;
+  targets: VaultChangeTargetResult[];
+}
+
+export interface VaultChangeStateRequest {
+  batchId: string;
+  state: Extract<
+    VaultChangeTransactionState,
+    "applied" | "expired" | "recovery_failed" | "rolled_back" | "undone"
+  >;
+}
+
+export interface RuntimeVaultChangeBatches {
+  batches: VaultChangeJournalRecord[];
+}
+
+export interface VaultUndoConflict {
+  appliedHash: string;
+  currentHash: string;
+  diff: string;
+  path: string;
+}
+
 export interface VaultChangeResult {
   batchId: string;
   checkpointRef?: string;
@@ -168,7 +211,14 @@ export type VaultUndoResultPayload =
       ok: true;
       value: { batchId: string; status: "undone"; type: "vault_change_undo" };
     }
-  | { ok: false; error: { code: VaultToolErrorCode; message: string } };
+  | {
+      ok: false;
+      error: {
+        code: VaultToolErrorCode;
+        conflicts?: VaultUndoConflict[];
+        message: string;
+      };
+    };
 
 export type LocalToolResultPayload =
   | {
@@ -190,6 +240,7 @@ export interface ToolCallRecord {
   id: string;
   name: LocalToolName;
   status: "completed" | "failed" | "requested";
+  vaultChangeState?: VaultChangeTransactionState;
 }
 
 interface ConversationCommandBase {

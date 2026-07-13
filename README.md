@@ -25,6 +25,8 @@ The current implementation includes the product shell, durable Conversations, an
 - full-batch validation before confirmation and again before apply, with typed Apply all / Reject all results in the same Agent Run;
 - hidden Git checkpoints created through an isolated temporary index without changing HEAD, the current branch, or the user's index;
 - hash-guarded undo that refuses to overwrite later edits;
+- a metadata-only Runtime journal that persists `applying` before the first mutation and reconciles interrupted batches on startup;
+- restart-safe undo, bounded conflict diffs, and Git checkpoint retention capped at thirty days or one hundred recent batches;
 - compact expandable Vault tool activity in the Agent Sidebar.
 
 The Codex adapter reuses the login cache managed by Codex CLI/desktop. It does not require an

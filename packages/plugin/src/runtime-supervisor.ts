@@ -28,6 +28,11 @@ import {
   type RuntimeShutdown,
   type ToolCallRecord,
   type ToolResultCommand,
+  type VaultChangeApplyingRequest,
+  type VaultChangeJournalRecord,
+  type VaultChangeStateRequest,
+  type VaultChangeTransactionState,
+  type RuntimeVaultChangeBatches,
 } from "@offeragent/protocol";
 
 const NODE_DIAGNOSTIC =
@@ -285,15 +290,25 @@ function callRuntime<T>(
   connection: RuntimeConnection,
   method: "GET" | "POST",
   pathname: string,
+  body?: unknown,
 ): Promise<T> {
   return new Promise((resolve, reject) => {
+    const encodedBody = body === undefined ? undefined : JSON.stringify(body);
     const outgoing = request(
       {
         host: "127.0.0.1",
         port: connection.port,
         method,
         path: pathname,
-        headers: { authorization: `Bearer ${connection.token}` },
+        headers: {
+          authorization: `Bearer ${connection.token}`,
+          ...(encodedBody === undefined
+            ? {}
+            : {
+                "content-type": "application/json; charset=utf-8",
+                "content-length": Buffer.byteLength(encodedBody, "utf8"),
+              }),
+        },
       },
       (response) => {
         let body = "";
@@ -333,7 +348,7 @@ function callRuntime<T>(
     outgoing.setTimeout(2_000, () => {
       outgoing.destroy(new Error("OfferAgent Runtime request timed out."));
     });
-    outgoing.end();
+    outgoing.end(encodedBody);
   });
 }
 
@@ -474,6 +489,37 @@ export class RuntimeSupervisor implements RuntimeClient {
     const connection = this.#requiredConnection();
     const response = await callRuntime<RuntimeModels>(connection, "GET", "/models");
     return response.models;
+  }
+
+  async listVaultChangeBatches(
+    states: VaultChangeTransactionState[],
+  ): Promise<VaultChangeJournalRecord[]> {
+    const connection = this.#requiredConnection();
+    const response = await callRuntime<RuntimeVaultChangeBatches>(
+      connection,
+      "GET",
+      `/vault-changes?states=${encodeURIComponent(states.join(","))}`,
+    );
+    return response.batches;
+  }
+
+  async markVaultChangeApplying(
+    batchId: string,
+    checkpointRef: string,
+    targets: VaultChangeApplyingRequest["targets"],
+  ): Promise<void> {
+    const connection = this.#requiredConnection();
+    const request: VaultChangeApplyingRequest = { batchId, checkpointRef, targets };
+    await callRuntime(connection, "POST", "/vault-changes/applying", request);
+  }
+
+  async markVaultChangeState(
+    batchId: string,
+    state: VaultChangeStateRequest["state"],
+  ): Promise<void> {
+    const connection = this.#requiredConnection();
+    const request: VaultChangeStateRequest = { batchId, state };
+    await callRuntime(connection, "POST", "/vault-changes/state", request);
   }
 
   async listConversations(): Promise<ConversationSummary[]> {

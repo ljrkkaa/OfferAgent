@@ -427,3 +427,203 @@ test("restart interruption advances beyond the last emitted live-only delta sequ
   assert.equal(JSON.stringify(events).includes("Stream without persisting text"), false);
   await store.close();
 });
+
+test("the Vault Change journal durably records applying metadata without file bodies", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-change-journal-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  let store = await RuntimeStateStore.open(statePath);
+  await store.beginAgentRun(
+    "journal-conversation",
+    "journal-run",
+    "fake-interview-model",
+    "Prepare a safe update",
+  );
+  await store.requestToolCall("journal-run", {
+    type: "tool_call.requested",
+    protocolVersion: 1,
+    eventId: "journal-requested",
+    conversationId: "journal-conversation",
+    agentRunId: "journal-run",
+    sequence: 2,
+    toolCallId: "journal-call",
+    tool: {
+      kind: "local",
+      name: "vault_propose_changes",
+      arguments: {
+        batchId: "journal-batch",
+        idempotencyKey: "journal-key",
+        task: "Update one note",
+        actions: [{
+          actionId: "journal-action",
+          idempotencyKey: "journal-action-key",
+          operation: "exact_replace",
+          path: "notes/private.md",
+          expectedVersion: "mtime:1:size:99",
+          expectedContent: "SOURCE-BODY-MUST-NOT-BE-IN-SQLITE",
+          replacement: "POST-BODY-MUST-NOT-BE-IN-SQLITE",
+        }],
+      },
+    },
+  });
+  await store.markVaultChangeApplying(
+    "journal-batch",
+    "refs/offeragent/checkpoints/journal-batch",
+    [{
+      path: "notes/private.md",
+      beforeHash: "sha256:before",
+      afterHash: "sha256:after",
+    }],
+  );
+  await store.close();
+
+  const bytes = await readFile(statePath);
+  assert.equal(bytes.includes(Buffer.from("SOURCE-BODY-MUST-NOT-BE-IN-SQLITE")), false);
+  assert.equal(bytes.includes(Buffer.from("POST-BODY-MUST-NOT-BE-IN-SQLITE")), false);
+  const SQL = await initSqlJs();
+  const database = new SQL.Database(bytes);
+  assert.equal(
+    database.exec("PRAGMA table_info(vault_change_batches)")[0].values
+      .some((column) => column[1] === "proposal_json"),
+    false,
+  );
+  assert.deepEqual(
+    database.exec(
+      `SELECT state, checkpoint_ref, before_hashes_json, after_hashes_json
+       FROM vault_change_batches WHERE id = 'journal-batch'`,
+    )[0].values,
+    [[
+      "applying",
+      "refs/offeragent/checkpoints/journal-batch",
+      JSON.stringify({ "notes/private.md": "sha256:before" }),
+      JSON.stringify({ "notes/private.md": "sha256:after" }),
+    ]],
+  );
+  database.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  assert.deepEqual(await store.listVaultChangeBatches(["applying"]), [{
+    batchId: "journal-batch",
+    checkpointRef: "refs/offeragent/checkpoints/journal-batch",
+    state: "applying",
+    targets: [{
+      path: "notes/private.md",
+      beforeHash: "sha256:before",
+      afterHash: "sha256:after",
+    }],
+  }]);
+  await store.markVaultChangeState("journal-batch", "applied");
+  assert.equal((await store.listVaultChangeBatches(["applied"]))[0].state, "applied");
+  await store.close();
+});
+
+test("the v7 migration purges legacy Vault Change bodies from tables and database pages", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-v6-body-purge-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const marker = "LEGACY-COMPLETE-VAULT-BODY-MUST-BE-PURGED";
+  const store = await RuntimeStateStore.open(statePath);
+  await store.beginAgentRun("legacy-body-conversation", "legacy-body-run", "fake-interview-model", "Safe input");
+  await store.requestToolCall("legacy-body-run", {
+    type: "tool_call.requested",
+    protocolVersion: 1,
+    eventId: "legacy-body-event",
+    conversationId: "legacy-body-conversation",
+    agentRunId: "legacy-body-run",
+    sequence: 2,
+    toolCallId: "legacy-body-call",
+    tool: {
+      kind: "local",
+      name: "vault_propose_changes",
+      arguments: {
+        batchId: "legacy-body-batch",
+        idempotencyKey: "legacy-body-key",
+        task: "Legacy proposal",
+        actions: [{
+          actionId: "legacy-body-action",
+          idempotencyKey: "legacy-body-action-key",
+          operation: "create",
+          path: "notes/legacy.md",
+          expectedVersion: "missing",
+          content: "safe placeholder",
+        }],
+      },
+    },
+  });
+  await store.close();
+
+  const SQL = await initSqlJs();
+  const legacy = new SQL.Database(await readFile(statePath));
+  const event = JSON.parse(
+    legacy.exec("SELECT payload_json FROM durable_events WHERE id = 'legacy-body-event'")[0].values[0][0],
+  );
+  event.tool.arguments.actions[0].content = marker;
+  legacy.run(`
+    DROP INDEX vault_change_batches_by_state;
+    DROP INDEX vault_change_batches_by_run;
+    ALTER TABLE vault_change_batches RENAME TO vault_change_batches_v7_fixture;
+    CREATE TABLE vault_change_batches (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+      tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls(id) ON DELETE CASCADE,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      task TEXT NOT NULL,
+      proposal_json TEXT NOT NULL,
+      target_paths_json TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('pending', 'applied', 'rejected', 'failed')),
+      checkpoint_ref TEXT,
+      after_hashes_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO vault_change_batches
+      (id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+       proposal_json, target_paths_json, state, checkpoint_ref, after_hashes_json,
+       created_at, updated_at)
+    SELECT id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+           '${marker}', target_paths_json, state, checkpoint_ref, after_hashes_json,
+           created_at, updated_at
+    FROM vault_change_batches_v7_fixture;
+    DROP TABLE vault_change_batches_v7_fixture;
+    CREATE INDEX vault_change_batches_by_run ON vault_change_batches(agent_run_id, created_at);
+    DELETE FROM schema_migrations WHERE version = 7;
+    UPDATE settings_metadata SET value = '6' WHERE key = 'schema_version';
+    PRAGMA user_version = 6;
+  `);
+  legacy.run(
+    "UPDATE tool_calls SET arguments_json = ? WHERE id = 'legacy-body-call'",
+    [JSON.stringify(event.tool.arguments)],
+  );
+  legacy.run(
+    "UPDATE durable_events SET payload_json = ? WHERE id = 'legacy-body-event'",
+    [JSON.stringify(event)],
+  );
+  legacy.run(
+    `UPDATE vault_change_batches
+     SET state = 'applied', checkpoint_ref = ?, after_hashes_json = ?
+     WHERE id = 'legacy-body-batch'`,
+    [
+      "refs/offeragent/checkpoints/legacy-body-batch",
+      JSON.stringify({ "notes/legacy.md": "sha256:legacy-after" }),
+    ],
+  );
+  await writeFile(statePath, legacy.export());
+  legacy.close();
+  assert.equal((await readFile(statePath)).includes(Buffer.from(marker)), true);
+
+  const upgraded = await RuntimeStateStore.open(statePath);
+  assert.deepEqual(await upgraded.listVaultChangeBatches(["applied"]), [{
+    batchId: "legacy-body-batch",
+    checkpointRef: "refs/offeragent/checkpoints/legacy-body-batch",
+    state: "applied",
+    targets: [{
+      path: "notes/legacy.md",
+      beforeHash: "missing",
+      afterHash: "sha256:legacy-after",
+    }],
+  }]);
+  await upgraded.close();
+  const upgradedBytes = await readFile(statePath);
+  assert.equal(upgradedBytes.includes(Buffer.from(marker)), false);
+});

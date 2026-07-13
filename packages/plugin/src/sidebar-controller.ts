@@ -9,6 +9,7 @@ import type {
   ToolCallRecord,
   VaultChangeBatchProposal,
   VaultUndoResultPayload,
+  VaultUndoConflict,
   LocalToolResultPayload,
 } from "@offeragent/protocol";
 import { RuntimeRequestError, type RuntimeClient } from "./runtime-supervisor";
@@ -29,7 +30,8 @@ export interface SidebarViewModel {
     vaultChanges: Array<{
       actions: Array<{ operation: string; path: string }>;
       batchId: string;
-      status: "applied" | "applying" | "failed" | "pending" | "rejected" | "rejecting" | "undone";
+      conflicts?: VaultUndoConflict[];
+      status: "applied" | "applying" | "conflicted" | "expired" | "failed" | "pending" | "rejected" | "rejecting" | "undone";
       task: string;
       toolCallId: string;
     }>;
@@ -392,6 +394,16 @@ export class SidebarController {
     if (!change) return;
     if (result.ok) this.#setVaultChangeStatus(change.toolCallId, "undone");
     else {
+      if (result.error.code === "undo_conflict" && result.error.conflicts) {
+        this.#updateConversation({
+          ...this.#viewModel.conversation,
+          vaultChanges: this.#viewModel.conversation.vaultChanges.map((candidate) =>
+            candidate.toolCallId === change.toolCallId
+              ? { ...candidate, status: "conflicted", conflicts: result.error.conflicts }
+              : candidate,
+          ),
+        });
+      }
       this.#updateConversation({
         ...this.#viewModel.conversation,
         error: { code: "provider_error", message: result.error.message },
@@ -518,14 +530,31 @@ export class SidebarController {
       return [
         {
           ...change,
-          status:
-            call.status === "requested"
-              ? "pending"
-              : call.status === "failed"
-                ? "failed"
-                : call.decision ?? "applied",
+          status: this.#vaultChangeStatus(call),
         },
       ];
     });
+  }
+
+  #vaultChangeStatus(
+    call: ToolCallRecord,
+  ): SidebarViewModel["conversation"]["vaultChanges"][number]["status"] {
+    if (
+      call.vaultChangeState === "applied" ||
+      call.vaultChangeState === "expired" ||
+      call.vaultChangeState === "rejected" ||
+      call.vaultChangeState === "undone"
+    ) {
+      return call.vaultChangeState;
+    }
+    if (
+      call.vaultChangeState === "recovery_failed" ||
+      call.vaultChangeState === "rolled_back" ||
+      call.status === "failed"
+    ) {
+      return "failed";
+    }
+    if (call.status === "requested") return "pending";
+    return call.decision ?? "applied";
   }
 }

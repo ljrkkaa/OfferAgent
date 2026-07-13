@@ -176,3 +176,12 @@
   color: var(--text-on-accent);
   background: var(--interactive-accent);
 }
+
+.offeragent-sidebar__change-conflict {
+  max-height: 16rem;
+  overflow: auto;
+  padding: var(--size-4-2);
+  color: var(--text-error);
+  background: var(--background-primary);
+  white-space: pre-wrap;
+}

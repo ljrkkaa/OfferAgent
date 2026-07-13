@@ -95,6 +95,7 @@ async function waitUntil(predicate, message, timeoutMs = 10_000) {
 
 test("Obsidian loads the packaged plugin and opens its connected sidebar", async (t) => {
   const previousProvider = process.env.OFFERAGENT_RUNTIME_PROVIDER;
+  const previousStatePath = process.env.OFFERAGENT_RUNTIME_STATE_PATH;
   const previousLocalAppData = process.env.LOCALAPPDATA;
   process.env.OFFERAGENT_RUNTIME_PROVIDER = "fake";
   const temporaryVault = await mkdtemp(path.join(os.tmpdir(), "offeragent-vault-"));
@@ -102,6 +103,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     path.join(os.tmpdir(), "offeragent-plugin-runtime-home-"),
   );
   process.env.LOCALAPPDATA = temporaryRuntimeHome;
+  process.env.OFFERAGENT_RUNTIME_STATE_PATH = path.join(temporaryRuntimeHome, "state.db");
   await mkdir(path.join(temporaryVault, "notes"), { recursive: true });
   await writeFile(path.join(temporaryVault, "agent.md"), "# Test Agent Contract", "utf8");
   await writeFile(path.join(temporaryVault, "notes", "example.md"), "line one\nline two", "utf8");
@@ -261,6 +263,8 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     await plugin?.onunload();
     if (previousProvider === undefined) delete process.env.OFFERAGENT_RUNTIME_PROVIDER;
     else process.env.OFFERAGENT_RUNTIME_PROVIDER = previousProvider;
+    if (previousStatePath === undefined) delete process.env.OFFERAGENT_RUNTIME_STATE_PATH;
+    else process.env.OFFERAGENT_RUNTIME_STATE_PATH = previousStatePath;
     if (previousLocalAppData === undefined) delete process.env.LOCALAPPDATA;
     else process.env.LOCALAPPDATA = previousLocalAppData;
     await rm(temporaryVault, { recursive: true, force: true });
@@ -473,6 +477,21 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
         statuses.every((status) => status.dataset.status === "completed");
     },
     "OfferAgent did not continue the applied batch Agent Run",
+  );
+  await plugin.onunload();
+  plugin = new OfferAgentPlugin(app, manifest);
+  await plugin.onload();
+  plugin.commands.get("open-offeragent-sidebar").callback();
+  await waitUntil(
+    () =>
+      activeView?.contentEl
+        .findAllByClass("offeragent-sidebar__change-batch")
+        .find(
+          (card) =>
+            card.dataset.status === "applied" &&
+            card.children[0]?.text.includes("Apply one smoke-test line"),
+        ),
+    "OfferAgent did not rehydrate the applied batch after plugin restart",
   );
   activeView.contentEl.findByClass("offeragent-sidebar__change-undo").dispatch("click");
   await waitUntil(

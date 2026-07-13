@@ -162,6 +162,12 @@ class OfferAgentSidebarView extends ItemView {
       for (const action of batch.actions) {
         actions.createEl("li", { text: `${action.operation}: ${action.path}` });
       }
+      for (const conflict of batch.conflicts ?? []) {
+        card.createEl("pre", {
+          cls: "offeragent-sidebar__change-conflict",
+          text: conflict.diff,
+        });
+      }
       if (batch.status === "pending") {
         const apply = card.createEl("button", {
           cls: "offeragent-sidebar__change-apply",
@@ -262,12 +268,20 @@ export default class OfferAgentPlugin extends Plugin {
     const runtimePath = this.#runtimePath();
     const vaultRoot = this.#vaultRoot();
     const readTools = new ObsidianVaultToolAdapter(this.app.vault, this.app.metadataCache);
+    let runtime!: RuntimeSupervisor;
     const changeCoordinator = new VaultChangeCoordinator(
       new ObsidianVaultChangeFileApi(this.app.vault, vaultRoot),
       new GitCheckpointStore(vaultRoot),
+      {
+        list: (states) => runtime.listVaultChangeBatches(states),
+        markApplying: (batchId, checkpointRef, targets) =>
+          runtime.markVaultChangeApplying(batchId, checkpointRef, targets),
+        markState: (batchId, state) => runtime.markVaultChangeState(batchId, state),
+      },
     );
-    const runtime = new RuntimeSupervisor({
+    runtime = new RuntimeSupervisor({
       runtimePath,
+      statePath: process.env.OFFERAGENT_RUNTIME_STATE_PATH,
       toolExecutor: {
         execute: (event) =>
           event.tool.name === "vault_propose_changes"
@@ -292,7 +306,11 @@ export default class OfferAgentPlugin extends Plugin {
       },
     });
 
-    void this.#controller.start().catch((error: unknown) => {
+    void (async () => {
+      await runtime.start();
+      await changeCoordinator.reconcile();
+      await this.#controller?.start();
+    })().catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       new Notice(message, 10_000);
     });

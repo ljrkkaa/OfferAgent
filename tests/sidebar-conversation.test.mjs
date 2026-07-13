@@ -562,3 +562,66 @@ test("a failed Vault Change tool event disables its confirmation card", async ()
   await controller.sendMessage("Try a stale change.");
   assert.equal(controller.getViewModel().conversation.vaultChanges[0].status, "failed");
 });
+
+test("guarded undo exposes a conflict diff instead of overwriting later edits", async () => {
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async listConversations() {
+      return [{ id: "conversation-conflict", title: "Conflict", modelId: "model-a" }];
+    },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: { id: "conversation-conflict", title: "Conflict", modelId: "model-a" },
+        agentRuns: [],
+        messages: [],
+        toolCalls: [{
+          id: "conflict-call",
+          agentRunId: "conflict-run",
+          name: "vault_propose_changes",
+          arguments: {
+            batchId: "conflict-batch",
+            task: "Update a note",
+            actions: [{ operation: "append", path: "notes/conflict.md" }],
+          },
+          status: "completed",
+          vaultChangeState: "applied",
+        }],
+      };
+    },
+    async *runAgent() {},
+    async start() {}, async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Conflict", modelId };
+    },
+  };
+  const changes = {
+    cancel() {},
+    async decide() { throw new Error("already applied"); },
+    async undo() {
+      return {
+        ok: false,
+        error: {
+          code: "undo_conflict",
+          message: "Later edits must be preserved.",
+          conflicts: [{
+            path: "notes/conflict.md",
+            appliedHash: "sha256:applied",
+            currentHash: "sha256:current",
+            diff: "--- current/notes/conflict.md\n+++ checkpoint/notes/conflict.md\n-later edit\n+before",
+          }],
+        },
+      };
+    },
+  };
+  const controller = new SidebarController(runtime, changes);
+  await controller.start();
+  assert.equal(controller.getViewModel().conversation.vaultChanges[0].status, "applied");
+  await controller.undoVaultChange("conflict-batch");
+  const change = controller.getViewModel().conversation.vaultChanges[0];
+  assert.equal(change.status, "conflicted");
+  assert.match(change.conflicts[0].diff, /later edit/);
+});

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createServer, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
@@ -20,6 +20,8 @@ import {
   type RuntimeModels,
   type RuntimeShutdown,
   type ToolResultCommand,
+  type VaultChangeApplyingRequest,
+  type VaultChangeStateRequest,
 } from "@offeragent/protocol";
 import { FakeModelProvider } from "./fake-model-provider";
 import { CodexSubscriptionProvider } from "./codex-subscription-provider";
@@ -185,6 +187,18 @@ function isBoundedVaultPath(value: unknown): value is string {
     !/^[A-Za-z]:/.test(value) &&
     value.toLowerCase() !== "agent.md" &&
     !value.split("/").some((segment) => !segment || segment === "." || segment === ".." || segment.startsWith("."))
+  );
+}
+
+function isBoundedChangeTargetPath(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 512 &&
+    !value.includes("\\") &&
+    !value.startsWith("/") &&
+    !/^[A-Za-z]:/.test(value) &&
+    !value.split("/").some((segment) => !segment || segment === "." || segment === "..")
   );
 }
 
@@ -369,13 +383,70 @@ function readOptions(): RuntimeOptions {
 function sendJson(
   response: ServerResponse,
   statusCode: number,
-  body: RuntimeError | RuntimeHealth | RuntimeModels | RuntimeShutdown,
+  body: unknown,
 ): void {
   response.writeHead(statusCode, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
   });
   response.end(JSON.stringify(body));
+}
+
+function readJsonBody(request: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk: string) => {
+      body += chunk;
+      if (Buffer.byteLength(body, "utf8") > 64 * 1024) {
+        reject(new Error("Runtime journal request exceeds its size limit."));
+        request.destroy();
+      }
+    });
+    request.on("end", () => {
+      try {
+        resolve(JSON.parse(body) as unknown);
+      } catch {
+        reject(new Error("Runtime journal request must contain valid JSON."));
+      }
+    });
+    request.on("error", reject);
+  });
+}
+
+function isVaultChangeApplyingRequest(value: unknown): value is VaultChangeApplyingRequest {
+  if (!value || typeof value !== "object") return false;
+  const request = value as Partial<VaultChangeApplyingRequest>;
+  return (
+    typeof request.batchId === "string" &&
+    request.batchId.length > 0 &&
+    request.batchId.length <= 128 &&
+    request.checkpointRef === `refs/offeragent/checkpoints/${request.batchId}` &&
+    Array.isArray(request.targets) &&
+    request.targets.length > 0 &&
+    request.targets.length <= 20 &&
+    request.targets.every(
+      (target) =>
+        isBoundedChangeTargetPath(target?.path) &&
+        typeof target.beforeHash === "string" &&
+        target.beforeHash.length <= 128 &&
+        typeof target.afterHash === "string" &&
+        target.afterHash.length <= 128,
+    )
+  );
+}
+
+function isVaultChangeStateRequest(value: unknown): value is VaultChangeStateRequest {
+  if (!value || typeof value !== "object") return false;
+  const request = value as Partial<VaultChangeStateRequest>;
+  return (
+    typeof request.batchId === "string" &&
+    request.batchId.length > 0 &&
+    request.batchId.length <= 128 &&
+    ["applied", "expired", "recovery_failed", "rolled_back", "undone"].includes(
+      request.state as string,
+    )
+  );
 }
 
 function parentExists(parentPid: number): boolean {
@@ -564,6 +635,64 @@ async function startRuntime({
       sendJson(response, 401, {
         code: "unauthorized",
         message: "A valid one-time Runtime token is required.",
+      });
+      return;
+    }
+
+    const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+
+    if (request.method === "GET" && requestUrl.pathname === "/vault-changes") {
+      const states = (requestUrl.searchParams.get("states") ?? "")
+        .split(",")
+        .filter(Boolean);
+      const allowed = new Set([
+        "pending", "applying", "applied", "rejected", "failed", "rolled_back",
+        "recovery_failed", "undone", "expired",
+      ]);
+      if (states.length === 0 || states.some((state) => !allowed.has(state))) {
+        sendJson(response, 400, { code: "not_found", message: "Vault Change states are invalid." });
+        return;
+      }
+      void store.listVaultChangeBatches(states as never).then(
+        (batches) => sendJson(response, 200, { batches }),
+        (error: unknown) => sendJson(response, 500, {
+          code: "storage_error",
+          message: error instanceof Error ? error.message : "Vault Change journal read failed.",
+        }),
+      );
+      return;
+    }
+
+    if (request.method === "POST" && requestUrl.pathname === "/vault-changes/applying") {
+      void readJsonBody(request).then(async (body) => {
+        if (!isVaultChangeApplyingRequest(body)) {
+          sendJson(response, 400, { code: "not_found", message: "Applying metadata is invalid." });
+          return;
+        }
+        await store.markVaultChangeApplying(body.batchId, body.checkpointRef, body.targets);
+        sendJson(response, 200, { status: "applying" });
+      }).catch((error: unknown) => {
+        sendJson(response, 409, {
+          code: "storage_error",
+          message: error instanceof Error ? error.message : "Applying metadata could not be stored.",
+        });
+      });
+      return;
+    }
+
+    if (request.method === "POST" && requestUrl.pathname === "/vault-changes/state") {
+      void readJsonBody(request).then(async (body) => {
+        if (!isVaultChangeStateRequest(body)) {
+          sendJson(response, 400, { code: "not_found", message: "Vault Change state is invalid." });
+          return;
+        }
+        await store.markVaultChangeState(body.batchId, body.state);
+        sendJson(response, 200, { status: body.state });
+      }).catch((error: unknown) => {
+        sendJson(response, 409, {
+          code: "storage_error",
+          message: error instanceof Error ? error.message : "Vault Change state could not be stored.",
+        });
       });
       return;
     }

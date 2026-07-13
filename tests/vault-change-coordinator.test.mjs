@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 const execFileAsync = promisify(execFile);
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
-const { GitCheckpointStore, VaultChangeCoordinator } = require(
+const { GitCheckpointStore, VaultChangeCoordinator, VaultChangeCrashInjectionError } = require(
   path.join(repositoryRoot, "packages", "plugin", "dist", "vault-change-coordinator.js"),
 );
 
@@ -62,12 +62,47 @@ class FileVaultApi {
   }
 
   async modify(vaultPath, content) {
-    if (this.failPath === vaultPath) throw new Error(`Injected modify failure for ${vaultPath}`);
+    if (this.failPath === vaultPath || this.failWhen?.(vaultPath, content)) {
+      throw new Error(`Injected modify failure for ${vaultPath}`);
+    }
     await writeFile(path.join(this.root, vaultPath), content, "utf8");
   }
 
   async remove(vaultPath) {
     await unlink(path.join(this.root, vaultPath));
+  }
+}
+
+class MemoryJournal {
+  constructor() {
+    this.entries = new Map();
+  }
+
+  async list(states) {
+    return [...this.entries.values()]
+      .filter((entry) => states.includes(entry.state))
+      .map((entry) => structuredClone(entry));
+  }
+
+  async markApplying(batchId, checkpointRef, targets) {
+    this.entries.set(batchId, {
+      batchId,
+      checkpointRef,
+      state: "applying",
+      targets: structuredClone(targets),
+    });
+  }
+
+  async markState(batchId, state) {
+    if (this.failState === state) throw new Error(`Injected journal failure for ${state}`);
+    const entry = this.entries.get(batchId);
+    if (!entry) throw new Error(`Journal batch '${batchId}' does not exist.`);
+    if (entry.state === state) return;
+    entry.state = state;
+    if (this.commitThenThrowState === state) {
+      this.commitThenThrowState = undefined;
+      throw new Error(`Injected lost response after committing ${state}`);
+    }
   }
 }
 
@@ -97,7 +132,7 @@ function batch(id, actions) {
   };
 }
 
-async function fixture(t) {
+async function fixture(t, journal, injectCrash) {
   const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-change-batch-"));
   await mkdir(path.join(root, "notes"), { recursive: true });
   await writeFile(path.join(root, "notes", "a.md"), "alpha\n", "utf8");
@@ -114,7 +149,7 @@ async function fixture(t) {
   await writeFile(path.join(root, "unstaged.md"), "unstaged user change\n", "utf8");
   const vault = new FileVaultApi(root);
   const checkpoints = new GitCheckpointStore(root);
-  const coordinator = new VaultChangeCoordinator(vault, checkpoints);
+  const coordinator = new VaultChangeCoordinator(vault, checkpoints, journal, injectCrash);
   t.after(async () => rm(root, { recursive: true, force: true }));
   return { checkpoints, coordinator, root, vault };
 }
@@ -365,5 +400,311 @@ test("rejection, stale sources, rollback, invalid operations, and guarded undo a
   const conflict = await coordinator.undo("batch-conflict");
   assert.equal(conflict.ok, false);
   assert.equal(conflict.error.code, "undo_conflict");
+  assert.equal(conflict.error.conflicts[0].path, "notes/a.md");
+  assert.match(conflict.error.conflicts[0].diff, /later user edit/);
   assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "later user edit\n");
+});
+
+test("restart reconciliation converges every injected crash boundary and rehydrates undo", async (t) => {
+  for (const crashPoint of ["applying", "action:0", "action:1", "action:2", "applied"]) {
+    await t.test(crashPoint, async (t) => {
+      const journal = new MemoryJournal();
+      const { checkpoints, coordinator, root, vault } = await fixture(
+        t,
+        journal,
+        (point) => {
+          if (point === crashPoint) throw new VaultChangeCrashInjectionError(point);
+        },
+      );
+      const a = await vault.read("notes/a.md");
+      const b = await vault.read("notes/b.md");
+      const proposal = batch(`batch-crash-${crashPoint.replace(":", "-")}`, [
+        {
+          operation: "append",
+          path: "notes/a.md",
+          expectedVersion: a.modifiedVersion,
+          content: "after-a\n",
+        },
+        {
+          operation: "exact_replace",
+          path: "notes/b.md",
+          expectedVersion: b.modifiedVersion,
+          expectedContent: "world",
+          replacement: "after-b",
+        },
+        {
+          operation: "create",
+          path: "notes/crash.md",
+          expectedVersion: "missing",
+          content: "after-c\n",
+        },
+      ]);
+      const execution = coordinator.execute(toolCall(`call-crash-${crashPoint}`, proposal));
+      void execution;
+      await coordinator.waitUntilPending(`call-crash-${crashPoint}`);
+      await assert.rejects(
+        coordinator.decide(`call-crash-${crashPoint}`, "apply"),
+        VaultChangeCrashInjectionError,
+      );
+      if (crashPoint === "applied") {
+        for (const target of journal.entries.get(proposal.batchId).targets) {
+          if (target.beforeHash !== "missing") target.beforeHash = "";
+        }
+      }
+      const restarted = new VaultChangeCoordinator(vault, checkpoints, journal);
+      const outcomes = await restarted.reconcile();
+      const state = journal.entries.get(proposal.batchId).state;
+      assert.ok(state === "applied" || state === "rolled_back");
+      assert.ok(outcomes.some((outcome) => outcome.batchId === proposal.batchId));
+      const contents = [
+        await readFile(path.join(root, "notes", "a.md"), "utf8"),
+        await readFile(path.join(root, "notes", "b.md"), "utf8"),
+        await vault.read("notes/crash.md"),
+      ];
+      if (state === "applied") {
+        assert.deepEqual(contents, ["alpha\nafter-a\n", "hello after-b\n", {
+          content: "after-c\n",
+          modifiedVersion: contents[2].modifiedVersion,
+        }]);
+        assert.equal((await restarted.undo(proposal.batchId)).ok, true);
+        assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "alpha\n");
+        assert.equal(await vault.read("notes/crash.md"), undefined);
+      } else {
+        assert.equal(contents[0], "alpha\n");
+        assert.equal(contents[1], "hello world\n");
+        assert.equal(contents[2], undefined);
+      }
+    });
+  }
+});
+
+test("missing or damaged checkpoints fail recovery without overwriting unknown content", async (t) => {
+  const journal = new MemoryJournal();
+  const { checkpoints, coordinator, root, vault } = await fixture(
+    t,
+    journal,
+    (point) => {
+      if (point === "action:0") throw new VaultChangeCrashInjectionError(point);
+    },
+  );
+  const a = await vault.read("notes/a.md");
+  const b = await vault.read("notes/b.md");
+  const proposal = batch("batch-missing-checkpoint", [
+    { operation: "append", path: "notes/a.md", expectedVersion: a.modifiedVersion, content: "partial\n" },
+    { operation: "append", path: "notes/b.md", expectedVersion: b.modifiedVersion, content: "not-run\n" },
+  ]);
+  void coordinator.execute(toolCall("call-missing-checkpoint", proposal));
+  await coordinator.waitUntilPending("call-missing-checkpoint");
+  await assert.rejects(
+    coordinator.decide("call-missing-checkpoint", "apply"),
+    VaultChangeCrashInjectionError,
+  );
+  await git(root, "update-ref", "-d", `refs/offeragent/checkpoints/${proposal.batchId}`);
+  await writeFile(path.join(root, "notes", "a.md"), "later unknown edit\n", "utf8");
+
+  const restarted = new VaultChangeCoordinator(vault, checkpoints, journal);
+  const outcomes = await restarted.reconcile();
+  assert.deepEqual(outcomes, [{ batchId: proposal.batchId, state: "recovery_failed" }]);
+  assert.equal(journal.entries.get(proposal.batchId).state, "recovery_failed");
+  assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "later unknown edit\n");
+  assert.equal(await readFile(path.join(root, "notes", "b.md"), "utf8"), "hello world\n");
+});
+
+test("a damaged non-commit checkpoint is reported without further Vault mutation", async (t) => {
+  const journal = new MemoryJournal();
+  const { checkpoints, coordinator, root, vault } = await fixture(
+    t,
+    journal,
+    (point) => {
+      if (point === "action:0") throw new VaultChangeCrashInjectionError(point);
+    },
+  );
+  const a = await vault.read("notes/a.md");
+  const b = await vault.read("notes/b.md");
+  const proposal = batch("batch-damaged-checkpoint", [
+    { operation: "append", path: "notes/a.md", expectedVersion: a.modifiedVersion, content: "partial\n" },
+    { operation: "append", path: "notes/b.md", expectedVersion: b.modifiedVersion, content: "not-run\n" },
+  ]);
+  void coordinator.execute(toolCall("call-damaged-checkpoint", proposal));
+  await coordinator.waitUntilPending("call-damaged-checkpoint");
+  await assert.rejects(
+    coordinator.decide("call-damaged-checkpoint", "apply"),
+    VaultChangeCrashInjectionError,
+  );
+  const blob = await git(root, "hash-object", "-w", "notes/a.md");
+  await git(root, "update-ref", `refs/offeragent/checkpoints/${proposal.batchId}`, blob);
+  const beforeRecovery = await readFile(path.join(root, "notes", "a.md"), "utf8");
+
+  const restarted = new VaultChangeCoordinator(vault, checkpoints, journal);
+  assert.deepEqual(await restarted.reconcile(), [
+    { batchId: proposal.batchId, state: "recovery_failed" },
+  ]);
+  assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), beforeRecovery);
+  assert.equal(await readFile(path.join(root, "notes", "b.md"), "utf8"), "hello world\n");
+});
+
+test("ambiguous applied and undone responses are retried idempotently", async (t) => {
+  const journal = new MemoryJournal();
+  journal.commitThenThrowState = "applied";
+  const { coordinator, root, vault } = await fixture(t, journal);
+  const original = await vault.read("notes/a.md");
+  const proposal = batch("batch-ambiguous-response", [{
+    operation: "append",
+    path: "notes/a.md",
+    expectedVersion: original.modifiedVersion,
+    content: "agent edit\n",
+  }]);
+  const execution = coordinator.execute(toolCall("call-ambiguous-response", proposal));
+  await coordinator.waitUntilPending("call-ambiguous-response");
+  assert.equal((await coordinator.decide("call-ambiguous-response", "apply")).ok, true);
+  assert.equal((await execution).ok, true);
+  assert.equal(journal.entries.get(proposal.batchId).state, "applied");
+  assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "alpha\nagent edit\n");
+
+  journal.commitThenThrowState = "undone";
+  assert.equal((await coordinator.undo(proposal.batchId)).ok, true);
+  assert.equal(journal.entries.get(proposal.batchId).state, "undone");
+  assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "alpha\n");
+});
+
+test("an unconfirmed undo state write is reconciled without destructive compensation", async (t) => {
+  const journal = new MemoryJournal();
+  const { checkpoints, coordinator, root, vault } = await fixture(t, journal);
+  const original = await vault.read("notes/a.md");
+  const proposal = batch("batch-undo-journal-failure", [{
+    operation: "append",
+    path: "notes/a.md",
+    expectedVersion: original.modifiedVersion,
+    content: "agent edit\n",
+  }]);
+  const execution = coordinator.execute(toolCall("call-undo-journal-failure", proposal));
+  await coordinator.waitUntilPending("call-undo-journal-failure");
+  await coordinator.decide("call-undo-journal-failure", "apply");
+  assert.equal((await execution).ok, true);
+  journal.failState = "undone";
+  const result = await coordinator.undo(proposal.batchId);
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "tool_error");
+  assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "alpha\n");
+  assert.equal(journal.entries.get(proposal.batchId).state, "applied");
+  journal.failState = undefined;
+  const restarted = new VaultChangeCoordinator(vault, checkpoints, journal);
+  assert.deepEqual(await restarted.reconcile(), [
+    { batchId: proposal.batchId, state: "undone" },
+  ]);
+  assert.equal(journal.entries.get(proposal.batchId).state, "undone");
+});
+
+test("restart preserves guarded undo and conflict diff after a later user edit", async (t) => {
+  const journal = new MemoryJournal();
+  const { checkpoints, coordinator, root, vault } = await fixture(t, journal);
+  const original = await vault.read("notes/a.md");
+  const proposal = batch("batch-restart-user-edit", [{
+    operation: "append",
+    path: "notes/a.md",
+    expectedVersion: original.modifiedVersion,
+    content: "agent edit\n",
+  }]);
+  const execution = coordinator.execute(toolCall("call-restart-user-edit", proposal));
+  await coordinator.waitUntilPending("call-restart-user-edit");
+  assert.equal((await coordinator.decide("call-restart-user-edit", "apply")).ok, true);
+  assert.equal((await execution).ok, true);
+  await writeFile(path.join(root, "notes", "a.md"), "later user edit\n", "utf8");
+
+  const restarted = new VaultChangeCoordinator(vault, checkpoints, journal);
+  assert.deepEqual(await restarted.reconcile(), [
+    { batchId: proposal.batchId, state: "applied" },
+  ]);
+  assert.equal(journal.entries.get(proposal.batchId).state, "applied");
+  const undo = await restarted.undo(proposal.batchId);
+  assert.equal(undo.ok, false);
+  assert.equal(undo.error.code, "undo_conflict");
+  assert.match(undo.error.conflicts[0].diff, /later user edit/);
+  assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "later user edit\n");
+});
+
+test("a failed undo rollback is surfaced and journaled for recovery", async (t) => {
+  const journal = new MemoryJournal();
+  const { coordinator, root, vault } = await fixture(t, journal);
+  const a = await vault.read("notes/a.md");
+  const b = await vault.read("notes/b.md");
+  const proposal = batch("batch-undo-rollback-failure", [
+    { operation: "append", path: "notes/a.md", expectedVersion: a.modifiedVersion, content: "post-a\n" },
+    { operation: "append", path: "notes/b.md", expectedVersion: b.modifiedVersion, content: "post-b\n" },
+  ]);
+  const execution = coordinator.execute(toolCall("call-undo-rollback-failure", proposal));
+  await coordinator.waitUntilPending("call-undo-rollback-failure");
+  await coordinator.decide("call-undo-rollback-failure", "apply");
+  assert.equal((await execution).ok, true);
+  vault.failWhen = (vaultPath, content) =>
+    (vaultPath === "notes/b.md" && content === "hello world\n") ||
+    (vaultPath === "notes/a.md" && content === "alpha\npost-a\n");
+  const undone = await coordinator.undo(proposal.batchId);
+  assert.equal(undone.ok, false);
+  assert.match(undone.error.message, /rollback failed/i);
+  assert.equal(journal.entries.get(proposal.batchId).state, "recovery_failed");
+  assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "alpha\n");
+  assert.equal(await readFile(path.join(root, "notes", "b.md"), "utf8"), "hello world\npost-b\n");
+});
+
+test("Git checkpoint retention keeps at most one hundred recent refs and removes old refs", async (t) => {
+  const { checkpoints, root } = await fixture(t);
+  const head = await git(root, "rev-parse", "HEAD");
+  for (let index = 0; index < 101; index += 1) {
+    await git(root, "update-ref", `refs/offeragent/checkpoints/retention-${String(index).padStart(3, "0")}`, head);
+  }
+  const oldTree = await git(root, "rev-parse", "HEAD^{tree}");
+  const { stdout: oldCommitOutput } = await execFileAsync(
+    "git",
+    ["-C", root, "commit-tree", oldTree, "-m", "old checkpoint"],
+    {
+      encoding: "utf8",
+      windowsHide: true,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "OfferAgent Test",
+        GIT_AUTHOR_EMAIL: "offeragent@example.invalid",
+        GIT_COMMITTER_NAME: "OfferAgent Test",
+        GIT_COMMITTER_EMAIL: "offeragent@example.invalid",
+        GIT_AUTHOR_DATE: "2020-01-01T00:00:00Z",
+        GIT_COMMITTER_DATE: "2020-01-01T00:00:00Z",
+      },
+    },
+  );
+  await git(root, "update-ref", "refs/offeragent/checkpoints/retention-old", oldCommitOutput.trim());
+  const deleted = await checkpoints.cleanup(new Date("2026-07-14T00:00:00Z"));
+  const remaining = (await git(root, "for-each-ref", "--format=%(refname)", "refs/offeragent/checkpoints/"))
+    .split(/\r?\n/)
+    .filter(Boolean);
+  assert.equal(remaining.length, 100);
+  assert.ok(deleted.includes("refs/offeragent/checkpoints/retention-old"));
+});
+
+test("a successful apply enforces checkpoint retention without waiting for restart", async (t) => {
+  const journal = new MemoryJournal();
+  const { checkpoints, root, vault } = await fixture(t, journal);
+  let cleanupCalls = 0;
+  const trackedCheckpoints = {
+    create: (...arguments_) => checkpoints.create(...arguments_),
+    read: (...arguments_) => checkpoints.read(...arguments_),
+    verify: (...arguments_) => checkpoints.verify(...arguments_),
+    cleanup: (...arguments_) => {
+      cleanupCalls += 1;
+      return checkpoints.cleanup(...arguments_);
+    },
+  };
+  const coordinator = new VaultChangeCoordinator(vault, trackedCheckpoints, journal);
+  const original = await vault.read("notes/a.md");
+  const proposal = batch("batch-live-retention", [{
+    operation: "append",
+    path: "notes/a.md",
+    expectedVersion: original.modifiedVersion,
+    content: "retained\n",
+  }]);
+  const execution = coordinator.execute(toolCall("call-live-retention", proposal));
+  await coordinator.waitUntilPending("call-live-retention");
+  assert.equal((await coordinator.decide("call-live-retention", "apply")).ok, true);
+  assert.equal((await execution).ok, true);
+  assert.equal(cleanupCalls, 1);
+  assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "alpha\nretained\n");
 });
