@@ -583,6 +583,202 @@ test("the Vault Change journal durably records applying metadata without file bo
   await store.close();
 });
 
+test("Run Checkpoints resume only Interrupted Runs from the latest committed step", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-run-checkpoint-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  let store = await RuntimeStateStore.open(statePath);
+  await store.beginAgentRun(
+    "checkpoint-conversation",
+    "checkpoint-run",
+    "fake-interview-model",
+    "resume me",
+  );
+  const first = {
+    version: 1,
+    input: [{ type: "user_message", text: "resume me" }],
+    localSkills: [],
+    canonicalReadPaths: [],
+    requiredRereads: [],
+    hostedWebSearchProbeAttempted: false,
+    completedSteps: 0,
+  };
+  await store.saveRunCheckpoint("checkpoint-run", first);
+  const latest = { ...first, completedSteps: 1 };
+  await store.saveRunCheckpoint("checkpoint-run", latest);
+  await store.interruptAgentRun("checkpoint-run");
+  await store.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  assert.deepEqual(await store.resumeAgentRun("checkpoint-conversation", "checkpoint-run"), {
+    checkpoint: latest,
+    model: "fake-interview-model",
+    nextSequence: 3,
+  });
+  assert.equal((await store.getConversation("checkpoint-conversation")).agentRuns[0].status, "running");
+  await store.cancelAgentRun("checkpoint-run");
+  await assert.rejects(
+    store.resumeAgentRun("checkpoint-conversation", "checkpoint-run"),
+    /cannot be resumed from 'cancelled'/,
+  );
+  await store.close();
+});
+
+test("Run Checkpoints do not persist Agent Contract, Local Skill, or pending proposal bodies", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-checkpoint-bodies-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const store = await RuntimeStateStore.open(statePath);
+  await store.beginAgentRun("body-conversation", "body-run", "fake-interview-model", "change it");
+  const proposalMarker = "PENDING-PROPOSAL-BODY-MUST-NOT-PERSIST";
+  const instructionMarker = "CONTROL-INSTRUCTION-BODY-MUST-NOT-PERSIST";
+  await store.saveRunCheckpoint("body-run", {
+    version: 1,
+    input: [
+      { type: "user_message", text: "change it" },
+      {
+        type: "local_tool_call",
+        callId: "skill-provider-call",
+        name: "skill_read",
+        arguments: { skill: "study" },
+      },
+      {
+        type: "local_tool_result",
+        callId: "skill-provider-call",
+        result: {
+          ok: true,
+          value: {
+            type: "skill_read",
+            skill: "study",
+            resource: "SKILL.md",
+            path: ".codex/skills/study/SKILL.md",
+            modifiedVersion: "mtime:1:size:1",
+            contentHash: "sha256:skill",
+            content: instructionMarker,
+          },
+        },
+      },
+      {
+        type: "local_tool_call",
+        callId: "proposal-provider-call",
+        name: "vault_propose_changes",
+        arguments: {
+          batchId: "body-batch",
+          idempotencyKey: "body-batch-key",
+          task: "Safe metadata",
+          actions: [{
+            actionId: "body-action",
+            idempotencyKey: "body-action-key",
+            operation: "create",
+            path: "notes/body.md",
+            expectedVersion: "missing",
+            content: proposalMarker,
+          }],
+        },
+      },
+    ],
+    agentContract: instructionMarker,
+    localSkills: [["study", instructionMarker]],
+    canonicalReadPaths: [],
+    requiredRereads: [],
+    hostedWebSearchProbeAttempted: false,
+    completedSteps: 1,
+  });
+  await store.close();
+  const databaseText = (await readFile(statePath)).toString("utf8");
+  assert.equal(databaseText.includes(proposalMarker), false);
+  assert.equal(databaseText.includes(instructionMarker), false);
+});
+
+test("a committed Tool Result remains recoverable when the following checkpoint write is lost", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-committed-tool-gap-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const store = await RuntimeStateStore.open(statePath);
+  await store.beginAgentRun("gap-conversation", "gap-run", "fake-interview-model", "change it");
+  const proposal = {
+    batchId: "gap-batch",
+    idempotencyKey: "gap-batch-key",
+    task: "Commit exactly once",
+    actions: [{
+      actionId: "gap-action",
+      idempotencyKey: "gap-action-key",
+      operation: "create",
+      path: "notes/gap.md",
+      expectedVersion: "missing",
+      content: "once\n",
+    }],
+  };
+  await store.saveRunCheckpoint("gap-run", {
+    version: 1,
+    input: [
+      { type: "user_message", text: "change it" },
+      { type: "local_tool_call", callId: "gap-provider-call", name: "vault_propose_changes", arguments: proposal },
+    ],
+    localSkills: [],
+    canonicalReadPaths: [],
+    requiredRereads: [],
+    hostedWebSearchProbeAttempted: false,
+    completedSteps: 0,
+    pendingToolStep: {
+      completedSteps: 1,
+      name: "vault_propose_changes",
+      providerCallId: "gap-provider-call",
+      toolCallId: "gap-tool-call",
+    },
+  });
+  await store.requestToolCall("gap-run", {
+    type: "tool_call.requested",
+    protocolVersion: 1,
+    eventId: "gap-request-event",
+    conversationId: "gap-conversation",
+    agentRunId: "gap-run",
+    sequence: 2,
+    toolCallId: "gap-tool-call",
+    tool: { kind: "local", name: "vault_propose_changes", arguments: proposal },
+  });
+  const result = {
+    ok: true,
+    value: {
+      type: "vault_propose_changes",
+      batchId: "gap-batch",
+      decision: "rejected",
+      targets: [{ path: "notes/gap.md", beforeHash: "missing", afterHash: "sha256:after" }],
+    },
+  };
+  await store.completeToolCall("gap-run", result, {
+    type: "tool_call.completed",
+    protocolVersion: 1,
+    eventId: "gap-completed-event",
+    conversationId: "gap-conversation",
+    agentRunId: "gap-run",
+    sequence: 3,
+    toolCallId: "gap-tool-call",
+    tool: { kind: "local", name: "vault_propose_changes" },
+    status: "completed",
+  }, "gap-result-event");
+  await store.interruptAgentRun("gap-run");
+  await assert.rejects(
+    store.resumeAgentRun("gap-conversation", "gap-run", {
+      toolCallId: "gap-tool-call",
+      result: {
+        ok: true,
+        value: {
+          type: "vault_propose_changes",
+          batchId: "wrong-batch",
+          decision: "rejected",
+          targets: [{ path: "notes/gap.md", beforeHash: "missing", afterHash: "sha256:after" }],
+        },
+      },
+    }),
+    /mismatched batch result/,
+  );
+  const resumed = await store.resumeAgentRun("gap-conversation", "gap-run");
+  assert.equal(resumed.checkpoint.pendingToolStep.toolCallId, "gap-tool-call");
+  assert.deepEqual(await store.getToolCallResult("gap-tool-call", "gap-run"), result);
+  await store.close();
+});
+
 test("the v7 migration purges legacy Vault Change bodies from tables and database pages", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-v6-body-purge-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));

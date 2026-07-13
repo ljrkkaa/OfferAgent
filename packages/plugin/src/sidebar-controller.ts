@@ -49,8 +49,13 @@ export interface SidebarViewModel {
 type Subscriber = (viewModel: SidebarViewModel) => void;
 
 export interface VaultChangeDecisionClient {
+  acknowledge?(toolCallId: string): Promise<void>;
   cancel(toolCallId: string): void;
   decide(toolCallId: string, decision: "apply" | "reject"): Promise<LocalToolResultPayload>;
+  rehydrate?(toolCallId: string): Promise<{
+    proposal?: VaultChangeBatchProposal;
+    result?: LocalToolResultPayload;
+  }>;
   undo(batchId: string): Promise<VaultUndoResultPayload>;
 }
 
@@ -72,6 +77,11 @@ export class SidebarController {
     runtime: { state: "idle" },
   };
   #activeRun?: { agentRunId: string; conversationId: string };
+  readonly #recoveredToolResults = new Map<string, {
+    eventId: string;
+    result: LocalToolResultPayload;
+    toolCallId: string;
+  }>();
 
   constructor(runtime: RuntimeClient, vaultChanges?: VaultChangeDecisionClient) {
     this.#runtime = runtime;
@@ -110,6 +120,9 @@ export class SidebarController {
         }
         const active = conversations[0];
         const snapshot = active ? await this.#runtime.openConversation(active.id) : undefined;
+        this.#recoveredToolResults.clear();
+        if (snapshot) await this.#rehydratePendingVaultChanges(snapshot.toolCalls ?? []);
+        const toolCalls = this.#toolCallsWithRecoveredFailures(snapshot?.toolCalls ?? []);
         this.#updateConversation({
           ...this.#viewModel.conversation,
           models,
@@ -119,8 +132,8 @@ export class SidebarController {
           messages:
             snapshot?.messages.map(({ role, text }) => ({ role, text })) ?? [],
           agentRuns: snapshot?.agentRuns ?? [],
-          toolCalls: snapshot?.toolCalls ?? [],
-          vaultChanges: this.#changesFromToolCalls(snapshot?.toolCalls ?? []),
+          toolCalls,
+          vaultChanges: this.#changesFromToolCalls(toolCalls),
           error: undefined,
         });
       } catch (error) {
@@ -148,6 +161,7 @@ export class SidebarController {
       title,
       modelId,
     });
+    this.#recoveredToolResults.clear();
     this.#updateConversation({
       ...this.#viewModel.conversation,
       activeConversationId: conversation.id,
@@ -167,6 +181,9 @@ export class SidebarController {
       throw new Error("Stop the current Agent Run before switching Conversations.");
     }
     const snapshot = await this.#runtime.openConversation(conversationId);
+    this.#recoveredToolResults.clear();
+    await this.#rehydratePendingVaultChanges(snapshot.toolCalls ?? []);
+    const toolCalls = this.#toolCallsWithRecoveredFailures(snapshot.toolCalls ?? []);
     this.#updateConversation({
       ...this.#viewModel.conversation,
       activeConversationId: snapshot.conversation.id,
@@ -178,8 +195,8 @@ export class SidebarController {
       })),
       runState: "idle",
       selectedModelId: snapshot.conversation.modelId,
-      toolCalls: snapshot.toolCalls ?? [],
-      vaultChanges: this.#changesFromToolCalls(snapshot.toolCalls ?? []),
+      toolCalls,
+      vaultChanges: this.#changesFromToolCalls(toolCalls),
       error: undefined,
     });
   }
@@ -190,7 +207,16 @@ export class SidebarController {
     if (this.#viewModel.conversation.runState === "streaming") {
       throw new Error("Stop the current Agent Run before deleting its Conversation.");
     }
+    const proposalCalls = this.#viewModel.conversation.toolCalls.filter(
+      (call) => call.name === "vault_propose_changes",
+    );
+    for (const call of proposalCalls) {
+      if (call.name !== "vault_propose_changes") continue;
+      if (call.status === "requested") this.#vaultChanges?.cancel(call.id);
+      await this.#vaultChanges?.acknowledge?.(call.id);
+    }
     await this.#runtime.deleteConversation(conversationId);
+    this.#recoveredToolResults.clear();
     const conversations = this.#viewModel.conversation.conversations.filter(
       (conversation) => conversation.id !== conversationId,
     );
@@ -303,6 +329,9 @@ export class SidebarController {
               : this.#viewModel.conversation.vaultChanges,
           });
         } else if (event.type === "tool_call.completed") {
+          if (event.tool.name === "vault_propose_changes") {
+            await this.#vaultChanges?.acknowledge?.(event.toolCallId);
+          }
           const vaultChanges =
             event.status === "failed"
               ? this.#viewModel.conversation.vaultChanges.map((change) =>
@@ -341,17 +370,22 @@ export class SidebarController {
             error: event.error,
           });
         } else if (event.type === "agent_run.cancelled" || event.type === "agent_run.interrupted") {
-          const vaultChanges = this.#cancelPendingVaultChanges(agentRunId);
+          const cancelled = event.type === "agent_run.cancelled";
+          const vaultChanges = cancelled
+            ? this.#cancelPendingVaultChanges(agentRunId)
+            : this.#viewModel.conversation.vaultChanges;
           messages.pop();
           this.#updateConversation({
             ...this.#viewModel.conversation,
             messages: [...messages],
             runState: "idle",
-            toolCalls: this.#terminalizedToolCalls(agentRunId),
+            toolCalls: cancelled
+              ? this.#terminalizedToolCalls(agentRunId)
+              : this.#interruptedToolCalls(agentRunId),
             vaultChanges,
             agentRuns: this.#runsWithStatus(
               agentRunId,
-              event.type === "agent_run.cancelled" ? "cancelled" : "interrupted",
+              cancelled ? "cancelled" : "interrupted",
             ),
           });
         }
@@ -362,15 +396,14 @@ export class SidebarController {
         runState: "idle",
       });
     } catch (error) {
-      const vaultChanges = this.#cancelPendingVaultChanges(agentRunId);
       messages.pop();
       const message = error instanceof Error ? error.message : String(error);
       this.#updateConversation({
         ...this.#viewModel.conversation,
         messages: [...messages],
         runState: "idle",
-        toolCalls: this.#terminalizedToolCalls(agentRunId),
-        vaultChanges,
+        toolCalls: this.#interruptedToolCalls(agentRunId),
+        vaultChanges: this.#viewModel.conversation.vaultChanges,
         agentRuns: this.#runsWithStatus(agentRunId, "interrupted"),
         error: { code: "transport_error", message },
       });
@@ -379,30 +412,189 @@ export class SidebarController {
     }
   }
 
+  async resumeAgentRun(agentRunId: string): Promise<void> {
+    await this.#resumeAgentRun(agentRunId, this.#recoveredToolResults.get(agentRunId));
+  }
+
+  async #resumeAgentRun(
+    agentRunId: string,
+    recoveredToolResult?: {
+      eventId: string;
+      result: LocalToolResultPayload;
+      toolCallId: string;
+    },
+  ): Promise<void> {
+    const conversationId = this.#viewModel.conversation.activeConversationId;
+    if (!conversationId) throw new Error("Create a Conversation before resuming an Agent Run.");
+    if (this.#viewModel.conversation.runState === "streaming") {
+      throw new Error("Wait for the current Agent Run to finish.");
+    }
+    const run = this.#viewModel.conversation.agentRuns.find((candidate) => candidate.id === agentRunId);
+    if (!run || run.status !== "interrupted") {
+      throw new Error(`Agent Run '${agentRunId}' is not Interrupted.`);
+    }
+    const messages = [
+      ...this.#viewModel.conversation.messages,
+      { role: "assistant" as const, text: "" },
+    ];
+    this.#activeRun = { agentRunId, conversationId };
+    this.#updateConversation({
+      ...this.#viewModel.conversation,
+      agentRuns: this.#runsWithStatus(agentRunId, "running"),
+      messages,
+      runState: "streaming",
+      error: undefined,
+    });
+    try {
+      for await (const event of this.#runtime.resumeAgentRun({
+        conversationId,
+        agentRunId,
+        ...(recoveredToolResult ? { recoveredToolResult } : {}),
+      })) {
+        if (event.type === "agent_run.delta") {
+          messages[messages.length - 1] = {
+            role: "assistant",
+            text: messages[messages.length - 1].text + event.delta,
+          };
+          this.#updateConversation({ ...this.#viewModel.conversation, messages: [...messages] });
+        } else if (event.type === "agent_run.completed") {
+          messages[messages.length - 1] = event.output;
+          this.#recoveredToolResults.delete(agentRunId);
+          this.#setRunStatus(agentRunId, "completed");
+        } else if (event.type === "tool_call.requested") {
+          const requestedChange = this.#requestedChange(
+            event.toolCallId,
+            event.tool.name,
+            event.tool.arguments,
+          );
+          this.#updateConversation({
+            ...this.#viewModel.conversation,
+            toolCalls: [
+              ...this.#viewModel.conversation.toolCalls,
+              {
+                id: event.toolCallId,
+                agentRunId,
+                name: event.tool.name,
+                arguments: event.tool.arguments,
+                status: "requested",
+              },
+            ],
+            vaultChanges: requestedChange
+              ? [...this.#viewModel.conversation.vaultChanges, requestedChange]
+              : this.#viewModel.conversation.vaultChanges,
+          });
+        } else if (event.type === "tool_call.completed") {
+          if (event.tool.name === "vault_propose_changes") {
+            await this.#vaultChanges?.acknowledge?.(event.toolCallId);
+          }
+          if (this.#recoveredToolResults.get(agentRunId)?.toolCallId === event.toolCallId) {
+            this.#recoveredToolResults.delete(agentRunId);
+          }
+          this.#updateConversation({
+            ...this.#viewModel.conversation,
+            toolCalls: this.#viewModel.conversation.toolCalls.map((call) =>
+              call.id === event.toolCallId ? { ...call, status: event.status } : call
+            ),
+            error:
+              event.status === "failed" && event.error
+                ? { code: event.error.code, message: event.error.message }
+                : this.#viewModel.conversation.error,
+          });
+        } else if (event.type === "agent_run.failed") {
+          this.#recoveredToolResults.delete(agentRunId);
+          messages.pop();
+          this.#updateConversation({
+            ...this.#viewModel.conversation,
+            messages: [...messages],
+            agentRuns: this.#runsWithStatus(agentRunId, "failed"),
+            runState: "idle",
+            error: event.error,
+          });
+        } else if (event.type === "agent_run.cancelled" || event.type === "agent_run.interrupted") {
+          const cancelled = event.type === "agent_run.cancelled";
+          if (cancelled) this.#recoveredToolResults.delete(agentRunId);
+          messages.pop();
+          this.#updateConversation({
+            ...this.#viewModel.conversation,
+            messages: [...messages],
+            agentRuns: this.#runsWithStatus(agentRunId, cancelled ? "cancelled" : "interrupted"),
+            runState: "idle",
+            toolCalls: cancelled
+              ? this.#terminalizedToolCalls(agentRunId)
+              : this.#interruptedToolCalls(agentRunId, recoveredToolResult?.toolCallId),
+            vaultChanges: cancelled
+              ? this.#cancelPendingVaultChanges(agentRunId)
+              : this.#viewModel.conversation.vaultChanges,
+          });
+        }
+      }
+      this.#updateConversation({
+        ...this.#viewModel.conversation,
+        messages: [...messages],
+        runState: "idle",
+      });
+    } catch (error) {
+      messages.pop();
+      this.#updateConversation({
+        ...this.#viewModel.conversation,
+        messages: [...messages],
+        runState: "idle",
+        agentRuns: this.#runsWithStatus(agentRunId, "interrupted"),
+        toolCalls: this.#interruptedToolCalls(agentRunId, recoveredToolResult?.toolCallId),
+        error: {
+          code: "transport_error",
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
+    } finally {
+      if (this.#activeRun?.agentRunId === agentRunId) this.#activeRun = undefined;
+    }
+  }
+
   stopAgentRun(): void {
     if (!this.#activeRun) return;
-    const vaultChanges = this.#cancelPendingVaultChanges(this.#activeRun.agentRunId);
-    if (vaultChanges !== this.#viewModel.conversation.vaultChanges) {
-      this.#updateConversation({ ...this.#viewModel.conversation, vaultChanges });
-    }
     this.#runtime.cancelAgentRun(this.#activeRun);
   }
 
   async decideVaultChange(toolCallId: string, decision: "apply" | "reject"): Promise<void> {
     if (!this.#vaultChanges) throw new Error("Vault Change decisions are unavailable.");
+    const call = this.#viewModel.conversation.toolCalls.find((candidate) => candidate.id === toolCallId);
+    const run = call
+      ? this.#viewModel.conversation.agentRuns.find((candidate) => candidate.id === call.agentRunId)
+      : undefined;
     this.#setVaultChangeStatus(toolCallId, decision === "apply" ? "applying" : "rejecting");
-    const result = await this.#vaultChanges.decide(toolCallId, decision);
-    if (!result.ok || result.value.type !== "vault_propose_changes") {
-      this.#setVaultChangeStatus(toolCallId, "failed");
-      if (!result.ok) {
-        this.#updateConversation({
-          ...this.#viewModel.conversation,
-          error: { code: "provider_error", message: result.error.message },
-        });
-      }
+    let result: LocalToolResultPayload;
+    try {
+      result = await this.#vaultChanges.decide(toolCallId, decision);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.#setVaultChangeStatus(toolCallId, "pending");
+      this.#updateConversation({
+        ...this.#viewModel.conversation,
+        error: { code: "tool_error", message },
+      });
       return;
     }
-    this.#setVaultChangeStatus(toolCallId, result.value.decision);
+    if (!result.ok) {
+      this.#setVaultChangeStatus(toolCallId, "failed");
+      this.#updateConversation({
+        ...this.#viewModel.conversation,
+        error: { code: result.error.code, message: result.error.message },
+      });
+    } else if (result.value.type === "vault_propose_changes") {
+      this.#setVaultChangeStatus(toolCallId, result.value.decision);
+    } else {
+      throw new Error("The Vault Change decision returned the wrong Tool Result type.");
+    }
+    if (call && run?.status === "interrupted") {
+      const recoveredToolResult = {
+        eventId: randomUUID(),
+        toolCallId,
+        result,
+      };
+      this.#recoveredToolResults.set(run.id, recoveredToolResult);
+      await this.#resumeAgentRun(run.id, recoveredToolResult);
+    }
   }
 
   async undoVaultChange(batchId: string): Promise<void> {
@@ -441,6 +633,39 @@ export class SidebarController {
     for (const subscriber of this.#subscribers) subscriber(this.#viewModel);
   }
 
+  async #rehydratePendingVaultChanges(calls: ToolCallRecord[]): Promise<void> {
+    if (!this.#vaultChanges?.rehydrate) return;
+    for (const call of calls) {
+      if (
+        call.name === "vault_propose_changes" &&
+        call.status === "requested" &&
+        call.vaultChangeState === "pending"
+      ) {
+        const restored = await this.#vaultChanges.rehydrate(call.id);
+        if (restored.result) {
+          this.#recoveredToolResults.set(call.agentRunId, {
+            eventId: randomUUID(),
+            toolCallId: call.id,
+            result: restored.result,
+          });
+        }
+      } else if (call.name === "vault_propose_changes") {
+        await this.#vaultChanges.acknowledge?.(call.id);
+      }
+    }
+  }
+
+  #toolCallsWithRecoveredFailures(calls: ToolCallRecord[]): ToolCallRecord[] {
+    const recoveredIds = new Set(
+      [...this.#recoveredToolResults.values()].map(({ toolCallId }) => toolCallId),
+    );
+    return calls.map((call) =>
+      recoveredIds.has(call.id) && call.status === "requested"
+        ? { ...call, status: "failed" }
+        : call,
+    );
+  }
+
   #updateConversation(conversation: SidebarViewModel["conversation"]): void {
     this.#viewModel = { ...this.#viewModel, conversation };
     for (const subscriber of this.#subscribers) subscriber(this.#viewModel);
@@ -458,6 +683,16 @@ export class SidebarController {
   #terminalizedToolCalls(agentRunId: string): ToolCallRecord[] {
     return this.#viewModel.conversation.toolCalls.map((call) =>
       call.agentRunId === agentRunId && call.status === "requested"
+        ? { ...call, status: "failed" }
+        : call,
+    );
+  }
+
+  #interruptedToolCalls(agentRunId: string, recoveredToolCallId?: string): ToolCallRecord[] {
+    return this.#viewModel.conversation.toolCalls.map((call) =>
+      call.agentRunId === agentRunId &&
+      call.status === "requested" &&
+      (call.name !== "vault_propose_changes" || call.id === recoveredToolCallId)
         ? { ...call, status: "failed" }
         : call,
     );

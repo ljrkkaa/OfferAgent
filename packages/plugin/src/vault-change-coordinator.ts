@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { TFile, Vault } from "obsidian";
@@ -19,6 +19,7 @@ import type {
 
 const MAX_ACTIONS = 20;
 const MAX_BATCH_BYTES = 131_072;
+const MAX_PENDING_BYTES = MAX_BATCH_BYTES + 16_384;
 const MAX_FILE_BYTES = 262_144;
 const MAX_ID_LENGTH = 128;
 const MAX_PATH_LENGTH = 512;
@@ -44,6 +45,19 @@ export interface CheckpointStore {
   create(batchId: string, existingPaths: string[]): Promise<string>;
   read(checkpointRef: string, vaultPath: string): Promise<string | undefined>;
   verify?(checkpointRef: string): Promise<boolean>;
+}
+
+export interface PendingProposalStore {
+  deletePending(toolCallId: string): Promise<void>;
+  loadPending(toolCallId: string): Promise<PersistedPendingProposal | undefined>;
+  savePending(toolCallId: string, pending: PersistedPendingProposal): Promise<void>;
+}
+
+export interface PersistedPendingProposal {
+  proposal: VaultChangeBatchProposal;
+  result?: LocalToolResultPayload;
+  targets: VaultChangeTargetResult[];
+  version: 1;
 }
 
 export interface VaultChangeJournal {
@@ -77,6 +91,7 @@ interface PreparedBatch {
 }
 
 interface PendingBatch {
+  completedResult?: LocalToolResultPayload;
   decision?: Promise<LocalToolResultPayload>;
   prepared: PreparedBatch;
   promise: Promise<LocalToolResultPayload>;
@@ -210,6 +225,13 @@ function validId(value: unknown): value is string {
   return typeof value === "string" && value.length <= MAX_ID_LENGTH && ID_PATTERN.test(value);
 }
 
+function pendingProposalRef(toolCallId: string): string | undefined {
+  if (typeof toolCallId !== "string" || toolCallId.length === 0 || toolCallId.length > MAX_ID_LENGTH) {
+    return undefined;
+  }
+  return `refs/offeragent/pending/${createHash("sha256").update(toolCallId, "utf8").digest("hex")}`;
+}
+
 function occurrences(content: string, expected: string): number {
   let count = 0;
   let offset = 0;
@@ -242,7 +264,7 @@ function gitCommand(
   });
 }
 
-export class GitCheckpointStore implements CheckpointStore {
+export class GitCheckpointStore implements CheckpointStore, PendingProposalStore {
   readonly #root: string;
 
   constructor(vaultRoot: string) {
@@ -333,6 +355,63 @@ export class GitCheckpointStore implements CheckpointStore {
       await gitCommand(this.#root, ["update-ref", "-d", checkpointRef]);
     }
     return deleted;
+  }
+
+  async savePending(toolCallId: string, pending: PersistedPendingProposal): Promise<void> {
+    const pendingRef = pendingProposalRef(toolCallId);
+    if (!pendingRef) throw new Error("The pending Tool Call identifier is invalid.");
+    const serialized = JSON.stringify(pending);
+    if (Buffer.byteLength(serialized, "utf8") > MAX_PENDING_BYTES) {
+      throw new Error("The pending Vault Change Batch is too large to persist.");
+    }
+    const repositoryRoot = await gitCommand(this.#root, ["rev-parse", "--show-toplevel"]);
+    if (path.resolve(repositoryRoot) !== path.resolve(this.#root)) {
+      throw new Error("The Vault root must be the Git repository root.");
+    }
+    const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-pending-"));
+    const pendingPath = path.join(temporaryDirectory, "proposal.json");
+    try {
+      await writeFile(pendingPath, serialized, { encoding: "utf8", flag: "wx" });
+      const blob = await gitCommand(this.#root, ["hash-object", "-w", pendingPath]);
+      await gitCommand(this.#root, ["update-ref", pendingRef, blob]);
+      await gitCommand(this.#root, ["cat-file", "-e", `${pendingRef}^{blob}`]);
+    } finally {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    }
+  }
+
+  async loadPending(toolCallId: string): Promise<PersistedPendingProposal | undefined> {
+    const pendingRef = pendingProposalRef(toolCallId);
+    if (!pendingRef) return undefined;
+    try {
+      await gitCommand(this.#root, ["cat-file", "-e", `${pendingRef}^{blob}`]);
+      const serialized = await gitCommand(this.#root, ["show", pendingRef], process.env, false);
+      if (Buffer.byteLength(serialized, "utf8") > MAX_PENDING_BYTES) return undefined;
+      const pending = JSON.parse(serialized) as PersistedPendingProposal;
+      if (
+        pending.version !== 1 ||
+        !pending.proposal ||
+        !Array.isArray(pending.proposal.actions) ||
+        !Array.isArray(pending.targets) ||
+        pending.targets.length !== pending.proposal.actions.length ||
+        pending.targets.some((target, index) =>
+          target.path !== pending.proposal.actions[index]?.path ||
+          typeof target.beforeHash !== "string" ||
+          typeof target.afterHash !== "string"
+        )
+      ) {
+        return undefined;
+      }
+      return pending;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async deletePending(toolCallId: string): Promise<void> {
+    const pendingRef = pendingProposalRef(toolCallId);
+    if (!pendingRef) return;
+    await gitCommand(this.#root, ["update-ref", "-d", pendingRef]);
   }
 }
 
@@ -438,11 +517,14 @@ export class VaultChangeCoordinator {
   readonly #automaticResults = new Map<string, LocalToolResultPayload>();
   readonly #authorizing = new Map<string, Promise<LocalToolResultPayload | undefined>>();
   readonly #cancelled = new Set<string>();
+  readonly #completedDecisions = new Map<string, LocalToolResultPayload>();
   readonly #checkpoints: CheckpointStore;
   readonly #injectCrash: (point: string) => Promise<void> | void;
   readonly #journal: VaultChangeJournal;
   readonly #permissionMode: () => VaultPermissionMode;
   readonly #pending = new Map<string, PendingBatch>();
+  readonly #pendingStore?: PendingProposalStore;
+  readonly #persisting = new Map<string, Promise<void>>();
   readonly #preparing = new Map<string, Promise<Failure | PreparedBatch>>();
   readonly #vault: VaultChangeFileApi;
 
@@ -452,12 +534,14 @@ export class VaultChangeCoordinator {
     journal: VaultChangeJournal = NOOP_JOURNAL,
     injectCrash: (point: string) => Promise<void> | void = () => {},
     permissionMode: () => VaultPermissionMode = () => "ask_every_time",
+    pendingStore?: PendingProposalStore,
   ) {
     this.#vault = vault;
     this.#checkpoints = checkpoints;
     this.#journal = journal;
     this.#injectCrash = injectCrash;
     this.#permissionMode = permissionMode;
+    this.#pendingStore = pendingStore;
   }
 
   async execute(event: ChangeToolCall): Promise<LocalToolResultPayload> {
@@ -483,53 +567,168 @@ export class VaultChangeCoordinator {
       this.#preparing.delete(event.toolCallId);
       return this.#permissionDenied();
     }
-    if (
+    const automatic =
       permissionMode === "trusted_vault" &&
-      prepared.actions.every(({ controlFile }) => !controlFile)
-    ) {
+      prepared.actions.every(({ controlFile }) => !controlFile);
+    const pending = automatic ? undefined : this.#pendingDecision(event.toolCallId, prepared);
+    try {
+      await this.#persistPending(event.toolCallId, prepared);
+    } catch (error) {
+      this.#pending.delete(event.toolCallId);
+      this.#preparing.delete(event.toolCallId);
+      throw error;
+    }
+    if (this.#cancelled.delete(event.toolCallId)) {
+      const cancelled = failure(
+        "tool_error",
+        "The pending Vault Change Batch was cancelled with its Agent Run.",
+      );
+      this.#pending.get(event.toolCallId)?.resolve(cancelled);
+      this.#pending.delete(event.toolCallId);
+      this.#preparing.delete(event.toolCallId);
+      await this.#pendingStore?.deletePending(event.toolCallId);
+      return cancelled;
+    }
+    if (automatic) {
       let finishAuthorization!: (result: LocalToolResultPayload | undefined) => void;
       const authorization = new Promise<LocalToolResultPayload | undefined>((resolve) => {
         finishAuthorization = resolve;
       });
       this.#authorizing.set(event.toolCallId, authorization);
+      let result: LocalToolResultPayload | ConfirmationRequired;
       try {
-        const result = await this.#apply(prepared, "automatic");
-        if (requiresConfirmation(result)) {
-          if (this.#cancelled.delete(event.toolCallId)) {
-            this.#preparing.delete(event.toolCallId);
-            finishAuthorization(undefined);
-            this.#authorizing.delete(event.toolCallId);
-            return failure(
-              "tool_error",
-              "The pending Vault Change Batch was cancelled with its Agent Run.",
-            );
-          }
-          const pending = this.#pendingDecision(event.toolCallId, result.prepared);
+        result = await this.#apply(prepared, "automatic");
+      } catch (error) {
+        if (error instanceof VaultChangeCrashInjectionError) {
           finishAuthorization(undefined);
           this.#authorizing.delete(event.toolCallId);
-          return pending;
+          throw error;
         }
-        this.#cancelled.delete(event.toolCallId);
-        this.#preparing.delete(event.toolCallId);
-        this.#rememberAutomaticResult(event.toolCallId, result);
-        finishAuthorization(result);
-        this.#authorizing.delete(event.toolCallId);
-        return result;
-      } catch (error) {
-        this.#cancelled.delete(event.toolCallId);
-        this.#preparing.delete(event.toolCallId);
-        const result = failure(
+        result = failure(
           "tool_error",
           error instanceof Error ? error.message : "The Vault Change Batch could not be applied.",
         );
-        this.#rememberAutomaticResult(event.toolCallId, result);
-        finishAuthorization(result);
+      }
+      if (requiresConfirmation(result)) {
+        if (this.#cancelled.delete(event.toolCallId)) {
+          this.#preparing.delete(event.toolCallId);
+          await this.#pendingStore?.deletePending(event.toolCallId);
+          finishAuthorization(undefined);
+          this.#authorizing.delete(event.toolCallId);
+          return failure(
+            "tool_error",
+            "The pending Vault Change Batch was cancelled with its Agent Run.",
+          );
+        }
+        const pending = this.#pendingDecision(event.toolCallId, result.prepared);
+        try {
+          await this.#persistPending(event.toolCallId, result.prepared);
+        } catch (error) {
+          this.#pending.delete(event.toolCallId);
+          this.#preparing.delete(event.toolCallId);
+          finishAuthorization(undefined);
+          this.#authorizing.delete(event.toolCallId);
+          throw error;
+        }
+        finishAuthorization(undefined);
         this.#authorizing.delete(event.toolCallId);
-        if (error instanceof VaultChangeCrashInjectionError) throw error;
-        return result;
+        return pending;
+      }
+      try {
+        await this.#persistDecisionResult(event.toolCallId, prepared, result);
+      } catch {
+        // The proposal and apply journal already make the actual result recoverable. A failed
+        // handoff overwrite must never turn a committed Vault mutation into a reported failure.
+      }
+      this.#cancelled.delete(event.toolCallId);
+      this.#preparing.delete(event.toolCallId);
+      this.#rememberAutomaticResult(event.toolCallId, result);
+      finishAuthorization(result);
+      this.#authorizing.delete(event.toolCallId);
+      return result;
+    }
+    return pending!;
+  }
+
+  async #persistPending(toolCallId: string, prepared: PreparedBatch): Promise<void> {
+    if (!this.#pendingStore) return;
+    const persistence = this.#pendingStore.savePending(toolCallId, {
+      version: 1,
+      proposal: prepared.proposal,
+      targets: prepared.actions.map((action) => ({
+        path: action.action.path,
+        beforeHash: action.beforeHash,
+        afterHash: action.afterHash,
+      })),
+    });
+    this.#persisting.set(toolCallId, persistence);
+    try {
+      await persistence;
+    } finally {
+      if (this.#persisting.get(toolCallId) === persistence) this.#persisting.delete(toolCallId);
+    }
+  }
+
+  async rehydrate(toolCallId: string): Promise<{
+    proposal?: VaultChangeBatchProposal;
+    result?: LocalToolResultPayload;
+  }> {
+    await this.#preparing.get(toolCallId);
+    await this.#persisting.get(toolCallId);
+    const existing = this.#pending.get(toolCallId);
+    if (existing) return { proposal: existing.prepared.proposal };
+    const persisted = await this.#pendingStore?.loadPending(toolCallId);
+    if (!persisted) {
+      return {
+        result: failure(
+          "plugin_disconnected",
+          "The Vault Change proposal was not durably prepared before the plugin disconnected.",
+        ),
+      };
+    }
+    if (!persisted.result) {
+      const applied = (await this.#journal.list(["applied"])).find(
+        (record) => record.batchId === persisted.proposal.batchId,
+      );
+      if (applied) {
+        persisted.result = {
+          ok: true,
+          value: {
+            type: "vault_propose_changes",
+            batchId: applied.batchId,
+            decision: "applied",
+            checkpointRef: applied.checkpointRef,
+            targets: applied.targets,
+          },
+        };
+        await this.#pendingStore?.savePending(toolCallId, persisted);
       }
     }
-    return this.#pendingDecision(event.toolCallId, prepared);
+    if (persisted.result) {
+      this.#completedDecisions.set(toolCallId, persisted.result);
+      return {
+        proposal: persisted.proposal,
+        result: persisted.result,
+      };
+    }
+    const preparation = Promise.resolve<PreparedBatch>({
+      proposal: persisted.proposal,
+      actions: persisted.proposal.actions.map((action, index) => ({
+        action,
+        afterContent: "",
+        afterHash: persisted.targets[index].afterHash,
+        beforeHash: persisted.targets[index].beforeHash,
+        controlFile: isControlVaultPath(action.path),
+      })),
+    });
+    this.#preparing.set(toolCallId, preparation);
+    const prepared = await preparation;
+    if (isFailure(prepared)) {
+      this.#preparing.delete(toolCallId);
+      throw new Error(prepared.error.message);
+    }
+    void this.#pendingDecision(toolCallId, prepared);
+    return { proposal: persisted.proposal };
   }
 
   #pendingDecision(toolCallId: string, prepared: PreparedBatch): Promise<LocalToolResultPayload> {
@@ -549,6 +748,11 @@ export class VaultChangeCoordinator {
       );
       this.#pending.delete(toolCallId);
       this.#preparing.delete(toolCallId);
+      const persistence = this.#persisting.get(toolCallId);
+      void (async () => {
+        await persistence;
+        await this.#pendingStore?.deletePending(toolCallId);
+      })().catch(() => {});
       return;
     }
     if (this.#preparing.has(toolCallId) && !pending) this.#cancelled.add(toolCallId);
@@ -561,6 +765,7 @@ export class VaultChangeCoordinator {
     if (isFailure(prepared)) throw new Error(prepared.error.message);
     await Promise.resolve();
     await this.#authorizing.get(toolCallId);
+    await this.#persisting.get(toolCallId);
     if (!this.#pending.has(toolCallId)) throw new Error(`Vault Change '${toolCallId}' is not pending.`);
     return prepared.proposal;
   }
@@ -569,11 +774,14 @@ export class VaultChangeCoordinator {
     toolCallId: string,
     decision: "apply" | "reject",
   ): Promise<LocalToolResultPayload> {
+    const completedDecision = this.#completedDecisions.get(toolCallId);
+    if (completedDecision) return completedDecision;
     const completedAutomaticResult = this.#automaticResults.get(toolCallId);
     if (completedAutomaticResult) return completedAutomaticResult;
     const preparation = this.#preparing.get(toolCallId);
     if (!preparation) return failure("not_found", `Vault Change '${toolCallId}' is not pending.`);
     await preparation;
+    await this.#persisting.get(toolCallId);
     await Promise.resolve();
     const automaticResult = await this.#authorizing.get(toolCallId);
     if (automaticResult) return automaticResult;
@@ -581,7 +789,9 @@ export class VaultChangeCoordinator {
     if (!pending) return failure("not_found", `Vault Change '${toolCallId}' is not pending.`);
     if (!pending.decision) {
       pending.decision =
-        decision === "apply" && this.#permissionMode() === "read_only"
+        pending.completedResult
+          ? this.#finishPendingResult(toolCallId, pending)
+          : decision === "apply" && this.#permissionMode() === "read_only"
           ? this.#finishPermissionDenial(toolCallId, pending)
           : this.#finishDecision(toolCallId, pending, decision);
     }
@@ -610,10 +820,14 @@ export class VaultChangeCoordinator {
     pending: PendingBatch,
   ): Promise<LocalToolResultPayload> {
     const result = this.#permissionDenied();
-    pending.resolve(result);
-    this.#pending.delete(toolCallId);
-    this.#preparing.delete(toolCallId);
-    return result;
+    pending.completedResult = result;
+    return this.#finishPendingResult(toolCallId, pending);
+  }
+
+  async acknowledge(toolCallId: string): Promise<void> {
+    await this.#persisting.get(toolCallId);
+    this.#completedDecisions.delete(toolCallId);
+    await this.#pendingStore?.deletePending(toolCallId);
   }
 
   async undo(batchId: string): Promise<VaultUndoResultPayload> {
@@ -780,10 +994,44 @@ export class VaultChangeCoordinator {
         error instanceof Error ? error.message : "The Vault Change Batch could not be applied.",
       );
     }
+    pending.completedResult = result;
+    return this.#finishPendingResult(toolCallId, pending);
+  }
+
+  async #finishPendingResult(
+    toolCallId: string,
+    pending: PendingBatch,
+  ): Promise<LocalToolResultPayload> {
+    const result = pending.completedResult;
+    if (!result) throw new Error(`Vault Change '${toolCallId}' has no completed decision.`);
+    try {
+      await this.#persistDecisionResult(toolCallId, pending.prepared, result);
+    } catch (error) {
+      pending.decision = undefined;
+      throw error;
+    }
     pending.resolve(result);
     this.#pending.delete(toolCallId);
     this.#preparing.delete(toolCallId);
     return result;
+  }
+
+  async #persistDecisionResult(
+    toolCallId: string,
+    prepared: PreparedBatch,
+    result: LocalToolResultPayload,
+  ): Promise<void> {
+    await this.#pendingStore?.savePending(toolCallId, {
+      version: 1,
+      proposal: prepared.proposal,
+      result,
+      targets: prepared.actions.map((action) => ({
+        path: action.action.path,
+        beforeHash: action.beforeHash,
+        afterHash: action.afterHash,
+      })),
+    });
+    this.#completedDecisions.set(toolCallId, result);
   }
 
   async #apply(

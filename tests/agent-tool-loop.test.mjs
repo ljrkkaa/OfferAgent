@@ -560,7 +560,7 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
   database.close();
 });
 
-test("a real plugin socket drop terminalizes its pending tool call as disconnected", async (t) => {
+test("a real plugin socket drop leaves an incomplete tool step uncommitted for Resume", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-tool-drop-"));
   const statePath = path.join(temporaryDirectory, "state.db");
   const token = "tool-drop-token";
@@ -652,7 +652,6 @@ test("a real plugin socket drop terminalizes its pending tool call as disconnect
       ["tool_call.requested"],
       ["tool_call.completed"],
       ["tool_call.requested"],
-      ["tool_call.completed"],
       ["agent_run.interrupted"],
     ],
   );

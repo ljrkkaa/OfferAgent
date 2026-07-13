@@ -388,6 +388,20 @@ export interface AgentRunCancel {
   type: "agent_run.cancel";
 }
 
+export interface AgentRunResume {
+  agentRunId: string;
+  conversationId: string;
+  eventId: string;
+  protocolVersion: typeof PROTOCOL_VERSION;
+  sequence: 0;
+  type: "agent_run.resume";
+  recoveredToolResult?: {
+    eventId: string;
+    result: LocalToolResultPayload;
+    toolCallId: string;
+  };
+}
+
 export interface DurableEventAck {
   acknowledgedEventId: string;
   agentRunId: string;
@@ -419,6 +433,7 @@ interface AgentRunEventBase {
 
 export type AgentRunEvent =
   | (AgentRunEventBase & { type: "agent_run.started"; model: string })
+  | (AgentRunEventBase & { type: "agent_run.resumed"; model: string })
   | (AgentRunEventBase & { type: "agent_run.delta"; delta: string })
   | (AgentRunEventBase & {
       type: "hosted_web_search.completed";

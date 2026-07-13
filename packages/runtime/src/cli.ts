@@ -8,6 +8,7 @@ import {
   PROTOCOL_VERSION,
   type AgentRunCancel,
   type AgentRunEvent,
+  type AgentRunResume,
   type AgentRunStart,
   type ConversationCommand,
   type ConversationEvent,
@@ -37,7 +38,7 @@ import {
   type ModelConversationItem,
   type ModelProvider,
 } from "./model-provider";
-import { RuntimeStateStore } from "./state-store";
+import { RuntimeStateStore, type RunCheckpoint } from "./state-store";
 import { WebReader } from "./web-read";
 import { CapabilityGatedModelProvider } from "./capability-gated-provider";
 
@@ -216,6 +217,55 @@ function assertBoundedToolArguments(arguments_: unknown): void {
       `The model provider returned local tool arguments larger than ${MAX_LOCAL_TOOL_ARGUMENT_BYTES} UTF-8 bytes.`,
     );
   }
+}
+
+function checkpointInput(input: ModelConversationItem[]): ModelConversationItem[] {
+  const skillCallIds = new Set(
+    input
+      .filter(
+        (item): item is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
+          item.type === "local_tool_call" && item.name === "skill_read",
+      )
+      .map((item) => item.callId),
+  );
+  return input.flatMap((item) => {
+    if (
+      (item.type === "local_tool_call" || item.type === "local_tool_result") &&
+      skillCallIds.has(item.callId)
+    ) {
+      return [];
+    }
+    if (item.type !== "local_tool_call" || item.name !== "vault_propose_changes") return [item];
+    const proposal = item.arguments && typeof item.arguments === "object" && !Array.isArray(item.arguments)
+      ? item.arguments as {
+          actions?: unknown[];
+          batchId?: unknown;
+          idempotencyKey?: unknown;
+          task?: unknown;
+        }
+      : {};
+    return [{
+      ...item,
+      arguments: {
+        batchId: proposal.batchId,
+        idempotencyKey: proposal.idempotencyKey,
+        task: proposal.task,
+        actions: Array.isArray(proposal.actions)
+          ? proposal.actions.map((candidate) => {
+              if (!candidate || typeof candidate !== "object") return {};
+              const action = candidate as Record<string, unknown>;
+              return {
+                actionId: action.actionId,
+                idempotencyKey: action.idempotencyKey,
+                operation: action.operation,
+                path: action.path,
+                expectedVersion: action.expectedVersion,
+              };
+            })
+          : [],
+      },
+    }];
+  });
 }
 
 function isBoundedVaultPath(value: unknown): value is string {
@@ -545,6 +595,23 @@ function isAgentRunStart(value: unknown): value is AgentRunStart {
   );
 }
 
+function isAgentRunResume(value: unknown): value is AgentRunResume {
+  if (!value || typeof value !== "object") return false;
+  const message = value as Partial<AgentRunResume>;
+  const recovered = message.recoveredToolResult;
+  return message.type === "agent_run.resume" &&
+    message.protocolVersion === PROTOCOL_VERSION &&
+    message.sequence === 0 &&
+    isProtocolIdentifier(message.eventId) &&
+    isProtocolIdentifier(message.conversationId) &&
+    isProtocolIdentifier(message.agentRunId) &&
+    (recovered === undefined || (
+      isProtocolIdentifier(recovered.eventId) &&
+      isProtocolIdentifier(recovered.toolCallId) &&
+      isLocalToolResultPayload(recovered.result)
+    ));
+}
+
 function isAgentRunCancel(value: unknown): value is AgentRunCancel {
   if (!value || typeof value !== "object") return false;
   const message = value as Partial<AgentRunCancel>;
@@ -792,6 +859,7 @@ async function startRuntime({
     string,
     {
       cancelRequested: boolean;
+      commandIdentity: string;
       controller: AbortController;
       conversationId: string;
       input: string;
@@ -932,15 +1000,9 @@ async function startRuntime({
         if (pending.socket !== socket) continue;
         pendingToolResults.delete(toolCallId);
         completedToolResults.set(toolCallId, {});
-        pending.resolve({
-          result: {
-            ok: false,
-            error: {
-              code: "plugin_disconnected",
-              message: "The Obsidian plugin disconnected during the Vault tool call.",
-            },
-          },
-        });
+        pending.reject(
+          new Error("The Obsidian plugin disconnected during the Vault tool call."),
+        );
       }
       for (const run of activeRuns.values()) {
         if (run.socket === socket) run.controller.abort();
@@ -1116,97 +1178,213 @@ async function startRuntime({
           });
         return;
       }
-      if (!isAgentRunStart(message)) {
+      const startCommand = isAgentRunStart(message) ? message : undefined;
+      const resumeCommand = isAgentRunResume(message) ? message : undefined;
+      if (!startCommand && !resumeCommand) {
         socket.close(1008, "Unsupported protocol message.");
         return;
       }
-      const activeRun = activeRuns.get(message.agentRunId);
+      const runCommand = (startCommand ?? resumeCommand) as AgentRunStart | AgentRunResume;
+      const activeRun = activeRuns.get(runCommand.agentRunId);
       if (activeRun) {
         if (
-          activeRun.startEventId === message.eventId &&
-          activeRun.conversationId === message.conversationId &&
-          activeRun.model === message.model &&
-          activeRun.input === message.input.text
+          activeRun.startEventId === runCommand.eventId &&
+          activeRun.conversationId === runCommand.conversationId &&
+          activeRun.commandIdentity === canonicalProtocolMessage(runCommand)
         ) {
           return;
         }
-        socket.close(1008, "Conflicting duplicate Agent Run start.");
+        socket.close(1008, "Conflicting duplicate Agent Run command.");
         return;
       }
       const controller = new AbortController();
-      activeRuns.set(message.agentRunId, {
+      activeRuns.set(runCommand.agentRunId, {
         cancelRequested: false,
+        commandIdentity: canonicalProtocolMessage(runCommand),
         controller,
-        conversationId: message.conversationId,
-        input: message.input.text,
-        model: message.model,
-        startEventId: message.eventId,
+        conversationId: runCommand.conversationId,
+        input: startCommand?.input.text ?? "",
+        model: startCommand?.model ?? "",
+        startEventId: runCommand.eventId,
         socket,
       });
       void (async () => {
         let sequence = 1;
+        let model = startCommand?.model ?? "";
+        let userInput = startCommand?.input.text ?? "";
+        let checkpoint: RunCheckpoint | undefined;
         let output = "";
         const citations: WebCitation[] = [];
         const base = {
           protocolVersion: PROTOCOL_VERSION,
-          conversationId: message.conversationId,
-          agentRunId: message.agentRunId,
+          conversationId: runCommand.conversationId,
+          agentRunId: runCommand.agentRunId,
         };
-        const startedEvent: AgentRunEvent = {
-          ...base,
-          type: "agent_run.started",
-          eventId: randomUUID(),
-          sequence,
-          model: message.model,
-        };
-        try {
-          const began = await store.beginAgentRun(
-            message.conversationId,
-            message.agentRunId,
-            message.model,
-            message.input.text,
-            startedEvent,
-            message.eventId,
-          );
-          if (!began) {
-            for (const event of await store.listUnacknowledgedEvents(message.agentRunId)) {
-              sendEvent(socket, event);
+        if (resumeCommand) {
+          try {
+            const resumable = await store.resumeAgentRun(
+              resumeCommand.conversationId,
+              resumeCommand.agentRunId,
+              resumeCommand.recoveredToolResult,
+            );
+            checkpoint = resumable.checkpoint;
+            model = resumable.model;
+            sequence = resumable.nextSequence;
+            userInput = checkpoint.input.find((item) => item.type === "user_message")?.text ?? "";
+            const active = activeRuns.get(runCommand.agentRunId);
+            if (active) {
+              active.input = userInput;
+              active.model = model;
             }
-            activeRuns.delete(message.agentRunId);
+            const resumedEvent: Extract<AgentRunEvent, { type: "agent_run.resumed" }> = {
+              ...base,
+              type: "agent_run.resumed",
+              eventId: randomUUID(),
+              sequence,
+              model,
+            };
+            await store.recordAgentRunEvent(resumedEvent);
+            publishEvent(resumedEvent);
+            sequence += 1;
+          } catch (error) {
+            socket.close(
+              1008,
+              error instanceof Error ? error.message.slice(0, 120) : "Agent Run cannot be resumed.",
+            );
+            activeRuns.delete(runCommand.agentRunId);
             return;
           }
-        } catch (error) {
-          if (isProtocolIdentityConflict(error)) {
-            socket.close(1008, "Conflicting duplicate Agent Run start.");
-            activeRuns.delete(message.agentRunId);
-            return;
-          }
-          const providerError = asModelProviderError(error);
-          sendEvent(socket, {
+        } else if (startCommand) {
+          const startedEvent: Extract<AgentRunEvent, { type: "agent_run.started" }> = {
             ...base,
-            type: "agent_run.failed",
+            type: "agent_run.started",
             eventId: randomUUID(),
             sequence,
-            error: { code: providerError.code, message: providerError.message },
-          });
-          activeRuns.delete(message.agentRunId);
-          return;
+            model,
+          };
+          try {
+            const began = await store.beginAgentRun(
+              startCommand.conversationId,
+              startCommand.agentRunId,
+              model,
+              userInput,
+              startedEvent,
+              startCommand.eventId,
+            );
+            if (!began) {
+              for (const event of await store.listUnacknowledgedEvents(startCommand.agentRunId)) {
+                sendEvent(socket, event);
+              }
+              activeRuns.delete(runCommand.agentRunId);
+              return;
+            }
+          } catch (error) {
+            if (isProtocolIdentityConflict(error)) {
+              socket.close(1008, "Conflicting duplicate Agent Run start.");
+              activeRuns.delete(runCommand.agentRunId);
+              return;
+            }
+            const providerError = asModelProviderError(error);
+            sendEvent(socket, {
+              ...base,
+              type: "agent_run.failed",
+              eventId: randomUUID(),
+              sequence,
+              error: { code: providerError.code, message: providerError.message },
+            });
+            activeRuns.delete(runCommand.agentRunId);
+            return;
+          }
+          publishEvent(startedEvent);
+          sequence += 1;
         }
-        publishEvent(startedEvent);
-        sequence += 1;
         try {
-          let input: ModelConversationItem[] = [
-            { type: "user_message", text: message.input.text },
+          let input: ModelConversationItem[] = checkpoint?.input ?? [
+            { type: "user_message", text: userInput },
           ];
-          const requiredRereads = new Set<string>();
-          const canonicalReadPaths = new Map<string, string>();
+          const requiredRereads = new Set(checkpoint?.requiredRereads ?? []);
+          const canonicalReadPaths = new Map(checkpoint?.canonicalReadPaths ?? []);
           let agentContract: string | undefined;
-          let hostedWebSearchProbeAttempted = false;
+          let hostedWebSearchProbeAttempted =
+            checkpoint?.hostedWebSearchProbeAttempted ?? false;
+          const checkpointSkills = new Set(checkpoint?.localSkills ?? []);
           const localSkills = new Map<string, string>();
+          let completedSteps = checkpoint?.completedSteps ?? 0;
+          let pendingToolStep = checkpoint?.pendingToolStep;
+          const currentCheckpoint = (): RunCheckpoint => ({
+              version: 1,
+              input: checkpointInput(input),
+              localSkills: [...new Set([...checkpointSkills, ...localSkills.keys()])],
+              ...(pendingToolStep ? { pendingToolStep } : {}),
+              canonicalReadPaths: [...canonicalReadPaths],
+              requiredRereads: [...requiredRereads],
+              hostedWebSearchProbeAttempted,
+              completedSteps,
+          });
+          const saveCheckpoint = async (): Promise<void> => {
+            await store.saveRunCheckpoint(runCommand.agentRunId, currentCheckpoint());
+          };
+          if (!checkpoint) await saveCheckpoint();
+          if (checkpoint && pendingToolStep) {
+            let recoveredResult = pendingToolStep.name === "skill_read"
+              ? undefined
+              : await store.getToolCallResult(
+              pendingToolStep.toolCallId,
+              runCommand.agentRunId,
+            );
+            if (!recoveredResult && pendingToolStep.name === "vault_propose_changes") {
+              const recovered = resumeCommand?.recoveredToolResult;
+              if (!recovered || recovered.toolCallId !== pendingToolStep.toolCallId) {
+                throw new Error("The pending Vault Change decision was not supplied.");
+              }
+              const completedEvent: Extract<AgentRunEvent, { type: "tool_call.completed" }> = {
+                ...base,
+                type: "tool_call.completed",
+                eventId: randomUUID(),
+                sequence,
+                toolCallId: recovered.toolCallId,
+                tool: { kind: "local", name: "vault_propose_changes" },
+                status: recovered.result.ok ? "completed" : "failed",
+                ...(recovered.result.ok ? {} : { error: recovered.result.error }),
+              };
+              await store.completeToolCall(
+                runCommand.agentRunId,
+                recovered.result,
+                completedEvent,
+                recovered.eventId,
+              );
+              publishEvent(completedEvent);
+              sequence += 1;
+              recoveredResult = recovered.result;
+            }
+            if (recoveredResult) {
+              input.push({
+                type: "local_tool_result",
+                callId: pendingToolStep.providerCallId,
+                result: recoveredResult,
+              });
+              completedSteps = pendingToolStep.completedSteps;
+            } else {
+              input = input.filter(
+                (item) =>
+                  !(
+                    item.type === "local_tool_call" &&
+                    item.callId === pendingToolStep!.providerCallId
+                  ),
+              );
+            }
+            pendingToolStep = undefined;
+            await saveCheckpoint();
+          }
           const executeLocalTool = async (
             name: LocalToolName,
             arguments_: unknown,
-          ): Promise<{ result: LocalToolResultPayload; stalePaths: string[] }> => {
+            pendingContext?: { completedSteps: number; providerCallId: string },
+          ): Promise<{
+            result: LocalToolResultPayload;
+            stalePaths: string[];
+            toolCallId: string;
+          }> => {
             assertBoundedToolArguments(arguments_);
             const toolCallId = randomUUID();
             const requestedSequence = sequence;
@@ -1225,7 +1403,36 @@ async function startRuntime({
                 arguments: arguments_,
               },
             };
-            await store.requestToolCall(message.agentRunId, requestedEvent);
+            if (pendingContext) {
+              pendingToolStep = {
+                completedSteps: pendingContext.completedSteps,
+                name,
+                providerCallId: pendingContext.providerCallId,
+                toolCallId,
+              };
+            }
+            await store.requestToolCall(
+              runCommand.agentRunId,
+              requestedEvent,
+              pendingContext ? currentCheckpoint() : undefined,
+            );
+            const resultPromise =
+              name === "web_read" || name === "hosted_web_search_probe"
+                ? undefined
+                : new Promise<{
+                    eventId?: string;
+                    result: LocalToolResultPayload;
+                  }>((resolve, reject) => {
+                    pendingToolResults.set(toolCallId, {
+                      agentRunId: runCommand.agentRunId,
+                      conversationId: runCommand.conversationId,
+                      reject,
+                      resolve,
+                      sequence: requestedSequence,
+                      socket,
+                    });
+                  });
+            void resultPromise?.catch(() => {});
             publishEvent(requestedEvent);
             sequence += 1;
             let result: LocalToolResultPayload;
@@ -1245,7 +1452,7 @@ async function startRuntime({
                 hostedWebSearchProbeAttempted = true;
                 try {
                   const status = await provider.reprobeHostedWebSearch(
-                    message.model,
+                    model,
                     controller.signal,
                   );
                   result = { ok: true, value: { type: "hosted_web_search_probe", status } };
@@ -1261,19 +1468,6 @@ async function startRuntime({
                 }
               }
             } else {
-              const resultPromise = new Promise<{
-                eventId?: string;
-                result: LocalToolResultPayload;
-              }>((resolve, reject) => {
-                pendingToolResults.set(toolCallId, {
-                  agentRunId: message.agentRunId,
-                  conversationId: message.conversationId,
-                  reject,
-                  resolve,
-                  sequence: requestedSequence,
-                  socket,
-                });
-              });
               const abortToolCall = (): void => {
                 const pending = pendingToolResults.get(toolCallId);
                 if (!pending) return;
@@ -1284,13 +1478,16 @@ async function startRuntime({
               controller.signal.addEventListener("abort", abortToolCall, { once: true });
               try {
                 if (controller.signal.aborted) abortToolCall();
-                const received = await resultPromise;
+                const received = await resultPromise!;
                 result = received.result;
                 resultEventId = received.eventId;
               } finally {
                 pendingToolResults.delete(toolCallId);
                 controller.signal.removeEventListener("abort", abortToolCall);
               }
+            }
+            if (controller.signal.aborted) {
+              throw new Error("The Agent Run was cancelled before the Tool Result committed.");
             }
             const completedEvent: Extract<AgentRunEvent, { type: "tool_call.completed" }> = {
               ...base,
@@ -1309,7 +1506,7 @@ async function startRuntime({
               ...(result.ok ? {} : { error: result.error }),
             };
             const stalePaths = await store.completeToolCall(
-              message.agentRunId,
+              runCommand.agentRunId,
               result,
               completedEvent,
               resultEventId,
@@ -1317,31 +1514,94 @@ async function startRuntime({
             completedToolResults.delete(toolCallId);
             publishEvent(completedEvent);
             sequence += 1;
-            return { result, stalePaths };
+            return { result, stalePaths, toolCallId };
           };
-          const loadedContract = await executeLocalTool("agent_contract_read", {});
-          if (!loadedContract.result.ok) {
-            throw new ModelProviderError(
-              "instruction_error",
-              `Agent Contract could not be loaded: ${loadedContract.result.error.message}`,
-            );
+          if (!agentContract) {
+            const loadedContract = await executeLocalTool("agent_contract_read", {});
+            if (!loadedContract.result.ok) {
+              throw new ModelProviderError(
+                "instruction_error",
+                `Agent Contract could not be loaded: ${loadedContract.result.error.message}`,
+              );
+            }
+            if (loadedContract.result.value.type !== "agent_contract_read") {
+              throw new ModelProviderError(
+                "instruction_error",
+                "The plugin returned an invalid Agent Contract result.",
+              );
+            }
+            agentContract = loadedContract.result.value.content;
+            await saveCheckpoint();
           }
-          if (loadedContract.result.value.type !== "agent_contract_read") {
-            throw new ModelProviderError(
-              "instruction_error",
-              "The plugin returned an invalid Agent Contract result.",
-            );
+          for (const skill of checkpointSkills) {
+            const loadedSkill = await executeLocalTool("skill_read", { skill });
+            if (
+              !loadedSkill.result.ok ||
+              loadedSkill.result.value.type !== "skill_read" ||
+              loadedSkill.result.value.skill !== skill ||
+              loadedSkill.result.value.resource !== "SKILL.md"
+            ) {
+              throw new ModelProviderError(
+                "instruction_error",
+                `Local Skill '${skill}' could not be restored safely.`,
+              );
+            }
+            localSkills.set(skill, loadedSkill.result.value.content);
           }
-          agentContract = loadedContract.result.value.content;
+          if (checkpointSkills.size > 0) await saveCheckpoint();
+          if (checkpoint && canonicalReadPaths.size > 0) {
+            for (const [priorCallId, path] of [...canonicalReadPaths]) {
+              const priorCall = input.find(
+                (item): item is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
+                  item.type === "local_tool_call" && item.callId === priorCallId,
+              );
+              if (!priorCall || priorCall.name !== "vault_read") continue;
+              const reread = await executeLocalTool("vault_read", priorCall.arguments);
+              input = input.filter(
+                (item) =>
+                  !(
+                    (item.type === "local_tool_call" || item.type === "local_tool_result") &&
+                    item.callId === priorCallId
+                  ),
+              );
+              canonicalReadPaths.delete(priorCallId);
+              for (const stalePath of reread.stalePaths) requiredRereads.add(stalePath);
+              const providerResult: LocalToolResultPayload =
+                reread.stalePaths.length > 0 &&
+                !(reread.result.ok && reread.result.value.type === "vault_read")
+                  ? {
+                      ok: false,
+                      error: {
+                        code: "stale_evidence",
+                        message: `Vault evidence changed for ${reread.stalePaths.join(", ")}. Reread and replan.`,
+                      },
+                    }
+                  : reread.result;
+              input.push(
+                {
+                  type: "local_tool_call",
+                  callId: reread.toolCallId,
+                  name: "vault_read",
+                  arguments: priorCall.arguments,
+                },
+                { type: "local_tool_result", callId: reread.toolCallId, result: providerResult },
+              );
+              if (reread.result.ok && reread.result.value.type === "vault_read") {
+                canonicalReadPaths.set(reread.toolCallId, reread.result.value.path);
+                requiredRereads.delete(path);
+              }
+              await saveCheckpoint();
+            }
+          }
           let finished = false;
-          for (let step = 0; step < 8; step += 1) {
+          for (let step = completedSteps; step < 8; step += 1) {
             output = "";
             citations.length = 0;
             let requestedTool = false;
             const hostedWebSearchCapability =
-              await provider.getHostedWebSearchCapability(message.model);
+              await provider.getHostedWebSearchCapability(model);
             for await (const providerEvent of provider.stream({
-              model: message.model,
+              model,
               input,
               instructions: composeInstructions(agentContract, localSkills),
               signal: controller.signal,
@@ -1352,7 +1612,7 @@ async function startRuntime({
             })) {
               if (providerEvent.type === "output_text.delta") {
                 output += providerEvent.delta;
-                await store.advanceAgentRunSequence(message.agentRunId, sequence);
+                await store.advanceAgentRunSequence(runCommand.agentRunId, sequence);
                 publishEvent({
                   ...base,
                   type: "agent_run.delta",
@@ -1415,6 +1675,8 @@ async function startRuntime({
                     callId: providerEvent.callId,
                     result: loadedSkill.result,
                   });
+                  completedSteps = step + 1;
+                  await saveCheckpoint();
                   break;
                 }
                 if (
@@ -1428,6 +1690,8 @@ async function startRuntime({
                   );
                 }
                 localSkills.set(skillRequest.skill, loadedSkill.result.value.content);
+                completedSteps = step + 1;
+                await saveCheckpoint();
                 break;
               }
               assertBoundedToolArguments(providerEvent.arguments);
@@ -1435,7 +1699,9 @@ async function startRuntime({
               const { result, stalePaths } = await executeLocalTool(
                 providerEvent.name,
                 providerEvent.arguments,
+                { completedSteps: step + 1, providerCallId: providerEvent.callId },
               );
+              pendingToolStep = undefined;
               if (
                 result.ok &&
                 result.value.type === "skill_read" &&
@@ -1487,6 +1753,8 @@ async function startRuntime({
                 callId: providerEvent.callId,
                 result: providerResult,
               });
+              completedSteps = step + 1;
+              await saveCheckpoint();
               if (providerEvent.name === "skill_read" && !skillWasLoaded) break;
             }
             if (requestedTool) continue;
@@ -1511,7 +1779,7 @@ async function startRuntime({
                   : {}),
               },
             };
-            await store.completeAgentRun(message.agentRunId, output, completedEvent);
+            await store.completeAgentRun(runCommand.agentRunId, output, completedEvent);
             publishEvent(completedEvent);
             finished = true;
             break;
@@ -1520,7 +1788,7 @@ async function startRuntime({
             throw new Error("The Agent Run exceeded the maximum of 8 Provider steps.");
           }
         } catch (error) {
-          const run = activeRuns.get(message.agentRunId);
+          const run = activeRuns.get(runCommand.agentRunId);
           if (controller.signal.aborted) {
             const cancelled = run?.cancelRequested === true;
             const terminalEvent: AgentRunEvent = {
@@ -1530,8 +1798,8 @@ async function startRuntime({
               sequence,
             };
             const transitioned = cancelled
-              ? await store.cancelAgentRun(message.agentRunId, terminalEvent as Extract<AgentRunEvent, { type: "agent_run.cancelled" }>)
-              : await store.interruptAgentRun(message.agentRunId, terminalEvent as Extract<AgentRunEvent, { type: "agent_run.interrupted" }>);
+              ? await store.cancelAgentRun(runCommand.agentRunId, terminalEvent as Extract<AgentRunEvent, { type: "agent_run.cancelled" }>)
+              : await store.interruptAgentRun(runCommand.agentRunId, terminalEvent as Extract<AgentRunEvent, { type: "agent_run.interrupted" }>);
             if (transitioned) publishEvent(terminalEvent);
             return;
           }
@@ -1544,14 +1812,14 @@ async function startRuntime({
             error: { code: providerError.code, message: providerError.message },
           };
           await store.failAgentRun(
-            message.agentRunId,
+            runCommand.agentRunId,
             providerError.code,
             providerError.message,
             failedEvent,
           );
           publishEvent(failedEvent);
         } finally {
-          activeRuns.delete(message.agentRunId);
+          activeRuns.delete(runCommand.agentRunId);
         }
       })();
     });

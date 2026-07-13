@@ -111,6 +111,57 @@ class MemoryJournal {
   }
 }
 
+class FailOnceDecisionStore {
+  records = new Map();
+  failed = false;
+
+  async savePending(toolCallId, pending) {
+    if (pending.result && !this.failed) {
+      this.failed = true;
+      throw new Error("Injected pending-result persistence failure");
+    }
+    this.records.set(toolCallId, structuredClone(pending));
+  }
+
+  async loadPending(toolCallId) {
+    const value = this.records.get(toolCallId);
+    return value ? structuredClone(value) : undefined;
+  }
+
+  async deletePending(toolCallId) {
+    this.records.delete(toolCallId);
+  }
+}
+
+class MemoryPendingStore {
+  records = new Map();
+
+  async savePending(toolCallId, pending) {
+    this.records.set(toolCallId, structuredClone(pending));
+  }
+
+  async loadPending(toolCallId) {
+    const value = this.records.get(toolCallId);
+    return value ? structuredClone(value) : undefined;
+  }
+
+  async deletePending(toolCallId) {
+    this.records.delete(toolCallId);
+  }
+}
+
+class FailOnceAutomaticResultStore extends MemoryPendingStore {
+  failed = false;
+
+  async savePending(toolCallId, pending) {
+    if (pending.result && !this.failed) {
+      this.failed = true;
+      throw new Error("Injected automatic-result persistence failure");
+    }
+    await super.savePending(toolCallId, pending);
+  }
+}
+
 function toolCall(toolCallId, batch) {
   return {
     type: "tool_call.requested",
@@ -169,10 +220,117 @@ async function fixture(t, journal, injectCrash, getPermissionMode) {
     journal,
     injectCrash,
     getPermissionMode,
+    checkpoints,
   );
   t.after(async () => rm(root, { recursive: true, force: true }));
   return { checkpoints, coordinator, root, vault };
 }
+
+test("a pending confirmation is rehydrated from plugin-owned durable storage", async (t) => {
+  const journal = new MemoryJournal();
+  const { checkpoints, coordinator, root, vault } = await fixture(
+    t,
+    journal,
+    () => {},
+    () => "ask_every_time",
+  );
+  const proposal = batch("rehydrated-pending", [{
+    operation: "append",
+    path: "notes/a.md",
+    expectedVersion: (await vault.read("notes/a.md")).modifiedVersion,
+    content: "restored\n",
+  }]);
+  const execution = coordinator.execute(toolCall("rehydrated-tool-call", proposal));
+  await coordinator.waitUntilPending("rehydrated-tool-call");
+  assert.equal(await settledWithin(execution, 25), "still-pending");
+  await writeFile(path.join(root, "notes", "a.md"), "user edit while offline\n", "utf8");
+
+  const restarted = new VaultChangeCoordinator(
+    vault,
+    checkpoints,
+    journal,
+    () => {},
+    () => "ask_every_time",
+    checkpoints,
+  );
+  assert.deepEqual(await restarted.rehydrate("rehydrated-tool-call"), { proposal });
+  const result = await restarted.decide("rehydrated-tool-call", "reject");
+  assert.equal(result.ok, true);
+  assert.equal(result.value.decision, "rejected");
+  assert.equal(
+    await readFile(path.join(root, "notes", "a.md"), "utf8"),
+    "user edit while offline\n",
+  );
+  const handoffRestart = new VaultChangeCoordinator(
+    vault,
+    checkpoints,
+    journal,
+    () => {},
+    () => "ask_every_time",
+    checkpoints,
+  );
+  assert.deepEqual(await handoffRestart.rehydrate("rehydrated-tool-call"), {
+    proposal,
+    result,
+  });
+  assert.deepEqual(await handoffRestart.decide("rehydrated-tool-call", "apply"), result);
+  await handoffRestart.acknowledge("rehydrated-tool-call");
+  assert.equal(await checkpoints.loadPending("rehydrated-tool-call"), undefined);
+});
+
+test("a requested proposal without plugin state becomes an explicit-Resume failure", async (t) => {
+  const { checkpoints, vault } = await fixture(t, new MemoryJournal());
+  const restarted = new VaultChangeCoordinator(
+    vault,
+    checkpoints,
+    new MemoryJournal(),
+    () => {},
+    () => "ask_every_time",
+    new MemoryPendingStore(),
+  );
+  assert.deepEqual(await restarted.rehydrate("commit-before-publish-tool"), {
+    result: {
+      ok: false,
+      error: {
+        code: "plugin_disconnected",
+        message: "The Vault Change proposal was not durably prepared before the plugin disconnected.",
+      },
+    },
+  });
+});
+
+test("a failed decision-result save retries without reapplying or stranding the live Run", async (t) => {
+  const journal = new MemoryJournal();
+  const { checkpoints, root, vault } = await fixture(t, journal, () => {}, () => "ask_every_time");
+  const pendingStore = new FailOnceDecisionStore();
+  const coordinator = new VaultChangeCoordinator(
+    vault,
+    checkpoints,
+    journal,
+    () => {},
+    () => "ask_every_time",
+    pendingStore,
+  );
+  const proposal = batch("retry-decision", [{
+    operation: "append",
+    path: "notes/a.md",
+    expectedVersion: (await vault.read("notes/a.md")).modifiedVersion,
+    content: "must not apply\n",
+  }]);
+  const execution = coordinator.execute(toolCall("retry-decision-tool", proposal));
+  await coordinator.waitUntilPending("retry-decision-tool");
+  await assert.rejects(
+    coordinator.decide("retry-decision-tool", "reject"),
+    /Injected pending-result persistence failure/,
+  );
+  assert.equal(await settledWithin(execution, 25), "still-pending");
+  const result = await coordinator.decide("retry-decision-tool", "apply");
+  assert.equal(result.ok, true);
+  assert.equal(result.value.decision, "rejected");
+  assert.deepEqual(await execution, result);
+  assert.deepEqual(pendingStore.records.get("retry-decision-tool").result, result);
+  assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "alpha\n");
+});
 
 async function settledWithin(promise, milliseconds = 100) {
   return Promise.race([
@@ -260,6 +418,89 @@ test("plugin-owned permission modes enforce the complete Vault mutation matrix",
     assert.match(result.value.checkpointRef, /batch-trusted-normal$/);
     assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "alpha\ntrusted\n");
     assert.equal((await coordinator.undo(proposal.batchId)).ok, true);
+  });
+
+  await t.test("Trusted Vault persists proposal and result around the automatic side effect", async (t) => {
+    const journal = new MemoryJournal();
+    const pendingStore = new MemoryPendingStore();
+    const { checkpoints, root, vault } = await fixture(t, journal);
+    const originalMarkApplying = journal.markApplying.bind(journal);
+    journal.markApplying = async (...arguments_) => {
+      const persisted = pendingStore.records.get("call-trusted-durable");
+      assert.equal(persisted?.proposal.batchId, "batch-trusted-durable");
+      assert.equal(persisted?.result, undefined);
+      await originalMarkApplying(...arguments_);
+    };
+    const coordinator = new VaultChangeCoordinator(
+      vault,
+      checkpoints,
+      journal,
+      undefined,
+      () => "trusted_vault",
+      pendingStore,
+    );
+    const original = await vault.read("notes/a.md");
+    const proposal = batch("batch-trusted-durable", [{
+      operation: "append",
+      path: "notes/a.md",
+      expectedVersion: original.modifiedVersion,
+      content: "durable\n",
+    }]);
+
+    const result = await coordinator.execute(toolCall("call-trusted-durable", proposal));
+    assert.equal(result.ok, true);
+    assert.deepEqual(pendingStore.records.get("call-trusted-durable")?.result, result);
+    assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "alpha\ndurable\n");
+  });
+
+  await t.test("Trusted Vault reports the applied result when its handoff overwrite fails", async (t) => {
+    const journal = new MemoryJournal();
+    const pendingStore = new FailOnceAutomaticResultStore();
+    const { checkpoints, root, vault } = await fixture(t, journal);
+    const coordinator = new VaultChangeCoordinator(
+      vault,
+      checkpoints,
+      journal,
+      undefined,
+      () => "trusted_vault",
+      pendingStore,
+    );
+    const original = await vault.read("notes/a.md");
+    const proposal = batch("batch-trusted-handoff-failure", [{
+      operation: "append",
+      path: "notes/a.md",
+      expectedVersion: original.modifiedVersion,
+      content: "applied once\n",
+    }]);
+
+    const result = await coordinator.execute(
+      toolCall("call-trusted-handoff-failure", proposal),
+    );
+    assert.equal(result.ok, true);
+    assert.equal(result.value.decision, "applied");
+    assert.equal(pendingStore.failed, true);
+    assert.equal(pendingStore.records.get("call-trusted-handoff-failure")?.result, undefined);
+    assert.deepEqual(
+      await coordinator.decide("call-trusted-handoff-failure", "apply"),
+      result,
+    );
+    assert.equal(
+      await readFile(path.join(root, "notes", "a.md"), "utf8"),
+      "alpha\napplied once\n",
+    );
+
+    const restarted = new VaultChangeCoordinator(
+      vault,
+      checkpoints,
+      journal,
+      undefined,
+      () => "trusted_vault",
+      pendingStore,
+    );
+    assert.deepEqual(await restarted.rehydrate("call-trusted-handoff-failure"), {
+      proposal,
+      result,
+    });
   });
 
   await t.test("a concurrent Apply click observes the successful Trusted auto-apply", async (t) => {

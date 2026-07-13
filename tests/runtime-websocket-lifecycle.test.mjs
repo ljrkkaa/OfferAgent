@@ -243,10 +243,22 @@ test("RuntimeSupervisor reconnects and delivers the durable interruption after a
     if (next.value.type === "agent_run.interrupted") break;
   }
   assert.equal(afterDrop.at(-1).type, "agent_run.interrupted");
+  await iterator.return();
   assert.equal(connectionCount, 2);
   assert.equal(contractExecutions, 1);
   assert.equal(vaultReadExecutions, 1);
   releaseRead({ ok: false, error: { code: "tool_error", message: "late result" } });
+  const resumed = [];
+  for await (const event of supervisor.resumeAgentRun({
+    conversationId: "reconnect-conversation",
+    agentRunId: "reconnect-run",
+  })) {
+    resumed.push(event);
+  }
+  assert.equal(resumed[0].type, "agent_run.resumed");
+  assert.equal(resumed.at(-1).type, "agent_run.completed");
+  assert.equal(contractExecutions, 2);
+  assert.equal(vaultReadExecutions, 2);
   await completeRun(supervisor, "after-reconnect");
 });
 

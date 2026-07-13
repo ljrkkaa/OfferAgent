@@ -18,8 +18,31 @@ import {
   type VaultToolErrorCode,
 } from "@offeragent/protocol";
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.js";
+import type { ModelConversationItem } from "./model-provider";
 
-const CURRENT_SCHEMA_VERSION = 9;
+const CURRENT_SCHEMA_VERSION = 10;
+
+export interface RunCheckpoint {
+  canonicalReadPaths: Array<[string, string]>;
+  completedSteps: number;
+  hostedWebSearchProbeAttempted: boolean;
+  input: ModelConversationItem[];
+  localSkills: string[];
+  pendingToolStep?: {
+    completedSteps: number;
+    name: ToolCallRecord["name"];
+    providerCallId: string;
+    toolCallId: string;
+  };
+  requiredRereads: string[];
+  version: 1;
+}
+
+export interface ResumableRun {
+  checkpoint: RunCheckpoint;
+  model: string;
+  nextSequence: number;
+}
 
 function persistedToolArguments(name: ToolCallRecord["name"], arguments_: unknown): unknown {
   if (name !== "vault_propose_changes" || !arguments_ || typeof arguments_ !== "object") {
@@ -49,6 +72,51 @@ function persistedToolArguments(name: ToolCallRecord["name"], arguments_: unknow
         })
       : [],
   };
+}
+
+function persistedRunCheckpoint(checkpoint: RunCheckpoint): RunCheckpoint {
+  const skillCallIds = new Set(
+    checkpoint.input
+      .filter(
+        (item): item is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
+          item.type === "local_tool_call" && item.name === "skill_read",
+      )
+      .map((item) => item.callId),
+  );
+  const input = checkpoint.input.flatMap((item) => {
+    if (
+      (item.type === "local_tool_call" || item.type === "local_tool_result") &&
+      skillCallIds.has(item.callId)
+    ) {
+      return [];
+    }
+    return item.type === "local_tool_call" && item.name === "vault_propose_changes"
+      ? [{ ...item, arguments: persistedToolArguments(item.name, item.arguments) }]
+      : [item];
+  });
+  return {
+    version: 1,
+    input,
+    localSkills: checkpoint.localSkills.filter(
+      (skill): skill is string => typeof skill === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(skill),
+    ),
+    canonicalReadPaths: checkpoint.canonicalReadPaths,
+    requiredRereads: checkpoint.requiredRereads,
+    hostedWebSearchProbeAttempted: checkpoint.hostedWebSearchProbeAttempted,
+    completedSteps: checkpoint.completedSteps,
+    ...(checkpoint.pendingToolStep ? { pendingToolStep: checkpoint.pendingToolStep } : {}),
+  };
+}
+
+function persistedToolResult(result: LocalToolResultPayload): unknown {
+  if (
+    result.ok &&
+    (result.value.type === "agent_contract_read" || result.value.type === "skill_read")
+  ) {
+    const { content: _content, ...metadata } = result.value;
+    return { ok: true, value: metadata };
+  }
+  return result;
 }
 
 function canonicalJson(value: unknown): string {
@@ -499,6 +567,10 @@ const MIGRATIONS = [
         ON protocol_responses(owner_conversation_id);
     `,
   },
+  {
+    version: 10,
+    sql: `SELECT 1;`,
+  },
 ] as const;
 
 interface ConversationSnapshot {
@@ -886,6 +958,15 @@ export class RuntimeStateStore {
           "UPDATE agent_runs SET status = 'interrupted', updated_at = ? WHERE id = ?",
           [timestamp, agentRunId as string],
         );
+        this.#database.run(
+          `UPDATE tool_calls
+           SET status = 'failed', error_code = 'plugin_disconnected',
+               error_message = 'The Obsidian plugin disconnected during the Vault tool call.',
+               updated_at = ?
+           WHERE agent_run_id = ? AND status = 'requested'
+             AND name != 'vault_propose_changes'`,
+          [timestamp, agentRunId as string],
+        );
         const event: AgentRunEvent = {
           type: "agent_run.interrupted",
           protocolVersion: PROTOCOL_VERSION,
@@ -899,6 +980,114 @@ export class RuntimeStateStore {
       }
       return events;
     });
+  }
+
+  async saveRunCheckpoint(agentRunId: string, checkpoint: RunCheckpoint): Promise<void> {
+    await this.#write(() => {
+      const run = firstRow(
+        this.#database,
+        "SELECT conversation_id, status FROM agent_runs WHERE id = ?",
+        [agentRunId],
+      );
+      if (!run) throw new Error(`Agent Run '${agentRunId}' does not exist.`);
+      if (run[1] !== "running") {
+        throw new Error(`Agent Run '${agentRunId}' cannot checkpoint from '${run[1]}'.`);
+      }
+      this.#database.run("DELETE FROM run_checkpoints WHERE agent_run_id = ?", [agentRunId]);
+      this.#database.run(
+        `INSERT INTO run_checkpoints
+          (id, conversation_id, agent_run_id, checkpoint_json, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        [randomUUID(), run[0] as string, agentRunId, JSON.stringify(persistedRunCheckpoint(checkpoint)), now()],
+      );
+    });
+  }
+
+  async resumeAgentRun(
+    conversationId: string,
+    agentRunId: string,
+    recoveredToolResult?: { result: LocalToolResultPayload; toolCallId: string },
+  ): Promise<ResumableRun> {
+    return this.#write(() => {
+      const run = firstRow(
+        this.#database,
+        `SELECT conversation_id, model_id, status, last_sequence
+         FROM agent_runs WHERE id = ?`,
+        [agentRunId],
+      );
+      if (!run || run[0] !== conversationId) {
+        throw new Error(`Agent Run '${agentRunId}' does not belong to Conversation '${conversationId}'.`);
+      }
+      if (run[2] !== "interrupted") {
+        throw new Error(`Agent Run '${agentRunId}' cannot be resumed from '${run[2]}'.`);
+      }
+      const checkpointJson = valueAt(
+        this.#database,
+        `SELECT checkpoint_json FROM run_checkpoints
+         WHERE agent_run_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+        [agentRunId],
+      );
+      if (typeof checkpointJson !== "string") {
+        throw new Error(`Agent Run '${agentRunId}' has no durable Run Checkpoint.`);
+      }
+      const checkpoint = JSON.parse(checkpointJson) as RunCheckpoint;
+      if (checkpoint.version !== 1) {
+        throw new Error(`Agent Run '${agentRunId}' has an unsupported Run Checkpoint.`);
+      }
+      if (checkpoint.pendingToolStep?.name === "vault_propose_changes") {
+        const pendingStatus = valueAt(
+          this.#database,
+          "SELECT status FROM tool_calls WHERE id = ? AND agent_run_id = ?",
+          [checkpoint.pendingToolStep.toolCallId, agentRunId],
+        );
+        if (
+          pendingStatus === "requested" &&
+          recoveredToolResult?.toolCallId !== checkpoint.pendingToolStep.toolCallId
+        ) {
+          throw new Error(
+            `Agent Run '${agentRunId}' is waiting for its pending Vault Change decision.`,
+          );
+        }
+        if (pendingStatus !== "requested" && pendingStatus !== "completed" && pendingStatus !== "failed") {
+          throw new Error(`Agent Run '${agentRunId}' has an invalid pending confirmation.`);
+        }
+        if (recoveredToolResult) {
+          this.#assertToolResultMatches(
+            checkpoint.pendingToolStep.toolCallId,
+            agentRunId,
+            recoveredToolResult.result,
+          );
+        }
+      } else if (recoveredToolResult) {
+        throw new Error(`Agent Run '${agentRunId}' has no pending confirmation to recover.`);
+      }
+      this.#database.run(
+        `UPDATE agent_runs SET status = 'running', error_code = NULL, error_message = NULL,
+           updated_at = ? WHERE id = ? AND status = 'interrupted'`,
+        [now(), agentRunId],
+      );
+      if (this.#database.getRowsModified() !== 1) {
+        throw new Error(`Agent Run '${agentRunId}' could not transition back to running.`);
+      }
+      return {
+        checkpoint,
+        model: run[1] as string,
+        nextSequence: Number(run[3]) + 1,
+      };
+    });
+  }
+
+  async getToolCallResult(toolCallId: string, agentRunId: string): Promise<LocalToolResultPayload | undefined> {
+    await this.#writeTail;
+    const row = firstRow(
+      this.#database,
+      `SELECT status, result_json FROM tool_calls WHERE id = ? AND agent_run_id = ?`,
+      [toolCallId, agentRunId],
+    );
+    if (!row || (row[0] !== "completed" && row[0] !== "failed") || typeof row[1] !== "string") {
+      return undefined;
+    }
+    return JSON.parse(row[1]) as LocalToolResultPayload;
   }
 
   async acknowledgeDurableEvent(
@@ -970,6 +1159,7 @@ export class RuntimeStateStore {
   async requestToolCall(
     agentRunId: string,
     event: Extract<AgentRunEvent, { type: "tool_call.requested" }>,
+    checkpoint?: RunCheckpoint,
   ): Promise<void> {
     await this.#write(() => {
       const run = this.#requiredRun(agentRunId);
@@ -1025,6 +1215,21 @@ export class RuntimeStateStore {
             ],
           );
         }
+      }
+      if (checkpoint) {
+        this.#database.run("DELETE FROM run_checkpoints WHERE agent_run_id = ?", [agentRunId]);
+        this.#database.run(
+          `INSERT INTO run_checkpoints
+            (id, conversation_id, agent_run_id, checkpoint_json, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [
+            randomUUID(),
+            run.conversationId,
+            agentRunId,
+            JSON.stringify(persistedRunCheckpoint(checkpoint)),
+            timestamp,
+          ],
+        );
       }
       this.#recordEvent(
         event.tool.name === "vault_propose_changes"
@@ -1193,6 +1398,7 @@ export class RuntimeStateStore {
   ): Promise<string[]> {
     return this.#write(() => {
       const run = this.#requiredRun(agentRunId);
+      this.#assertToolResultMatches(event.toolCallId, agentRunId, result);
       const timestamp = now();
       const stalePaths: string[] = [];
       this.#database.run(
@@ -1205,7 +1411,7 @@ export class RuntimeStateStore {
           result.ok ? null : result.error.code,
           result.ok ? null : result.error.message,
           resultEventId ?? null,
-          JSON.stringify(result),
+          JSON.stringify(persistedToolResult(result)),
           timestamp,
           event.toolCallId,
           agentRunId,
@@ -1254,14 +1460,6 @@ export class RuntimeStateStore {
               : [];
         for (const source of sources) {
           this.#database.run(
-            `DELETE FROM run_checkpoints
-             WHERE agent_run_id IN (
-               SELECT agent_run_id FROM evidence_snapshots
-               WHERE path = ? AND content_hash <> ? AND is_stale = 0
-             )`,
-            [source.path, source.contentHash],
-          );
-          this.#database.run(
             `UPDATE evidence_snapshots
              SET is_stale = 1, stale_detected_at = ?
              WHERE path = ? AND content_hash <> ? AND is_stale = 0`,
@@ -1298,6 +1496,36 @@ export class RuntimeStateStore {
     });
   }
 
+  #assertToolResultMatches(
+    toolCallId: string,
+    agentRunId: string,
+    result: LocalToolResultPayload,
+  ): void {
+    const row = firstRow(
+      this.#database,
+      "SELECT name FROM tool_calls WHERE id = ? AND agent_run_id = ?",
+      [toolCallId, agentRunId],
+    );
+    if (!row) throw new Error(`Tool Call '${toolCallId}' does not belong to Agent Run '${agentRunId}'.`);
+    if (!result.ok) return;
+    const name = row[0] as ToolCallRecord["name"];
+    if (result.value.type !== name) {
+      throw new Error(`Tool Call '${toolCallId}' returned '${result.value.type}' for '${name}'.`);
+    }
+    if (name !== "vault_propose_changes" || result.value.type !== "vault_propose_changes") return;
+    const batch = firstRow(
+      this.#database,
+      "SELECT id, target_paths_json FROM vault_change_batches WHERE tool_call_id = ? AND agent_run_id = ?",
+      [toolCallId, agentRunId],
+    );
+    if (!batch) throw new Error(`Vault Change Tool Call '${toolCallId}' has no pending batch.`);
+    const expectedPaths = JSON.parse(batch[1] as string) as string[];
+    const resultPaths = result.value.targets.map((target) => target.path);
+    if (result.value.batchId !== batch[0] || JSON.stringify(resultPaths) !== JSON.stringify(expectedPaths)) {
+      throw new Error(`Vault Change Tool Call '${toolCallId}' returned a mismatched batch result.`);
+    }
+  }
+
   async isDuplicateToolResult(
     toolCallId: string,
     eventId: string,
@@ -1312,7 +1540,7 @@ export class RuntimeStateStore {
     return Boolean(
       row &&
       row[0] === eventId &&
-      row[1] === JSON.stringify(result) &&
+      row[1] === JSON.stringify(persistedToolResult(result)) &&
       (row[2] === "completed" || row[2] === "failed"),
     );
   }
@@ -1503,8 +1731,9 @@ export class RuntimeStateStore {
       if (this.#database.getRowsModified() !== 1) return false;
       this.#database.run(
         `UPDATE tool_calls
-         SET status = 'failed', error_code = ?, error_message = ?, updated_at = ?
-         WHERE agent_run_id = ? AND status = 'requested'`,
+          SET status = 'failed', error_code = ?, error_message = ?, updated_at = ?
+          WHERE agent_run_id = ? AND status = 'requested'
+            ${status === "cancelled" ? "" : "AND name != 'vault_propose_changes'"}`,
         [
           status === "cancelled" ? "tool_error" : "plugin_disconnected",
           status === "cancelled"
@@ -1514,12 +1743,14 @@ export class RuntimeStateStore {
           agentRunId,
         ],
       );
-      this.#database.run(
-        `UPDATE vault_change_batches
-         SET state = 'failed', updated_at = ?
-         WHERE agent_run_id = ? AND state = 'pending'`,
-        [timestamp, agentRunId],
-      );
+      if (status === "cancelled") {
+        this.#database.run(
+          `UPDATE vault_change_batches
+            SET state = 'failed', updated_at = ?
+            WHERE agent_run_id = ? AND state = 'pending'`,
+          [timestamp, agentRunId],
+        );
+      }
       this.#recordEvent(
         event ?? {
           type: status === "cancelled" ? "agent_run.cancelled" : "agent_run.interrupted",
@@ -1606,6 +1837,7 @@ export class RuntimeStateStore {
         this.#database.run(migration.sql);
         if (migration.version === 7) this.#scrubPersistedVaultChangeArguments();
         if (migration.version === 8) this.#ensureCitationsColumn();
+        if (migration.version === 10) this.#scrubResumableStateBodies();
         const timestamp = now();
         this.#database.run(
           "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
@@ -1624,7 +1856,7 @@ export class RuntimeStateStore {
         throw error;
       }
     }
-    if (version < 7) this.#database.run("VACUUM");
+    if (version < 10) this.#database.run("VACUUM");
     await this.#persist();
   }
 
@@ -1676,6 +1908,69 @@ export class RuntimeStateStore {
           "UPDATE durable_events SET payload_json = '{}' WHERE id = ?",
           [id],
         );
+      }
+    }
+  }
+
+  #scrubResumableStateBodies(): void {
+    const checkpoints = this.#database.exec(
+      "SELECT id, checkpoint_json FROM run_checkpoints",
+    )[0]?.values ?? [];
+    for (const [id, checkpointJson] of checkpoints) {
+      try {
+        const legacy = JSON.parse(checkpointJson as string) as Partial<RunCheckpoint> & {
+          localSkills?: Array<string | [string, string]>;
+        };
+        const checkpoint: RunCheckpoint = {
+          version: 1,
+          input: Array.isArray(legacy.input) ? legacy.input : [],
+          localSkills: Array.isArray(legacy.localSkills)
+            ? legacy.localSkills.flatMap((skill) =>
+                typeof skill === "string"
+                  ? [skill]
+                  : Array.isArray(skill) && typeof skill[0] === "string"
+                    ? [skill[0]]
+                    : [],
+              )
+            : [],
+          canonicalReadPaths: Array.isArray(legacy.canonicalReadPaths)
+            ? legacy.canonicalReadPaths
+            : [],
+          requiredRereads: Array.isArray(legacy.requiredRereads) ? legacy.requiredRereads : [],
+          hostedWebSearchProbeAttempted: legacy.hostedWebSearchProbeAttempted === true,
+          completedSteps: Number.isInteger(legacy.completedSteps) ? legacy.completedSteps as number : 0,
+          ...(legacy.pendingToolStep
+            ? { pendingToolStep: legacy.pendingToolStep }
+            : (legacy as { pendingConfirmation?: Omit<NonNullable<RunCheckpoint["pendingToolStep"]>, "name"> }).pendingConfirmation
+              ? {
+                  pendingToolStep: {
+                    ...(legacy as { pendingConfirmation: Omit<NonNullable<RunCheckpoint["pendingToolStep"]>, "name"> }).pendingConfirmation,
+                    name: "vault_propose_changes",
+                  },
+                }
+              : {}),
+        };
+        this.#database.run(
+          "UPDATE run_checkpoints SET checkpoint_json = ? WHERE id = ?",
+          [JSON.stringify(persistedRunCheckpoint(checkpoint)), id],
+        );
+      } catch {
+        this.#database.run("DELETE FROM run_checkpoints WHERE id = ?", [id]);
+      }
+    }
+    const results = this.#database.exec(
+      `SELECT id, result_json FROM tool_calls
+       WHERE name IN ('agent_contract_read', 'skill_read') AND result_json IS NOT NULL`,
+    )[0]?.values ?? [];
+    for (const [id, resultJson] of results) {
+      try {
+        const result = JSON.parse(resultJson as string) as LocalToolResultPayload;
+        this.#database.run(
+          "UPDATE tool_calls SET result_json = ? WHERE id = ?",
+          [JSON.stringify(persistedToolResult(result)), id],
+        );
+      } catch {
+        this.#database.run("UPDATE tool_calls SET result_json = NULL WHERE id = ?", [id]);
       }
     }
   }

@@ -12,6 +12,7 @@ import {
   type AgentRunCancel,
   type AgentRunEvent,
   type AgentRunRecord,
+  type AgentRunResume,
   type AgentRunStart,
   type ConversationCommand,
   type ConversationEvent,
@@ -63,6 +64,10 @@ export interface AgentRunRequest {
   model: string;
 }
 
+export interface AgentRunResumeRequest extends Pick<AgentRunRequest, "agentRunId" | "conversationId"> {
+  recoveredToolResult?: AgentRunResume["recoveredToolResult"];
+}
+
 export interface ConversationSnapshot {
   agentRuns: AgentRunRecord[];
   conversation: ConversationSummary;
@@ -78,6 +83,9 @@ export interface RuntimeClient {
   listConversations(): Promise<ConversationSummary[]>;
   onUnavailable(subscriber: UnavailableSubscriber): () => void;
   openConversation(conversationId: string): Promise<ConversationSnapshot>;
+  resumeAgentRun(
+    request: AgentRunResumeRequest,
+  ): AsyncIterable<AgentRunEvent>;
   runAgent(request: AgentRunRequest): AsyncIterable<AgentRunEvent>;
   start(): Promise<RuntimeHandshake>;
   stop(): Promise<void>;
@@ -94,13 +102,14 @@ type RuntimeChild = ChildProcessByStdio<null, Readable, Readable>;
 
 interface RunChannel {
   allowReplaySequenceGaps: boolean;
+  awaitingResumeBoundary: boolean;
   conversationId: string;
   events: AgentRunEvent[];
   expectedSequence: number;
   failure?: Error;
   processedEventIds: Set<string>;
   seenEventIds: Set<string>;
-  start: AgentRunStart;
+  command: AgentRunResume | AgentRunStart;
   wake?: () => void;
 }
 
@@ -232,6 +241,7 @@ function isAgentRunEventEnvelope(value: unknown): value is AgentRunEvent {
     typeof event.type === "string" &&
     [
       "agent_run.started",
+      "agent_run.resumed",
       "agent_run.delta",
       "agent_run.cancelled",
       "agent_run.interrupted",
@@ -715,15 +725,7 @@ export class RuntimeSupervisor implements RuntimeClient {
   }
 
   async *runAgent(request: AgentRunRequest): AsyncIterable<AgentRunEvent> {
-    this.#requiredConnection();
-    const socket = this.#eventSocket;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      throw new Error("OfferAgent Runtime event connection is unavailable.");
-    }
-    if (this.#runChannels.has(request.agentRunId)) {
-      throw new Error(`Agent Run '${request.agentRunId}' is already active.`);
-    }
-    const start: AgentRunStart = {
+    const command: AgentRunStart = {
       type: "agent_run.start",
       protocolVersion: PROTOCOL_VERSION,
       eventId: randomUUID(),
@@ -733,18 +735,51 @@ export class RuntimeSupervisor implements RuntimeClient {
       model: request.model,
       input: { role: "user", text: request.input },
     };
+    yield* this.#runAgentCommand(request, command);
+  }
+
+  async *resumeAgentRun(
+    request: AgentRunResumeRequest,
+  ): AsyncIterable<AgentRunEvent> {
+    const command: AgentRunResume = {
+      type: "agent_run.resume",
+      protocolVersion: PROTOCOL_VERSION,
+      eventId: randomUUID(),
+      conversationId: request.conversationId,
+      agentRunId: request.agentRunId,
+      sequence: 0,
+      ...(request.recoveredToolResult
+        ? { recoveredToolResult: request.recoveredToolResult }
+        : {}),
+    };
+    yield* this.#runAgentCommand({ ...request, input: "", model: "" }, command);
+  }
+
+  async *#runAgentCommand(
+    request: AgentRunRequest,
+    command: AgentRunResume | AgentRunStart,
+  ): AsyncIterable<AgentRunEvent> {
+    this.#requiredConnection();
+    const socket = this.#eventSocket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error("OfferAgent Runtime event connection is unavailable.");
+    }
+    if (this.#runChannels.has(request.agentRunId)) {
+      throw new Error(`Agent Run '${request.agentRunId}' is already active.`);
+    }
     const channel: RunChannel = {
       allowReplaySequenceGaps: false,
+      awaitingResumeBoundary: command.type === "agent_run.resume",
       conversationId: request.conversationId,
       events: [],
       expectedSequence: 1,
       processedEventIds: new Set<string>(),
       seenEventIds: new Set<string>(),
-      start,
+      command,
     };
     this.#runChannels.set(request.agentRunId, channel);
     try {
-      socket.send(JSON.stringify(start));
+      socket.send(JSON.stringify(command));
     } catch (error) {
       this.#runChannels.delete(request.agentRunId);
       throw error;
@@ -974,7 +1009,7 @@ export class RuntimeSupervisor implements RuntimeClient {
         !isAcceptableAgentRunSequence(
           event,
           channel.expectedSequence,
-          channel.allowReplaySequenceGaps,
+          channel.allowReplaySequenceGaps || channel.awaitingResumeBoundary,
         )
       ) {
         this.#handleEventSocketFailure(
@@ -987,6 +1022,7 @@ export class RuntimeSupervisor implements RuntimeClient {
         return;
       }
       channel.expectedSequence = event.sequence + 1;
+      if (event.type === "agent_run.resumed") channel.awaitingResumeBoundary = false;
       channel.seenEventIds.add(event.eventId);
       channel.events.push(event);
       channel.wake?.();
@@ -1016,7 +1052,7 @@ export class RuntimeSupervisor implements RuntimeClient {
       socket.send(JSON.stringify(channel.command));
     }
     for (const channel of this.#runChannels.values()) {
-      socket.send(JSON.stringify(channel.start));
+      socket.send(JSON.stringify(channel.command));
     }
   }
 

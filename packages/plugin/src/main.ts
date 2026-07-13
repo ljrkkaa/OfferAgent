@@ -308,6 +308,27 @@ class OfferAgentSidebarView extends ItemView {
         });
         runStatus.dataset.agentRunId = run.id;
         runStatus.dataset.status = run.status;
+        if (
+          run.status === "interrupted" &&
+          viewModel.runtime.state === "connected" &&
+          viewModel.conversation.runState === "idle" &&
+          !viewModel.conversation.toolCalls.some(
+            (call) =>
+              call.agentRunId === run.id &&
+              call.name === "vault_propose_changes" &&
+              call.status === "requested",
+          )
+        ) {
+          const resume = runList.createEl("button", {
+            cls: "offeragent-sidebar__resume",
+            text: "Resume",
+          });
+          resume.type = "button";
+          resume.dataset.agentRunId = run.id;
+          resume.addEventListener("click", () => {
+            void this.#controller.resumeAgentRun(run.id);
+          });
+        }
       }
     }
 
@@ -361,9 +382,10 @@ export default class OfferAgentPlugin extends Plugin {
     const vaultRoot = this.#vaultRoot();
     const readTools = new ObsidianVaultToolAdapter(this.app.vault, this.app.metadataCache);
     let runtime!: RuntimeSupervisor;
+    const checkpointStore = new GitCheckpointStore(vaultRoot);
     const changeCoordinator = new VaultChangeCoordinator(
       new ObsidianVaultChangeFileApi(this.app.vault, vaultRoot),
-      new GitCheckpointStore(vaultRoot),
+      checkpointStore,
       {
         list: (states) => runtime.listVaultChangeBatches(states),
         markApplying: (batchId, checkpointRef, targets) =>
@@ -372,6 +394,7 @@ export default class OfferAgentPlugin extends Plugin {
       },
       () => {},
       () => this.#settings.vaultPermissionMode,
+      checkpointStore,
     );
     runtime = new RuntimeSupervisor({
       runtimePath,
