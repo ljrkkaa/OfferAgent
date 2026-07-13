@@ -7,6 +7,9 @@ import type {
   ModelDescriptor,
   ProviderErrorCode,
   ToolCallRecord,
+  VaultChangeBatchProposal,
+  VaultUndoResultPayload,
+  LocalToolResultPayload,
 } from "@offeragent/protocol";
 import { RuntimeRequestError, type RuntimeClient } from "./runtime-supervisor";
 
@@ -23,6 +26,13 @@ export interface SidebarViewModel {
     runState: "idle" | "streaming";
     selectedModelId?: string;
     toolCalls: ToolCallRecord[];
+    vaultChanges: Array<{
+      actions: Array<{ operation: string; path: string }>;
+      batchId: string;
+      status: "applied" | "applying" | "failed" | "pending" | "rejected" | "rejecting" | "undone";
+      task: string;
+      toolCallId: string;
+    }>;
   };
   runtime: {
     message?: string;
@@ -33,8 +43,15 @@ export interface SidebarViewModel {
 
 type Subscriber = (viewModel: SidebarViewModel) => void;
 
+export interface VaultChangeDecisionClient {
+  cancel(toolCallId: string): void;
+  decide(toolCallId: string, decision: "apply" | "reject"): Promise<LocalToolResultPayload>;
+  undo(batchId: string): Promise<VaultUndoResultPayload>;
+}
+
 export class SidebarController {
   readonly #runtime: RuntimeClient;
+  readonly #vaultChanges?: VaultChangeDecisionClient;
   readonly #subscribers = new Set<Subscriber>();
   #viewModel: SidebarViewModel = {
     title: "OfferAgent",
@@ -45,13 +62,15 @@ export class SidebarController {
       models: [],
       runState: "idle",
       toolCalls: [],
+      vaultChanges: [],
     },
     runtime: { state: "idle" },
   };
   #activeRun?: { agentRunId: string; conversationId: string };
 
-  constructor(runtime: RuntimeClient) {
+  constructor(runtime: RuntimeClient, vaultChanges?: VaultChangeDecisionClient) {
     this.#runtime = runtime;
+    this.#vaultChanges = vaultChanges;
     this.#runtime.onUnavailable((message) => {
       this.#update({ state: "unavailable", message });
     });
@@ -96,6 +115,7 @@ export class SidebarController {
             snapshot?.messages.map(({ role, text }) => ({ role, text })) ?? [],
           agentRuns: snapshot?.agentRuns ?? [],
           toolCalls: snapshot?.toolCalls ?? [],
+          vaultChanges: this.#changesFromToolCalls(snapshot?.toolCalls ?? []),
           error: undefined,
         });
       } catch (error) {
@@ -132,6 +152,7 @@ export class SidebarController {
       runState: "idle",
       selectedModelId: conversation.modelId,
       toolCalls: [],
+      vaultChanges: [],
       error: undefined,
     });
   }
@@ -149,6 +170,7 @@ export class SidebarController {
       runState: "idle",
       selectedModelId: snapshot.conversation.modelId,
       toolCalls: snapshot.toolCalls ?? [],
+      vaultChanges: this.#changesFromToolCalls(snapshot.toolCalls ?? []),
       error: undefined,
     });
   }
@@ -171,6 +193,7 @@ export class SidebarController {
       messages: [],
       runState: "idle",
       toolCalls: [],
+      vaultChanges: [],
       error: undefined,
     });
     if (conversations[0]) await this.openConversation(conversations[0].id);
@@ -253,6 +276,7 @@ export class SidebarController {
           messages[messages.length - 1] = event.output;
           this.#setRunStatus(agentRunId, "completed");
         } else if (event.type === "tool_call.requested") {
+          const requestedChange = this.#requestedChange(event.toolCallId, event.tool.name, event.tool.arguments);
           this.#updateConversation({
             ...this.#viewModel.conversation,
             toolCalls: [
@@ -265,6 +289,9 @@ export class SidebarController {
                 status: "requested",
               },
             ],
+            vaultChanges: requestedChange
+              ? [...this.#viewModel.conversation.vaultChanges, requestedChange]
+              : this.#viewModel.conversation.vaultChanges,
           });
         } else if (event.type === "tool_call.completed") {
           this.#updateConversation({
@@ -274,23 +301,32 @@ export class SidebarController {
                 ? { ...call, status: event.status }
                 : call,
             ),
+            vaultChanges:
+              event.status === "failed"
+                ? this.#vaultChangesWithStatus(event.toolCallId, "failed")
+                : this.#viewModel.conversation.vaultChanges,
           });
         } else if (event.type === "agent_run.failed") {
+          const vaultChanges = this.#cancelPendingVaultChanges(agentRunId);
           messages.pop();
           this.#updateConversation({
             ...this.#viewModel.conversation,
             messages: [...messages],
             runState: "idle",
             agentRuns: this.#runsWithStatus(agentRunId, "failed"),
+            toolCalls: this.#terminalizedToolCalls(agentRunId),
+            vaultChanges,
             error: event.error,
           });
         } else if (event.type === "agent_run.cancelled" || event.type === "agent_run.interrupted") {
+          const vaultChanges = this.#cancelPendingVaultChanges(agentRunId);
           messages.pop();
           this.#updateConversation({
             ...this.#viewModel.conversation,
             messages: [...messages],
             runState: "idle",
             toolCalls: this.#terminalizedToolCalls(agentRunId),
+            vaultChanges,
             agentRuns: this.#runsWithStatus(
               agentRunId,
               event.type === "agent_run.cancelled" ? "cancelled" : "interrupted",
@@ -304,6 +340,7 @@ export class SidebarController {
         runState: "idle",
       });
     } catch (error) {
+      const vaultChanges = this.#cancelPendingVaultChanges(agentRunId);
       messages.pop();
       const message = error instanceof Error ? error.message : String(error);
       this.#updateConversation({
@@ -311,6 +348,7 @@ export class SidebarController {
         messages: [...messages],
         runState: "idle",
         toolCalls: this.#terminalizedToolCalls(agentRunId),
+        vaultChanges,
         agentRuns: this.#runsWithStatus(agentRunId, "interrupted"),
         error: { code: "transport_error", message },
       });
@@ -320,7 +358,45 @@ export class SidebarController {
   }
 
   stopAgentRun(): void {
-    if (this.#activeRun) this.#runtime.cancelAgentRun(this.#activeRun);
+    if (!this.#activeRun) return;
+    const vaultChanges = this.#cancelPendingVaultChanges(this.#activeRun.agentRunId);
+    if (vaultChanges !== this.#viewModel.conversation.vaultChanges) {
+      this.#updateConversation({ ...this.#viewModel.conversation, vaultChanges });
+    }
+    this.#runtime.cancelAgentRun(this.#activeRun);
+  }
+
+  async decideVaultChange(toolCallId: string, decision: "apply" | "reject"): Promise<void> {
+    if (!this.#vaultChanges) throw new Error("Vault Change decisions are unavailable.");
+    this.#setVaultChangeStatus(toolCallId, decision === "apply" ? "applying" : "rejecting");
+    const result = await this.#vaultChanges.decide(toolCallId, decision);
+    if (!result.ok || result.value.type !== "vault_propose_changes") {
+      this.#setVaultChangeStatus(toolCallId, "failed");
+      if (!result.ok) {
+        this.#updateConversation({
+          ...this.#viewModel.conversation,
+          error: { code: "provider_error", message: result.error.message },
+        });
+      }
+      return;
+    }
+    this.#setVaultChangeStatus(toolCallId, result.value.decision);
+  }
+
+  async undoVaultChange(batchId: string): Promise<void> {
+    if (!this.#vaultChanges) throw new Error("Vault Change undo is unavailable.");
+    const result = await this.#vaultChanges.undo(batchId);
+    const change = this.#viewModel.conversation.vaultChanges.find(
+      (candidate) => candidate.batchId === batchId,
+    );
+    if (!change) return;
+    if (result.ok) this.#setVaultChangeStatus(change.toolCallId, "undone");
+    else {
+      this.#updateConversation({
+        ...this.#viewModel.conversation,
+        error: { code: "provider_error", message: result.error.message },
+      });
+    }
   }
 
   async stop(): Promise<void> {
@@ -359,6 +435,97 @@ export class SidebarController {
     this.#updateConversation({
       ...this.#viewModel.conversation,
       agentRuns: this.#runsWithStatus(agentRunId, status),
+    });
+  }
+
+  #setVaultChangeStatus(
+    toolCallId: string,
+    status: SidebarViewModel["conversation"]["vaultChanges"][number]["status"],
+  ): void {
+    this.#updateConversation({
+      ...this.#viewModel.conversation,
+      vaultChanges: this.#vaultChangesWithStatus(toolCallId, status),
+    });
+  }
+
+  #vaultChangesWithStatus(
+    toolCallId: string,
+    status: SidebarViewModel["conversation"]["vaultChanges"][number]["status"],
+  ): SidebarViewModel["conversation"]["vaultChanges"] {
+    return this.#viewModel.conversation.vaultChanges.map((change) =>
+      change.toolCallId === toolCallId ? { ...change, status } : change,
+    );
+  }
+
+  #cancelPendingVaultChanges(
+    agentRunId: string,
+  ): SidebarViewModel["conversation"]["vaultChanges"] {
+    const pendingIds = new Set(
+      this.#viewModel.conversation.toolCalls
+        .filter(
+          (call) =>
+            call.agentRunId === agentRunId &&
+            call.name === "vault_propose_changes" &&
+            call.status === "requested",
+        )
+        .map((call) => call.id),
+    );
+    if (pendingIds.size === 0) return this.#viewModel.conversation.vaultChanges;
+    for (const toolCallId of pendingIds) this.#vaultChanges?.cancel(toolCallId);
+    return this.#viewModel.conversation.vaultChanges.map((change) =>
+      pendingIds.has(change.toolCallId) && change.status === "pending"
+        ? { ...change, status: "failed" }
+        : change,
+    );
+  }
+
+  #requestedChange(
+    toolCallId: string,
+    name: ToolCallRecord["name"],
+    arguments_: unknown,
+  ): SidebarViewModel["conversation"]["vaultChanges"][number] | undefined {
+    if (name !== "vault_propose_changes" || !arguments_ || typeof arguments_ !== "object") {
+      return undefined;
+    }
+    const proposal = arguments_ as Partial<VaultChangeBatchProposal>;
+    if (
+      typeof proposal.batchId !== "string" ||
+      typeof proposal.task !== "string" ||
+      !Array.isArray(proposal.actions)
+    ) {
+      return undefined;
+    }
+    return {
+      toolCallId,
+      batchId: proposal.batchId,
+      task: proposal.task,
+      status: "pending",
+      actions: proposal.actions
+        .filter(
+          (action) =>
+            action && typeof action.path === "string" && typeof action.operation === "string",
+        )
+        .map((action) => ({ path: action.path, operation: action.operation })),
+    };
+  }
+
+  #changesFromToolCalls(
+    calls: ToolCallRecord[],
+  ): SidebarViewModel["conversation"]["vaultChanges"] {
+    return calls.flatMap((call) => {
+      const change = this.#requestedChange(call.id, call.name, call.arguments);
+      if (!change) return [];
+      return [
+        {
+          ...change,
+          status:
+            call.status === "requested"
+              ? "pending"
+              : call.status === "failed"
+                ? "failed"
+                : call.decision ?? "applied",
+        },
+      ];
     });
   }
 }

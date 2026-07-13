@@ -21,6 +21,10 @@ The current implementation includes the product shell, durable Conversations, an
 - bounded `skill_read` access to registered `.codex/skills/*/SKILL.md` instructions and only their directly referenced in-skill resources;
 - canonical-path containment for Agent Contract and Local Skill control files, with no Skill authority to add tools, permissions, or sub-agents;
 - bounded Evidence Snapshots with source path, exact lines, modified version, SHA-256 hash, and stale-source invalidation;
+- one confirmed, all-or-nothing `vault_propose_changes` batch for bounded create, append, and exact-replace operations;
+- full-batch validation before confirmation and again before apply, with typed Apply all / Reject all results in the same Agent Run;
+- hidden Git checkpoints created through an isolated temporary index without changing HEAD, the current branch, or the user's index;
+- hash-guarded undo that refuses to overwrite later edits;
 - compact expandable Vault tool activity in the Agent Sidebar.
 
 The Codex adapter reuses the login cache managed by Codex CLI/desktop. It does not require an

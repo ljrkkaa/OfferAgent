@@ -289,6 +289,7 @@ test("a Conversation and its completed Agent Run survive restart and delete tran
     "run_checkpoints",
     "tool_calls",
     "evidence_snapshots",
+    "vault_change_batches",
   ]) {
     const result = database.exec(`SELECT COUNT(*) AS count FROM ${table}`);
     assert.equal(result[0].values[0][0], 0, `${table} should be empty after cascade deletion`);

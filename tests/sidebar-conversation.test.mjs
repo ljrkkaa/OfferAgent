@@ -322,3 +322,243 @@ test("a failed Agent Run remains visible with its typed error", async () => {
     { role: "user", text: "Fail this run." },
   ]);
 });
+
+test("the Sidebar exposes one whole-batch decision and guarded undo", async () => {
+  let releaseDecision;
+  const decisionMade = new Promise((resolve) => (releaseDecision = resolve));
+  const proposal = {
+    batchId: "sidebar-batch",
+    idempotencyKey: "sidebar-batch-key",
+    task: "Update interview progress",
+    actions: [
+      {
+        actionId: "sidebar-action",
+        idempotencyKey: "sidebar-action-key",
+        operation: "append",
+        path: "notes/progress.md",
+        expectedVersion: "mtime:1:size:4",
+        content: "done\n",
+      },
+    ],
+  };
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) {
+      return conversation;
+    },
+    async deleteConversation() {},
+    async listConversations() {
+      return [{ id: "conversation-change", title: "Changes", modelId: "model-a" }];
+    },
+    async listModels() {
+      return [{ id: "model-a", label: "Model A" }];
+    },
+    onUnavailable() {
+      return () => {};
+    },
+    async openConversation() {
+      return {
+        conversation: { id: "conversation-change", title: "Changes", modelId: "model-a" },
+        agentRuns: [],
+        messages: [],
+        toolCalls: [],
+      };
+    },
+    async *runAgent() {
+      yield { type: "agent_run.started", model: "model-a" };
+      yield {
+        type: "tool_call.requested",
+        toolCallId: "sidebar-change-call",
+        tool: { kind: "local", name: "vault_propose_changes", arguments: proposal },
+      };
+      await decisionMade;
+      yield {
+        type: "tool_call.completed",
+        toolCallId: "sidebar-change-call",
+        tool: { kind: "local", name: "vault_propose_changes" },
+        status: "completed",
+      };
+      yield { type: "agent_run.delta", delta: "Applied safely" };
+      yield {
+        type: "agent_run.completed",
+        output: { role: "assistant", text: "Applied safely" },
+      };
+    },
+    async start() {},
+    async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Changes", modelId };
+    },
+  };
+  const decisions = [];
+  const changeClient = {
+    async decide(toolCallId, decision) {
+      decisions.push({ toolCallId, decision });
+      releaseDecision();
+      return {
+        ok: true,
+        value: {
+          type: "vault_propose_changes",
+          batchId: proposal.batchId,
+          decision: "applied",
+          checkpointRef: "refs/offeragent/checkpoints/sidebar-batch",
+          targets: [
+            { path: "notes/progress.md", beforeHash: "sha256:before", afterHash: "sha256:after" },
+          ],
+        },
+      };
+    },
+    async undo(batchId) {
+      assert.equal(batchId, proposal.batchId);
+      return { ok: true, value: { type: "vault_change_undo", batchId, status: "undone" } };
+    },
+  };
+  const controller = new SidebarController(runtime, changeClient);
+  await controller.start();
+  const sending = controller.sendMessage("Update my progress.");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(controller.getViewModel().conversation.vaultChanges, [
+    {
+      toolCallId: "sidebar-change-call",
+      batchId: "sidebar-batch",
+      task: "Update interview progress",
+      status: "pending",
+      actions: [{ operation: "append", path: "notes/progress.md" }],
+    },
+  ]);
+  await controller.decideVaultChange("sidebar-change-call", "apply");
+  await sending;
+  assert.deepEqual(decisions, [{ toolCallId: "sidebar-change-call", decision: "apply" }]);
+  assert.equal(controller.getViewModel().conversation.vaultChanges[0].status, "applied");
+  await controller.undoVaultChange("sidebar-batch");
+  assert.equal(controller.getViewModel().conversation.vaultChanges[0].status, "undone");
+});
+
+test("failed and cancelled Vault Change requests cannot remain actionable", async () => {
+  let releaseCancellation;
+  const cancellation = new Promise((resolve) => (releaseCancellation = resolve));
+  let cancelledToolCallId;
+  const proposal = {
+    batchId: "terminal-batch",
+    idempotencyKey: "terminal-batch-key",
+    task: "Do not apply after termination",
+    actions: [
+      {
+        actionId: "terminal-action",
+        idempotencyKey: "terminal-action-key",
+        operation: "create",
+        path: "notes/terminal.md",
+        expectedVersion: "missing",
+        content: "never written\n",
+      },
+    ],
+  };
+  const runtime = {
+    cancelAgentRun() {
+      releaseCancellation();
+    },
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async listConversations() {
+      return [{ id: "conversation-terminal", title: "Terminal", modelId: "model-a" }];
+    },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: { id: "conversation-terminal", title: "Terminal", modelId: "model-a" },
+        agentRuns: [],
+        messages: [],
+        toolCalls: [],
+      };
+    },
+    async *runAgent() {
+      yield { type: "agent_run.started", model: "model-a" };
+      yield {
+        type: "tool_call.requested",
+        toolCallId: "terminal-change-call",
+        tool: { kind: "local", name: "vault_propose_changes", arguments: proposal },
+      };
+      await cancellation;
+      yield { type: "agent_run.cancelled" };
+    },
+    async start() {},
+    async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Terminal", modelId };
+    },
+  };
+  const changes = {
+    cancel(toolCallId) { cancelledToolCallId = toolCallId; },
+    async decide() { throw new Error("cancelled change must not be decided"); },
+    async undo() { throw new Error("cancelled change was never applied"); },
+  };
+  const controller = new SidebarController(runtime, changes);
+  await controller.start();
+  const sending = controller.sendMessage("Propose then stop.");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(controller.getViewModel().conversation.vaultChanges[0].status, "pending");
+  controller.stopAgentRun();
+  await sending;
+  assert.equal(cancelledToolCallId, "terminal-change-call");
+  assert.equal(controller.getViewModel().conversation.vaultChanges[0].status, "failed");
+});
+
+test("a failed Vault Change tool event disables its confirmation card", async () => {
+  const proposal = {
+    batchId: "failed-batch",
+    idempotencyKey: "failed-batch-key",
+    task: "Reject a stale proposal",
+    actions: [{
+      actionId: "failed-action",
+      idempotencyKey: "failed-action-key",
+      operation: "append",
+      path: "notes/stale.md",
+      expectedVersion: "mtime:old",
+      content: "stale\n",
+    }],
+  };
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async listConversations() {
+      return [{ id: "conversation-failed-change", title: "Failed change", modelId: "model-a" }];
+    },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: { id: "conversation-failed-change", title: "Failed change", modelId: "model-a" },
+        agentRuns: [], messages: [], toolCalls: [],
+      };
+    },
+    async *runAgent() {
+      yield { type: "agent_run.started", model: "model-a" };
+      yield {
+        type: "tool_call.requested",
+        toolCallId: "failed-change-call",
+        tool: { kind: "local", name: "vault_propose_changes", arguments: proposal },
+      };
+      yield {
+        type: "tool_call.completed",
+        toolCallId: "failed-change-call",
+        tool: { kind: "local", name: "vault_propose_changes" },
+        status: "failed",
+        error: { code: "stale_evidence", message: "The proposal is stale." },
+      };
+      yield {
+        type: "agent_run.completed",
+        output: { role: "assistant", text: "I will re-read the file." },
+      };
+    },
+    async start() {}, async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Failed change", modelId };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+  await controller.sendMessage("Try a stale change.");
+  assert.equal(controller.getViewModel().conversation.vaultChanges[0].status, "failed");
+});

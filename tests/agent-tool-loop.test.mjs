@@ -302,6 +302,63 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
   );
   assert.match(skillResourceEvents.at(-1).output.text, /bounded guide/);
 
+  for (const decision of ["applied", "rejected"]) {
+    const proposal = {
+      batchId: `batch-${decision}`,
+      idempotencyKey: `batch-key-${decision}`,
+      task: `Test ${decision} batch`,
+      actions: [
+        {
+          actionId: `action-${decision}`,
+          idempotencyKey: `action-key-${decision}`,
+          operation: "append",
+          path: "notes/batch.md",
+          expectedVersion: "mtime:1234:size:25",
+          content: "next\n",
+        },
+      ],
+    };
+    const batchEvents = await runWithToolPeer(
+      socket,
+      {
+        type: "agent_run.start",
+        protocolVersion: 1,
+        eventId: `batch-${decision}-start`,
+        conversationId: "tool-conversation",
+        agentRunId: `tool-run-batch-${decision}`,
+        sequence: 0,
+        model: "fake-interview-model",
+        input: { role: "user", text: `vault_propose_changes ${JSON.stringify(proposal)}` },
+      },
+      () => ({
+        ok: true,
+        value: {
+          type: "vault_propose_changes",
+          batchId: proposal.batchId,
+          decision,
+          ...(decision === "applied"
+            ? { checkpointRef: `refs/offeragent/checkpoints/${proposal.batchId}` }
+            : {}),
+          targets: [
+            {
+              path: "notes/batch.md",
+              beforeHash: "sha256:before",
+              afterHash: "sha256:after",
+            },
+          ],
+        },
+      }),
+    );
+    assert.equal(
+      batchEvents.find(
+        (event) =>
+          event.type === "tool_call.requested" && event.tool.name === "vault_propose_changes",
+      ).tool.arguments.batchId,
+      proposal.batchId,
+    );
+    assert.match(batchEvents.at(-1).output.text, new RegExp(decision));
+  }
+
   const missingContractEvents = await new Promise((resolve, reject) => {
     const events = [];
     const timeout = setTimeout(() => reject(new Error("Missing contract run timed out")), 10_000);
@@ -387,6 +444,8 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
       { name: "vault_search", status: "completed" },
       { name: "skill_read", status: "completed" },
       { name: "skill_read", status: "completed" },
+      { name: "vault_propose_changes", status: "completed" },
+      { name: "vault_propose_changes", status: "completed" },
     ],
   );
 
@@ -403,6 +462,21 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
     database.exec("SELECT COUNT(*) FROM tool_calls WHERE name = 'skill_read' AND status = 'completed'")[0]
       .values[0][0],
     2,
+  );
+  assert.deepEqual(
+    database.exec(
+      `SELECT id, idempotency_key, state, checkpoint_ref
+       FROM vault_change_batches ORDER BY created_at, id`,
+    )[0].values,
+    [
+      [
+        "batch-applied",
+        "batch-key-applied",
+        "applied",
+        "refs/offeragent/checkpoints/batch-applied",
+      ],
+      ["batch-rejected", "batch-key-rejected", "rejected", null],
+    ],
   );
   assert.deepEqual(
     database.exec(

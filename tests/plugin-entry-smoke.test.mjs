@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import Module from "node:module";
@@ -12,6 +13,15 @@ const repositoryRoot = path.resolve(
   "..",
 );
 const builtPlugin = path.join(repositoryRoot, "packages", "plugin", "dist");
+
+function git(root, ...args) {
+  return new Promise((resolve, reject) => {
+    execFile("git", ["-C", root, ...args], { windowsHide: true }, (error, stdout, stderr) => {
+      if (error) reject(new Error(stderr || error.message));
+      else resolve(stdout.toString("utf8").trim());
+    });
+  });
+}
 
 class StubElement {
   constructor(className = "", tagName = "div") {
@@ -95,6 +105,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   await mkdir(path.join(temporaryVault, "notes"), { recursive: true });
   await writeFile(path.join(temporaryVault, "agent.md"), "# Test Agent Contract", "utf8");
   await writeFile(path.join(temporaryVault, "notes", "example.md"), "line one\nline two", "utf8");
+  await git(temporaryVault, "init", "-q");
   const installation = path.join(
     temporaryVault,
     ".obsidian",
@@ -197,28 +208,49 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     await readFile(path.join(installation, "manifest.json"), "utf8"),
   );
   manifest.dir = path.join(".obsidian", "plugins", "offeragent");
+  const vaultFiles = [
+    {
+      path: "agent.md",
+      extension: "md",
+      stat: { mtime: 1234, size: 26 },
+      content: "# Test Agent Contract",
+    },
+    {
+      path: "notes/example.md",
+      extension: "md",
+      stat: { mtime: 1234, size: 17 },
+      content: "line one\nline two",
+    },
+  ];
   const app = {
     vault: {
       adapter: new FileSystemAdapter(temporaryVault),
       configDir: ".obsidian",
       getFiles() {
-        return [
-          {
-            path: "agent.md",
-            extension: "md",
-            stat: { mtime: 1234, size: 26 },
-            content: "# Test Agent Contract",
-          },
-          {
-            path: "notes/example.md",
-            extension: "md",
-            stat: { mtime: 1234, size: 17 },
-            content: "line one\nline two",
-          },
-        ];
+        return vaultFiles;
       },
       async cachedRead(file) {
         return file.content;
+      },
+      async create(vaultPath, content) {
+        const file = {
+          path: vaultPath,
+          extension: vaultPath.split(".").at(-1),
+          stat: { mtime: Date.now(), size: Buffer.byteLength(content, "utf8") },
+          content,
+        };
+        vaultFiles.push(file);
+        await writeFile(path.join(temporaryVault, vaultPath), content, { encoding: "utf8", flag: "wx" });
+        return file;
+      },
+      async modify(file, content) {
+        file.content = content;
+        file.stat = { mtime: Date.now(), size: Buffer.byteLength(content, "utf8") };
+        await writeFile(path.join(temporaryVault, file.path), content, "utf8");
+      },
+      async delete(file) {
+        vaultFiles.splice(vaultFiles.indexOf(file), 1);
+        await rm(path.join(temporaryVault, file.path), { force: true });
       },
     },
     workspace,
@@ -317,6 +349,144 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "OfferAgent did not execute and render the Vault tool activity",
   );
   assert.match(completedTool.children[0].text, /vault_read · completed/);
+
+  await waitUntil(
+    () => {
+      const statuses = activeView.contentEl.findAllByClass("offeragent-sidebar__run-status");
+      return statuses.length === 3 &&
+        statuses.every((status) => status.dataset.status === "completed");
+    },
+    "OfferAgent did not finish the Vault read Agent Run",
+  );
+
+  const proposal = {
+    batchId: "smoke-batch-reject",
+    idempotencyKey: "smoke-batch-reject-key",
+    task: "Append one smoke-test line",
+    actions: [
+      {
+        actionId: "smoke-action-reject",
+        idempotencyKey: "smoke-action-reject-key",
+        operation: "append",
+        path: "notes/example.md",
+        expectedVersion: "mtime:1234:size:17",
+        content: "\nrejected",
+      },
+    ],
+  };
+  const changeComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
+  const changeInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  changeInput.value = `vault_propose_changes ${JSON.stringify(proposal)}`;
+  changeComposer.dispatch("submit");
+  const pendingBatch = await waitUntil(
+    () => {
+      const card = activeView.contentEl.findByClass("offeragent-sidebar__change-batch");
+      return card?.dataset.status === "pending" ? card : undefined;
+    },
+    "OfferAgent did not render the pending whole-batch confirmation card",
+  );
+  assert.match(pendingBatch.children[0].text, /Append one smoke-test line/);
+  const applyAll = activeView.contentEl.findByClass("offeragent-sidebar__change-apply");
+  const rejectAll = activeView.contentEl.findByClass("offeragent-sidebar__change-reject");
+  assert.equal(applyAll.text, "Apply all");
+  assert.equal(rejectAll.text, "Reject all");
+  rejectAll.dispatch("click");
+  const rejectedBatch = await waitUntil(
+    () => {
+      const card = activeView.contentEl.findByClass("offeragent-sidebar__change-batch");
+      return card?.dataset.status === "rejected" ? card : undefined;
+    },
+    "OfferAgent did not reject the whole batch and continue the Agent Run",
+  );
+  assert.equal(rejectedBatch.dataset.status, "rejected");
+  assert.equal(
+    await readFile(path.join(temporaryVault, "notes", "example.md"), "utf8"),
+    "line one\nline two",
+  );
+  await waitUntil(
+    () => {
+      const statuses = activeView.contentEl.findAllByClass("offeragent-sidebar__run-status");
+      return statuses.length === 4 &&
+        statuses.every((status) => status.dataset.status === "completed");
+    },
+    "OfferAgent did not continue the rejected batch Agent Run",
+  );
+
+  const appliedProposal = {
+    ...proposal,
+    batchId: "smoke-batch-apply",
+    idempotencyKey: "smoke-batch-apply-key",
+    task: "Apply one smoke-test line",
+    actions: [
+      {
+        ...proposal.actions[0],
+        actionId: "smoke-action-apply",
+        idempotencyKey: "smoke-action-apply-key",
+        operation: "create",
+        path: "notes/applied.md",
+        expectedVersion: "missing",
+        content: "applied\n",
+      },
+    ],
+  };
+  const applyComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
+  const applyInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  applyInput.value = `vault_propose_changes ${JSON.stringify(appliedProposal)}`;
+  applyComposer.dispatch("submit");
+  await waitUntil(
+    () =>
+      activeView.contentEl
+        .findAllByClass("offeragent-sidebar__change-batch")
+        .find(
+          (card) =>
+            card.dataset.status === "pending" &&
+            card.children[0]?.text.includes("Apply one smoke-test line"),
+        ),
+    "OfferAgent did not render the applied batch confirmation card",
+  );
+  activeView.contentEl.findByClass("offeragent-sidebar__change-apply").dispatch("click");
+  await waitUntil(
+    () =>
+      activeView.contentEl
+        .findAllByClass("offeragent-sidebar__change-batch")
+        .find(
+          (card) =>
+            card.dataset.status === "applied" &&
+            card.children[0]?.text.includes("Apply one smoke-test line"),
+        ),
+    "OfferAgent did not apply the whole batch",
+  );
+  assert.equal(
+    await readFile(path.join(temporaryVault, "notes", "applied.md"), "utf8"),
+    "applied\n",
+  );
+  await git(
+    temporaryVault,
+    "cat-file",
+    "-e",
+    "refs/offeragent/checkpoints/smoke-batch-apply^{commit}",
+  );
+  await waitUntil(
+    () => {
+      const statuses = activeView.contentEl.findAllByClass("offeragent-sidebar__run-status");
+      return statuses.length === 5 &&
+        statuses.every((status) => status.dataset.status === "completed");
+    },
+    "OfferAgent did not continue the applied batch Agent Run",
+  );
+  activeView.contentEl.findByClass("offeragent-sidebar__change-undo").dispatch("click");
+  await waitUntil(
+    () =>
+      activeView.contentEl
+        .findAllByClass("offeragent-sidebar__change-batch")
+        .find(
+          (card) =>
+            card.dataset.status === "undone" &&
+            card.children[0]?.text.includes("Apply one smoke-test line"),
+        ),
+    "OfferAgent did not undo the applied batch",
+  );
+  await assert.rejects(readFile(path.join(temporaryVault, "notes", "applied.md"), "utf8"));
 
   await plugin.onunload();
   plugin = undefined;

@@ -14,7 +14,7 @@ import {
 } from "@offeragent/protocol";
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.js";
 
-const CURRENT_SCHEMA_VERSION = 5;
+const CURRENT_SCHEMA_VERSION = 6;
 
 const MIGRATIONS = [
   {
@@ -228,6 +228,77 @@ const MIGRATIONS = [
       CREATE INDEX tool_calls_by_run ON tool_calls(agent_run_id, created_at);
       CREATE INDEX evidence_by_run ON evidence_snapshots(agent_run_id, created_at);
       CREATE INDEX evidence_by_source ON evidence_snapshots(path, content_hash, is_stale);
+    `,
+  },
+  {
+    version: 6,
+    sql: `
+      CREATE TABLE tool_calls_v6 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        name TEXT NOT NULL CHECK (name IN (
+          'agent_contract_read', 'skill_read', 'vault_list', 'vault_propose_changes',
+          'vault_read', 'vault_search'
+        )),
+        arguments_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('requested', 'completed', 'failed')),
+        error_code TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO tool_calls_v6
+        (id, conversation_id, agent_run_id, name, arguments_json, status,
+         error_code, error_message, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, name, arguments_json, status,
+             error_code, error_message, created_at, updated_at
+      FROM tool_calls;
+      CREATE TABLE evidence_snapshots_v6 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v6(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        line_start INTEGER NOT NULL,
+        line_end INTEGER NOT NULL,
+        modified_version TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        is_stale INTEGER NOT NULL DEFAULT 0 CHECK (is_stale IN (0, 1)),
+        stale_detected_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO evidence_snapshots_v6
+        (id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+         modified_version, content_hash, content, is_stale, stale_detected_at, created_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+             modified_version, content_hash, content, is_stale, stale_detected_at, created_at
+      FROM evidence_snapshots;
+      DROP TABLE evidence_snapshots;
+      DROP TABLE tool_calls;
+      ALTER TABLE tool_calls_v6 RENAME TO tool_calls;
+      ALTER TABLE evidence_snapshots_v6 RENAME TO evidence_snapshots;
+      CREATE INDEX tool_calls_by_run ON tool_calls(agent_run_id, created_at);
+      CREATE INDEX evidence_by_run ON evidence_snapshots(agent_run_id, created_at);
+      CREATE INDEX evidence_by_source ON evidence_snapshots(path, content_hash, is_stale);
+      CREATE TABLE vault_change_batches (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        task TEXT NOT NULL,
+        proposal_json TEXT NOT NULL,
+        target_paths_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'applied', 'rejected', 'failed')),
+        checkpoint_ref TEXT,
+        after_hashes_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX vault_change_batches_by_run
+        ON vault_change_batches(agent_run_id, created_at);
     `,
   },
 ] as const;
@@ -521,6 +592,45 @@ export class RuntimeStateStore {
           timestamp,
         ],
       );
+      if (
+        event.tool.name === "vault_propose_changes" &&
+        event.tool.arguments &&
+        typeof event.tool.arguments === "object" &&
+        !Array.isArray(event.tool.arguments)
+      ) {
+        const proposal = event.tool.arguments as {
+          actions?: Array<{ path?: unknown }>;
+          batchId?: unknown;
+          idempotencyKey?: unknown;
+          task?: unknown;
+        };
+        if (
+          typeof proposal.batchId === "string" &&
+          typeof proposal.idempotencyKey === "string" &&
+          typeof proposal.task === "string" &&
+          Array.isArray(proposal.actions) &&
+          proposal.actions.every((action) => typeof action?.path === "string")
+        ) {
+          this.#database.run(
+            `INSERT INTO vault_change_batches
+              (id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+               proposal_json, target_paths_json, state, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+            [
+              proposal.batchId,
+              run.conversationId,
+              agentRunId,
+              event.toolCallId,
+              proposal.idempotencyKey,
+              proposal.task,
+              JSON.stringify(event.tool.arguments),
+              JSON.stringify(proposal.actions.map((action) => action.path)),
+              timestamp,
+              timestamp,
+            ],
+          );
+        }
+      }
       this.#recordEvent(event);
       this.#touchConversation(run.conversationId, timestamp);
     });
@@ -551,10 +661,40 @@ export class RuntimeStateStore {
       if (this.#database.getRowsModified() !== 1) {
         throw new Error(`Tool Call '${event.toolCallId}' is not pending.`);
       }
+      if (result.ok && result.value.type === "vault_propose_changes") {
+        this.#database.run(
+          `UPDATE vault_change_batches
+           SET state = ?, checkpoint_ref = ?, after_hashes_json = ?, updated_at = ?
+           WHERE tool_call_id = ?`,
+          [
+            result.value.decision,
+            result.value.checkpointRef ?? null,
+            JSON.stringify(
+              Object.fromEntries(
+                result.value.targets.map((target) => [target.path, target.afterHash]),
+              ),
+            ),
+            timestamp,
+            event.toolCallId,
+          ],
+        );
+      } else if (!result.ok) {
+        this.#database.run(
+          `UPDATE vault_change_batches SET state = 'failed', updated_at = ?
+           WHERE tool_call_id = ?`,
+          [timestamp, event.toolCallId],
+        );
+      }
       if (result.ok) {
         const sources =
           result.value.type === "vault_read"
             ? [{ path: result.value.path, contentHash: result.value.contentHash }]
+            : result.value.type === "vault_propose_changes" &&
+                result.value.decision === "applied"
+              ? result.value.targets.map(({ path, afterHash }) => ({
+                  path,
+                  contentHash: afterHash,
+                }))
             : result.value.type === "vault_list" || result.value.type === "vault_search"
               ? result.value.entries.map(({ path, contentHash }) => ({ path, contentHash }))
               : [];
@@ -626,8 +766,12 @@ export class RuntimeStateStore {
       )[0]?.values ?? [];
     const toolCallRows =
       this.#database.exec(
-        `SELECT id, agent_run_id, name, arguments_json, status
-         FROM tool_calls WHERE conversation_id = ? ORDER BY created_at, id`,
+        `SELECT tool_calls.id, tool_calls.agent_run_id, tool_calls.name,
+                tool_calls.arguments_json, tool_calls.status, vault_change_batches.state
+         FROM tool_calls
+         LEFT JOIN vault_change_batches ON vault_change_batches.tool_call_id = tool_calls.id
+         WHERE tool_calls.conversation_id = ?
+         ORDER BY tool_calls.created_at, tool_calls.id`,
         [conversationId],
       )[0]?.values ?? [];
     return {
@@ -648,12 +792,15 @@ export class RuntimeStateStore {
         modelId: modelId as string,
         status: status as AgentRunStatus,
       })),
-      toolCalls: toolCallRows.map(([id, agentRunId, name, argumentsJson, status]) => ({
+      toolCalls: toolCallRows.map(([id, agentRunId, name, argumentsJson, status, batchState]) => ({
         id: id as string,
         agentRunId: agentRunId as string,
         name: name as ToolCallRecord["name"],
         arguments: JSON.parse(argumentsJson as string) as unknown,
         status: status as ToolCallRecord["status"],
+        ...(batchState === "applied" || batchState === "rejected"
+          ? { decision: batchState }
+          : {}),
       })),
     };
   }

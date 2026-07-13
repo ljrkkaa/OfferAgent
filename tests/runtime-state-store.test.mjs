@@ -85,6 +85,7 @@ test("Runtime State applies explicit schema migrations and rejects newer schemas
       timestamp,
     ],
   );
+  migrated.run("DROP TABLE vault_change_batches");
   migrated.run("DROP TABLE evidence_snapshots");
   migrated.run("DROP TABLE tool_calls");
   migrated.run("ALTER TABLE agent_runs DROP COLUMN last_sequence");
@@ -221,6 +222,7 @@ test("populated v3 tool and evidence tables survive the current control-tool reb
       SELECT id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
              modified_version, content_hash, content, created_at
       FROM evidence_snapshots;
+    DROP TABLE vault_change_batches;
     DROP TABLE evidence_snapshots;
     DROP TABLE tool_calls;
     ALTER TABLE tool_calls_v3_fixture RENAME TO tool_calls;

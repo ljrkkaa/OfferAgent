@@ -13,6 +13,11 @@ import {
   type SidebarViewModel,
 } from "./sidebar-controller";
 import { ObsidianVaultToolAdapter } from "./vault-tool-adapter";
+import {
+  GitCheckpointStore,
+  ObsidianVaultChangeFileApi,
+  VaultChangeCoordinator,
+} from "./vault-change-coordinator";
 
 const SIDEBAR_VIEW_TYPE = "offeragent-sidebar";
 
@@ -145,9 +150,51 @@ class OfferAgentSidebarView extends ItemView {
       diagnostic.dataset.code = viewModel.conversation.error.code;
     }
 
+    for (const batch of viewModel.conversation.vaultChanges) {
+      const card = container.createDiv({ cls: "offeragent-sidebar__change-batch" });
+      card.dataset.status = batch.status;
+      card.createEl("h3", { text: batch.task });
+      card.createDiv({
+        cls: "offeragent-sidebar__change-batch-status",
+        text: `Vault Change Batch: ${batch.status}`,
+      });
+      const actions = card.createEl("ul", { cls: "offeragent-sidebar__change-actions" });
+      for (const action of batch.actions) {
+        actions.createEl("li", { text: `${action.operation}: ${action.path}` });
+      }
+      if (batch.status === "pending") {
+        const apply = card.createEl("button", {
+          cls: "offeragent-sidebar__change-apply",
+          text: "Apply all",
+        });
+        apply.type = "button";
+        apply.addEventListener("click", () => {
+          void this.#controller.decideVaultChange(batch.toolCallId, "apply");
+        });
+        const reject = card.createEl("button", {
+          cls: "offeragent-sidebar__change-reject",
+          text: "Reject all",
+        });
+        reject.type = "button";
+        reject.addEventListener("click", () => {
+          void this.#controller.decideVaultChange(batch.toolCallId, "reject");
+        });
+      } else if (batch.status === "applied") {
+        const undo = card.createEl("button", {
+          cls: "offeragent-sidebar__change-undo",
+          text: "Undo",
+        });
+        undo.type = "button";
+        undo.addEventListener("click", () => {
+          void this.#controller.undoVaultChange(batch.batchId);
+        });
+      }
+    }
+
     if (viewModel.conversation.toolCalls.length > 0) {
       const activities = container.createDiv({ cls: "offeragent-sidebar__tool-activities" });
       for (const call of viewModel.conversation.toolCalls) {
+        if (call.name === "vault_propose_changes") continue;
         const activity = activities.createEl("details", {
           cls: "offeragent-sidebar__tool-activity",
         });
@@ -213,12 +260,22 @@ export default class OfferAgentPlugin extends Plugin {
     }
 
     const runtimePath = this.#runtimePath();
-    this.#controller = new SidebarController(
-      new RuntimeSupervisor({
-        runtimePath,
-      toolExecutor: new ObsidianVaultToolAdapter(this.app.vault, this.app.metadataCache),
-      }),
+    const vaultRoot = this.#vaultRoot();
+    const readTools = new ObsidianVaultToolAdapter(this.app.vault, this.app.metadataCache);
+    const changeCoordinator = new VaultChangeCoordinator(
+      new ObsidianVaultChangeFileApi(this.app.vault, vaultRoot),
+      new GitCheckpointStore(vaultRoot),
     );
+    const runtime = new RuntimeSupervisor({
+      runtimePath,
+      toolExecutor: {
+        execute: (event) =>
+          event.tool.name === "vault_propose_changes"
+            ? changeCoordinator.execute(event)
+            : readTools.execute(event),
+      },
+    });
+    this.#controller = new SidebarController(runtime, changeCoordinator);
 
     this.registerView(
       SIDEBAR_VIEW_TYPE,
@@ -268,13 +325,17 @@ export default class OfferAgentPlugin extends Plugin {
   }
 
   #runtimePath(): string {
+    const vaultRoot = this.#vaultRoot();
+    const pluginDirectory =
+      this.manifest.dir ?? path.join(this.app.vault.configDir, "plugins", this.manifest.id);
+    return path.join(vaultRoot, pluginDirectory, "runtime.js");
+  }
+
+  #vaultRoot(): string {
     const adapter = this.app.vault.adapter;
     if (!(adapter instanceof FileSystemAdapter)) {
       throw new Error("OfferAgent requires a local filesystem Vault.");
     }
-    const pluginDirectory =
-      this.manifest.dir ??
-      path.join(this.app.vault.configDir, "plugins", this.manifest.id);
-    return path.join(adapter.getBasePath(), pluginDirectory, "runtime.js");
+    return adapter.getBasePath();
   }
 }

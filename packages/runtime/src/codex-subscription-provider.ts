@@ -413,6 +413,7 @@ function isLocalToolName(value: unknown): value is LocalToolName {
   return (
     value === "skill_read" ||
     value === "vault_list" ||
+    value === "vault_propose_changes" ||
     value === "vault_read" ||
     value === "vault_search"
   );

@@ -86,6 +86,40 @@ const LOCAL_TOOLS: LocalToolDefinition[] = [
     },
   },
   {
+    name: "vault_propose_changes",
+    description:
+      "Propose one atomic, user-visible Vault Change Batch. This never writes directly; the plugin validates and applies or rejects the whole batch.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        batchId: { type: "string", minLength: 1, maxLength: 128 },
+        idempotencyKey: { type: "string", minLength: 1, maxLength: 128 },
+        task: { type: "string", minLength: 1, maxLength: 512 },
+        actions: {
+          type: "array",
+          minItems: 1,
+          maxItems: 20,
+          items: {
+            type: "object",
+            properties: {
+              actionId: { type: "string", minLength: 1, maxLength: 128 },
+              idempotencyKey: { type: "string", minLength: 1, maxLength: 128 },
+              operation: { type: "string", enum: ["create", "append", "exact_replace"] },
+              path: { type: "string", minLength: 1, maxLength: 512 },
+              expectedVersion: { type: "string", minLength: 1, maxLength: 256 },
+              content: { type: "string" },
+              expectedContent: { type: "string" },
+              replacement: { type: "string" },
+            },
+            required: ["actionId", "idempotencyKey", "operation", "path", "expectedVersion"],
+          },
+        },
+      },
+      required: ["batchId", "idempotencyKey", "task", "actions"],
+    },
+  },
+  {
     name: "vault_read",
     description: "Read an exact bounded line range from one Vault Markdown or text file.",
     parameters: {
@@ -160,7 +194,7 @@ function isLocalToolResultPayload(value: unknown): value is LocalToolResultPaylo
   if (result.ok === false) {
     return Boolean(
       result.error &&
-      ["invalid_path", "malformed_control_file", "not_found", "plugin_disconnected", "request_too_large", "stale_evidence", "tool_error"].includes(
+      ["invalid_change", "invalid_path", "malformed_control_file", "not_found", "plugin_disconnected", "request_too_large", "stale_evidence", "tool_error", "undo_conflict"].includes(
         result.error.code as string,
       ) &&
       typeof result.error.message === "string" &&
@@ -196,6 +230,31 @@ function isLocalToolResultPayload(value: unknown): value is LocalToolResultPaylo
       result.value.modifiedVersion.length <= 128 &&
       typeof result.value.contentHash === "string" &&
       result.value.contentHash.length <= 128
+    );
+  }
+  if (result.value.type === "vault_propose_changes") {
+    return (
+      typeof result.value.batchId === "string" &&
+      result.value.batchId.length > 0 &&
+      result.value.batchId.length <= 128 &&
+      (result.value.decision === "applied" || result.value.decision === "rejected") &&
+      (result.value.decision === "applied"
+        ? result.value.checkpointRef ===
+          `refs/offeragent/checkpoints/${result.value.batchId}`
+        : result.value.checkpointRef === undefined) &&
+      Array.isArray(result.value.targets) &&
+      result.value.targets.length > 0 &&
+      result.value.targets.length <= 20 &&
+      result.value.targets.every(
+        (target) =>
+          target &&
+          typeof target.path === "string" &&
+          target.path.length <= 512 &&
+          typeof target.beforeHash === "string" &&
+          target.beforeHash.length <= 128 &&
+          typeof target.afterHash === "string" &&
+          target.afterHash.length <= 128,
+      )
     );
   }
   if (result.value.type === "vault_list") {
@@ -891,7 +950,9 @@ async function startRuntime({
               }
               if (currentReadPath) requiredRereads.delete(currentReadPath);
               const providerResult: LocalToolResultPayload =
-                stalePaths.length > 0 && !currentReadPath
+                stalePaths.length > 0 &&
+                !currentReadPath &&
+                !(result.ok && result.value.type === "vault_propose_changes")
                   ? {
                       ok: false,
                       error: {

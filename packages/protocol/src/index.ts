@@ -53,17 +53,20 @@ export type LocalToolName =
   | "agent_contract_read"
   | "skill_read"
   | "vault_list"
+  | "vault_propose_changes"
   | "vault_read"
   | "vault_search";
 
 export type VaultToolErrorCode =
   | "invalid_path"
+  | "invalid_change"
   | "malformed_control_file"
   | "not_found"
   | "plugin_disconnected"
   | "request_too_large"
   | "stale_evidence"
-  | "tool_error";
+  | "tool_error"
+  | "undo_conflict";
 
 export interface VaultListResult {
   entries: Array<{
@@ -121,6 +124,52 @@ export interface SkillReadResult {
   type: "skill_read";
 }
 
+interface VaultActionBase {
+  actionId: string;
+  expectedVersion: string;
+  idempotencyKey: string;
+  path: string;
+}
+
+export type VaultAction =
+  | (VaultActionBase & {
+      content: string;
+      operation: "append" | "create";
+    })
+  | (VaultActionBase & {
+      expectedContent: string;
+      operation: "exact_replace";
+      replacement: string;
+    });
+
+export interface VaultChangeBatchProposal {
+  actions: VaultAction[];
+  batchId: string;
+  idempotencyKey: string;
+  task: string;
+}
+
+export interface VaultChangeTargetResult {
+  afterHash: string;
+  beforeHash: string;
+  path: string;
+}
+
+export interface VaultChangeResult {
+  batchId: string;
+  checkpointRef?: string;
+  decision: "applied" | "rejected";
+  targets: VaultChangeTargetResult[];
+  type: "vault_propose_changes";
+}
+
+export type VaultUndoResultPayload =
+  | {
+      ok: true;
+      value: { batchId: string; status: "undone"; type: "vault_change_undo" };
+    }
+  | { ok: false; error: { code: VaultToolErrorCode; message: string } };
+
 export type LocalToolResultPayload =
   | {
       ok: true;
@@ -128,6 +177,7 @@ export type LocalToolResultPayload =
         | AgentContractResult
         | SkillReadResult
         | VaultListResult
+        | VaultChangeResult
         | VaultReadResult
         | VaultSearchResult;
     }
@@ -136,6 +186,7 @@ export type LocalToolResultPayload =
 export interface ToolCallRecord {
   agentRunId: string;
   arguments: unknown;
+  decision?: "applied" | "rejected";
   id: string;
   name: LocalToolName;
   status: "completed" | "failed" | "requested";

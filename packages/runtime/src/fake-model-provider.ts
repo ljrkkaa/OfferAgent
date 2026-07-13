@@ -111,6 +111,14 @@ export class FakeModelProvider implements ModelProvider {
 }
 
 function fakeToolRequest(input: string): { name: LocalToolName; arguments: unknown } | undefined {
+  const change = /^vault_propose_changes\s+([\s\S]+)$/i.exec(input.trim());
+  if (change) {
+    try {
+      return { name: "vault_propose_changes", arguments: JSON.parse(change[1]) as unknown };
+    } catch {
+      return { name: "vault_propose_changes", arguments: change[1] };
+    }
+  }
   const skill = /^skill_read\s+([^\s]+)(?:\s+(.+))?$/i.exec(input.trim());
   if (skill) {
     return {

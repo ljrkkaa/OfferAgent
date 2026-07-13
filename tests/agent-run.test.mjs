@@ -382,6 +382,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
     "vault_list",
     "vault_search",
     "skill_read",
+    "vault_propose_changes",
     "vault_read",
   ]);
   assert.ok(responseRequest.tools.every((tool) => tool.strict === false));
@@ -552,7 +553,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   assert.match(finalInstructions, /cannot add tools, grant permissions, create sub-agents/);
   assert.deepEqual(
     instructionRequests[2].tools.map((tool) => tool.name),
-    ["vault_list", "vault_search", "skill_read", "vault_read"],
+    ["vault_list", "vault_search", "skill_read", "vault_propose_changes", "vault_read"],
   );
   assert.equal(instructionRequests[2].tools.some((tool) => tool.name === "shell"), false);
 
