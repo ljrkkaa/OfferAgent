@@ -68,12 +68,68 @@ class OfferAgentSidebarView extends ItemView {
         cls: "offeragent-sidebar__diagnostic",
         text: viewModel.runtime.message,
       });
-    } else {
+    }
+
+    const modelRow = container.createDiv({ cls: "offeragent-sidebar__models" });
+    modelRow.createEl("label", { text: "Model" });
+    const modelSelect = modelRow.createEl("select", {
+      cls: "offeragent-sidebar__model-select",
+    });
+    for (const model of viewModel.conversation.models) {
+      const option = modelSelect.createEl("option", { text: model.label });
+      option.value = model.id;
+    }
+    modelSelect.value = viewModel.conversation.selectedModelId ?? "";
+    modelSelect.disabled =
+      viewModel.conversation.models.length === 0 ||
+      viewModel.conversation.runState === "streaming";
+    modelSelect.addEventListener("change", () => {
+      this.#controller.selectModel(modelSelect.value);
+    });
+
+    const transcript = container.createDiv({ cls: "offeragent-sidebar__transcript" });
+    if (viewModel.conversation.messages.length === 0) {
       container.createDiv({
         cls: "offeragent-sidebar__empty",
         text: "OfferAgent is ready for a conversation.",
       });
+    } else {
+      for (const message of viewModel.conversation.messages) {
+        transcript.createDiv({
+          cls: `offeragent-sidebar__message offeragent-sidebar__message--${message.role}`,
+          text: message.text,
+        });
+      }
     }
+
+    if (viewModel.conversation.error) {
+      const diagnostic = container.createDiv({
+        cls: "offeragent-sidebar__diagnostic offeragent-sidebar__provider-error",
+        text: viewModel.conversation.error.message,
+      });
+      diagnostic.dataset.code = viewModel.conversation.error.code;
+    }
+
+    const composer = container.createEl("form", { cls: "offeragent-sidebar__composer" });
+    const input = composer.createEl("textarea", { cls: "offeragent-sidebar__input" });
+    input.placeholder = "Ask OfferAgent…";
+    input.disabled = viewModel.conversation.runState === "streaming";
+    const submit = composer.createEl("button", {
+      cls: "offeragent-sidebar__send",
+      text: viewModel.conversation.runState === "streaming" ? "Working…" : "Send",
+    });
+    submit.type = "submit";
+    submit.disabled =
+      viewModel.runtime.state !== "connected" ||
+      !viewModel.conversation.selectedModelId ||
+      viewModel.conversation.runState === "streaming";
+    composer.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const text = input.value;
+      if (!text.trim()) return;
+      input.value = "";
+      void this.#controller.sendMessage(text);
+    });
   }
 }
 

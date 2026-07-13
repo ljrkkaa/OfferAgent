@@ -6,10 +6,18 @@ import path from "node:path";
 import { delimiter } from "node:path";
 import { once } from "node:events";
 import type { Readable } from "node:stream";
+import WebSocket from "ws";
 import {
   PROTOCOL_VERSION,
+  type AgentRunCancel,
+  type AgentRunEvent,
+  type AgentRunStart,
+  type ModelDescriptor,
+  type ProviderErrorCode,
+  type RuntimeError,
   type RuntimeHandshake,
   type RuntimeHealth,
+  type RuntimeModels,
   type RuntimeShutdown,
 } from "@offeragent/protocol";
 
@@ -19,8 +27,24 @@ const NODE_DIAGNOSTIC =
 export interface RuntimeSupervisorOptions {
   nodeCandidates?: string[];
   parentPid?: number;
+  provider?: "codex" | "fake";
   runtimePath: string;
   startupTimeoutMs?: number;
+}
+
+export interface AgentRunRequest {
+  agentRunId: string;
+  conversationId: string;
+  input: string;
+  model: string;
+}
+
+export interface RuntimeClient {
+  listModels(): Promise<ModelDescriptor[]>;
+  onUnavailable(subscriber: UnavailableSubscriber): () => void;
+  runAgent(request: AgentRunRequest): AsyncIterable<AgentRunEvent>;
+  start(): Promise<RuntimeHandshake>;
+  stop(): Promise<void>;
 }
 
 type UnavailableSubscriber = (message: string) => void;
@@ -30,6 +54,22 @@ interface RuntimeConnection extends RuntimeHandshake {
 }
 
 type RuntimeChild = ChildProcessByStdio<null, Readable, Readable>;
+
+interface RunChannel {
+  events: AgentRunEvent[];
+  failure?: Error;
+  wake?: () => void;
+}
+
+export class RuntimeRequestError extends Error {
+  readonly code: ProviderErrorCode;
+
+  constructor(code: ProviderErrorCode, message: string) {
+    super(message);
+    this.name = "RuntimeRequestError";
+    this.code = code;
+  }
+}
 
 function defaultNodeCandidates(environment: NodeJS.ProcessEnv): string[] {
   const executable = process.platform === "win32" ? "node.exe" : "node";
@@ -163,7 +203,21 @@ function callRuntime<T>(
         });
         response.on("end", () => {
           if (!response.statusCode || response.statusCode >= 400) {
-            reject(new Error(`OfferAgent Runtime request failed with status ${response.statusCode}.`));
+            try {
+              const error = JSON.parse(body) as RuntimeError;
+              if (
+                error.code === "auth_required" ||
+                error.code === "model_unavailable" ||
+                error.code === "provider_error" ||
+                error.code === "transport_error"
+              ) {
+                reject(new RuntimeRequestError(error.code, error.message));
+              } else {
+                reject(new Error(error.message));
+              }
+            } catch {
+              reject(new Error(`OfferAgent Runtime request failed with status ${response.statusCode}.`));
+            }
             return;
           }
           try {
@@ -182,21 +236,26 @@ function callRuntime<T>(
   });
 }
 
-export class RuntimeSupervisor {
+export class RuntimeSupervisor implements RuntimeClient {
   readonly #options: Required<
-    Pick<RuntimeSupervisorOptions, "parentPid" | "runtimePath" | "startupTimeoutMs">
+    Pick<RuntimeSupervisorOptions, "parentPid" | "provider" | "runtimePath" | "startupTimeoutMs">
   > & { nodeCandidates: string[] };
   readonly #unavailableSubscribers = new Set<UnavailableSubscriber>();
   #child?: RuntimeChild;
   #connection?: RuntimeConnection;
+  #eventSocket?: WebSocket;
   #healthCheckInFlight = false;
   #healthTimer?: NodeJS.Timeout;
+  readonly #runChannels = new Map<string, RunChannel>();
   #stopping = false;
 
   constructor(options: RuntimeSupervisorOptions) {
     this.#options = {
       nodeCandidates: options.nodeCandidates ?? defaultNodeCandidates(process.env),
       parentPid: options.parentPid ?? process.pid,
+      provider:
+        options.provider ??
+        (process.env.OFFERAGENT_RUNTIME_PROVIDER === "fake" ? "fake" : "codex"),
       runtimePath: options.runtimePath,
       startupTimeoutMs: options.startupTimeoutMs ?? 10_000,
     };
@@ -225,6 +284,8 @@ export class RuntimeSupervisor {
         token,
         "--parent-pid",
         `${this.#options.parentPid}`,
+        "--provider",
+        this.#options.provider,
       ],
       {
         stdio: ["ignore", "pipe", "pipe"],
@@ -247,10 +308,12 @@ export class RuntimeSupervisor {
       ) {
         throw new Error("OfferAgent Runtime health response did not match its startup handshake.");
       }
+      await this.#openEventSocket(child, connection);
       this.#connection = connection;
       this.#startHealthMonitor(child, connection);
       return handshake;
     } catch (error) {
+      this.#closeEventSocket(new Error("OfferAgent Runtime startup did not complete."));
       if (child.exitCode === null) child.kill();
       this.#child = undefined;
       throw error;
@@ -260,12 +323,16 @@ export class RuntimeSupervisor {
   async stop(): Promise<void> {
     const child = this.#child;
     const connection = this.#connection;
+    this.#stopping = true;
     this.#child = undefined;
     this.#connection = undefined;
     this.#clearHealthMonitor();
-    if (!child || child.exitCode !== null) return;
+    this.#closeEventSocket(new Error("OfferAgent Runtime is shutting down."));
+    if (!child || child.exitCode !== null) {
+      this.#stopping = false;
+      return;
+    }
 
-    this.#stopping = true;
     const exited = once(child, "exit");
     if (connection) {
       try {
@@ -290,6 +357,196 @@ export class RuntimeSupervisor {
     } finally {
       this.#stopping = false;
     }
+  }
+
+  async listModels(): Promise<ModelDescriptor[]> {
+    const connection = this.#requiredConnection();
+    const response = await callRuntime<RuntimeModels>(connection, "GET", "/models");
+    return response.models;
+  }
+
+  async *runAgent(request: AgentRunRequest): AsyncIterable<AgentRunEvent> {
+    this.#requiredConnection();
+    const socket = this.#eventSocket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error("OfferAgent Runtime event connection is unavailable.");
+    }
+    if (this.#runChannels.has(request.agentRunId)) {
+      throw new Error(`Agent Run '${request.agentRunId}' is already active.`);
+    }
+    const channel: RunChannel = { events: [] };
+    this.#runChannels.set(request.agentRunId, channel);
+
+    const start: AgentRunStart = {
+      type: "agent_run.start",
+      protocolVersion: PROTOCOL_VERSION,
+      eventId: randomUUID(),
+      conversationId: request.conversationId,
+      agentRunId: request.agentRunId,
+      sequence: 0,
+      model: request.model,
+      input: { role: "user", text: request.input },
+    };
+    try {
+      socket.send(JSON.stringify(start));
+    } catch (error) {
+      this.#runChannels.delete(request.agentRunId);
+      throw error;
+    }
+
+    let expectedSequence = 1;
+    let terminal = false;
+    try {
+      while (true) {
+        if (channel.failure) throw channel.failure;
+        const event = channel.events.shift();
+        if (!event) {
+          await new Promise<void>((resolve) => {
+            channel.wake = resolve;
+            if (channel.events.length > 0 || channel.failure) {
+              channel.wake = undefined;
+              resolve();
+            }
+          });
+          continue;
+        }
+        if (
+          event.protocolVersion !== PROTOCOL_VERSION ||
+          typeof event.eventId !== "string" ||
+          event.conversationId !== request.conversationId ||
+          event.agentRunId !== request.agentRunId ||
+          event.sequence !== expectedSequence
+        ) {
+          throw new Error("OfferAgent Runtime returned an out-of-sequence Agent Run event.");
+        }
+        expectedSequence += 1;
+        yield event;
+        if (event.type === "agent_run.completed" || event.type === "agent_run.failed") {
+          terminal = true;
+          return;
+        }
+      }
+    } finally {
+      this.#runChannels.delete(request.agentRunId);
+      if (
+        !terminal &&
+        this.#eventSocket === socket &&
+        socket.readyState === WebSocket.OPEN
+      ) {
+        const cancel: AgentRunCancel = {
+          type: "agent_run.cancel",
+          protocolVersion: PROTOCOL_VERSION,
+          eventId: randomUUID(),
+          conversationId: request.conversationId,
+          agentRunId: request.agentRunId,
+          sequence: expectedSequence,
+        };
+        socket.send(JSON.stringify(cancel));
+      }
+    }
+  }
+
+  async #openEventSocket(child: RuntimeChild, connection: RuntimeConnection): Promise<void> {
+    const socket = new WebSocket(`ws://127.0.0.1:${connection.port}/events`, {
+      headers: { authorization: `Bearer ${connection.token}` },
+    });
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = (): void => {
+        socket.off("open", onOpen);
+        socket.off("error", onError);
+        socket.off("close", onClose);
+      };
+      const onOpen = (): void => {
+        cleanup();
+        resolve();
+      };
+      const onError = (error: Error): void => {
+        cleanup();
+        reject(new Error("OfferAgent Runtime event connection failed during startup.", { cause: error }));
+      };
+      const onClose = (): void => {
+        cleanup();
+        reject(new Error("OfferAgent Runtime event connection closed during startup."));
+      };
+      socket.once("open", onOpen);
+      socket.once("error", onError);
+      socket.once("close", onClose);
+    });
+
+    this.#eventSocket = socket;
+    socket.on("message", (data) => {
+      let event: AgentRunEvent;
+      try {
+        event = JSON.parse(data.toString("utf8")) as AgentRunEvent;
+        if (typeof event.agentRunId !== "string") throw new Error("Agent Run id is missing.");
+      } catch (error) {
+        this.#handleEventSocketFailure(
+          child,
+          socket,
+          new Error("OfferAgent Runtime returned an invalid Agent Run event.", { cause: error }),
+        );
+        return;
+      }
+      const channel = this.#runChannels.get(event.agentRunId);
+      if (!channel) return;
+      channel.events.push(event);
+      channel.wake?.();
+      channel.wake = undefined;
+    });
+    socket.once("error", (error) => {
+      this.#handleEventSocketFailure(
+        child,
+        socket,
+        new Error("The connection to OfferAgent Runtime failed.", { cause: error }),
+      );
+    });
+    socket.once("close", () => {
+      this.#handleEventSocketFailure(
+        child,
+        socket,
+        new Error("OfferAgent Runtime event connection closed unexpectedly."),
+      );
+    });
+  }
+
+  #handleEventSocketFailure(child: RuntimeChild, socket: WebSocket, error: Error): void {
+    if (this.#eventSocket !== socket) return;
+    this.#eventSocket = undefined;
+    this.#failRunChannels(error);
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      socket.close();
+    }
+    if (!this.#stopping) {
+      this.#markUnavailable(
+        child,
+        "OfferAgent Runtime event connection failed. Restart the plugin to reconnect.",
+      );
+    }
+  }
+
+  #closeEventSocket(error: Error): void {
+    const socket = this.#eventSocket;
+    this.#eventSocket = undefined;
+    this.#failRunChannels(error);
+    if (
+      socket &&
+      (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)
+    ) {
+      socket.close();
+    }
+  }
+
+  #failRunChannels(error: Error): void {
+    for (const channel of this.#runChannels.values()) {
+      channel.failure = error;
+      channel.wake?.();
+      channel.wake = undefined;
+    }
+  }
+
+  #requiredConnection(): RuntimeConnection {
+    if (!this.#connection) throw new Error("OfferAgent Runtime is not connected.");
+    return this.#connection;
   }
 
   #startHealthMonitor(child: RuntimeChild, connection: RuntimeConnection): void {
@@ -330,6 +587,7 @@ export class RuntimeSupervisor {
     this.#child = undefined;
     this.#connection = undefined;
     this.#clearHealthMonitor();
+    this.#closeEventSocket(new Error("OfferAgent Runtime stopped unexpectedly."));
     if (!wasConnected || this.#stopping) return;
 
     const reason = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
@@ -341,6 +599,7 @@ export class RuntimeSupervisor {
     this.#child = undefined;
     this.#connection = undefined;
     this.#clearHealthMonitor();
+    this.#closeEventSocket(new Error(message));
     if (child.exitCode === null) child.kill();
     this.#notifyUnavailable(message);
   }

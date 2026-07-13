@@ -51,6 +51,7 @@ test("the sidebar controller starts and stops the bundled Runtime", async (t) =>
   const supervisor = new RuntimeSupervisor({
     nodeCandidates: [process.execPath],
     parentPid: process.pid,
+    provider: "fake",
     runtimePath: runtimeEntry,
   });
   const controller = new SidebarController(supervisor);
@@ -66,7 +67,7 @@ test("the sidebar controller starts and stops the bundled Runtime", async (t) =>
 
   await controller.start();
   assert.equal(controller.getViewModel().runtime.state, "connected");
-  assert.deepEqual(observedStates.slice(-2), ["starting", "connected"]);
+  assert.ok(observedStates.indexOf("starting") < observedStates.indexOf("connected"));
 
   await controller.stop();
   assert.equal(controller.getViewModel().runtime.state, "idle");
@@ -124,6 +125,7 @@ test("the sidebar becomes unavailable when a connected Runtime exits", async (t)
     new RuntimeSupervisor({
       nodeCandidates: [process.execPath],
       parentPid: temporaryParent.pid,
+      provider: "fake",
       runtimePath: runtimeEntry,
     }),
   );
@@ -138,6 +140,6 @@ test("the sidebar becomes unavailable when a connected Runtime exits", async (t)
   const unavailable = await waitForRuntimeState(controller, "unavailable");
   assert.match(
     unavailable.message,
-    /Runtime (?:stopped unexpectedly|health checks failed)/,
+    /Runtime (?:event connection failed|stopped unexpectedly|health checks failed)/,
   );
 });

@@ -14,11 +14,15 @@ const repositoryRoot = path.resolve(
 const builtPlugin = path.join(repositoryRoot, "packages", "plugin", "dist");
 
 class StubElement {
-  constructor(className = "") {
+  constructor(className = "", tagName = "div") {
     this.className = className;
     this.children = [];
     this.dataset = {};
+    this.disabled = false;
+    this.listeners = new Map();
+    this.tagName = tagName;
     this.text = "";
+    this.value = "";
   }
 
   empty() {
@@ -34,7 +38,15 @@ class StubElement {
   }
 
   createEl(_tagName, options = {}) {
-    return this.#createChild(options);
+    return this.#createChild(options, _tagName);
+  }
+
+  addEventListener(type, listener) {
+    this.listeners.set(type, listener);
+  }
+
+  dispatch(type) {
+    this.listeners.get(type)?.({ preventDefault() {} });
   }
 
   findByClass(className) {
@@ -46,9 +58,10 @@ class StubElement {
     return undefined;
   }
 
-  #createChild(options) {
-    const child = new StubElement(options.cls ?? "");
+  #createChild(options, tagName = "div") {
+    const child = new StubElement(options.cls ?? "", tagName);
     child.text = options.text ?? "";
+    child.value = options.value ?? "";
     this.children.push(child);
     return child;
   }
@@ -65,6 +78,8 @@ async function waitUntil(predicate, message, timeoutMs = 10_000) {
 }
 
 test("Obsidian loads the packaged plugin and opens its connected sidebar", async (t) => {
+  const previousProvider = process.env.OFFERAGENT_RUNTIME_PROVIDER;
+  process.env.OFFERAGENT_RUNTIME_PROVIDER = "fake";
   const temporaryVault = await mkdtemp(path.join(os.tmpdir(), "offeragent-vault-"));
   const installation = path.join(
     temporaryVault,
@@ -179,6 +194,8 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   plugin = new OfferAgentPlugin(app, manifest);
   t.after(async () => {
     await plugin?.onunload();
+    if (previousProvider === undefined) delete process.env.OFFERAGENT_RUNTIME_PROVIDER;
+    else process.env.OFFERAGENT_RUNTIME_PROVIDER = previousProvider;
     await rm(temporaryVault, { recursive: true, force: true });
   });
 
@@ -197,6 +214,30 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "OfferAgent sidebar did not report a connected Runtime",
   );
   assert.equal(connectedStatus.text, "connected");
+
+  const modelSelect = await waitUntil(
+    () => {
+      const select = activeView.contentEl.findByClass("offeragent-sidebar__model-select");
+      return select?.value === "fake-interview-model" ? select : undefined;
+    },
+    "OfferAgent did not render its model selector",
+  );
+  assert.equal(modelSelect.value, "fake-interview-model");
+  const composer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
+  const input = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  assert.ok(composer);
+  assert.ok(input);
+  input.value = "Practice my introduction.";
+  composer.dispatch("submit");
+
+  const assistantMessage = await waitUntil(
+    () => {
+      const message = activeView.contentEl.findByClass("offeragent-sidebar__message--assistant");
+      return message?.text === "OfferAgent received: Practice my introduction." ? message : undefined;
+    },
+    "OfferAgent did not stream the fake Provider response into the Sidebar",
+  );
+  assert.equal(assistantMessage.text, "OfferAgent received: Practice my introduction.");
 
   await plugin.onunload();
   plugin = undefined;

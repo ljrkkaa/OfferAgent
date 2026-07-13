@@ -2,15 +2,20 @@
 
 OfferAgent is a single-user, local interview study agent delivered as a desktop-only Obsidian plugin. The Vault remains the source of truth. A plugin-owned, headless TypeScript Runtime handles agent execution without receiving direct filesystem authority over the Vault.
 
-The current implementation is the first product-shell slice:
+The current implementation includes the product shell and one complete Agent Run:
 
 - one TypeScript workspace for the shared protocol, Runtime, and Obsidian plugin;
 - one minimal OfferAgent right sidebar;
 - a bundled loopback-only Runtime with one-time-token authentication;
 - hidden child-process startup on Windows, health monitoring, parent-loss detection, and graceful shutdown;
 - actionable Node.js discovery diagnostics.
+- a Runtime-owned Model Provider seam with deterministic test and Codex Subscription adapters;
+- model selection plus streamed, single-run conversation in the Sidebar;
+- typed auth, model, transport, and Provider failures over a versioned WebSocket protocol.
 
-Later capabilities are tracked in GitHub Issues #3-#16 and are intentionally not exposed early.
+The Codex adapter reuses the login cache managed by Codex CLI/desktop. It does not require an
+OpenAI API key and never copies OAuth material into plugin settings or protocol events. Later
+capabilities are tracked in GitHub Issues #4-#16 and are intentionally not exposed early.
 
 ## Requirements
 
@@ -36,6 +41,13 @@ Run the smoke tests:
 
 ```powershell
 npm.cmd test
+```
+
+The default suite uses the deterministic fake Provider. To opt into one real subscription-backed
+request using the existing local Codex login:
+
+```powershell
+npm.cmd run test:live-codex
 ```
 
 The production plugin package is emitted to `packages/plugin/dist/` and contains:

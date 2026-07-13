@@ -62,3 +62,48 @@
   color: var(--text-muted);
   text-align: center;
 }
+
+.offeragent-sidebar__models,
+.offeragent-sidebar__composer {
+  display: flex;
+  gap: var(--size-4-2);
+}
+
+.offeragent-sidebar__models {
+  align-items: center;
+}
+
+.offeragent-sidebar__model-select,
+.offeragent-sidebar__input {
+  flex: 1;
+  min-width: 0;
+}
+
+.offeragent-sidebar__transcript {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-2);
+  overflow-y: auto;
+}
+
+.offeragent-sidebar__message {
+  border-radius: var(--radius-m);
+  padding: var(--size-4-2) var(--size-4-3);
+  white-space: pre-wrap;
+}
+
+.offeragent-sidebar__message--user {
+  align-self: flex-end;
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+}
+
+.offeragent-sidebar__message--assistant {
+  align-self: flex-start;
+  background: var(--background-secondary);
+}
+
+.offeragent-sidebar__input {
+  min-height: 5rem;
+  resize: vertical;
+}
