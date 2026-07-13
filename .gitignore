@@ -1,64 +1,22 @@
-# Khoj artifacts
-*.gz
-*.pt
-tests/data/models
-tests/data/embeddings
-tests/evals/**.txt
-tests/evals/**.csv
-pgserver_data/
-
-# External app artifacts
-__pycache__
-.DS_Store
-.emacs.desktop*
-*.py[cod]
-.vscode
-.env
-.venv/*
-.obsidian
-todesktop.json
-
-# Build artifacts
-/src/khoj/interface/web/images
-/src/khoj/interface/built/
-/src/khoj/interface/compiled/404.html
-/build/
-/dist/
-khoj_assistant.egg-info
-/config/khoj*.yml
-.pytest_cache
-*.log
-/src/khoj/static
-
-# Obsidian plugin artifacts
-# ---
-# npm
-node_modules
-
-# Don't include the compiled obsidian main.js file in the repo.
-# They should be uploaded to GitHub releases instead.
-src/interface/obsidian/main.js
-
-# Exclude sourcemaps
+# Dependencies and generated builds
+node_modules/
+packages/*/dist/
 *.map
-# IntelliJ
-.idea
 
-# obsidian
+# Local settings and diagnostics
+.env
+.env.*
+!.env.example
+*.log
 data.json
 
-# Android
-src/interface/android/.gradle
-src/interface/android/app/build
-src/interface/android/build
-src/interface/android/*.aab
-src/interface/android/*.apk
-src/interface/android/*.apk.idsig
-src/interface/android/*.keystore
-src/interface/android/local.properties
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
 
-INTERVIEW_PERSONAL_KB_AGENT.md
-
+# Keep only accepted product design documents under docs/
 docs/*
 !docs/adr/
 docs/adr/*
@@ -66,7 +24,7 @@ docs/adr/*
 !docs/specs/
 docs/specs/*
 !docs/specs/*.md
-demos
-reference/
+
+# Local agent/workspace artifacts
 AGENTS.md
 .understand-anything

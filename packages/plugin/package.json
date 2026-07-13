@@ -1,0 +1,12 @@
+{
+  "name": "@offeragent/plugin",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/main.js",
+  "dependencies": {
+    "@offeragent/protocol": "0.1.0"
+  },
+  "peerDependencies": {
+    "obsidian": ">=1.6.0"
+  }
+}

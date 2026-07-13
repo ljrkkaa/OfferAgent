@@ -1,140 +1,58 @@
-# Khoj 面试版个人知识库 Agent
+# OfferAgent
 
-这是一个基于 Khoj 精简改造的个人知识库 Agent 项目，当前目标是跑通第一阶段 demo 主链路：
+OfferAgent is a single-user, local interview study agent delivered as a desktop-only Obsidian plugin. The Vault remains the source of truth. A plugin-owned, headless TypeScript Runtime handles agent execution without receiving direct filesystem authority over the Vault.
 
-`Obsidian 同步 -> 本地文件 evidence -> OpenKB evidence -> Chat 问答 -> 工具调用 -> 记忆 -> 评估`
+The current implementation is the first product-shell slice:
 
-项目保留 Khoj 原有的核心 Agent 能力，但去掉或隐藏了商业化、多客户端和部分外部服务功能，让仓库更适合展示个人知识库、Agent 工具编排和本地优先的产品思路。
+- one TypeScript workspace for the shared protocol, Runtime, and Obsidian plugin;
+- one minimal OfferAgent right sidebar;
+- a bundled loopback-only Runtime with one-time-token authentication;
+- hidden child-process startup on Windows, health monitoring, parent-loss detection, and graceful shutdown;
+- actionable Node.js discovery diagnostics.
 
-## 当前已有功能
+Later capabilities are tracked in GitHub Issues #3-#16 and are intentionally not exposed early.
 
-### 1. Obsidian 知识库同步
+## Requirements
 
-当前保留 Obsidian 插件和同步链路，可用于把本地 Obsidian 项目库中的内容同步到服务端。
+- Node.js 20 or newer
+- npm
+- Obsidian desktop 1.6 or newer for manual plugin use
 
-- 支持通过 Obsidian 客户端上传内容。
-- 默认主线面向 Markdown、PDF 和纯文本资料。
-- 服务端负责内容解析、切分、索引和后续检索。
+## Development
 
-### 2. 本地文档索引
+Install dependencies:
 
-项目目前聚焦个人知识库最小闭环，支持以下内容类型：
-
-- Markdown
-- PDF
-- Plaintext / HTML-like plaintext
-
-相关处理逻辑位于 `src/khoj/processor/content`，搜索和过滤能力位于 `src/khoj/search_type`、`src/khoj/search_filter`。
-
-### 3. Web/API Chat
-
-项目保留 Web 和 API 聊天入口，可通过统一的后端 Agent 链路处理用户问题。
-
-- API 聊天入口：`/api/chat`
-- Web 路由和页面仍保留在 `src/interface/web`
-- 支持会话历史、模型配置、文件上下文和流式回答等基础能力
-
-### 4. File/OpenKB evidence 引用
-
-当前主线能力是基于本地知识库收集可审计证据。
-
-- 支持从本地文件库读取真实文件行。
-- 支持从 OpenKB compiled wiki 收集摘要、概念和页码证据。
-- 回答可携带知识库引用，便于追踪答案来源。
-- 支持文本搜索、过滤条件和 Agent 上下文组合。
-
-这部分是面试展示的核心：用户提问后，系统先收集本地 evidence，再把相关上下文交给模型生成回答。
-
-### 5. Agent 配置与工具能力
-
-项目保留 Agent 配置、工具权限和工具调用相关逻辑。
-
-当前可作为高级能力保留的工具包括：
-
-- Online search / webpage 工具
-- Code tool
-- MCP tool
-- Operator/browser/computer 相关能力
-- Deep Research 多轮研究链路
-
-这些能力适合在本地知识库主流程稳定后作为进阶演示。默认演示路径仍建议先走本地知识库问答。
-
-### 6. Memory 长期记忆
-
-项目保留用户记忆能力，可用于记录用户偏好、长期事实和可复用上下文。
-
-- 支持查看、修改和删除记忆。
-- 支持 Agent/用户维度的上下文隔离。
-- 可作为个人助理能力的一部分展示。
-
-### 7. Deep Research
-
-项目保留 `/research` 研究链路，用于展示更复杂的 Agent 规划和工具执行能力。
-
-Deep Research 可以多轮选择工具、收集资料、记录中间步骤，并在最后汇总结果。它适合展示“模型不只是聊天，而是能规划任务并调用工具”。
-
-### 8. 测试与评估
-
-项目保留 pytest 测试和 eval 相关入口。
-
-- 单元/集成测试位于 `tests`
-- 测试数据位于 `tests/data`
-- 评估脚本位于 `tests/evals`
-
-后续可以补充一组本地知识库 gold set，用于衡量回答质量、引用准确性和工具选择效果。
-
-## 本地运行
-
-初始化开发环境：
-
-```bash
-bash scripts/dev_setup.sh
+```powershell
+npm.cmd install
 ```
 
-启动本地服务：
+Run type checking, compile all packages, and produce the installable plugin directory:
 
-```bash
-bash scripts/run_local.sh
+```powershell
+npm.cmd run build
 ```
 
-默认本地服务会读取 `.env`，使用嵌入式数据库配置，并监听 `127.0.0.1:42110`。可通过环境变量覆盖主机、端口、模型和 API 配置。
+Run the smoke tests:
 
-运行测试：
-
-```bash
-uv run pytest
+```powershell
+npm.cmd test
 ```
 
-运行单个测试文件：
+The production plugin package is emitted to `packages/plugin/dist/` and contains:
 
-```bash
-uv run pytest tests/test_local_kb.py
-```
+- `manifest.json`
+- `main.js`
+- `styles.css`
+- `runtime.js`
 
-## 当前暂不支持或已隐藏的功能
+For a local manual smoke test, copy those files to `.obsidian/plugins/offeragent/` inside a test Vault, enable OfferAgent in Obsidian, and use the ribbon icon or the `Open OfferAgent sidebar` command.
 
-为了让项目更聚焦，当前分支已经删除、隐藏或暂不作为主线展示以下能力：
+## Architecture
 
-- Android、Desktop、Emacs 多客户端
-- Stripe 订阅计费
-- Twilio、WhatsApp、短信/手机号登录
-- S3 上传路径
-- 外发 telemetry 服务
-- 语音转文字、文字转语音
-- creative image generation 入口
-- Notion/GitHub 内容源 UI 和 API
-- DOCX、图片 OCR、Org-mode 的第一阶段外露入口
-- QQ bot 实际接入
+- `packages/protocol`: shared versioned local protocol types.
+- `packages/runtime`: plugin-owned headless Runtime process.
+- `packages/plugin`: Obsidian entry point, Runtime lifecycle owner, and sidebar controller/view.
+- `tests`: black-box Runtime and public sidebar-controller smoke tests.
+- `docs/specs`, `docs/adr`, and `CONTEXT.md`: accepted product specification, decisions, and domain language.
 
-注意：当前分支不保留旧向量检索兼容层；旧数据库需要按新的初始迁移重建。
-
-## 项目状态
-
-当前仓库是一个面试/演示导向的精简分支，重点展示：
-
-1. 本地优先的个人知识库同步与索引。
-2. 基于本地资料的 evidence 引用回答。
-3. Agent 工具选择、长期记忆和 Deep Research 等进阶能力。
-4. 可测试、可评估、可继续扩展到 QQ bot 或其他入口的架构。
-
-完整端到端效果仍依赖真实 LLM 和本地知识库配置。建议演示顺序为：先配置本地文件库或导入 Obsidian/Markdown/PDF 资料，再展示 evidence 引用问答，最后展示 Memory、Deep Research 或 MCP/Operator 等高级能力。
+The v1 scope explicitly excludes the legacy Python/Django/Khoj server, Web UI, old Obsidian plugin, Shell tools, arbitrary code execution, vector databases, and multi-agent behavior.

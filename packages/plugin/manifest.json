@@ -1,0 +1,10 @@
+{
+  "id": "offeragent",
+  "name": "OfferAgent",
+  "version": "0.1.0",
+  "minAppVersion": "1.6.0",
+  "description": "A local, evidence-based interview study agent.",
+  "author": "OfferAgent",
+  "main": "main.js",
+  "isDesktopOnly": true
+}
