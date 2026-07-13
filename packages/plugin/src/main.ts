@@ -216,7 +216,7 @@ export default class OfferAgentPlugin extends Plugin {
     this.#controller = new SidebarController(
       new RuntimeSupervisor({
         runtimePath,
-        toolExecutor: new ObsidianVaultToolAdapter(this.app.vault),
+      toolExecutor: new ObsidianVaultToolAdapter(this.app.vault, this.app.metadataCache),
       }),
     );
 

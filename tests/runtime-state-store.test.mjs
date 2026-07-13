@@ -129,6 +129,134 @@ test("Runtime State applies explicit schema migrations and rejects newer schemas
   );
 });
 
+test("the populated v3 tool and evidence tables survive the v4 rebuild", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-v3-evidence-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const store = await RuntimeStateStore.open(statePath);
+  await store.beginAgentRun(
+    "v3-conversation",
+    "v3-run",
+    "fake-interview-model",
+    "legacy evidence",
+  );
+  await store.requestToolCall("v3-run", {
+    type: "tool_call.requested",
+    protocolVersion: 1,
+    eventId: "v3-tool-requested",
+    conversationId: "v3-conversation",
+    agentRunId: "v3-run",
+    sequence: 2,
+    toolCallId: "v3-tool-call",
+    tool: { kind: "local", name: "vault_read", arguments: { path: "notes/v3.md" } },
+  });
+  await store.completeToolCall(
+    "v3-run",
+    {
+      ok: true,
+      value: {
+        type: "vault_read",
+        path: "notes/v3.md",
+        lineStart: 4,
+        lineEnd: 5,
+        modifiedVersion: "mtime:3:size:14",
+        contentHash: "sha256:v3",
+        content: "legacy\nevidence",
+        truncated: false,
+      },
+    },
+    {
+      type: "tool_call.completed",
+      protocolVersion: 1,
+      eventId: "v3-tool-completed",
+      conversationId: "v3-conversation",
+      agentRunId: "v3-run",
+      sequence: 3,
+      toolCallId: "v3-tool-call",
+      tool: { kind: "local", name: "vault_read" },
+      status: "completed",
+    },
+  );
+  await store.completeAgentRun("v3-run", "done", {
+    type: "agent_run.completed",
+    protocolVersion: 1,
+    eventId: "v3-run-completed",
+    conversationId: "v3-conversation",
+    agentRunId: "v3-run",
+    sequence: 4,
+    output: { role: "assistant", text: "done" },
+  });
+  await store.close();
+
+  const SQL = await initSqlJs();
+  const v3 = new SQL.Database(await readFile(statePath));
+  v3.run(`
+    CREATE TABLE tool_calls_v3_fixture (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+      name TEXT NOT NULL CHECK (name IN ('vault_list', 'vault_read')),
+      arguments_json TEXT NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('requested', 'completed', 'failed')),
+      error_code TEXT,
+      error_message TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO tool_calls_v3_fixture SELECT * FROM tool_calls;
+    CREATE TABLE evidence_snapshots_v3_fixture (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+      tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v3_fixture(id) ON DELETE CASCADE,
+      path TEXT NOT NULL,
+      line_start INTEGER NOT NULL,
+      line_end INTEGER NOT NULL,
+      modified_version TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    INSERT INTO evidence_snapshots_v3_fixture
+      SELECT id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+             modified_version, content_hash, content, created_at
+      FROM evidence_snapshots;
+    DROP TABLE evidence_snapshots;
+    DROP TABLE tool_calls;
+    ALTER TABLE tool_calls_v3_fixture RENAME TO tool_calls;
+    ALTER TABLE evidence_snapshots_v3_fixture RENAME TO evidence_snapshots;
+    CREATE INDEX tool_calls_by_run ON tool_calls(agent_run_id, created_at);
+    CREATE INDEX evidence_by_run ON evidence_snapshots(agent_run_id, created_at);
+    DELETE FROM schema_migrations WHERE version = 4;
+    UPDATE settings_metadata SET value = '3' WHERE key = 'schema_version';
+    PRAGMA user_version = 3;
+  `);
+  await writeFile(statePath, v3.export());
+  v3.close();
+
+  const upgradedStore = await RuntimeStateStore.open(statePath);
+  await upgradedStore.close();
+  const upgraded = new SQL.Database(await readFile(statePath));
+  upgraded.run("PRAGMA foreign_keys = ON");
+  assert.equal(upgraded.exec("PRAGMA user_version")[0].values[0][0], 4);
+  assert.deepEqual(
+    upgraded.exec("SELECT name, status FROM tool_calls")[0].values,
+    [["vault_read", "completed"]],
+  );
+  assert.deepEqual(
+    upgraded.exec(
+      `SELECT path, line_start, line_end, content_hash, content, is_stale, stale_detected_at
+       FROM evidence_snapshots`,
+    )[0].values,
+    [["notes/v3.md", 4, 5, "sha256:v3", "legacy\nevidence", 0, null]],
+  );
+  assert.deepEqual(upgraded.exec("PRAGMA foreign_key_check"), []);
+  upgraded.run("DELETE FROM conversations WHERE id = 'v3-conversation'");
+  assert.equal(upgraded.exec("SELECT COUNT(*) FROM tool_calls")[0].values[0][0], 0);
+  assert.equal(upgraded.exec("SELECT COUNT(*) FROM evidence_snapshots")[0].values[0][0], 0);
+  upgraded.close();
+});
+
 test("Runtime State rolls back a failed write and serves consistent concurrent reads", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-transactions-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));

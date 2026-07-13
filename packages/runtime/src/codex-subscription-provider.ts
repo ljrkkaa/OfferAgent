@@ -411,7 +411,7 @@ export class CodexSubscriptionProvider implements ModelProvider {
 }
 
 function isLocalToolName(value: unknown): value is LocalToolName {
-  return value === "vault_list" || value === "vault_read";
+  return value === "vault_list" || value === "vault_read" || value === "vault_search";
 }
 
 function encodeConversationItem(item: ModelConversationItem): Record<string, unknown> {

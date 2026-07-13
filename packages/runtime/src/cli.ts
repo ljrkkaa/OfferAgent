@@ -25,6 +25,7 @@ import { CodexSubscriptionProvider } from "./codex-subscription-provider";
 import {
   asModelProviderError,
   MAX_LOCAL_TOOL_ARGUMENT_BYTES,
+  ModelProviderError,
   type LocalToolDefinition,
   type ModelConversationItem,
   type ModelProvider,
@@ -50,6 +51,23 @@ const LOCAL_TOOLS: LocalToolDefinition[] = [
         directory: { type: "string", maxLength: 512 },
         limit: { type: "integer", minimum: 1, maximum: 100 },
       },
+    },
+  },
+  {
+    name: "vault_search",
+    description:
+      "Search the connected Obsidian Vault for bounded keyword or exact-phrase candidates. Use vault_read before treating a candidate as evidence.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        query: { type: "string", minLength: 1, maxLength: 512 },
+        exactPhrase: { type: "boolean" },
+        limit: { type: "integer", minimum: 1, maximum: 20 },
+        snippetsPerFile: { type: "integer", minimum: 1, maximum: 3 },
+        snippetMaxBytes: { type: "integer", minimum: 16, maximum: 512 },
+      },
+      required: ["query"],
     },
   },
   {
@@ -92,7 +110,8 @@ function isBoundedVaultPath(value: unknown): value is string {
     !value.includes("\\") &&
     !value.startsWith("/") &&
     !/^[A-Za-z]:/.test(value) &&
-    !value.split("/").some((segment) => !segment || segment === "." || segment === "..")
+    value.toLowerCase() !== "agent.md" &&
+    !value.split("/").some((segment) => !segment || segment === "." || segment === ".." || segment.startsWith("."))
   );
 }
 
@@ -102,7 +121,7 @@ function isLocalToolResultPayload(value: unknown): value is LocalToolResultPaylo
   if (result.ok === false) {
     return Boolean(
       result.error &&
-      ["invalid_path", "not_found", "plugin_disconnected", "request_too_large", "tool_error"].includes(
+      ["invalid_path", "not_found", "plugin_disconnected", "request_too_large", "stale_evidence", "tool_error"].includes(
         result.error.code as string,
       ) &&
       typeof result.error.message === "string" &&
@@ -117,11 +136,45 @@ function isLocalToolResultPayload(value: unknown): value is LocalToolResultPaylo
       result.value.entries.length <= 100 &&
       result.value.entries.every(
         (entry) =>
+          entry !== null &&
+          typeof entry === "object" &&
           isBoundedVaultPath(entry.path) &&
           typeof entry.modifiedVersion === "string" &&
           entry.modifiedVersion.length <= 128 &&
           typeof entry.contentHash === "string" &&
           entry.contentHash.length <= 128,
+      )
+    );
+  }
+  if (result.value.type === "vault_search") {
+    return (
+      typeof result.value.truncated === "boolean" &&
+      Array.isArray(result.value.entries) &&
+      result.value.entries.length <= 20 &&
+      result.value.entries.every(
+        (entry) =>
+          entry !== null &&
+          typeof entry === "object" &&
+          isBoundedVaultPath(entry.path) &&
+          ["path", "metadata", "body"].includes(entry.matchTier) &&
+          typeof entry.modifiedVersion === "string" &&
+          entry.modifiedVersion.length <= 128 &&
+          typeof entry.contentHash === "string" &&
+          entry.contentHash.length <= 128 &&
+          Array.isArray(entry.snippets) &&
+          entry.snippets.length <= 3 &&
+          entry.snippets.every(
+            (snippet) =>
+              snippet !== null &&
+              typeof snippet === "object" &&
+              typeof snippet.content === "string" &&
+              Buffer.byteLength(snippet.content, "utf8") <= 512 &&
+              Number.isInteger(snippet.lineStart) &&
+              Number.isInteger(snippet.lineEnd) &&
+              snippet.lineStart >= 1 &&
+              snippet.lineEnd >= snippet.lineStart &&
+              typeof snippet.truncated === "boolean",
+          ),
       )
     );
   }
@@ -577,9 +630,11 @@ async function startRuntime({
         sendEvent(socket, startedEvent);
         sequence += 1;
         try {
-          const input: ModelConversationItem[] = [
+          let input: ModelConversationItem[] = [
             { type: "user_message", text: message.input.text },
           ];
+          const requiredRereads = new Set<string>();
+          const canonicalReadPaths = new Map<string, string>();
           let finished = false;
           for (let step = 0; step < 8; step += 1) {
             output = "";
@@ -660,12 +715,64 @@ async function startRuntime({
                 status: result.ok ? "completed" : "failed",
                 ...(result.ok ? {} : { error: result.error }),
               };
-              await store.completeToolCall(message.agentRunId, result, completedEvent);
+              const stalePaths = await store.completeToolCall(
+                message.agentRunId,
+                result,
+                completedEvent,
+              );
               sendEvent(socket, completedEvent);
               sequence += 1;
-              input.push({ type: "local_tool_result", callId: providerEvent.callId, result });
+              const currentReadPath =
+                result.ok && result.value.type === "vault_read" ? result.value.path : undefined;
+              if (currentReadPath) canonicalReadPaths.set(providerEvent.callId, currentReadPath);
+              if (stalePaths.length > 0) {
+                const stalePathSet = new Set(stalePaths);
+                const staleCallIds = new Set(
+                  input
+                    .filter(
+                      (item): item is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
+                        item.type === "local_tool_call" &&
+                        item.callId !== providerEvent.callId &&
+                        item.name === "vault_read" &&
+                        stalePathSet.has(canonicalReadPaths.get(item.callId) ?? ""),
+                    )
+                    .map((item) => item.callId),
+                );
+                input = input.filter(
+                  (item) =>
+                    !(
+                      (item.type === "local_tool_call" || item.type === "local_tool_result") &&
+                      staleCallIds.has(item.callId)
+                    ),
+                );
+                for (const staleCallId of staleCallIds) canonicalReadPaths.delete(staleCallId);
+                for (const stalePath of stalePaths) requiredRereads.add(stalePath);
+              }
+              if (currentReadPath) requiredRereads.delete(currentReadPath);
+              const providerResult: LocalToolResultPayload =
+                stalePaths.length > 0 && !currentReadPath
+                  ? {
+                      ok: false,
+                      error: {
+                        code: "stale_evidence",
+                        message: `Vault evidence changed for ${stalePaths.join(", ")}. Call vault_read for each changed path before continuing.`,
+                      },
+                    }
+                  : result;
+              input.push({
+                type: "local_tool_result",
+                callId: providerEvent.callId,
+                result: providerResult,
+              });
             }
             if (requestedTool) continue;
+
+            if (requiredRereads.size > 0) {
+              throw new ModelProviderError(
+                "provider_error",
+                `Vault evidence changed. Reread ${[...requiredRereads].join(", ")} before continuing.`,
+              );
+            }
 
             const completedEvent: Extract<AgentRunEvent, { type: "agent_run.completed" }> = {
               ...base,

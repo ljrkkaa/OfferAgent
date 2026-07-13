@@ -14,7 +14,7 @@ import {
 } from "@offeragent/protocol";
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.js";
 
-const CURRENT_SCHEMA_VERSION = 3;
+const CURRENT_SCHEMA_VERSION = 4;
 
 const MIGRATIONS = [
   {
@@ -124,6 +124,57 @@ const MIGRATIONS = [
       );
       CREATE INDEX tool_calls_by_run ON tool_calls(agent_run_id, created_at);
       CREATE INDEX evidence_by_run ON evidence_snapshots(agent_run_id, created_at);
+    `,
+  },
+  {
+    version: 4,
+    sql: `
+      CREATE TABLE tool_calls_v4 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        name TEXT NOT NULL CHECK (name IN ('vault_list', 'vault_read', 'vault_search')),
+        arguments_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('requested', 'completed', 'failed')),
+        error_code TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO tool_calls_v4
+        (id, conversation_id, agent_run_id, name, arguments_json, status,
+         error_code, error_message, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, name, arguments_json, status,
+             error_code, error_message, created_at, updated_at
+      FROM tool_calls;
+      CREATE TABLE evidence_snapshots_v4 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v4(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        line_start INTEGER NOT NULL,
+        line_end INTEGER NOT NULL,
+        modified_version TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        is_stale INTEGER NOT NULL DEFAULT 0 CHECK (is_stale IN (0, 1)),
+        stale_detected_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO evidence_snapshots_v4
+        (id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+         modified_version, content_hash, content, is_stale, stale_detected_at, created_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+             modified_version, content_hash, content, 0, NULL, created_at
+      FROM evidence_snapshots;
+      DROP TABLE evidence_snapshots;
+      DROP TABLE tool_calls;
+      ALTER TABLE tool_calls_v4 RENAME TO tool_calls;
+      ALTER TABLE evidence_snapshots_v4 RENAME TO evidence_snapshots;
+      CREATE INDEX tool_calls_by_run ON tool_calls(agent_run_id, created_at);
+      CREATE INDEX evidence_by_run ON evidence_snapshots(agent_run_id, created_at);
+      CREATE INDEX evidence_by_source ON evidence_snapshots(path, content_hash, is_stale);
     `,
   },
 ] as const;
@@ -426,10 +477,11 @@ export class RuntimeStateStore {
     agentRunId: string,
     result: LocalToolResultPayload,
     event: Extract<AgentRunEvent, { type: "tool_call.completed" }>,
-  ): Promise<void> {
-    await this.#write(() => {
+  ): Promise<string[]> {
+    return this.#write(() => {
       const run = this.#requiredRun(agentRunId);
       const timestamp = now();
+      const stalePaths: string[] = [];
       this.#database.run(
         `UPDATE tool_calls
          SET status = ?, error_code = ?, error_message = ?, updated_at = ?
@@ -445,6 +497,29 @@ export class RuntimeStateStore {
       );
       if (this.#database.getRowsModified() !== 1) {
         throw new Error(`Tool Call '${event.toolCallId}' is not pending.`);
+      }
+      if (result.ok) {
+        const sources =
+          result.value.type === "vault_read"
+            ? [{ path: result.value.path, contentHash: result.value.contentHash }]
+            : result.value.entries.map(({ path, contentHash }) => ({ path, contentHash }));
+        for (const source of sources) {
+          this.#database.run(
+            `DELETE FROM run_checkpoints
+             WHERE agent_run_id IN (
+               SELECT agent_run_id FROM evidence_snapshots
+               WHERE path = ? AND content_hash <> ? AND is_stale = 0
+             )`,
+            [source.path, source.contentHash],
+          );
+          this.#database.run(
+            `UPDATE evidence_snapshots
+             SET is_stale = 1, stale_detected_at = ?
+             WHERE path = ? AND content_hash <> ? AND is_stale = 0`,
+            [timestamp, source.path, source.contentHash],
+          );
+          if (this.#database.getRowsModified() > 0) stalePaths.push(source.path);
+        }
       }
       if (result.ok && result.value.type === "vault_read") {
         const evidence = result.value;
@@ -470,6 +545,7 @@ export class RuntimeStateStore {
       }
       this.#recordEvent(event);
       this.#touchConversation(run.conversationId, timestamp);
+      return stalePaths;
     });
   }
 

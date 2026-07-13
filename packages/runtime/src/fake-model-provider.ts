@@ -29,6 +29,62 @@ export class FakeModelProvider implements ModelProvider {
       );
     }
     const userInput = request.input.find((item) => item.type === "user_message")?.text ?? "";
+    const staleFlow = /^stale_evidence_flow\s+([^\s]+)$/i.exec(userInput.trim());
+    if (staleFlow) {
+      const calls = request.input.filter((item) => item.type === "local_tool_call");
+      const results = request.input.filter((item) => item.type === "local_tool_result");
+      const successfulRead = results.find(
+        (item) => item.result.ok && item.result.value.type === "vault_read",
+      );
+      const staleResult = results.find(
+        (item) => !item.result.ok && item.result.error.code === "stale_evidence",
+      );
+      const hasSearchCall = calls.some((item) => item.name === "vault_search");
+      if (!successfulRead && !staleResult) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-stale-read-${this.#toolCallSequence}`,
+          name: "vault_read",
+          arguments: { path: `${staleFlow[1]} `, lineStart: 1, lineEnd: 1 },
+        };
+        return;
+      }
+      if (successfulRead && !hasSearchCall) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-stale-search-${this.#toolCallSequence}`,
+          name: "vault_search",
+          arguments: { query: "content", exactPhrase: true },
+        };
+        return;
+      }
+      if (staleResult && !successfulRead) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-stale-reread-${this.#toolCallSequence}`,
+          name: "vault_read",
+          arguments: { path: staleFlow[1], lineStart: 1, lineEnd: 1 },
+        };
+        return;
+      }
+      if (staleResult && successfulRead) {
+        const readContents = results
+          .filter(
+            (item) => item.result.ok && item.result.value.type === "vault_read",
+          )
+          .map((item) =>
+            item.result.ok && item.result.value.type === "vault_read"
+              ? item.result.value.content
+              : "",
+          );
+        yield { type: "output_text.delta", delta: "OfferAgent received: " };
+        yield { type: "output_text.delta", delta: JSON.stringify(readContents) };
+        return;
+      }
+    }
     const toolResult = [...request.input].reverse().find((item) => item.type === "local_tool_result");
     if (!toolResult) {
       const toolRequest = fakeToolRequest(userInput);
@@ -70,6 +126,13 @@ function fakeToolRequest(input: string): { name: LocalToolName; arguments: unkno
     return {
       name: "vault_list",
       arguments: directory ? { directory } : {},
+    };
+  }
+  const search = /^vault_search\s+(.+)$/i.exec(input.trim());
+  if (search) {
+    return {
+      name: "vault_search",
+      arguments: { query: search[1] },
     };
   }
   return undefined;

@@ -49,13 +49,14 @@ export interface AgentRunRecord {
   status: AgentRunStatus;
 }
 
-export type LocalToolName = "vault_list" | "vault_read";
+export type LocalToolName = "vault_list" | "vault_read" | "vault_search";
 
 export type VaultToolErrorCode =
   | "invalid_path"
   | "not_found"
   | "plugin_disconnected"
   | "request_too_large"
+  | "stale_evidence"
   | "tool_error";
 
 export interface VaultListResult {
@@ -79,8 +80,25 @@ export interface VaultReadResult {
   type: "vault_read";
 }
 
+export interface VaultSearchResult {
+  entries: Array<{
+    contentHash: string;
+    matchTier: "body" | "metadata" | "path";
+    modifiedVersion: string;
+    path: string;
+    snippets: Array<{
+      content: string;
+      lineEnd: number;
+      lineStart: number;
+      truncated: boolean;
+    }>;
+  }>;
+  truncated: boolean;
+  type: "vault_search";
+}
+
 export type LocalToolResultPayload =
-  | { ok: true; value: VaultListResult | VaultReadResult }
+  | { ok: true; value: VaultListResult | VaultReadResult | VaultSearchResult }
   | { ok: false; error: { code: VaultToolErrorCode; message: string } };
 
 export interface ToolCallRecord {

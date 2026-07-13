@@ -321,7 +321,11 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   assert.equal(responseRequest.store, false);
   assert.equal(responseRequest.stream, true);
   assert.equal(responseRequest.input[0].content[0].text, "Prepare me.");
-  assert.deepEqual(responseRequest.tools.map((tool) => tool.name), ["vault_list", "vault_read"]);
+  assert.deepEqual(responseRequest.tools.map((tool) => tool.name), [
+    "vault_list",
+    "vault_search",
+    "vault_read",
+  ]);
   assert.ok(responseRequest.tools.every((tool) => tool.strict === false));
 
   responseMode = "tool";

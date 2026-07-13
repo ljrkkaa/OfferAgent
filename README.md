@@ -15,13 +15,14 @@ The current implementation includes the product shell, durable Conversations, an
 - durable Conversations, Messages, Agent Runs, and schema metadata in Runtime-owned SQLite;
 - persisted Run-boundary events with stable identities, client acknowledgements, and reconnect replay;
 - Conversation create/switch/reopen/delete controls plus visible Run status and cancellation.
-- local `vault_list` and `vault_read` Function Tools executed only by the Obsidian plugin;
-- bounded Evidence Snapshots with source path, exact lines, modified version, and SHA-256 hash;
+- local `vault_list`, `vault_search`, and `vault_read` Function Tools executed only by the Obsidian plugin;
+- on-demand keyword and exact-phrase search with path-first ranking and bounded candidate snippets;
+- bounded Evidence Snapshots with source path, exact lines, modified version, SHA-256 hash, and stale-source invalidation;
 - compact expandable Vault tool activity in the Agent Sidebar.
 
 The Codex adapter reuses the login cache managed by Codex CLI/desktop. It does not require an
-OpenAI API key and never copies OAuth material into plugin settings or protocol events. Later
-capabilities are tracked in GitHub Issues #5-#16 and are intentionally not exposed early.
+OpenAI API key and never copies OAuth material into plugin settings or protocol events. Remaining
+v1 capabilities are tracked in the subsequent GitHub tickets and are intentionally not exposed early.
 
 ## Requirements
 
