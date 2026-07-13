@@ -129,7 +129,7 @@ test("Runtime State applies explicit schema migrations and rejects newer schemas
   );
 });
 
-test("the populated v3 tool and evidence tables survive the v4 rebuild", async (t) => {
+test("populated v3 tool and evidence tables survive the current control-tool rebuild", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-v3-evidence-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
   const statePath = path.join(temporaryDirectory, "state.db");
@@ -227,7 +227,7 @@ test("the populated v3 tool and evidence tables survive the v4 rebuild", async (
     ALTER TABLE evidence_snapshots_v3_fixture RENAME TO evidence_snapshots;
     CREATE INDEX tool_calls_by_run ON tool_calls(agent_run_id, created_at);
     CREATE INDEX evidence_by_run ON evidence_snapshots(agent_run_id, created_at);
-    DELETE FROM schema_migrations WHERE version = 4;
+    DELETE FROM schema_migrations WHERE version >= 4;
     UPDATE settings_metadata SET value = '3' WHERE key = 'schema_version';
     PRAGMA user_version = 3;
   `);
@@ -238,7 +238,10 @@ test("the populated v3 tool and evidence tables survive the v4 rebuild", async (
   await upgradedStore.close();
   const upgraded = new SQL.Database(await readFile(statePath));
   upgraded.run("PRAGMA foreign_keys = ON");
-  assert.equal(upgraded.exec("PRAGMA user_version")[0].values[0][0], 4);
+  assert.equal(
+    upgraded.exec("PRAGMA user_version")[0].values[0][0],
+    CURRENT_SCHEMA_VERSION,
+  );
   assert.deepEqual(
     upgraded.exec("SELECT name, status FROM tool_calls")[0].values,
     [["vault_read", "completed"]],

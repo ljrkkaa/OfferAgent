@@ -37,6 +37,26 @@ try {
 
 const runtimeEntry = path.join(repositoryRoot, "packages", "runtime", "dist", "cli.js");
 
+function contractResult() {
+  return {
+    ok: true,
+    value: {
+      type: "agent_contract_read",
+      path: "agent.md",
+      modifiedVersion: "mtime:1:size:24",
+      contentHash: "sha256:test-contract",
+      content: "# Test Agent Contract",
+    },
+  };
+}
+
+const contractToolExecutor = {
+  async execute(event) {
+    assert.equal(event.tool.name, "agent_contract_read");
+    return contractResult();
+  },
+};
+
 test("Conversation responses require the expected protocol identity and ordering", () => {
   const expected = {
     conversationId: "conversation-one",
@@ -84,6 +104,7 @@ test("RuntimeSupervisor keeps one WebSocket across sequential Agent Runs", async
     parentPid: process.pid,
     provider: "fake",
     runtimePath: runtimeEntry,
+    toolExecutor: contractToolExecutor,
   });
   t.after(() => supervisor.stop());
 
@@ -102,6 +123,7 @@ test("a consumed failed terminal event is durably acknowledged before iterator r
     provider: "fake",
     runtimePath: runtimeEntry,
     statePath,
+    toolExecutor: contractToolExecutor,
   });
   t.after(async () => {
     await supervisor.stop();
@@ -130,7 +152,12 @@ test("a consumed failed terminal event is durably acknowledged before iterator r
       `SELECT event_type, acknowledged_at IS NOT NULL
        FROM durable_events ORDER BY sequence`,
     )[0].values,
-    [["agent_run.started", 1], ["agent_run.failed", 1]],
+    [
+      ["agent_run.started", 1],
+      ["tool_call.requested", 1],
+      ["tool_call.completed", 1],
+      ["agent_run.failed", 1],
+    ],
   );
   assert.equal(
     database.exec("SELECT status FROM agent_runs WHERE id = 'terminal-ack-run'")[0].values[0][0],
@@ -147,6 +174,29 @@ test("a missing connected Vault executor returns a typed tool error and the Run 
     provider: "fake",
     runtimePath: runtimeEntry,
     statePath: path.join(temporaryDirectory, "state.db"),
+    toolExecutor: {
+      async execute(event) {
+        if (event.tool.name === "agent_contract_read") {
+          return {
+            ok: true,
+            value: {
+              type: "agent_contract_read",
+              path: "agent.md",
+              modifiedVersion: "mtime:1:size:24",
+              contentHash: "sha256:test-contract",
+              content: "# Test Agent Contract",
+            },
+          };
+        }
+        return {
+          ok: false,
+          error: {
+            code: "plugin_disconnected",
+            message: "The connected Obsidian plugin has no Vault tool executor.",
+          },
+        };
+      },
+    },
   });
   t.after(async () => {
     await supervisor.stop();
@@ -163,7 +213,9 @@ test("a missing connected Vault executor returns a typed tool error and the Run 
   })) {
     events.push(event);
   }
-  const toolResult = events.find((event) => event.type === "tool_call.completed");
+  const toolResult = events.find(
+    (event) => event.type === "tool_call.completed" && event.tool.name === "vault_read",
+  );
   assert.equal(toolResult.status, "failed");
   assert.equal(toolResult.error.code, "plugin_disconnected");
   assert.equal(events.at(-1).type, "agent_run.completed");
@@ -200,6 +252,7 @@ test("returning one Agent Run iterator cancels only that run", async (t) => {
     provider: "codex",
     runtimePath: runtimeEntry,
     statePath: path.join(temporaryDirectory, "state.db"),
+    toolExecutor: contractToolExecutor,
   });
   t.after(async () => {
     await supervisor.stop();
@@ -221,6 +274,8 @@ test("returning one Agent Run iterator cancels only that run", async (t) => {
     })
     [Symbol.asyncIterator]();
   assert.equal((await iterator.next()).value.type, "agent_run.started");
+  assert.equal((await iterator.next()).value.type, "tool_call.requested");
+  assert.equal((await iterator.next()).value.type, "tool_call.completed");
   assert.equal((await iterator.next()).value.type, "agent_run.delta");
   await iterator.return();
   await Promise.race([
@@ -256,7 +311,10 @@ test("cancelling during a delayed Vault tool call ignores its late result and te
     provider: "fake",
     runtimePath: runtimeEntry,
     statePath,
-    toolExecutor: { execute: async () => delayedResult },
+    toolExecutor: {
+      execute: async (event) =>
+        event.tool.name === "agent_contract_read" ? contractResult() : delayedResult,
+    },
   });
   t.after(async () => {
     await supervisor.stop();
@@ -273,6 +331,8 @@ test("cancelling during a delayed Vault tool call ignores its late result and te
     })
     [Symbol.asyncIterator]();
   assert.equal((await iterator.next()).value.type, "agent_run.started");
+  assert.equal((await iterator.next()).value.type, "tool_call.requested");
+  assert.equal((await iterator.next()).value.type, "tool_call.completed");
   assert.equal((await iterator.next()).value.type, "tool_call.requested");
   await iterator.return();
   releaseTool({
@@ -298,7 +358,7 @@ test("cancelling during a delayed Vault tool call ignores its late result and te
   const database = new SQL.Database(await readFile(statePath));
   assert.deepEqual(
     database.exec(
-      "SELECT status, error_code FROM tool_calls WHERE agent_run_id = 'tool-cancel-run'",
+      "SELECT status, error_code FROM tool_calls WHERE agent_run_id = 'tool-cancel-run' AND name = 'vault_read'",
     )[0].values,
     [["failed", "tool_error"]],
   );

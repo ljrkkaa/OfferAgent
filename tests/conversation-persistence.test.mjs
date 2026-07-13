@@ -30,12 +30,18 @@ function readHandshake(stream) {
 
 function waitForEvent(socket, predicate, timeoutMs = 5_000) {
   return new Promise((resolve, reject) => {
+    const observed = [];
     const timeout = setTimeout(() => {
       socket.off("message", onMessage);
-      reject(new Error("Timed out waiting for Runtime event"));
+      reject(
+        new Error(
+          `Timed out waiting for Runtime event matching ${predicate}; observed ${observed.join(", ")}`,
+        ),
+      );
     }, timeoutMs);
     function onMessage(data) {
       const event = JSON.parse(data.toString("utf8"));
+      observed.push(`${event.type}:${event.agentRunId}`);
       if (!predicate(event)) return;
       clearTimeout(timeout);
       socket.off("message", onMessage);
@@ -80,6 +86,36 @@ async function connectRuntimeSocket(handshake, token) {
   return socket;
 }
 
+function installContractResponder(socket) {
+  socket.on("message", (data) => {
+    const event = JSON.parse(data.toString("utf8"));
+    if (event.type !== "tool_call.requested" || event.tool.name !== "agent_contract_read") {
+      return;
+    }
+    socket.send(
+      JSON.stringify({
+        type: "tool_result",
+        protocolVersion: 1,
+        eventId: `contract-result-${event.toolCallId}`,
+        conversationId: event.conversationId,
+        agentRunId: event.agentRunId,
+        sequence: event.sequence,
+        toolCallId: event.toolCallId,
+        result: {
+          ok: true,
+          value: {
+            type: "agent_contract_read",
+            path: "agent.md",
+            modifiedVersion: "mtime:1:size:24",
+            contentHash: "sha256:test-contract",
+            content: "# Test Agent Contract",
+          },
+        },
+      }),
+    );
+  });
+}
+
 async function stopRuntime(instance, token) {
   const exited = once(instance.runtime, "exit");
   await new Promise((resolve, reject) => {
@@ -109,6 +145,7 @@ test("a Conversation and its completed Agent Run survive restart and delete tran
   const agentRunId = "agent-run-persistence-1";
   const token = "conversation-persistence-token";
   let instance = await startRuntime(statePath, token);
+  installContractResponder(instance.socket);
   t.after(async () => {
     if (instance.runtime.exitCode === null) instance.runtime.kill();
     await rm(temporaryDirectory, { recursive: true, force: true });
@@ -266,6 +303,7 @@ test("only committed Agent Run boundary events replay with stable identities", a
   const conversationId = "event-replay-conversation";
   const agentRunId = "event-replay-run";
   const instance = await startRuntime(statePath, token);
+  installContractResponder(instance.socket);
   t.after(async () => {
     if (instance.runtime.exitCode === null) instance.runtime.kill();
     await rm(temporaryDirectory, { recursive: true, force: true });
@@ -349,7 +387,12 @@ test("only committed Agent Run boundary events replay with stable identities", a
     database.exec(
       "SELECT event_type FROM durable_events ORDER BY sequence",
     )[0].values,
-    [["agent_run.started"], ["agent_run.completed"]],
+    [
+      ["agent_run.started"],
+      ["tool_call.requested"],
+      ["tool_call.completed"],
+      ["agent_run.completed"],
+    ],
   );
   assert.equal(
     database.exec(
@@ -410,6 +453,7 @@ test("an explicitly stopped Agent Run is durably cancelled", async (t) => {
     headers: { authorization: `Bearer ${token}` },
   });
   await once(instance.socket, "open");
+  installContractResponder(instance.socket);
   t.after(async () => {
     if (instance.runtime.exitCode === null) instance.runtime.kill();
     await new Promise((resolve) => upstream.close(resolve));

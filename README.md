@@ -17,6 +17,9 @@ The current implementation includes the product shell, durable Conversations, an
 - Conversation create/switch/reopen/delete controls plus visible Run status and cancellation.
 - local `vault_list`, `vault_search`, and `vault_read` Function Tools executed only by the Obsidian plugin;
 - on-demand keyword and exact-phrase search with path-first ranking and bounded candidate snippets;
+- a mandatory root `agent.md` contract gate before each Agent Run's first Provider step, with Contract > requested Local Skill > model-default precedence;
+- bounded `skill_read` access to registered `.codex/skills/*/SKILL.md` instructions and only their directly referenced in-skill resources;
+- canonical-path containment for Agent Contract and Local Skill control files, with no Skill authority to add tools, permissions, or sub-agents;
 - bounded Evidence Snapshots with source path, exact lines, modified version, SHA-256 hash, and stale-source invalidation;
 - compact expandable Vault tool activity in the Agent Sidebar.
 

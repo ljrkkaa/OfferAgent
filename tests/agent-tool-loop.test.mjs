@@ -59,6 +59,19 @@ function runWithToolPeer(socket, requestPayload, resultForCall) {
       if (event.agentRunId !== requestPayload.agentRunId) return;
       events.push(event);
       if (event.type === "tool_call.requested") {
+        const result =
+          event.tool.name === "agent_contract_read"
+            ? {
+                ok: true,
+                value: {
+                  type: "agent_contract_read",
+                  path: "agent.md",
+                  modifiedVersion: "mtime:1:size:24",
+                  contentHash: "sha256:test-contract",
+                  content: "# Test Agent Contract",
+                },
+              }
+            : resultForCall(event);
         socket.send(
           JSON.stringify({
             type: "tool_result",
@@ -68,7 +81,7 @@ function runWithToolPeer(socket, requestPayload, resultForCall) {
             agentRunId: event.agentRunId,
             sequence: event.sequence,
             toolCallId: event.toolCallId,
-            result: resultForCall(event),
+            result,
           }),
         );
       }
@@ -159,13 +172,16 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
       "agent_run.started",
       "tool_call.requested",
       "tool_call.completed",
+      "tool_call.requested",
+      "tool_call.completed",
       "agent_run.delta",
       "agent_run.delta",
       "agent_run.completed",
     ],
   );
-  assert.equal(successfulEvents[1].tool.name, "vault_read");
-  assert.equal(successfulEvents[2].status, "completed");
+  assert.equal(successfulEvents[1].tool.name, "agent_contract_read");
+  assert.equal(successfulEvents[3].tool.name, "vault_read");
+  assert.equal(successfulEvents[4].status, "completed");
   assert.match(successfulEvents.at(-1).output.text, /second\\nthird/);
 
   const failedToolEvents = await runWithToolPeer(
@@ -185,7 +201,12 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
       error: { code: "invalid_path", message: "The requested Vault path is invalid." },
     }),
   );
-  assert.equal(failedToolEvents.find((event) => event.type === "tool_call.completed").status, "failed");
+  assert.equal(
+    failedToolEvents.find(
+      (event) => event.type === "tool_call.completed" && event.tool.name === "vault_read",
+    ).status,
+    "failed",
+  );
   assert.equal(failedToolEvents.at(-1).type, "agent_run.completed");
 
   const searchEvents = await runWithToolPeer(
@@ -224,8 +245,119 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
       },
     }),
   );
-  assert.equal(searchEvents.find((event) => event.type === "tool_call.requested").tool.name, "vault_search");
+  assert.equal(
+    searchEvents.find(
+      (event) => event.type === "tool_call.requested" && event.tool.name === "vault_search",
+    ).tool.name,
+    "vault_search",
+  );
   assert.equal(searchEvents.at(-1).type, "agent_run.completed");
+
+  const skillResourceEvents = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "skill-resource-start",
+      conversationId: "tool-conversation",
+      agentRunId: "tool-run-skill-resource",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "skill_read study references/guide.md" },
+    },
+    (event) =>
+      event.tool.arguments.resource
+        ? {
+            ok: true,
+            value: {
+              type: "skill_read",
+              skill: "study",
+              resource: "references/guide.md",
+              path: ".codex/skills/study/references/guide.md",
+              modifiedVersion: "mtime:3:size:13",
+              contentHash: "sha256:skill-resource",
+              content: "bounded guide",
+            },
+          }
+        : {
+            ok: true,
+            value: {
+              type: "skill_read",
+              skill: "study",
+              resource: "SKILL.md",
+              path: ".codex/skills/study/SKILL.md",
+              modifiedVersion: "mtime:2:size:32",
+              contentHash: "sha256:skill-instructions",
+              content: "# Study Skill\nUse bounded evidence.",
+            },
+          },
+  );
+  assert.deepEqual(
+    skillResourceEvents
+      .filter(
+        (event) => event.type === "tool_call.requested" && event.tool.name === "skill_read",
+      )
+      .map((event) => event.tool.arguments),
+    [{ skill: "study" }, { skill: "study", resource: "references/guide.md" }],
+  );
+  assert.match(skillResourceEvents.at(-1).output.text, /bounded guide/);
+
+  const missingContractEvents = await new Promise((resolve, reject) => {
+    const events = [];
+    const timeout = setTimeout(() => reject(new Error("Missing contract run timed out")), 10_000);
+    const onMessage = (data) => {
+      const event = JSON.parse(data.toString("utf8"));
+      if (event.agentRunId !== "tool-run-missing-contract") return;
+      events.push(event);
+      if (event.type === "tool_call.requested") {
+        assert.equal(event.tool.name, "agent_contract_read");
+        socket.send(
+          JSON.stringify({
+            type: "tool_result",
+            protocolVersion: 1,
+            eventId: `missing-${event.toolCallId}`,
+            conversationId: event.conversationId,
+            agentRunId: event.agentRunId,
+            sequence: event.sequence,
+            toolCallId: event.toolCallId,
+            result: {
+              ok: false,
+              error: { code: "not_found", message: "The root Agent Contract is missing." },
+            },
+          }),
+        );
+      }
+      if (event.type === "agent_run.failed") {
+        clearTimeout(timeout);
+        socket.off("message", onMessage);
+        resolve(events);
+      }
+    };
+    socket.on("message", onMessage);
+    socket.send(
+      JSON.stringify({
+        type: "agent_run.start",
+        protocolVersion: 1,
+        eventId: "missing-contract-start",
+        conversationId: "tool-conversation",
+        agentRunId: "tool-run-missing-contract",
+        sequence: 0,
+        model: "fake-interview-model",
+        input: { role: "user", text: "vault_read notes/must-not-run.md" },
+      }),
+    );
+  });
+  assert.deepEqual(
+    missingContractEvents
+      .filter((event) => event.type === "tool_call.requested")
+      .map((event) => event.tool.name),
+    ["agent_contract_read"],
+  );
+  assert.equal(
+    missingContractEvents.find((event) => event.type === "tool_call.completed").error.code,
+    "not_found",
+  );
+  assert.equal(missingContractEvents.at(-1).error.code, "instruction_error");
 
   const snapshot = new Promise((resolve) => {
     socket.on("message", function onMessage(data) {
@@ -246,11 +378,15 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
     }),
   );
   assert.deepEqual(
-    (await snapshot).toolCalls.map(({ name, status }) => ({ name, status })),
+    (await snapshot).toolCalls
+      .filter(({ name }) => name !== "agent_contract_read")
+      .map(({ name, status }) => ({ name, status })),
     [
       { name: "vault_read", status: "completed" },
       { name: "vault_read", status: "failed" },
       { name: "vault_search", status: "completed" },
+      { name: "skill_read", status: "completed" },
+      { name: "skill_read", status: "completed" },
     ],
   );
 
@@ -258,8 +394,15 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
   const SQL = await initSqlJs();
   const database = new SQL.Database(await readFile(statePath));
   assert.deepEqual(
-    database.exec("SELECT status FROM tool_calls ORDER BY agent_run_id")[0].values,
+    database.exec(
+      "SELECT status FROM tool_calls WHERE name IN ('vault_read', 'vault_search') ORDER BY agent_run_id",
+    )[0].values,
     [["failed"], ["completed"], ["completed"]],
+  );
+  assert.equal(
+    database.exec("SELECT COUNT(*) FROM tool_calls WHERE name = 'skill_read' AND status = 'completed'")[0]
+      .values[0][0],
+    2,
   );
   assert.deepEqual(
     database.exec(
@@ -311,6 +454,30 @@ test("a real plugin socket drop terminalizes its pending tool call as disconnect
     socket.on("message", function onMessage(data) {
       const event = JSON.parse(data.toString("utf8"));
       if (event.agentRunId !== "tool-drop-run" || event.type !== "tool_call.requested") return;
+      if (event.tool.name === "agent_contract_read") {
+        socket.send(
+          JSON.stringify({
+            type: "tool_result",
+            protocolVersion: 1,
+            eventId: "tool-drop-contract-result",
+            conversationId: event.conversationId,
+            agentRunId: event.agentRunId,
+            sequence: event.sequence,
+            toolCallId: event.toolCallId,
+            result: {
+              ok: true,
+              value: {
+                type: "agent_contract_read",
+                path: "agent.md",
+                modifiedVersion: "mtime:1:size:24",
+                contentHash: "sha256:test-contract",
+                content: "# Test Agent Contract",
+              },
+            },
+          }),
+        );
+        return;
+      }
       socket.off("message", onMessage);
       resolve();
     });
@@ -337,7 +504,7 @@ test("a real plugin socket drop terminalizes its pending tool call as disconnect
   const database = new SQL.Database(await readFile(statePath));
   assert.deepEqual(
     database.exec(
-      "SELECT status, error_code FROM tool_calls WHERE agent_run_id = 'tool-drop-run'",
+      "SELECT status, error_code FROM tool_calls WHERE agent_run_id = 'tool-drop-run' AND name = 'vault_read'",
     )[0].values,
     [["failed", "plugin_disconnected"]],
   );
@@ -347,6 +514,8 @@ test("a real plugin socket drop terminalizes its pending tool call as disconnect
     )[0].values,
     [
       ["agent_run.started"],
+      ["tool_call.requested"],
+      ["tool_call.completed"],
       ["tool_call.requested"],
       ["tool_call.completed"],
       ["agent_run.interrupted"],
@@ -432,7 +601,11 @@ test("stale evidence is removed from Provider input and must be reread before co
     },
   );
   assert.deepEqual(
-    events.filter((event) => event.type === "tool_call.requested").map((event) => event.tool.name),
+    events
+      .filter(
+        (event) => event.type === "tool_call.requested" && event.tool.name !== "agent_contract_read",
+      )
+      .map((event) => event.tool.name),
     ["vault_read", "vault_search", "vault_read"],
   );
   assert.match(events.at(-1).output.text, /new content/);
@@ -479,6 +652,30 @@ test("malformed nested search results close only the offending socket", async (t
   socket.on("message", (data) => {
     const event = JSON.parse(data.toString("utf8"));
     if (event.type !== "tool_call.requested") return;
+    if (event.tool.name === "agent_contract_read") {
+      socket.send(
+        JSON.stringify({
+          type: "tool_result",
+          protocolVersion: 1,
+          eventId: "malformed-contract-result",
+          conversationId: event.conversationId,
+          agentRunId: event.agentRunId,
+          sequence: event.sequence,
+          toolCallId: event.toolCallId,
+          result: {
+            ok: true,
+            value: {
+              type: "agent_contract_read",
+              path: "agent.md",
+              modifiedVersion: "mtime:1:size:24",
+              contentHash: "sha256:test-contract",
+              content: "# Test Agent Contract",
+            },
+          },
+        }),
+      );
+      return;
+    }
     socket.send(
       JSON.stringify({
         type: "tool_result",

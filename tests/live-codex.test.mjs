@@ -88,6 +88,33 @@ test(
       socket.once("open", resolve);
       socket.once("error", reject);
     });
+    socket.on("message", (data) => {
+      const event = JSON.parse(data.toString("utf8"));
+      if (event.type !== "tool_call.requested" || event.tool.name !== "agent_contract_read") {
+        return;
+      }
+      socket.send(
+        JSON.stringify({
+          type: "tool_result",
+          protocolVersion: 1,
+          eventId: `live-contract-result-${event.toolCallId}`,
+          conversationId: event.conversationId,
+          agentRunId: event.agentRunId,
+          sequence: event.sequence,
+          toolCallId: event.toolCallId,
+          result: {
+            ok: true,
+            value: {
+              type: "agent_contract_read",
+              path: "agent.md",
+              modifiedVersion: "mtime:1:size:52",
+              contentHash: "sha256:live-agent-contract",
+              content: "# Live Agent Contract\nUse only explicit Vault evidence.",
+            },
+          },
+        }),
+      );
+    });
     const output = await new Promise((resolve, reject) => {
       let text = "";
       const timeout = setTimeout(() => reject(new Error("Live Agent Run timed out")), 60_000);
@@ -125,6 +152,8 @@ test(
         const event = JSON.parse(data.toString("utf8"));
         if (event.agentRunId !== "live-agent-run-tool") return;
         if (event.type === "tool_call.requested") {
+          const isContract = event.tool.name === "agent_contract_read";
+          if (isContract) return;
           requestedVaultRead = event.tool.name === "vault_read";
           socket.send(
             JSON.stringify({

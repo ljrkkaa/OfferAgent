@@ -49,10 +49,16 @@ export interface AgentRunRecord {
   status: AgentRunStatus;
 }
 
-export type LocalToolName = "vault_list" | "vault_read" | "vault_search";
+export type LocalToolName =
+  | "agent_contract_read"
+  | "skill_read"
+  | "vault_list"
+  | "vault_read"
+  | "vault_search";
 
 export type VaultToolErrorCode =
   | "invalid_path"
+  | "malformed_control_file"
   | "not_found"
   | "plugin_disconnected"
   | "request_too_large"
@@ -97,8 +103,34 @@ export interface VaultSearchResult {
   type: "vault_search";
 }
 
+export interface AgentContractResult {
+  content: string;
+  contentHash: string;
+  modifiedVersion: string;
+  path: "agent.md";
+  type: "agent_contract_read";
+}
+
+export interface SkillReadResult {
+  content: string;
+  contentHash: string;
+  modifiedVersion: string;
+  path: string;
+  resource: string;
+  skill: string;
+  type: "skill_read";
+}
+
 export type LocalToolResultPayload =
-  | { ok: true; value: VaultListResult | VaultReadResult | VaultSearchResult }
+  | {
+      ok: true;
+      value:
+        | AgentContractResult
+        | SkillReadResult
+        | VaultListResult
+        | VaultReadResult
+        | VaultSearchResult;
+    }
   | { ok: false; error: { code: VaultToolErrorCode; message: string } };
 
 export interface ToolCallRecord {
@@ -160,6 +192,7 @@ export interface RuntimeModels {
 
 export type ProviderErrorCode =
   | "auth_required"
+  | "instruction_error"
   | "model_unavailable"
   | "provider_error"
   | "transport_error";

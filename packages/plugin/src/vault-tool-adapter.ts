@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { realpath } from "node:fs/promises";
+import path from "node:path";
 import type { MetadataCache, TFile, Vault } from "obsidian";
 import type {
   AgentRunEvent,
@@ -18,13 +20,19 @@ const MAX_SEARCH_SNIPPETS = 3;
 const DEFAULT_SEARCH_SNIPPET_BYTES = 240;
 const MAX_SEARCH_SNIPPET_BYTES = 512;
 const MAX_SEARCH_QUERY_BYTES = 512;
+const MAX_CONTROL_FILE_BYTES = 32_768;
+const MAX_SKILL_NAME_LENGTH = 64;
 const EXCLUDED_SEGMENTS = new Set([".git", ".obsidian", ".codex", "node_modules"]);
 
 type VaultToolCall = Extract<AgentRunEvent, { type: "tool_call.requested" }>;
 type VaultApi = Pick<Vault, "cachedRead" | "getFiles">;
 type MetadataApi = Pick<MetadataCache, "getFileCache">;
+type CanonicalizeVaultPath = (vaultPath: string) => Promise<string>;
 
-function failure(code: VaultToolErrorCode, message: string): LocalToolResultPayload {
+function failure(
+  code: VaultToolErrorCode,
+  message: string,
+): Extract<LocalToolResultPayload, { ok: false }> {
   return { ok: false, error: { code, message } };
 }
 
@@ -71,6 +79,64 @@ function isReadableFile(file: TFile): boolean {
   return extension === "md" || extension === "txt";
 }
 
+function defaultCanonicalizer(vault: VaultApi): CanonicalizeVaultPath | undefined {
+  const adapter = (vault as VaultApi & { adapter?: { getBasePath?: () => string } }).adapter;
+  if (!adapter || typeof adapter.getBasePath !== "function") return undefined;
+  const basePath = adapter.getBasePath();
+  return (vaultPath) => realpath(path.resolve(basePath, vaultPath));
+}
+
+function isContained(root: string, target: string): boolean {
+  const relative = path.relative(root, target);
+  return (
+    relative === "" ||
+    (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))
+  );
+}
+
+function normalizeSkillResource(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  let candidate = value.trim();
+  if (candidate.startsWith("<") && candidate.endsWith(">")) {
+    candidate = candidate.slice(1, -1);
+  }
+  candidate = candidate.split("#", 1)[0];
+  try {
+    candidate = decodeURIComponent(candidate);
+  } catch {
+    return undefined;
+  }
+  if (
+    !candidate ||
+    candidate.length > MAX_PATH_LENGTH ||
+    candidate.includes("\\") ||
+    candidate.startsWith("/") ||
+    /^[A-Za-z]:/.test(candidate) ||
+    /^[a-z][a-z0-9+.-]*:/i.test(candidate)
+  ) {
+    return undefined;
+  }
+  const segments = candidate.split("/");
+  if (
+    segments.some(
+      (segment) => !segment || segment === "." || segment === ".." || segment.startsWith("."),
+    )
+  ) {
+    return undefined;
+  }
+  return segments.join("/");
+}
+
+function referencedResources(content: string): Set<string> {
+  const resources = new Set<string>();
+  const links = /\[[^\]]*\]\(([^)\s]+)(?:\s+[^)]*)?\)/g;
+  for (const match of content.matchAll(links)) {
+    const normalized = normalizeSkillResource(match[1]);
+    if (normalized) resources.add(normalized);
+  }
+  return resources;
+}
+
 function occurrences(value: string, needles: string[]): number {
   return needles.reduce((total, needle) => {
     let count = 0;
@@ -108,18 +174,28 @@ function boundedUtf8(value: string, maximumBytes: number): { content: string; tr
 }
 
 export class ObsidianVaultToolAdapter {
+  readonly #canonicalize?: CanonicalizeVaultPath;
   readonly #metadata?: MetadataApi;
   readonly #vault: VaultApi;
 
-  constructor(vault: VaultApi, metadata?: MetadataApi) {
+  constructor(
+    vault: VaultApi,
+    metadata?: MetadataApi,
+    canonicalize: CanonicalizeVaultPath | undefined = defaultCanonicalizer(vault),
+  ) {
     this.#vault = vault;
     this.#metadata = metadata;
+    this.#canonicalize = canonicalize;
   }
 
   async execute(call: VaultToolCall): Promise<LocalToolResultPayload> {
     try {
       if (call.tool.name === "vault_list") return await this.#list(call.tool.arguments);
       if (call.tool.name === "vault_search") return await this.#search(call.tool.arguments);
+      if (call.tool.name === "agent_contract_read") {
+        return await this.#readAgentContract(call.tool.arguments);
+      }
+      if (call.tool.name === "skill_read") return await this.#readSkill(call.tool.arguments);
       return await this.#read(call.tool.arguments);
     } catch (error) {
       return failure(
@@ -347,6 +423,146 @@ export class ObsidianVaultToolAdapter {
       },
     };
   }
+
+  async #readAgentContract(arguments_: unknown): Promise<LocalToolResultPayload> {
+    if (
+      !arguments_ ||
+      typeof arguments_ !== "object" ||
+      Array.isArray(arguments_) ||
+      Object.keys(arguments_).length > 0
+    ) {
+      return failure("request_too_large", "agent_contract_read accepts an empty object.");
+    }
+    const file = this.#vault.getFiles().find((candidate) => candidate.path === "agent.md");
+    if (!file || !isReadableFile(file)) {
+      return failure("not_found", "The root Agent Contract 'agent.md' does not exist.");
+    }
+    if (!this.#canonicalize) {
+      return failure(
+        "tool_error",
+        "The Agent Contract path containment could not be verified safely.",
+      );
+    }
+    try {
+      const [vaultRoot, canonicalContract] = await Promise.all([
+        this.#canonicalize(""),
+        this.#canonicalize("agent.md"),
+      ]);
+      if (!isContained(vaultRoot, canonicalContract)) {
+        return failure("invalid_path", "The Agent Contract resolves outside the Vault root.");
+      }
+    } catch {
+      return failure("invalid_path", "The Agent Contract path could not be resolved safely.");
+    }
+    const content = await this.#vault.cachedRead(file);
+    const invalid = this.#validateControlContent(content, "Agent Contract");
+    if (invalid) return invalid;
+    return {
+      ok: true,
+      value: {
+        type: "agent_contract_read",
+        path: "agent.md",
+        modifiedVersion: fileVersion(file),
+        contentHash: contentHash(content),
+        content,
+      },
+    };
+  }
+
+  async #readSkill(arguments_: unknown): Promise<LocalToolResultPayload> {
+    if (!arguments_ || typeof arguments_ !== "object" || Array.isArray(arguments_)) {
+      return failure("request_too_large", "skill_read arguments must be an object.");
+    }
+    const input = arguments_ as { resource?: unknown; skill?: unknown };
+    if (
+      typeof input.skill !== "string" ||
+      input.skill.length > MAX_SKILL_NAME_LENGTH ||
+      !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(input.skill)
+    ) {
+      return failure("invalid_path", "The requested Local Skill name is invalid.");
+    }
+    const skillRoot = `.codex/skills/${input.skill}`;
+    const skillFile = this.#vault
+      .getFiles()
+      .find((candidate) => candidate.path === `${skillRoot}/SKILL.md`);
+    if (!skillFile) {
+      return failure("not_found", `Local Skill '${input.skill}' is not registered.`);
+    }
+    const skillContent = await this.#vault.cachedRead(skillFile);
+    const invalidSkill = this.#validateControlContent(skillContent, `Local Skill '${input.skill}'`);
+    if (invalidSkill) return invalidSkill;
+    const resource =
+      input.resource === undefined ? "SKILL.md" : normalizeSkillResource(input.resource);
+    if (!resource) {
+      return failure("invalid_path", "The requested Local Skill resource path is invalid.");
+    }
+    if (resource !== "SKILL.md" && !referencedResources(skillContent).has(resource)) {
+      return failure(
+        "invalid_path",
+        `Local Skill resource '${resource}' is not directly referenced by SKILL.md.`,
+      );
+    }
+    const resourcePath = `${skillRoot}/${resource}`;
+    const resourceFile = this.#vault
+      .getFiles()
+      .find((candidate) => candidate.path === resourcePath);
+    if (!resourceFile || !isReadableFile(resourceFile)) {
+      return failure("not_found", `Local Skill resource '${resource}' does not exist.`);
+    }
+    if (!this.#canonicalize) {
+      return failure("tool_error", "Local Skill path containment could not be verified safely.");
+    }
+    try {
+      const [vaultRoot, canonicalSkillRoot, canonicalResource] = await Promise.all([
+        this.#canonicalize(""),
+        this.#canonicalize(skillRoot),
+        this.#canonicalize(resourcePath),
+      ]);
+      if (
+        !isContained(vaultRoot, canonicalSkillRoot) ||
+        !isContained(canonicalSkillRoot, canonicalResource)
+      ) {
+        return failure("invalid_path", "The Local Skill resource resolves outside its owning Skill.");
+      }
+    } catch {
+      return failure("invalid_path", "The Local Skill resource path could not be resolved safely.");
+    }
+    const content =
+      resource === "SKILL.md" ? skillContent : await this.#vault.cachedRead(resourceFile);
+    const invalidResource = this.#validateControlContent(
+      content,
+      `Local Skill resource '${resource}'`,
+    );
+    if (invalidResource) return invalidResource;
+    return {
+      ok: true,
+      value: {
+        type: "skill_read",
+        skill: input.skill,
+        resource,
+        path: resourcePath,
+        modifiedVersion: fileVersion(resourceFile),
+        contentHash: contentHash(content),
+        content,
+      },
+    };
+  }
+
+  #validateControlContent(
+    content: string,
+    label: string,
+  ): Extract<LocalToolResultPayload, { ok: false }> | undefined {
+    if (Buffer.byteLength(content, "utf8") > MAX_CONTROL_FILE_BYTES) {
+      return failure(
+        "request_too_large",
+        `${label} exceeds ${MAX_CONTROL_FILE_BYTES} UTF-8 bytes.`,
+      );
+    }
+    if (!content.trim() || content.includes("\0")) {
+      return failure("malformed_control_file", `${label} is empty or malformed.`);
+    }
+    return undefined;
+  }
 }
 
 export {
@@ -361,4 +577,5 @@ export {
   MAX_SEARCH_RESULTS,
   MAX_SEARCH_SNIPPET_BYTES,
   MAX_SEARCH_SNIPPETS,
+  MAX_CONTROL_FILE_BYTES,
 };

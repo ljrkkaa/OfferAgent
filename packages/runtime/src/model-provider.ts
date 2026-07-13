@@ -19,6 +19,7 @@ export interface LocalToolDefinition {
 
 export interface ModelRequest {
   input: ModelConversationItem[];
+  instructions: string;
   model: string;
   signal: AbortSignal;
   tools: LocalToolDefinition[];

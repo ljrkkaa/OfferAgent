@@ -171,8 +171,7 @@ export class CodexSubscriptionProvider implements ModelProvider {
         signal: request.signal,
         body: JSON.stringify({
           model: request.model,
-          instructions:
-            "You are OfferAgent, an interview preparation assistant. Answer the user's request directly and clearly.",
+          instructions: request.instructions,
           input: request.input.map(encodeConversationItem),
           tools: request.tools.map((tool) => ({
             type: "function",
@@ -411,7 +410,12 @@ export class CodexSubscriptionProvider implements ModelProvider {
 }
 
 function isLocalToolName(value: unknown): value is LocalToolName {
-  return value === "vault_list" || value === "vault_read" || value === "vault_search";
+  return (
+    value === "skill_read" ||
+    value === "vault_list" ||
+    value === "vault_read" ||
+    value === "vault_search"
+  );
 }
 
 function encodeConversationItem(item: ModelConversationItem): Record<string, unknown> {

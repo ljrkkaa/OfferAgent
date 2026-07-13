@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, mkdtemp, readFile, rm } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import Module from "node:module";
 import os from "node:os";
@@ -85,8 +85,16 @@ async function waitUntil(predicate, message, timeoutMs = 10_000) {
 
 test("Obsidian loads the packaged plugin and opens its connected sidebar", async (t) => {
   const previousProvider = process.env.OFFERAGENT_RUNTIME_PROVIDER;
+  const previousLocalAppData = process.env.LOCALAPPDATA;
   process.env.OFFERAGENT_RUNTIME_PROVIDER = "fake";
   const temporaryVault = await mkdtemp(path.join(os.tmpdir(), "offeragent-vault-"));
+  const temporaryRuntimeHome = await mkdtemp(
+    path.join(os.tmpdir(), "offeragent-plugin-runtime-home-"),
+  );
+  process.env.LOCALAPPDATA = temporaryRuntimeHome;
+  await mkdir(path.join(temporaryVault, "notes"), { recursive: true });
+  await writeFile(path.join(temporaryVault, "agent.md"), "# Test Agent Contract", "utf8");
+  await writeFile(path.join(temporaryVault, "notes", "example.md"), "line one\nline two", "utf8");
   const installation = path.join(
     temporaryVault,
     ".obsidian",
@@ -196,6 +204,12 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
       getFiles() {
         return [
           {
+            path: "agent.md",
+            extension: "md",
+            stat: { mtime: 1234, size: 26 },
+            content: "# Test Agent Contract",
+          },
+          {
             path: "notes/example.md",
             extension: "md",
             stat: { mtime: 1234, size: 17 },
@@ -215,7 +229,10 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     await plugin?.onunload();
     if (previousProvider === undefined) delete process.env.OFFERAGENT_RUNTIME_PROVIDER;
     else process.env.OFFERAGENT_RUNTIME_PROVIDER = previousProvider;
+    if (previousLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = previousLocalAppData;
     await rm(temporaryVault, { recursive: true, force: true });
+    await rm(temporaryRuntimeHome, { recursive: true, force: true });
   });
 
   await plugin.onload();
@@ -290,8 +307,12 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   toolComposer.dispatch("submit");
   const completedTool = await waitUntil(
     () => {
-      const activity = activeView.contentEl.findByClass("offeragent-sidebar__tool-activity");
-      return activity?.dataset.status === "completed" ? activity : undefined;
+      const activities = activeView.contentEl.findAllByClass("offeragent-sidebar__tool-activity");
+      return activities.find(
+        (activity) =>
+          activity.dataset.status === "completed" &&
+          activity.children[0]?.text.includes("vault_read"),
+      );
     },
     "OfferAgent did not execute and render the Vault tool activity",
   );

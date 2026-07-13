@@ -307,6 +307,7 @@ function callRuntime<T>(
               const error = JSON.parse(body) as RuntimeError;
               if (
                 error.code === "auth_required" ||
+                error.code === "instruction_error" ||
                 error.code === "model_unavailable" ||
                 error.code === "provider_error" ||
                 error.code === "transport_error"
