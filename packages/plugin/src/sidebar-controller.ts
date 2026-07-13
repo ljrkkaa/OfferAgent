@@ -11,6 +11,7 @@ import type {
   VaultUndoResultPayload,
   VaultUndoConflict,
   LocalToolResultPayload,
+  VaultToolErrorCode,
 } from "@offeragent/protocol";
 import { RuntimeRequestError, type RuntimeClient } from "./runtime-supervisor";
 
@@ -21,7 +22,7 @@ export interface SidebarViewModel {
     activeConversationId?: string;
     agentRuns: AgentRunRecord[];
     conversations: ConversationSummary[];
-    error?: { code: ProviderErrorCode; message: string };
+    error?: { code: ProviderErrorCode | VaultToolErrorCode; message: string };
     messages: Array<{ role: "assistant" | "user"; text: string }>;
     models: ModelDescriptor[];
     runState: "idle" | "streaming";
@@ -31,6 +32,7 @@ export interface SidebarViewModel {
       actions: Array<{ operation: string; path: string }>;
       batchId: string;
       conflicts?: VaultUndoConflict[];
+      message?: string;
       status: "applied" | "applying" | "conflicted" | "expired" | "failed" | "pending" | "rejected" | "rejecting" | "undone";
       task: string;
       toolCallId: string;
@@ -296,6 +298,18 @@ export class SidebarController {
               : this.#viewModel.conversation.vaultChanges,
           });
         } else if (event.type === "tool_call.completed") {
+          const vaultChanges =
+            event.status === "failed"
+              ? this.#viewModel.conversation.vaultChanges.map((change) =>
+                  change.toolCallId === event.toolCallId
+                    ? { ...change, status: "failed" as const, message: event.error?.message }
+                    : change,
+                )
+              : this.#viewModel.conversation.vaultChanges.map((change) =>
+                  change.toolCallId === event.toolCallId && change.status === "pending"
+                    ? { ...change, status: "applied" as const }
+                    : change,
+                );
           this.#updateConversation({
             ...this.#viewModel.conversation,
             toolCalls: this.#viewModel.conversation.toolCalls.map((call) =>
@@ -303,10 +317,11 @@ export class SidebarController {
                 ? { ...call, status: event.status }
                 : call,
             ),
-            vaultChanges:
-              event.status === "failed"
-                ? this.#vaultChangesWithStatus(event.toolCallId, "failed")
-                : this.#viewModel.conversation.vaultChanges,
+            vaultChanges,
+            error:
+              event.status === "failed" && event.error
+                ? { code: event.error.code, message: event.error.message }
+                : this.#viewModel.conversation.error,
           });
         } else if (event.type === "agent_run.failed") {
           const vaultChanges = this.#cancelPendingVaultChanges(agentRunId);
@@ -531,6 +546,7 @@ export class SidebarController {
         {
           ...change,
           status: this.#vaultChangeStatus(call),
+          ...(call.error ? { message: call.error.message } : {}),
         },
       ];
     });

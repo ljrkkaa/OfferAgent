@@ -12,7 +12,12 @@ import { fileURLToPath } from "node:url";
 const execFileAsync = promisify(execFile);
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
-const { GitCheckpointStore, VaultChangeCoordinator, VaultChangeCrashInjectionError } = require(
+const {
+  GitCheckpointStore,
+  ObsidianVaultChangeFileApi,
+  VaultChangeCoordinator,
+  VaultChangeCrashInjectionError,
+} = require(
   path.join(repositoryRoot, "packages", "plugin", "dist", "vault-change-coordinator.js"),
 );
 
@@ -132,9 +137,18 @@ function batch(id, actions) {
   };
 }
 
-async function fixture(t, journal, injectCrash) {
+async function fixture(t, journal, injectCrash, getPermissionMode) {
   const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-change-batch-"));
   await mkdir(path.join(root, "notes"), { recursive: true });
+  await mkdir(path.join(root, ".obsidian"), { recursive: true });
+  await mkdir(path.join(root, ".codex", "skills", "study"), { recursive: true });
+  await writeFile(path.join(root, "agent.md"), "# Agent contract\n", "utf8");
+  await writeFile(path.join(root, ".obsidian", "app.json"), "{}\n", "utf8");
+  await writeFile(
+    path.join(root, ".codex", "skills", "study", "SKILL.md"),
+    "# Study skill\n",
+    "utf8",
+  );
   await writeFile(path.join(root, "notes", "a.md"), "alpha\n", "utf8");
   await writeFile(path.join(root, "notes", "b.md"), "hello world\n", "utf8");
   await writeFile(path.join(root, "staged.md"), "staged base\n", "utf8");
@@ -149,10 +163,423 @@ async function fixture(t, journal, injectCrash) {
   await writeFile(path.join(root, "unstaged.md"), "unstaged user change\n", "utf8");
   const vault = new FileVaultApi(root);
   const checkpoints = new GitCheckpointStore(root);
-  const coordinator = new VaultChangeCoordinator(vault, checkpoints, journal, injectCrash);
+  const coordinator = new VaultChangeCoordinator(
+    vault,
+    checkpoints,
+    journal,
+    injectCrash,
+    getPermissionMode,
+  );
   t.after(async () => rm(root, { recursive: true, force: true }));
   return { checkpoints, coordinator, root, vault };
 }
+
+async function settledWithin(promise, milliseconds = 100) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve("still-pending"), milliseconds)),
+  ]);
+}
+
+test("the Obsidian adapter handles hidden control configuration through the official adapter", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-control-adapter-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, ".obsidian"), { recursive: true });
+  await writeFile(path.join(root, ".obsidian", "app.json"), "{}\n", "utf8");
+  const adapter = {
+    async exists(vaultPath) {
+      try {
+        await stat(path.join(root, vaultPath));
+        return true;
+      } catch (error) {
+        if (error?.code === "ENOENT") return false;
+        throw error;
+      }
+    },
+    async read(vaultPath) {
+      return readFile(path.join(root, vaultPath), "utf8");
+    },
+    async remove(vaultPath) {
+      await unlink(path.join(root, vaultPath));
+    },
+    async stat(vaultPath) {
+      try {
+        const info = await stat(path.join(root, vaultPath));
+        return { type: info.isFile() ? "file" : "folder", mtime: info.mtimeMs, size: info.size };
+      } catch (error) {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      }
+    },
+    async write(vaultPath, content) {
+      await writeFile(path.join(root, vaultPath), content, "utf8");
+    },
+  };
+  const api = new ObsidianVaultChangeFileApi({
+    adapter,
+    async cachedRead() { throw new Error("hidden control files must use the adapter"); },
+    async create() { throw new Error("hidden control files must use the adapter"); },
+    async delete() { throw new Error("hidden control files must use the adapter"); },
+    getFiles() { return []; },
+    async modify() { throw new Error("hidden control files must use the adapter"); },
+  }, root);
+  const original = await api.read(".obsidian/app.json");
+  assert.equal(original.content, "{}\n");
+  assert.match(original.modifiedVersion, /^mtime:/);
+  await api.modify(".obsidian/app.json", '{"alwaysUpdateLinks":true}\n');
+  assert.equal(await readFile(path.join(root, ".obsidian", "app.json"), "utf8"), '{"alwaysUpdateLinks":true}\n');
+  await api.create(".obsidian/new-config.json", "{}\n");
+  assert.equal(await readFile(path.join(root, ".obsidian", "new-config.json"), "utf8"), "{}\n");
+  await api.remove(".obsidian/new-config.json");
+  assert.equal(await adapter.exists(".obsidian/new-config.json"), false);
+});
+
+test("plugin-owned permission modes enforce the complete Vault mutation matrix", async (t) => {
+  await t.test("Trusted Vault auto-applies normal notes with checkpoint and undo", async (t) => {
+    const journal = new MemoryJournal();
+    const { coordinator, root, vault } = await fixture(
+      t,
+      journal,
+      undefined,
+      () => "trusted_vault",
+    );
+    const original = await vault.read("notes/a.md");
+    const proposal = batch("batch-trusted-normal", [{
+      operation: "append",
+      path: "notes/a.md",
+      expectedVersion: original.modifiedVersion,
+      content: "trusted\n",
+    }]);
+    const result = await settledWithin(
+      coordinator.execute(toolCall("call-trusted-normal", proposal)),
+      3_000,
+    );
+    assert.notEqual(result, "still-pending");
+    assert.equal(result.ok, true);
+    assert.equal(result.value.decision, "applied");
+    assert.match(result.value.checkpointRef, /batch-trusted-normal$/);
+    assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "alpha\ntrusted\n");
+    assert.equal((await coordinator.undo(proposal.batchId)).ok, true);
+  });
+
+  await t.test("a concurrent Apply click observes the successful Trusted auto-apply", async (t) => {
+    let targetReads = 0;
+    let releaseFinalRead;
+    let reportFinalRead;
+    const finalReadStarted = new Promise((resolve) => (reportFinalRead = resolve));
+    const finalReadRelease = new Promise((resolve) => (releaseFinalRead = resolve));
+    const journal = new MemoryJournal();
+    const { checkpoints, root, vault } = await fixture(t, journal);
+    const guardedVault = {
+      canonicalize: (...arguments_) => vault.canonicalize(...arguments_),
+      create: (...arguments_) => vault.create(...arguments_),
+      modify: (...arguments_) => vault.modify(...arguments_),
+      async read(vaultPath) {
+        if (vaultPath === "notes/a.md" && ++targetReads === 2) {
+          reportFinalRead();
+          await finalReadRelease;
+        }
+        return vault.read(vaultPath);
+      },
+      remove: (...arguments_) => vault.remove(...arguments_),
+    };
+    const coordinator = new VaultChangeCoordinator(
+      guardedVault,
+      checkpoints,
+      journal,
+      undefined,
+      () => "trusted_vault",
+    );
+    const original = await vault.read("notes/a.md");
+    const proposal = batch("batch-trusted-click-race", [{
+      operation: "append",
+      path: "notes/a.md",
+      expectedVersion: original.modifiedVersion,
+      content: "exactly once\n",
+    }]);
+    const execution = coordinator.execute(toolCall("call-trusted-click-race", proposal));
+    await finalReadStarted;
+    const decision = coordinator.decide("call-trusted-click-race", "apply");
+    releaseFinalRead();
+
+    const [executionResult, decisionResult] = await Promise.all([execution, decision]);
+    assert.equal(executionResult.ok, true);
+    assert.equal(executionResult.value.decision, "applied");
+    assert.deepEqual(decisionResult, executionResult);
+    assert.deepEqual(
+      await coordinator.decide("call-trusted-click-race", "apply"),
+      executionResult,
+    );
+    assert.equal(
+      await readFile(path.join(root, "notes", "a.md"), "utf8"),
+      "alpha\nexactly once\n",
+    );
+  });
+
+  await t.test("Trusted Vault still requires one confirmation for a mixed control batch", async (t) => {
+    const journal = new MemoryJournal();
+    const { coordinator, root, vault } = await fixture(
+      t,
+      journal,
+      undefined,
+      () => "trusted_vault",
+    );
+    const note = await vault.read("notes/a.md");
+    const contract = await vault.read("agent.md");
+    const skill = await vault.read(".codex/skills/study/SKILL.md");
+    const proposal = batch("batch-trusted-control", [
+      {
+        operation: "append",
+        path: "notes/a.md",
+        expectedVersion: note.modifiedVersion,
+        content: "normal\n",
+      },
+      {
+        operation: "append",
+        path: "agent.md",
+        expectedVersion: contract.modifiedVersion,
+        content: "control\n",
+      },
+      {
+        operation: "append",
+        path: ".codex/skills/study/SKILL.md",
+        expectedVersion: skill.modifiedVersion,
+        content: "control\n",
+      },
+    ]);
+    const execution = coordinator.execute(toolCall("call-trusted-control", proposal));
+    await coordinator.waitUntilPending("call-trusted-control");
+    assert.equal(await settledWithin(execution, 25), "still-pending");
+    assert.equal((await coordinator.decide("call-trusted-control", "apply")).ok, true);
+    assert.equal((await execution).ok, true);
+    assert.equal(await readFile(path.join(root, "agent.md"), "utf8"), "# Agent contract\ncontrol\n");
+    assert.equal(
+      await readFile(path.join(root, ".codex", "skills", "study", "SKILL.md"), "utf8"),
+      "# Study skill\ncontrol\n",
+    );
+  });
+
+  await t.test("Obsidian configuration is a confirm-only control target", async (t) => {
+    const { coordinator, root, vault } = await fixture(
+      t,
+      new MemoryJournal(),
+      undefined,
+      () => "trusted_vault",
+    );
+    const config = await vault.read(".obsidian/app.json");
+    const proposal = batch("batch-obsidian-control", [{
+      operation: "exact_replace",
+      path: ".obsidian/app.json",
+      expectedVersion: config.modifiedVersion,
+      expectedContent: "{}",
+      replacement: '{"alwaysUpdateLinks":true}',
+    }]);
+    const execution = coordinator.execute(toolCall("call-obsidian-control", proposal));
+    await coordinator.waitUntilPending("call-obsidian-control");
+    assert.equal(await settledWithin(execution, 25), "still-pending");
+    assert.equal((await coordinator.decide("call-obsidian-control", "apply")).ok, true);
+    assert.equal((await execution).ok, true);
+    assert.equal(
+      await readFile(path.join(root, ".obsidian", "app.json"), "utf8"),
+      '{"alwaysUpdateLinks":true}\n',
+    );
+  });
+
+  await t.test("a normal-looking alias resolving to a control file still requires confirmation", async (t) => {
+    const journal = new MemoryJournal();
+    const { checkpoints, root, vault } = await fixture(t, journal);
+    await writeFile(path.join(root, "notes", "alias.md"), "# Agent contract\n", "utf8");
+    const aliasingVault = {
+      canonicalize: async (vaultPath, exists) =>
+        vaultPath === "notes/alias.md"
+          ? { root: await realpath(root), target: await realpath(path.join(root, "agent.md")) }
+          : vault.canonicalize(vaultPath, exists),
+      create: (...arguments_) => vault.create(...arguments_),
+      modify: (...arguments_) => vault.modify(...arguments_),
+      read: (...arguments_) => vault.read(...arguments_),
+      remove: (...arguments_) => vault.remove(...arguments_),
+    };
+    const coordinator = new VaultChangeCoordinator(
+      aliasingVault,
+      checkpoints,
+      journal,
+      undefined,
+      () => "trusted_vault",
+    );
+    const alias = await aliasingVault.read("notes/alias.md");
+    const proposal = batch("batch-control-alias", [{
+      operation: "append",
+      path: "notes/alias.md",
+      expectedVersion: alias.modifiedVersion,
+      content: "control alias\n",
+    }]);
+    const execution = coordinator.execute(toolCall("call-control-alias", proposal));
+    await coordinator.waitUntilPending("call-control-alias");
+    assert.equal(await settledWithin(execution, 25), "still-pending");
+    assert.equal((await coordinator.decide("call-control-alias", "reject")).ok, true);
+    assert.equal(await readFile(path.join(root, "notes", "alias.md"), "utf8"), "# Agent contract\n");
+  });
+
+  await t.test("Ask Every Time keeps a normal note pending", async (t) => {
+    const { coordinator, vault } = await fixture(
+      t,
+      new MemoryJournal(),
+      undefined,
+      () => "ask_every_time",
+    );
+    const original = await vault.read("notes/a.md");
+    const proposal = batch("batch-ask-normal", [{
+      operation: "append",
+      path: "notes/a.md",
+      expectedVersion: original.modifiedVersion,
+      content: "ask\n",
+    }]);
+    const execution = coordinator.execute(toolCall("call-ask-normal", proposal));
+    await coordinator.waitUntilPending("call-ask-normal");
+    assert.equal(await settledWithin(execution, 25), "still-pending");
+    assert.equal((await coordinator.decide("call-ask-normal", "reject")).ok, true);
+  });
+
+  await t.test("Read Only rejects mutation and ignores an Agent escalation field", async (t) => {
+    const { coordinator, root, vault } = await fixture(
+      t,
+      new MemoryJournal(),
+      undefined,
+      () => "read_only",
+    );
+    const original = await vault.read("notes/a.md");
+    const proposal = {
+      ...batch("batch-read-only", [{
+        operation: "append",
+        path: "notes/a.md",
+        expectedVersion: original.modifiedVersion,
+        content: "forbidden\n",
+      }]),
+      permissionMode: "trusted_vault",
+    };
+    const result = await settledWithin(coordinator.execute(toolCall("call-read-only", proposal)));
+    assert.notEqual(result, "still-pending");
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, "permission_denied");
+    assert.match(result.error.message, /Read Only/i);
+    assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "alpha\n");
+  });
+
+  await t.test("switching to Read Only invalidates an already pending Apply", async (t) => {
+    let mode = "ask_every_time";
+    const { coordinator, root, vault } = await fixture(
+      t,
+      new MemoryJournal(),
+      undefined,
+      () => mode,
+    );
+    const original = await vault.read("notes/a.md");
+    const proposal = batch("batch-mode-switch", [{
+      operation: "append",
+      path: "notes/a.md",
+      expectedVersion: original.modifiedVersion,
+      content: "forbidden after switch\n",
+    }]);
+    const execution = coordinator.execute(toolCall("call-mode-switch", proposal));
+    await coordinator.waitUntilPending("call-mode-switch");
+    mode = "read_only";
+    const decision = await coordinator.decide("call-mode-switch", "apply");
+    assert.equal(decision.ok, false);
+    assert.equal(decision.error.code, "permission_denied");
+    assert.deepEqual(await execution, decision);
+    assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "alpha\n");
+  });
+
+  for (const tightenedMode of ["ask_every_time", "read_only"]) {
+    await t.test(`a switch to ${tightenedMode} during final validation blocks Trusted auto-apply`, async (t) => {
+      let mode = "trusted_vault";
+      let targetReads = 0;
+      let releaseFinalRead;
+      let reportFinalRead;
+      const finalReadStarted = new Promise((resolve) => (reportFinalRead = resolve));
+      const finalReadRelease = new Promise((resolve) => (releaseFinalRead = resolve));
+      const journal = new MemoryJournal();
+      const { checkpoints, root, vault } = await fixture(t, journal);
+      const guardedVault = {
+        canonicalize: (...arguments_) => vault.canonicalize(...arguments_),
+        create: (...arguments_) => vault.create(...arguments_),
+        modify: (...arguments_) => vault.modify(...arguments_),
+        async read(vaultPath) {
+          if (vaultPath === "notes/a.md" && ++targetReads === 2) {
+            reportFinalRead();
+            await finalReadRelease;
+          }
+          return vault.read(vaultPath);
+        },
+        remove: (...arguments_) => vault.remove(...arguments_),
+      };
+      const coordinator = new VaultChangeCoordinator(
+        guardedVault,
+        checkpoints,
+        journal,
+        undefined,
+        () => mode,
+      );
+      const original = await vault.read("notes/a.md");
+      const proposal = batch(`batch-final-${tightenedMode}`, [{
+        operation: "append",
+        path: "notes/a.md",
+        expectedVersion: original.modifiedVersion,
+        content: "must not auto-apply\n",
+      }]);
+      const execution = coordinator.execute(toolCall(`call-final-${tightenedMode}`, proposal));
+      await finalReadStarted;
+      mode = tightenedMode;
+      releaseFinalRead();
+      if (tightenedMode === "ask_every_time") {
+        await new Promise((resolve) => setImmediate(resolve));
+        await coordinator.waitUntilPending(`call-final-${tightenedMode}`);
+        assert.equal(await settledWithin(execution, 25), "still-pending");
+        assert.equal((await coordinator.decide(`call-final-${tightenedMode}`, "reject")).ok, true);
+      } else {
+        const result = await execution;
+        assert.equal(result.ok, false);
+        assert.equal(result.error.code, "permission_denied");
+      }
+      assert.equal(await readFile(path.join(root, "notes", "a.md"), "utf8"), "alpha\n");
+    });
+  }
+
+  await t.test("policy never authorizes external paths or unsupported operations", async (t) => {
+    const { coordinator } = await fixture(
+      t,
+      new MemoryJournal(),
+      undefined,
+      () => "trusted_vault",
+    );
+    const external = await coordinator.execute(toolCall("call-policy-external", batch("batch-policy-external", [{
+      operation: "create",
+      path: "../outside.md",
+      expectedVersion: "missing",
+      content: "forbidden\n",
+    }])));
+    assert.equal(external.ok, false);
+    assert.ok(["invalid_change", "invalid_path"].includes(external.error.code));
+    const unsupported = await coordinator.execute(toolCall("call-policy-delete", batch("batch-policy-delete", [{
+      operation: "delete",
+      path: "notes/a.md",
+      expectedVersion: "anything",
+    }])));
+    assert.equal(unsupported.ok, false);
+    assert.equal(unsupported.error.code, "invalid_change");
+    const permissionStore = await coordinator.execute(toolCall(
+      "call-policy-settings",
+      batch("batch-policy-settings", [{
+        operation: "create",
+        path: ".obsidian/plugins/offeragent/data.json",
+        expectedVersion: "missing",
+        content: '{"vaultPermissionMode":"trusted_vault"}',
+      }]),
+    ));
+    assert.equal(permissionStore.ok, false);
+    assert.ok(["invalid_change", "invalid_path"].includes(permissionStore.error.code));
+  });
+});
 
 test("an approved batch applies atomically through the Vault and undo restores its checkpoint", async (t) => {
   const { coordinator, root, vault } = await fixture(t);

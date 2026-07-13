@@ -118,6 +118,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
 
   let activeView;
   let plugin;
+  let persistedPluginData;
 
   class FileSystemAdapter {
     constructor(basePath) {
@@ -142,6 +143,8 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
       this.manifest = manifest;
       this.commands = new Map();
       this.ribbonActions = [];
+      this.savedData = persistedPluginData;
+      this.settingTabs = [];
       this.views = new Map();
     }
 
@@ -155,6 +158,64 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
 
     addCommand(command) {
       this.commands.set(command.id, command);
+    }
+
+    addSettingTab(settingTab) {
+      this.settingTabs.push(settingTab);
+    }
+
+    async loadData() {
+      return persistedPluginData;
+    }
+
+    async saveData(data) {
+      persistedPluginData = structuredClone(data);
+      this.savedData = persistedPluginData;
+    }
+  }
+
+  class PluginSettingTab {
+    constructor(app, owner) {
+      this.app = app;
+      this.plugin = owner;
+      this.containerEl = new StubElement();
+    }
+  }
+
+  class Setting {
+    constructor(container) {
+      this.settingEl = container.createDiv({ cls: "setting-item" });
+    }
+
+    setName(name) {
+      this.settingEl.createDiv({ cls: "setting-item-name", text: name });
+      return this;
+    }
+
+    setDesc(description) {
+      this.settingEl.createDiv({ cls: "setting-item-description", text: description });
+      return this;
+    }
+
+    addDropdown(configure) {
+      const selectEl = this.settingEl.createEl("select", { cls: "dropdown" });
+      const dropdown = {
+        addOption(value, label) {
+          const option = selectEl.createEl("option", { text: label });
+          option.value = value;
+          return dropdown;
+        },
+        onChange(listener) {
+          selectEl.addEventListener("change", () => listener(selectEl.value));
+          return dropdown;
+        },
+        setValue(value) {
+          selectEl.value = value;
+          return dropdown;
+        },
+      };
+      configure(dropdown);
+      return this;
     }
   }
 
@@ -189,6 +250,8 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     Notice,
     Platform: { isDesktopApp: true },
     Plugin,
+    PluginSettingTab,
+    Setting,
   };
 
   const require = createRequire(import.meta.url);
@@ -275,6 +338,10 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   assert.ok(plugin.views.has("offeragent-sidebar"));
   assert.ok(plugin.commands.has("open-offeragent-sidebar"));
   assert.equal(plugin.ribbonActions.length, 1);
+  assert.equal(plugin.settingTabs.length, 1);
+  plugin.settingTabs[0].display();
+  const permissionSelect = plugin.settingTabs[0].containerEl.findByClass("dropdown");
+  assert.equal(permissionSelect.value, "trusted_vault");
 
   plugin.commands.get("open-offeragent-sidebar").callback();
   await waitUntil(() => activeView, "OfferAgent did not open its sidebar");
@@ -378,15 +445,63 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
       },
     ],
   };
+  const autoProposal = {
+    ...proposal,
+    batchId: "smoke-batch-auto",
+    idempotencyKey: "smoke-batch-auto-key",
+    task: "Auto-apply one trusted smoke-test line",
+    actions: [{
+      ...proposal.actions[0],
+      actionId: "smoke-action-auto",
+      idempotencyKey: "smoke-action-auto-key",
+      operation: "create",
+      path: "notes/auto-applied.md",
+      expectedVersion: "missing",
+      content: "auto applied\n",
+    }],
+  };
+  const autoComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
+  const autoInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  autoInput.value = `vault_propose_changes ${JSON.stringify(autoProposal)}`;
+  autoComposer.dispatch("submit");
+  await waitUntil(
+    () =>
+      activeView.contentEl
+        .findAllByClass("offeragent-sidebar__change-batch")
+        .find(
+          (card) =>
+            card.dataset.status === "applied" &&
+            card.children[0]?.text.includes("Auto-apply one trusted smoke-test line"),
+        ),
+    "Trusted Vault did not auto-apply the normal batch",
+  );
+  assert.equal(
+    await readFile(path.join(temporaryVault, "notes", "auto-applied.md"), "utf8"),
+    "auto applied\n",
+  );
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
+    "Trusted Vault Agent Run did not finish after auto-apply",
+  );
+  permissionSelect.value = "ask_every_time";
+  permissionSelect.dispatch("change");
+  await waitUntil(
+    () => plugin.savedData?.vaultPermissionMode === "ask_every_time",
+    "OfferAgent did not persist Ask Every Time for this Vault",
+  );
   const changeComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const changeInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
   changeInput.value = `vault_propose_changes ${JSON.stringify(proposal)}`;
   changeComposer.dispatch("submit");
   const pendingBatch = await waitUntil(
-    () => {
-      const card = activeView.contentEl.findByClass("offeragent-sidebar__change-batch");
-      return card?.dataset.status === "pending" ? card : undefined;
-    },
+    () =>
+      activeView.contentEl
+        .findAllByClass("offeragent-sidebar__change-batch")
+        .find(
+          (card) =>
+            card.dataset.status === "pending" &&
+            card.children[0]?.text.includes("Append one smoke-test line"),
+        ),
     "OfferAgent did not render the pending whole-batch confirmation card",
   );
   assert.match(pendingBatch.children[0].text, /Append one smoke-test line/);
@@ -396,10 +511,14 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   assert.equal(rejectAll.text, "Reject all");
   rejectAll.dispatch("click");
   const rejectedBatch = await waitUntil(
-    () => {
-      const card = activeView.contentEl.findByClass("offeragent-sidebar__change-batch");
-      return card?.dataset.status === "rejected" ? card : undefined;
-    },
+    () =>
+      activeView.contentEl
+        .findAllByClass("offeragent-sidebar__change-batch")
+        .find(
+          (card) =>
+            card.dataset.status === "rejected" &&
+            card.children[0]?.text.includes("Append one smoke-test line"),
+        ),
     "OfferAgent did not reject the whole batch and continue the Agent Run",
   );
   assert.equal(rejectedBatch.dataset.status, "rejected");
@@ -410,7 +529,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   await waitUntil(
     () => {
       const statuses = activeView.contentEl.findAllByClass("offeragent-sidebar__run-status");
-      return statuses.length === 4 &&
+      return statuses.length === 5 &&
         statuses.every((status) => status.dataset.status === "completed");
     },
     "OfferAgent did not continue the rejected batch Agent Run",
@@ -473,16 +592,98 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   await waitUntil(
     () => {
       const statuses = activeView.contentEl.findAllByClass("offeragent-sidebar__run-status");
-      return statuses.length === 5 &&
+      return statuses.length === 6 &&
         statuses.every((status) => status.dataset.status === "completed");
     },
     "OfferAgent did not continue the applied batch Agent Run",
   );
+  permissionSelect.value = "read_only";
+  permissionSelect.dispatch("change");
+  await waitUntil(
+    () => plugin.savedData?.vaultPermissionMode === "read_only",
+    "OfferAgent did not persist Read Only for this Vault",
+  );
+  const deniedProposal = {
+    ...appliedProposal,
+    batchId: "smoke-batch-read-only",
+    idempotencyKey: "smoke-batch-read-only-key",
+    task: "Reject one read-only smoke-test line",
+    actions: [{
+      ...appliedProposal.actions[0],
+      actionId: "smoke-action-read-only",
+      idempotencyKey: "smoke-action-read-only-key",
+      path: "notes/read-only.md",
+    }],
+  };
+  const deniedComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
+  const deniedInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  deniedInput.value = `vault_propose_changes ${JSON.stringify(deniedProposal)}`;
+  deniedComposer.dispatch("submit");
+  await waitUntil(
+    () =>
+      activeView.contentEl
+        .findAllByClass("offeragent-sidebar__change-batch")
+        .find(
+          (card) =>
+            card.dataset.status === "failed" &&
+            card.children[0]?.text.includes("Reject one read-only smoke-test line"),
+        ),
+    "Read Only did not visibly reject the mutation",
+  );
+  const deniedPolicy = activeView.contentEl.findByClass("offeragent-sidebar__change-policy-decision");
+  assert.match(deniedPolicy.text, /Read Only/i);
+  await assert.rejects(readFile(path.join(temporaryVault, "notes", "read-only.md"), "utf8"));
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
+    "Read Only Agent Run did not finish after policy rejection",
+  );
+  const readActivityCount = activeView.contentEl
+    .findAllByClass("offeragent-sidebar__tool-activity")
+    .filter((activity) => activity.children[0]?.text.includes("vault_read")).length;
+  const readOnlyComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
+  const readOnlyInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  readOnlyInput.value = "vault_read notes/example.md 1-2";
+  readOnlyComposer.dispatch("submit");
+  await waitUntil(
+    () =>
+      activeView.contentEl
+        .findAllByClass("offeragent-sidebar__tool-activity")
+        .filter(
+          (activity) =>
+            activity.dataset.status === "completed" &&
+            activity.children[0]?.text.includes("vault_read"),
+        ).length === readActivityCount + 1,
+    "Read Only blocked a permitted Vault read",
+  );
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
+    "Read Only Vault read Agent Run did not finish",
+  );
   await plugin.onunload();
   plugin = new OfferAgentPlugin(app, manifest);
   await plugin.onload();
+  plugin.settingTabs[0].display();
+  assert.equal(
+    plugin.settingTabs[0].containerEl.findByClass("dropdown").value,
+    "read_only",
+  );
   plugin.commands.get("open-offeragent-sidebar").callback();
-  await waitUntil(
+  const rehydratedDeniedBatch = await waitUntil(
+    () =>
+      activeView?.contentEl
+        .findAllByClass("offeragent-sidebar__change-batch")
+        .find(
+          (card) =>
+            card.dataset.status === "failed" &&
+            card.children[0]?.text.includes("Reject one read-only smoke-test line"),
+        ),
+    "OfferAgent did not preserve the rejected Read Only decision after restart",
+  );
+  assert.match(
+    rehydratedDeniedBatch.findByClass("offeragent-sidebar__change-policy-decision").text,
+    /Read Only/i,
+  );
+  const rehydratedAppliedBatch = await waitUntil(
     () =>
       activeView?.contentEl
         .findAllByClass("offeragent-sidebar__change-batch")
@@ -493,7 +694,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
         ),
     "OfferAgent did not rehydrate the applied batch after plugin restart",
   );
-  activeView.contentEl.findByClass("offeragent-sidebar__change-undo").dispatch("click");
+  rehydratedAppliedBatch.findByClass("offeragent-sidebar__change-undo").dispatch("click");
   await waitUntil(
     () =>
       activeView.contentEl

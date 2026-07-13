@@ -24,10 +24,12 @@ const MAX_ID_LENGTH = 128;
 const MAX_PATH_LENGTH = 512;
 const MAX_TASK_BYTES = 512;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-const BLOCKED_SEGMENTS = new Set([".git", ".obsidian", "node_modules"]);
+const BLOCKED_SEGMENTS = new Set([".git", "node_modules"]);
 
 type ChangeToolCall = Extract<AgentRunEvent, { type: "tool_call.requested" }>;
 type Failure = Extract<LocalToolResultPayload, { ok: false }>;
+
+export type VaultPermissionMode = "ask_every_time" | "read_only" | "trusted_vault";
 
 export interface VaultChangeFileApi {
   canonicalize(vaultPath: string, exists: boolean): Promise<{ root: string; target: string }>;
@@ -66,6 +68,7 @@ interface PreparedAction {
   afterHash: string;
   beforeContent?: string;
   beforeHash: string;
+  controlFile: boolean;
 }
 
 interface PreparedBatch {
@@ -78,6 +81,11 @@ interface PendingBatch {
   prepared: PreparedBatch;
   promise: Promise<LocalToolResultPayload>;
   resolve(result: LocalToolResultPayload): void;
+}
+
+interface ConfirmationRequired {
+  confirmationRequired: true;
+  prepared: PreparedBatch;
 }
 
 type AppliedBatch = VaultChangeJournalRecord;
@@ -137,6 +145,12 @@ function isFailure(value: PreparedBatch | Failure): value is Failure {
   return "ok" in value && value.ok === false;
 }
 
+function requiresConfirmation(
+  value: LocalToolResultPayload | ConfirmationRequired,
+): value is ConfirmationRequired {
+  return "confirmationRequired" in value;
+}
+
 function isContained(root: string, target: string): boolean {
   const relative = path.relative(root, target);
   return (
@@ -171,7 +185,25 @@ function safeVaultPath(value: unknown): string | undefined {
     return undefined;
   }
   const extension = path.posix.extname(candidate).toLowerCase();
-  return extension === ".md" || extension === ".txt" ? segments.join("/") : undefined;
+  const normalized = segments.join("/");
+  if (isControlVaultPath(normalized) && normalized.toLowerCase().startsWith(".obsidian/")) {
+    if (isProtectedPermissionPath(normalized)) return undefined;
+    return [".css", ".json", ".md", ".txt"].includes(extension) ? normalized : undefined;
+  }
+  return extension === ".md" || extension === ".txt" ? normalized : undefined;
+}
+
+function isProtectedPermissionPath(vaultPath: string): boolean {
+  return vaultPath.toLowerCase().startsWith(".obsidian/plugins/offeragent/");
+}
+
+function isControlVaultPath(vaultPath: string): boolean {
+  const normalized = vaultPath.toLowerCase();
+  return (
+    normalized === "agent.md" ||
+    normalized.startsWith(".codex/") ||
+    normalized.startsWith(".obsidian/")
+  );
 }
 
 function validId(value: unknown): value is string {
@@ -306,10 +338,16 @@ export class GitCheckpointStore implements CheckpointStore {
 
 export class ObsidianVaultChangeFileApi implements VaultChangeFileApi {
   readonly #basePath: string;
-  readonly #vault: Pick<Vault, "cachedRead" | "create" | "delete" | "getFiles" | "modify">;
+  readonly #vault: Pick<
+    Vault,
+    "adapter" | "cachedRead" | "create" | "delete" | "getFiles" | "modify"
+  >;
 
   constructor(
-    vault: Pick<Vault, "cachedRead" | "create" | "delete" | "getFiles" | "modify">,
+    vault: Pick<
+      Vault,
+      "adapter" | "cachedRead" | "create" | "delete" | "getFiles" | "modify"
+    >,
     basePath: string,
   ) {
     this.#vault = vault;
@@ -318,10 +356,23 @@ export class ObsidianVaultChangeFileApi implements VaultChangeFileApi {
 
   async read(vaultPath: string): Promise<{ content: string; modifiedVersion: string } | undefined> {
     const file = this.#file(vaultPath);
-    if (!file) return undefined;
+    if (file) {
+      return {
+        content: await this.#vault.cachedRead(file),
+        modifiedVersion: `mtime:${file.stat.mtime}:size:${file.stat.size}`,
+      };
+    }
+    if (!isControlVaultPath(vaultPath) || !(await this.#vault.adapter.exists(vaultPath, true))) {
+      return undefined;
+    }
+    const [content, fileStat] = await Promise.all([
+      this.#vault.adapter.read(vaultPath),
+      this.#vault.adapter.stat(vaultPath),
+    ]);
+    if (!fileStat || fileStat.type !== "file") return undefined;
     return {
-      content: await this.#vault.cachedRead(file),
-      modifiedVersion: `mtime:${file.stat.mtime}:size:${file.stat.size}`,
+      content,
+      modifiedVersion: `mtime:${fileStat.mtime}:size:${fileStat.size}`,
     };
   }
 
@@ -337,19 +388,44 @@ export class ObsidianVaultChangeFileApi implements VaultChangeFileApi {
   }
 
   async create(vaultPath: string, content: string): Promise<void> {
+    if (isControlVaultPath(vaultPath) && !this.#file(vaultPath)) {
+      if (await this.#vault.adapter.exists(vaultPath, true)) {
+        throw new Error(`Vault file '${vaultPath}' already exists.`);
+      }
+      await this.#vault.adapter.write(vaultPath, content);
+      return;
+    }
     await this.#vault.create(vaultPath, content);
   }
 
   async modify(vaultPath: string, content: string): Promise<void> {
     const file = this.#file(vaultPath);
-    if (!file) throw new Error(`Vault file '${vaultPath}' disappeared before modification.`);
-    await this.#vault.modify(file, content);
+    if (file) {
+      await this.#vault.modify(file, content);
+      return;
+    }
+    if (
+      isControlVaultPath(vaultPath) &&
+      await this.#vault.adapter.exists(vaultPath, true)
+    ) {
+      await this.#vault.adapter.write(vaultPath, content);
+      return;
+    }
+    throw new Error(`Vault file '${vaultPath}' disappeared before modification.`);
   }
 
   async remove(vaultPath: string): Promise<void> {
     const file = this.#file(vaultPath);
-    if (!file) return;
-    await this.#vault.delete(file, true);
+    if (file) {
+      await this.#vault.delete(file, true);
+      return;
+    }
+    if (
+      isControlVaultPath(vaultPath) &&
+      await this.#vault.adapter.exists(vaultPath, true)
+    ) {
+      await this.#vault.adapter.remove(vaultPath);
+    }
   }
 
   #file(vaultPath: string): TFile | undefined {
@@ -359,10 +435,13 @@ export class ObsidianVaultChangeFileApi implements VaultChangeFileApi {
 
 export class VaultChangeCoordinator {
   readonly #applied = new Map<string, AppliedBatch>();
+  readonly #automaticResults = new Map<string, LocalToolResultPayload>();
+  readonly #authorizing = new Map<string, Promise<LocalToolResultPayload | undefined>>();
   readonly #cancelled = new Set<string>();
   readonly #checkpoints: CheckpointStore;
   readonly #injectCrash: (point: string) => Promise<void> | void;
   readonly #journal: VaultChangeJournal;
+  readonly #permissionMode: () => VaultPermissionMode;
   readonly #pending = new Map<string, PendingBatch>();
   readonly #preparing = new Map<string, Promise<Failure | PreparedBatch>>();
   readonly #vault: VaultChangeFileApi;
@@ -372,16 +451,21 @@ export class VaultChangeCoordinator {
     checkpoints: CheckpointStore,
     journal: VaultChangeJournal = NOOP_JOURNAL,
     injectCrash: (point: string) => Promise<void> | void = () => {},
+    permissionMode: () => VaultPermissionMode = () => "ask_every_time",
   ) {
     this.#vault = vault;
     this.#checkpoints = checkpoints;
     this.#journal = journal;
     this.#injectCrash = injectCrash;
+    this.#permissionMode = permissionMode;
   }
 
   async execute(event: ChangeToolCall): Promise<LocalToolResultPayload> {
     if (event.tool.name !== "vault_propose_changes") {
       return failure("invalid_change", "The Vault Change Coordinator received the wrong tool.");
+    }
+    if (this.#permissionMode() === "read_only") {
+      return this.#permissionDenied();
     }
     const preparation = this.#prepare(event.tool.arguments);
     this.#preparing.set(event.toolCallId, preparation);
@@ -394,11 +478,66 @@ export class VaultChangeCoordinator {
       this.#preparing.delete(event.toolCallId);
       return prepared;
     }
+    const permissionMode = this.#permissionMode();
+    if (permissionMode === "read_only") {
+      this.#preparing.delete(event.toolCallId);
+      return this.#permissionDenied();
+    }
+    if (
+      permissionMode === "trusted_vault" &&
+      prepared.actions.every(({ controlFile }) => !controlFile)
+    ) {
+      let finishAuthorization!: (result: LocalToolResultPayload | undefined) => void;
+      const authorization = new Promise<LocalToolResultPayload | undefined>((resolve) => {
+        finishAuthorization = resolve;
+      });
+      this.#authorizing.set(event.toolCallId, authorization);
+      try {
+        const result = await this.#apply(prepared, "automatic");
+        if (requiresConfirmation(result)) {
+          if (this.#cancelled.delete(event.toolCallId)) {
+            this.#preparing.delete(event.toolCallId);
+            finishAuthorization(undefined);
+            this.#authorizing.delete(event.toolCallId);
+            return failure(
+              "tool_error",
+              "The pending Vault Change Batch was cancelled with its Agent Run.",
+            );
+          }
+          const pending = this.#pendingDecision(event.toolCallId, result.prepared);
+          finishAuthorization(undefined);
+          this.#authorizing.delete(event.toolCallId);
+          return pending;
+        }
+        this.#cancelled.delete(event.toolCallId);
+        this.#preparing.delete(event.toolCallId);
+        this.#rememberAutomaticResult(event.toolCallId, result);
+        finishAuthorization(result);
+        this.#authorizing.delete(event.toolCallId);
+        return result;
+      } catch (error) {
+        this.#cancelled.delete(event.toolCallId);
+        this.#preparing.delete(event.toolCallId);
+        const result = failure(
+          "tool_error",
+          error instanceof Error ? error.message : "The Vault Change Batch could not be applied.",
+        );
+        this.#rememberAutomaticResult(event.toolCallId, result);
+        finishAuthorization(result);
+        this.#authorizing.delete(event.toolCallId);
+        if (error instanceof VaultChangeCrashInjectionError) throw error;
+        return result;
+      }
+    }
+    return this.#pendingDecision(event.toolCallId, prepared);
+  }
+
+  #pendingDecision(toolCallId: string, prepared: PreparedBatch): Promise<LocalToolResultPayload> {
     let resolve!: (result: LocalToolResultPayload) => void;
     const promise = new Promise<LocalToolResultPayload>((resolveResult) => {
       resolve = resolveResult;
     });
-    this.#pending.set(event.toolCallId, { prepared, promise, resolve });
+    this.#pending.set(toolCallId, { prepared, promise, resolve });
     return promise;
   }
 
@@ -421,6 +560,7 @@ export class VaultChangeCoordinator {
     const prepared = await preparation;
     if (isFailure(prepared)) throw new Error(prepared.error.message);
     await Promise.resolve();
+    await this.#authorizing.get(toolCallId);
     if (!this.#pending.has(toolCallId)) throw new Error(`Vault Change '${toolCallId}' is not pending.`);
     return prepared.proposal;
   }
@@ -429,15 +569,51 @@ export class VaultChangeCoordinator {
     toolCallId: string,
     decision: "apply" | "reject",
   ): Promise<LocalToolResultPayload> {
+    const completedAutomaticResult = this.#automaticResults.get(toolCallId);
+    if (completedAutomaticResult) return completedAutomaticResult;
     const preparation = this.#preparing.get(toolCallId);
     if (!preparation) return failure("not_found", `Vault Change '${toolCallId}' is not pending.`);
     await preparation;
+    await Promise.resolve();
+    const automaticResult = await this.#authorizing.get(toolCallId);
+    if (automaticResult) return automaticResult;
     const pending = this.#pending.get(toolCallId);
     if (!pending) return failure("not_found", `Vault Change '${toolCallId}' is not pending.`);
     if (!pending.decision) {
-      pending.decision = this.#finishDecision(toolCallId, pending, decision);
+      pending.decision =
+        decision === "apply" && this.#permissionMode() === "read_only"
+          ? this.#finishPermissionDenial(toolCallId, pending)
+          : this.#finishDecision(toolCallId, pending, decision);
     }
     return pending.decision;
+  }
+
+  #rememberAutomaticResult(toolCallId: string, result: LocalToolResultPayload): void {
+    this.#automaticResults.delete(toolCallId);
+    this.#automaticResults.set(toolCallId, result);
+    while (this.#automaticResults.size > 100) {
+      const oldest = this.#automaticResults.keys().next().value as string | undefined;
+      if (oldest === undefined) return;
+      this.#automaticResults.delete(oldest);
+    }
+  }
+
+  #permissionDenied(): Failure {
+    return failure(
+      "permission_denied",
+      "Vault mutation was rejected because this Vault is in Read Only mode.",
+    );
+  }
+
+  async #finishPermissionDenial(
+    toolCallId: string,
+    pending: PendingBatch,
+  ): Promise<LocalToolResultPayload> {
+    const result = this.#permissionDenied();
+    pending.resolve(result);
+    this.#pending.delete(toolCallId);
+    this.#preparing.delete(toolCallId);
+    return result;
   }
 
   async undo(batchId: string): Promise<VaultUndoResultPayload> {
@@ -585,7 +761,7 @@ export class VaultChangeCoordinator {
     pending: PendingBatch,
     decision: "apply" | "reject",
   ): Promise<LocalToolResultPayload> {
-    let result: LocalToolResultPayload;
+    let result: LocalToolResultPayload | ConfirmationRequired;
     try {
       result =
         decision === "reject"
@@ -593,7 +769,10 @@ export class VaultChangeCoordinator {
               ok: true,
               value: this.#result(pending.prepared, "rejected"),
             }
-          : await this.#apply(pending.prepared);
+          : await this.#apply(pending.prepared, "confirmed");
+      if (requiresConfirmation(result)) {
+        result = failure("tool_error", "A confirmed Vault Change unexpectedly lost authorization.");
+      }
     } catch (error) {
       if (error instanceof VaultChangeCrashInjectionError) throw error;
       result = failure(
@@ -607,9 +786,21 @@ export class VaultChangeCoordinator {
     return result;
   }
 
-  async #apply(original: PreparedBatch): Promise<LocalToolResultPayload> {
+  async #apply(
+    original: PreparedBatch,
+    authorization: "automatic" | "confirmed",
+  ): Promise<LocalToolResultPayload | ConfirmationRequired> {
     const currentPreparation = await this.#prepare(original.proposal);
     if (isFailure(currentPreparation)) return currentPreparation;
+    const permissionMode = this.#permissionMode();
+    if (permissionMode === "read_only") return this.#permissionDenied();
+    if (
+      authorization === "automatic" &&
+      (permissionMode !== "trusted_vault" ||
+        currentPreparation.actions.some(({ controlFile }) => controlFile))
+    ) {
+      return { confirmationRequired: true, prepared: currentPreparation };
+    }
     const existingPaths = currentPreparation.actions
       .filter((prepared) => prepared.beforeContent !== undefined)
       .map((prepared) => prepared.action.path);
@@ -888,11 +1079,20 @@ export class VaultChangeCoordinator {
       actionIds.add(action.actionId);
       idempotencyKeys.add(action.idempotencyKey);
       const current = await this.#vault.read(vaultPath);
+      let controlFile = isControlVaultPath(vaultPath);
       try {
         const canonical = await this.#vault.canonicalize(vaultPath, current !== undefined);
         if (!isContained(canonical.root, canonical.target)) {
           return failure("invalid_path", `Vault path '${vaultPath}' resolves outside the Vault.`);
         }
+        const canonicalVaultPath = path
+          .relative(canonical.root, canonical.target)
+          .split(path.sep)
+          .join("/");
+        if (isProtectedPermissionPath(canonicalVaultPath)) {
+          return failure("invalid_path", `Vault path '${vaultPath}' resolves to protected settings.`);
+        }
+        controlFile ||= isControlVaultPath(canonicalVaultPath);
       } catch {
         return failure("invalid_path", `Vault path '${vaultPath}' could not be resolved safely.`);
       }
@@ -938,6 +1138,7 @@ export class VaultChangeCoordinator {
         action: { ...action, path: vaultPath } as VaultAction,
         beforeContent: current?.content,
         beforeHash: current ? digest(current.content) : "missing",
+        controlFile,
         afterContent,
         afterHash: digest(afterContent),
       });

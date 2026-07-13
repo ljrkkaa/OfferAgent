@@ -208,7 +208,7 @@ function isLocalToolResultPayload(value: unknown): value is LocalToolResultPaylo
   if (result.ok === false) {
     return Boolean(
       result.error &&
-      ["invalid_change", "invalid_path", "malformed_control_file", "not_found", "plugin_disconnected", "request_too_large", "stale_evidence", "tool_error", "undo_conflict"].includes(
+      ["invalid_change", "invalid_path", "malformed_control_file", "not_found", "permission_denied", "plugin_disconnected", "request_too_large", "stale_evidence", "tool_error", "undo_conflict"].includes(
         result.error.code as string,
       ) &&
       typeof result.error.message === "string" &&

@@ -1,10 +1,13 @@
 import path from "node:path";
 import {
+  type App,
   FileSystemAdapter,
   ItemView,
   Notice,
   Platform,
   Plugin,
+  PluginSettingTab,
+  Setting,
   type WorkspaceLeaf,
 } from "obsidian";
 import {
@@ -17,9 +20,47 @@ import {
   GitCheckpointStore,
   ObsidianVaultChangeFileApi,
   VaultChangeCoordinator,
+  type VaultPermissionMode,
 } from "./vault-change-coordinator";
 
 const SIDEBAR_VIEW_TYPE = "offeragent-sidebar";
+const DEFAULT_SETTINGS: OfferAgentPluginSettings = { vaultPermissionMode: "trusted_vault" };
+
+interface OfferAgentPluginSettings {
+  vaultPermissionMode: VaultPermissionMode;
+}
+
+function permissionMode(value: unknown): VaultPermissionMode {
+  return value === "ask_every_time" || value === "read_only" || value === "trusted_vault"
+    ? value
+    : DEFAULT_SETTINGS.vaultPermissionMode;
+}
+
+class OfferAgentSettingTab extends PluginSettingTab {
+  readonly #owner: OfferAgentPlugin;
+
+  constructor(app: App, owner: OfferAgentPlugin) {
+    super(app, owner);
+    this.#owner = owner;
+  }
+
+  display(): void {
+    this.containerEl.empty();
+    new Setting(this.containerEl)
+      .setName("Vault Permission Mode")
+      .setDesc("Controls Agent-requested writes for this Vault. Control files always require confirmation.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("trusted_vault", "Trusted Vault")
+          .addOption("ask_every_time", "Ask Every Time")
+          .addOption("read_only", "Read Only")
+          .setValue(this.#owner.getVaultPermissionMode())
+          .onChange(async (value) => {
+            await this.#owner.setVaultPermissionMode(permissionMode(value));
+          }),
+      );
+  }
+}
 
 class OfferAgentSidebarView extends ItemView {
   readonly #controller: SidebarController;
@@ -158,6 +199,12 @@ class OfferAgentSidebarView extends ItemView {
         cls: "offeragent-sidebar__change-batch-status",
         text: `Vault Change Batch: ${batch.status}`,
       });
+      if (batch.message) {
+        card.createDiv({
+          cls: "offeragent-sidebar__change-policy-decision",
+          text: batch.message,
+        });
+      }
       const actions = card.createEl("ul", { cls: "offeragent-sidebar__change-actions" });
       for (const action of batch.actions) {
         actions.createEl("li", { text: `${action.operation}: ${action.path}` });
@@ -259,11 +306,17 @@ class OfferAgentSidebarView extends ItemView {
 
 export default class OfferAgentPlugin extends Plugin {
   #controller?: SidebarController;
+  #settings: OfferAgentPluginSettings = { ...DEFAULT_SETTINGS };
 
   async onload(): Promise<void> {
     if (!Platform.isDesktopApp) {
       throw new Error("OfferAgent requires the desktop version of Obsidian.");
     }
+    const stored = (await this.loadData()) as Partial<OfferAgentPluginSettings> | null;
+    this.#settings = {
+      vaultPermissionMode: permissionMode(stored?.vaultPermissionMode),
+    };
+    this.addSettingTab(new OfferAgentSettingTab(this.app, this));
 
     const runtimePath = this.#runtimePath();
     const vaultRoot = this.#vaultRoot();
@@ -278,6 +331,8 @@ export default class OfferAgentPlugin extends Plugin {
           runtime.markVaultChangeApplying(batchId, checkpointRef, targets),
         markState: (batchId, state) => runtime.markVaultChangeState(batchId, state),
       },
+      () => {},
+      () => this.#settings.vaultPermissionMode,
     );
     runtime = new RuntimeSupervisor({
       runtimePath,
@@ -319,6 +374,15 @@ export default class OfferAgentPlugin extends Plugin {
   async onunload(): Promise<void> {
     await this.#controller?.stop();
     this.app.workspace.detachLeavesOfType(SIDEBAR_VIEW_TYPE);
+  }
+
+  getVaultPermissionMode(): VaultPermissionMode {
+    return this.#settings.vaultPermissionMode;
+  }
+
+  async setVaultPermissionMode(vaultPermissionMode: VaultPermissionMode): Promise<void> {
+    this.#settings = { vaultPermissionMode };
+    await this.saveData(this.#settings);
   }
 
   async #openSidebar(): Promise<void> {

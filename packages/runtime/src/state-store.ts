@@ -14,6 +14,7 @@ import {
   type VaultChangeJournalRecord,
   type VaultChangeTargetResult,
   type VaultChangeTransactionState,
+  type VaultToolErrorCode,
 } from "@offeragent/protocol";
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.js";
 
@@ -978,7 +979,8 @@ export class RuntimeStateStore {
     const toolCallRows =
       this.#database.exec(
         `SELECT tool_calls.id, tool_calls.agent_run_id, tool_calls.name,
-                tool_calls.arguments_json, tool_calls.status, vault_change_batches.state
+                tool_calls.arguments_json, tool_calls.status, vault_change_batches.state,
+                tool_calls.error_code, tool_calls.error_message
          FROM tool_calls
          LEFT JOIN vault_change_batches ON vault_change_batches.tool_call_id = tool_calls.id
          WHERE tool_calls.conversation_id = ?
@@ -1003,12 +1005,24 @@ export class RuntimeStateStore {
         modelId: modelId as string,
         status: status as AgentRunStatus,
       })),
-      toolCalls: toolCallRows.map(([id, agentRunId, name, argumentsJson, status, batchState]) => ({
+      toolCalls: toolCallRows.map(([
+        id,
+        agentRunId,
+        name,
+        argumentsJson,
+        status,
+        batchState,
+        errorCode,
+        errorMessage,
+      ]) => ({
         id: id as string,
         agentRunId: agentRunId as string,
         name: name as ToolCallRecord["name"],
         arguments: JSON.parse(argumentsJson as string) as unknown,
         status: status as ToolCallRecord["status"],
+        ...(errorCode && errorMessage
+          ? { error: { code: errorCode as VaultToolErrorCode, message: errorMessage as string } }
+          : {}),
         ...(batchState === "applied" || batchState === "rejected"
           ? { decision: batchState }
           : {}),

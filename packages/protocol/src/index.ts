@@ -62,6 +62,7 @@ export type VaultToolErrorCode =
   | "invalid_change"
   | "malformed_control_file"
   | "not_found"
+  | "permission_denied"
   | "plugin_disconnected"
   | "request_too_large"
   | "stale_evidence"
@@ -237,6 +238,7 @@ export interface ToolCallRecord {
   agentRunId: string;
   arguments: unknown;
   decision?: "applied" | "rejected";
+  error?: { code: VaultToolErrorCode; message: string };
   id: string;
   name: LocalToolName;
   status: "completed" | "failed" | "requested";
