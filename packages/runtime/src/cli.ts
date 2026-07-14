@@ -1302,9 +1302,11 @@ async function startRuntime({
           sequence += 1;
         }
         try {
-          let input: ModelConversationItem[] = checkpoint?.input ?? [
-            { type: "user_message", text: userInput },
-          ];
+          let input: ModelConversationItem[] = checkpoint?.input ??
+            await store.getConversationContext(
+              runCommand.conversationId,
+              runCommand.agentRunId,
+            );
           const requiredRereads = new Set(checkpoint?.requiredRereads ?? []);
           const canonicalReadPaths = new Map(checkpoint?.canonicalReadPaths ?? []);
           let agentContract: string | undefined;

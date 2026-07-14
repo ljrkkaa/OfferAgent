@@ -525,6 +525,34 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   assert.equal(responseRequest.tools.some((tool) => tool.type === "web_search"), false);
   assert.ok(responseRequest.tools.filter((tool) => tool.type === "function").every((tool) => tool.strict === false));
 
+  const followup = collectRunEvents(socket, "agent-run-codex-context");
+  socket.send(
+    JSON.stringify({
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "client-codex-context-event",
+      conversationId: "conversation-codex-1",
+      agentRunId: "agent-run-codex-context",
+      sequence: 0,
+      model: "gpt-5.4",
+      input: { role: "user", text: "Continue." },
+    }),
+  );
+  assert.equal((await followup).at(-1).output.text, "Interview answer");
+  const contextRequest = JSON.parse(upstreamRequests.at(-1).body);
+  assert.deepEqual(
+    contextRequest.input.map((item) => ({
+      role: item.role,
+      contentType: item.content?.[0]?.type,
+      text: item.content?.[0]?.text,
+    })),
+    [
+      { role: "user", contentType: "input_text", text: "Prepare me." },
+      { role: "assistant", contentType: "output_text", text: "Interview answer" },
+      { role: "user", contentType: "input_text", text: "Continue." },
+    ],
+  );
+
   assert.deepEqual(await getJson(
     handshake.port,
     token,

@@ -1,10 +1,22 @@
 import type { LocalToolName, ModelDescriptor } from "@offeragent/protocol";
 import {
   ModelProviderError,
+  type ModelConversationItem,
   type ModelProvider,
   type ModelRequest,
   type ModelStreamEvent,
 } from "./model-provider";
+
+function findLatest<T extends ModelConversationItem>(
+  input: ModelConversationItem[],
+  predicate: (item: ModelConversationItem) => item is T,
+): T | undefined {
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = input[index];
+    if (predicate(item)) return item;
+  }
+  return undefined;
+}
 
 const MODEL: ModelDescriptor = {
   id: "fake-interview-model",
@@ -30,7 +42,61 @@ export class FakeModelProvider implements ModelProvider {
         `The selected model '${request.model}' is not available.`,
       );
     }
-    const userInput = request.input.find((item) => item.type === "user_message")?.text ?? "";
+    const userInput = findLatest(
+      request.input,
+      (item): item is Extract<ModelConversationItem, { type: "user_message" }> =>
+        item.type === "user_message",
+    )?.text ?? "";
+    if (userInput.trim() === "conversation_context") {
+      yield {
+        type: "output_text.delta",
+        delta: JSON.stringify(
+          request.input.map((item) =>
+            item.type === "user_message" || item.type === "assistant_message"
+              ? {
+                  role: item.type === "user_message" ? "user" : "assistant",
+                  marker: item.text.slice(0, 1),
+                  length: item.text.length,
+                }
+              : { role: item.type },
+          ),
+        ),
+      };
+      return;
+    }
+    if (userInput.trim() === "context_tool_demo") {
+      const result = findLatest(
+        request.input,
+        (item): item is Extract<ModelConversationItem, { type: "local_tool_result" }> =>
+          item.type === "local_tool_result" && item.callId.startsWith("fake-context-read-"),
+      );
+      if (!result) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-context-read-${this.#toolCallSequence}`,
+          name: "vault_read",
+          arguments: { path: "notes/context.md", lineStart: 1, lineEnd: 1 },
+        };
+        return;
+      }
+      yield { type: "output_text.delta", delta: "Tool completed." };
+      return;
+    }
+    if (userInput.trim() === "可以的") {
+      const priorResponse = findLatest(
+        request.input,
+        (item): item is Extract<ModelConversationItem, { type: "assistant_message" }> =>
+          item.type === "assistant_message",
+      );
+      yield {
+        type: "output_text.delta",
+        delta: priorResponse
+          ? `OfferAgent confirmed: ${priorResponse.text}`
+          : "OfferAgent cannot confirm without prior context.",
+      };
+      return;
+    }
     if (userInput.trim() === "hosted_search_demo") {
       yield {
         type: "hosted_web_search_call",
@@ -50,8 +116,10 @@ export class FakeModelProvider implements ModelProvider {
       return;
     }
     if (userInput.trim() === "citation_then_tool") {
-      const toolResult = [...request.input].reverse().find(
-        (item) => item.type === "local_tool_result" && item.callId.startsWith("fake-citation-read-"),
+      const toolResult = findLatest(
+        request.input,
+        (item): item is Extract<ModelConversationItem, { type: "local_tool_result" }> =>
+          item.type === "local_tool_result" && item.callId.startsWith("fake-citation-read-"),
       );
       if (!toolResult) {
         this.#toolCallSequence += 1;
@@ -132,7 +200,11 @@ export class FakeModelProvider implements ModelProvider {
         return;
       }
     }
-    const toolResult = [...request.input].reverse().find((item) => item.type === "local_tool_result");
+    const toolResult = findLatest(
+      request.input,
+      (item): item is Extract<ModelConversationItem, { type: "local_tool_result" }> =>
+        item.type === "local_tool_result",
+    );
     if (!toolResult) {
       const toolRequest = fakeToolRequest(userInput);
       if (toolRequest) {

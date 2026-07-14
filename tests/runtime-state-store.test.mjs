@@ -484,6 +484,51 @@ test("concurrent first runs create their shared Conversation exactly once", asyn
   await store.close();
 });
 
+test("Conversation Context trims interleaved messages as complete Agent Run turns", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-context-turns-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const store = await RuntimeStateStore.open(path.join(temporaryDirectory, "state.db"));
+  const olderUser = "A".repeat(20_000);
+  const newerUser = "B".repeat(20_000);
+  const olderAssistant = "a".repeat(20_000);
+  const newerAssistant = "b".repeat(20_000);
+
+  await store.beginAgentRun("interleaved-context", "older-run", "model", olderUser);
+  await store.beginAgentRun("interleaved-context", "newer-run", "model", newerUser);
+  await store.completeAgentRun("newer-run", newerAssistant);
+  await store.completeAgentRun("older-run", olderAssistant);
+  await store.beginAgentRun("interleaved-context", "current-run", "model", "current");
+
+  assert.deepEqual(
+    await store.getConversationContext("interleaved-context", "current-run"),
+    [
+      { type: "user_message", text: newerUser },
+      { type: "assistant_message", text: newerAssistant },
+      { type: "user_message", text: "current" },
+    ],
+  );
+  await store.close();
+});
+
+test("Conversation Context remains bounded when completed messages are empty", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-context-empty-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const store = await RuntimeStateStore.open(
+    path.join(temporaryDirectory, "state.db"),
+    async () => {},
+  );
+  for (let index = 0; index < 1_000; index += 1) {
+    await store.beginAgentRun("empty-context", `empty-run-${index}`, "model", "");
+    await store.completeAgentRun(`empty-run-${index}`, "");
+  }
+  await store.beginAgentRun("empty-context", "empty-current", "model", "current");
+
+  const context = await store.getConversationContext("empty-context", "empty-current");
+  assert.ok(context.length < 2_001);
+  assert.deepEqual(context.at(-1), { type: "user_message", text: "current" });
+  await store.close();
+});
+
 test("a failed atomic file replacement restores the pre-transaction in-memory state", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-persist-failure-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));

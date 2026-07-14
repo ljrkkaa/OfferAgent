@@ -514,6 +514,12 @@ function encodeConversationItem(item: ModelConversationItem): Record<string, unk
       content: [{ type: "input_text", text: item.text }],
     };
   }
+  if (item.type === "assistant_message") {
+    return {
+      role: "assistant",
+      content: [{ type: "output_text", text: item.text }],
+    };
+  }
   if (item.type === "local_tool_call") {
     return {
       type: "function_call",

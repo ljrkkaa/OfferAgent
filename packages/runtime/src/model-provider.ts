@@ -11,6 +11,7 @@ export const MAX_LOCAL_TOOL_ARGUMENT_BYTES = 8_192;
 
 export type ModelConversationItem =
   | { type: "user_message"; text: string }
+  | { type: "assistant_message"; text: string }
   | { type: "local_tool_call"; callId: string; name: LocalToolName; arguments: unknown }
   | { type: "local_tool_result"; callId: string; result: LocalToolResultPayload };
 

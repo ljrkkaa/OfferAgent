@@ -21,6 +21,7 @@ import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.
 import type { ModelConversationItem } from "./model-provider";
 
 const CURRENT_SCHEMA_VERSION = 10;
+const MAX_CONVERSATION_CONTEXT_BYTES = 64 * 1_024;
 
 export interface RunCheckpoint {
   canonicalReadPaths: Array<[string, string]>;
@@ -608,6 +609,13 @@ function firstRow(database: Database, sql: string, parameters: unknown[] = []): 
 
 function valueAt(database: Database, sql: string, parameters: unknown[] = []): unknown {
   return firstRow(database, sql, parameters)?.[0];
+}
+
+function contextByteLength(items: ModelConversationItem[]): number {
+  return items.reduce(
+    (total, item) => total + Buffer.byteLength(JSON.stringify(item), "utf8"),
+    0,
+  );
 }
 
 export class RuntimeStateStore {
@@ -1635,6 +1643,58 @@ export class RuntimeStateStore {
         ...(batchState ? { vaultChangeState: batchState as VaultChangeTransactionState } : {}),
       })),
     };
+  }
+
+  async getConversationContext(
+    conversationId: string,
+    agentRunId: string,
+  ): Promise<ModelConversationItem[]> {
+    await this.#writeTail;
+    const rows =
+      this.#database.exec(
+        `SELECT messages.agent_run_id, messages.role, messages.text
+         FROM messages
+         JOIN agent_runs ON agent_runs.id = messages.agent_run_id
+         WHERE messages.conversation_id = ?
+           AND (agent_runs.status = 'completed' OR agent_runs.id = ?)
+         ORDER BY messages.sequence`,
+        [conversationId, agentRunId],
+      )[0]?.values ?? [];
+    const current: ModelConversationItem[] = [];
+    const completedTurns: ModelConversationItem[][] = [];
+    const turnsByRunId = new Map<string, ModelConversationItem[]>();
+    for (const [messageRunIdValue, role, textValue] of rows) {
+      const messageRunId = messageRunIdValue as string;
+      const item: ModelConversationItem = {
+        type: role === "assistant" ? "assistant_message" : "user_message",
+        text: textValue as string,
+      };
+      if (messageRunId === agentRunId) {
+        current.push(item);
+        continue;
+      }
+      let turn = turnsByRunId.get(messageRunId);
+      if (!turn) {
+        turn = [];
+        turnsByRunId.set(messageRunId, turn);
+        completedTurns.push(turn);
+      }
+      turn.push(item);
+    }
+
+    let remainingBytes = Math.max(
+      0,
+      MAX_CONVERSATION_CONTEXT_BYTES - contextByteLength(current),
+    );
+    const retainedTurns: ModelConversationItem[][] = [];
+    for (let index = completedTurns.length - 1; index >= 0; index -= 1) {
+      const turn = completedTurns[index];
+      const turnBytes = contextByteLength(turn);
+      if (turnBytes > remainingBytes) break;
+      retainedTurns.unshift(turn);
+      remainingBytes -= turnBytes;
+    }
+    return [...retainedTurns.flat(), ...current];
   }
 
   async listConversations(): Promise<ConversationSummary[]> {
