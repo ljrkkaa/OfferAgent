@@ -119,6 +119,7 @@ const DEFAULT_ENVIRONMENT: SidebarEnvironment = {
 const TOOL_ACTIONS: Record<ToolCallRecord["name"], string> = {
   agent_contract_read: "Read contract",
   daily_note_context: "Resolve Daily Note",
+  interview_catalog: "Search interview catalog",
   planning_memory_list: "Scan Planning Memory",
   planning_memory_read: "Recall Planning Memory",
   hosted_web_search_probe: "Probe web search",

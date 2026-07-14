@@ -43,7 +43,12 @@ const MODEL: ModelDescriptor = {
 
 export class FakeModelProvider implements ModelProvider {
   readonly backendId = "fake";
+  readonly #scenario?: "text-interview-ingestion";
   #toolCallSequence = 0;
+
+  constructor(options: { scenario?: "text-interview-ingestion" } = {}) {
+    this.#scenario = options.scenario;
+  }
 
   async listModels(): Promise<ModelDescriptor[]> {
     return [MODEL];
@@ -116,6 +121,209 @@ export class FakeModelProvider implements ModelProvider {
         selected = [];
       }
       yield { type: "output_text.delta", delta: JSON.stringify(selected) };
+      return;
+    }
+    if (this.#scenario === "text-interview-ingestion") {
+      const catalog = toolResultFor(request.input, "interview_catalog");
+      if (!catalog) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-interview-catalog-${this.#toolCallSequence}`,
+          name: "interview_catalog",
+          arguments: {
+            query: "后端工程师 Node.js 事件循环 消息处理幂等",
+            limit: 10,
+          },
+        };
+        return;
+      }
+      if (!catalog.result.ok || catalog.result.value.type !== "interview_catalog") {
+        yield {
+          type: "output_text.delta",
+          delta: catalog.result.ok
+            ? "The Interview Catalog returned an invalid result."
+            : `Interview Catalog failed: ${catalog.result.error.message}`,
+        };
+        return;
+      }
+      const candidatePaths = [
+        catalog.result.value.experienceCandidates[0]?.path,
+        catalog.result.value.questionCandidates[0]?.path,
+      ].filter((candidate): candidate is string => typeof candidate === "string");
+      for (const candidatePath of candidatePaths) {
+        const candidateRead = toolResultFor(
+          request.input,
+          "vault_read",
+          (call) => (call.arguments as { path?: unknown }).path === candidatePath,
+        );
+        if (!candidateRead) {
+          this.#toolCallSequence += 1;
+          yield {
+            type: "local_tool_call",
+            callId: `fake-interview-candidate-${this.#toolCallSequence}`,
+            name: "vault_read",
+            arguments: { path: candidatePath },
+          };
+          return;
+        }
+        if (!candidateRead.result.ok || candidateRead.result.value.type !== "vault_read") {
+          yield {
+            type: "output_text.delta",
+            delta: candidateRead.result.ok
+              ? "Candidate evidence returned an invalid result."
+              : `Candidate evidence failed: ${candidateRead.result.error.message}`,
+          };
+          return;
+        }
+      }
+      const experienceIndexDescriptor = catalog.result.value.indexes.find(
+        ({ kind }) => kind === "experience",
+      );
+      const questionIndexDescriptor = catalog.result.value.indexes.find(
+        ({ kind }) => kind === "question",
+      );
+      if (!experienceIndexDescriptor || !questionIndexDescriptor) {
+        yield { type: "output_text.delta", delta: "The Interview Catalog omitted an index." };
+        return;
+      }
+      const applied = toolResultFor(request.input, "vault_propose_changes");
+      const experienceIndex = experienceIndexDescriptor.exists || applied
+        ? toolResultFor(
+            request.input,
+            "vault_read",
+            (call) => (call.arguments as { path?: unknown }).path === "experiences/index.md",
+          )
+        : undefined;
+      if ((experienceIndexDescriptor.exists || applied) && !experienceIndex) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-experience-index-${this.#toolCallSequence}`,
+          name: "vault_read",
+          arguments: { path: "experiences/index.md" },
+        };
+        return;
+      }
+      const questionIndex = questionIndexDescriptor.exists || applied
+        ? toolResultFor(
+            request.input,
+            "vault_read",
+            (call) => (call.arguments as { path?: unknown }).path === "interview/index.md",
+          )
+        : undefined;
+      if ((questionIndexDescriptor.exists || applied) && !questionIndex) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-question-index-${this.#toolCallSequence}`,
+          name: "vault_read",
+          arguments: { path: "interview/index.md" },
+        };
+        return;
+      }
+      if (!applied) {
+        const experienceIndexValue = experienceIndex?.result.ok &&
+          experienceIndex.result.value.type === "vault_read"
+          ? experienceIndex.result.value
+          : undefined;
+        const questionIndexValue = questionIndex?.result.ok &&
+          questionIndex.result.value.type === "vault_read"
+          ? questionIndex.result.value
+          : undefined;
+        if (
+          (experienceIndexDescriptor.exists && !experienceIndexValue) ||
+          (questionIndexDescriptor.exists && !questionIndexValue)
+        ) {
+          yield { type: "output_text.delta", delta: "The interview indexes could not be read." };
+          return;
+        }
+        this.#toolCallSequence += 1;
+        const batchId = `text-interview-batch-${this.#toolCallSequence}`;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-interview-proposal-${this.#toolCallSequence}`,
+          name: "vault_propose_changes",
+          arguments: {
+            batchId,
+            idempotencyKey: batchId,
+            task: "Ingest one backend Interview Experience and its Interview Questions",
+            actions: [
+              {
+                actionId: "create-backend-experience",
+                idempotencyKey: "create-backend-experience",
+                operation: "create",
+                path: "experiences/backend-engineer-interview.md",
+                expectedVersion: "missing",
+                content: "---\ntitle: Backend engineer interview\ntype: interview-experience\nsource-type: user-text\nposition: Backend Engineer\n---\n\n# Backend engineer interview\n\n## Summary\n\nA backend candidate discussed Node.js scheduling and reliable message consumption.\n\n## Questions\n\n- [[interview/nodejs-event-loop]]\n- [[interview/message-processing-idempotency]]\n",
+              },
+              {
+                actionId: "create-event-loop-question",
+                idempotencyKey: "create-event-loop-question",
+                operation: "create",
+                path: "interview/nodejs-event-loop.md",
+                expectedVersion: "missing",
+                content: "---\ntitle: Explain the Node.js event loop\ntype: interview-question\nanswer-state: needs-research\nfrequency: 1\n---\n\n# Explain the Node.js event loop\n\nSeen in [[experiences/backend-engineer-interview]].\n",
+              },
+              {
+                actionId: "create-message-idempotency-question",
+                idempotencyKey: "create-message-idempotency-question",
+                operation: "create",
+                path: "interview/message-processing-idempotency.md",
+                expectedVersion: "missing",
+                content: "---\ntitle: Guarantee idempotent message processing\ntype: interview-question\nanswer-state: needs-research\nfrequency: 1\n---\n\n# Guarantee idempotent message processing\n\nSeen in [[experiences/backend-engineer-interview]].\n",
+              },
+              experienceIndexDescriptor.exists
+                ? {
+                    actionId: "update-experience-index",
+                    idempotencyKey: "update-experience-index",
+                    operation: "exact_replace",
+                    path: "experiences/index.md",
+                    expectedVersion: experienceIndexValue!.modifiedVersion,
+                    expectedContent: experienceIndexValue!.content,
+                    replacement: `${experienceIndexValue!.content}\n\n- [[backend-engineer-interview]]\n`,
+                  }
+                : {
+                    actionId: "create-experience-index",
+                    idempotencyKey: "create-experience-index",
+                    operation: "create",
+                    path: "experiences/index.md",
+                    expectedVersion: "missing",
+                    content: "# Interview Experiences\n\n- [[backend-engineer-interview]]\n",
+                  },
+              questionIndexDescriptor.exists
+                ? {
+                    actionId: "update-question-index",
+                    idempotencyKey: "update-question-index",
+                    operation: "exact_replace",
+                    path: "interview/index.md",
+                    expectedVersion: questionIndexValue!.modifiedVersion,
+                    expectedContent: questionIndexValue!.content,
+                    replacement: `${questionIndexValue!.content}\n\n- [[nodejs-event-loop]]\n- [[message-processing-idempotency]]\n`,
+                  }
+                : {
+                    actionId: "create-question-index",
+                    idempotencyKey: "create-question-index",
+                    operation: "create",
+                    path: "interview/index.md",
+                    expectedVersion: "missing",
+                    content: "# Interview Questions\n\n- [[nodejs-event-loop]]\n- [[message-processing-idempotency]]\n",
+                  },
+            ],
+          },
+        };
+        return;
+      }
+      if (applied.result.ok && applied.result.value.type === "vault_propose_changes") {
+        yield {
+          type: "output_text.delta",
+          delta: applied.result.value.decision === "applied"
+            ? `5 Vault changes applied with ${applied.result.value.checkpointRef}.`
+            : "The interview ingestion batch was rejected.",
+        };
+        return;
+      }
+      yield { type: "output_text.delta", delta: "The interview ingestion batch failed." };
       return;
     }
     if (userInput.trim() === "planning_memory_acceptance") {

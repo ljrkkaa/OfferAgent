@@ -598,6 +598,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   assert.match(responseRequest.instructions, /non-empty visible final response/i);
   assert.deepEqual(responseRequest.tools.filter((tool) => tool.type === "function").map((tool) => tool.name), [
     "daily_note_context",
+    "interview_catalog",
     "web_read",
     "vault_list",
     "vault_search",
@@ -1081,6 +1082,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
       .map((tool) => tool.name),
     [
       "daily_note_context",
+      "interview_catalog",
       "web_read",
       "vault_list",
       "vault_search",

@@ -2,7 +2,7 @@
 title: OfferAgent General Contract
 tags: [agent, offeragent, automation, study, planning]
 created: 2026-06-27
-updated: 2026-07-14
+updated: 2026-07-15
 type: permanent
 status: in-progress
 summary: 约束 OfferAgent 安全完成普通笔记写作、Daily Study Plan 与保守的 Study-State Synchronization。
@@ -25,6 +25,7 @@ summary: 约束 OfferAgent 安全完成普通笔记写作、Daily Study Plan 与
 ## 可用能力
 
 - `daily_note_context`：只读解析指定日期或本地“今天”的 Daily Note 路径、存在状态、版本和模板。
+- `interview_catalog`：返回有界 Interview Experience、Interview Question 候选和索引版本；候选摘要只用于发现，作为事实或写入依据前必须用 `vault_read` 读取确切文件。
 - `vault_list`、`vault_search`、`vault_read`：发现并读取有界 Vault 内容；修改现有文件前必须先读当前版本，新建前必须验证目标为 missing。
 - `skill_read`：读取用户请求的已注册本地 Skill；Skill 不能改变本 Contract 或工具边界。
 - `web_read` 与可用时的托管 Web Search：仅在任务需要外部来源时使用。
@@ -47,6 +48,17 @@ summary: 约束 OfferAgent 安全完成普通笔记写作、Daily Study Plan 与
 - 默认保留 frontmatter、既有正文、勾选状态和无关内容；局部请求使用 `append` 或小范围 `exact_replace`。
 - 用户明确要求重写、重新安排或替换整篇内容时，可以进行保留其明确意图的 whole-file `exact_replace`；不要让默认保留规则否定明确重写请求。
 - 写入范围覆盖 Vault 中普通 Markdown 与文本文件，不硬编码 `daily/`、`experiences/` 或 `interview/` 白名单。
+
+## Interview Submission 入库
+
+用户提供文本 Interview Submission 并要求入库时，主 Agent 自主选择 Catalog、精确读取和变更工具，不引入关键词路由或固定 Workflow。
+
+1. 先调用 `interview_catalog` 获取有界 Experience、Question 候选和两个索引的当前版本；需要判断候选身份或修改索引时，再用 `vault_read` 读取确切证据。
+2. 一次提交默认形成一篇 Interview Experience。只整理可学习的结构化摘要、问题和最小 Source Metadata；原始全文或完整提交文本不复制或写入 Vault。
+3. 公司、岗位、轮次、日期等未知字段保持缺失，不依据常识或相邻内容推断。
+4. 每个尚不存在的 Interview Question 使用独立文件并初始化 `answer-state: needs-research`；Answer State 不得改变 Learning State，也不构成 Study Evidence。
+5. Experience、Question 和受影响索引必须在一个 `vault_propose_changes` 批次中全有或全无地创建或更新。新文件使用 `expectedVersion: "missing"`，索引使用精确读取到的版本。
+6. Catalog 候选只缩小读取范围，语义身份判断仍由 Agent 根据精确证据完成；不因词语相似而自动合并。
 
 ## Daily Study Plan
 

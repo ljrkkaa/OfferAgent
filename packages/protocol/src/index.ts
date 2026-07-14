@@ -70,6 +70,7 @@ export type LocalToolName =
   | "agent_contract_read"
   | "daily_note_context"
   | "hosted_web_search_probe"
+  | "interview_catalog"
   | "planning_memory_list"
   | "planning_memory_read"
   | "skill_read"
@@ -166,6 +167,35 @@ export interface DailyNoteContextResult {
   templatePath: string | null;
   templateVersion: string | null;
   type: "daily_note_context";
+}
+
+export interface InterviewCatalogResult {
+  experienceCandidates: Array<{
+    company?: string;
+    contentHash: string;
+    date?: string;
+    modifiedVersion: string;
+    path: string;
+    position?: string;
+    round?: string;
+    title: string;
+  }>;
+  indexes: Array<{
+    contentHash?: string;
+    exists: boolean;
+    kind: "experience" | "question";
+    modifiedVersion: string;
+    path: string;
+  }>;
+  questionCandidates: Array<{
+    answerState?: "draft" | "needs-research" | "verified";
+    contentHash: string;
+    modifiedVersion: string;
+    path: string;
+    title: string;
+  }>;
+  truncated: boolean;
+  type: "interview_catalog";
 }
 
 export type MemoryTopicType = "feedback" | "project" | "study" | "user";
@@ -335,6 +365,7 @@ export type LocalToolResultPayload =
         | AgentContractResult
         | DailyNoteContextResult
         | HostedWebSearchProbeResult
+        | InterviewCatalogResult
         | PlanningMemoryListResult
         | PlanningMemoryReadResult
         | SkillReadResult

@@ -52,6 +52,7 @@ import {
 } from "./planning-memory";
 
 interface RuntimeOptions {
+  fakeScenario?: "text-interview-ingestion";
   parentPid: number;
   port: number;
   provider: "codex" | "fake";
@@ -71,6 +72,21 @@ const LOCAL_TOOLS: LocalToolDefinition[] = [
       properties: {
         date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
       },
+    },
+  },
+  {
+    kind: "local",
+    name: "interview_catalog",
+    description:
+      "Find bounded Interview Experience and Interview Question candidates plus their index versions. Candidate summaries are not exact evidence; call vault_read for any candidate or index used in a change.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        query: { type: "string", minLength: 1, maxLength: 512 },
+        limit: { type: "integer", minimum: 1, maximum: 20 },
+      },
+      required: ["query"],
     },
   },
   {
@@ -395,6 +411,63 @@ function isLocalToolResultPayload(value: unknown): value is LocalToolResultPaylo
       templateFieldsAreConsistent
     );
   }
+  if (result.value.type === "interview_catalog") {
+    const boundedText = (text: unknown, maximumBytes: number): text is string =>
+      typeof text === "string" &&
+      text.trim().length > 0 &&
+      Buffer.byteLength(text, "utf8") <= maximumBytes;
+    const commonCandidate = (candidate: unknown, directory: "experiences" | "interview"): boolean => {
+      if (!candidate || typeof candidate !== "object") return false;
+      const entry = candidate as Record<string, unknown>;
+      return (
+        isBoundedVaultPath(entry.path) &&
+        new RegExp(`^${directory}/[^/]+\\.md$`, "u").test(entry.path) &&
+        entry.path !== `${directory}/index.md` &&
+        boundedText(entry.title, 256) &&
+        boundedText(entry.modifiedVersion, 128) &&
+        boundedText(entry.contentHash, 128)
+      );
+    };
+    return (
+      typeof result.value.truncated === "boolean" &&
+      Array.isArray(result.value.experienceCandidates) &&
+      result.value.experienceCandidates.length <= 20 &&
+      result.value.experienceCandidates.every(
+        (candidate) =>
+          commonCandidate(candidate, "experiences") &&
+          [candidate.company, candidate.position, candidate.round, candidate.date].every(
+            (field) => field === undefined || boundedText(field, 256),
+          ),
+      ) &&
+      Array.isArray(result.value.questionCandidates) &&
+      result.value.questionCandidates.length <= 20 &&
+      result.value.questionCandidates.every(
+        (candidate) =>
+          commonCandidate(candidate, "interview") &&
+          (candidate.answerState === undefined ||
+            ["needs-research", "draft", "verified"].includes(candidate.answerState)),
+      ) &&
+      Array.isArray(result.value.indexes) &&
+      result.value.indexes.length === 2 &&
+      result.value.indexes.some(
+        (index) => index.kind === "experience" && index.path === "experiences/index.md",
+      ) &&
+      result.value.indexes.some(
+        (index) => index.kind === "question" && index.path === "interview/index.md",
+      ) &&
+      result.value.indexes.every(
+        (index) =>
+          ((index.kind === "experience" && index.path === "experiences/index.md") ||
+            (index.kind === "question" && index.path === "interview/index.md")) &&
+          typeof index.exists === "boolean" &&
+          (index.exists
+            ? index.modifiedVersion !== "missing" &&
+              boundedText(index.modifiedVersion, 128) &&
+              boundedText(index.contentHash, 128)
+            : index.modifiedVersion === "missing" && index.contentHash === undefined),
+      )
+    );
+  }
   if (result.value.type === "planning_memory_list") {
     return (
       Array.isArray(result.value.topics) &&
@@ -575,7 +648,17 @@ function readOptions(): RuntimeOptions {
   }
   const statePathIndex = process.argv.indexOf("--state-path");
   const statePath = statePathIndex === -1 ? undefined : readOption("--state-path");
+  const fakeScenario = process.argv.includes("--fake-scenario")
+    ? readOption("--fake-scenario")
+    : undefined;
+  if (fakeScenario !== undefined && fakeScenario !== "text-interview-ingestion") {
+    throw new Error(`Unsupported fake Provider scenario: ${fakeScenario}`);
+  }
+  if (fakeScenario && provider !== "fake") {
+    throw new Error("--fake-scenario requires --provider fake");
+  }
   return {
+    ...(fakeScenario ? { fakeScenario } : {}),
     parentPid: parseIntegerOption("--parent-pid"),
     port: parseIntegerOption("--port", true),
     provider,
@@ -648,9 +731,12 @@ function parentExists(parentPid: number): boolean {
   }
 }
 
-function createProvider(provider: RuntimeOptions["provider"]): ModelProvider {
+function createProvider(
+  provider: RuntimeOptions["provider"],
+  fakeScenario?: RuntimeOptions["fakeScenario"],
+): ModelProvider {
   if (provider === "codex") return new CodexSubscriptionProvider();
-  if (provider === "fake") return new FakeModelProvider();
+  if (provider === "fake") return new FakeModelProvider({ scenario: fakeScenario });
   throw new Error(`Unsupported Runtime Provider: ${provider satisfies never}`);
 }
 
@@ -968,6 +1054,7 @@ async function handleVaultChangeCommand(
 }
 
 async function startRuntime({
+  fakeScenario,
   parentPid,
   port,
   provider: providerName,
@@ -976,7 +1063,10 @@ async function startRuntime({
 }: RuntimeOptions): Promise<void> {
   const instanceId = randomUUID();
   const store = await RuntimeStateStore.open(statePath);
-  const provider = new CapabilityGatedModelProvider(createProvider(providerName), store);
+  const provider = new CapabilityGatedModelProvider(
+    createProvider(providerName, fakeScenario),
+    store,
+  );
   const activeRuns = new Map<
     string,
     {

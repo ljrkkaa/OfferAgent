@@ -23,6 +23,8 @@ const MAX_SEARCH_SNIPPET_BYTES = 512;
 const MAX_SEARCH_QUERY_BYTES = 512;
 const MAX_CONTROL_FILE_BYTES = 32_768;
 const MAX_DAILY_TEMPLATE_BYTES = 32_768;
+const DEFAULT_INTERVIEW_CATALOG_RESULTS = 10;
+const MAX_INTERVIEW_CATALOG_RESULTS = 20;
 const MAX_MEMORY_TOPICS = 100;
 const MAX_MEMORY_READ_TOPICS = 5;
 const MAX_MEMORY_TOPIC_BYTES = 32_768;
@@ -238,6 +240,9 @@ export class ObsidianVaultToolAdapter {
       if (call.tool.name === "daily_note_context") {
         return await this.#dailyNoteContext(call.tool.arguments);
       }
+      if (call.tool.name === "interview_catalog") {
+        return await this.#interviewCatalog(call.tool.arguments);
+      }
       if (call.tool.name === "planning_memory_list") {
         return await this.#listPlanningMemory(call.tool.arguments);
       }
@@ -300,6 +305,143 @@ export class ObsidianVaultToolAdapter {
         type: "planning_memory_list",
         topics: topics.slice(0, MAX_MEMORY_TOPICS),
         truncated: topics.length > MAX_MEMORY_TOPICS,
+      },
+    };
+  }
+
+  async #interviewCatalog(arguments_: unknown): Promise<LocalToolResultPayload> {
+    if (!arguments_ || typeof arguments_ !== "object" || Array.isArray(arguments_)) {
+      return failure("request_too_large", "interview_catalog arguments must be an object.");
+    }
+    const input = arguments_ as { limit?: unknown; query?: unknown };
+    if (Object.keys(input).some((key) => key !== "limit" && key !== "query")) {
+      return failure("request_too_large", "interview_catalog accepts only query and limit.");
+    }
+    const query = typeof input.query === "string" ? input.query.trim().toLocaleLowerCase() : "";
+    if (!query || Buffer.byteLength(query, "utf8") > MAX_SEARCH_QUERY_BYTES) {
+      return failure(
+        "request_too_large",
+        `interview_catalog query must be between 1 and ${MAX_SEARCH_QUERY_BYTES} UTF-8 bytes.`,
+      );
+    }
+    const limit = input.limit === undefined ? DEFAULT_INTERVIEW_CATALOG_RESULTS : input.limit;
+    if (
+      !Number.isInteger(limit) ||
+      (limit as number) < 1 ||
+      (limit as number) > MAX_INTERVIEW_CATALOG_RESULTS
+    ) {
+      return failure(
+        "request_too_large",
+        `interview_catalog limit must be between 1 and ${MAX_INTERVIEW_CATALOG_RESULTS}.`,
+      );
+    }
+
+    const terms = query.split(/\s+/u).filter(Boolean);
+    const score = (value: string): number =>
+      terms.reduce((total, term) => total + occurrences(value, [term]), 0);
+    const experienceMatches: Array<{
+      company?: string;
+      contentHash: string;
+      date?: string;
+      modifiedVersion: string;
+      path: string;
+      position?: string;
+      round?: string;
+      score: number;
+      title: string;
+    }> = [];
+    const questionMatches: Array<{
+      answerState?: "draft" | "needs-research" | "verified";
+      contentHash: string;
+      modifiedVersion: string;
+      path: string;
+      score: number;
+      title: string;
+    }> = [];
+
+    for (const file of this.#vault.getFiles()) {
+      const isExperience = /^experiences\/[^/]+\.md$/u.test(file.path) && file.path !== "experiences/index.md";
+      const isQuestion = /^interview\/[^/]+\.md$/u.test(file.path) && file.path !== "interview/index.md";
+      if ((!isExperience && !isQuestion) || !isReadableFile(file) || !safePath(file.path)) continue;
+      const content = await this.#vault.cachedRead(file);
+      const frontmatter = this.#metadata?.getFileCache(file)?.frontmatter ?? {};
+      const metadata = frontmatter && typeof frontmatter === "object" ? frontmatter : {};
+      const searchable = `${file.path} ${metadataValues(metadata).join(" ")} ${content}`.toLocaleLowerCase();
+      const matchScore = score(searchable);
+      if (matchScore === 0) continue;
+      const textField = (name: string): string | undefined => {
+        const value = (metadata as Record<string, unknown>)[name];
+        return typeof value === "string" && value.trim()
+          ? boundedUtf8(value.trim(), 256).content
+          : undefined;
+      };
+      const title = textField("title") ?? file.path.split("/").at(-1)!.replace(/\.md$/iu, "");
+      const common = {
+        path: file.path,
+        title,
+        modifiedVersion: fileVersion(file),
+        contentHash: contentHash(content),
+        score: matchScore,
+      };
+      if (isExperience) {
+        experienceMatches.push({
+          ...common,
+          ...(textField("company") ? { company: textField("company") } : {}),
+          ...(textField("position") ? { position: textField("position") } : {}),
+          ...(textField("round") ? { round: textField("round") } : {}),
+          ...(textField("date") ? { date: textField("date") } : {}),
+        });
+      } else {
+        const answerState = textField("answer-state");
+        questionMatches.push({
+          ...common,
+          ...(answerState === "needs-research" || answerState === "draft" || answerState === "verified"
+            ? { answerState }
+            : {}),
+        });
+      }
+    }
+
+    const byScoreThenPath = <T extends { path: string; score: number }>(left: T, right: T) =>
+      right.score - left.score || left.path.localeCompare(right.path);
+    experienceMatches.sort(byScoreThenPath);
+    questionMatches.sort(byScoreThenPath);
+    const selectedExperiences = experienceMatches.slice(0, limit as number).map(({ score: _, ...entry }) => entry);
+    const selectedQuestions = questionMatches.slice(0, limit as number).map(({ score: _, ...entry }) => entry);
+    const indexes = [];
+    for (const [kind, indexPath] of [
+      ["experience", "experiences/index.md"],
+      ["question", "interview/index.md"],
+    ] as const) {
+      const file = this.#vault.getFiles().find((candidate) => candidate.path === indexPath);
+      if (!file || !isReadableFile(file)) {
+        indexes.push({
+          kind,
+          path: indexPath,
+          exists: false,
+          modifiedVersion: "missing",
+        });
+        continue;
+      }
+      const content = await this.#vault.cachedRead(file);
+      indexes.push({
+        kind,
+        path: indexPath,
+        exists: true,
+        modifiedVersion: fileVersion(file),
+        contentHash: contentHash(content),
+      });
+    }
+    return {
+      ok: true,
+      value: {
+        type: "interview_catalog",
+        experienceCandidates: selectedExperiences,
+        questionCandidates: selectedQuestions,
+        indexes,
+        truncated:
+          experienceMatches.length > selectedExperiences.length ||
+          questionMatches.length > selectedQuestions.length,
       },
     };
   }

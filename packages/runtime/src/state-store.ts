@@ -21,7 +21,7 @@ import {
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.js";
 import type { ModelConversationItem } from "./model-provider";
 
-const CURRENT_SCHEMA_VERSION = 12;
+const CURRENT_SCHEMA_VERSION = 13;
 const MAX_CONVERSATION_CONTEXT_BYTES = 64 * 1_024;
 
 export interface RunCheckpoint {
@@ -771,6 +771,94 @@ const MIGRATIONS = [
       ALTER TABLE tool_calls_v12 RENAME TO tool_calls;
       ALTER TABLE evidence_snapshots_v12 RENAME TO evidence_snapshots;
       ALTER TABLE vault_change_batches_v12 RENAME TO vault_change_batches;
+      CREATE INDEX tool_calls_by_run ON tool_calls(agent_run_id, created_at);
+      CREATE INDEX evidence_by_run ON evidence_snapshots(agent_run_id, created_at);
+      CREATE INDEX evidence_by_source ON evidence_snapshots(path, content_hash, is_stale);
+      CREATE INDEX vault_change_batches_by_run ON vault_change_batches(agent_run_id, created_at);
+      CREATE INDEX vault_change_batches_by_state ON vault_change_batches(state, updated_at);
+    `,
+  },
+  {
+    version: 13,
+    sql: `
+      CREATE TABLE tool_calls_v13 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        name TEXT NOT NULL CHECK (name IN (
+          'agent_contract_read', 'daily_note_context', 'hosted_web_search_probe',
+          'interview_catalog', 'planning_memory_list', 'planning_memory_read',
+          'skill_read', 'vault_list', 'vault_propose_changes', 'vault_read',
+          'vault_search', 'web_read'
+        )),
+        arguments_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('requested', 'completed', 'failed')),
+        error_code TEXT,
+        error_message TEXT,
+        result_json TEXT,
+        result_event_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO tool_calls_v13
+        (id, conversation_id, agent_run_id, name, arguments_json, status,
+         error_code, error_message, result_json, result_event_id, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, name, arguments_json, status,
+             error_code, error_message, result_json, result_event_id, created_at, updated_at
+      FROM tool_calls;
+      CREATE TABLE evidence_snapshots_v13 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v13(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        line_start INTEGER NOT NULL,
+        line_end INTEGER NOT NULL,
+        modified_version TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        is_stale INTEGER NOT NULL DEFAULT 0 CHECK (is_stale IN (0, 1)),
+        stale_detected_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO evidence_snapshots_v13
+        (id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+         modified_version, content_hash, content, is_stale, stale_detected_at, created_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+             modified_version, content_hash, content, is_stale, stale_detected_at, created_at
+      FROM evidence_snapshots;
+      CREATE TABLE vault_change_batches_v13 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v13(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        task TEXT NOT NULL,
+        target_paths_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+          'pending', 'applying', 'applied', 'rejected', 'failed', 'rolled_back',
+          'recovery_failed', 'undone', 'expired'
+        )),
+        checkpoint_ref TEXT,
+        before_hashes_json TEXT,
+        after_hashes_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO vault_change_batches_v13
+        (id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+         target_paths_json, state, checkpoint_ref, before_hashes_json,
+         after_hashes_json, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+             target_paths_json, state, checkpoint_ref, before_hashes_json,
+             after_hashes_json, created_at, updated_at
+      FROM vault_change_batches;
+      DROP TABLE evidence_snapshots;
+      DROP TABLE vault_change_batches;
+      DROP TABLE tool_calls;
+      ALTER TABLE tool_calls_v13 RENAME TO tool_calls;
+      ALTER TABLE evidence_snapshots_v13 RENAME TO evidence_snapshots;
+      ALTER TABLE vault_change_batches_v13 RENAME TO vault_change_batches;
       CREATE INDEX tool_calls_by_run ON tool_calls(agent_run_id, created_at);
       CREATE INDEX evidence_by_run ON evidence_snapshots(agent_run_id, created_at);
       CREATE INDEX evidence_by_source ON evidence_snapshots(path, content_hash, is_stale);

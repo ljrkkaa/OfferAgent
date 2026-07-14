@@ -298,6 +298,134 @@ test("Planning Memory reads reject indexes, malformed requests, escapes, and ove
   assert.equal(oversized.error.code, "response_too_large");
 });
 
+test("Interview Catalog returns bounded candidates and index versions without note bodies", async () => {
+  const experience = file(
+    "experiences/tencent-backend.md",
+    "---\ntitle: Tencent backend interview\ncompany: Tencent\nposition: Backend Engineer\nround: second\n---\nPRIVATE EXPERIENCE BODY",
+    2001,
+  );
+  const question = file(
+    "interview/node-event-loop.md",
+    "---\ntitle: Explain the Node.js event loop\nanswer-state: needs-research\n---\nPRIVATE QUESTION BODY",
+    2002,
+  );
+  const experienceIndex = file("experiences/index.md", "# Interview Experiences", 2003);
+  const questionIndex = file("interview/index.md", "# Interview Questions", 2004);
+  const subject = adapter(
+    [experience, question, experienceIndex, questionIndex, file("notes/unrelated.md", "Tencent event loop")],
+    {
+      [experience.path]: {
+        frontmatter: {
+          title: "Tencent backend interview",
+          company: "Tencent",
+          position: "Backend Engineer",
+          round: "second",
+        },
+      },
+      [question.path]: {
+        frontmatter: {
+          title: "Explain the Node.js event loop",
+          "answer-state": "needs-research",
+        },
+      },
+    },
+  );
+
+  const result = await subject.execute(
+    call("interview_catalog", { query: "Tencent backend event loop", limit: 5 }),
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.value.type, "interview_catalog");
+  assert.deepEqual(
+    result.value.experienceCandidates.map(({ path, title, company, position, round }) => ({
+      path,
+      title,
+      company,
+      position,
+      round,
+    })),
+    [{
+      path: "experiences/tencent-backend.md",
+      title: "Tencent backend interview",
+      company: "Tencent",
+      position: "Backend Engineer",
+      round: "second",
+    }],
+  );
+  assert.deepEqual(
+    result.value.questionCandidates.map(({ path, title, answerState }) => ({ path, title, answerState })),
+    [{
+      path: "interview/node-event-loop.md",
+      title: "Explain the Node.js event loop",
+      answerState: "needs-research",
+    }],
+  );
+  assert.deepEqual(
+    result.value.indexes.map(({ exists, kind, path, modifiedVersion }) => ({
+      exists,
+      kind,
+      path,
+      modifiedVersion,
+    })),
+    [
+      { exists: true, kind: "experience", path: "experiences/index.md", modifiedVersion: "mtime:2003:size:23" },
+      { exists: true, kind: "question", path: "interview/index.md", modifiedVersion: "mtime:2004:size:21" },
+    ],
+  );
+  assert.equal(result.value.truncated, false);
+  assert.equal(JSON.stringify(result).includes("PRIVATE EXPERIENCE BODY"), false);
+  assert.equal(JSON.stringify(result).includes("PRIVATE QUESTION BODY"), false);
+  assert.equal(JSON.stringify(result).includes("notes/unrelated.md"), false);
+});
+
+test("Interview Catalog bounds metadata and reports both missing index versions", async () => {
+  const oversized = "界".repeat(200);
+  const experience = file("experiences/oversized.md", `needle\n${oversized}`);
+  const subject = adapter(
+    [experience],
+    {
+      [experience.path]: {
+        frontmatter: {
+          title: oversized,
+          company: oversized,
+          position: oversized,
+          round: oversized,
+          date: oversized,
+        },
+      },
+    },
+  );
+
+  const result = await subject.execute(call("interview_catalog", { query: "needle" }));
+
+  assert.equal(result.ok, true);
+  const [candidate] = result.value.experienceCandidates;
+  for (const value of [
+    candidate.title,
+    candidate.company,
+    candidate.position,
+    candidate.round,
+    candidate.date,
+  ]) {
+    assert.ok(Buffer.byteLength(value, "utf8") <= 256);
+  }
+  assert.deepEqual(result.value.indexes, [
+    {
+      kind: "experience",
+      path: "experiences/index.md",
+      exists: false,
+      modifiedVersion: "missing",
+    },
+    {
+      kind: "question",
+      path: "interview/index.md",
+      exists: false,
+      modifiedVersion: "missing",
+    },
+  ]);
+});
+
 test("vault_read returns bounded exact evidence with stable source metadata", async () => {
   const subject = adapter([file("notes/interview.md", "first\nsecond\nthird\nfourth", 5678)]);
   const result = await subject.execute(
