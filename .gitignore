@@ -31,3 +31,4 @@ docs/acceptance/*
 # Local agent/workspace artifacts
 AGENTS.md
 .understand-anything
+reference

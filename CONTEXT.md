@@ -32,15 +32,67 @@ _Avoid_: 模型自行授权、Runtime 绕过插件、全文件系统权限
 Vault Change Batch 应用前，由恢复模块使用临时 Git index 为本批目标文件创建的隐藏恢复引用；它不切换分支、不修改现有暂存区，也不等同于用户提交。
 _Avoid_: 自动提交当前分支、`git add .`、完整 Vault 备份
 
-**Study-Maintenance Agent**:
-检查 Study Evidence、提出 Learning State 变化并推荐下一学习主题的 OfferAgent 角色；它不把计划或已有材料当成完成证据。
-_Avoid_: 内容生成器、自动完成器
+**Daily Study Plan**:
+OfferAgent 根据用户的学习安排意图，使用 Vault 已配置的 Daily Notes 模板创建并填充 `daily/YYYY-MM-DD.md`；生成前召回相关 Study Memory 与 Project Memory，并读取历史 daily、项目库和待学习队列。目标缺失时实例化模板并创建；目标已存在时保留 frontmatter、已有记录和勾选状态，优先填充空占位或按用户意图追加；只有用户明确要求重新安排或重写时才替换已有计划。若本次计划形成跨天学习主线、主题顺序或暂缓方向，则在同一 Vault Change Batch 中更新 Study Memory；不把当天完整清单复制进记忆，且计划本身不是 Study Evidence。
+_Avoid_: 学习日记、关键词路由、Study-State Synchronization
+
+**Daily Note Context**:
+Obsidian 插件通过专用 `daily_note_context` 工具为指定日期解析 Daily Notes 配置；未指定日期时按插件所在本地时区确定“今天”。它返回解析后的日期、目标路径、文件是否存在及其版本、模板路径与模板正文及其版本、日期格式。它不创建文件、不选择学习内容，也不向普通 Vault 读取开放 `.obsidian/**`。
+_Avoid_: agent.md 硬编码模板路径、vault_read 读取 Obsidian 配置、插件替模型规划内容
+
+**Planning Memory**:
+Vault 中用户可见、可编辑并跨 Conversation 保留的 User Memory、Feedback Memory、Project Memory 和 Study Memory；它默认启用并允许 Agent 直接写入，不提供独立的启用开关或权限配置。它存放在 Vault 根目录 `memory/`：`MEMORY.md` 只保存简短索引，实际记忆按语义主题分别存放在 `user/`、`feedback/`、`project/` 和 `study/` 中，并由 Agent 根据当前请求按需读取。Daily Study Plan 可以使用它，但它不是 Study Evidence 或 Runtime State。
+_Avoid_: 隐藏模型记忆、大类汇总文件、按时间堆积、可选功能开关、独立权限配置、Conversation Context、运行日志
+
+**Memory Topic**:
+Planning Memory 中可独立召回和更新的 Markdown 文件；它使用 `name`、`description` 和 `type` 元数据说明语义，并在 `MEMORY.md` 中保留一条简短链接。一个主题可以容纳多条彼此相关的事实，但不按消息逐条建文件。
+_Avoid_: 一条消息一个文件、完整对话副本、MEMORY.md 内嵌正文
+
+**Memory Capture**:
+Planning Memory 的双通道写入机制：主 Agent 在明确请求记忆或语义上识别到长期有效信息时立即写入；若本轮没有发生记忆写入，则在回答结束后对本轮新增用户与 Agent 消息执行一次受限的语义提取。兜底提取只能读写 `memory/**`，成功后向用户显示实际更新的 Memory Topic。
+_Avoid_: 关键词触发、两条通道重复写入、扫描完整历史、后台修改非 memory 文件
+
+**Memory Recall**:
+每个 Agent Run 根据当前请求与 Conversation Context 扫描 Memory Topic 的 `name`、`description` 和 `type`，由模型语义选择最多五个相关主题，并把选中正文加入本轮上下文；用户明确要求检查、回忆或使用记忆时必须执行召回。`MEMORY.md` 只用于用户浏览和记忆整理，不常驻模型上下文。v1 不计算记忆年龄、不设置过期阈值，也不显示新鲜度提醒。
+_Avoid_: 关键词匹配、无条件加载全部记忆、MEMORY.md 常驻 Prompt、重复注入同一主题、新鲜度评分
+
+**Memory Consolidation**:
+Memory Capture 写入前对相关 Memory Topic 做语义合并：更新已有主题、删除被纠正或不再成立的内容、消除重复，并同步 `MEMORY.md` 索引。记忆文件只表达当前有效理解，变更历史由 Vault Change Batch 的 Git 检查点与撤销机制承担。
+_Avoid_: 追加式事件流水、保留失效正文、为同一事实重复建主题
+
+**User Memory**:
+用户稳定的身份、知识背景和长期偏好；它不包含一次性任务要求。
+_Avoid_: 临时提示、当前消息、Feedback Memory
+
+**Feedback Memory**:
+用户对 OfferAgent 行为、表达或工作流的持久纠正；它描述未来应该如何协作，而不是当前任务要做什么。v1 不把 Feedback Memory 晋升或建议晋升到 Agent Contract。
+_Avoid_: 普通补充信息、一次性修改、User Memory、自动修改 agent.md
+
+**Project Memory**:
+单个项目的目标、进展、关键决策、约束和截止日期；它引用项目权威来源而不复制项目内容或运行日志。
+_Avoid_: Study Memory、源码副本、项目日志
+
+**Study Memory**:
+跨 Daily Study Plan 延续的当前学习主线、暂缓方向、主题顺序和安排偏好；已完成学习事实仍由 Study Evidence 决定。
+_Avoid_: Project Memory、Study Evidence、完成状态
+
+**Memory Precedence**:
+记忆参与决策时遵循 Agent Contract > 当前用户明确要求 > Feedback Memory > 与任务相关的 User Memory、Project Memory 或 Study Memory > 模型默认行为；同层冲突采用更具体且更新的内容。当前请求可以覆盖本次行为，但除非表达了持久纠正或稳定事实，否则不改写 Planning Memory。
+_Avoid_: 旧记忆覆盖当前要求、单次要求自动永久化、所有记忆无条件拼接
+
+**Study-State Synchronization**:
+OfferAgent 从已有 daily 中的 Study Evidence 保守推进 Learning State 并推荐下一学习主题；daily 缺失时结束而不创建日记。
+_Avoid_: Daily Study Plan、计划生成、推测完成
 
 ## Conversations and Runs
 
 **Conversation**:
 用户与 OfferAgent 之间可跨多次启动持续存在的交互历史，其中可以包含多个 Agent Run。
 _Avoid_: 单次请求、单次模型调用、Agent Run
+
+**Conversation Context**:
+新 Agent Run 可见的同一 Conversation 中有限、按序的用户与 Agent 消息；它不继承旧工具结果或 Evidence Snapshot，接近模型上限时从最旧的完整对话轮次开始裁剪。
+_Avoid_: 完整运行日志、旧证据缓存、单轮输入
 
 **Agent Run**:
 OfferAgent 为处理一条用户请求而进行的一次执行，直到完成、失败、取消或中断。
@@ -87,5 +139,7 @@ _Avoid_: 根据模型名称猜测能力、把内部后端当成公开稳定协�
 ## Migration Requirement
 
 在新的 TypeScript Agent 接管目标 Vault 前，必须重新审查并修改目标 Vault 根目录的 `agent.md`，使其中的角色名称、工具名称、运行边界、确认流程和恢复语义与新 Agent 一致。旧 `agent.md` 不得未经适配直接作为新 Agent 的正式 Agent Contract。
+
+目标 Vault 当前 `agent.md` 及仓库内对应部署模板必须从单一“学习状态维护”契约改为按用户意图工作的 OfferAgent 契约：创建和改写是覆盖整个 Vault 普通 `.md`、`.txt` 文件的通用能力。用户要求创建内容时，应在确认目标缺失后直接创建；用户要求整体或局部改写时，应先读取当前版本再执行。用户未要求重写时仍保留无关内容。不得用“daily 缺失”“默认文件范围”或固定状态检查输出阻止明确的创建、填充或重写请求；控制文件确认、插件权限、版本校验和 Git Checkpoint 仍保持不变。Daily Study Plan 与 Study-State Synchronization 继续按各自证据边界独立工作。
 
 目标 Vault 的 `obsidian-cli` Skill 也必须改写为 OfferAgent Vault 工具说明，不能继续要求 Agent 执行本机不存在且未授权的 `obsidian ...` Shell 命令。`skill_read` 必须支持读取对应 Skill 目录内被 `SKILL.md` 直接引用的资源文件，同时拒绝目录越界。
