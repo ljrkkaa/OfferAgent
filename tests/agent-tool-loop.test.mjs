@@ -304,6 +304,331 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
   assert.equal(foregroundProposals, 1, "semantic fallback must not duplicate foreground memory writes");
   assert.match(foregroundEvents.at(-1).output.text, /Planning Memory updated/);
 
+  let dailyOnlyProposals = 0;
+  let dailyOnlyProposalPaths = [];
+  const dailyOnlyEvents = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "memory-daily-only-start",
+      conversationId: "memory-daily-only-conversation",
+      agentRunId: "memory-daily-only-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "planning_memory_daily_only" },
+    },
+    (event) => {
+      if (event.tool.name === "daily_note_context") {
+        return {
+          ok: true,
+          value: {
+            type: "daily_note_context",
+            resolvedDate: "2026-07-14",
+            dateFormat: "YYYY-MM-DD",
+            targetPath: "journal/2026-07-14.md",
+            targetExists: false,
+            targetVersion: "missing",
+            templatePath: null,
+            templateContent: null,
+            templateVersion: null,
+          },
+        };
+      }
+      if (event.tool.name === "vault_read") {
+        return { ok: false, error: { code: "not_found", message: "Memory index is missing." } };
+      }
+      assert.equal(event.tool.name, "vault_propose_changes");
+      dailyOnlyProposals += 1;
+      dailyOnlyProposalPaths = event.tool.arguments.actions.map(({ path }) => path);
+      return {
+        ok: true,
+        value: {
+          type: "vault_propose_changes",
+          batchId: event.tool.arguments.batchId,
+          decision: "applied",
+          checkpointRef: `refs/offeragent/checkpoints/${event.tool.arguments.batchId}`,
+          targets: event.tool.arguments.actions.map(({ path }) => ({
+            path,
+            beforeHash: "missing",
+            afterHash: "sha256:after",
+          })),
+        },
+      };
+    },
+  );
+  assert.equal(
+    dailyOnlyProposals,
+    1,
+    "an applied Daily plan must not trigger a separate semantic Study Memory batch",
+  );
+  assert.deepEqual(dailyOnlyProposalPaths, [
+    "journal/2026-07-14.md",
+    "memory/study/retrieval-evaluation.md",
+    "memory/MEMORY.md",
+  ]);
+  assert.match(dailyOnlyEvents.at(-1).output.text, /Planning Memory updated/);
+
+  let malformedDailyProposals = 0;
+  const malformedDailyEvents = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "memory-daily-malformed-start",
+      conversationId: "memory-daily-malformed-conversation",
+      agentRunId: "memory-daily-malformed-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "planning_memory_daily_malformed" },
+    },
+    (event) => {
+      if (event.tool.name === "daily_note_context") {
+        return {
+          ok: true,
+          value: {
+            type: "daily_note_context",
+            resolvedDate: "2026-07-14",
+            dateFormat: "YYYY-MM-DD",
+            targetPath: "journal/2026-07-14.md",
+            targetExists: false,
+            targetVersion: "missing",
+            templatePath: null,
+            templateContent: null,
+            templateVersion: null,
+          },
+        };
+      }
+      if (event.tool.name === "vault_propose_changes") malformedDailyProposals += 1;
+      return { ok: false, error: { code: "tool_error", message: "Unexpected tool call." } };
+    },
+  );
+  assert.equal(malformedDailyEvents.at(-1).type, "agent_run.failed");
+  assert.equal(malformedDailyEvents.at(-1).error.code, "provider_error");
+  assert.equal(malformedDailyProposals, 0, "malformed preflight must fail before proposing Daily changes");
+
+  let mixedDailyProposals = 0;
+  const mixedDailyEvents = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "memory-daily-mixed-start",
+      conversationId: "memory-daily-mixed-conversation",
+      agentRunId: "memory-daily-mixed-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "planning_memory_daily_mixed" },
+    },
+    (event) => {
+      if (event.tool.name === "daily_note_context") {
+        return {
+          ok: true,
+          value: {
+            type: "daily_note_context",
+            resolvedDate: "2026-07-14",
+            dateFormat: "YYYY-MM-DD",
+            targetPath: "journal/2026-07-14.md",
+            targetExists: false,
+            targetVersion: "missing",
+            templatePath: null,
+            templateContent: null,
+            templateVersion: null,
+          },
+        };
+      }
+      if (event.tool.name === "vault_propose_changes") mixedDailyProposals += 1;
+      return { ok: false, error: { code: "tool_error", message: "Unexpected tool call." } };
+    },
+  );
+  assert.equal(mixedDailyEvents.at(-1).type, "agent_run.failed");
+  assert.equal(mixedDailyProposals, 0, "an incomplete mixed-memory proposal must be replanned, not duplicated");
+
+  let invalidActionProposals = 0;
+  const invalidActionEvents = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "memory-daily-invalid-action-start",
+      conversationId: "memory-daily-invalid-action-conversation",
+      agentRunId: "memory-daily-invalid-action-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "planning_memory_daily_invalid_action" },
+    },
+    (event) => {
+      if (event.tool.name === "daily_note_context") {
+        return {
+          ok: true,
+          value: {
+            type: "daily_note_context",
+            resolvedDate: "2026-07-14",
+            dateFormat: "YYYY-MM-DD",
+            targetPath: "journal/2026-07-14.md",
+            targetExists: false,
+            targetVersion: "missing",
+            templatePath: null,
+            templateContent: null,
+            templateVersion: null,
+          },
+        };
+      }
+      if (event.tool.name === "vault_propose_changes") invalidActionProposals += 1;
+      return { ok: false, error: { code: "tool_error", message: "Unexpected tool call." } };
+    },
+  );
+  assert.equal(invalidActionEvents.at(-1).type, "agent_run.failed");
+  assert.equal(invalidActionProposals, 0, "preflight must reject malformed actions without sanitizing or sending them");
+
+  let truncatedMixedProposals = 0;
+  const truncatedMixedEvents = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "memory-truncated-mixed-start",
+      conversationId: "memory-truncated-mixed-conversation",
+      agentRunId: "memory-truncated-mixed-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "planning_memory_daily_mixed" },
+    },
+    (event) => {
+      if (event.tool.name === "daily_note_context") {
+        return {
+          ok: true,
+          value: {
+            type: "daily_note_context",
+            resolvedDate: "2026-07-14",
+            dateFormat: "YYYY-MM-DD",
+            targetPath: "journal/2026-07-14.md",
+            targetExists: false,
+            targetVersion: "missing",
+            templatePath: null,
+            templateContent: null,
+            templateVersion: null,
+          },
+        };
+      }
+      if (event.tool.name === "vault_propose_changes") truncatedMixedProposals += 1;
+      return { ok: false, error: { code: "tool_error", message: "Unexpected tool call." } };
+    },
+    [],
+    "# Test Agent Contract",
+    true,
+  );
+  assert.equal(truncatedMixedEvents.at(-1).type, "agent_run.failed");
+  assert.equal(
+    truncatedMixedProposals,
+    0,
+    "a truncated index plus unrelated memory topic must not bypass atomic Study Memory",
+  );
+
+  let truncatedDeleteProposals = 0;
+  const truncatedDeleteEvents = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "memory-truncated-delete-start",
+      conversationId: "memory-truncated-delete-conversation",
+      agentRunId: "memory-truncated-delete-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "planning_memory_daily_delete" },
+    },
+    (event) => {
+      if (event.tool.name === "daily_note_context") {
+        return {
+          ok: true,
+          value: {
+            type: "daily_note_context",
+            resolvedDate: "2026-07-14",
+            dateFormat: "YYYY-MM-DD",
+            targetPath: "journal/2026-07-14.md",
+            targetExists: false,
+            targetVersion: "missing",
+            templatePath: null,
+            templateContent: null,
+            templateVersion: null,
+          },
+        };
+      }
+      if (event.tool.name === "vault_propose_changes") truncatedDeleteProposals += 1;
+      return { ok: false, error: { code: "tool_error", message: "Unexpected tool call." } };
+    },
+    [],
+    "# Test Agent Contract",
+    true,
+  );
+  assert.equal(truncatedDeleteEvents.at(-1).type, "agent_run.failed");
+  assert.equal(
+    truncatedDeleteProposals,
+    0,
+    "deleting a Study topic cannot satisfy a truncated Daily plan's durable direction",
+  );
+
+  let truncatedUpdateProposals = 0;
+  let truncatedUpdateActions;
+  const truncatedUpdateEvents = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "memory-truncated-update-start",
+      conversationId: "memory-truncated-update-conversation",
+      agentRunId: "memory-truncated-update-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "planning_memory_daily_update" },
+    },
+    (event) => {
+      if (event.tool.name === "daily_note_context") {
+        return {
+          ok: true,
+          value: {
+            type: "daily_note_context",
+            resolvedDate: "2026-07-14",
+            dateFormat: "YYYY-MM-DD",
+            targetPath: "journal/2026-07-14.md",
+            targetExists: false,
+            targetVersion: "missing",
+            templatePath: null,
+            templateContent: null,
+            templateVersion: null,
+          },
+        };
+      }
+      assert.equal(event.tool.name, "vault_propose_changes");
+      truncatedUpdateProposals += 1;
+      truncatedUpdateActions = event.tool.arguments.actions;
+      return {
+        ok: true,
+        value: {
+          type: "vault_propose_changes",
+          batchId: event.tool.arguments.batchId,
+          decision: "applied",
+          checkpointRef: `refs/offeragent/checkpoints/${event.tool.arguments.batchId}`,
+          targets: event.tool.arguments.actions.map(({ path }) => ({
+            path,
+            beforeHash: "sha256:before",
+            afterHash: "sha256:after",
+          })),
+        },
+      };
+    },
+    [],
+    "# Test Agent Contract",
+    true,
+  );
+  assert.equal(truncatedUpdateEvents.at(-1).type, "agent_run.completed");
+  assert.equal(truncatedUpdateProposals, 1);
+  assert.equal(
+    truncatedUpdateActions.find(({ path }) => path === "memory/study/retrieval-evaluation.md").operation,
+    "exact_replace",
+  );
+
   const truncatedEvents = await runWithToolPeer(
     socket,
     {

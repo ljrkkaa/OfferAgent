@@ -69,6 +69,10 @@ export class FakeModelProvider implements ModelProvider {
       try {
         const payload = JSON.parse(userInput) as { newMessages?: Array<{ text?: string }> };
         const messages = payload.newMessages?.map(({ text }) => text ?? "").join("\n") ?? "";
+        if (/planning_memory_daily_malformed/.test(messages)) {
+          yield { type: "output_text.delta", delta: "{malformed" };
+          return;
+        }
         durable = /I will study retrieval evaluation across the next three days/i.test(messages) ||
           /planning_memory_foreground/.test(messages);
       } catch {
@@ -167,6 +171,118 @@ export class FakeModelProvider implements ModelProvider {
         return;
       }
       yield { type: "output_text.delta", delta: "Saved the durable project direction." };
+      return;
+    }
+    if (
+      userInput.trim() === "planning_memory_daily_only" ||
+      userInput.trim() === "planning_memory_daily_malformed" ||
+      userInput.trim() === "planning_memory_daily_mixed" ||
+      userInput.trim() === "planning_memory_daily_update" ||
+      userInput.trim() === "planning_memory_daily_delete" ||
+      userInput.trim() === "planning_memory_daily_invalid_action"
+    ) {
+      const context = toolResultFor(request.input, "daily_note_context");
+      if (!context) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-daily-only-context-${this.#toolCallSequence}`,
+          name: "daily_note_context",
+          arguments: {},
+        };
+        return;
+      }
+      const applied = toolResultFor(request.input, "vault_propose_changes");
+      if (!applied) {
+        this.#toolCallSequence += 1;
+        const batchId = `foreground-daily-batch-${this.#toolCallSequence}`;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-daily-only-${this.#toolCallSequence}`,
+          name: "vault_propose_changes",
+          arguments: {
+            batchId,
+            idempotencyKey: batchId,
+            task: "Create a Daily plan without a separate memory transaction",
+            actions: [{
+              actionId: "foreground-daily-note",
+              idempotencyKey: "foreground-daily-note",
+              operation: "create",
+              path:
+                context.result.ok && context.result.value.type === "daily_note_context"
+                  ? context.result.value.targetPath
+                  : "daily/2026-07-14.md",
+              expectedVersion: "missing",
+              content: "# Daily Plan\n\nCross-day direction: I will study retrieval evaluation across the next three days.\n\n- [ ] Retrieval evaluation\n",
+            }, ...(userInput.trim() === "planning_memory_daily_mixed"
+              ? [
+                  {
+                    actionId: "foreground-project-topic",
+                    idempotencyKey: "foreground-project-topic",
+                    operation: "create",
+                    path: "memory/project/offeragent.md",
+                    expectedVersion: "missing",
+                    content: "---\nname: OfferAgent\ndescription: Project direction\ntype: project\n---\n\nShip the plugin.\n",
+                  },
+                  {
+                    actionId: "foreground-project-index",
+                    idempotencyKey: "foreground-project-index",
+                    operation: "create",
+                    path: "memory/MEMORY.md",
+                    expectedVersion: "missing",
+                    content: "# Planning Memory\n\n- [OfferAgent](project/offeragent.md) - Project direction\n",
+                  },
+                ]
+              : userInput.trim() === "planning_memory_daily_invalid_action"
+                ? ["invalid-action"]
+                : userInput.trim() === "planning_memory_daily_update"
+                  ? [
+                      {
+                        actionId: "foreground-study-update",
+                        idempotencyKey: "foreground-study-update",
+                        operation: "exact_replace",
+                        path: "memory/study/retrieval-evaluation.md",
+                        expectedVersion: "sha256:study-topic",
+                        expectedContent: "Old study direction.\n",
+                        replacement: "Study retrieval evaluation across the next three days.\n",
+                      },
+                      {
+                        actionId: "foreground-study-update-index",
+                        idempotencyKey: "foreground-study-update-index",
+                        operation: "exact_replace",
+                        path: "memory/MEMORY.md",
+                        expectedVersion: "sha256:memory-index",
+                        expectedContent: "# Planning Memory\n",
+                        replacement: "# Planning Memory\n\n- [Retrieval evaluation](study/retrieval-evaluation.md) - Three-day study direction\n",
+                      },
+                    ]
+                  : userInput.trim() === "planning_memory_daily_delete"
+                  ? [
+                      {
+                        actionId: "foreground-study-delete",
+                        idempotencyKey: "foreground-study-delete",
+                        operation: "delete",
+                        path: "memory/study/old-topic.md",
+                        expectedVersion: "sha256:old-topic",
+                      },
+                      {
+                        actionId: "foreground-study-delete-index",
+                        idempotencyKey: "foreground-study-delete-index",
+                        operation: "create",
+                        path: "memory/MEMORY.md",
+                        expectedVersion: "missing",
+                        content: "# Planning Memory\n",
+                      },
+                    ]
+                : [])],
+          },
+        };
+        return;
+      }
+      yield {
+        type: "output_text.delta",
+        delta: "I will study retrieval evaluation across the next three days.",
+      };
       return;
     }
     const precedence = /^planning_memory_precedence\s+(\w+)$/i.exec(userInput.trim());

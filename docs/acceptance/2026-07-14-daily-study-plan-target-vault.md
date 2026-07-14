@@ -32,7 +32,7 @@ The installed plugin files exactly matched the built artifacts after the final d
 | --- | --- |
 | `main.js` | `fa244751f07c0822979b8b432c4629ffe373ed109637543228dea3a87f257b68` |
 | `manifest.json` | `3277f0a0fc663f83ca6098479a8bff54bc25f879212924282f862628a8515304` |
-| `runtime.js` | `cff461b6bd19dea539a1742569ca4596c339c8a2d38b7ad35f1f8780d0eb1cfb` |
+| `runtime.js` | `d150b53aee570ad61cf8d9f60f3b3241deea0717374f3cf3e16f3c0e8728012b` |
 | `styles.css` | `9115509e0a52efbcea682a792ad2d1e631a829dadc3c0aeafeff84388cdbbef2` |
 
 ## Exact two-message live regression
@@ -107,10 +107,11 @@ No diagnostic hook or provider trace file remains in the repository or deployed 
 
 ## Final gate
 
-- `npm.cmd test`: 161 tests, 160 passed, 1 explicit live-only skip, 0 failed.
+- `npm.cmd test`: 163 tests, 162 passed, 1 explicit live-only skip, 0 failed.
 - `npm.cmd run build`: passed, including TypeScript typecheck and packaged plugin/runtime builds.
 - `git diff --check`: passed.
 - No temporary provider diagnostic hook or trace marker exists in source, tests, documentation, or the deployed runtime.
 - The smoke test pins its initial local date, so this record remains reproducible after midnight.
 - Review regressions verify out-of-order Responses `output_index` completion and stale-evidence pruning without disturbing reasoning/call/result replay order.
+- Before a resolved Daily target is applied, semantic capture augments that same proposal with any missing durable memory actions; a later fallback excludes only Study operations while preserving unrelated User, Feedback, and Project capture. The regression uses a configured `journal/` target, and a committed-result/lost-checkpoint Resume case, to prove this is neither hardcoded to `daily/` nor split across transactions.
 - The final built package was redeployed after review fixes; plugin reload succeeded, every installed artifact matched the build, and the subsequent deployment preview was clean.

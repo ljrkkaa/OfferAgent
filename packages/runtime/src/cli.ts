@@ -1439,6 +1439,8 @@ async function startRuntime({
           let planningTopics: MemoryTopicMetadata[] = [];
           let planningTopicsTruncated = false;
           let memoryHandledByMain = checkpoint?.memoryHandledByMain ?? false;
+          let dailyPlanApplied = checkpoint?.dailyPlanApplied ?? false;
+          const resolvedDailyNotePaths = new Set(checkpoint?.resolvedDailyNotePaths ?? []);
           const changedMemoryPaths = new Set(checkpoint?.changedMemoryPaths ?? []);
           let postResponseOutput = checkpoint?.postResponseOutput;
           let postResponseCitations = checkpoint?.postResponseCitations ?? [];
@@ -1462,6 +1464,10 @@ async function startRuntime({
               ...(fastMode ? { fastMode: true } : {}),
               completedSteps,
               ...(memoryHandledByMain ? { memoryHandledByMain: true } : {}),
+              ...(dailyPlanApplied ? { dailyPlanApplied: true } : {}),
+              ...(resolvedDailyNotePaths.size > 0
+                ? { resolvedDailyNotePaths: [...resolvedDailyNotePaths] }
+                : {}),
               ...(changedMemoryPaths.size > 0 ? { changedMemoryPaths: [...changedMemoryPaths] } : {}),
               ...(postResponseOutput !== undefined ? { postResponseOutput } : {}),
               ...(postResponseCitations.length > 0 ? { postResponseCitations } : {}),
@@ -1504,6 +1510,9 @@ async function startRuntime({
             }
             if (recoveredResult) {
               const recoveredFallback = pendingToolStep.providerCallId.startsWith("memory-fallback-");
+              if (recoveredResult.ok && recoveredResult.value.type === "daily_note_context") {
+                resolvedDailyNotePaths.add(recoveredResult.value.targetPath);
+              }
               if (!recoveredFallback) {
                 input.push({
                   type: "local_tool_result",
@@ -1523,6 +1532,15 @@ async function startRuntime({
                     changedMemoryPaths.add(path);
                   }
                 }
+              }
+              if (
+                !recoveredFallback &&
+                recoveredResult.ok &&
+                recoveredResult.value.type === "vault_propose_changes" &&
+                recoveredResult.value.decision === "applied" &&
+                recoveredResult.value.targets.some(({ path }) => resolvedDailyNotePaths.has(path))
+              ) {
+                dailyPlanApplied = true;
               }
               if (recoveredFallback) {
                 output = postResponseOutput ?? "";
@@ -1912,11 +1930,123 @@ async function startRuntime({
                 await saveCheckpoint();
                 break;
               }
-              assertBoundedToolArguments(providerEvent.arguments);
+              let effectiveProviderEvent = providerEvent;
+              if (
+                providerEvent.name === "vault_propose_changes" &&
+                providerEvent.arguments &&
+                typeof providerEvent.arguments === "object" &&
+                !Array.isArray(providerEvent.arguments)
+              ) {
+                const proposal = providerEvent.arguments as Record<string, unknown>;
+                const rawProposalActions = Array.isArray(proposal.actions) ? proposal.actions : [];
+                const proposalActionsAreObjects = rawProposalActions.every(
+                  (candidate) => Boolean(candidate) && typeof candidate === "object" && !Array.isArray(candidate),
+                );
+                if (!proposalActionsAreObjects) {
+                  throw new ModelProviderError(
+                    "provider_error",
+                    "The model returned a Vault proposal with malformed actions. Replan a valid batch without altering the original request.",
+                  );
+                }
+                const proposalActions = rawProposalActions as Record<string, unknown>[];
+                const touchesResolvedDaily = proposalActions.some(
+                  ({ path }) => typeof path === "string" && resolvedDailyNotePaths.has(path),
+                );
+                const proposedMemoryPaths = new Set(
+                  proposalActions.flatMap(({ path }) =>
+                    typeof path === "string" &&
+                    /^(?:memory\/MEMORY\.md|memory\/(?:user|feedback|project|study)\/[^/]+\.md)$/.test(path)
+                      ? [path]
+                      : [],
+                  ),
+                );
+                const hasProposedStudyTopic = proposalActions.some(({ path, operation }) =>
+                  typeof path === "string" &&
+                  /^memory\/study\/[^/]+\.md$/.test(path) &&
+                  (operation === "create" || operation === "append" || operation === "exact_replace"),
+                );
+                const hasProposedMemoryIndex = proposedMemoryPaths.has("memory/MEMORY.md");
+                if (
+                  touchesResolvedDaily &&
+                  planningTopicsTruncated &&
+                  (!hasProposedStudyTopic || !hasProposedMemoryIndex)
+                ) {
+                  throw new ModelProviderError(
+                    "provider_error",
+                    "Cannot safely apply a Daily plan while Planning Memory metadata is truncated. Replan with an explicit atomic Daily, Study topic, and Planning Memory index batch.",
+                  );
+                }
+                if (touchesResolvedDaily && !planningTopicsTruncated) {
+                  const capture = new ProviderSemanticMemoryCapture({
+                    provider,
+                    model,
+                    fastMode,
+                    signal: controller.signal,
+                  });
+                  const recalledTopics = [...recalledMemory.feedback, ...recalledMemory.planning];
+                  let operations: MemoryCaptureOperation[];
+                  try {
+                    operations = await capture.extractStrict({
+                      newMessages: [
+                        { type: "user_message", text: userInput },
+                        {
+                          type: "assistant_message",
+                          text: `${output}\n\nProposed atomic Daily plan:\n${JSON.stringify(proposalActions)}`,
+                        },
+                      ],
+                      recalledTopics,
+                    });
+                    operations = operations.filter(({ path }) => !proposedMemoryPaths.has(path));
+                    if (operations.length > 0 && proposedMemoryPaths.size > 0) {
+                      throw new Error(
+                        "The Daily proposal already owns Planning Memory but omits other durable memory. Replan one complete atomic batch.",
+                      );
+                    }
+                  } catch (error) {
+                    throw new ModelProviderError(
+                      "provider_error",
+                      "Could not verify durable Planning Memory before applying the Daily plan.",
+                      { cause: error },
+                    );
+                  }
+                  if (operations.length > 0) {
+                    const indexRead = await executeLocalTool("vault_read", { path: "memory/MEMORY.md" });
+                    const index = indexRead.result.ok && indexRead.result.value.type === "vault_read"
+                      ? {
+                          content: indexRead.result.value.content,
+                          modifiedVersion: indexRead.result.value.modifiedVersion,
+                        }
+                      : undefined;
+                    const change = buildMemoryChangeActions({
+                      operations,
+                      topics: planningTopics,
+                      bodies: recalledTopics,
+                      index,
+                    });
+                    if (change) {
+                      effectiveProviderEvent = {
+                        ...providerEvent,
+                        arguments: {
+                          ...proposal,
+                          actions: [
+                            ...proposalActions,
+                            ...change.actions.map((action, index) => ({
+                              ...action,
+                              actionId: `${action.actionId}-daily-${index + 1}-${runCommand.agentRunId}`,
+                              idempotencyKey: `${action.idempotencyKey}-daily-${index + 1}-${runCommand.agentRunId}`,
+                            })),
+                          ],
+                        },
+                      };
+                    }
+                  }
+                }
+              }
+              assertBoundedToolArguments(effectiveProviderEvent.arguments);
               appendProviderStepItems(providerEvent);
               const { result, stalePaths } = await executeLocalTool(
-                providerEvent.name,
-                providerEvent.arguments,
+                effectiveProviderEvent.name,
+                effectiveProviderEvent.arguments,
                 { completedSteps: step + 1, providerCallId: providerEvent.callId },
               );
               pendingToolStep = undefined;
@@ -1954,6 +2084,9 @@ async function startRuntime({
                 for (const stalePath of stalePaths) requiredRereads.add(stalePath);
               }
               if (currentReadPath) requiredRereads.delete(currentReadPath);
+              if (result.ok && result.value.type === "daily_note_context") {
+                resolvedDailyNotePaths.add(result.value.targetPath);
+              }
               const providerResult: LocalToolResultPayload =
                 stalePaths.length > 0 &&
                 !currentReadPath &&
@@ -1978,6 +2111,12 @@ async function startRuntime({
                 if (memoryPaths.length > 0 && result.value.decision === "applied") {
                   memoryHandledByMain = true;
                     for (const path of memoryPaths) changedMemoryPaths.add(path);
+                }
+                if (
+                  result.value.decision === "applied" &&
+                  result.value.targets.some(({ path }) => resolvedDailyNotePaths.has(path))
+                ) {
+                  dailyPlanApplied = true;
                 }
               }
               completedSteps = step + 1;
@@ -2048,6 +2187,9 @@ async function startRuntime({
                 });
               } catch {
                 operations = [];
+              }
+              if (dailyPlanApplied) {
+                operations = operations.filter(({ path }) => !path.startsWith("memory/study/"));
               }
               if (operations.length > 0) {
                 const indexRead = await executeLocalTool("vault_read", { path: "memory/MEMORY.md" });

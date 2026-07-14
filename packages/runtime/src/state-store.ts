@@ -32,7 +32,9 @@ export interface RunCheckpoint {
   input: ModelConversationItem[];
   localSkills: string[];
   changedMemoryPaths?: string[];
+  dailyPlanApplied?: boolean;
   memoryHandledByMain?: boolean;
+  resolvedDailyNotePaths?: string[];
   postResponseCitations?: WebCitation[];
   postResponseOutput?: string;
   pendingToolStep?: {
@@ -111,7 +113,11 @@ function persistedRunCheckpoint(checkpoint: RunCheckpoint): RunCheckpoint {
     requiredRereads: checkpoint.requiredRereads,
     hostedWebSearchProbeAttempted: checkpoint.hostedWebSearchProbeAttempted,
     completedSteps: checkpoint.completedSteps,
+    ...(checkpoint.dailyPlanApplied ? { dailyPlanApplied: true } : {}),
     ...(checkpoint.memoryHandledByMain ? { memoryHandledByMain: true } : {}),
+    ...(checkpoint.resolvedDailyNotePaths?.length
+      ? { resolvedDailyNotePaths: [...new Set(checkpoint.resolvedDailyNotePaths)] }
+      : {}),
     ...(checkpoint.changedMemoryPaths?.length
       ? { changedMemoryPaths: [...new Set(checkpoint.changedMemoryPaths)] }
       : {}),

@@ -835,7 +835,9 @@ test("post-response fallback phase survives interruption for direct finalization
     requiredRereads: [],
     hostedWebSearchProbeAttempted: false,
     completedSteps: 1,
+    dailyPlanApplied: true,
     memoryHandledByMain: true,
+    resolvedDailyNotePaths: ["journal/2026-07-14.md"],
     changedMemoryPaths: ["memory/study/current.md"],
     postResponseOutput: "The answer produced before fallback.",
     postResponseCitations: [],
@@ -844,6 +846,8 @@ test("post-response fallback phase survives interruption for direct finalization
   const resumed = await store.resumeAgentRun("post-response-conversation", "post-response-run");
   assert.equal(resumed.checkpoint.postResponseOutput, "The answer produced before fallback.");
   assert.equal(resumed.checkpoint.memoryHandledByMain, true);
+  assert.equal(resumed.checkpoint.dailyPlanApplied, true);
+  assert.deepEqual(resumed.checkpoint.resolvedDailyNotePaths, ["journal/2026-07-14.md"]);
   assert.deepEqual(resumed.checkpoint.changedMemoryPaths, ["memory/study/current.md"]);
   assert.equal(resumed.checkpoint.pendingToolStep, undefined);
   await store.close();

@@ -150,6 +150,25 @@ test("semantic capture receives only current-run messages and validates confined
   assert.deepEqual(validateCaptureOperations([{ kind: "delete", path: "../outside.md" }]), []);
 });
 
+test("strict semantic capture distinguishes malformed output from a valid empty result", async () => {
+  const capture = new ProviderSemanticMemoryCapture({
+    provider: {
+      stream: async function* () {
+        yield { type: "output_text.delta", delta: "{malformed" };
+      },
+    },
+    model: "test",
+    fastMode: false,
+    signal: new AbortController().signal,
+  });
+  const input = {
+    newMessages: [{ type: "user_message", text: "new direction" }],
+    recalledTopics: [],
+  };
+  assert.deepEqual(await capture.extract(input), []);
+  await assert.rejects(capture.extractStrict(input), /not valid JSON/);
+});
+
 test("capture batches consolidate, delete, and keep the concise index atomic", () => {
   const existing = {
     path: "memory/study/old.md",

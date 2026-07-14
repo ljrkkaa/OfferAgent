@@ -73,6 +73,17 @@ export class ProviderSemanticMemoryCapture {
   }
 
   async extract(input: { newMessages: ModelConversationItem[]; recalledTopics: RecalledMemoryTopic[] }): Promise<MemoryCaptureOperation[]> {
+    return this.#extract(input, false);
+  }
+
+  async extractStrict(input: { newMessages: ModelConversationItem[]; recalledTopics: RecalledMemoryTopic[] }): Promise<MemoryCaptureOperation[]> {
+    return this.#extract(input, true);
+  }
+
+  async #extract(
+    input: { newMessages: ModelConversationItem[]; recalledTopics: RecalledMemoryTopic[] },
+    strict: boolean,
+  ): Promise<MemoryCaptureOperation[]> {
     let output = "";
     for await (const event of this.#provider.stream({
       model: this.#model,
@@ -84,25 +95,38 @@ export class ProviderSemanticMemoryCapture {
     })) {
       if (event.type !== "output_text.delta") continue;
       output += event.delta;
-      if (Buffer.byteLength(output, "utf8") > 65_536) return [];
+      if (Buffer.byteLength(output, "utf8") > 65_536) {
+        if (strict) throw new Error("Planning Memory capture output exceeds 65536 UTF-8 bytes.");
+        return [];
+      }
     }
+    let parsed: unknown;
     try {
-      return validateCaptureOperations(JSON.parse(output));
+      parsed = JSON.parse(output);
     } catch {
+      if (strict) throw new Error("Planning Memory capture output is not valid JSON.");
       return [];
     }
+    const operations = parseCaptureOperations(parsed);
+    if (operations) return operations;
+    if (strict) throw new Error("Planning Memory capture output contains invalid operations.");
+    return [];
   }
 }
 
 export function validateCaptureOperations(value: unknown): MemoryCaptureOperation[] {
-  if (!Array.isArray(value) || value.length > 3) return [];
+  return parseCaptureOperations(value) ?? [];
+}
+
+function parseCaptureOperations(value: unknown): MemoryCaptureOperation[] | undefined {
+  if (!Array.isArray(value) || value.length > 3) return undefined;
   const operations: MemoryCaptureOperation[] = [];
   const paths = new Set<string>();
   for (const candidate of value) {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return undefined;
     const operation = candidate as Record<string, unknown>;
     const match = typeof operation.path === "string" ? MEMORY_PATH.exec(operation.path) : null;
-    if (!match || paths.has(operation.path as string)) return [];
+    if (!match || paths.has(operation.path as string)) return undefined;
     if (operation.kind === "delete" && Object.keys(operation).every((key) => key === "kind" || key === "path")) {
       operations.push({ kind: "delete", path: operation.path as string });
     } else if (
@@ -122,7 +146,7 @@ export function validateCaptureOperations(value: unknown): MemoryCaptureOperatio
         description: operation.description.trim(),
         content: operation.content.trim(),
       });
-    } else return [];
+    } else return undefined;
     paths.add(operation.path as string);
   }
   return operations;
