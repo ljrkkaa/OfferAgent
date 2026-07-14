@@ -15,9 +15,11 @@ import { interviewDeduplicationEvent } from "./fake-interview-deduplication-scen
 import { interviewUrlIngestionEvent } from "./fake-interview-url-scenario";
 import { multiImageInterviewEvent } from "./fake-multi-image-scenario";
 import { publicInterviewResearchEvents } from "./fake-public-interview-research-scenario";
+import { dynamicInterviewResearchEvent } from "./fake-dynamic-interview-research-scenario";
 import { toolResultFor, toolResultForAfter } from "./fake-provider-conversation";
 
 export const FAKE_SCENARIOS = [
+  "dynamic-interview-research",
   "interview-deduplication",
   "multi-image-interview-ingestion",
   "public-interview-research",
@@ -218,6 +220,13 @@ export class FakeModelProvider implements ModelProvider {
     }
     if (this.#scenario === "interview-deduplication") {
       yield interviewDeduplicationEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
+      return;
+    }
+    if (this.#scenario === "dynamic-interview-research") {
+      yield dynamicInterviewResearchEvent(request, (prefix) => {
         this.#toolCallSequence += 1;
         return `${prefix}-${this.#toolCallSequence}`;
       });

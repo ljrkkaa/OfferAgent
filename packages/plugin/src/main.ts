@@ -24,6 +24,7 @@ import {
   type VaultPermissionMode,
 } from "./vault-change-coordinator";
 import { resolveLocalToday } from "./daily-note-context";
+import { createHostResearchBrowser, type ResearchBrowser } from "./research-browser";
 
 const SIDEBAR_VIEW_TYPE = "offeragent-sidebar";
 const localMoment = moment as unknown as {
@@ -538,6 +539,7 @@ class OfferAgentSidebarView extends ItemView {
 
 export default class OfferAgentPlugin extends Plugin {
   #controller?: SidebarController;
+  #researchBrowser?: ResearchBrowser;
   #runtime?: RuntimeSupervisor;
   #settings: OfferAgentPluginSettings = { ...DEFAULT_SETTINGS };
 
@@ -568,6 +570,8 @@ export default class OfferAgentPlugin extends Plugin {
         formatDate: (date, format) => localMoment(date, "YYYY-MM-DD", true).format(format),
       },
     );
+    const researchBrowser = createHostResearchBrowser();
+    this.#researchBrowser = researchBrowser;
     let runtime!: RuntimeSupervisor;
     const checkpointStore = new GitCheckpointStore(vaultRoot);
     const changeCoordinator = new VaultChangeCoordinator(
@@ -586,10 +590,13 @@ export default class OfferAgentPlugin extends Plugin {
     runtime = new RuntimeSupervisor({
       runtimePath,
       statePath: process.env.OFFERAGENT_RUNTIME_STATE_PATH,
+      onCancelAgentRun: (agentRunId) => researchBrowser.cancelRun(agentRunId),
       toolExecutor: {
         execute: (event) =>
           event.tool.name === "vault_propose_changes"
             ? changeCoordinator.execute(event)
+            : event.tool.name === "research_browser"
+              ? researchBrowser.execute(event)
             : readTools.execute(event),
       },
     });
@@ -630,6 +637,7 @@ export default class OfferAgentPlugin extends Plugin {
 
   async onunload(): Promise<void> {
     await this.#controller?.stop();
+    await this.#researchBrowser?.close();
     this.app.workspace.detachLeavesOfType(SIDEBAR_VIEW_TYPE);
   }
 

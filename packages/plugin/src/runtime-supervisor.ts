@@ -56,6 +56,7 @@ export interface RuntimeSupervisorOptions {
   statePath?: string;
   startupTimeoutMs?: number;
   toolExecutor?: LocalToolExecutor;
+  onCancelAgentRun?: (agentRunId: string) => void;
 }
 
 export interface LocalToolExecutor {
@@ -493,6 +494,7 @@ export class RuntimeSupervisor implements RuntimeClient {
     Pick<RuntimeSupervisorOptions, "parentPid" | "provider" | "runtimePath" | "startupTimeoutMs">
   > & { nodeCandidates: string[]; statePath?: string };
   readonly #toolExecutor?: LocalToolExecutor;
+  readonly #onCancelAgentRun?: (agentRunId: string) => void;
   readonly #unavailableSubscribers = new Set<UnavailableSubscriber>();
   #child?: RuntimeChild;
   #connection?: RuntimeConnection;
@@ -521,6 +523,7 @@ export class RuntimeSupervisor implements RuntimeClient {
       startupTimeoutMs: options.startupTimeoutMs ?? 10_000,
     };
     this.#toolExecutor = options.toolExecutor;
+    this.#onCancelAgentRun = options.onCancelAgentRun;
   }
 
   onUnavailable(subscriber: UnavailableSubscriber): () => void {
@@ -836,6 +839,7 @@ export class RuntimeSupervisor implements RuntimeClient {
   }
 
   cancelAgentRun(request: Pick<AgentRunRequest, "agentRunId" | "conversationId">): void {
+    this.#onCancelAgentRun?.(request.agentRunId);
     const socket = this.#eventSocket;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     const cancel: AgentRunCancel = {

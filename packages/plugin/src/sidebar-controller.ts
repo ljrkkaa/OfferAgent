@@ -131,6 +131,7 @@ const TOOL_ACTIONS: Record<ToolCallRecord["name"], string> = {
   interview_catalog: "Search interview catalog",
   planning_memory_list: "Scan Planning Memory",
   planning_memory_read: "Recall Planning Memory",
+  research_browser: "Research in browser",
   hosted_web_search_probe: "Probe web search",
   skill_read: "Read skill",
   vault_list: "List",

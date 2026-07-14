@@ -98,6 +98,7 @@ export type LocalToolName =
   | "interview_catalog"
   | "planning_memory_list"
   | "planning_memory_read"
+  | "research_browser"
   | "skill_read"
   | "vault_list"
   | "vault_propose_changes"
@@ -173,6 +174,32 @@ export interface WebReadResult {
 export interface HostedWebSearchProbeResult {
   status: HostedWebSearchCapability;
   type: "hosted_web_search_probe";
+}
+
+export type ResearchBrowserAction =
+  | "back"
+  | "enumerate"
+  | "follow"
+  | "open"
+  | "paginate"
+  | "read";
+
+export interface ResearchBrowserResult {
+  action: ResearchBrowserAction;
+  content?: string;
+  entries?: Array<{
+    id: string;
+    title: string;
+    url: string;
+  }>;
+  message?: string;
+  sourceFingerprint?: string;
+  status: "login_required" | "ready";
+  title: string;
+  truncated?: boolean;
+  type: "research_browser";
+  untrusted: true;
+  url: string;
 }
 
 export interface AgentContractResult {
@@ -396,6 +423,7 @@ export type LocalToolResultPayload =
         | InterviewCatalogResult
         | PlanningMemoryListResult
         | PlanningMemoryReadResult
+        | ResearchBrowserResult
         | SkillReadResult
         | VaultListResult
         | VaultChangeResult

@@ -846,6 +846,182 @@ test("Run Checkpoints do not persist Agent Contract, Local Skill, or pending pro
   assert.equal(databaseText.includes(attachmentIdMarker), false);
 });
 
+test("Research Browser rendered content and enumerated links are ephemeral", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-research-ephemeral-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const store = await RuntimeStateStore.open(statePath);
+  const contentMarker = "HOSTILE-RENDERED-PAGE-MUST-NOT-PERSIST";
+  const linkMarker = "https://dynamic.example/private-result-marker";
+  const credentialMarker = "OAUTH-CODE-MUST-NOT-PERSIST";
+  const sessionMarker = "OAUTH-STATE-MUST-NOT-PERSIST";
+  const failureMarker = "ELECTRON-FAILURE-URL-MUST-NOT-PERSIST";
+  await store.beginAgentRun("research-conversation", "research-run", "fake-interview-model", "research it");
+  const callEvent = {
+    type: "tool_call.requested",
+    protocolVersion: 1,
+    eventId: "research-request-event",
+    conversationId: "research-conversation",
+    agentRunId: "research-run",
+    sequence: 2,
+    toolCallId: "research-tool-call",
+    tool: {
+      kind: "local",
+      name: "research_browser",
+      arguments: {
+        action: "open",
+        url: `https://dynamic.example/signin-oidc?code=${credentialMarker}&state=${sessionMarker}&view=interview`,
+      },
+    },
+  };
+  await store.requestToolCall("research-run", callEvent);
+  const result = {
+    ok: true,
+    value: {
+      type: "research_browser",
+      action: "read",
+      status: "ready",
+      title: "Dynamic interview",
+      url: "https://dynamic.example/interview/42",
+      content: `${contentMarker}\n${linkMarker}`,
+      sourceFingerprint: `sha256:${"a".repeat(64)}`,
+      truncated: false,
+      untrusted: true,
+    },
+  };
+  await store.completeToolCall("research-run", result, {
+    type: "tool_call.completed",
+    protocolVersion: 1,
+    eventId: "research-completed-event",
+    conversationId: "research-conversation",
+    agentRunId: "research-run",
+    sequence: 3,
+    toolCallId: "research-tool-call",
+    tool: { kind: "local", name: "research_browser" },
+    status: "completed",
+  });
+  await store.requestToolCall("research-run", {
+    ...callEvent,
+    eventId: "research-enumerate-request-event",
+    sequence: 4,
+    toolCallId: "research-enumerate-tool-call",
+    tool: { kind: "local", name: "research_browser", arguments: { action: "enumerate", limit: 10 } },
+  });
+  await store.completeToolCall("research-run", {
+    ok: true,
+    value: {
+      type: "research_browser",
+      action: "enumerate",
+      status: "ready",
+      title: "Dynamic interview search",
+      url: "https://dynamic.example/search",
+      entries: [{ id: "result-1", title: "Private marker", url: linkMarker }],
+      truncated: false,
+      untrusted: true,
+    },
+  }, {
+    type: "tool_call.completed",
+    protocolVersion: 1,
+    eventId: "research-enumerate-completed-event",
+    conversationId: "research-conversation",
+    agentRunId: "research-run",
+    sequence: 5,
+    toolCallId: "research-enumerate-tool-call",
+    tool: { kind: "local", name: "research_browser" },
+    status: "completed",
+  });
+  await store.requestToolCall("research-run", {
+    ...callEvent,
+    eventId: "research-failed-request-event",
+    sequence: 6,
+    toolCallId: "research-failed-tool-call",
+    tool: {
+      kind: "local",
+      name: "research_browser",
+      arguments: { action: "open", url: `https://dynamic.example/cb?code=${failureMarker}` },
+    },
+  });
+  await store.completeToolCall("research-run", {
+    ok: false,
+    error: {
+      code: "tool_error",
+      message: `ERR_FAILED loading https://dynamic.example/cb?code=${failureMarker}`,
+    },
+  }, {
+    type: "tool_call.completed",
+    protocolVersion: 1,
+    eventId: "research-failed-completed-event",
+    conversationId: "research-conversation",
+    agentRunId: "research-run",
+    sequence: 7,
+    toolCallId: "research-failed-tool-call",
+    tool: { kind: "local", name: "research_browser" },
+    status: "failed",
+    error: {
+      code: "tool_error",
+      message: `ERR_FAILED loading https://dynamic.example/cb?code=${failureMarker}`,
+    },
+  });
+  await store.saveRunCheckpoint("research-run", {
+    version: 1,
+    input: [
+      { type: "user_message", text: "research it" },
+      { type: "local_tool_call", callId: "research-provider-call", name: "research_browser", arguments: { action: "read" } },
+      { type: "local_tool_result", callId: "research-provider-call", result },
+    ],
+    localSkills: [],
+    canonicalReadPaths: [],
+    requiredRereads: [],
+    hostedWebSearchProbeAttempted: false,
+    completedSteps: 1,
+    pendingToolStep: {
+      completedSteps: 1,
+      name: "research_browser",
+      providerCallId: "research-provider-call",
+      toolCallId: "research-tool-call",
+    },
+  });
+  await store.interruptAgentRun("research-run");
+  const resumed = await store.resumeAgentRun("research-conversation", "research-run");
+  assert.deepEqual(resumed.checkpoint.input, [{ type: "user_message", text: "research it" }]);
+  assert.equal(resumed.checkpoint.pendingToolStep, undefined);
+  const stored = await store.getToolCallResult("research-tool-call", "research-run");
+  assert.equal(stored.value.content, undefined);
+  const storedEnumeration = await store.getToolCallResult("research-enumerate-tool-call", "research-run");
+  assert.equal(storedEnumeration.value.entries, undefined);
+  await store.close();
+  const stateBytes = await readFile(statePath);
+  const SQL = await initSqlJs();
+  const database = new SQL.Database(stateBytes);
+  const storedArguments = JSON.parse(database.exec(
+    "SELECT arguments_json FROM tool_calls WHERE id = 'research-tool-call'",
+  )[0].values[0][0]);
+  assert.deepEqual(storedArguments, { action: "open" });
+  const storedRequestEvent = JSON.parse(database.exec(
+    "SELECT payload_json FROM durable_events WHERE id = 'research-request-event'",
+  )[0].values[0][0]);
+  assert.deepEqual(storedRequestEvent.tool.arguments, { action: "open" });
+  const [storedFailureMessage, storedFailureResult] = database.exec(
+    "SELECT error_message, result_json FROM tool_calls WHERE id = 'research-failed-tool-call'",
+  )[0].values[0];
+  assert.equal(storedFailureMessage, "The Research Browser action failed.");
+  assert.equal(
+    JSON.parse(storedFailureResult).error.message,
+    "The Research Browser action failed.",
+  );
+  const storedFailureEvent = database.exec(
+    "SELECT payload_json FROM durable_events WHERE id = 'research-failed-completed-event'",
+  )[0].values[0][0];
+  assert.equal(storedFailureEvent.includes(failureMarker), false);
+  database.close();
+  const databaseText = stateBytes.toString("utf8");
+  assert.equal(databaseText.includes(contentMarker), false);
+  assert.equal(databaseText.includes(linkMarker), false);
+  assert.equal(databaseText.includes(credentialMarker), false);
+  assert.equal(databaseText.includes(sessionMarker), false);
+  assert.equal(databaseText.includes(failureMarker), false);
+});
+
 test("post-response fallback phase survives interruption for direct finalization", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-post-response-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
