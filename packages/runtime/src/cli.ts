@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createServer, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
@@ -51,6 +51,11 @@ import {
 } from "./fake-web-fixture";
 import { CapabilityGatedModelProvider } from "./capability-gated-provider";
 import {
+  RunAttachmentError,
+  RunAttachmentModule,
+  type MaterializedRunAttachment,
+} from "./run-attachments";
+import {
   buildMemoryChangeActions,
   PlanningMemoryModule,
   ProviderSemanticMemoryCapture,
@@ -61,6 +66,7 @@ import {
 } from "./planning-memory";
 
 interface RuntimeOptions {
+  attachmentsPath?: string;
   fakeScenario?: FakeScenario;
   fakeWebFixture?: FakeWebFixture;
   parentPid: number;
@@ -676,6 +682,10 @@ function readOptions(): RuntimeOptions {
   }
   const statePathIndex = process.argv.indexOf("--state-path");
   const statePath = statePathIndex === -1 ? undefined : readOption("--state-path");
+  const attachmentsPathIndex = process.argv.indexOf("--attachments-path");
+  const attachmentsPath = attachmentsPathIndex === -1
+    ? undefined
+    : readOption("--attachments-path");
   const fakeScenario = process.argv.includes("--fake-scenario")
     ? readOption("--fake-scenario")
     : undefined;
@@ -695,6 +705,7 @@ function readOptions(): RuntimeOptions {
     throw new Error("--fake-web-fixture requires --provider fake");
   }
   return {
+    ...(attachmentsPath ? { attachmentsPath } : {}),
     ...(fakeScenario ? { fakeScenario } : {}),
     ...(fakeWebFixture ? { fakeWebFixture } : {}),
     parentPid: parseIntegerOption("--parent-pid"),
@@ -711,6 +722,23 @@ function readOptions(): RuntimeOptions {
           )),
     token: readOption("--token"),
   };
+}
+
+async function readRequestBytes(request: IncomingMessage, maximumBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of request) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+    size += bytes.byteLength;
+    if (size > maximumBytes) {
+      throw new RunAttachmentError(
+        "attachment_too_large",
+        `The image exceeds the ${maximumBytes} byte per-image limit.`,
+      );
+    }
+    chunks.push(bytes);
+  }
+  return Buffer.concat(chunks, size);
 }
 
 function sendJson(
@@ -837,7 +865,15 @@ function isAgentRunStart(value: unknown): value is AgentRunStart {
     typeof message.model === "string" &&
     (message.fastMode === undefined || typeof message.fastMode === "boolean") &&
     message.input?.role === "user" &&
-    typeof message.input.text === "string"
+    typeof message.input.text === "string" &&
+    (message.input.attachments === undefined || (
+      Array.isArray(message.input.attachments) &&
+      message.input.attachments.length <= 1 &&
+      message.input.attachments.every((attachment, index) =>
+        isProtocolIdentifier(attachment.attachmentId) &&
+        attachment.order === index
+      )
+    ))
   );
 }
 
@@ -968,6 +1004,7 @@ async function handleConversationCommand(
   socket: WebSocket,
   command: ConversationCommand,
   store: RuntimeStateStore,
+  attachments: RunAttachmentModule,
 ): Promise<void> {
   const cacheable = command.type !== "conversation.open" && command.type !== "conversation.list";
   if (cacheable) {
@@ -1011,6 +1048,7 @@ async function handleConversationCommand(
     );
     event = { ...base, type: "conversation.updated", conversation };
   } else {
+    await attachments.deleteConversation(command.conversationId);
     await store.deleteConversation(command.conversationId);
     event = { ...base, type: "conversation.deleted" };
   }
@@ -1092,6 +1130,7 @@ async function handleVaultChangeCommand(
 }
 
 async function startRuntime({
+  attachmentsPath,
   fakeScenario,
   fakeWebFixture,
   parentPid,
@@ -1102,6 +1141,28 @@ async function startRuntime({
 }: RuntimeOptions): Promise<void> {
   const instanceId = randomUUID();
   const store = await RuntimeStateStore.open(statePath);
+  const attachments = new RunAttachmentModule({
+    directory:
+      attachmentsPath ??
+      path.join(
+        process.env.LOCALAPPDATA || path.join(homedir(), ".local", "share"),
+        "OfferAgent",
+        "attachments",
+      ),
+    metadata: store,
+  });
+  await attachments.sweepExpired();
+  const deleteTerminalAttachments = async (agentRunId: string): Promise<void> => {
+    try {
+      await attachments.deleteRun(agentRunId);
+    } catch (error) {
+      process.stderr.write(
+        `OfferAgent could not remove terminal Run Attachments: ${
+          error instanceof Error ? error.message : String(error)
+        }\n`,
+      );
+    }
+  };
   const provider = new CapabilityGatedModelProvider(
     createProvider(providerName, fakeScenario),
     store,
@@ -1119,6 +1180,7 @@ async function startRuntime({
       socket: WebSocket;
     }
   >();
+  const attachmentDiscards = new Set<string>();
   const pendingToolResults = new Map<
     string,
     {
@@ -1148,6 +1210,110 @@ async function startRuntime({
     }
 
     const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+
+    if (request.method === "POST" && requestUrl.pathname === "/attachments") {
+      const contentLength = Number(request.headers["content-length"]);
+      if (Number.isFinite(contentLength) && contentLength > 10 * 1024 * 1024) {
+        request.resume();
+        sendJson(response, 400, {
+          code: "attachment_too_large",
+          message: "The image exceeds the 10485760 byte per-image limit.",
+        });
+        return;
+      }
+      const conversationId = request.headers["x-offeragent-conversation-id"];
+      const agentRunId = request.headers["x-offeragent-agent-run-id"];
+      const encodedFileName = request.headers["x-offeragent-file-name"];
+      if (
+        typeof conversationId !== "string" ||
+        typeof agentRunId !== "string" ||
+        typeof encodedFileName !== "string" ||
+        !isProtocolIdentifier(conversationId) ||
+        !isProtocolIdentifier(agentRunId)
+      ) {
+        sendJson(response, 400, {
+          code: "invalid_attachment",
+          message: "Attachment ownership headers are missing or invalid.",
+        });
+        return;
+      }
+      let fileName: string;
+      try {
+        fileName = decodeURIComponent(encodedFileName);
+      } catch {
+        sendJson(response, 400, {
+          code: "invalid_attachment",
+          message: "The attachment file name is invalid.",
+        });
+        return;
+      }
+      void readRequestBytes(request, 10 * 1024 * 1024).then(
+        async (bytes) => {
+          const staged = await attachments.stage({
+            agentRunId,
+            bytes,
+            claimedMediaType: request.headers["content-type"],
+            conversationId,
+            fileName,
+          });
+          sendJson(response, 201, staged);
+        },
+      ).catch((error: unknown) => {
+        const attachmentError = error instanceof RunAttachmentError ? error : undefined;
+        sendJson(response, attachmentError ? 400 : 500, {
+          code: attachmentError?.code ?? "storage_error",
+          message: attachmentError?.message ?? "The Run Attachment could not be staged.",
+        });
+      });
+      return;
+    }
+
+    if (request.method === "DELETE" && requestUrl.pathname.startsWith("/attachments/")) {
+      const attachmentId = requestUrl.pathname.slice("/attachments/".length);
+      const conversationId = request.headers["x-offeragent-conversation-id"];
+      const agentRunId = request.headers["x-offeragent-agent-run-id"];
+      if (
+        !isProtocolIdentifier(attachmentId) ||
+        typeof conversationId !== "string" ||
+        typeof agentRunId !== "string" ||
+        !isProtocolIdentifier(conversationId) ||
+        !isProtocolIdentifier(agentRunId)
+      ) {
+        sendJson(response, 400, {
+          code: "invalid_attachment",
+          message: "Attachment ownership or identity is invalid.",
+        });
+        return;
+      }
+      if (activeRuns.has(agentRunId) || attachmentDiscards.has(agentRunId)) {
+        sendJson(response, 409, {
+          code: "run_already_started",
+          message: "A started Agent Run retains its attachment until a terminal state or Resume.",
+        });
+        return;
+      }
+      attachmentDiscards.add(agentRunId);
+      void (async () => {
+        if (await store.hasAgentRun(agentRunId)) {
+          sendJson(response, 409, {
+            code: "run_already_started",
+            message: "A started Agent Run retains its attachment until a terminal state or Resume.",
+          });
+          return;
+        }
+        await attachments.discard({ attachmentId, conversationId, agentRunId });
+        sendJson(response, 200, { status: "discarded" });
+      })().catch((error: unknown) => {
+        const attachmentError = error instanceof RunAttachmentError ? error : undefined;
+        sendJson(response, attachmentError ? 403 : 500, {
+          code: attachmentError?.code ?? "storage_error",
+          message: attachmentError?.message ?? "The Run Attachment could not be discarded.",
+        });
+      }).finally(() => {
+        attachmentDiscards.delete(agentRunId);
+      });
+      return;
+    }
 
     if (request.method === "GET" && request.url === "/health") {
       sendJson(response, 200, {
@@ -1355,7 +1521,7 @@ async function startRuntime({
         } else {
           activeProtocolCommands.set(message.eventId, { count: 1, identity });
         }
-        void handleConversationCommand(socket, message, store)
+        void handleConversationCommand(socket, message, store, attachments)
           .catch((error: unknown) => {
             if (isProtocolIdentityConflict(error)) {
               socket.close(1008, "Conflicting duplicate protocol event identity.");
@@ -1436,6 +1602,10 @@ async function startRuntime({
         return;
       }
       const runCommand = (startCommand ?? resumeCommand) as AgentRunStart | AgentRunResume;
+      if (attachmentDiscards.has(runCommand.agentRunId)) {
+        socket.close(1008, "The Run Attachment is being discarded; retry the Agent Run.");
+        return;
+      }
       const activeRun = activeRuns.get(runCommand.agentRunId);
       if (activeRun) {
         if (
@@ -1465,6 +1635,7 @@ async function startRuntime({
         let fastMode = startCommand?.fastMode ?? false;
         let userInput = startCommand?.input.text ?? "";
         let checkpoint: RunCheckpoint | undefined;
+        let materializedAttachments: MaterializedRunAttachment[] = [];
         let output = "";
         const citations: WebCitation[] = [];
         const base = {
@@ -1474,6 +1645,50 @@ async function startRuntime({
         };
         if (resumeCommand) {
           try {
+            const prepared = await store.inspectResumableAgentRun(
+              resumeCommand.conversationId,
+              resumeCommand.agentRunId,
+            );
+            checkpoint = prepared.checkpoint;
+            model = prepared.model;
+            fastMode = checkpoint.fastMode ?? false;
+            sequence = prepared.nextSequence;
+            const legacyRunInput = [...checkpoint.input].reverse().find(
+              (item): item is Extract<ModelConversationItem, { type: "user_message" }> =>
+                item.type === "user_message" &&
+                item.text !== EMPTY_RESPONSE_RECOVERY_PROMPT,
+            );
+            const originalRunInput = checkpoint.runInput ?? (legacyRunInput
+              ? { text: legacyRunInput.text, attachments: legacyRunInput.attachments }
+              : { text: "" });
+            userInput = originalRunInput.text;
+            const retainedAttachments = await store.listAttachmentsByRun(runCommand.agentRunId);
+            const usedAttachmentIds = new Set<string>();
+            const attachmentReferences = (originalRunInput.attachments ?? []).map((metadata) => {
+              const retained = retainedAttachments.find((candidate) =>
+                !usedAttachmentIds.has(candidate.attachmentId) &&
+                candidate.contentHash === metadata.contentHash &&
+                candidate.fileName === metadata.fileName &&
+                candidate.mediaType === metadata.mediaType &&
+                candidate.size === metadata.size
+              );
+              if (!retained) {
+                throw new RunAttachmentError(
+                  "attachment_missing",
+                  "The retained Run Attachment metadata is missing or expired.",
+                );
+              }
+              usedAttachmentIds.add(retained.attachmentId);
+              return { attachmentId: retained.attachmentId, order: metadata.order };
+            });
+            materializedAttachments = await Promise.all(
+              attachmentReferences.map((attachment) => attachments.materialize({
+                agentRunId: runCommand.agentRunId,
+                attachmentId: attachment.attachmentId,
+                conversationId: runCommand.conversationId,
+                order: attachment.order,
+              })),
+            );
             const resumable = await store.resumeAgentRun(
               resumeCommand.conversationId,
               resumeCommand.agentRunId,
@@ -1481,9 +1696,7 @@ async function startRuntime({
             );
             checkpoint = resumable.checkpoint;
             model = resumable.model;
-            fastMode = checkpoint.fastMode ?? false;
             sequence = resumable.nextSequence;
-            userInput = checkpoint.input.find((item) => item.type === "user_message")?.text ?? "";
             const active = activeRuns.get(runCommand.agentRunId);
             if (active) {
               active.input = userInput;
@@ -1516,6 +1729,16 @@ async function startRuntime({
             model,
           };
           try {
+            materializedAttachments = await Promise.all(
+              (startCommand.input.attachments ?? []).map((attachment) =>
+                attachments.materialize({
+                  agentRunId: startCommand.agentRunId,
+                  attachmentId: attachment.attachmentId,
+                  conversationId: startCommand.conversationId,
+                  order: attachment.order,
+                })
+              ),
+            );
             const began = await store.beginAgentRun(
               startCommand.conversationId,
               startCommand.agentRunId,
@@ -1523,6 +1746,9 @@ async function startRuntime({
               userInput,
               startedEvent,
               startCommand.eventId,
+              materializedAttachments.map(
+                ({ bytes: _bytes, attachmentId: _attachmentId, ...metadata }) => metadata,
+              ),
             );
             if (!began) {
               for (const event of await store.listUnacknowledgedEvents(startCommand.agentRunId)) {
@@ -1537,6 +1763,7 @@ async function startRuntime({
               activeRuns.delete(runCommand.agentRunId);
               return;
             }
+            await deleteTerminalAttachments(runCommand.agentRunId);
             const providerError = asModelProviderError(error);
             sendEvent(socket, {
               ...base,
@@ -1557,6 +1784,28 @@ async function startRuntime({
               runCommand.conversationId,
               runCommand.agentRunId,
             );
+          if (materializedAttachments.length > 0) {
+            const owningInputIndex = input.findLastIndex(
+              (item) => item.type === "user_message" && item.text === userInput,
+            );
+            if (owningInputIndex < 0) {
+              throw new RunAttachmentError(
+                "attachment_missing",
+                "The owning image message is missing from the Agent Run input.",
+              );
+            }
+            const owningInput = input[owningInputIndex];
+            input = input.map((item, index) =>
+              index === owningInputIndex && owningInput.type === "user_message"
+                ? {
+                    ...owningInput,
+                    attachments: materializedAttachments.map(
+                      ({ bytes: _bytes, ...attachment }) => attachment,
+                    ),
+                  }
+                : item,
+            );
+          }
           const requiredRereads = new Set(checkpoint?.requiredRereads ?? []);
           const canonicalReadPaths = new Map(checkpoint?.canonicalReadPaths ?? []);
           let agentContract: string | undefined;
@@ -1585,6 +1834,16 @@ async function startRuntime({
           const currentCheckpoint = (): RunCheckpoint => ({
               version: 1,
               input: checkpointInput(input),
+              runInput: {
+                text: userInput,
+                ...(materializedAttachments.length > 0
+                  ? {
+                      attachments: materializedAttachments.map(
+                        ({ bytes: _bytes, attachmentId: _attachmentId, ...metadata }) => metadata,
+                      ),
+                    }
+                  : {}),
+              },
               localSkills: [...new Set([...checkpointSkills, ...localSkills.keys()])],
               ...(pendingToolStep ? { pendingToolStep } : {}),
               canonicalReadPaths: [...canonicalReadPaths],
@@ -1954,6 +2213,16 @@ async function startRuntime({
               model,
               ...(fastMode ? { fastMode: true } : {}),
               input,
+              ...(materializedAttachments.length > 0
+                ? {
+                    imageInputs: materializedAttachments.map((attachment) => ({
+                      attachmentId: attachment.attachmentId,
+                      dataUrl: `data:${attachment.mediaType};base64,${attachment.bytes.toString("base64")}`,
+                      mediaType: attachment.mediaType,
+                      order: attachment.order,
+                    })),
+                  }
+                : {}),
               instructions: composeInstructions(agentContract, localSkills, recalledMemory),
               signal: controller.signal,
               tools:
@@ -2391,6 +2660,7 @@ async function startRuntime({
               },
             };
             await store.completeAgentRun(runCommand.agentRunId, output, completedEvent);
+            await deleteTerminalAttachments(runCommand.agentRunId);
             publishEvent(completedEvent);
             finished = true;
             break;
@@ -2423,6 +2693,7 @@ async function startRuntime({
               },
             };
             await store.completeAgentRun(runCommand.agentRunId, output, completedEvent);
+            await deleteTerminalAttachments(runCommand.agentRunId);
             publishEvent(completedEvent);
             finished = true;
           }
@@ -2442,6 +2713,7 @@ async function startRuntime({
             const transitioned = cancelled
               ? await store.cancelAgentRun(runCommand.agentRunId, terminalEvent as Extract<AgentRunEvent, { type: "agent_run.cancelled" }>)
               : await store.interruptAgentRun(runCommand.agentRunId, terminalEvent as Extract<AgentRunEvent, { type: "agent_run.interrupted" }>);
+            if (cancelled && transitioned) await deleteTerminalAttachments(runCommand.agentRunId);
             if (transitioned) publishEvent(terminalEvent);
             return;
           }
@@ -2459,6 +2731,7 @@ async function startRuntime({
             providerError.message,
             failedEvent,
           );
+          await deleteTerminalAttachments(runCommand.agentRunId);
           publishEvent(failedEvent);
         } finally {
           activeRuns.delete(runCommand.agentRunId);
@@ -2471,9 +2744,20 @@ async function startRuntime({
     if (!parentExists(parentPid)) shutdown();
   }, 500);
   parentWatch.unref();
+  const attachmentSweep = setInterval(() => {
+    void attachments.sweepExpired().catch((error: unknown) => {
+      process.stderr.write(
+        `OfferAgent could not sweep expired Run Attachments: ${
+          error instanceof Error ? error.message : String(error)
+        }\n`,
+      );
+    });
+  }, 60_000);
+  attachmentSweep.unref();
 
   const forceExit = (): void => {
     clearInterval(parentWatch);
+    clearInterval(attachmentSweep);
     process.exit(0);
   };
 
@@ -2481,6 +2765,7 @@ async function startRuntime({
     if (exiting) return;
     exiting = true;
     clearInterval(parentWatch);
+    clearInterval(attachmentSweep);
     for (const run of activeRuns.values()) run.controller.abort();
     for (const socket of sockets) socket.close(1001, "Runtime is shutting down.");
     webSockets.close();

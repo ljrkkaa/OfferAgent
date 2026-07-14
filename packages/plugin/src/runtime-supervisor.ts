@@ -22,12 +22,14 @@ import {
   type LocalToolResultPayload,
   type ModelDescriptor,
   type ProviderErrorCode,
+  type RunAttachmentReference,
   type RuntimeError,
   type RuntimeHandshake,
   type RuntimeHealth,
   type RuntimeHostedWebSearchCapability,
   type RuntimeModels,
   type RuntimeShutdown,
+  type StagedRunAttachment,
   type ToolCallRecord,
   type ToolResultCommand,
   type VaultChangeApplyingRequest,
@@ -64,6 +66,7 @@ export interface LocalToolExecutor {
 
 export interface AgentRunRequest {
   agentRunId: string;
+  attachments?: RunAttachmentReference[];
   conversationId: string;
   fastMode?: boolean;
   input: string;
@@ -85,6 +88,11 @@ export interface RuntimeClient {
   cancelAgentRun(request: Pick<AgentRunRequest, "agentRunId" | "conversationId">): void;
   createConversation(conversation: ConversationSummary): Promise<ConversationSummary>;
   deleteConversation(conversationId: string): Promise<void>;
+  discardAttachment(request: {
+    agentRunId: string;
+    attachmentId: string;
+    conversationId: string;
+  }): Promise<void>;
   listModels(): Promise<ModelDescriptor[]>;
   listConversations(): Promise<ConversationSummary[]>;
   onUnavailable(subscriber: UnavailableSubscriber): () => void;
@@ -94,6 +102,13 @@ export interface RuntimeClient {
   ): AsyncIterable<AgentRunEvent>;
   runAgent(request: AgentRunRequest): AsyncIterable<AgentRunEvent>;
   start(): Promise<RuntimeHandshake>;
+  stageAttachment(request: {
+    agentRunId: string;
+    bytes: Uint8Array;
+    conversationId: string;
+    fileName: string;
+    mediaType: string;
+  }): Promise<StagedRunAttachment>;
   stop(): Promise<void>;
   updateConversationModel(conversationId: string, modelId: string): Promise<ConversationSummary>;
 }
@@ -619,6 +634,109 @@ export class RuntimeSupervisor implements RuntimeClient {
     return response.models;
   }
 
+  async stageAttachment(input: {
+    agentRunId: string;
+    bytes: Uint8Array;
+    conversationId: string;
+    fileName: string;
+    mediaType: string;
+  }): Promise<StagedRunAttachment> {
+    const connection = this.#requiredConnection();
+    return new Promise((resolve, reject) => {
+      const bytes = Buffer.from(input.bytes);
+      const outgoing = request(
+        {
+          host: "127.0.0.1",
+          port: connection.port,
+          method: "POST",
+          path: "/attachments",
+          headers: {
+            authorization: `Bearer ${connection.token}`,
+            "content-length": bytes.byteLength,
+            "content-type": input.mediaType,
+            "x-offeragent-agent-run-id": input.agentRunId,
+            "x-offeragent-conversation-id": input.conversationId,
+            "x-offeragent-file-name": encodeURIComponent(input.fileName),
+          },
+        },
+        (response) => {
+          let body = "";
+          response.setEncoding("utf8");
+          response.on("data", (chunk) => {
+            body += chunk;
+          });
+          response.on("end", () => {
+            if (!response.statusCode || response.statusCode >= 400) {
+              try {
+                const error = JSON.parse(body) as RuntimeError;
+                reject(new Error(error.message));
+              } catch {
+                reject(new Error(`Run Attachment upload failed with status ${response.statusCode}.`));
+              }
+              return;
+            }
+            try {
+              resolve(JSON.parse(body) as StagedRunAttachment);
+            } catch (error) {
+              reject(error);
+            }
+          });
+        },
+      );
+      outgoing.once("error", reject);
+      outgoing.setTimeout(5_000, () => {
+        outgoing.destroy(new Error("Run Attachment upload timed out."));
+      });
+      outgoing.end(bytes);
+    });
+  }
+
+  async discardAttachment(input: {
+    agentRunId: string;
+    attachmentId: string;
+    conversationId: string;
+  }): Promise<void> {
+    const connection = this.#requiredConnection();
+    return new Promise((resolve, reject) => {
+      const outgoing = request(
+        {
+          host: "127.0.0.1",
+          port: connection.port,
+          method: "DELETE",
+          path: `/attachments/${encodeURIComponent(input.attachmentId)}`,
+          headers: {
+            authorization: `Bearer ${connection.token}`,
+            "x-offeragent-agent-run-id": input.agentRunId,
+            "x-offeragent-conversation-id": input.conversationId,
+          },
+        },
+        (response) => {
+          let body = "";
+          response.setEncoding("utf8");
+          response.on("data", (chunk) => {
+            body += chunk;
+          });
+          response.on("end", () => {
+            if (!response.statusCode || response.statusCode >= 400) {
+              try {
+                reject(new Error((JSON.parse(body) as RuntimeError).message));
+              } catch {
+                reject(new Error(`Run Attachment discard failed with status ${response.statusCode}.`));
+              }
+              return;
+            }
+            resolve();
+          });
+        },
+      );
+      outgoing.once("error", reject);
+      outgoing.setTimeout(5_000, () => {
+        outgoing.destroy(new Error("Run Attachment discard timed out."));
+      });
+      outgoing.end();
+    });
+  }
+
   async getHostedWebSearchCapability(modelId: string): Promise<RuntimeHostedWebSearchCapability> {
     return callRuntime<RuntimeHostedWebSearchCapability>(
       this.#requiredConnection(),
@@ -741,7 +859,11 @@ export class RuntimeSupervisor implements RuntimeClient {
       sequence: 0,
       model: request.model,
       ...(request.fastMode ? { fastMode: true } : {}),
-      input: { role: "user", text: request.input },
+      input: {
+        role: "user",
+        text: request.input,
+        ...(request.attachments?.length ? { attachments: request.attachments } : {}),
+      },
     };
     yield* this.#runAgentCommand(request, command);
   }

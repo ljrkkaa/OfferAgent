@@ -603,6 +603,14 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   const input = activeView.contentEl.findByClass("offeragent-sidebar__input");
   assert.ok(composer);
   assert.ok(input);
+  assert.equal(input.listeners.has("paste"), true);
+  assert.equal(composer.listeners.has("dragover"), true);
+  assert.equal(composer.listeners.has("drop"), true);
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__file-picker")?.listeners.has("change"),
+    true,
+  );
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__attach")?.text, "Attach image");
   assert.equal(
     activeView.contentEl.findByClass("offeragent-sidebar__context-chip")?.text,
     "Vault context",

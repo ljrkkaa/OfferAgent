@@ -23,6 +23,28 @@ export interface ModelDescriptor {
   supportsFastMode?: boolean;
 }
 
+export interface RunAttachmentReference {
+  attachmentId: string;
+  order: number;
+}
+
+export interface RunAttachmentMetadata extends RunAttachmentReference {
+  contentHash: string;
+  fileName: string;
+  mediaType: "image/gif" | "image/jpeg" | "image/png" | "image/webp";
+  size: number;
+}
+
+export type PersistedRunAttachmentMetadata = Omit<RunAttachmentMetadata, "attachmentId">;
+
+export interface StagedRunAttachment {
+  attachmentId: string;
+  contentHash: string;
+  fileName: string;
+  mediaType: RunAttachmentMetadata["mediaType"];
+  size: number;
+}
+
 export type AgentRunStatus =
   | "cancelled"
   | "completed"
@@ -38,6 +60,7 @@ export interface ConversationSummary {
 
 export interface ConversationMessage {
   agentRunId: string;
+  attachments?: PersistedRunAttachmentMetadata[];
   citations?: WebCitation[];
   id: string;
   role: "assistant" | "user";
@@ -45,7 +68,9 @@ export interface ConversationMessage {
   text: string;
 }
 
-export type HostedWebSearchCapability = "available" | "unavailable" | "unknown";
+export type ProviderCapabilityStatus = "available" | "unavailable" | "unknown";
+export type HostedWebSearchCapability = ProviderCapabilityStatus;
+export type VisionCapability = ProviderCapabilityStatus;
 
 export interface WebCitation {
   endIndex: number;
@@ -440,6 +465,11 @@ export interface RuntimeHostedWebSearchCapability {
   status: HostedWebSearchCapability;
 }
 
+export interface RuntimeVisionCapability {
+  modelId: string;
+  status: VisionCapability;
+}
+
 export type ProviderErrorCode =
   | "auth_required"
   | "instruction_error"
@@ -453,7 +483,7 @@ export interface AgentRunStart {
   conversationId: string;
   eventId: string;
   fastMode?: boolean;
-  input: { role: "user"; text: string };
+  input: { attachments?: RunAttachmentReference[]; role: "user"; text: string };
   model: string;
   protocolVersion: typeof PROTOCOL_VERSION;
   sequence: 0;

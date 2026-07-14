@@ -294,6 +294,40 @@
   resize: vertical;
 }
 
+.offeragent-sidebar__attachment {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--size-4-2);
+  min-width: 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  padding: var(--size-4-1) var(--size-4-2);
+  color: var(--text-muted);
+  background: var(--background-primary);
+  font-size: var(--font-ui-smaller);
+}
+
+.offeragent-sidebar__attachment > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.offeragent-sidebar__file-picker {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+.offeragent-sidebar__attach,
+.offeragent-sidebar__attachment-remove {
+  flex: 0 0 auto;
+}
+
 .offeragent-sidebar__composer-controls {
   flex-wrap: wrap;
 }

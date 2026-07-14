@@ -764,10 +764,22 @@ test("Run Checkpoints do not persist Agent Contract, Local Skill, or pending pro
   await store.beginAgentRun("body-conversation", "body-run", "fake-interview-model", "change it");
   const proposalMarker = "PENDING-PROPOSAL-BODY-MUST-NOT-PERSIST";
   const instructionMarker = "CONTROL-INSTRUCTION-BODY-MUST-NOT-PERSIST";
+  const attachmentIdMarker = "OPAQUE-ATTACHMENT-ID-MUST-NOT-PERSIST";
   await store.saveRunCheckpoint("body-run", {
     version: 1,
     input: [
-      { type: "user_message", text: "change it" },
+      {
+        type: "user_message",
+        text: "change it",
+        attachments: [{
+          attachmentId: attachmentIdMarker,
+          contentHash: `sha256:${"a".repeat(64)}`,
+          fileName: "interview.png",
+          mediaType: "image/png",
+          order: 0,
+          size: 12,
+        }],
+      },
       {
         type: "local_tool_call",
         callId: "skill-provider-call",
@@ -815,11 +827,23 @@ test("Run Checkpoints do not persist Agent Contract, Local Skill, or pending pro
     requiredRereads: [],
     hostedWebSearchProbeAttempted: false,
     completedSteps: 1,
+    runInput: {
+      text: "change it",
+      attachments: [{
+        attachmentId: attachmentIdMarker,
+        contentHash: `sha256:${"a".repeat(64)}`,
+        fileName: "interview.png",
+        mediaType: "image/png",
+        order: 0,
+        size: 12,
+      }],
+    },
   });
   await store.close();
   const databaseText = (await readFile(statePath)).toString("utf8");
   assert.equal(databaseText.includes(proposalMarker), false);
   assert.equal(databaseText.includes(instructionMarker), false);
+  assert.equal(databaseText.includes(attachmentIdMarker), false);
 });
 
 test("post-response fallback phase survives interruption for direct finalization", async (t) => {

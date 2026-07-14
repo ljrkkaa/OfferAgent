@@ -157,6 +157,314 @@ test("the Sidebar presentation keeps activity, composer, and common settings com
   assert.equal(observed.at(-1).composer.permissionMode, "ask_every_time");
 });
 
+test("one image draft survives staging failure and sends only an opaque Attachment ID", async () => {
+  let rejectUpload = true;
+  let runRequest;
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async listConversations() {
+      return [{ id: "image-conversation", title: "Image", modelId: "model-a" }];
+    },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: { id: "image-conversation", title: "Image", modelId: "model-a" },
+        agentRuns: [], messages: [], toolCalls: [],
+      };
+    },
+    async *resumeAgentRun() {},
+    async *runAgent(request) {
+      runRequest = request;
+      yield { type: "agent_run.started", model: request.model };
+      yield {
+        type: "agent_run.completed",
+        output: { role: "assistant", text: "Image understood." },
+      };
+    },
+    async stageAttachment() {
+      if (rejectUpload) throw new Error("Image signature is unsupported.");
+      return {
+        attachmentId: "opaque-attachment-id",
+        fileName: "interview.png",
+        mediaType: "image/png",
+        size: 12,
+      };
+    },
+    async start() {},
+    async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Image", modelId };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+  controller.setComposerDraft("Read this screenshot.");
+  controller.attachImage({
+    bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+    fileName: "interview.png",
+    mediaType: "image/png",
+  });
+  assert.equal(controller.getViewModel().presentation.composer.draftText, "Read this screenshot.");
+  assert.deepEqual(controller.getViewModel().presentation.composer.attachment, {
+    fileName: "interview.png",
+    mediaType: "image/png",
+    size: 4,
+  });
+
+  await assert.rejects(controller.sendMessage(), /unsupported/);
+  assert.equal(controller.getViewModel().presentation.composer.draftText, "Read this screenshot.");
+  assert.equal(controller.getViewModel().presentation.composer.attachment.fileName, "interview.png");
+
+  rejectUpload = false;
+  await controller.sendMessage();
+  assert.deepEqual(runRequest.attachments, [{ attachmentId: "opaque-attachment-id", order: 0 }]);
+  assert.equal("bytes" in runRequest, false);
+  assert.equal(controller.getViewModel().presentation.composer.draftText, "");
+  assert.equal(controller.getViewModel().presentation.composer.attachment, undefined);
+});
+
+test("a staged image is discarded and its draft survives when the Run never starts", async () => {
+  const discarded = [];
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async discardAttachment(request) { discarded.push(request); },
+    async listConversations() {
+      return [{ id: "unstarted-image-conversation", title: "Image", modelId: "model-a" }];
+    },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: { id: "unstarted-image-conversation", title: "Image", modelId: "model-a" },
+        agentRuns: [], messages: [], toolCalls: [],
+      };
+    },
+    async *resumeAgentRun() {},
+    async *runAgent() { throw new Error("Runtime event connection is unavailable."); },
+    async stageAttachment() {
+      return {
+        attachmentId: "unstarted-attachment",
+        contentHash: "sha256:test",
+        fileName: "interview.png",
+        mediaType: "image/png",
+        size: 4,
+      };
+    },
+    async start() {},
+    async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Image", modelId };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+  controller.setComposerDraft("Keep this draft.");
+  controller.attachImage({
+    bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+    fileName: "interview.png",
+    mediaType: "image/png",
+  });
+
+  await controller.sendMessage();
+
+  assert.equal(discarded.length, 1);
+  assert.equal(discarded[0].attachmentId, "unstarted-attachment");
+  assert.equal(controller.getViewModel().presentation.composer.draftText, "Keep this draft.");
+  assert.equal(controller.getViewModel().presentation.composer.attachment.fileName, "interview.png");
+  assert.deepEqual(controller.getViewModel().conversation.agentRuns, []);
+  assert.deepEqual(controller.getViewModel().conversation.messages, []);
+  assert.equal(controller.getViewModel().presentation.composer.primaryAction.kind, "send");
+});
+
+test("a started image Run restores the untouched submitted draft after vision failure", async () => {
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async discardAttachment() {},
+    async listConversations() {
+      return [{ id: "vision-failure-conversation", title: "Image", modelId: "text-model" }];
+    },
+    async listModels() { return [{ id: "text-model", label: "Text Model" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: {
+          id: "vision-failure-conversation",
+          title: "Image",
+          modelId: "text-model",
+        },
+        agentRuns: [], messages: [], toolCalls: [],
+      };
+    },
+    async *resumeAgentRun() {},
+    async *runAgent(request) {
+      yield { type: "agent_run.started", model: request.model };
+      yield {
+        type: "agent_run.failed",
+        error: {
+          code: "unsupported_capability",
+          message: "The selected model does not support image input.",
+        },
+      };
+    },
+    async stageAttachment() {
+      return {
+        attachmentId: "started-vision-attachment",
+        contentHash: "sha256:test",
+        fileName: "interview.png",
+        mediaType: "image/png",
+        size: 4,
+      };
+    },
+    async start() {},
+    async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Image", modelId };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+  controller.setComposerDraft("Read this interview screenshot.");
+  controller.attachImage({
+    bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+    fileName: "interview.png",
+    mediaType: "image/png",
+  });
+
+  await controller.sendMessage();
+
+  assert.equal(
+    controller.getViewModel().presentation.composer.draftText,
+    "Read this interview screenshot.",
+  );
+  assert.equal(
+    controller.getViewModel().presentation.composer.attachment.fileName,
+    "interview.png",
+  );
+  assert.equal(controller.getViewModel().conversation.agentRuns[0].status, "failed");
+  assert.match(controller.getViewModel().conversation.error.message, /does not support image/i);
+});
+
+test("composer edits made during image staging survive the started Run", async () => {
+  let finishStaging;
+  let stagingStarted;
+  const staging = new Promise((resolve) => { stagingStarted = resolve; });
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async discardAttachment() {},
+    async listConversations() {
+      return [{ id: "edited-draft-conversation", title: "Image", modelId: "text-model" }];
+    },
+    async listModels() { return [{ id: "text-model", label: "Text Model" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: {
+          id: "edited-draft-conversation", title: "Image", modelId: "text-model",
+        },
+        agentRuns: [], messages: [], toolCalls: [],
+      };
+    },
+    async *resumeAgentRun() {},
+    async *runAgent(request) {
+      yield { type: "agent_run.started", model: request.model };
+      yield {
+        type: "agent_run.failed",
+        error: { code: "unsupported_capability", message: "Vision is unavailable." },
+      };
+    },
+    async stageAttachment() {
+      stagingStarted();
+      return new Promise((resolve) => { finishStaging = resolve; });
+    },
+    async start() {},
+    async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Image", modelId };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+  controller.setComposerDraft("Submitted draft A");
+  controller.attachImage({
+    bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+    fileName: "interview.png",
+    mediaType: "image/png",
+  });
+
+  const sending = controller.sendMessage();
+  await staging;
+  controller.setComposerDraft("New draft B");
+  finishStaging({
+    attachmentId: "edited-draft-attachment",
+    contentHash: "sha256:test",
+    fileName: "interview.png",
+    mediaType: "image/png",
+    size: 4,
+  });
+  await sending;
+
+  assert.equal(controller.getViewModel().presentation.composer.draftText, "New draft B");
+  assert.equal(controller.getViewModel().presentation.composer.attachment.fileName, "interview.png");
+});
+
+test("the Sidebar serializes sends while an image upload is pending", async () => {
+  let failUpload;
+  let uploadStarted;
+  const started = new Promise((resolve) => { uploadStarted = resolve; });
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async discardAttachment() {},
+    async listConversations() {
+      return [{ id: "upload-lock-conversation", title: "Image", modelId: "model-a" }];
+    },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: { id: "upload-lock-conversation", title: "Image", modelId: "model-a" },
+        agentRuns: [], messages: [], toolCalls: [],
+      };
+    },
+    async *resumeAgentRun() {},
+    async *runAgent() {},
+    async stageAttachment() {
+      uploadStarted();
+      return new Promise((_resolve, reject) => { failUpload = reject; });
+    },
+    async start() {},
+    async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Image", modelId };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+  controller.setComposerDraft("Only once.");
+  controller.attachImage({
+    bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+    fileName: "interview.png",
+    mediaType: "image/png",
+  });
+
+  const firstSend = controller.sendMessage();
+  await started;
+  await assert.rejects(controller.sendMessage(), /Wait for the current Agent Run/);
+  failUpload(new Error("Upload stopped for test."));
+  await assert.rejects(firstSend, /Upload stopped/);
+  assert.equal(controller.getViewModel().presentation.composer.draftText, "Only once.");
+});
+
 test("the Sidebar selects a model and renders a streamed Agent Run", async () => {
   let unavailableSubscriber;
   const runtime = {

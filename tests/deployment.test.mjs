@@ -147,6 +147,12 @@ test("deployment preserves Runtime State, plugin data, branch, index, and unrela
   assert.match(contract, /vault_propose_changes/);
   assert.match(contract, /Trusted Vault/);
   assert.match(contract, /explicit Resume/i);
+  assert.match(contract, /Run Attachments and Vision/);
+  assert.match(contract, /temporary evidence for its owning Agent Run/);
+  assert.match(contract, /Do not invoke OCR/);
+  assert.match(contract, /Interrupted Run may retain its image only for explicit Resume/);
+  assert.match(contract, /completed, failed, cancelled, deleted, or expired Run must release/);
+  assert.match(contract, /later text-only Run must remain usable/);
   const skill = await readFile(
     path.join(root, ".codex", "skills", "obsidian-cli", "SKILL.md"),
     "utf8",

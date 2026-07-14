@@ -19,6 +19,8 @@ export const FAKE_SCENARIOS = [
   "interview-deduplication",
   "text-interview-ingestion",
   "url-interview-ingestion",
+  "single-image",
+  "vision-unavailable",
 ] as const;
 export type FakeScenario = (typeof FAKE_SCENARIOS)[number];
 
@@ -78,11 +80,83 @@ export class FakeModelProvider implements ModelProvider {
         `The selected model '${request.model}' is not available.`,
       );
     }
+    if (this.#scenario === "vision-unavailable" && request.imageInputs?.length) {
+      throw new ModelProviderError(
+        "unsupported_capability",
+        "input_image is unsupported",
+        { capability: "vision" },
+      );
+    }
+    if (
+      this.#scenario === "single-image" &&
+      request.instructions === "This is a minimal Vision Capability probe. Reply only OK."
+    ) {
+      yield { type: "output_text.delta", delta: "OK" };
+      return;
+    }
     const userInput = findLatest(
       request.input,
       (item): item is Extract<ModelConversationItem, { type: "user_message" }> =>
         item.type === "user_message",
     )?.text ?? "";
+    if (this.#scenario === "single-image" && request.imageInputs?.length) {
+      const userMessage = findLatest(
+        request.input,
+        (item): item is Extract<ModelConversationItem, { type: "user_message" }> =>
+          item.type === "user_message" && Boolean(item.attachments?.length),
+      );
+      const image = request.imageInputs[0];
+      if (
+        !userMessage?.attachments?.some(
+          ({ attachmentId, order }) => attachmentId === image.attachmentId && order === 0,
+        ) ||
+        !image.dataUrl.startsWith(`data:${image.mediaType};base64,`)
+      ) {
+        throw new ModelProviderError("provider_error", "The ordered image input was invalid.");
+      }
+      const contract = toolResultFor(request.input, "agent_contract_read");
+      if (!contract) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-image-contract-${this.#toolCallSequence}`,
+          name: "agent_contract_read",
+          arguments: {},
+        };
+        return;
+      }
+      const originalImageInput = findLatest(
+        request.input,
+        (item): item is Extract<ModelConversationItem, { type: "user_message" }> =>
+          item.type === "user_message" && Boolean(item.attachments?.length),
+      )?.text ?? userInput;
+      if (/image_empty_interrupt/u.test(originalImageInput)) {
+        const recoveryRequested = request.input.some(
+          (item) =>
+            item.type === "user_message" &&
+            item.text === "Complete the pending user request with a visible final response. Do not return an empty answer.",
+        );
+        if (!recoveryRequested) return;
+      }
+      if (/image_(?:empty_)?interrupt/u.test(originalImageInput)) {
+        const read = toolResultFor(request.input, "vault_read");
+        if (!read) {
+          this.#toolCallSequence += 1;
+          yield {
+            type: "local_tool_call",
+            callId: `fake-image-read-${this.#toolCallSequence}`,
+            name: "vault_read",
+            arguments: { path: "notes/image-context.md" },
+          };
+          return;
+        }
+      }
+      yield {
+        type: "output_text.delta",
+        delta: "The image shows an interview question about distributed cache consistency.",
+      };
+      return;
+    }
     if (request.instructions === MEMORY_CAPTURE_INSTRUCTIONS) {
       let durable = false;
       try {

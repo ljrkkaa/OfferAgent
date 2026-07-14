@@ -1,4 +1,4 @@
-import type { HostedWebSearchCapability } from "@offeragent/protocol";
+import type { ProviderCapabilityStatus } from "@offeragent/protocol";
 import {
   ModelProviderError,
   type ModelProvider,
@@ -10,23 +10,26 @@ interface CapabilityStore {
   getProviderCapability(
     backendId: string,
     modelId: string,
-    capability: "hosted_web_search",
-  ): Promise<HostedWebSearchCapability>;
+    capability: "hosted_web_search" | "vision",
+  ): Promise<ProviderCapabilityStatus>;
   resetProviderCapability(
     backendId: string,
     modelId: string,
-    capability: "hosted_web_search",
+    capability: "hosted_web_search" | "vision",
   ): Promise<void>;
   setProviderCapability(
     backendId: string,
     modelId: string,
-    capability: "hosted_web_search",
-    status: HostedWebSearchCapability,
+    capability: "hosted_web_search" | "vision",
+    status: ProviderCapabilityStatus,
   ): Promise<void>;
 }
 
 const HOSTED_WEB_SEARCH = { kind: "hosted", name: "web_search" } as const;
 const MAX_CAPABILITY_PRELUDE_EVENTS = 8;
+const VISION_PROBE_ATTACHMENT_ID = "offeragent-vision-probe";
+const VISION_PROBE_DATA_URL =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
 type NextOutcome =
   | { kind: "event"; result: IteratorResult<ModelStreamEvent> }
@@ -49,8 +52,13 @@ function waitOneTurn(outcome: Promise<NextOutcome>): Promise<NextOutcome | { kin
   });
 }
 
-function isUnsupported(error: unknown): boolean {
-  return error instanceof ModelProviderError && error.code === "unsupported_capability";
+function isUnsupported(
+  error: unknown,
+  capability?: "hosted_web_search" | "vision",
+): boolean {
+  return error instanceof ModelProviderError &&
+    error.code === "unsupported_capability" &&
+    (!capability || !error.capability || error.capability === capability);
 }
 
 function withoutHostedWebSearch(request: ModelRequest): ModelRequest {
@@ -80,16 +88,51 @@ export class CapabilityGatedModelProvider implements ModelProvider {
     return this.#provider.listModels();
   }
 
-  getHostedWebSearchCapability(model: string): Promise<HostedWebSearchCapability> {
+  getHostedWebSearchCapability(model: string): Promise<ProviderCapabilityStatus> {
     return this.#store.getProviderCapability(this.backendId, model, "hosted_web_search");
   }
 
-  async reprobeHostedWebSearch(model: string, signal: AbortSignal): Promise<HostedWebSearchCapability> {
+  getVisionCapability(model: string): Promise<ProviderCapabilityStatus> {
+    return this.#store.getProviderCapability(this.backendId, model, "vision");
+  }
+
+  async reprobeHostedWebSearch(model: string, signal: AbortSignal): Promise<ProviderCapabilityStatus> {
     await this.#store.resetProviderCapability(this.backendId, model, "hosted_web_search");
     return this.#probe(model, signal);
   }
 
   async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    if (request.imageInputs?.length) {
+      let capability = await this.getVisionCapability(request.model);
+      if (capability === "unknown") capability = await this.#probeVision(request.model, request.signal);
+      if (capability !== "available") {
+        throw new ModelProviderError(
+          "unsupported_capability",
+          "The selected model cannot process images. Choose a vision-capable model or provide text.",
+        );
+      }
+      try {
+        yield* this.#streamWithHostedWebSearch(request);
+        return;
+      } catch (error) {
+        if (!isUnsupported(error, "vision")) throw error;
+        await this.#store.setProviderCapability(
+          this.backendId,
+          request.model,
+          "vision",
+          "unavailable",
+        );
+        throw new ModelProviderError(
+          "unsupported_capability",
+          "The selected model cannot process images. Choose a vision-capable model or provide text.",
+          { cause: error },
+        );
+      }
+    }
+    yield* this.#streamWithHostedWebSearch(request);
+  }
+
+  async *#streamWithHostedWebSearch(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
     const capability = await this.getHostedWebSearchCapability(request.model);
     if (capability !== "available") {
       yield* this.#provider.stream(withoutHostedWebSearch(request));
@@ -116,7 +159,7 @@ export class CapabilityGatedModelProvider implements ModelProvider {
       let outcome = await nextOutcome(iterator);
       if (outcome.kind === "error") {
         iteratorDone = true;
-        if (isUnsupported(outcome.error)) {
+        if (isUnsupported(outcome.error, "hosted_web_search")) {
           await markUnavailable();
           yield* this.#provider.stream(withoutHostedWebSearch(request));
           return;
@@ -138,7 +181,7 @@ export class CapabilityGatedModelProvider implements ModelProvider {
           while (true) {
             if (outcome.kind === "error") {
               iteratorDone = true;
-              if (isUnsupported(outcome.error)) {
+              if (isUnsupported(outcome.error, "hosted_web_search")) {
                 await markUnavailable();
                 yield* this.#provider.stream(withoutHostedWebSearch(request));
                 return;
@@ -155,7 +198,7 @@ export class CapabilityGatedModelProvider implements ModelProvider {
         }
         if (decision.kind === "error") {
           iteratorDone = true;
-          if (isUnsupported(decision.error)) {
+          if (isUnsupported(decision.error, "hosted_web_search")) {
             await markUnavailable();
             yield* this.#provider.stream(withoutHostedWebSearch(request));
             return;
@@ -175,7 +218,7 @@ export class CapabilityGatedModelProvider implements ModelProvider {
       while (true) {
         if (outcome.kind === "error") {
           iteratorDone = true;
-          if (isUnsupported(outcome.error)) {
+          if (isUnsupported(outcome.error, "hosted_web_search")) {
             await markUnavailable();
             yield* this.#provider.stream(withoutHostedWebSearch(request));
             return;
@@ -202,7 +245,7 @@ export class CapabilityGatedModelProvider implements ModelProvider {
     }
   }
 
-  async #probe(model: string, signal: AbortSignal): Promise<HostedWebSearchCapability> {
+  async #probe(model: string, signal: AbortSignal): Promise<ProviderCapabilityStatus> {
     try {
       for await (const _event of this.#provider.stream({
         model,
@@ -228,6 +271,43 @@ export class CapabilityGatedModelProvider implements ModelProvider {
         "hosted_web_search",
         "unavailable",
       );
+      return "unavailable";
+    }
+  }
+
+  async #probeVision(model: string, signal: AbortSignal): Promise<ProviderCapabilityStatus> {
+    try {
+      for await (const _event of this.#provider.stream({
+        model,
+        signal,
+        instructions: "This is a minimal Vision Capability probe. Reply only OK.",
+        input: [{
+          type: "user_message",
+          text: "Reply OK.",
+          attachments: [{
+            attachmentId: VISION_PROBE_ATTACHMENT_ID,
+            contentHash: "sha256:offeragent-vision-probe",
+            fileName: "probe.png",
+            mediaType: "image/png",
+            order: 0,
+            size: 68,
+          }],
+        }],
+        imageInputs: [{
+          attachmentId: VISION_PROBE_ATTACHMENT_ID,
+          dataUrl: VISION_PROBE_DATA_URL,
+          mediaType: "image/png",
+          order: 0,
+        }],
+        tools: [],
+      })) {
+        // A completed response proves that this backend/model accepted image input.
+      }
+      await this.#store.setProviderCapability(this.backendId, model, "vision", "available");
+      return "available";
+    } catch (error) {
+      if (!isUnsupported(error, "vision")) throw error;
+      await this.#store.setProviderCapability(this.backendId, model, "vision", "unavailable");
       return "unavailable";
     }
   }

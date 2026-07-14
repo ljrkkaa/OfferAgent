@@ -389,8 +389,65 @@ class OfferAgentSidebarView extends ItemView {
     const input = composer.createEl("textarea", { cls: "offeragent-sidebar__input" });
     input.placeholder = "Ask OfferAgent…";
     input.setAttribute("aria-label", "Message OfferAgent");
+    input.value = viewModel.presentation.composer.draftText;
     input.disabled = viewModel.presentation.composer.primaryAction.kind !== "send";
+    input.addEventListener("input", () => this.#controller.setComposerDraft(input.value));
+    const acceptImage = async (file: File): Promise<void> => {
+      this.#controller.setComposerDraft(input.value);
+      try {
+        this.#controller.attachImage({
+          bytes: new Uint8Array(await file.arrayBuffer()),
+          fileName: file.name,
+          mediaType: file.type,
+        });
+      } catch {
+        // The controller keeps the draft and publishes an actionable composer error.
+      }
+    };
+    input.addEventListener("paste", (event) => {
+      const file = [...(event.clipboardData?.files ?? [])][0];
+      if (!file) return;
+      event.preventDefault();
+      void acceptImage(file);
+    });
+    composer.addEventListener("dragover", (event) => {
+      if (event.dataTransfer?.files.length) event.preventDefault();
+    });
+    composer.addEventListener("drop", (event) => {
+      const file = [...(event.dataTransfer?.files ?? [])][0];
+      if (!file) return;
+      event.preventDefault();
+      void acceptImage(file);
+    });
+    if (viewModel.presentation.composer.attachment) {
+      const attachment = composer.createDiv({ cls: "offeragent-sidebar__attachment" });
+      attachment.createDiv({
+        text: `${viewModel.presentation.composer.attachment.fileName} (${Math.ceil(viewModel.presentation.composer.attachment.size / 1024)} KiB)`,
+      });
+      const removeAttachment = attachment.createEl("button", {
+        cls: "offeragent-sidebar__attachment-remove",
+        text: "Remove",
+      });
+      removeAttachment.type = "button";
+      removeAttachment.setAttribute("aria-label", "Remove attached image");
+      removeAttachment.addEventListener("click", () => this.#controller.removeDraftImage());
+    }
     const controls = composer.createDiv({ cls: "offeragent-sidebar__composer-controls" });
+    const filePicker = controls.createEl("input", { cls: "offeragent-sidebar__file-picker" });
+    filePicker.type = "file";
+    filePicker.accept = "image/png,image/jpeg,image/webp,image/gif";
+    filePicker.setAttribute("aria-label", "Choose one image");
+    filePicker.addEventListener("change", () => {
+      const file = filePicker.files?.[0];
+      if (file) void acceptImage(file);
+    });
+    const attachButton = controls.createEl("button", {
+      cls: "offeragent-sidebar__attach",
+      text: "Attach image",
+    });
+    attachButton.type = "button";
+    attachButton.disabled = viewModel.presentation.composer.primaryAction.kind !== "send";
+    attachButton.addEventListener("click", () => filePicker.click());
     const modelSelect = controls.createEl("select", {
       cls: "offeragent-sidebar__model-select",
     });
@@ -430,8 +487,8 @@ class OfferAgentSidebarView extends ItemView {
       event.preventDefault();
       if (primary.kind !== "send") return;
       const text = input.value;
-      if (!text.trim()) return;
-      input.value = "";
+      if (!text.trim() && !viewModel.presentation.composer.attachment) return;
+      this.#controller.setComposerDraft(text);
       void this.#controller.sendMessage(text);
     });
   }

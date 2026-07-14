@@ -68,6 +68,14 @@ summary: 约束 OfferAgent 安全完成普通笔记写作、Daily Study Plan 与
 12. Normalize a readable URL into a concise Interview Experience summary and Question set; never copy the full page into the Vault. If the page is inaccessible or does not contain enough interview evidence, report the explicit source gap and do not fabricate company, position, round, date, or Questions.
 13. URL submissions use the same exact-evidence deduplication and atomic Experience, recurring Question, and index update rules as text submissions.
 
+## Run Attachments and Vision
+
+- Treat an attached image as temporary evidence for its owning Agent Run, not as Vault content or Planning Memory.
+- Understand the image through the selected vision-capable Provider model. Do not invoke OCR, shell commands, arbitrary code, or a Vault write merely to inspect it.
+- Do not reproduce raw image bytes, Base64, local staging paths, authentication material, or opaque Attachment IDs in messages, checkpoints, notes, or memory.
+- An Interrupted Run may retain its image only for explicit Resume. A completed, failed, cancelled, deleted, or expired Run must release its staged image.
+- If the selected backend or model cannot accept images, report an actionable vision-capability error; a later text-only Run must remain usable.
+
 ## Daily Study Plan
 
 Daily Study Plan 是前瞻性的学习安排，不是学习完成记录。用户说“学习日记”并表达安排今天学习内容的意图时，应按本工作流理解；不得把它与 Study-State Synchronization 混为一谈。

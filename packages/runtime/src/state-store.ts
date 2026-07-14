@@ -8,8 +8,9 @@ import {
   type AgentRunStatus,
   type ConversationMessage,
   type ConversationSummary,
-  type HostedWebSearchCapability,
+  type ProviderCapabilityStatus,
   type LocalToolResultPayload,
+  type PersistedRunAttachmentMetadata,
   type ProviderErrorCode,
   type ToolCallRecord,
   type VaultChangeJournalRecord,
@@ -20,8 +21,9 @@ import {
 } from "@offeragent/protocol";
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.js";
 import type { ModelConversationItem } from "./model-provider";
+import type { RunAttachmentMetadata as StoredRunAttachmentMetadata } from "./run-attachments";
 
-const CURRENT_SCHEMA_VERSION = 13;
+const CURRENT_SCHEMA_VERSION = 15;
 const MAX_CONVERSATION_CONTEXT_BYTES = 64 * 1_024;
 
 export interface RunCheckpoint {
@@ -37,6 +39,10 @@ export interface RunCheckpoint {
   resolvedDailyNotePaths?: string[];
   postResponseCitations?: WebCitation[];
   postResponseOutput?: string;
+  runInput?: {
+    attachments?: PersistedRunAttachmentMetadata[];
+    text: string;
+  };
   pendingToolStep?: {
     completedSteps: number;
     name: ToolCallRecord["name"];
@@ -99,6 +105,9 @@ function persistedRunCheckpoint(checkpoint: RunCheckpoint): RunCheckpoint {
     ) {
       return [];
     }
+    if (item.type === "user_message" && item.attachments?.length) {
+      return [{ type: "user_message" as const, text: item.text }];
+    }
     return item.type === "local_tool_call" && item.name === "vault_propose_changes"
       ? [{ ...item, arguments: persistedToolArguments(item.name, item.arguments) }]
       : [item];
@@ -128,6 +137,20 @@ function persistedRunCheckpoint(checkpoint: RunCheckpoint): RunCheckpoint {
       ? { postResponseCitations: checkpoint.postResponseCitations }
       : {}),
     ...(checkpoint.fastMode ? { fastMode: true } : {}),
+    ...(checkpoint.runInput
+      ? {
+          runInput: {
+            text: checkpoint.runInput.text,
+            ...(checkpoint.runInput.attachments?.length
+              ? {
+                  attachments: (checkpoint.runInput.attachments as Array<
+                    PersistedRunAttachmentMetadata & { attachmentId?: string }
+                  >).map(({ attachmentId: _attachmentId, ...metadata }) => metadata),
+                }
+              : {}),
+          },
+        }
+      : {}),
     ...(checkpoint.pendingToolStep ? { pendingToolStep: checkpoint.pendingToolStep } : {}),
   };
 }
@@ -866,6 +889,45 @@ const MIGRATIONS = [
       CREATE INDEX vault_change_batches_by_state ON vault_change_batches(state, updated_at);
     `,
   },
+  {
+    version: 14,
+    sql: `
+      CREATE TABLE provider_capabilities_v14 (
+        backend_id TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        capability TEXT NOT NULL CHECK (capability IN ('hosted_web_search', 'vision')),
+        status TEXT NOT NULL CHECK (status IN ('unknown', 'available', 'unavailable')),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (backend_id, model_id, capability)
+      );
+      INSERT INTO provider_capabilities_v14
+        (backend_id, model_id, capability, status, updated_at)
+      SELECT backend_id, model_id, capability, status, updated_at
+      FROM provider_capabilities;
+      DROP TABLE provider_capabilities;
+      ALTER TABLE provider_capabilities_v14 RENAME TO provider_capabilities;
+      CREATE TABLE IF NOT EXISTS run_attachments (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        media_type TEXT NOT NULL CHECK (media_type IN (
+          'image/gif', 'image/jpeg', 'image/png', 'image/webp'
+        )),
+        size INTEGER NOT NULL CHECK (size > 0 AND size <= 10485760),
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS run_attachments_by_run ON run_attachments(agent_run_id, created_at);
+      CREATE INDEX IF NOT EXISTS run_attachments_by_conversation
+        ON run_attachments(conversation_id, created_at);
+      CREATE INDEX IF NOT EXISTS run_attachments_by_created ON run_attachments(created_at);
+    `,
+  },
+  {
+    version: 15,
+    sql: `SELECT 1;`,
+  },
 ] as const;
 
 interface ConversationSnapshot {
@@ -990,11 +1052,16 @@ export class RuntimeStateStore {
     return valueAt(this.#database, "SELECT 1 FROM conversations WHERE id = ?", [conversationId]) === 1;
   }
 
+  async hasAgentRun(agentRunId: string): Promise<boolean> {
+    await this.#writeTail;
+    return valueAt(this.#database, "SELECT 1 FROM agent_runs WHERE id = ?", [agentRunId]) === 1;
+  }
+
   async getProviderCapability(
     backendId: string,
     modelId: string,
-    capability: "hosted_web_search",
-  ): Promise<HostedWebSearchCapability> {
+    capability: "hosted_web_search" | "vision",
+  ): Promise<ProviderCapabilityStatus> {
     await this.#writeTail;
     const status = valueAt(
       this.#database,
@@ -1008,8 +1075,8 @@ export class RuntimeStateStore {
   async setProviderCapability(
     backendId: string,
     modelId: string,
-    capability: "hosted_web_search",
-    status: HostedWebSearchCapability,
+    capability: "hosted_web_search" | "vision",
+    status: ProviderCapabilityStatus,
   ): Promise<void> {
     await this.#write(() => {
       this.#database.run(
@@ -1026,7 +1093,7 @@ export class RuntimeStateStore {
   async resetProviderCapability(
     backendId: string,
     modelId: string,
-    capability: "hosted_web_search",
+    capability: "hosted_web_search" | "vision",
   ): Promise<void> {
     await this.#write(() => {
       this.#database.run(
@@ -1035,6 +1102,67 @@ export class RuntimeStateStore {
         [backendId, modelId, capability],
       );
     });
+  }
+
+  async createAttachment(metadata: StoredRunAttachmentMetadata): Promise<void> {
+    await this.#write(() => {
+      if (
+        valueAt(this.#database, "SELECT 1 FROM conversations WHERE id = ?", [metadata.conversationId]) !== 1
+      ) {
+        throw new Error(`Conversation '${metadata.conversationId}' does not exist.`);
+      }
+      this.#database.run(
+        `INSERT INTO run_attachments
+          (id, conversation_id, agent_run_id, content_hash, file_name, media_type, size, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          metadata.attachmentId,
+          metadata.conversationId,
+          metadata.agentRunId,
+          metadata.contentHash,
+          metadata.fileName,
+          metadata.mediaType,
+          metadata.size,
+          metadata.createdAt,
+        ],
+      );
+    });
+  }
+
+  async deleteAttachment(attachmentId: string): Promise<void> {
+    await this.#write(() => {
+      this.#database.run("DELETE FROM run_attachments WHERE id = ?", [attachmentId]);
+    });
+  }
+
+  async getAttachment(attachmentId: string): Promise<StoredRunAttachmentMetadata | undefined> {
+    await this.#writeTail;
+    const row = firstRow(
+      this.#database,
+      `SELECT id, conversation_id, agent_run_id, content_hash, file_name, media_type, size, created_at
+       FROM run_attachments WHERE id = ?`,
+      [attachmentId],
+    );
+    return row ? this.#attachmentMetadata(row) : undefined;
+  }
+
+  async listAttachmentsByConversation(
+    conversationId: string,
+  ): Promise<StoredRunAttachmentMetadata[]> {
+    await this.#writeTail;
+    return this.#attachmentRows("conversation_id = ?", [conversationId]);
+  }
+
+  async listAttachmentsByRun(agentRunId: string): Promise<StoredRunAttachmentMetadata[]> {
+    await this.#writeTail;
+    return this.#attachmentRows("agent_run_id = ?", [agentRunId]);
+  }
+
+  async listAttachmentsCreatedBefore(
+    isoTimestamp: string,
+  ): Promise<StoredRunAttachmentMetadata[]> {
+    await this.#writeTail;
+    return this.#attachmentRows("created_at < ?", [isoTimestamp]);
   }
 
   async getProtocolResponse(
@@ -1123,13 +1251,17 @@ export class RuntimeStateStore {
     input: string,
     startedEvent?: Extract<AgentRunEvent, { type: "agent_run.started" }>,
     startEventId?: string,
+    attachments: PersistedRunAttachmentMetadata[] = [],
   ): Promise<boolean> {
     return this.#write(() => {
+      const persistedAttachments = (attachments as Array<
+        PersistedRunAttachmentMetadata & { attachmentId?: string }
+      >).map(({ attachmentId: _attachmentId, ...metadata }) => metadata);
       const timestamp = now();
       const existing = firstRow(
         this.#database,
         `SELECT agent_runs.conversation_id, agent_runs.model_id, agent_runs.start_event_id,
-                messages.text
+                messages.text, messages.attachments_json
          FROM agent_runs
          LEFT JOIN messages ON messages.id = agent_runs.user_message_id
          WHERE agent_runs.id = ?`,
@@ -1141,7 +1273,8 @@ export class RuntimeStateStore {
           existing[0] === conversationId &&
           existing[1] === modelId &&
           existing[2] === startEventId &&
-          existing[3] === input
+          existing[3] === input &&
+          existing[4] === JSON.stringify(persistedAttachments)
         ) {
           return false;
         }
@@ -1172,9 +1305,17 @@ export class RuntimeStateStore {
       );
       this.#database.run(
         `INSERT INTO messages
-          (id, conversation_id, agent_run_id, role, text, sequence, created_at)
-         VALUES (?, ?, ?, 'user', ?, ?, ?)`,
-        [messageId, conversationId, agentRunId, input, sequence, timestamp],
+          (id, conversation_id, agent_run_id, role, text, sequence, attachments_json, created_at)
+         VALUES (?, ?, ?, 'user', ?, ?, ?, ?)`,
+        [
+          messageId,
+          conversationId,
+          agentRunId,
+          input,
+          sequence,
+          JSON.stringify(persistedAttachments),
+          timestamp,
+        ],
       );
       this.#database.run("UPDATE agent_runs SET user_message_id = ? WHERE id = ?", [
         messageId,
@@ -1311,31 +1452,8 @@ export class RuntimeStateStore {
     recoveredToolResult?: { result: LocalToolResultPayload; toolCallId: string },
   ): Promise<ResumableRun> {
     return this.#write(() => {
-      const run = firstRow(
-        this.#database,
-        `SELECT conversation_id, model_id, status, last_sequence
-         FROM agent_runs WHERE id = ?`,
-        [agentRunId],
-      );
-      if (!run || run[0] !== conversationId) {
-        throw new Error(`Agent Run '${agentRunId}' does not belong to Conversation '${conversationId}'.`);
-      }
-      if (run[2] !== "interrupted") {
-        throw new Error(`Agent Run '${agentRunId}' cannot be resumed from '${run[2]}'.`);
-      }
-      const checkpointJson = valueAt(
-        this.#database,
-        `SELECT checkpoint_json FROM run_checkpoints
-         WHERE agent_run_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
-        [agentRunId],
-      );
-      if (typeof checkpointJson !== "string") {
-        throw new Error(`Agent Run '${agentRunId}' has no durable Run Checkpoint.`);
-      }
-      const checkpoint = JSON.parse(checkpointJson) as RunCheckpoint;
-      if (checkpoint.version !== 1) {
-        throw new Error(`Agent Run '${agentRunId}' has an unsupported Run Checkpoint.`);
-      }
+      const resumable = this.#resumableRun(conversationId, agentRunId);
+      const { checkpoint } = resumable;
       if (checkpoint.pendingToolStep?.name === "vault_propose_changes") {
         const pendingStatus = valueAt(
           this.#database,
@@ -1373,10 +1491,18 @@ export class RuntimeStateStore {
       }
       return {
         checkpoint,
-        model: run[1] as string,
-        nextSequence: Number(run[3]) + 1,
+        model: resumable.model,
+        nextSequence: resumable.nextSequence,
       };
     });
+  }
+
+  async inspectResumableAgentRun(
+    conversationId: string,
+    agentRunId: string,
+  ): Promise<ResumableRun> {
+    await this.#writeTail;
+    return this.#resumableRun(conversationId, agentRunId);
   }
 
   async getToolCallResult(toolCallId: string, agentRunId: string): Promise<LocalToolResultPayload | undefined> {
@@ -1866,7 +1992,7 @@ export class RuntimeStateStore {
     if (!conversationRow) throw new Error(`Conversation '${conversationId}' does not exist.`);
     const messageRows =
       this.#database.exec(
-        `SELECT id, agent_run_id, role, text, sequence, citations_json
+        `SELECT id, agent_run_id, role, text, sequence, citations_json, attachments_json
          FROM messages WHERE conversation_id = ? ORDER BY sequence`,
         [conversationId],
       )[0]?.values ?? [];
@@ -1893,7 +2019,15 @@ export class RuntimeStateStore {
         title: conversationRow[1] as string,
         modelId: conversationRow[2] as string,
       },
-      messages: messageRows.map(([id, agentRunId, role, text, sequence, citationsJson]) => ({
+      messages: messageRows.map(([
+        id,
+        agentRunId,
+        role,
+        text,
+        sequence,
+        citationsJson,
+        attachmentsJson,
+      ]) => ({
         id: id as string,
         agentRunId: agentRunId as string,
         role: role as "assistant" | "user",
@@ -1901,6 +2035,9 @@ export class RuntimeStateStore {
         sequence: sequence as number,
         ...((JSON.parse(citationsJson as string) as unknown[]).length > 0
           ? { citations: JSON.parse(citationsJson as string) }
+          : {}),
+        ...((JSON.parse(attachmentsJson as string) as unknown[]).length > 0
+          ? { attachments: JSON.parse(attachmentsJson as string) }
           : {}),
       })),
       agentRuns: runRows.map(([id, modelId, status, errorCode, errorMessage]) => ({
@@ -1944,7 +2081,7 @@ export class RuntimeStateStore {
     await this.#writeTail;
     const rows =
       this.#database.exec(
-        `SELECT messages.agent_run_id, messages.role, messages.text
+        `SELECT messages.agent_run_id, messages.role, messages.text, messages.attachments_json
          FROM messages
          JOIN agent_runs ON agent_runs.id = messages.agent_run_id
          WHERE messages.conversation_id = ?
@@ -2142,6 +2279,61 @@ export class RuntimeStateStore {
     return { conversationId: row[0] as string };
   }
 
+  #resumableRun(conversationId: string, agentRunId: string): ResumableRun {
+    const run = firstRow(
+      this.#database,
+      `SELECT conversation_id, model_id, status, last_sequence
+       FROM agent_runs WHERE id = ?`,
+      [agentRunId],
+    );
+    if (!run || run[0] !== conversationId) {
+      throw new Error(`Agent Run '${agentRunId}' does not belong to Conversation '${conversationId}'.`);
+    }
+    if (run[2] !== "interrupted") {
+      throw new Error(`Agent Run '${agentRunId}' cannot be resumed from '${run[2]}'.`);
+    }
+    const checkpointJson = valueAt(
+      this.#database,
+      `SELECT checkpoint_json FROM run_checkpoints
+       WHERE agent_run_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      [agentRunId],
+    );
+    if (typeof checkpointJson !== "string") {
+      throw new Error(`Agent Run '${agentRunId}' has no durable Run Checkpoint.`);
+    }
+    const checkpoint = JSON.parse(checkpointJson) as RunCheckpoint;
+    if (checkpoint.version !== 1) {
+      throw new Error(`Agent Run '${agentRunId}' has an unsupported Run Checkpoint.`);
+    }
+    return {
+      checkpoint,
+      model: run[1] as string,
+      nextSequence: Number(run[3]) + 1,
+    };
+  }
+
+  #attachmentRows(where: string, parameters: unknown[]): StoredRunAttachmentMetadata[] {
+    const rows = this.#database.exec(
+      `SELECT id, conversation_id, agent_run_id, content_hash, file_name, media_type, size, created_at
+       FROM run_attachments WHERE ${where} ORDER BY created_at, id`,
+      parameters as (string | number | null | Uint8Array)[],
+    )[0]?.values ?? [];
+    return rows.map((row) => this.#attachmentMetadata(row));
+  }
+
+  #attachmentMetadata(row: unknown[]): StoredRunAttachmentMetadata {
+    return {
+      attachmentId: row[0] as string,
+      conversationId: row[1] as string,
+      agentRunId: row[2] as string,
+      contentHash: row[3] as string,
+      fileName: row[4] as string,
+      mediaType: row[5] as StoredRunAttachmentMetadata["mediaType"],
+      size: row[6] as number,
+      createdAt: row[7] as string,
+    };
+  }
+
   #nextMessageSequence(conversationId: string): number {
     const current = valueAt(
       this.#database,
@@ -2203,6 +2395,8 @@ export class RuntimeStateStore {
         this.#database.run(migration.sql);
         if (migration.version === 7) this.#scrubPersistedVaultChangeArguments();
         if (migration.version === 8) this.#ensureCitationsColumn();
+        if (migration.version === 14) this.#ensureAttachmentsColumn();
+        if (migration.version === 15) this.#scrubOpaqueAttachmentIds();
         if (migration.version === 10) this.#scrubResumableStateBodies();
         const timestamp = now();
         this.#database.run(
@@ -2225,6 +2419,7 @@ export class RuntimeStateStore {
     // Early v9/v10 builds could persist the current version before these additive
     // protocol columns existed. Keep the repair idempotent for already-versioned State.
     this.#ensureProtocolColumns();
+    this.#ensureAttachmentStorageColumns();
     if (version < 10) this.#database.run("VACUUM");
     await this.#persist();
   }
@@ -2308,6 +2503,9 @@ export class RuntimeStateStore {
           requiredRereads: Array.isArray(legacy.requiredRereads) ? legacy.requiredRereads : [],
           hostedWebSearchProbeAttempted: legacy.hostedWebSearchProbeAttempted === true,
           completedSteps: Number.isInteger(legacy.completedSteps) ? legacy.completedSteps as number : 0,
+          ...(legacy.runInput && typeof legacy.runInput.text === "string"
+            ? { runInput: legacy.runInput }
+            : {}),
           ...(legacy.pendingToolStep
             ? { pendingToolStep: legacy.pendingToolStep }
             : (legacy as { pendingConfirmation?: Omit<NonNullable<RunCheckpoint["pendingToolStep"]>, "name"> }).pendingConfirmation
@@ -2395,6 +2593,71 @@ export class RuntimeStateStore {
     const columns = this.#database.exec("PRAGMA table_info(messages)")[0]?.values ?? [];
     if (!columns.some((column) => column[1] === "citations_json")) {
       this.#database.run("ALTER TABLE messages ADD COLUMN citations_json TEXT NOT NULL DEFAULT '[]'");
+    }
+  }
+
+  #ensureAttachmentsColumn(): void {
+    const columns = this.#database.exec("PRAGMA table_info(messages)")[0]?.values ?? [];
+    if (!columns.some((column) => column[1] === "attachments_json")) {
+      this.#database.run(
+        "ALTER TABLE messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'",
+      );
+    }
+  }
+
+  #ensureAttachmentStorageColumns(): void {
+    const table = this.#database.exec(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_attachments'",
+    )[0]?.values ?? [];
+    if (table.length === 0) return;
+    const columns = this.#database.exec("PRAGMA table_info(run_attachments)")[0]?.values ?? [];
+    if (!columns.some((column) => column[1] === "content_hash")) {
+      this.#database.run(
+        "ALTER TABLE run_attachments ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+      );
+    }
+  }
+
+  #scrubOpaqueAttachmentIds(): void {
+    const messages = this.#database.exec(
+      "SELECT id, attachments_json FROM messages WHERE attachments_json <> '[]'",
+    )[0]?.values ?? [];
+    for (const [id, attachmentsJson] of messages) {
+      try {
+        const attachments = JSON.parse(attachmentsJson as string) as Array<Record<string, unknown>>;
+        this.#database.run(
+          "UPDATE messages SET attachments_json = ? WHERE id = ?",
+          [JSON.stringify(attachments.map(({ attachmentId: _id, ...metadata }) => metadata)), id],
+        );
+      } catch {
+        this.#database.run("UPDATE messages SET attachments_json = '[]' WHERE id = ?", [id]);
+      }
+    }
+    const checkpoints = this.#database.exec(
+      "SELECT id, checkpoint_json FROM run_checkpoints",
+    )[0]?.values ?? [];
+    for (const [id, checkpointJson] of checkpoints) {
+      try {
+        const checkpoint = JSON.parse(checkpointJson as string) as RunCheckpoint;
+        if (checkpoint.runInput?.attachments) {
+          checkpoint.runInput.attachments = (checkpoint.runInput.attachments as Array<
+            PersistedRunAttachmentMetadata & { attachmentId?: string }
+          >).map(
+            ({ attachmentId: _id, ...metadata }) => metadata,
+          );
+        }
+        checkpoint.input = checkpoint.input.map((item) =>
+          item.type === "user_message" && item.attachments?.length
+            ? { type: "user_message" as const, text: item.text }
+            : item,
+        );
+        this.#database.run(
+          "UPDATE run_checkpoints SET checkpoint_json = ? WHERE id = ?",
+          [JSON.stringify(checkpoint), id],
+        );
+      } catch {
+        this.#database.run("DELETE FROM run_checkpoints WHERE id = ?", [id]);
+      }
     }
   }
 

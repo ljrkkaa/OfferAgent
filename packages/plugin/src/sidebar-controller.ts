@@ -59,7 +59,9 @@ export interface SidebarViewModel {
       target?: string;
     }>;
     composer: {
+      attachment?: { fileName: string; mediaType: string; size: number };
       contextChips: Array<{ kind: "scope"; label: string }>;
+      draftText: string;
       permissionMode: VaultPermissionMode;
       primaryAction: {
         agentRunId?: string;
@@ -185,6 +187,10 @@ export class SidebarController {
   };
   #activeRun?: { agentRunId: string; conversationId: string };
   #providerStatus: "connected" | "unavailable" = "unavailable";
+  #draftText = "";
+  #draftImage?: { bytes: Uint8Array; fileName: string; mediaType: string };
+  #draftRevision = 0;
+  #sendPending = false;
   readonly #recoveredToolResults = new Map<string, {
     eventId: string;
     result: LocalToolResultPayload;
@@ -217,6 +223,40 @@ export class SidebarController {
 
   refreshPresentation(): void {
     for (const subscriber of this.#subscribers) subscriber(this.getViewModel());
+  }
+
+  setComposerDraft(text: string): void {
+    this.#draftText = text;
+    this.#draftRevision += 1;
+  }
+
+  attachImage(image: { bytes: Uint8Array; fileName: string; mediaType: string }): void {
+    const reject = (message: string): never => {
+      this.#updateConversation({
+        ...this.#viewModel.conversation,
+        error: { code: "provider_error", message },
+      });
+      throw new Error(message);
+    };
+    if (!new Set(["image/gif", "image/jpeg", "image/png", "image/webp"]).has(image.mediaType)) {
+      reject("Choose a PNG, JPEG, WEBP, or GIF image.");
+    }
+    if (image.bytes.byteLength === 0 || image.bytes.byteLength > 10 * 1024 * 1024) {
+      reject("The image must be non-empty and no larger than 10 MiB.");
+    }
+    this.#draftImage = {
+      bytes: new Uint8Array(image.bytes),
+      fileName: image.fileName,
+      mediaType: image.mediaType,
+    };
+    this.#draftRevision += 1;
+    this.refreshPresentation();
+  }
+
+  removeDraftImage(): void {
+    this.#draftImage = undefined;
+    this.#draftRevision += 1;
+    this.refreshPresentation();
   }
 
   async start(): Promise<void> {
@@ -394,17 +434,65 @@ export class SidebarController {
     }
   }
 
-  async sendMessage(input: string): Promise<void> {
+  async sendMessage(input = this.#draftText): Promise<void> {
     const text = input.trim();
     const selectedModelId = this.#viewModel.conversation.selectedModelId;
     const conversationId = this.#viewModel.conversation.activeConversationId;
-    if (!text) return;
+    if (!text && !this.#draftImage) return;
     if (!selectedModelId) throw new Error("Choose an available model before sending a message.");
     if (!conversationId) throw new Error("Create a Conversation before sending a message.");
-    if (this.#viewModel.conversation.runState === "streaming") {
+    if (this.#viewModel.conversation.runState === "streaming" || this.#sendPending) {
       throw new Error("Wait for the current Agent Run to finish.");
     }
+    this.#sendPending = true;
     const agentRunId = randomUUID();
+    const submittedDraft = {
+      image: this.#draftImage
+        ? { ...this.#draftImage, bytes: new Uint8Array(this.#draftImage.bytes) }
+        : undefined,
+      text: this.#draftText,
+    };
+    const submittedDraftRevision = this.#draftRevision;
+    let clearedDraftRevision: number | undefined;
+    const restoreSubmittedDraft = (): void => {
+      if (clearedDraftRevision === undefined || this.#draftRevision !== clearedDraftRevision) return;
+      this.#draftText = submittedDraft.text;
+      this.#draftImage = submittedDraft.image;
+      this.#draftRevision += 1;
+    };
+    let attachments: Array<{ attachmentId: string; order: number }> | undefined;
+    if (this.#draftImage) {
+      try {
+        const staged = await this.#runtime.stageAttachment({
+          agentRunId,
+          bytes: this.#draftImage.bytes,
+          conversationId,
+          fileName: this.#draftImage.fileName,
+          mediaType: this.#draftImage.mediaType,
+        });
+        attachments = [{ attachmentId: staged.attachmentId, order: 0 }];
+      } catch (error) {
+        this.#sendPending = false;
+        this.#updateConversation({
+          ...this.#viewModel.conversation,
+          error: {
+            code: "provider_error",
+            message: error instanceof Error ? error.message : String(error),
+          },
+        });
+        throw error;
+      }
+    }
+    let runStarted = false;
+    const discardUnstartedAttachment = async (): Promise<void> => {
+      const attachment = attachments?.[0];
+      if (runStarted || !attachment) return;
+      await this.#runtime.discardAttachment({
+        agentRunId,
+        attachmentId: attachment.attachmentId,
+        conversationId,
+      }).catch(() => undefined);
+    };
     const messages = [
       ...this.#viewModel.conversation.messages,
       { agentRunId, role: "user" as const, text },
@@ -422,6 +510,7 @@ export class SidebarController {
       runState: "streaming",
       error: undefined,
     });
+    this.#sendPending = false;
 
     try {
       for await (const event of this.#runtime.runAgent({
@@ -433,8 +522,16 @@ export class SidebarController {
           ? { fastMode: true }
           : {}),
         input: text,
+        ...(attachments ? { attachments } : {}),
       })) {
         if (event.type === "agent_run.started") {
+          runStarted = true;
+          if (this.#draftRevision === submittedDraftRevision) {
+            this.#draftText = "";
+            this.#draftImage = undefined;
+            this.#draftRevision += 1;
+            clearedDraftRevision = this.#draftRevision;
+          }
           this.#providerStatus = "connected";
           this.refreshPresentation();
         } else if (event.type === "agent_run.delta") {
@@ -501,12 +598,18 @@ export class SidebarController {
         } else if (event.type === "agent_run.failed") {
           if (providerHealthFailure(event.error.code)) this.#providerStatus = "unavailable";
           const vaultChanges = this.#cancelPendingVaultChanges(agentRunId);
-          messages.pop();
+          if (runStarted) {
+            messages.pop();
+            restoreSubmittedDraft();
+          }
+          else messages.splice(-2, 2);
           this.#updateConversation({
             ...this.#viewModel.conversation,
             messages: [...messages],
             runState: "idle",
-            agentRuns: this.#runsWithStatus(agentRunId, "failed", event.error),
+            agentRuns: runStarted
+              ? this.#runsWithStatus(agentRunId, "failed", event.error)
+              : this.#viewModel.conversation.agentRuns.filter(({ id }) => id !== agentRunId),
             toolCalls: this.#terminalizedToolCalls(agentRunId),
             vaultChanges,
             error: event.error,
@@ -532,14 +635,17 @@ export class SidebarController {
           });
         }
       }
+      await discardUnstartedAttachment();
       this.#updateConversation({
         ...this.#viewModel.conversation,
         messages: [...messages],
         runState: "idle",
       });
     } catch (error) {
+      await discardUnstartedAttachment();
       this.#providerStatus = "unavailable";
-      messages.pop();
+      if (runStarted) messages.pop();
+      else messages.splice(-2, 2);
       const message = error instanceof Error ? error.message : String(error);
       this.#updateConversation({
         ...this.#viewModel.conversation,
@@ -547,10 +653,13 @@ export class SidebarController {
         runState: "idle",
         toolCalls: this.#interruptedToolCalls(agentRunId),
         vaultChanges: this.#viewModel.conversation.vaultChanges,
-        agentRuns: this.#runsWithStatus(agentRunId, "interrupted"),
+        agentRuns: runStarted
+          ? this.#runsWithStatus(agentRunId, "interrupted")
+          : this.#viewModel.conversation.agentRuns.filter(({ id }) => id !== agentRunId),
         error: { code: "transport_error", message },
       });
     } finally {
+      this.#sendPending = false;
       if (this.#activeRun?.agentRunId === agentRunId) this.#activeRun = undefined;
     }
   }
@@ -934,7 +1043,17 @@ export class SidebarController {
     return {
       activities,
       composer: {
+        ...(this.#draftImage
+          ? {
+              attachment: {
+                fileName: this.#draftImage.fileName,
+                mediaType: this.#draftImage.mediaType,
+                size: this.#draftImage.bytes.byteLength,
+              },
+            }
+          : {}),
         contextChips: [{ kind: "scope", label: "Vault context" }],
+        draftText: this.#draftText,
         permissionMode,
         primaryAction,
       },
