@@ -37,6 +37,7 @@ import { CodexSubscriptionProvider } from "./codex-subscription-provider";
 import {
   asModelProviderError,
   MAX_LOCAL_TOOL_ARGUMENT_BYTES,
+  MAX_VAULT_PROPOSAL_ARGUMENT_BYTES,
   ModelProviderError,
   type LocalToolDefinition,
   type ModelConversationItem,
@@ -285,7 +286,7 @@ function composeInstructions(
   return sections.join("\n\n");
 }
 
-function assertBoundedToolArguments(arguments_: unknown): void {
+function assertBoundedToolArguments(name: LocalToolName, arguments_: unknown): void {
   let encoded: string;
   try {
     encoded = JSON.stringify(arguments_);
@@ -294,9 +295,12 @@ function assertBoundedToolArguments(arguments_: unknown): void {
       cause: error,
     });
   }
-  if (Buffer.byteLength(encoded, "utf8") > MAX_LOCAL_TOOL_ARGUMENT_BYTES) {
+  const maximumBytes = name === "vault_propose_changes"
+    ? MAX_VAULT_PROPOSAL_ARGUMENT_BYTES
+    : MAX_LOCAL_TOOL_ARGUMENT_BYTES;
+  if (Buffer.byteLength(encoded, "utf8") > maximumBytes) {
     throw new Error(
-      `The model provider returned local tool arguments larger than ${MAX_LOCAL_TOOL_ARGUMENT_BYTES} UTF-8 bytes.`,
+      `The model provider returned local tool arguments larger than ${maximumBytes} UTF-8 bytes.`,
     );
   }
 }
@@ -1956,7 +1960,7 @@ async function startRuntime({
             stalePaths: string[];
             toolCallId: string;
           }> => {
-            assertBoundedToolArguments(arguments_);
+            assertBoundedToolArguments(name, arguments_);
             const toolCallId = randomUUID();
             const requestedSequence = sequence;
             const requestedEvent: Extract<AgentRunEvent, { type: "tool_call.requested" }> = {
@@ -2441,7 +2445,10 @@ async function startRuntime({
                   }
                 }
               }
-              assertBoundedToolArguments(effectiveProviderEvent.arguments);
+              assertBoundedToolArguments(
+                effectiveProviderEvent.name,
+                effectiveProviderEvent.arguments,
+              );
               appendProviderStepItems(providerEvent);
               const { result, stalePaths } = await executeLocalTool(
                 effectiveProviderEvent.name,
@@ -2459,6 +2466,10 @@ async function startRuntime({
               const currentReadPath =
                 result.ok && result.value.type === "vault_read" ? result.value.path : undefined;
               if (currentReadPath) canonicalReadPaths.set(providerEvent.callId, currentReadPath);
+              const appliedProposal =
+                result.ok &&
+                result.value.type === "vault_propose_changes" &&
+                result.value.decision === "applied";
               if (stalePaths.length > 0) {
                 const stalePathSet = new Set(stalePaths);
                 const staleCallIds = new Set(
@@ -2480,7 +2491,9 @@ async function startRuntime({
                     ),
                 );
                 for (const staleCallId of staleCallIds) canonicalReadPaths.delete(staleCallId);
-                for (const stalePath of stalePaths) requiredRereads.add(stalePath);
+                if (!appliedProposal) {
+                  for (const stalePath of stalePaths) requiredRereads.add(stalePath);
+                }
               }
               if (currentReadPath) requiredRereads.delete(currentReadPath);
               if (result.ok && result.value.type === "daily_note_context") {

@@ -208,8 +208,6 @@ test("a text Interview Submission becomes one normalized atomic knowledge batch"
       "vault_read",
       "vault_read",
       "vault_propose_changes",
-      "vault_read",
-      "vault_read",
     ],
   );
   assert.equal(
@@ -421,8 +419,6 @@ test("a text Interview Submission becomes one normalized atomic knowledge batch"
       "planning_memory_list",
       "interview_catalog",
       "vault_propose_changes",
-      "vault_read",
-      "vault_read",
     ],
   );
   assert.deepEqual(

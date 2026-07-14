@@ -7,6 +7,7 @@ import { EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
 import {
   MAX_LOCAL_TOOL_ARGUMENT_BYTES,
   MAX_PROVIDER_REASONING_BYTES,
+  MAX_VAULT_PROPOSAL_ARGUMENT_BYTES,
   ModelProviderError,
   type ModelConversationItem,
   type ModelProvider,
@@ -14,11 +15,14 @@ import {
   type ModelStreamEvent,
 } from "./model-provider";
 
-function boundedToolArguments(encoded: string): string {
-  if (Buffer.byteLength(encoded, "utf8") > MAX_LOCAL_TOOL_ARGUMENT_BYTES) {
+function boundedToolArguments(
+  encoded: string,
+  maximumBytes = MAX_LOCAL_TOOL_ARGUMENT_BYTES,
+): string {
+  if (Buffer.byteLength(encoded, "utf8") > maximumBytes) {
     throw new ModelProviderError(
       "provider_error",
-      `Codex local tool arguments exceed ${MAX_LOCAL_TOOL_ARGUMENT_BYTES} UTF-8 bytes.`,
+      `Codex local tool arguments exceed ${maximumBytes} UTF-8 bytes.`,
     );
   }
   return encoded;
@@ -281,7 +285,10 @@ export class CodexSubscriptionProvider implements ModelProvider {
             ) {
               functionArguments.set(
                 event.item_id,
-                boundedToolArguments(`${functionArguments.get(event.item_id) ?? ""}${event.delta}`),
+                boundedToolArguments(
+                  `${functionArguments.get(event.item_id) ?? ""}${event.delta}`,
+                  MAX_VAULT_PROPOSAL_ARGUMENT_BYTES,
+                ),
               );
             } else if (event.type === "response.output_item.done") {
               const item = event.item;
@@ -383,6 +390,9 @@ export class CodexSubscriptionProvider implements ModelProvider {
                       : typeof call.id === "string"
                         ? functionArguments.get(call.id) ?? "{}"
                         : "{}",
+                    call.name === "vault_propose_changes"
+                      ? MAX_VAULT_PROPOSAL_ARGUMENT_BYTES
+                      : MAX_LOCAL_TOOL_ARGUMENT_BYTES,
                   );
                   let arguments_: unknown;
                   try {
@@ -608,6 +618,7 @@ export class CodexSubscriptionProvider implements ModelProvider {
 function isLocalToolName(value: unknown): value is LocalToolName {
   return (
     value === "daily_note_context" ||
+    value === "interview_catalog" ||
     value === "skill_read" ||
     value === "hosted_web_search_probe" ||
     value === "vault_list" ||

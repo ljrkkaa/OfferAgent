@@ -296,14 +296,14 @@ export class FakeModelProvider implements ModelProvider {
         return;
       }
       const applied = toolResultFor(request.input, "vault_propose_changes");
-      const experienceIndex = experienceIndexDescriptor.exists || applied
+      const experienceIndex = experienceIndexDescriptor.exists && !applied
         ? toolResultFor(
             request.input,
             "vault_read",
             (call) => (call.arguments as { path?: unknown }).path === "experiences/index.md",
           )
         : undefined;
-      if ((experienceIndexDescriptor.exists || applied) && !experienceIndex) {
+      if (experienceIndexDescriptor.exists && !applied && !experienceIndex) {
         this.#toolCallSequence += 1;
         yield {
           type: "local_tool_call",
@@ -313,14 +313,14 @@ export class FakeModelProvider implements ModelProvider {
         };
         return;
       }
-      const questionIndex = questionIndexDescriptor.exists || applied
+      const questionIndex = questionIndexDescriptor.exists && !applied
         ? toolResultFor(
             request.input,
             "vault_read",
             (call) => (call.arguments as { path?: unknown }).path === "interview/index.md",
           )
         : undefined;
-      if ((questionIndexDescriptor.exists || applied) && !questionIndex) {
+      if (questionIndexDescriptor.exists && !applied && !questionIndex) {
         this.#toolCallSequence += 1;
         yield {
           type: "local_tool_call",

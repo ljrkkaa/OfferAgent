@@ -9,6 +9,7 @@ import type {
 } from "@offeragent/protocol";
 
 export const MAX_LOCAL_TOOL_ARGUMENT_BYTES = 8_192;
+export const MAX_VAULT_PROPOSAL_ARGUMENT_BYTES = 131_072;
 export const MAX_PROVIDER_REASONING_BYTES = 256 * 1_024;
 
 export interface ProviderReasoningItem {
