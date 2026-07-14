@@ -169,8 +169,21 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   process.env.LOCALAPPDATA = temporaryRuntimeHome;
   process.env.OFFERAGENT_RUNTIME_STATE_PATH = path.join(temporaryRuntimeHome, "state.db");
   await mkdir(path.join(temporaryVault, "notes"), { recursive: true });
+  await mkdir(path.join(temporaryVault, ".obsidian"), { recursive: true });
+  await mkdir(path.join(temporaryVault, "templates"), { recursive: true });
+  await mkdir(path.join(temporaryVault, "interview"), { recursive: true });
+  await mkdir(path.join(temporaryVault, "daily"), { recursive: true });
   await writeFile(path.join(temporaryVault, "agent.md"), "# Test Agent Contract", "utf8");
   await writeFile(path.join(temporaryVault, "notes", "example.md"), "line one\nline two", "utf8");
+  await writeFile(
+    path.join(temporaryVault, ".obsidian", "daily-notes.json"),
+    JSON.stringify({ folder: "daily", format: "YYYY-MM-DD", template: "templates/daily.md" }),
+    "utf8",
+  );
+  const dailyTemplate = "---\nkind: daily\nowner: user\n---\n# {{date}}\n\n## 今日学习计划\n\n## 完成记录\n- [x] Keep this checked record\n";
+  const interviewQueue = "# 面试八股学习进度\n\n- [x] Existing completed topic\n- [ ] Self-Attention\n";
+  await writeFile(path.join(temporaryVault, "templates", "daily.md"), dailyTemplate, "utf8");
+  await writeFile(path.join(temporaryVault, "interview", "面试八股学习进度.md"), interviewQueue, "utf8");
   await git(temporaryVault, "init", "-q");
   const installation = path.join(
     temporaryVault,
@@ -186,7 +199,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   assert.equal(deployment.installed, true);
   assert.equal(deployment.controlMigration.decision, "applied");
   const migratedContract = await readFile(path.join(temporaryVault, "agent.md"), "utf8");
-  assert.match(migratedContract, /OfferAgent 面试学习状态维护 Contract/);
+  assert.match(migratedContract, /OfferAgent General Contract/);
 
   let activeView;
   let plugin;
@@ -199,6 +212,19 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
 
     getBasePath() {
       return this.basePath;
+    }
+
+    async exists(vaultPath) {
+      try {
+        await readFile(path.join(this.basePath, vaultPath));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    read(vaultPath) {
+      return readFile(path.join(this.basePath, vaultPath), "utf8");
     }
   }
 
@@ -362,6 +388,14 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     Plugin,
     PluginSettingTab,
     Setting,
+    moment(date) {
+      return {
+        format(format) {
+          const [year, month, day] = date.split("-");
+          return format.replaceAll("YYYY", year).replaceAll("MM", month).replaceAll("DD", day);
+        },
+      };
+    },
   };
 
   const require = createRequire(import.meta.url);
@@ -395,6 +429,18 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
       extension: "md",
       stat: { mtime: 1234, size: 17 },
       content: "line one\nline two",
+    },
+    {
+      path: "templates/daily.md",
+      extension: "md",
+      stat: { mtime: 1235, size: Buffer.byteLength(dailyTemplate, "utf8") },
+      content: dailyTemplate,
+    },
+    {
+      path: "interview/面试八股学习进度.md",
+      extension: "md",
+      stat: { mtime: 1236, size: Buffer.byteLength(interviewQueue, "utf8") },
+      content: interviewQueue,
     },
   ];
   const contractReads = [];
@@ -615,6 +661,213 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "OfferAgent did not finish the Vault read Agent Run",
   );
 
+  const planComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
+  const planInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  planInput.value = "帮我做一个今天的学习日记";
+  planComposer.dispatch("submit");
+  await waitUntil(
+    () => activeView.contentEl
+      .findAllByClass("offeragent-sidebar__message--assistant")
+      .some(({ text }) => text.includes("DAILY_STUDY_PLAN_PROPOSAL")),
+    "OfferAgent did not propose the Daily Study Plan",
+  );
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
+    "OfferAgent did not finish the Daily Study Plan proposal Run",
+  );
+  const confirmComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
+  const confirmInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  confirmInput.value = "可以的";
+  confirmComposer.dispatch("submit");
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
+    "OfferAgent did not finish the confirmed Daily Study Plan Run",
+    20_000,
+  );
+  assert.ok(
+    vaultFiles.some(({ path }) => path === "daily/2026-07-14.md"),
+    JSON.stringify({
+      messages: activeView.contentEl
+        .findAllByClass("offeragent-sidebar__message--assistant")
+        .map(({ text }) => text),
+      activities: activeView.contentEl
+        .findAllByClass("offeragent-sidebar__tool-activity")
+        .map((activity) => ({ status: activity.dataset.status, text: activity.children[0]?.text })),
+    }),
+  );
+  const dailyPlan = await readFile(path.join(temporaryVault, "daily", "2026-07-14.md"), "utf8");
+  assert.match(dailyPlan, /^---\nkind: daily\nowner: user\n---/);
+  assert.match(dailyPlan, /# 2026-07-14/);
+  assert.match(dailyPlan, /- \[ \] Self-Attention/);
+  assert.match(dailyPlan, /来源：interview\/面试八股学习进度\.md/);
+  assert.match(dailyPlan, /前瞻计划，不是学习完成证据/);
+  assert.doesNotMatch(dailyPlan, /- \[x\] Self-Attention/i);
+  assert.equal(
+    await readFile(path.join(temporaryVault, "interview", "面试八股学习进度.md"), "utf8"),
+    interviewQueue,
+  );
+  assert.match(await git(temporaryVault, "for-each-ref", "--format=%(refname)", "refs/offeragent"), /refs\/offeragent/);
+
+  const existingDaily = vaultFiles.find(({ path }) => path === "daily/2026-07-14.md");
+  const proposalCount = activeView.contentEl
+    .findAllByClass("offeragent-sidebar__message--assistant")
+    .filter(({ text }) => text.includes("DAILY_STUDY_PLAN_PROPOSAL")).length;
+  const existingPlanInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  existingPlanInput.value = "帮我做一个今天的学习日记";
+  activeView.contentEl.findByClass("offeragent-sidebar__composer").dispatch("submit");
+  await waitUntil(
+    () => activeView.contentEl
+      .findAllByClass("offeragent-sidebar__message--assistant")
+      .filter(({ text }) => text.includes("DAILY_STUDY_PLAN_PROPOSAL")).length === proposalCount + 1,
+    "OfferAgent did not produce the existing-note proposal",
+  );
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
+    "OfferAgent did not finish the existing-note proposal Run",
+  );
+  const existingConfirmInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  const unchangedPlanMessageCount = activeView.contentEl
+    .findAllByClass("offeragent-sidebar__message--assistant")
+    .filter(({ text }) => text.includes("无需重复写入")).length;
+  existingConfirmInput.value = "可以的";
+  activeView.contentEl.findByClass("offeragent-sidebar__composer").dispatch("submit");
+  try {
+    await waitUntil(
+      () => activeView.contentEl
+        .findAllByClass("offeragent-sidebar__message--assistant")
+        .filter(({ text }) => text.includes("无需重复写入")).length ===
+        unchangedPlanMessageCount + 1,
+      "OfferAgent did not answer the existing-note confirmation",
+      20_000,
+    );
+  } catch (error) {
+    assert.fail(JSON.stringify({
+      error: error.message,
+      messages: activeView.contentEl
+        .findAllByClass("offeragent-sidebar__message--assistant")
+        .slice(-5)
+        .map(({ text }) => text),
+      activities: activeView.contentEl
+        .findAllByClass("offeragent-sidebar__tool-activity")
+        .slice(-12)
+        .map((activity) => ({ status: activity.dataset.status, text: activity.children[0]?.text })),
+      runStatuses: activeView.contentEl
+        .findAllByClass("offeragent-sidebar__run-status")
+        .map(({ dataset, text }) => ({ state: dataset.state, text })),
+    }));
+  }
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
+    "OfferAgent did not finish the existing-note confirmation Run",
+    20_000,
+  );
+  assert.ok(
+    existingDaily.content.includes("- [ ] Self-Attention"),
+    JSON.stringify({
+      messages: activeView.contentEl
+        .findAllByClass("offeragent-sidebar__message--assistant")
+        .slice(-4)
+        .map(({ text }) => text),
+      activities: activeView.contentEl
+        .findAllByClass("offeragent-sidebar__tool-activity")
+        .slice(-10)
+        .map((activity) => ({ status: activity.dataset.status, text: activity.children[0]?.text })),
+    }),
+  );
+  const filledExisting = await readFile(path.join(temporaryVault, existingDaily.path), "utf8");
+  assert.match(filledExisting, /^---\nkind: daily\nowner: user\n---/);
+  assert.match(filledExisting, /- \[x\] Keep this checked record/);
+  assert.match(filledExisting, /## 今日学习计划\n\n- \[ \] Self-Attention/);
+  assert.equal((filledExisting.match(/## 今日学习计划/g) ?? []).length, 1);
+  assert.equal((filledExisting.match(/- \[ \] Self-Attention/g) ?? []).length, 1);
+  assert.equal((filledExisting.match(/本节是前瞻计划，不是学习完成证据。/g) ?? []).length, 1);
+
+  const optionalQueue = vaultFiles.find(
+    ({ path: vaultPath }) => vaultPath === "interview/面试八股学习进度.md",
+  );
+  const acceptAnotherDailyPlan = async (scenario) => {
+    const proposalCountBefore = activeView.contentEl
+      .findAllByClass("offeragent-sidebar__message--assistant")
+      .filter(({ text }) => text.includes("DAILY_STUDY_PLAN_PROPOSAL")).length;
+    activeView.contentEl.findByClass("offeragent-sidebar__input").value =
+      "帮我做一个今天的学习日记";
+    activeView.contentEl.findByClass("offeragent-sidebar__composer").dispatch("submit");
+    await waitUntil(
+      () => activeView.contentEl
+        .findAllByClass("offeragent-sidebar__message--assistant")
+        .filter(({ text }) => text.includes("DAILY_STUDY_PLAN_PROPOSAL")).length ===
+        proposalCountBefore + 1,
+      `OfferAgent did not propose the ${scenario} plan`,
+    );
+    await waitUntil(
+      () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
+      `OfferAgent did not finish the ${scenario} proposal Run`,
+    );
+    const appliedCountBefore = activeView.contentEl
+      .findAllByClass("offeragent-sidebar__message--assistant")
+      .filter(({ text }) => text.includes("今日学习计划已写入")).length;
+    activeView.contentEl.findByClass("offeragent-sidebar__input").value = "可以的";
+    activeView.contentEl.findByClass("offeragent-sidebar__composer").dispatch("submit");
+    await waitUntil(
+      () => activeView.contentEl
+        .findAllByClass("offeragent-sidebar__message--assistant")
+        .filter(({ text }) => text.includes("今日学习计划已写入")).length ===
+        appliedCountBefore + 1,
+      `OfferAgent did not create the ${scenario} grounded plan`,
+      20_000,
+    );
+    await waitUntil(
+      () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
+      `OfferAgent did not finish the ${scenario} confirmation Run`,
+      20_000,
+    );
+  };
+
+  await app.vault.modify(
+    optionalQueue,
+    "# 面试八股学习进度\n\n- [x] Existing completed topic\n- [x] Another completed topic\n",
+  );
+  await acceptAnotherDailyPlan("all-completed-queue fallback");
+  const allCompletedFallback = await readFile(
+    path.join(temporaryVault, existingDaily.path),
+    "utf8",
+  );
+  assert.match(allCompletedFallback, /- \[ \] line one（来源：notes\/example\.md）/);
+  assert.doesNotMatch(allCompletedFallback, /- \[ \] Existing completed topic/);
+
+  await app.vault.delete(optionalQueue);
+  const fallbackNote = vaultFiles.find(({ path: vaultPath }) => vaultPath === "notes/example.md");
+  await app.vault.modify(fallbackNote, "line two");
+  await acceptAnotherDailyPlan("missing-optional-source fallback");
+  const fallbackPlan = await readFile(path.join(temporaryVault, existingDaily.path), "utf8");
+  assert.match(fallbackPlan, /- \[ \] line two（来源：notes\/example\.md）/);
+  assert.doesNotMatch(fallbackPlan, /复习最近的学习主题/);
+  await app.vault.modify(fallbackNote, "line one\nline two");
+
+  const checkpointRefsBeforeFill = (await git(
+    temporaryVault,
+    "for-each-ref",
+    "--format=%(refname)",
+    "refs/offeragent/checkpoints",
+  )).trim().split(/\r?\n/).filter(Boolean).length;
+  await app.vault.modify(
+    existingDaily,
+    dailyTemplate.replace("{{date}}", "2026-07-14"),
+  );
+  await acceptAnotherDailyPlan("pre-existing empty placeholder");
+  const filledPlaceholder = await readFile(path.join(temporaryVault, existingDaily.path), "utf8");
+  assert.match(filledPlaceholder, /^---\nkind: daily\nowner: user\n---/);
+  assert.match(filledPlaceholder, /- \[x\] Keep this checked record/);
+  assert.match(filledPlaceholder, /## 今日学习计划\n\n- \[ \] line one/);
+  assert.equal((filledPlaceholder.match(/## 今日学习计划/g) ?? []).length, 1);
+  const checkpointRefsAfterFill = (await git(
+    temporaryVault,
+    "for-each-ref",
+    "--format=%(refname)",
+    "refs/offeragent/checkpoints",
+  )).trim().split(/\r?\n/).filter(Boolean).length;
+  assert.ok(checkpointRefsAfterFill > checkpointRefsBeforeFill);
+
   const proposal = {
     batchId: "smoke-batch-reject",
     idempotencyKey: "smoke-batch-reject-key",
@@ -625,7 +878,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
         idempotencyKey: "smoke-action-reject-key",
         operation: "append",
         path: "notes/example.md",
-        expectedVersion: "mtime:1234:size:17",
+        expectedVersion: `mtime:${fallbackNote.stat.mtime}:size:${fallbackNote.stat.size}`,
         content: "\nrejected",
       },
     ],

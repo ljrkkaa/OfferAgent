@@ -89,9 +89,21 @@ async function connectRuntimeSocket(handshake, token) {
 function installContractResponder(socket) {
   socket.on("message", (data) => {
     const event = JSON.parse(data.toString("utf8"));
-    if (event.type !== "tool_call.requested" || event.tool.name !== "agent_contract_read") {
+    if (event.type !== "tool_call.requested") return;
+    if (event.tool.name === "planning_memory_list") {
+      socket.send(JSON.stringify({
+        type: "tool_result",
+        protocolVersion: 1,
+        eventId: `memory-list-result-${event.toolCallId}`,
+        conversationId: event.conversationId,
+        agentRunId: event.agentRunId,
+        sequence: event.sequence,
+        toolCallId: event.toolCallId,
+        result: { ok: true, value: { type: "planning_memory_list", topics: [], truncated: false } },
+      }));
       return;
     }
+    if (event.tool.name !== "agent_contract_read") return;
     socket.send(
       JSON.stringify({
         type: "tool_result",
@@ -206,9 +218,9 @@ test("a follow-up Run receives the ordered user and Agent messages from its Conv
     agentRunId: "context-run-1",
     conversationId,
     eventId: "context-run-1-start",
-    text: "帮我做一个今天的学习日记",
+    text: "Help me prepare today.",
   });
-  assert.equal(first.output.text, "OfferAgent received: 帮我做一个今天的学习日记");
+  assert.equal(first.output.text, "OfferAgent received: Help me prepare today.");
 
   await stopRuntime(instance, token);
   instance = await startRuntime(statePath, token);
@@ -222,7 +234,7 @@ test("a follow-up Run receives the ordered user and Agent messages from its Conv
   });
   assert.equal(
     second.output.text,
-    "OfferAgent confirmed: OfferAgent received: 帮我做一个今天的学习日记",
+    "OfferAgent confirmed: OfferAgent received: Help me prepare today.",
   );
 
   await stopRuntime(instance, token);
@@ -556,6 +568,8 @@ test("only committed Agent Run boundary events replay with stable identities", a
     )[0].values,
     [
       ["agent_run.started"],
+      ["tool_call.requested"],
+      ["tool_call.completed"],
       ["tool_call.requested"],
       ["tool_call.completed"],
       ["agent_run.completed"],
