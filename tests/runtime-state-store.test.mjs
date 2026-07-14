@@ -378,6 +378,10 @@ test("Runtime State rolls back a failed write and serves consistent concurrent r
   const reopened = await store.getConversation("transaction-conversation");
   assert.equal(reopened.conversation.title, "Original title");
   assert.deepEqual(reopened.agentRuns.map((run) => run.status).sort(), ["failed", "interrupted"]);
+  assert.deepEqual(
+    reopened.agentRuns.find((run) => run.id === "failed-run")?.error,
+    { code: "provider_error", message: "Provider failed." },
+  );
   await store.close();
 });
 

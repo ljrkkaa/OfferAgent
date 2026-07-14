@@ -20,6 +20,7 @@ export interface RuntimeShutdown {
 export interface ModelDescriptor {
   id: string;
   label: string;
+  supportsFastMode?: boolean;
 }
 
 export type AgentRunStatus =
@@ -59,6 +60,7 @@ export interface WebSearchSource {
 }
 
 export interface AgentRunRecord {
+  error?: { code: ProviderErrorCode; message: string };
   id: string;
   modelId: string;
   status: AgentRunStatus;
@@ -372,6 +374,7 @@ export interface AgentRunStart {
   agentRunId: string;
   conversationId: string;
   eventId: string;
+  fastMode?: boolean;
   input: { role: "user"; text: string };
   model: string;
   protocolVersion: typeof PROTOCOL_VERSION;

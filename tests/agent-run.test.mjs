@@ -144,7 +144,13 @@ test("a deterministic Provider lists models and streams one Agent Run", async (t
   const models = await getJson(handshake.port, token, "/models");
   assert.equal(models.statusCode, 200);
   assert.deepEqual(models.body, {
-    models: [{ id: "fake-interview-model", label: "Fake Interview Model" }],
+    models: [
+      {
+        id: "fake-interview-model",
+        label: "Fake Interview Model",
+        supportsFastMode: true,
+      },
+    ],
   });
 
   const socket = new WebSocket(`ws://127.0.0.1:${handshake.port}/events`, {
@@ -244,7 +250,12 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
         response.end(
           JSON.stringify({
             models: [
-              { slug: "gpt-5.4", display_name: "GPT-5.4", visibility: "list" },
+              {
+                slug: "gpt-5.4",
+                display_name: "GPT-5.4",
+                visibility: "list",
+                supports_fast_mode: true,
+              },
               { slug: "hidden", display_name: "Hidden", visibility: "hide" },
             ],
           }),
@@ -458,7 +469,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   const models = await getJson(handshake.port, token, "/models");
   assert.deepEqual(models, {
     statusCode: 200,
-    body: { models: [{ id: "gpt-5.4", label: "GPT-5.4" }] },
+    body: { models: [{ id: "gpt-5.4", label: "GPT-5.4", supportsFastMode: true }] },
   });
 
   const socket = new WebSocket(`ws://127.0.0.1:${handshake.port}/events`, {
@@ -479,6 +490,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
       agentRunId: "agent-run-codex-1",
       sequence: 0,
       model: "gpt-5.4",
+      fastMode: true,
       input: { role: "user", text: "Prepare me." },
     }),
   );
@@ -496,6 +508,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   assert.match(upstreamRequests[0].url, /^\/models\?client_version=/);
   const responseRequest = JSON.parse(upstreamRequests[1].body);
   assert.equal(responseRequest.model, "gpt-5.4");
+  assert.equal(responseRequest.service_tier, "priority");
   assert.equal(responseRequest.store, false);
   assert.equal(responseRequest.stream, true);
   assert.equal(responseRequest.input[0].content[0].text, "Prepare me.");

@@ -24,9 +24,13 @@ import {
 } from "./vault-change-coordinator";
 
 const SIDEBAR_VIEW_TYPE = "offeragent-sidebar";
-const DEFAULT_SETTINGS: OfferAgentPluginSettings = { vaultPermissionMode: "trusted_vault" };
+const DEFAULT_SETTINGS: OfferAgentPluginSettings = {
+  fastMode: false,
+  vaultPermissionMode: "trusted_vault",
+};
 
 interface OfferAgentPluginSettings {
+  fastMode: boolean;
   vaultPermissionMode: VaultPermissionMode;
 }
 
@@ -35,6 +39,12 @@ function permissionMode(value: unknown): VaultPermissionMode {
     ? value
     : DEFAULT_SETTINGS.vaultPermissionMode;
 }
+
+const PERMISSION_LABELS: Record<VaultPermissionMode, string> = {
+  ask_every_time: "Ask Every Time",
+  read_only: "Read Only",
+  trusted_vault: "Trusted Vault",
+};
 
 class OfferAgentSettingTab extends PluginSettingTab {
   readonly #owner: OfferAgentPlugin;
@@ -46,6 +56,44 @@ class OfferAgentSettingTab extends PluginSettingTab {
 
   display(): void {
     this.containerEl.empty();
+    const viewModel = this.#owner.getSidebarViewModel();
+    const presentation = viewModel.presentation.settings;
+    this.containerEl.createEl("h2", { text: "OfferAgent" });
+    new Setting(this.containerEl)
+      .setName("Runtime status")
+      .setDesc(
+        presentation.runtimeStatus === "connected"
+          ? "Connected to the local OfferAgent Runtime."
+          : presentation.advanced.diagnostics,
+      );
+    new Setting(this.containerEl)
+      .setName("Provider status")
+      .setDesc(
+        presentation.providerStatus === "connected"
+          ? "Codex subscription Provider is available."
+          : "Provider is unavailable; check authentication and Runtime diagnostics.",
+      );
+    new Setting(this.containerEl)
+      .setName("Model")
+      .setDesc("Model used for this Conversation.")
+      .addDropdown((dropdown) => {
+        for (const model of viewModel.conversation.models) {
+          dropdown.addOption(model.id, model.label);
+        }
+        dropdown
+          .setValue(viewModel.conversation.selectedModelId ?? "")
+          .onChange(async (value) => this.#owner.selectModel(value));
+      });
+    if (presentation.fastMode) {
+      new Setting(this.containerEl)
+        .setName("Fast Mode")
+        .setDesc("Uses the Provider's faster priority processing and may consume more credits.")
+        .addToggle((toggle) =>
+          toggle
+            .setValue(presentation.fastMode!.enabled)
+            .onChange(async (value) => this.#owner.setFastMode(value)),
+        );
+    }
     new Setting(this.containerEl)
       .setName("Vault Permission Mode")
       .setDesc("Controls Agent-requested writes for this Vault. Control files always require confirmation.")
@@ -59,7 +107,18 @@ class OfferAgentSettingTab extends PluginSettingTab {
             await this.#owner.setVaultPermissionMode(permissionMode(value));
           }),
       );
-    const hostedSearch = new Setting(this.containerEl)
+    const advanced = this.containerEl.createEl("details", {
+      cls: "offeragent-settings__advanced",
+    });
+    advanced.createEl("summary", { text: "Advanced" });
+    const advancedContent = advanced.createDiv({ cls: "offeragent-settings__advanced-content" });
+    new Setting(advancedContent)
+      .setName("Git Checkpoint retention")
+      .setDesc(presentation.advanced.gitRetention);
+    new Setting(advancedContent)
+      .setName("Diagnostics")
+      .setDesc(presentation.advanced.diagnostics);
+    const hostedSearch = new Setting(advancedContent)
       .setName("Hosted Web Search")
       .setDesc("Capability status: unknown. Status is discovered from the active backend and model.")
       .addButton((button) =>
@@ -90,11 +149,13 @@ class OfferAgentSettingTab extends PluginSettingTab {
 
 class OfferAgentSidebarView extends ItemView {
   readonly #controller: SidebarController;
+  readonly #openSettings: () => void;
   #unsubscribe?: () => void;
 
-  constructor(leaf: WorkspaceLeaf, controller: SidebarController) {
+  constructor(leaf: WorkspaceLeaf, controller: SidebarController, openSettings: () => void) {
     super(leaf);
     this.#controller = controller;
+    this.#openSettings = openSettings;
   }
 
   getViewType(): string {
@@ -126,11 +187,12 @@ class OfferAgentSidebarView extends ItemView {
     container.addClass("offeragent-sidebar");
 
     const header = container.createDiv({ cls: "offeragent-sidebar__header" });
-    header.createEl("h2", {
+    const brand = header.createDiv({ cls: "offeragent-sidebar__brand" });
+    brand.createEl("h2", {
       cls: "offeragent-sidebar__title",
       text: viewModel.title,
     });
-    const status = header.createDiv({
+    const status = brand.createDiv({
       cls: "offeragent-sidebar__status",
       text: viewModel.runtime.state,
     });
@@ -143,7 +205,7 @@ class OfferAgentSidebarView extends ItemView {
       });
     }
 
-    const conversationRow = container.createDiv({ cls: "offeragent-sidebar__conversations" });
+    const conversationRow = header.createDiv({ cls: "offeragent-sidebar__conversations" });
     const conversationSelect = conversationRow.createEl("select", {
       cls: "offeragent-sidebar__conversation-select",
     });
@@ -152,6 +214,7 @@ class OfferAgentSidebarView extends ItemView {
       option.value = conversation.id;
     }
     conversationSelect.value = viewModel.conversation.activeConversationId ?? "";
+    conversationSelect.setAttribute("aria-label", "Conversation history");
     conversationSelect.disabled = viewModel.conversation.runState === "streaming";
     conversationSelect.addEventListener("change", () => {
       void this.#controller.openConversation(conversationSelect.value);
@@ -161,6 +224,7 @@ class OfferAgentSidebarView extends ItemView {
       text: "New",
     });
     newConversation.type = "button";
+    newConversation.setAttribute("aria-label", "New Conversation");
     newConversation.disabled = viewModel.conversation.runState === "streaming";
     newConversation.addEventListener("click", () => {
       void this.#controller.createConversation();
@@ -170,38 +234,43 @@ class OfferAgentSidebarView extends ItemView {
       text: "Delete",
     });
     deleteConversation.type = "button";
+    deleteConversation.setAttribute("aria-label", "Delete Conversation");
     deleteConversation.disabled =
       !viewModel.conversation.activeConversationId ||
       viewModel.conversation.runState === "streaming";
     deleteConversation.addEventListener("click", () => {
       void this.#controller.deleteCurrentConversation();
     });
-
-    const modelRow = container.createDiv({ cls: "offeragent-sidebar__models" });
-    modelRow.createEl("label", { text: "Model" });
-    const modelSelect = modelRow.createEl("select", {
-      cls: "offeragent-sidebar__model-select",
+    const settings = conversationRow.createEl("button", {
+      cls: "offeragent-sidebar__settings",
+      text: "Settings",
     });
-    for (const model of viewModel.conversation.models) {
-      const option = modelSelect.createEl("option", { text: model.label });
-      option.value = model.id;
-    }
-    modelSelect.value = viewModel.conversation.selectedModelId ?? "";
-    modelSelect.disabled =
-      viewModel.conversation.models.length === 0 ||
-      viewModel.conversation.runState === "streaming";
-    modelSelect.addEventListener("change", () => {
-      void this.#controller.selectModel(modelSelect.value);
-    });
+    settings.type = "button";
+    settings.setAttribute("aria-label", "Open OfferAgent settings");
+    settings.addEventListener("click", this.#openSettings);
 
     const transcript = container.createDiv({ cls: "offeragent-sidebar__transcript" });
-    if (viewModel.conversation.messages.length === 0) {
-      container.createDiv({
+    if (viewModel.presentation.transcript.length === 0) {
+      transcript.createDiv({
         cls: "offeragent-sidebar__empty",
         text: "OfferAgent is ready for a conversation.",
       });
-    } else {
-      for (const message of viewModel.conversation.messages) {
+    }
+
+    const inlineRunDiagnostic = viewModel.presentation.transcript.some(
+      (item) => item.kind === "run_status" && item.message,
+    );
+    if (viewModel.conversation.error && !inlineRunDiagnostic) {
+      const diagnostic = transcript.createDiv({
+        cls: "offeragent-sidebar__diagnostic offeragent-sidebar__provider-error",
+        text: viewModel.conversation.error.message,
+      });
+      diagnostic.dataset.code = viewModel.conversation.error.code;
+    }
+
+    for (const item of viewModel.presentation.transcript) {
+      if (item.kind === "message") {
+        const { message } = item;
         const messageElement = transcript.createDiv({
           cls: `offeragent-sidebar__message offeragent-sidebar__message--${message.role}`,
           text: message.text,
@@ -218,143 +287,142 @@ class OfferAgentSidebarView extends ItemView {
             link.rel = "noopener noreferrer";
           }
         }
-      }
-    }
-
-    if (viewModel.conversation.error) {
-      const diagnostic = container.createDiv({
-        cls: "offeragent-sidebar__diagnostic offeragent-sidebar__provider-error",
-        text: viewModel.conversation.error.message,
-      });
-      diagnostic.dataset.code = viewModel.conversation.error.code;
-    }
-
-    for (const batch of viewModel.conversation.vaultChanges) {
-      const card = container.createDiv({ cls: "offeragent-sidebar__change-batch" });
-      card.dataset.status = batch.status;
-      card.createEl("h3", { text: batch.task });
-      card.createDiv({
-        cls: "offeragent-sidebar__change-batch-status",
-        text: `Vault Change Batch: ${batch.status}`,
-      });
-      if (batch.message) {
+      } else if (item.kind === "vault_change") {
+        const { change: batch } = item;
+        const card = transcript.createDiv({ cls: "offeragent-sidebar__change-batch" });
+        card.dataset.status = batch.status;
+        card.createEl("h3", { text: batch.task });
         card.createDiv({
-          cls: "offeragent-sidebar__change-policy-decision",
-          text: batch.message,
+          cls: "offeragent-sidebar__change-batch-status",
+          text: `Vault Change Batch: ${batch.status}`,
         });
-      }
-      const actions = card.createEl("ul", { cls: "offeragent-sidebar__change-actions" });
-      for (const action of batch.actions) {
-        actions.createEl("li", { text: `${action.operation}: ${action.path}` });
-      }
-      for (const conflict of batch.conflicts ?? []) {
-        card.createEl("pre", {
-          cls: "offeragent-sidebar__change-conflict",
-          text: conflict.diff,
-        });
-      }
-      if (batch.status === "pending") {
-        const apply = card.createEl("button", {
-          cls: "offeragent-sidebar__change-apply",
-          text: "Apply all",
-        });
-        apply.type = "button";
-        apply.addEventListener("click", () => {
-          void this.#controller.decideVaultChange(batch.toolCallId, "apply");
-        });
-        const reject = card.createEl("button", {
-          cls: "offeragent-sidebar__change-reject",
-          text: "Reject all",
-        });
-        reject.type = "button";
-        reject.addEventListener("click", () => {
-          void this.#controller.decideVaultChange(batch.toolCallId, "reject");
-        });
-      } else if (batch.status === "applied") {
-        const undo = card.createEl("button", {
-          cls: "offeragent-sidebar__change-undo",
-          text: "Undo",
-        });
-        undo.type = "button";
-        undo.addEventListener("click", () => {
-          void this.#controller.undoVaultChange(batch.batchId);
-        });
-      }
-    }
-
-    if (viewModel.conversation.toolCalls.length > 0) {
-      const activities = container.createDiv({ cls: "offeragent-sidebar__tool-activities" });
-      for (const call of viewModel.conversation.toolCalls) {
-        if (call.name === "vault_propose_changes") continue;
-        const activity = activities.createEl("details", {
-          cls: "offeragent-sidebar__tool-activity",
-        });
-        activity.dataset.status = call.status;
-        activity.createEl("summary", {
-          text: `${call.name} · ${call.status}`,
-        });
-        activity.createEl("pre", {
-          text: JSON.stringify(call.arguments, null, 2),
-        });
-      }
-    }
-
-    if (viewModel.conversation.agentRuns.length > 0) {
-      const runList = container.createDiv({ cls: "offeragent-sidebar__run-list" });
-      for (const [index, run] of viewModel.conversation.agentRuns.entries()) {
-        const runStatus = runList.createDiv({
-          cls: "offeragent-sidebar__run-status",
-          text: `Run ${index + 1}: ${run.status}`,
-        });
-        runStatus.dataset.agentRunId = run.id;
-        runStatus.dataset.status = run.status;
-        if (
-          run.status === "interrupted" &&
-          viewModel.runtime.state === "connected" &&
-          viewModel.conversation.runState === "idle" &&
-          !viewModel.conversation.toolCalls.some(
-            (call) =>
-              call.agentRunId === run.id &&
-              call.name === "vault_propose_changes" &&
-              call.status === "requested",
-          )
-        ) {
-          const resume = runList.createEl("button", {
-            cls: "offeragent-sidebar__resume",
-            text: "Resume",
-          });
-          resume.type = "button";
-          resume.dataset.agentRunId = run.id;
-          resume.addEventListener("click", () => {
-            void this.#controller.resumeAgentRun(run.id);
+        if (batch.message) {
+          card.createDiv({
+            cls: "offeragent-sidebar__change-policy-decision",
+            text: batch.message,
           });
         }
+        const actions = card.createEl("ul", { cls: "offeragent-sidebar__change-actions" });
+        for (const action of batch.actions) {
+          actions.createEl("li", { text: `${action.operation}: ${action.path}` });
+        }
+        for (const conflict of batch.conflicts ?? []) {
+          card.createEl("pre", {
+            cls: "offeragent-sidebar__change-conflict",
+            text: conflict.diff,
+          });
+        }
+        if (batch.status === "pending") {
+          const apply = card.createEl("button", {
+            cls: "offeragent-sidebar__change-apply",
+            text: "Apply all",
+          });
+          apply.type = "button";
+          apply.addEventListener("click", () => {
+            void this.#controller.decideVaultChange(batch.toolCallId, "apply");
+          });
+          const reject = card.createEl("button", {
+            cls: "offeragent-sidebar__change-reject",
+            text: "Reject all",
+          });
+          reject.type = "button";
+          reject.addEventListener("click", () => {
+            void this.#controller.decideVaultChange(batch.toolCallId, "reject");
+          });
+        } else if (batch.status === "applied") {
+          const undo = card.createEl("button", {
+            cls: "offeragent-sidebar__change-undo",
+            text: "Undo",
+          });
+          undo.type = "button";
+          undo.addEventListener("click", () => {
+            void this.#controller.undoVaultChange(batch.batchId);
+          });
+        }
+      } else if (item.kind === "activity") {
+        const presented = item.activity;
+        const activity = transcript.createEl("details", {
+          cls: "offeragent-sidebar__tool-activity",
+        });
+        activity.dataset.status = presented.status;
+        const summary = activity.createEl("summary", {
+          text: presented.label,
+        });
+        summary.setAttribute("aria-expanded", "false");
+        summary.setAttribute("aria-label", `${presented.label}. Press Enter to show details.`);
+        activity.addEventListener("toggle", () => {
+          summary.setAttribute("aria-expanded", activity.open ? "true" : "false");
+        });
+        activity.createEl("pre", {
+          text: presented.details,
+        });
+      } else {
+        const runStatus = transcript.createDiv({
+          cls: "offeragent-sidebar__run-status",
+          text: item.message ? `${item.label} ${item.message}` : item.label,
+        });
+        runStatus.dataset.agentRunId = item.agentRunId;
+        runStatus.dataset.status = item.status;
       }
     }
 
     const composer = container.createEl("form", { cls: "offeragent-sidebar__composer" });
+    const context = composer.createDiv({ cls: "offeragent-sidebar__context" });
+    for (const chip of viewModel.presentation.composer.contextChips) {
+      context.createDiv({
+        cls: "offeragent-sidebar__context-chip",
+        text: chip.label,
+      });
+    }
+    if (viewModel.presentation.settings.fastMode?.enabled) {
+      context.createDiv({
+        cls: "offeragent-sidebar__context-chip offeragent-sidebar__context-chip--fast",
+        text: "Fast Mode",
+      });
+    }
     const input = composer.createEl("textarea", { cls: "offeragent-sidebar__input" });
     input.placeholder = "Ask OfferAgent…";
-    input.disabled = viewModel.conversation.runState === "streaming";
-    const submit = composer.createEl("button", {
-      cls: "offeragent-sidebar__send",
-      text: viewModel.conversation.runState === "streaming" ? "Working…" : "Send",
+    input.setAttribute("aria-label", "Message OfferAgent");
+    input.disabled = viewModel.presentation.composer.primaryAction.kind !== "send";
+    const controls = composer.createDiv({ cls: "offeragent-sidebar__composer-controls" });
+    const modelSelect = controls.createEl("select", {
+      cls: "offeragent-sidebar__model-select",
     });
-    submit.type = "submit";
-    submit.disabled =
+    modelSelect.setAttribute("aria-label", "Conversation model");
+    for (const model of viewModel.conversation.models) {
+      const option = modelSelect.createEl("option", { text: model.label });
+      option.value = model.id;
+    }
+    modelSelect.value = viewModel.conversation.selectedModelId ?? "";
+    modelSelect.disabled =
+      viewModel.conversation.models.length === 0 ||
+      viewModel.presentation.composer.primaryAction.kind !== "send";
+    modelSelect.addEventListener("change", () => {
+      void this.#controller.selectModel(modelSelect.value);
+    });
+    controls.createDiv({
+      cls: "offeragent-sidebar__permission",
+      text: PERMISSION_LABELS[viewModel.presentation.composer.permissionMode],
+    });
+    const primary = viewModel.presentation.composer.primaryAction;
+    const primaryButton = controls.createEl("button", {
+      cls: `offeragent-sidebar__primary offeragent-sidebar__${primary.kind}`,
+      text: primary.label,
+    });
+    primaryButton.type = primary.kind === "send" ? "submit" : "button";
+    primaryButton.disabled =
       viewModel.runtime.state !== "connected" ||
-      !viewModel.conversation.selectedModelId ||
-      viewModel.conversation.runState === "streaming";
-    if (viewModel.conversation.runState === "streaming") {
-      const stop = composer.createEl("button", {
-        cls: "offeragent-sidebar__stop",
-        text: "Stop",
+      (primary.kind === "send" && !viewModel.conversation.selectedModelId);
+    if (primary.kind === "stop") {
+      primaryButton.addEventListener("click", () => this.#controller.stopAgentRun());
+    } else if (primary.kind === "resume" && primary.agentRunId) {
+      primaryButton.addEventListener("click", () => {
+        void this.#controller.resumeAgentRun(primary.agentRunId!);
       });
-      stop.type = "button";
-      stop.addEventListener("click", () => this.#controller.stopAgentRun());
     }
     composer.addEventListener("submit", (event) => {
       event.preventDefault();
+      if (primary.kind !== "send") return;
       const text = input.value;
       if (!text.trim()) return;
       input.value = "";
@@ -374,6 +442,7 @@ export default class OfferAgentPlugin extends Plugin {
     }
     const stored = (await this.loadData()) as Partial<OfferAgentPluginSettings> | null;
     this.#settings = {
+      fastMode: stored?.fastMode === true,
       vaultPermissionMode: permissionMode(stored?.vaultPermissionMode),
     };
     this.addSettingTab(new OfferAgentSettingTab(this.app, this));
@@ -407,11 +476,18 @@ export default class OfferAgentPlugin extends Plugin {
       },
     });
     this.#runtime = runtime;
-    this.#controller = new SidebarController(runtime, changeCoordinator);
+    this.#controller = new SidebarController(runtime, changeCoordinator, {
+      getFastModeEnabled: () => this.#settings.fastMode,
+      getVaultPermissionMode: () => this.#settings.vaultPermissionMode,
+    });
 
     this.registerView(
       SIDEBAR_VIEW_TYPE,
-      (leaf) => new OfferAgentSidebarView(leaf, this.#requiredController()),
+      (leaf) => new OfferAgentSidebarView(
+        leaf,
+        this.#requiredController(),
+        () => this.#openSettings(),
+      ),
     );
     this.addRibbonIcon("sparkles", "Open OfferAgent", () => {
       void this.#openSidebar();
@@ -443,6 +519,20 @@ export default class OfferAgentPlugin extends Plugin {
     return this.#settings.vaultPermissionMode;
   }
 
+  getSidebarViewModel(): SidebarViewModel {
+    return this.#requiredController().getViewModel();
+  }
+
+  async selectModel(modelId: string): Promise<void> {
+    await this.#requiredController().selectModel(modelId);
+  }
+
+  async setFastMode(fastMode: boolean): Promise<void> {
+    this.#settings = { ...this.#settings, fastMode };
+    await this.saveData(this.#settings);
+    this.#requiredController().refreshPresentation();
+  }
+
   async getHostedWebSearchCapability() {
     const modelId = this.#controller?.getViewModel().conversation.selectedModelId;
     if (!modelId) throw new Error("Select a model before checking Hosted Web Search.");
@@ -458,8 +548,17 @@ export default class OfferAgentPlugin extends Plugin {
   }
 
   async setVaultPermissionMode(vaultPermissionMode: VaultPermissionMode): Promise<void> {
-    this.#settings = { vaultPermissionMode };
+    this.#settings = { ...this.#settings, vaultPermissionMode };
     await this.saveData(this.#settings);
+    this.#requiredController().refreshPresentation();
+  }
+
+  #openSettings(): void {
+    const setting = (this.app as App & {
+      setting?: { open(): void; openTabById(id: string): void };
+    }).setting;
+    setting?.open();
+    setting?.openTabById(this.manifest.id);
   }
 
   async #openSidebar(): Promise<void> {

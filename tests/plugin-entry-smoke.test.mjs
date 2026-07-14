@@ -29,7 +29,9 @@ class StubElement {
     this.children = [];
     this.dataset = {};
     this.disabled = false;
+    this.attributes = new Map();
     this.listeners = new Map();
+    this.open = false;
     this.tagName = tagName;
     this.text = "";
     this.value = "";
@@ -53,6 +55,14 @@ class StubElement {
 
   addEventListener(type, listener) {
     this.listeners.set(type, listener);
+  }
+
+  setAttribute(name, value) {
+    this.attributes.set(name, `${value}`);
+  }
+
+  getAttribute(name) {
+    return this.attributes.get(name);
   }
 
   dispatch(type) {
@@ -237,6 +247,24 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
       configure(button);
       return this;
     }
+
+    addToggle(configure) {
+      const toggleEl = this.settingEl.createEl("input", { cls: "checkbox-container" });
+      toggleEl.type = "checkbox";
+      toggleEl.checked = false;
+      const toggle = {
+        onChange(listener) {
+          toggleEl.addEventListener("change", () => listener(toggleEl.checked));
+          return toggle;
+        },
+        setValue(value) {
+          toggleEl.checked = value;
+          return toggle;
+        },
+      };
+      configure(toggle);
+      return this;
+    }
   }
 
   class Notice {
@@ -307,7 +335,12 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
       content: "line one\nline two",
     },
   ];
+  let settingsOpened = 0;
   const app = {
+    setting: {
+      open() { settingsOpened += 1; },
+      openTabById() {},
+    },
     vault: {
       adapter: new FileSystemAdapter(temporaryVault),
       configDir: ".obsidian",
@@ -360,8 +393,18 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   assert.equal(plugin.ribbonActions.length, 1);
   assert.equal(plugin.settingTabs.length, 1);
   plugin.settingTabs[0].display();
-  const permissionSelect = plugin.settingTabs[0].containerEl.findByClass("dropdown");
+  const permissionSelect = plugin.settingTabs[0].containerEl
+    .findAllByClass("dropdown")
+    .find(({ value }) => value === "trusted_vault");
   assert.equal(permissionSelect.value, "trusted_vault");
+  const commonSettingNames = plugin.settingTabs[0].containerEl
+    .findAllByClass("setting-item-name")
+    .map(({ text }) => text);
+  assert.ok(commonSettingNames.includes("Runtime status"));
+  assert.ok(commonSettingNames.includes("Provider status"));
+  assert.ok(commonSettingNames.includes("Model"));
+  assert.ok(commonSettingNames.includes("Vault Permission Mode"));
+  assert.ok(plugin.settingTabs[0].containerEl.findByClass("offeragent-settings__advanced"));
 
   plugin.commands.get("open-offeragent-sidebar").callback();
   await waitUntil(() => activeView, "OfferAgent did not open its sidebar");
@@ -373,6 +416,10 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "OfferAgent sidebar did not report a connected Runtime",
   );
   assert.equal(connectedStatus.text, "connected");
+  const settingsButton = activeView.contentEl.findByClass("offeragent-sidebar__settings");
+  assert.ok(settingsButton);
+  settingsButton.dispatch("click");
+  assert.equal(settingsOpened, 1);
 
   const modelSelect = await waitUntil(
     () => {
@@ -382,7 +429,21 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "OfferAgent did not render its model selector",
   );
   assert.equal(modelSelect.value, "fake-interview-model");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__conversation-select")
+      .getAttribute("aria-label"),
+    "Conversation history",
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input").getAttribute("aria-label"),
+    "Message OfferAgent",
+  );
   plugin.settingTabs[0].display();
+  assert.ok(
+    plugin.settingTabs[0].containerEl
+      .findAllByClass("setting-item-name")
+      .some(({ text }) => text === "Fast Mode"),
+  );
   const capabilityStatus = await waitUntil(
     () => plugin.settingTabs[0].containerEl
       .findAllByClass("setting-item-description")
@@ -405,6 +466,27 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   const input = activeView.contentEl.findByClass("offeragent-sidebar__input");
   assert.ok(composer);
   assert.ok(input);
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__context-chip")?.text,
+    "Vault context",
+  );
+  assert.match(
+    activeView.contentEl.findByClass("offeragent-sidebar__permission")?.text ?? "",
+    /Trusted Vault/,
+  );
+  await plugin.setFastMode(true);
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__context-chip--fast"),
+    "Fast Mode setting did not refresh the idle Sidebar presentation",
+  );
+  await plugin.setFastMode(false);
+  await plugin.setVaultPermissionMode("read_only");
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__permission")?.text === "Read Only",
+    "Vault Permission setting did not refresh the idle Sidebar presentation",
+  );
+  await plugin.setVaultPermissionMode("trusted_vault");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__send")?.text, "Send");
   input.value = "Practice my introduction.";
   composer.dispatch("submit");
 
@@ -416,32 +498,21 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "OfferAgent did not stream the fake Provider response into the Sidebar",
   );
   assert.equal(assistantMessage.text, "OfferAgent received: Practice my introduction.");
-  const completedRun = await waitUntil(
-    () => {
-      const status = activeView.contentEl.findByClass("offeragent-sidebar__run-status");
-      return status?.dataset.status === "completed" ? status : undefined;
-    },
-    "OfferAgent did not render the completed first Agent Run",
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
+    "OfferAgent did not finish the first Agent Run",
   );
-  assert.equal(completedRun.dataset.status, "completed");
+  assert.equal(activeView.contentEl.findAllByClass("offeragent-sidebar__run-status").length, 0);
 
   const nextComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const nextInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
   nextInput.value = "Practice a second answer.";
   nextComposer.dispatch("submit");
-  const visibleRunStatuses = await waitUntil(
-    () => {
-      const statuses = activeView.contentEl.findAllByClass("offeragent-sidebar__run-status");
-      return statuses.length === 2 && statuses.every((status) => status.dataset.status === "completed")
-        ? statuses
-        : undefined;
-    },
-    "OfferAgent did not keep both Agent Run statuses visible",
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
+    "OfferAgent did not finish the second Agent Run",
   );
-  assert.deepEqual(
-    visibleRunStatuses.map((status) => status.dataset.status),
-    ["completed", "completed"],
-  );
+  assert.equal(activeView.contentEl.findAllByClass("offeragent-sidebar__run-status").length, 0);
 
   const toolComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const toolInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
@@ -453,19 +524,19 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
       return activities.find(
         (activity) =>
           activity.dataset.status === "completed" &&
-          activity.children[0]?.text.includes("vault_read"),
+          activity.children[0]?.text.includes("Read notes/example.md"),
       );
     },
     "OfferAgent did not execute and render the Vault tool activity",
   );
-  assert.match(completedTool.children[0].text, /vault_read · completed/);
+  assert.match(completedTool.children[0].text, /Read notes\/example\.md · completed/);
+  assert.equal(completedTool.children[0].getAttribute("aria-expanded"), "false");
+  completedTool.open = true;
+  completedTool.dispatch("toggle");
+  assert.equal(completedTool.children[0].getAttribute("aria-expanded"), "true");
 
   await waitUntil(
-    () => {
-      const statuses = activeView.contentEl.findAllByClass("offeragent-sidebar__run-status");
-      return statuses.length === 3 &&
-        statuses.every((status) => status.dataset.status === "completed");
-    },
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
     "OfferAgent did not finish the Vault read Agent Run",
   );
 
@@ -566,11 +637,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "line one\nline two",
   );
   await waitUntil(
-    () => {
-      const statuses = activeView.contentEl.findAllByClass("offeragent-sidebar__run-status");
-      return statuses.length === 5 &&
-        statuses.every((status) => status.dataset.status === "completed");
-    },
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
     "OfferAgent did not continue the rejected batch Agent Run",
   );
 
@@ -629,11 +696,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "refs/offeragent/checkpoints/smoke-batch-apply^{commit}",
   );
   await waitUntil(
-    () => {
-      const statuses = activeView.contentEl.findAllByClass("offeragent-sidebar__run-status");
-      return statuses.length === 6 &&
-        statuses.every((status) => status.dataset.status === "completed");
-    },
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
     "OfferAgent did not continue the applied batch Agent Run",
   );
   permissionSelect.value = "read_only";
@@ -678,7 +741,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   );
   const readActivityCount = activeView.contentEl
     .findAllByClass("offeragent-sidebar__tool-activity")
-    .filter((activity) => activity.children[0]?.text.includes("vault_read")).length;
+    .filter((activity) => activity.children[0]?.text.includes("Read notes/example.md")).length;
   const readOnlyComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const readOnlyInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
   readOnlyInput.value = "vault_read notes/example.md 1-2";
@@ -690,7 +753,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
         .filter(
           (activity) =>
             activity.dataset.status === "completed" &&
-            activity.children[0]?.text.includes("vault_read"),
+            activity.children[0]?.text.includes("Read notes/example.md"),
         ).length === readActivityCount + 1,
     "Read Only blocked a permitted Vault read",
   );
@@ -703,7 +766,9 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   await plugin.onload();
   plugin.settingTabs[0].display();
   assert.equal(
-    plugin.settingTabs[0].containerEl.findByClass("dropdown").value,
+    plugin.settingTabs[0].containerEl
+      .findAllByClass("dropdown")
+      .find(({ value }) => value === "read_only")?.value,
     "read_only",
   );
   plugin.commands.get("open-offeragent-sidebar").callback();

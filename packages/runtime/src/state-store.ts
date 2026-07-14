@@ -25,6 +25,7 @@ const CURRENT_SCHEMA_VERSION = 10;
 export interface RunCheckpoint {
   canonicalReadPaths: Array<[string, string]>;
   completedSteps: number;
+  fastMode?: boolean;
   hostedWebSearchProbeAttempted: boolean;
   input: ModelConversationItem[];
   localSkills: string[];
@@ -104,6 +105,7 @@ function persistedRunCheckpoint(checkpoint: RunCheckpoint): RunCheckpoint {
     requiredRereads: checkpoint.requiredRereads,
     hostedWebSearchProbeAttempted: checkpoint.hostedWebSearchProbeAttempted,
     completedSteps: checkpoint.completedSteps,
+    ...(checkpoint.fastMode ? { fastMode: true } : {}),
     ...(checkpoint.pendingToolStep ? { pendingToolStep: checkpoint.pendingToolStep } : {}),
   };
 }
@@ -1561,7 +1563,7 @@ export class RuntimeStateStore {
       )[0]?.values ?? [];
     const runRows =
       this.#database.exec(
-        `SELECT id, model_id, status
+        `SELECT id, model_id, status, error_code, error_message
          FROM agent_runs WHERE conversation_id = ? ORDER BY created_at, id`,
         [conversationId],
       )[0]?.values ?? [];
@@ -1592,10 +1594,13 @@ export class RuntimeStateStore {
           ? { citations: JSON.parse(citationsJson as string) }
           : {}),
       })),
-      agentRuns: runRows.map(([id, modelId, status]) => ({
+      agentRuns: runRows.map(([id, modelId, status, errorCode, errorMessage]) => ({
         id: id as string,
         modelId: modelId as string,
         status: status as AgentRunStatus,
+        ...(errorCode && errorMessage
+          ? { error: { code: errorCode as ProviderErrorCode, message: errorMessage as string } }
+          : {}),
       })),
       toolCalls: toolCallRows.map(([
         id,

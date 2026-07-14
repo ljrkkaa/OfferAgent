@@ -9,6 +9,7 @@ import {
 const MODEL: ModelDescriptor = {
   id: "fake-interview-model",
   label: "Fake Interview Model",
+  supportsFastMode: true,
 };
 
 export class FakeModelProvider implements ModelProvider {

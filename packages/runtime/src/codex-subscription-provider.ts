@@ -161,7 +161,8 @@ export class CodexSubscriptionProvider implements ModelProvider {
           : typeof model.label === "string"
             ? model.label
             : id;
-      return [{ id, label }];
+      const supportsFastMode = model.supports_fast_mode === true;
+      return [{ id, label, ...(supportsFastMode ? { supportsFastMode } : {}) }];
     });
     if (models.length === 0) {
       throw new ModelProviderError(
@@ -185,6 +186,7 @@ export class CodexSubscriptionProvider implements ModelProvider {
         signal: request.signal,
         body: JSON.stringify({
           model: request.model,
+          ...(request.fastMode ? { service_tier: "priority" } : {}),
           instructions: request.instructions,
           input: request.input.map(encodeConversationItem),
           tools: request.tools.map((tool) =>

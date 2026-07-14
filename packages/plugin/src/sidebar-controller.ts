@@ -15,6 +15,7 @@ import type {
   WebCitation,
 } from "@offeragent/protocol";
 import { RuntimeRequestError, type RuntimeClient } from "./runtime-supervisor";
+import type { VaultPermissionMode } from "./vault-change-coordinator";
 
 export type RuntimeViewState = "connected" | "idle" | "starting" | "unavailable";
 
@@ -24,7 +25,12 @@ export interface SidebarViewModel {
     agentRuns: AgentRunRecord[];
     conversations: ConversationSummary[];
     error?: { code: ProviderErrorCode | VaultToolErrorCode; message: string };
-    messages: Array<{ citations?: WebCitation[]; role: "assistant" | "user"; text: string }>;
+    messages: Array<{
+      agentRunId: string;
+      citations?: WebCitation[];
+      role: "assistant" | "user";
+      text: string;
+    }>;
     models: ModelDescriptor[];
     runState: "idle" | "streaming";
     selectedModelId?: string;
@@ -43,10 +49,106 @@ export interface SidebarViewModel {
     message?: string;
     state: RuntimeViewState;
   };
+  presentation: {
+    activities: Array<{
+      action: string;
+      details: string;
+      id: string;
+      label: string;
+      status: ToolCallRecord["status"];
+      target?: string;
+    }>;
+    composer: {
+      contextChips: Array<{ kind: "scope"; label: string }>;
+      permissionMode: VaultPermissionMode;
+      primaryAction: {
+        agentRunId?: string;
+        kind: "resume" | "send" | "stop";
+        label: "Resume" | "Send" | "Stop";
+      };
+    };
+    settings: {
+      advanced: {
+        diagnostics: string;
+        gitRetention: string;
+        hostedWebSearch: string;
+      };
+      fastMode?: { enabled: boolean };
+      model?: { id: string; label: string };
+      permissionMode: VaultPermissionMode;
+      providerStatus: "connected" | "unavailable";
+      runtimeStatus: RuntimeViewState;
+    };
+    transcript: Array<
+      | {
+          kind: "activity";
+          activity: SidebarViewModel["presentation"]["activities"][number];
+        }
+      | {
+          kind: "message";
+          message: SidebarViewModel["conversation"]["messages"][number];
+        }
+      | {
+          kind: "run_status";
+          agentRunId: string;
+          label: string;
+          message?: string;
+          status: Exclude<AgentRunRecord["status"], "completed" | "running">;
+        }
+      | {
+          kind: "vault_change";
+          change: SidebarViewModel["conversation"]["vaultChanges"][number];
+        }
+    >;
+  };
   title: "OfferAgent";
 }
 
 type Subscriber = (viewModel: SidebarViewModel) => void;
+
+export interface SidebarEnvironment {
+  getFastModeEnabled(): boolean;
+  getVaultPermissionMode(): VaultPermissionMode;
+}
+
+const DEFAULT_ENVIRONMENT: SidebarEnvironment = {
+  getFastModeEnabled: () => false,
+  getVaultPermissionMode: () => "trusted_vault",
+};
+
+const TOOL_ACTIONS: Record<ToolCallRecord["name"], string> = {
+  agent_contract_read: "Read contract",
+  hosted_web_search_probe: "Probe web search",
+  skill_read: "Read skill",
+  vault_list: "List",
+  vault_propose_changes: "Change Vault",
+  vault_read: "Read",
+  vault_search: "Search",
+  web_read: "Read web page",
+};
+
+function toolTarget(call: ToolCallRecord): string | undefined {
+  if (!call.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments)) {
+    return call.name === "agent_contract_read" ? "agent.md" : undefined;
+  }
+  const arguments_ = call.arguments as Record<string, unknown>;
+  if (call.name === "skill_read" && typeof arguments_.skill === "string") {
+    return typeof arguments_.resource === "string"
+      ? `${arguments_.skill}/${arguments_.resource}`
+      : arguments_.skill;
+  }
+  for (const key of ["path", "directory", "query", "url"]) {
+    if (typeof arguments_[key] === "string" && arguments_[key]) return arguments_[key];
+  }
+  if (call.name === "agent_contract_read") return "agent.md";
+  if (call.name === "vault_list") return "Vault";
+  if (call.name === "hosted_web_search_probe") return "active model";
+  return undefined;
+}
+
+function providerHealthFailure(code: ProviderErrorCode): boolean {
+  return code === "auth_required" || code === "provider_error" || code === "transport_error";
+}
 
 export interface VaultChangeDecisionClient {
   acknowledge?(toolCallId: string): Promise<void>;
@@ -60,10 +162,11 @@ export interface VaultChangeDecisionClient {
 }
 
 export class SidebarController {
+  readonly #environment: SidebarEnvironment;
   readonly #runtime: RuntimeClient;
   readonly #vaultChanges?: VaultChangeDecisionClient;
   readonly #subscribers = new Set<Subscriber>();
-  #viewModel: SidebarViewModel = {
+  #viewModel: Omit<SidebarViewModel, "presentation"> = {
     title: "OfferAgent",
     conversation: {
       agentRuns: [],
@@ -77,28 +180,39 @@ export class SidebarController {
     runtime: { state: "idle" },
   };
   #activeRun?: { agentRunId: string; conversationId: string };
+  #providerStatus: "connected" | "unavailable" = "unavailable";
   readonly #recoveredToolResults = new Map<string, {
     eventId: string;
     result: LocalToolResultPayload;
     toolCallId: string;
   }>();
 
-  constructor(runtime: RuntimeClient, vaultChanges?: VaultChangeDecisionClient) {
+  constructor(
+    runtime: RuntimeClient,
+    vaultChanges?: VaultChangeDecisionClient,
+    environment: SidebarEnvironment = DEFAULT_ENVIRONMENT,
+  ) {
+    this.#environment = environment;
     this.#runtime = runtime;
     this.#vaultChanges = vaultChanges;
     this.#runtime.onUnavailable((message) => {
+      this.#providerStatus = "unavailable";
       this.#update({ state: "unavailable", message });
     });
   }
 
   getViewModel(): SidebarViewModel {
-    return this.#viewModel;
+    return { ...this.#viewModel, presentation: this.#presentation() };
   }
 
   subscribe(subscriber: Subscriber): () => void {
     this.#subscribers.add(subscriber);
-    subscriber(this.#viewModel);
+    subscriber(this.getViewModel());
     return () => this.#subscribers.delete(subscriber);
+  }
+
+  refreshPresentation(): void {
+    for (const subscriber of this.#subscribers) subscriber(this.getViewModel());
   }
 
   async start(): Promise<void> {
@@ -108,6 +222,7 @@ export class SidebarController {
       this.#update({ state: "connected" });
       try {
         const models = await this.#runtime.listModels();
+        this.#providerStatus = "connected";
         let conversations = await this.#runtime.listConversations();
         if (conversations.length === 0 && models[0]) {
           conversations = [
@@ -130,13 +245,21 @@ export class SidebarController {
           activeConversationId: snapshot?.conversation.id,
           selectedModelId: snapshot?.conversation.modelId ?? models[0]?.id,
           messages:
-            snapshot?.messages.map(({ role, text }) => ({ role, text })) ?? [],
+            snapshot?.messages.map(({ agentRunId, role, text, citations }) => ({
+              agentRunId,
+              role,
+              text,
+              ...(citations ? { citations } : {}),
+            })) ?? [],
           agentRuns: snapshot?.agentRuns ?? [],
           toolCalls,
           vaultChanges: this.#changesFromToolCalls(toolCalls),
           error: undefined,
         });
       } catch (error) {
+        if (error instanceof RuntimeRequestError) {
+          this.#providerStatus = providerHealthFailure(error.code) ? "unavailable" : "connected";
+        }
         const message = error instanceof Error ? error.message : String(error);
         this.#updateConversation({
           ...this.#viewModel.conversation,
@@ -147,6 +270,7 @@ export class SidebarController {
         });
       }
     } catch (error) {
+      this.#providerStatus = "unavailable";
       const message = error instanceof Error ? error.message : String(error);
       this.#update({ state: "unavailable", message });
       throw error;
@@ -188,7 +312,8 @@ export class SidebarController {
       ...this.#viewModel.conversation,
       activeConversationId: snapshot.conversation.id,
       agentRuns: snapshot.agentRuns,
-      messages: snapshot.messages.map(({ role, text, citations }) => ({
+      messages: snapshot.messages.map(({ agentRunId, role, text, citations }) => ({
+        agentRunId,
         role,
         text,
         ...(citations ? { citations } : {}),
@@ -275,12 +400,12 @@ export class SidebarController {
     if (this.#viewModel.conversation.runState === "streaming") {
       throw new Error("Wait for the current Agent Run to finish.");
     }
+    const agentRunId = randomUUID();
     const messages = [
       ...this.#viewModel.conversation.messages,
-      { role: "user" as const, text },
-      { role: "assistant" as const, text: "" },
+      { agentRunId, role: "user" as const, text },
+      { agentRunId, role: "assistant" as const, text: "" },
     ];
-    const agentRunId = randomUUID();
     const agentRuns = [
       ...this.#viewModel.conversation.agentRuns,
       { id: agentRunId, modelId: selectedModelId, status: "running" as const },
@@ -299,16 +424,24 @@ export class SidebarController {
         conversationId,
         agentRunId,
         model: selectedModelId,
+        ...(this.#viewModel.conversation.models.find(({ id }) => id === selectedModelId)
+          ?.supportsFastMode && this.#environment.getFastModeEnabled()
+          ? { fastMode: true }
+          : {}),
         input: text,
       })) {
-        if (event.type === "agent_run.delta") {
+        if (event.type === "agent_run.started") {
+          this.#providerStatus = "connected";
+          this.refreshPresentation();
+        } else if (event.type === "agent_run.delta") {
           messages[messages.length - 1] = {
+            agentRunId,
             role: "assistant",
             text: messages[messages.length - 1].text + event.delta,
           };
           this.#updateConversation({ ...this.#viewModel.conversation, messages: [...messages] });
         } else if (event.type === "agent_run.completed") {
-          messages[messages.length - 1] = event.output;
+          messages[messages.length - 1] = { agentRunId, ...event.output };
           this.#setRunStatus(agentRunId, "completed");
         } else if (event.type === "tool_call.requested") {
           const requestedChange = this.#requestedChange(event.toolCallId, event.tool.name, event.tool.arguments);
@@ -348,7 +481,11 @@ export class SidebarController {
             ...this.#viewModel.conversation,
             toolCalls: this.#viewModel.conversation.toolCalls.map((call) =>
               call.id === event.toolCallId
-                ? { ...call, status: event.status }
+                ? {
+                    ...call,
+                    status: event.status,
+                    ...(event.error ? { error: event.error } : {}),
+                  }
                 : call,
             ),
             vaultChanges,
@@ -358,13 +495,14 @@ export class SidebarController {
                 : this.#viewModel.conversation.error,
           });
         } else if (event.type === "agent_run.failed") {
+          if (providerHealthFailure(event.error.code)) this.#providerStatus = "unavailable";
           const vaultChanges = this.#cancelPendingVaultChanges(agentRunId);
           messages.pop();
           this.#updateConversation({
             ...this.#viewModel.conversation,
             messages: [...messages],
             runState: "idle",
-            agentRuns: this.#runsWithStatus(agentRunId, "failed"),
+            agentRuns: this.#runsWithStatus(agentRunId, "failed", event.error),
             toolCalls: this.#terminalizedToolCalls(agentRunId),
             vaultChanges,
             error: event.error,
@@ -396,6 +534,7 @@ export class SidebarController {
         runState: "idle",
       });
     } catch (error) {
+      this.#providerStatus = "unavailable";
       messages.pop();
       const message = error instanceof Error ? error.message : String(error);
       this.#updateConversation({
@@ -435,7 +574,7 @@ export class SidebarController {
     }
     const messages = [
       ...this.#viewModel.conversation.messages,
-      { role: "assistant" as const, text: "" },
+      { agentRunId, role: "assistant" as const, text: "" },
     ];
     this.#activeRun = { agentRunId, conversationId };
     this.#updateConversation({
@@ -451,14 +590,18 @@ export class SidebarController {
         agentRunId,
         ...(recoveredToolResult ? { recoveredToolResult } : {}),
       })) {
-        if (event.type === "agent_run.delta") {
+        if (event.type === "agent_run.resumed") {
+          this.#providerStatus = "connected";
+          this.refreshPresentation();
+        } else if (event.type === "agent_run.delta") {
           messages[messages.length - 1] = {
+            agentRunId,
             role: "assistant",
             text: messages[messages.length - 1].text + event.delta,
           };
           this.#updateConversation({ ...this.#viewModel.conversation, messages: [...messages] });
         } else if (event.type === "agent_run.completed") {
-          messages[messages.length - 1] = event.output;
+          messages[messages.length - 1] = { agentRunId, ...event.output };
           this.#recoveredToolResults.delete(agentRunId);
           this.#setRunStatus(agentRunId, "completed");
         } else if (event.type === "tool_call.requested") {
@@ -493,7 +636,13 @@ export class SidebarController {
           this.#updateConversation({
             ...this.#viewModel.conversation,
             toolCalls: this.#viewModel.conversation.toolCalls.map((call) =>
-              call.id === event.toolCallId ? { ...call, status: event.status } : call
+              call.id === event.toolCallId
+                ? {
+                    ...call,
+                    status: event.status,
+                    ...(event.error ? { error: event.error } : {}),
+                  }
+                : call
             ),
             error:
               event.status === "failed" && event.error
@@ -501,12 +650,13 @@ export class SidebarController {
                 : this.#viewModel.conversation.error,
           });
         } else if (event.type === "agent_run.failed") {
+          if (providerHealthFailure(event.error.code)) this.#providerStatus = "unavailable";
           this.#recoveredToolResults.delete(agentRunId);
           messages.pop();
           this.#updateConversation({
             ...this.#viewModel.conversation,
             messages: [...messages],
-            agentRuns: this.#runsWithStatus(agentRunId, "failed"),
+            agentRuns: this.#runsWithStatus(agentRunId, "failed", event.error),
             runState: "idle",
             error: event.error,
           });
@@ -534,6 +684,7 @@ export class SidebarController {
         runState: "idle",
       });
     } catch (error) {
+      this.#providerStatus = "unavailable";
       messages.pop();
       this.#updateConversation({
         ...this.#viewModel.conversation,
@@ -630,7 +781,7 @@ export class SidebarController {
 
   #update(runtime: SidebarViewModel["runtime"]): void {
     this.#viewModel = { ...this.#viewModel, runtime };
-    for (const subscriber of this.#subscribers) subscriber(this.#viewModel);
+    for (const subscriber of this.#subscribers) subscriber(this.getViewModel());
   }
 
   async #rehydratePendingVaultChanges(calls: ToolCallRecord[]): Promise<void> {
@@ -668,16 +819,150 @@ export class SidebarController {
 
   #updateConversation(conversation: SidebarViewModel["conversation"]): void {
     this.#viewModel = { ...this.#viewModel, conversation };
-    for (const subscriber of this.#subscribers) subscriber(this.#viewModel);
+    for (const subscriber of this.#subscribers) subscriber(this.getViewModel());
+  }
+
+  #presentation(): SidebarViewModel["presentation"] {
+    const activities = this.#viewModel.conversation.toolCalls.flatMap((call) => {
+      if (call.name === "vault_propose_changes") return [];
+      const action = TOOL_ACTIONS[call.name];
+      const target = toolTarget(call);
+      return [{
+        action,
+        details: JSON.stringify(
+          {
+            arguments: call.arguments,
+            status: call.status,
+            ...(call.error ? { error: call.error } : {}),
+          },
+          null,
+          2,
+        ),
+        id: call.id,
+        label: `${action}${target ? ` ${target}` : ""} · ${call.status}`,
+        status: call.status,
+        ...(target ? { target } : {}),
+      }];
+    });
+    const resumable = [...this.#viewModel.conversation.agentRuns]
+      .reverse()
+      .find(
+        (run) =>
+          run.status === "interrupted" &&
+          !this.#viewModel.conversation.toolCalls.some(
+            (call) =>
+              call.agentRunId === run.id &&
+              call.name === "vault_propose_changes" &&
+              call.status === "requested",
+          ),
+      );
+    const primaryAction = this.#viewModel.conversation.runState === "streaming"
+      ? {
+          ...(this.#activeRun ? { agentRunId: this.#activeRun.agentRunId } : {}),
+          kind: "stop" as const,
+          label: "Stop" as const,
+        }
+      : resumable
+        ? { agentRunId: resumable.id, kind: "resume" as const, label: "Resume" as const }
+        : { kind: "send" as const, label: "Send" as const };
+    const selectedModel = this.#viewModel.conversation.models.find(
+      ({ id }) => id === this.#viewModel.conversation.selectedModelId,
+    );
+    const permissionMode = this.#environment.getVaultPermissionMode();
+    const activityById = new Map(activities.map((activity) => [activity.id, activity]));
+    const changeByToolCallId = new Map(
+      this.#viewModel.conversation.vaultChanges.map((change) => [change.toolCallId, change]),
+    );
+    const transcript: SidebarViewModel["presentation"]["transcript"] = [];
+    const includedMessages = new Set<SidebarViewModel["conversation"]["messages"][number]>();
+    const includedCalls = new Set<string>();
+    const latestRun = this.#viewModel.conversation.agentRuns.at(-1);
+    for (const run of this.#viewModel.conversation.agentRuns) {
+      const runMessages = this.#viewModel.conversation.messages.filter(
+        (message) => message.agentRunId === run.id,
+      );
+      for (const message of runMessages.filter(({ role }) => role === "user")) {
+        includedMessages.add(message);
+        transcript.push({ kind: "message", message });
+      }
+      for (const call of this.#viewModel.conversation.toolCalls.filter(
+        (candidate) => candidate.agentRunId === run.id,
+      )) {
+        includedCalls.add(call.id);
+        const change = changeByToolCallId.get(call.id);
+        const activity = activityById.get(call.id);
+        if (change) transcript.push({ kind: "vault_change", change });
+        else if (activity) transcript.push({ kind: "activity", activity });
+      }
+      for (const message of runMessages.filter(({ role }) => role === "assistant")) {
+        includedMessages.add(message);
+        transcript.push({ kind: "message", message });
+      }
+      if (run.status !== "completed" && run.status !== "running") {
+        const labels = {
+          cancelled: "Run stopped.",
+          failed: "Run failed.",
+          interrupted: "Run interrupted. Resume when ready.",
+        } as const;
+        transcript.push({
+          kind: "run_status",
+          agentRunId: run.id,
+          label: labels[run.status],
+          status: run.status,
+          ...(run.error?.message
+            ? { message: run.error.message }
+            : latestRun?.id === run.id && this.#viewModel.conversation.error
+              ? { message: this.#viewModel.conversation.error.message }
+            : {}),
+        });
+      }
+    }
+    for (const message of this.#viewModel.conversation.messages) {
+      if (!includedMessages.has(message)) transcript.push({ kind: "message", message });
+    }
+    for (const call of this.#viewModel.conversation.toolCalls) {
+      if (includedCalls.has(call.id)) continue;
+      const change = changeByToolCallId.get(call.id);
+      const activity = activityById.get(call.id);
+      if (change) transcript.push({ kind: "vault_change", change });
+      else if (activity) transcript.push({ kind: "activity", activity });
+    }
+    return {
+      activities,
+      composer: {
+        contextChips: [{ kind: "scope", label: "Vault context" }],
+        permissionMode,
+        primaryAction,
+      },
+      settings: {
+        advanced: {
+          diagnostics:
+            this.#viewModel.runtime.message ?? `Runtime is ${this.#viewModel.runtime.state}.`,
+          gitRetention: "Git Checkpoints: 30 days or the most recent 100 batches.",
+          hostedWebSearch: "Hosted Web Search capability is probed per backend and model.",
+        },
+        ...(selectedModel?.supportsFastMode
+          ? { fastMode: { enabled: this.#environment.getFastModeEnabled() } }
+          : {}),
+        ...(selectedModel ? { model: { id: selectedModel.id, label: selectedModel.label } } : {}),
+        permissionMode,
+        providerStatus: this.#providerStatus,
+        runtimeStatus: this.#viewModel.runtime.state,
+      },
+      transcript,
+    };
   }
 
   #runsWithStatus(
     agentRunId: string,
     status: AgentRunRecord["status"],
+    error?: AgentRunRecord["error"],
   ): AgentRunRecord[] {
-    return this.#viewModel.conversation.agentRuns.map((run) =>
-      run.id === agentRunId ? { ...run, status } : run,
-    );
+    return this.#viewModel.conversation.agentRuns.map((run) => {
+      if (run.id !== agentRunId) return run;
+      const { error: _previousError, ...withoutError } = run;
+      return { ...withoutError, status, ...(error ? { error } : {}) };
+    });
   }
 
   #terminalizedToolCalls(agentRunId: string): ToolCallRecord[] {

@@ -13,6 +13,150 @@ const { RuntimeRequestError } = require(
   path.join(repositoryRoot, "packages", "plugin", "dist", "runtime-supervisor.js"),
 );
 
+test("the Sidebar presentation keeps activity, composer, and common settings compact", async () => {
+  let fastModeEnabled = true;
+  let vaultPermissionMode = "read_only";
+  const longPath = `notes/${"deep/".repeat(20)}interview.md`;
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async listConversations() {
+      return [{ id: "presentation-conversation", title: "Interview", modelId: "model-fast" }];
+    },
+    async listModels() {
+      return [{ id: "model-fast", label: "Fast Model", supportsFastMode: true }];
+    },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: { id: "presentation-conversation", title: "Interview", modelId: "model-fast" },
+        messages: [
+          {
+            id: "message-user",
+            agentRunId: "presentation-run",
+            role: "user",
+            text: "Review my interview notes.",
+            sequence: 1,
+          },
+          {
+            id: "message-one",
+            agentRunId: "presentation-run",
+            role: "assistant",
+            text: "A very long answer remains readable.",
+            sequence: 4,
+          },
+        ],
+        agentRuns: [
+          {
+            id: "failed-presentation-run",
+            modelId: "model-fast",
+            status: "failed",
+            error: { code: "provider_error", message: "The earlier Provider request failed." },
+          },
+          { id: "presentation-run", modelId: "model-fast", status: "interrupted" },
+        ],
+        toolCalls: [{
+          id: "presentation-tool",
+          agentRunId: "presentation-run",
+          name: "vault_read",
+          arguments: { path: longPath },
+          status: "failed",
+          error: { code: "not_found", message: "The requested note no longer exists." },
+        }, {
+          id: "presentation-skill",
+          agentRunId: "presentation-run",
+          name: "skill_read",
+          arguments: { skill: "interview-coach", resource: "rubric.md" },
+          status: "completed",
+        }, {
+          id: "presentation-list",
+          agentRunId: "presentation-run",
+          name: "vault_list",
+          arguments: {},
+          status: "completed",
+        }, {
+          id: "presentation-probe",
+          agentRunId: "presentation-run",
+          name: "hosted_web_search_probe",
+          arguments: {},
+          status: "completed",
+        }],
+      };
+    },
+    async *resumeAgentRun() {
+      yield { type: "agent_run.resumed", model: "model-fast" };
+      yield { type: "agent_run.completed", output: { role: "assistant", text: "Done" } };
+    },
+    async *runAgent() {},
+    async start() {},
+    async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Interview", modelId };
+    },
+  };
+  const controller = new SidebarController(runtime, undefined, {
+    getFastModeEnabled: () => fastModeEnabled,
+    getVaultPermissionMode: () => vaultPermissionMode,
+  });
+  const observed = [];
+  controller.subscribe((viewModel) => observed.push(viewModel.presentation));
+
+  await controller.start();
+  const presentation = controller.getViewModel().presentation;
+  assert.deepEqual(
+    presentation.activities.map(({ id, target }) => ({ id, target })),
+    [
+      { id: "presentation-tool", target: longPath },
+      { id: "presentation-skill", target: "interview-coach/rubric.md" },
+      { id: "presentation-list", target: "Vault" },
+      { id: "presentation-probe", target: "active model" },
+    ],
+  );
+  assert.match(presentation.activities[0].details, /not_found.*no longer exists/s);
+  assert.deepEqual(
+    presentation.transcript.map((item) => item.kind),
+    [
+      "run_status",
+      "message",
+      "activity",
+      "activity",
+      "activity",
+      "activity",
+      "message",
+      "run_status",
+    ],
+  );
+  assert.equal(
+    presentation.transcript.find(
+      (item) => item.kind === "run_status" && item.agentRunId === "failed-presentation-run",
+    )?.message,
+    "The earlier Provider request failed.",
+  );
+  assert.deepEqual(presentation.composer.contextChips, [
+    { kind: "scope", label: "Vault context" },
+  ]);
+  assert.deepEqual(presentation.composer.primaryAction, {
+    agentRunId: "presentation-run",
+    kind: "resume",
+    label: "Resume",
+  });
+  assert.equal(presentation.composer.permissionMode, "read_only");
+  assert.deepEqual(presentation.settings.model, { id: "model-fast", label: "Fast Model" });
+  assert.deepEqual(presentation.settings.fastMode, { enabled: true });
+  assert.equal(presentation.settings.providerStatus, "connected");
+  assert.equal(presentation.settings.runtimeStatus, "connected");
+  assert.equal(presentation.settings.permissionMode, "read_only");
+  assert.match(presentation.settings.advanced.gitRetention, /30 days.*100/i);
+  assert.match(presentation.settings.advanced.diagnostics, /connected/i);
+
+  fastModeEnabled = false;
+  vaultPermissionMode = "ask_every_time";
+  controller.refreshPresentation();
+  assert.equal(observed.at(-1).settings.fastMode.enabled, false);
+  assert.equal(observed.at(-1).composer.permissionMode, "ask_every_time");
+});
+
 test("the Sidebar selects a model and renders a streamed Agent Run", async () => {
   let unavailableSubscriber;
   const runtime = {
@@ -33,7 +177,7 @@ test("the Sidebar selects a model and renders a streamed Agent Run", async () =>
     async listModels() {
       return [
         { id: "model-a", label: "Model A" },
-        { id: "model-b", label: "Model B" },
+        { id: "model-b", label: "Model B", supportsFastMode: true },
       ];
     },
     async listConversations() {
@@ -49,6 +193,7 @@ test("the Sidebar selects a model and renders a streamed Agent Run", async () =>
     },
     async *runAgent(request) {
       assert.equal(request.model, "model-b");
+      assert.equal(request.fastMode, true);
       assert.equal(request.input, "Tell me about yourself.");
       yield { type: "agent_run.started", model: request.model };
       yield {
@@ -67,7 +212,10 @@ test("the Sidebar selects a model and renders a streamed Agent Run", async () =>
       yield { type: "agent_run.completed", output: { role: "assistant", text: "Strong answer" } };
     },
   };
-  const controller = new SidebarController(runtime);
+  const controller = new SidebarController(runtime, undefined, {
+    getFastModeEnabled: () => true,
+    getVaultPermissionMode: () => "trusted_vault",
+  });
   const observed = [];
   controller.subscribe((viewModel) => observed.push(structuredClone(viewModel)));
 
@@ -75,7 +223,7 @@ test("the Sidebar selects a model and renders a streamed Agent Run", async () =>
   assert.equal(controller.getViewModel().runtime.state, "connected");
   assert.deepEqual(controller.getViewModel().conversation.models, [
     { id: "model-a", label: "Model A" },
-    { id: "model-b", label: "Model B" },
+    { id: "model-b", label: "Model B", supportsFastMode: true },
   ]);
   assert.equal(controller.getViewModel().conversation.selectedModelId, "model-a");
 
@@ -83,10 +231,11 @@ test("the Sidebar selects a model and renders a streamed Agent Run", async () =>
   await controller.sendMessage("Tell me about yourself.");
 
   const final = controller.getViewModel();
+  const finalRunId = final.conversation.agentRuns.at(-1).id;
   assert.equal(final.conversation.runState, "idle");
   assert.deepEqual(final.conversation.messages, [
-    { role: "user", text: "Tell me about yourself." },
-    { role: "assistant", text: "Strong answer" },
+    { agentRunId: finalRunId, role: "user", text: "Tell me about yourself." },
+    { agentRunId: finalRunId, role: "assistant", text: "Strong answer" },
   ]);
   assert.equal(final.conversation.agentRuns.at(-1).status, "completed");
   assert.deepEqual(final.conversation.toolCalls, [
@@ -140,6 +289,17 @@ test("the Sidebar preserves a typed model-catalog error", async () => {
     message: "Sign in to Codex and retry.",
   });
   assert.equal(controller.getViewModel().runtime.state, "connected");
+  assert.equal(controller.getViewModel().presentation.settings.providerStatus, "unavailable");
+
+  runtime.listModels = async () => {
+    throw new RuntimeRequestError("model_unavailable", "The selected model was retired.");
+  };
+  const modelErrorController = new SidebarController(runtime);
+  await modelErrorController.start();
+  assert.equal(
+    modelErrorController.getViewModel().presentation.settings.providerStatus,
+    "connected",
+  );
 });
 
 test("the Sidebar resumes one restored Interrupted Run only after an explicit user action", async () => {
@@ -609,7 +769,7 @@ test("the Sidebar creates, switches, and deletes Conversations", async () => {
 
   await controller.openConversation("conversation-b");
   assert.deepEqual(controller.getViewModel().conversation.messages, [
-    { role: "user", text: "history conversation-b" },
+    { agentRunId: "run-conversation-b", role: "user", text: "history conversation-b" },
   ]);
 
   await controller.createConversation("Fresh Conversation");
@@ -763,7 +923,11 @@ test("stopping an active Sidebar run makes it visibly cancelled", async () => {
   assert.equal(controller.getViewModel().conversation.toolCalls.at(-1).status, "failed");
   assert.deepEqual(order, ["runtime-cancel", "proposal-cleanup:cancelled-sidebar-tool"]);
   assert.deepEqual(controller.getViewModel().conversation.messages, [
-    { role: "user", text: "Cancel this run." },
+    {
+      agentRunId: controller.getViewModel().conversation.agentRuns.at(-1).id,
+      role: "user",
+      text: "Cancel this run.",
+    },
   ]);
 });
 
@@ -812,8 +976,28 @@ test("a failed Agent Run remains visible with its typed error", async () => {
     message: "Provider rejected the request.",
   });
   assert.deepEqual(controller.getViewModel().conversation.messages, [
-    { role: "user", text: "Fail this run." },
+    {
+      agentRunId: controller.getViewModel().conversation.agentRuns.at(-1).id,
+      role: "user",
+      text: "Fail this run.",
+    },
   ]);
+  assert.equal(controller.getViewModel().presentation.settings.providerStatus, "unavailable");
+
+  runtime.runAgent = async function* runInstructionFailure() {
+    yield { type: "agent_run.started", model: "model-a" };
+    yield {
+      type: "agent_run.failed",
+      error: { code: "instruction_error", message: "The local Agent Contract is invalid." },
+    };
+  };
+  const instructionController = new SidebarController(runtime);
+  await instructionController.start();
+  await instructionController.sendMessage("Use the local contract.");
+  assert.equal(
+    instructionController.getViewModel().presentation.settings.providerStatus,
+    "connected",
+  );
 });
 
 test("the Sidebar exposes one whole-batch decision and guarded undo", async () => {

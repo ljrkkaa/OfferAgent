@@ -590,6 +590,7 @@ function isAgentRunStart(value: unknown): value is AgentRunStart {
     isProtocolIdentifier(message.conversationId) &&
     isProtocolIdentifier(message.agentRunId) &&
     typeof message.model === "string" &&
+    (message.fastMode === undefined || typeof message.fastMode === "boolean") &&
     message.input?.role === "user" &&
     typeof message.input.text === "string"
   );
@@ -1211,6 +1212,7 @@ async function startRuntime({
       void (async () => {
         let sequence = 1;
         let model = startCommand?.model ?? "";
+        let fastMode = startCommand?.fastMode ?? false;
         let userInput = startCommand?.input.text ?? "";
         let checkpoint: RunCheckpoint | undefined;
         let output = "";
@@ -1229,6 +1231,7 @@ async function startRuntime({
             );
             checkpoint = resumable.checkpoint;
             model = resumable.model;
+            fastMode = checkpoint.fastMode ?? false;
             sequence = resumable.nextSequence;
             userInput = checkpoint.input.find((item) => item.type === "user_message")?.text ?? "";
             const active = activeRuns.get(runCommand.agentRunId);
@@ -1319,6 +1322,7 @@ async function startRuntime({
               canonicalReadPaths: [...canonicalReadPaths],
               requiredRereads: [...requiredRereads],
               hostedWebSearchProbeAttempted,
+              ...(fastMode ? { fastMode: true } : {}),
               completedSteps,
           });
           const saveCheckpoint = async (): Promise<void> => {
@@ -1602,6 +1606,7 @@ async function startRuntime({
               await provider.getHostedWebSearchCapability(model);
             for await (const providerEvent of provider.stream({
               model,
+              ...(fastMode ? { fastMode: true } : {}),
               input,
               instructions: composeInstructions(agentContract, localSkills),
               signal: controller.signal,

@@ -35,6 +35,7 @@ export interface HostedToolDefinition {
 export type ModelToolDefinition = HostedToolDefinition | LocalToolDefinition;
 
 export interface ModelRequest {
+  fastMode?: boolean;
   input: ModelConversationItem[];
   instructions: string;
   model: string;

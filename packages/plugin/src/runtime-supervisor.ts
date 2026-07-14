@@ -60,6 +60,7 @@ export interface LocalToolExecutor {
 export interface AgentRunRequest {
   agentRunId: string;
   conversationId: string;
+  fastMode?: boolean;
   input: string;
   model: string;
 }
@@ -733,6 +734,7 @@ export class RuntimeSupervisor implements RuntimeClient {
       agentRunId: request.agentRunId,
       sequence: 0,
       model: request.model,
+      ...(request.fastMode ? { fastMode: true } : {}),
       input: { role: "user", text: request.input },
     };
     yield* this.#runAgentCommand(request, command);
