@@ -443,6 +443,55 @@ test("Planning Memory delete and index update apply atomically and undo restores
   assert.equal(canonicalEscape.error.code, "invalid_path");
 });
 
+test("a failed Daily and Study Memory batch rolls every target back atomically", async (t) => {
+  const journal = new MemoryJournal();
+  const { coordinator, root, vault } = await fixture(t, journal, () => {}, () => "trusted_vault");
+  const dailyPath = "daily/2026-07-15.md";
+  const topicPath = "memory/study/retrieval-evaluation.md";
+  const indexPath = "memory/MEMORY.md";
+  const daily = "# 2026-07-15\n\n## 今日学习计划\n";
+  const topic = "---\nname: \"Retrieval Evaluation\"\ndescription: \"Current cross-day direction\"\ntype: study\n---\n\nCurrent direction: Retrieval Evaluation.\n";
+  const index = "# Planning Memory\n\n- [Retrieval Evaluation](study/retrieval-evaluation.md) - Current cross-day direction\n";
+  await mkdir(path.join(root, "daily"), { recursive: true });
+  await mkdir(path.join(root, "memory", "study"), { recursive: true });
+  await writeFile(path.join(root, dailyPath), daily, "utf8");
+  await writeFile(path.join(root, topicPath), topic, "utf8");
+  await writeFile(path.join(root, indexPath), index, "utf8");
+  vault.failPath = topicPath;
+
+  const proposal = batch("daily-study-rollback", [
+    {
+      operation: "exact_replace",
+      path: dailyPath,
+      expectedVersion: (await vault.read(dailyPath)).modifiedVersion,
+      expectedContent: daily,
+      replacement: `${daily}\n- [ ] Retrieval Evaluation\n`,
+    },
+    {
+      operation: "exact_replace",
+      path: topicPath,
+      expectedVersion: (await vault.read(topicPath)).modifiedVersion,
+      expectedContent: topic,
+      replacement: topic.replace("Current direction: Retrieval Evaluation.", "Current direction: RAG evaluation."),
+    },
+    {
+      operation: "exact_replace",
+      path: indexPath,
+      expectedVersion: (await vault.read(indexPath)).modifiedVersion,
+      expectedContent: index,
+      replacement: index,
+    },
+  ]);
+  const result = await coordinator.execute(toolCall("daily-study-rollback-tool", proposal));
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "tool_error");
+  assert.equal(await readFile(path.join(root, dailyPath), "utf8"), daily);
+  assert.equal(await readFile(path.join(root, topicPath), "utf8"), topic);
+  assert.equal(await readFile(path.join(root, indexPath), "utf8"), index);
+  assert.equal(journal.entries.get(proposal.batchId).state, "rolled_back");
+});
+
 test("a pending confirmation is rehydrated from plugin-owned durable storage", async (t) => {
   const journal = new MemoryJournal();
   const { checkpoints, coordinator, root, vault } = await fixture(

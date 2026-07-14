@@ -23,6 +23,18 @@ function findLatest<T extends ModelConversationItem>(
   return undefined;
 }
 
+function userMessageBefore(
+  input: ModelConversationItem[],
+  item: ModelConversationItem,
+): Extract<ModelConversationItem, { type: "user_message" }> | undefined {
+  const beforeIndex = input.lastIndexOf(item);
+  for (let index = beforeIndex - 1; index >= 0; index -= 1) {
+    const candidate = input[index];
+    if (candidate.type === "user_message") return candidate;
+  }
+  return undefined;
+}
+
 const MODEL: ModelDescriptor = {
   id: "fake-interview-model",
   label: "Fake Interview Model",
@@ -209,7 +221,11 @@ export class FakeModelProvider implements ModelProvider {
       yield { type: "output_text.delta", delta: "Tool completed." };
       return;
     }
-    if (userInput.trim() === "帮我做一个今天的学习日记") {
+    if (
+      userInput.trim() === "帮我做一个今天的学习日记" ||
+      userInput.trim() === "今天改学 RAG evaluation" ||
+      userInput.trim() === "帮我按 Agentic RL Project 做今天的学习日记"
+    ) {
       yield {
         type: "output_text.delta",
         delta: "DAILY_STUDY_PLAN_PROPOSAL: 我会按 Obsidian 配置创建或保守填充今天的前瞻学习计划，并从 Vault 学习队列选取有来源的主题。",
@@ -223,25 +239,33 @@ export class FakeModelProvider implements ModelProvider {
           item.type === "assistant_message",
       );
       if (priorResponse?.text.includes("DAILY_STUDY_PLAN_PROPOSAL")) {
+        const proposalRequest = userMessageBefore(request.input, priorResponse)?.text.trim() ?? "";
+        const explicitDirection = proposalRequest === "今天改学 RAG evaluation"
+          ? "RAG evaluation"
+          : undefined;
         const change = toolResultFor(request.input, "vault_propose_changes");
         if (change?.result.ok && change.result.value.type === "vault_propose_changes") {
-          const appliedTarget = change.result.value.targets[0]?.path;
-          const verifiedTarget = appliedTarget
-            ? toolResultForAfter(
-                request.input,
-                "vault_read",
-                request.input.indexOf(change),
-                (call) => Boolean(call.arguments && typeof call.arguments === "object" &&
-                  (call.arguments as { path?: unknown }).path === appliedTarget),
-              )
+          const changeIndex = request.input.indexOf(change);
+          const unverifiedTarget = change.result.value.decision === "applied"
+            ? change.result.value.targets.find((target) => {
+                const verification = toolResultForAfter(
+                  request.input,
+                  "vault_read",
+                  changeIndex,
+                  (call) => Boolean(call.arguments && typeof call.arguments === "object" &&
+                    (call.arguments as { path?: unknown }).path === target.path),
+                );
+                return !verification?.result.ok || verification.result.value.type !== "vault_read" ||
+                  verification.result.value.contentHash !== target.afterHash;
+              })
             : undefined;
-          if (change.result.value.decision === "applied" && appliedTarget && !verifiedTarget) {
+          if (unverifiedTarget) {
             this.#toolCallSequence += 1;
             yield {
               type: "local_tool_call",
               callId: `fake-daily-plan-verify-${this.#toolCallSequence}`,
               name: "vault_read",
-              arguments: { path: appliedTarget },
+              arguments: { path: unverifiedTarget.path },
             };
             return;
           }
@@ -285,14 +309,74 @@ export class FakeModelProvider implements ModelProvider {
           };
           return;
         }
-        let sourcePath = "interview/面试八股学习进度.md";
-        let sourceRead = toolResultFor(
+        const recalledPlanningPath = recalledPlanningPathFrom(request.instructions, proposalRequest);
+        const recalledPlanningRead = recalledPlanningPath ? toolResultFor(
+          request.input,
+          "vault_read",
+          (call) => Boolean(call.arguments && typeof call.arguments === "object" &&
+            (call.arguments as { path?: unknown }).path === recalledPlanningPath),
+        ) : undefined;
+        if (recalledPlanningPath && !recalledPlanningRead) {
+          this.#toolCallSequence += 1;
+          yield {
+            type: "local_tool_call",
+            callId: `fake-daily-plan-memory-${this.#toolCallSequence}`,
+            name: "vault_read",
+            arguments: { path: recalledPlanningPath },
+          };
+          return;
+        }
+        const needsMemoryIndex = Boolean(recalledPlanningPath || explicitDirection);
+        const memoryIndexRead = needsMemoryIndex ? toolResultFor(
+          request.input,
+          "vault_read",
+          (call) => Boolean(call.arguments && typeof call.arguments === "object" &&
+            (call.arguments as { path?: unknown }).path === "memory/MEMORY.md"),
+        ) : undefined;
+        if (needsMemoryIndex && !memoryIndexRead) {
+          this.#toolCallSequence += 1;
+          yield {
+            type: "local_tool_call",
+            callId: `fake-daily-plan-index-${this.#toolCallSequence}`,
+            name: "vault_read",
+            arguments: { path: "memory/MEMORY.md" },
+          };
+          return;
+        }
+        const projectDerivedPath = recalledPlanningPath?.startsWith("memory/project/")
+          ? "memory/study/project-informed-direction.md"
+          : undefined;
+        const projectDerivedRead = projectDerivedPath ? toolResultFor(
+          request.input,
+          "vault_read",
+          (call) => Boolean(call.arguments && typeof call.arguments === "object" &&
+            (call.arguments as { path?: unknown }).path === projectDerivedPath),
+        ) : undefined;
+        if (projectDerivedPath && !projectDerivedRead) {
+          this.#toolCallSequence += 1;
+          yield {
+            type: "local_tool_call",
+            callId: `fake-daily-plan-derived-memory-${this.#toolCallSequence}`,
+            name: "vault_read",
+            arguments: { path: projectDerivedPath },
+          };
+          return;
+        }
+        const usesPlanningMemory = Boolean(
+          recalledPlanningPath &&
+          recalledPlanningRead?.result.ok && recalledPlanningRead.result.value.type === "vault_read" &&
+          memoryIndexRead?.result.ok && memoryIndexRead.result.value.type === "vault_read",
+        );
+        let sourcePath = explicitDirection
+          ? "当前用户明确请求"
+          : usesPlanningMemory ? recalledPlanningPath! : "interview/面试八股学习进度.md";
+        let sourceRead = usesPlanningMemory ? recalledPlanningRead! : toolResultFor(
           request.input,
           "vault_read",
           (call) => Boolean(call.arguments && typeof call.arguments === "object" &&
             (call.arguments as { path?: unknown }).path === sourcePath),
         );
-        if (!sourceRead) {
+        if (!explicitDirection && !sourceRead) {
           this.#toolCallSequence += 1;
           yield {
             type: "local_tool_call",
@@ -302,9 +386,11 @@ export class FakeModelProvider implements ModelProvider {
           };
           return;
         }
-        let topic = sourceRead.result.ok && sourceRead.result.value.type === "vault_read"
-          ? dailyPlanTopic(sourceRead.result.value.content)
-          : undefined;
+        let topic = explicitDirection ?? (sourceRead?.result.ok && sourceRead.result.value.type === "vault_read"
+          ? (usesPlanningMemory
+              ? studyMemoryDirection(sourceRead.result.value.content)
+              : dailyPlanTopic(sourceRead.result.value.content))
+          : undefined);
         if (!topic) {
           const fallbackPath = "notes/example.md";
           const fallbackRead = toolResultFor(
@@ -329,7 +415,7 @@ export class FakeModelProvider implements ModelProvider {
             ? dailyPlanTopic(sourceRead.result.value.content)
             : undefined;
         }
-        if (!sourceRead.result.ok || sourceRead.result.value.type !== "vault_read" || !topic) {
+        if ((!explicitDirection && (!sourceRead?.result.ok || sourceRead.result.value.type !== "vault_read")) || !topic) {
           yield { type: "output_text.delta", delta: "可选来源均不可用，未将未读取的内容标记为计划来源。" };
           return;
         }
@@ -338,7 +424,7 @@ export class FakeModelProvider implements ModelProvider {
           "- [ ] 整理 3 个核心问答并进行一次口述自测",
           "\n> 本节是前瞻计划，不是学习完成证据。",
         ].join("\n");
-        const action = dailyPlanAction(context, targetRead, planItems);
+        const action = dailyPlanAction(context, targetRead, planItems, Boolean(explicitDirection));
         if (action === null) {
           yield { type: "output_text.delta", delta: "今日学习计划已包含这些未完成计划项，无需重复写入。" };
           return;
@@ -351,6 +437,177 @@ export class FakeModelProvider implements ModelProvider {
         const proposalSequence = this.#toolCallSequence;
         action.actionId = `${action.actionId}-${proposalSequence}`;
         action.idempotencyKey = `${action.idempotencyKey}-${proposalSequence}`;
+        const actions: Record<string, unknown>[] = [action];
+        const readableMemoryIndex = memoryIndexRead?.result.ok &&
+          memoryIndexRead.result.value.type === "vault_read"
+          ? memoryIndexRead.result.value
+          : undefined;
+        if (explicitDirection) {
+          const memoryName = "RAG evaluation";
+          const memoryDescription = "Current cross-day RAG evaluation direction";
+          if (
+            recalledPlanningPath?.startsWith("memory/study/") && recalledPlanningRead?.result.ok &&
+            recalledPlanningRead.result.value.type === "vault_read" && readableMemoryIndex
+          ) {
+            const nextIndex = replaceMemoryIndexEntry(
+              readableMemoryIndex.content,
+              recalledPlanningPath,
+              memoryName,
+              memoryDescription,
+            );
+            if (!nextIndex) {
+              yield { type: "output_text.delta", delta: "Planning Memory 索引无法安全同步，未提交修改。" };
+              return;
+            }
+            actions.push(
+              {
+                actionId: `daily-study-direction-${proposalSequence}`,
+                idempotencyKey: `daily-study-direction-${proposalSequence}`,
+                operation: "exact_replace",
+                path: recalledPlanningPath,
+                expectedVersion: recalledPlanningRead.result.value.modifiedVersion,
+                expectedContent: recalledPlanningRead.result.value.content,
+                replacement: studyMemoryDocument(
+                  memoryName,
+                  memoryDescription,
+                  explicitDirection,
+                  context.resolvedDate,
+                ),
+              },
+              {
+                actionId: `daily-study-index-${proposalSequence}`,
+                idempotencyKey: `daily-study-index-${proposalSequence}`,
+                operation: "exact_replace",
+                path: "memory/MEMORY.md",
+                expectedVersion: readableMemoryIndex.modifiedVersion,
+                expectedContent: readableMemoryIndex.content,
+                replacement: nextIndex,
+              },
+            );
+          } else if (
+            readableMemoryIndex ||
+            (memoryIndexRead && !memoryIndexRead.result.ok && memoryIndexRead.result.error.code === "not_found")
+          ) {
+            const memoryPath = "memory/study/rag-evaluation.md";
+            const indexEntry = `- [${memoryName}](study/rag-evaluation.md) - ${memoryDescription}`;
+            actions.push(
+              {
+                actionId: `daily-study-direction-${proposalSequence}`,
+                idempotencyKey: `daily-study-direction-${proposalSequence}`,
+                operation: "create",
+                path: memoryPath,
+                expectedVersion: "missing",
+                content: studyMemoryDocument(
+                  memoryName,
+                  memoryDescription,
+                  explicitDirection,
+                  context.resolvedDate,
+                ),
+              },
+              readableMemoryIndex
+                ? {
+                    actionId: `daily-study-index-${proposalSequence}`,
+                    idempotencyKey: `daily-study-index-${proposalSequence}`,
+                    operation: "exact_replace",
+                    path: "memory/MEMORY.md",
+                    expectedVersion: readableMemoryIndex.modifiedVersion,
+                    expectedContent: readableMemoryIndex.content,
+                    replacement: `${readableMemoryIndex.content.trimEnd()}\n${indexEntry}\n`,
+                  }
+                : {
+                    actionId: `daily-study-index-${proposalSequence}`,
+                    idempotencyKey: `daily-study-index-${proposalSequence}`,
+                    operation: "create",
+                    path: "memory/MEMORY.md",
+                    expectedVersion: "missing",
+                    content: `# Planning Memory\n\n${indexEntry}\n`,
+                  },
+            );
+          } else {
+            yield { type: "output_text.delta", delta: "Planning Memory 索引不可用，未提交修改。" };
+            return;
+          }
+        } else if (
+          usesPlanningMemory && recalledPlanningPath?.startsWith("memory/study/") && recalledPlanningRead?.result.ok &&
+          recalledPlanningRead.result.value.type === "vault_read" && readableMemoryIndex
+        ) {
+          const frontmatter = /^---[\s\S]*?---/.exec(recalledPlanningRead.result.value.content)?.[0];
+          if (!frontmatter) {
+            yield { type: "output_text.delta", delta: "Study Memory 元数据无效，未提交修改。" };
+            return;
+          }
+          actions.push(
+            {
+              actionId: `daily-study-direction-${proposalSequence}`,
+              idempotencyKey: `daily-study-direction-${proposalSequence}`,
+              operation: "exact_replace",
+              path: recalledPlanningPath,
+              expectedVersion: recalledPlanningRead.result.value.modifiedVersion,
+              expectedContent: recalledPlanningRead.result.value.content,
+              replacement: `${frontmatter}\n\nCurrent direction: ${topic}\nLast planned for ${context.resolvedDate}. Detailed schedules remain in Daily Notes.\n`,
+            },
+            {
+              actionId: `daily-study-index-${proposalSequence}`,
+              idempotencyKey: `daily-study-index-${proposalSequence}`,
+              operation: "exact_replace",
+              path: "memory/MEMORY.md",
+              expectedVersion: readableMemoryIndex.modifiedVersion,
+              expectedContent: readableMemoryIndex.content,
+              replacement: readableMemoryIndex.content,
+            },
+          );
+        } else if (
+          usesPlanningMemory && recalledPlanningPath?.startsWith("memory/project/") && readableMemoryIndex
+        ) {
+          const memoryName = "Project-informed daily study direction";
+          const memoryDescription = "Current study direction derived from relevant Project Memory";
+          const indexEntry = `- [${memoryName}](study/project-informed-direction.md) - ${memoryDescription}`;
+          if (projectDerivedRead?.result.ok && projectDerivedRead.result.value.type === "vault_read") {
+            actions.push(
+              {
+                actionId: `daily-study-direction-${proposalSequence}`,
+                idempotencyKey: `daily-study-direction-${proposalSequence}`,
+                operation: "exact_replace",
+                path: projectDerivedPath!,
+                expectedVersion: projectDerivedRead.result.value.modifiedVersion,
+                expectedContent: projectDerivedRead.result.value.content,
+                replacement: studyMemoryDocument(memoryName, memoryDescription, topic, context.resolvedDate),
+              },
+              {
+                actionId: `daily-study-index-${proposalSequence}`,
+                idempotencyKey: `daily-study-index-${proposalSequence}`,
+                operation: "exact_replace",
+                path: "memory/MEMORY.md",
+                expectedVersion: readableMemoryIndex.modifiedVersion,
+                expectedContent: readableMemoryIndex.content,
+                replacement: readableMemoryIndex.content,
+              },
+            );
+          } else if (projectDerivedRead && !projectDerivedRead.result.ok && projectDerivedRead.result.error.code === "not_found") {
+            actions.push(
+              {
+                actionId: `daily-study-direction-${proposalSequence}`,
+                idempotencyKey: `daily-study-direction-${proposalSequence}`,
+                operation: "create",
+                path: projectDerivedPath!,
+                expectedVersion: "missing",
+                content: studyMemoryDocument(memoryName, memoryDescription, topic, context.resolvedDate),
+              },
+              {
+                actionId: `daily-study-index-${proposalSequence}`,
+                idempotencyKey: `daily-study-index-${proposalSequence}`,
+                operation: "exact_replace",
+                path: "memory/MEMORY.md",
+                expectedVersion: readableMemoryIndex.modifiedVersion,
+                expectedContent: readableMemoryIndex.content,
+                replacement: `${readableMemoryIndex.content.trimEnd()}\n${indexEntry}\n`,
+              },
+            );
+          } else {
+            yield { type: "output_text.delta", delta: "Project 派生的 Study Memory 无法安全读取，未提交修改。" };
+            return;
+          }
+        }
         yield {
           type: "local_tool_call",
           callId: `fake-daily-plan-change-${proposalSequence}`,
@@ -359,7 +616,7 @@ export class FakeModelProvider implements ModelProvider {
             batchId: `daily-study-plan-batch-${proposalSequence}`,
             idempotencyKey: `daily-study-plan-batch-${proposalSequence}`,
             task: "Create or conservatively fill today's grounded Daily Study Plan",
-            actions: [action],
+            actions,
           },
         };
         return;
@@ -513,6 +770,62 @@ function dailyPlanTopic(content: string): string | undefined {
   );
 }
 
+function recalledPlanningPathFrom(instructions: string, request: string): string | undefined {
+  const requestFeatures = textFeatures(request);
+  return [...instructions.matchAll(
+    /^## (.+) \[(?:study|project)\] \((memory\/(?:study|project)\/[^)]+\.md)\)$/gm,
+  )]
+    .map((match, index) => ({
+      index,
+      path: match[2]!,
+      score: overlapScore(requestFeatures, textFeatures(match[1]!)),
+    }))
+    .sort((left, right) => right.score - left.score || left.index - right.index)[0]?.path;
+}
+
+function studyMemoryDirection(content: string): string | undefined {
+  const line = content.replace(/^---[\s\S]*?---\s*/, "").split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((candidate) => candidate && !candidate.startsWith("Last planned for "));
+  return /^Current direction:\s*(.+)$/.exec(line ?? "")?.[1]?.trim() ?? line;
+}
+
+function studyMemoryDocument(
+  name: string,
+  description: string,
+  direction: string,
+  resolvedDate: string,
+): string {
+  return [
+    "---",
+    `name: ${JSON.stringify(name)}`,
+    `description: ${JSON.stringify(description)}`,
+    "type: study",
+    "---",
+    "",
+    `Current direction: ${direction}`,
+    `Last planned for ${resolvedDate}. Detailed schedules remain in Daily Notes.`,
+    "",
+  ].join("\n");
+}
+
+function replaceMemoryIndexEntry(
+  content: string,
+  memoryPath: string,
+  name: string,
+  description: string,
+): string | undefined {
+  const relativePath = memoryPath.replace(/^memory\//, "");
+  let replaced = false;
+  const lines = content.split(/\r?\n/).map((line) => {
+    const target = /^-\s+\[[^\]]+\]\(([^)]+)\)\s+-\s+.+$/.exec(line)?.[1];
+    if (target !== relativePath) return line;
+    replaced = true;
+    return `- [${name}](${relativePath}) - ${description}`;
+  });
+  return replaced ? lines.join("\n") : undefined;
+}
+
 function toolResultFor(
   input: ModelConversationItem[],
   name: LocalToolName,
@@ -557,6 +870,7 @@ function dailyPlanAction(
   context: DailyNoteContextResult,
   targetRead: Extract<ModelConversationItem, { type: "local_tool_result" }> | undefined,
   planItems: string,
+  replaceExisting = false,
 ): Record<string, unknown> | null | undefined {
   const heading = "## 今日学习计划";
   if (!context.targetExists) {
@@ -582,6 +896,17 @@ function dailyPlanAction(
     const nextHeading = current.indexOf("\n## ", sectionStart + heading.length);
     const sectionEnd = nextHeading >= 0 ? nextHeading : current.length;
     const currentSection = current.slice(sectionStart, sectionEnd);
+    if (replaceExisting && currentSection.trim() !== heading) {
+      return {
+        actionId: "daily-study-plan-replace",
+        idempotencyKey: "daily-study-plan-replace",
+        operation: "exact_replace",
+        path: context.targetPath,
+        expectedVersion: targetRead.result.value.modifiedVersion,
+        expectedContent: currentSection,
+        replacement: `${heading}\n\n${planItems}\n`,
+      };
+    }
     if (currentSection.trim() === heading) {
       return {
         actionId: "daily-study-plan-fill",

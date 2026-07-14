@@ -1790,7 +1790,7 @@ async function startRuntime({
             }
           }
           let finished = false;
-          for (let step = completedSteps; !resumeAfterFallback && step < 8; step += 1) {
+          for (let step = completedSteps; !resumeAfterFallback && step < 12; step += 1) {
             output = "";
             citations.length = 0;
             let requestedTool = false;
@@ -2109,7 +2109,7 @@ async function startRuntime({
             finished = true;
           }
           if (!finished) {
-            throw new Error("The Agent Run exceeded the maximum of 8 Provider steps.");
+            throw new Error("The Agent Run exceeded the maximum of 12 Provider steps.");
           }
         } catch (error) {
           const run = activeRuns.get(runCommand.agentRunId);
