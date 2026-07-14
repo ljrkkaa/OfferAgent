@@ -40,6 +40,30 @@ _Avoid_: 学习日记、关键词路由、Study-State Synchronization
 Obsidian 插件通过专用 `daily_note_context` 工具为指定日期解析 Daily Notes 配置；未指定日期时按插件所在本地时区确定“今天”。它返回解析后的日期、目标路径、文件是否存在及其版本、模板路径与模板正文及其版本、日期格式。它不创建文件、不选择学习内容，也不向普通 Vault 读取开放 `.obsidian/**`。
 _Avoid_: agent.md 硬编码模板路径、vault_read 读取 Obsidian 配置、插件替模型规划内容
 
+**Interview Experience**:
+OfferAgent 从用户分享或自主检索的内容中整理出的结构化面经笔记；它保存可学习的面试上下文与问题，不把原始图片、网页正文或聊天原文作为独立知识层重复归档。每次入库都在同一个 Vault Change Batch 中同步相关 Interview Question。
+_Avoid_: 原始素材库、网页镜像、聊天记录副本
+
+**Interview Submission**:
+用户在一条消息中提供的文本、URL 和有序 Run Attachment 集合；多张图片默认共同描述一篇 Interview Experience，Agent 应综合全部内容后再提取，只有用户明确说明时才拆成多篇。
+_Avoid_: 每张截图一篇面经、忽略附件顺序、未征得用户意图自动拆分
+
+**Interview Experience Identity**:
+一篇 Interview Experience 所代表的单次来源事件；相同 URL、相同截图内容或明显搬运内容属于同一事件并合并，来自不同求职者、时间或轮次的经历仍是不同事件，即使部分问题重合。
+_Avoid_: 按公司岗位合并全部面经、搬运内容重复建档、按题目重合误删不同经历
+
+**Source Metadata**:
+Interview Experience 中用于最低限度追溯的信息，例如来源类型、可用时的来源 URL、采集日期、公司、岗位和面试轮次；它不包含原始素材正文。
+_Avoid_: 完整来源存档、无来源标记
+
+**Interview Question**:
+从一个或多个 Interview Experience 中提取并合并的可复用学习单元；语义重复的问题更新既有条目及其出现上下文和出现频率，只有尚不存在的问题才创建新条目。新题可以先入库，再依据 Answer State 独立完成研究与答案建设。
+_Avoid_: 每篇面经复制一套题目、同义问题重复建档、与面经入库分离的手工同步
+
+**Answer State**:
+Interview Question 的答案成熟度，依次为 `needs-research`、`draft` 和 `verified`；它描述答案是否经过研究与验证，不表示用户是否已经学习或掌握该题。
+_Avoid_: Learning State、用文件存在表示答案成熟、把即时生成内容标为已验证
+
 **Planning Memory**:
 Vault 中用户可见、可编辑并跨 Conversation 保留的 User Memory、Feedback Memory、Project Memory 和 Study Memory；它默认启用并允许 Agent 直接写入，不提供独立的启用开关或权限配置。它存放在 Vault 根目录 `memory/`：`MEMORY.md` 只保存简短索引，实际记忆按语义主题分别存放在 `user/`、`feedback/`、`project/` 和 `study/` 中，并由 Agent 根据当前请求按需读取。Daily Study Plan 可以使用它，但它不是 Study Evidence 或 Runtime State。
 _Avoid_: 隐藏模型记忆、大类汇总文件、按时间堆积、可选功能开关、独立权限配置、Conversation Context、运行日志
@@ -76,6 +100,10 @@ _Avoid_: Study Memory、源码副本、项目日志
 跨 Daily Study Plan 延续的当前学习主线、暂缓方向、主题顺序和安排偏好；已完成学习事实仍由 Study Evidence 决定。
 _Avoid_: Project Memory、Study Evidence、完成状态
 
+**Study Planning Priority**:
+Daily Study Plan 选择学习内容与研究方向时采用的语义优先级：当前明确的公司、岗位、面试日期或目标优先，其次参考最近六个月匹配面经中的高频问题、答案或学习尚未成熟的题目、与用户项目简历高度相关的方向，并避免近期计划的无意义重复。
+_Avoid_: 固定分数公式、忽略当前用户目标、只按热度排序、把计划优先级当成完成证据
+
 **Memory Precedence**:
 记忆参与决策时遵循 Agent Contract > 当前用户明确要求 > Feedback Memory > 与任务相关的 User Memory、Project Memory 或 Study Memory > 模型默认行为；同层冲突采用更具体且更新的内容。当前请求可以覆盖本次行为，但除非表达了持久纠正或稳定事实，否则不改写 Planning Memory。
 _Avoid_: 旧记忆覆盖当前要求、单次要求自动永久化、所有记忆无条件拼接
@@ -95,8 +123,8 @@ _Avoid_: 单次请求、单次模型调用、Agent Run
 _Avoid_: 完整运行日志、旧证据缓存、单轮输入
 
 **Agent Run**:
-OfferAgent 为处理一条用户请求而进行的一次执行，直到完成、失败、取消或中断。
-_Avoid_: Conversation、模型请求、聊天消息
+用户为一个目标明确启动、由 OfferAgent 自主选择和调度可用工具的一次执行，直到完成、失败、取消或中断；首版不在用户未启动目标时创建后台研究运行。
+_Avoid_: Conversation、模型请求、聊天消息、无人触发的后台任务、固定 Workflow 实例
 
 **Interrupted Run**:
 在完成前因插件或 Runtime 断开而停止、但仍保留可恢复进度的 Agent Run。
@@ -113,6 +141,46 @@ _Avoid_: Study Evidence、Vault 内容、学习记录
 **Evidence Snapshot**:
 Agent Run 实际使用过的有限 Vault 文本片段及其来源标识；源文件发生变化后，它不能继续作为当前证据。
 _Avoid_: 完整文件副本、Vault 缓存、永久知识副本
+
+**Project Evidence**:
+Agent 从 `projects/` 中的项目文档、文本源码和配置里精确读取的有界证据，用于核对项目事实并生成特化面试回答；它不包含密钥、依赖、构建产物或版本控制内部文件，也不授权执行或修改项目代码。
+_Avoid_: README 推测、完整项目副本、Shell 输出、代码执行结果、用户已掌握的证明
+
+**Project Interview Training**:
+基于 Project Evidence 的交互式模拟面试；Agent 一次提出一道与目标岗位相关的问题，在用户回答后继续真实性与技术深挖、给出反馈和改进建议，训练结束后才沉淀经确认的项目特化内容。
+_Avoid_: 直接代写答案、一次展示整套问题、脱离项目事实的通用问答、未训练先标记掌握
+
+**Project Answer**:
+Interview Question 针对一个具体个人项目形成的回答版本，包含用户实际职责、实现依据、取舍、指标、失败案例和追问准备；它与通用标准答案分开保存并关联对应 Project Evidence。
+_Avoid_: 覆盖通用标准答案、把模型推测写成个人经历、无项目证据的包装
+
+**Project Interview Profile**:
+一个项目的特化面试知识集合；它以独立目录组织稳定项目事实、训练索引和按问题拆分的 Project Answer，只为实际训练过的问题创建答案内容。
+_Avoid_: 单个巨型项目问答文件、未训练问题的空文件、把项目源码复制进回答目录
+
+**Project Ownership**:
+纳入 Project Interview Profile 的个人项目默认由用户独立完成，Agent 可以依据 Project Evidence 使用第一人称描述其设计与实现，不需要逐题确认个人贡献；未注册的外部项目副本或临时实验不自动获得该归属。
+_Avoid_: 每道题重复确认作者身份、把任意 projects 目录内容都包装成个人成果、虚构源码中不存在的实现
+
+**Project Registry**:
+`projects/index.md` 中列出的当前项目，是可以建立 Project Interview Profile 并按 Project Ownership 生成第一人称回答的个人面试项目集合；其他项目目录只能作为研究参考，除非通过正常 Vault Change Batch 加入注册表。
+_Avoid_: 扫描目录即认定个人项目、隐藏项目名单、Agent 绕过变更批次自行授权
+
+**Training Outcome**:
+Project Interview Training 结束后写入 Vault 的精炼成果，包括用户确认的 Project Answer、Project Evidence 引用、薄弱点、可能追问和下一次复训题目；完整逐轮问答只保留在 Conversation，不复制进知识库。
+_Avoid_: 完整训练转录、模型未确认的临场回答、只保存评分不保存改进内容
+
+**Training Feedback**:
+Agent 对用户回答给出的维度化改进意见，覆盖项目事实、个人职责、技术取舍、指标结果、追问准备和表达时长；每个维度只说明已覆盖或需要补充，并提供具体证据与改进方向，不计算数字总分。
+_Avoid_: 伪精确总分、脱离 Project Evidence 的主观评价、只判好坏不给改法
+
+**Training Question Selection**:
+Project Interview Training 的逐题选择规则；用户可以明确点题，否则 Agent 根据当前目标公司与岗位、最近匹配面经中的高频问题、项目关键设计与风险、既有 Training Feedback 和复训项自主选择下一题，并降低已成熟且无新证据题目的优先级。
+_Avoid_: 一次展示整套题、固定题序、忽略用户点题、无意义重复训练
+
+**Run Attachment**:
+用户为当前 Agent Run 提供的图片等非文本输入；它只在 Runtime 的临时附件区保留到运行终止、Conversation 删除或短期清理期限，以支持 Interrupted Run 恢复，不进入 Vault 或 Interview Experience 正文。
+_Avoid_: 知识库原始素材、永久附件、Evidence Snapshot、Planning Memory
 
 **Agent Sidebar**:
 Obsidian 右侧栏中承载 Conversation、Agent Run 状态和用户输入的唯一首版工作区；辅助信息只在当前操作需要时出现。
@@ -135,6 +203,22 @@ _Avoid_: CLI 包装器、Runtime 直接文件访问、模型执行 Shell
 **Provider Capability**:
 模型 Provider 在当前认证方式和后端上经过实际探测后可用的托管能力，例如 Codex Hosted Web Search。未知或探测失败的能力不得被 Agent 当成已提供的工具。
 _Avoid_: 根据模型名称猜测能力、把内部后端当成公开稳定协议
+
+**Vision Capability**:
+Provider 在当前后端和模型上经过实际探测后可用的原生图片理解能力；它读取用户明确提供的 Run Attachment，不依赖本地 OCR，也不能因其他模型支持图片而推断当前模型可用。
+_Avoid_: OCR Pipeline、按模型名称假定支持、把附件永久上传为知识库素材
+
+**Research Browser**:
+OfferAgent 为用户发起的研究任务使用的隔离登录浏览器；它拥有独立于日常 Chrome 的 Profile，可根据研究目标自主跨站搜索、跳转、翻页和读取，但不发布内容或进行社交互动。
+_Avoid_: 用户日常 Chrome 会话、通用电脑控制、后台爬虫、发帖点赞私信
+
+**Interview Research Scope**:
+用户请求限定的公司、岗位或技术方向、时间范围和期望数量；未明确时间时默认最近六个月，并在范围内选择岗位相关且信息具体的少量 Interview Experience。Agent 不得为凑数量自行放宽岗位或时间范围，合格结果不足时应明确报告。
+_Avoid_: 自动扩大岗位、自动纳入更早面经、固定抓取篇数、用低质量结果填满配额
+
+**Interview Research Ranking**:
+Agent 根据当前用户需求对 Interview Research Scope 内的候选结果进行语义排序，优先公司与岗位更匹配、时间更新且问题更具体的内容；它不生成伪精确的可信度等级，并在入库前排除已经保存的重复 Interview Experience。
+_Avoid_: high/medium/low 可信度打分、固定站点权重、忽略用户需求的热度排序、重复入库
 
 ## Migration Requirement
 
