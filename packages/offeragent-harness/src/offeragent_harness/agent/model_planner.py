@@ -186,7 +186,19 @@ class ToolPlanCatalog:
 
     def violations(self, value: Mapping[str, Any]) -> tuple[str, ...]:
         errors = sorted(self._validator.iter_errors(value), key=lambda item: tuple(str(part) for part in item.path))
-        return tuple(f"{_json_path(error.absolute_path)}: {error.message}" for error in errors)
+        structural = tuple(f"{_json_path(error.absolute_path)}: {error.message}" for error in errors)
+        if structural:
+            return structural
+        calls = value.get("calls")
+        if not isinstance(calls, list):
+            raise AssertionError("the validated ToolPlan calls field is not an array")
+        names = tuple(call.get("name") for call in calls if isinstance(call, Mapping))
+        if "skill.read" in names and any(name != "skill.read" for name in names):
+            return (
+                "$.calls: a planning step that reads Skill instructions may contain only skill.read calls; "
+                "plan other tools after the Skill body is available",
+            )
+        return ()
 
     def _build_schema(self) -> dict[str, Any]:
         definitions: dict[str, Any] = {}

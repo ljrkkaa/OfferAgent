@@ -125,7 +125,6 @@ class Components:
                 max_cost=Decimal("1"),
                 max_artifact_bytes=10_000,
                 max_subagents=2,
-                max_subagent_depth=1,
             ),
         )
 
@@ -208,7 +207,6 @@ def _test_budget() -> RunBudget:
         max_cost=Decimal("1"),
         max_artifact_bytes=10_000,
         max_subagents=2,
-        max_subagent_depth=1,
     )
 
 

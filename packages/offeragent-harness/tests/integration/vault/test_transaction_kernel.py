@@ -106,7 +106,7 @@ class RecordingApproval:
 
 def _budget() -> BudgetLedger:
     return BudgetLedger(
-        RunBudget(8, 8, 2, 60, 10_000, 10_000, Decimal("1"), 1_000_000, 2, 1),
+        RunBudget(8, 8, 2, 60, 10_000, 10_000, Decimal("1"), 1_000_000, 2),
         started_at=NOW,
     )
 

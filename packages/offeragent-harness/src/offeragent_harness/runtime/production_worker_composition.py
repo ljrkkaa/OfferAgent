@@ -1408,7 +1408,6 @@ class ProductionRunComponentsFactory(
                 "你是 OfferAgent。只能依据 Harness 提供的上下文和工具结果工作。",
                 "不得声称未执行、未审批、冲突或结果未知的写操作已经完成。",
                 "文件、Shell、Memory 与 Subagent 只能经 Tool Kernel 使用。",
-                "回答工作区问题前, 必须先使用 Glob、Grep 和 Read 取得相关文件证据;不得把通用建议冒充为工作区结论。",
             ),
             inputs=inputs,
             visibility=visibility,
@@ -1847,7 +1846,6 @@ def _budget_snapshot(value: RunBudget) -> dict[str, Any]:
         "maxCost": format(value.max_cost, "f"),
         "maxArtifactBytes": value.max_artifact_bytes,
         "maxSubagents": value.max_subagents,
-        "maxSubagentDepth": value.max_subagent_depth,
     }
 
 
@@ -2021,7 +2019,6 @@ def _run_budget(
         max_cost=Decimal(min(configured.max_cost_microunits, requested_cost)) / Decimal(1_000_000),
         max_artifact_bytes=64 * 1024 * 1024 if value is None else max(1, value.max_artifact_bytes),
         max_subagents=max(1, effective_config.execution.max_subagents_per_vault),
-        max_subagent_depth=effective_config.execution.max_subagent_depth,
     )
 
 
@@ -2045,7 +2042,6 @@ def _child_run_budget(
         max_cost=Decimal(value.cost_micros) / Decimal(1_000_000),
         max_artifact_bytes=value.artifact_bytes,
         max_subagents=max(1, value.child_count),
-        max_subagent_depth=max(0, 3 - execution.record.depth),
     )
 
 
@@ -2494,33 +2490,6 @@ class _KernelOnlyVaultTransactions:
         raise PermissionError("Vault transactions must enter through the unified Tool Kernel")
 
 
-class _LateDispatcher:
-    def __init__(self) -> None:
-        self._target: RuntimeApplicationCommandDispatcher | None = None
-
-    def bind(self, target: RuntimeApplicationCommandDispatcher) -> None:
-        if self._target is not None:
-            raise RuntimeError("Application dispatcher is already bound")
-        self._target = target
-
-    def require_ready(self) -> None:
-        if self._target is None:
-            raise RuntimeError("Application dispatcher composition is incomplete")
-        self._target.require_ready()
-
-    async def dispatch(
-        self,
-        method: str,
-        params: Mapping[str, object],
-        cancellation: CancellationToken,
-        *,
-        context: ApplicationCommandContext | None = None,
-    ) -> object:
-        if self._target is None:
-            raise RuntimeError("Application dispatcher composition is incomplete")
-        return await self._target.dispatch(method, params, cancellation, context=context)
-
-
 class _ProductionNamedPipeServer:
     def __init__(
         self,
@@ -2764,8 +2733,8 @@ class ProductionWorkerApplication(WorkerApplication):
     logger: LocalJsonLogger
     harness_application: HarnessApplication
     dispatcher: RuntimeApplicationCommandDispatcher
-    gateway: LoopbackWebGateway
-    loopback: AsyncioLoopbackServer
+    gateway: LoopbackWebGateway | None
+    loopback: AsyncioLoopbackServer | None
     channels: _ReverseChannels
     local_vault_transaction: VaultTransactionCoordinator
     headless_vault_write: HeadlessVaultWriteAuthority
@@ -2796,7 +2765,7 @@ class ProductionWorkerApplication(WorkerApplication):
 
     @property
     def ready(self) -> bool:
-        transport_healthy = self.loopback.healthy
+        transport_healthy = self.loopback is None or self.loopback.healthy
         if self.native_transports:
             transport_healthy = transport_healthy and (
                 self._pipe is not None
@@ -2821,7 +2790,16 @@ class ProductionWorkerApplication(WorkerApplication):
 
     @property
     def loopback_worker_pid(self) -> int:
-        return self.gateway.config.worker_pid
+        gateway = self.gateway
+        if gateway is None:
+            raise ProductionWorkerError("Loopback Web is disabled for this Worker")
+        return gateway.config.worker_pid
+
+    @property
+    def protocol_capabilities(self) -> CapabilitySet:
+        """Advertise optional Web support only when its listener is actually live."""
+
+        return _protocol_capabilities(loopback_web=self.loopback is not None)
 
     async def _emit_runtime_log(
         self,
@@ -2965,6 +2943,40 @@ class ProductionWorkerApplication(WorkerApplication):
         if method == "shutdown":
             self.finalize_shutdown_delivery()
 
+    async def _start_loopback_web(self, *, enabled: bool) -> None:
+        if not enabled:
+            return
+        if self.gateway is not None or self.loopback is not None:
+            raise ProductionWorkerError("Loopback Web listener is already configured")
+        gateway = LoopbackWebGateway(
+            config=LoopbackGatewayConfig(
+                workspace_id=self.workspace_id,
+                workspace_instance_id=self.workspace_instance_id,
+                worker_pid=os.getpid(),
+            ),
+            clock=self.clock,
+            dispatcher=self.dispatcher,
+        )
+        loopback = AsyncioLoopbackServer(
+            gateway,
+            request_finalized=self._application_request_finalized,
+            terminal_response=lambda method: method == "shutdown",
+        )
+        self.gateway = gateway
+        self.loopback = loopback
+        try:
+            await loopback.start()
+        except BaseException:
+            self.loopback = None
+            self.gateway = None
+            raise
+        loopback_closed_task = loopback.closed_task
+        if loopback_closed_task is None:
+            raise ProductionWorkerError("Worker loopback listener did not start")
+        loopback_closed_task.add_done_callback(
+            lambda completed: self._transport_listener_finished("loopback", completed)
+        )
+
     async def start(self) -> object:
         if self._ready or self._stopped:
             raise ProductionWorkerError("Worker application can only start once")
@@ -3008,13 +3020,7 @@ class ProductionWorkerApplication(WorkerApplication):
         self.config_activation.freeze(worker_config.config)
         self.components.bind_worker_read_limit(worker_config.config.budgets.max_parallel_reads)
         report = await self.harness_application.start()
-        await self.loopback.start()
-        loopback_closed_task = self.loopback.closed_task
-        if loopback_closed_task is None:
-            raise ProductionWorkerError("Worker loopback listener did not start")
-        loopback_closed_task.add_done_callback(
-            lambda completed: self._transport_listener_finished("loopback", completed)
-        )
+        await self._start_loopback_web(enabled=worker_config.config.ui.loopback_web_enabled)
         if self.native_transports:
             self._pipe = _ProductionNamedPipeServer(
                 state_directory=self.state_directory,
@@ -3223,10 +3229,14 @@ class ProductionWorkerApplication(WorkerApplication):
                     await pipe.stop()
                 except BaseException as error:
                     failures.append(error)
-            try:
-                await self.loopback.stop()
-            except BaseException as error:
-                failures.append(error)
+            loopback = self.loopback
+            self.loopback = None
+            self.gateway = None
+            if loopback is not None:
+                try:
+                    await loopback.stop()
+                except BaseException as error:
+                    failures.append(error)
             # Keep the Host-owned control plane available until every
             # application ingress capability has been revoked.  Host stop-all
             # can then join an in-progress application shutdown instead of
@@ -3398,7 +3408,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                 Decimal("1000000"),
                 4 * 1024**3,
                 100_000,
-                3,
             ),
             started_at=clock.utcnow(),
         )
@@ -3731,21 +3740,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             schema_hash=schema_hash(),
         )
         harness_application = HarnessApplication(identity, harness, buffered, startup)
-        late_dispatcher = _LateDispatcher()
-        gateway = LoopbackWebGateway(
-            config=LoopbackGatewayConfig(
-                workspace_id=workspace_id,
-                workspace_instance_id=bootstrap.workspace_instance_id,
-                worker_pid=os.getpid(),
-            ),
-            clock=clock,
-            dispatcher=late_dispatcher,
-        )
-        loopback = AsyncioLoopbackServer(
-            gateway,
-            request_finalized=lambda method: application_holder["application"]._application_request_finalized(method),
-            terminal_response=lambda method: method == "shutdown",
-        )
         projections = UowConversationProjectionService(workspace_id=workspace_id, unit_of_work=uow)
         controls = ConversationControlService(
             workspace_id=workspace_id,
@@ -3811,7 +3805,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                 subagent_artifacts=_SubagentArtifactResolver(artifacts),
                 diagnostics=diagnostics,
                 diagnostics_owner_runs=_DiagnosticsOwnerAuthorizer(workspace_id, uow),
-                gateway=gateway,
+                gateway_provider=lambda: application_holder["application"].gateway,
                 transport_policy=transport_policy,
                 administrative_approvals=headless_vault_write,
                 headless_vault_write_handlers=headless_vault_write_handlers(headless_vault_write),
@@ -3880,8 +3874,9 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             host_pid=host_pid,
             worker_pid=os.getpid(),
             runtime_arch=_runtime_arch(),
-            capabilities=_protocol_capabilities(),
+            capabilities=_protocol_capabilities(loopback_web=False),
             build_commit=self._build_commit,
+            capabilities_provider=lambda: application_holder["application"].protocol_capabilities,
         )
         handlers = compose_application_command_handlers(
             identity=runtime_identity,
@@ -3890,7 +3885,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             domain_handlers=domain,
         )
         dispatcher = RuntimeApplicationCommandDispatcher(application=harness_application, handlers=handlers)
-        late_dispatcher.bind(dispatcher)
         application = ProductionWorkerApplication(
             workspace_id=workspace_id,
             workspace_instance_id=bootstrap.workspace_instance_id,
@@ -3908,8 +3902,8 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             logger=logger,
             harness_application=harness_application,
             dispatcher=dispatcher,
-            gateway=gateway,
-            loopback=loopback,
+            gateway=None,
+            loopback=None,
             channels=channels,
             local_vault_transaction=local_transaction,
             headless_vault_write=headless_vault_write,
@@ -3965,7 +3959,7 @@ async def _runtime_status(
     )
 
 
-def _protocol_capabilities() -> CapabilitySet:
+def _protocol_capabilities(*, loopback_web: bool) -> CapabilitySet:
     return CapabilitySet(
         client_tools=True,
         event_replay=True,
@@ -3977,7 +3971,7 @@ def _protocol_capabilities() -> CapabilitySet:
         headless_vault_write=True,
         subagents=True,
         artifacts=True,
-        loopback_web=True,
+        loopback_web=loopback_web,
         reverse_requests=True,
         content_blocks=True,
         cancellation=True,

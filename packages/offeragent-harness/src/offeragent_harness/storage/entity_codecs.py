@@ -499,7 +499,6 @@ def _run_budget_to_payload(budget: RunBudget) -> dict[str, Any]:
         "maxCost": _decimal_to_string(budget.max_cost, "budget maxCost"),
         "maxArtifactBytes": budget.max_artifact_bytes,
         "maxSubagents": budget.max_subagents,
-        "maxSubagentDepth": budget.max_subagent_depth,
     }
 
 
@@ -516,7 +515,6 @@ def _run_budget_from_payload(value: Any) -> RunBudget:
             "maxCost",
             "maxArtifactBytes",
             "maxSubagents",
-            "maxSubagentDepth",
         },
         "budget limits",
     )
@@ -530,7 +528,6 @@ def _run_budget_from_payload(value: Any) -> RunBudget:
         max_cost=_decimal_from_string(raw["maxCost"], "maxCost"),
         max_artifact_bytes=_integer(raw["maxArtifactBytes"], "maxArtifactBytes"),
         max_subagents=_integer(raw["maxSubagents"], "maxSubagents"),
-        max_subagent_depth=_integer(raw["maxSubagentDepth"], "maxSubagentDepth"),
     )
 
 

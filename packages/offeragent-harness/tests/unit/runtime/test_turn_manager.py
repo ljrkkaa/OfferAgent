@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 from datetime import timedelta
 
 import pytest
@@ -127,3 +128,28 @@ async def test_turn_manager_observer_records_active_count_and_cleanup_complete_c
     observer.run_depth_registered(3)
     observer.run_depth_registered(2)
     assert {item.name: item for item in metrics.snapshots()}[MetricName.SUBAGENT_DEPTH].current == 3
+
+
+@pytest.mark.asyncio
+async def test_failed_background_run_is_observed_before_manager_releases_it() -> None:
+    manager = TurnManager()
+    reported: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+    try:
+
+        async def fails(_scope: CancellationScope) -> None:
+            raise RuntimeError("expected run failure")
+
+        active = await manager.start(session_id="s1", run_id="r1", factory=fails)
+        for _ in range(10):
+            if not await manager.active_runs():
+                break
+            await asyncio.sleep(0)
+        del active
+        gc.collect()
+        await asyncio.sleep(0)
+        assert reported == []
+    finally:
+        loop.set_exception_handler(previous_handler)

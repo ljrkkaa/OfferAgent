@@ -29,7 +29,6 @@ def budget() -> RunBudget:
         max_cost=Decimal("25.1250"),
         max_artifact_bytes=5_000_000,
         max_subagents=5,
-        max_subagent_depth=3,
     )
 
 

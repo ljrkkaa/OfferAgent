@@ -25,11 +25,20 @@ from .recovery_contract import (
     is_safe_crash_replay,
     is_side_effect_free,
 )
-from .results import SideEffect, SideEffectKind, SideEffectState, ToolError, ToolResult, ToolResultStatus
+from .results import (
+    MAX_TOOL_RESULT_SOURCE_REFERENCES,
+    SideEffect,
+    SideEffectKind,
+    SideEffectState,
+    ToolError,
+    ToolResult,
+    ToolResultStatus,
+)
 from .source_references import vault_source_reference
 from .validator import ToolValidationError, ToolValidator, ValidatedArguments, ValidationIssue
 
 __all__ = [
+    "MAX_TOOL_RESULT_SOURCE_REFERENCES",
     "ApprovalEvidence",
     "CanonicalJsonError",
     "ExecutorLocation",

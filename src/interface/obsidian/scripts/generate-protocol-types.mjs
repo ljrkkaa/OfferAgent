@@ -55,7 +55,7 @@ lines.push(
     "export type ProtocolEventPayload<Type extends ProtocolEventType> = ProtocolEventMap[Type][\"payload\"];",
     "",
 );
-await writeFile(join(pluginRoot, "src", "runtime", "generated_protocol.ts"), `${lines.join("\n")}\n`, "utf8");
+await writeFile(join(pluginRoot, "src", "runtime", "generated_protocol.ts"), `${lines.join("\n").trimEnd()}\n`, "utf8");
 
 function emitMethodMap(output, name, mapping, requestResponse) {
     if (!mapping || typeof mapping !== "object" || Array.isArray(mapping)) throw new Error(`${name} is invalid`);

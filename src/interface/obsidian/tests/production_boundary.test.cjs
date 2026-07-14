@@ -110,7 +110,7 @@ test("Subagents require an explicit local setting and send a bounded execution c
     const settings = await readFile(path.join(__dirname, "../src/local/settings.ts"), "utf8");
     assert.match(main, /subagents_enabled:\s*settings\.subagentsEnabled/);
     assert.match(main, /max_subagents_per_vault:\s*settings\.subagentsEnabled\s*\?\s*[1-9][0-9]*\s*:\s*0/);
-    assert.match(main, /max_subagent_depth:\s*settings\.subagentsEnabled\s*\?\s*[1-3]\s*:\s*0/);
+    assert.doesNotMatch(main, /subagent.*depth/i);
     assert.match(settings, /subagentsEnabled:\s*false/);
 });
 

@@ -39,8 +39,6 @@ class AgentDefinition:
     skills: tuple[str, ...]
     permission_ceiling: PermissionMode
     capability_ceiling: CapabilityScope
-    can_spawn_children: bool
-    max_depth: int
     max_tool_calls: int
     result_schema: Mapping[str, Any]
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -67,8 +65,8 @@ class AgentDefinition:
             raise ValueError("agent definitions cannot grant bypass permission")
         if self.reasoning_effort is not None and self.reasoning_effort not in _REASONING:
             raise ValueError("agent reasoning_effort is invalid")
-        if not 0 <= self.max_depth <= 3 or not 0 <= self.max_tool_calls <= 10_000:
-            raise ValueError("agent limits exceed the hard Subagent ceiling")
+        if not 0 <= self.max_tool_calls <= 10_000:
+            raise ValueError("agent maximum Tool-call count is invalid")
         if len(self.skills) > 256 or len(self.skills) != len(set(self.skills)) or any(not item for item in self.skills):
             raise ValueError("agent skills must be unique non-empty names")
         Draft202012Validator.check_schema(dict(self.result_schema))
@@ -194,8 +192,6 @@ def builtin_agent_definitions(
                     network,
                     False,
                 ),
-                can_spawn_children=False,
-                max_depth=1,
                 max_tool_calls=20,
                 result_schema=_structured_result_schema(),
                 metadata={"builtin": True, "capabilityCeilingExplicit": True},

@@ -1806,7 +1806,6 @@ async def test_schema_valid_oversized_output_preserves_sensitivity_in_artifact(
             max_cost=Decimal("10"),
             max_artifact_bytes=10_000,
             max_subagents=1,
-            max_subagent_depth=1,
         ),
         started_at=NOW,
     )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, cast
@@ -189,7 +189,7 @@ def compose_domain_command_handlers(
     subagent_artifacts: SubagentArtifactReferenceResolver,
     diagnostics: DiagnosticsService,
     diagnostics_owner_runs: DiagnosticsOwnerRunAuthorizer,
-    gateway: LoopbackWebGateway,
+    gateway_provider: Callable[[], LoopbackWebGateway | None],
     transport_policy: ApplicationTransportPolicy,
     administrative_approvals: AdministrativeApprovalResolver,
     headless_vault_write_handlers: Mapping[str, ApplicationCommandHandler],
@@ -262,7 +262,7 @@ def compose_domain_command_handlers(
             owner_runs=diagnostics_owner_runs,
         )
     )
-    add(web_launch_handlers(gateway=gateway))
+    add(web_launch_handlers(gateway_provider=gateway_provider))
     expected = frozenset(COMMAND_REGISTRY) - {"initialize", "runtime/ping", "runtime/status"}
     actual = frozenset(handlers)
     if actual != expected:

@@ -268,7 +268,7 @@ class _Components:
             planner_factory=lambda budget: planner,
             tool_kernel_factory=lambda budget: kernel,
             composer=_Composer(),
-            budget=RunBudget(8, 8, 2, 60, 1_000, 1_000, Decimal("1"), 10_000, 2, 1),
+            budget=RunBudget(8, 8, 2, 60, 1_000, 1_000, Decimal("1"), 10_000, 2),
         )
 
 

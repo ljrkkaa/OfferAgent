@@ -146,7 +146,6 @@ class ExecutionSettings(_StrictModel):
     shell_enabled: StrictBool = False
     subagents_enabled: StrictBool = False
     max_subagents_per_vault: Annotated[StrictInt, Field(ge=0, le=32)] = 0
-    max_subagent_depth: Annotated[StrictInt, Field(ge=0, le=3)] = 0
 
 
 class ExtensibilitySettings(_StrictModel):
@@ -203,10 +202,8 @@ class HarnessConfig(_StrictModel):
             raise ValueError("automatic install requires automatic update checks")
         if self.update.automatic_check and self.update.channel is UpdateChannel.DISABLED:
             raise ValueError("automatic update checks require a release channel")
-        if self.execution.subagents_enabled and (
-            self.execution.max_subagents_per_vault < 1 or self.execution.max_subagent_depth < 1
-        ):
-            raise ValueError("enabled subagents require positive count and depth limits")
+        if self.execution.subagents_enabled and self.execution.max_subagents_per_vault < 1:
+            raise ValueError("enabled subagents require a positive concurrent-run limit")
         return self
 
 
@@ -268,7 +265,6 @@ class ExecutionPatch(_StrictModel):
     shell_enabled: StrictBool | None = None
     subagents_enabled: StrictBool | None = None
     max_subagents_per_vault: Annotated[StrictInt, Field(ge=0, le=32)] | None = None
-    max_subagent_depth: Annotated[StrictInt, Field(ge=0, le=3)] | None = None
 
 
 class ExtensibilityPatch(_StrictModel):

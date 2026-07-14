@@ -17,7 +17,6 @@ class RunBudget:
     max_cost: Decimal
     max_artifact_bytes: int
     max_subagents: int
-    max_subagent_depth: int
 
     def __post_init__(self) -> None:
         integer_limits = (
@@ -33,8 +32,8 @@ class RunBudget:
             raise ValueError("run budget limits must be positive")
         if self.max_parallel_reads > 256:
             raise ValueError("max_parallel_reads cannot exceed 256")
-        if self.max_wall_seconds <= 0 or self.max_cost < 0 or self.max_subagent_depth < 0:
-            raise ValueError("wall time must be positive; cost and depth cannot be negative")
+        if self.max_wall_seconds <= 0 or self.max_cost < 0:
+            raise ValueError("wall time must be positive and cost cannot be negative")
 
 
 @dataclass(frozen=True, slots=True)

@@ -22,7 +22,6 @@ def budget() -> RunBudget:
         max_cost=Decimal("12.50"),
         max_artifact_bytes=2_000_000,
         max_subagents=4,
-        max_subagent_depth=2,
     )
 
 
@@ -107,12 +106,12 @@ def test_checkpoint_rejects_budget_overflow_and_inconsistent_time() -> None:
     ("invalid_budget", "invalid_delta", "expected"),
     [
         (
-            RunBudget(6, 12, 3, float("inf"), 10_000, 5_000, Decimal("1"), 100, 2, 1),
+            RunBudget(6, 12, 3, float("inf"), 10_000, 5_000, Decimal("1"), 100, 2),
             BudgetDelta(),
             "max_wall_seconds",
         ),
         (
-            RunBudget(6, 12, 3, 10, 10_000, 5_000, 1, 100, 2, 1),  # type: ignore[arg-type]
+            RunBudget(6, 12, 3, 10, 10_000, 5_000, 1, 100, 2),  # type: ignore[arg-type]
             BudgetDelta(),
             "max_cost must be Decimal",
         ),

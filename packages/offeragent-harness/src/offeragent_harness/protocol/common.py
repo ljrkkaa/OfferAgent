@@ -7,6 +7,8 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
+from offeragent_harness.foundation import MAX_SOURCE_REFERENCES
+
 from ._base import JsonObject, WireModel
 from .content import ArtifactRef, ContentBlock, FileRef, RelativeVaultPath, SourceRef
 from .errors import ErrorEnvelope
@@ -32,6 +34,7 @@ class PermissionMode(str, Enum):
 
 
 class ReasoningEffort(str, Enum):
+    NONE = "none"
     MINIMAL = "minimal"
     LOW = "low"
     MEDIUM = "medium"
@@ -224,7 +227,7 @@ class ToolResultDescriptor(WireModel):
     summary: str = Field(min_length=1, max_length=8192)
     data: JsonObject = Field(default_factory=dict)
     artifact_refs: list[ArtifactRef] = Field(default_factory=list, max_length=256)
-    source_refs: list[SourceRef] = Field(default_factory=list, max_length=512)
+    source_refs: list[SourceRef] = Field(default_factory=list, max_length=MAX_SOURCE_REFERENCES)
     side_effects: list[SideEffect] = Field(default_factory=list, max_length=256)
     retryable: bool = False
     error: ErrorEnvelope | None = None

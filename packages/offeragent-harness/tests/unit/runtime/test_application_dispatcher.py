@@ -200,7 +200,7 @@ def test_domain_factory_covers_every_non_identity_command_exactly_once() -> None
         subagent_artifacts=shared,  # type: ignore[arg-type]
         diagnostics=shared,  # type: ignore[arg-type]
         diagnostics_owner_runs=shared,  # type: ignore[arg-type]
-        gateway=shared,  # type: ignore[arg-type]
+        gateway_provider=lambda: shared,  # type: ignore[return-value]
         transport_policy=shared,  # type: ignore[arg-type]
         administrative_approvals=shared,  # type: ignore[arg-type]
         headless_vault_write_handlers={

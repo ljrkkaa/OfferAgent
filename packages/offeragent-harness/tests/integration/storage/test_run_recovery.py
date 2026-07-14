@@ -215,7 +215,7 @@ def _bundle(run_id: str, calls: tuple[ToolCall, ...]) -> _RunBundle:
 
 def _budget_checkpoint(tool_calls: int) -> BudgetCheckpoint:
     return BudgetCheckpoint(
-        budget=RunBudget(8, 20, 4, 300, 20_000, 8_000, Decimal("10"), 1_000_000, 4, 2),
+        budget=RunBudget(8, 20, 4, 300, 20_000, 8_000, Decimal("10"), 1_000_000, 4),
         started_at=NOW,
         used=BudgetDelta(model_rounds=1, tool_calls=tool_calls),
         reserved=BudgetDelta(model_rounds=1),

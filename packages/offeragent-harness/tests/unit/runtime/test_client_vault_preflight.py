@@ -308,7 +308,7 @@ class _FixedConnectionProvider:
 
 def _budget() -> BudgetLedger:
     return BudgetLedger(
-        RunBudget(8, 8, 2, 60, 100_000, 100_000, Decimal("10"), 1_000_000, 4, 1),
+        RunBudget(8, 8, 2, 60, 100_000, 100_000, Decimal("10"), 1_000_000, 4),
         started_at=NOW,
     )
 

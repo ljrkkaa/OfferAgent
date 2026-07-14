@@ -300,7 +300,7 @@ def _build(
     runner = _Runner(block=block)
     artifacts = _Artifacts()
     root_ledger = ledger or BudgetLedger(
-        RunBudget(100, 100, 4, 1_000, 100_000, 100_000, Decimal("100"), 10_000_000, 20, 3),
+        RunBudget(100, 100, 4, 1_000, 100_000, 100_000, Decimal("100"), 10_000_000, 20),
         started_at=NOW,
     )
     tree = SubagentBudgetTree(
@@ -441,7 +441,7 @@ async def _seed_expired_run(uow: InMemoryUnitOfWorkFactory, *, safe: bool) -> st
 
 def _restored_root_ledger() -> BudgetLedger:
     return BudgetLedger.restore(
-        RunBudget(100, 100, 4, 1_000, 100_000, 100_000, Decimal("100"), 10_000_000, 20, 3),
+        RunBudget(100, 100, 4, 1_000, 100_000, 100_000, Decimal("100"), 10_000_000, 20),
         started_at=NOW,
         used=BudgetDelta(),
         reserved=BudgetDelta(

@@ -204,7 +204,7 @@ async def test_fragment_token_is_one_time_and_cookie_is_strict_httponly() -> Non
 @pytest.mark.asyncio
 async def test_web_launch_command_uses_bound_gateway_identity_and_fragment_token() -> None:
     gateway = _gateway()
-    handler = web_launch_handlers(gateway=gateway)["web/launch"]
+    handler = web_launch_handlers(gateway_provider=lambda: gateway)["web/launch"]
     result = await handler(
         WebLaunchParams(),
         ManualCancellationToken(),
@@ -221,6 +221,18 @@ async def test_web_launch_command_uses_bound_gateway_identity_and_fragment_token
             WebLaunchParams(),
             ManualCancellationToken(),
             ApplicationCommandContext(transport="loopback-http"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_web_launch_command_fails_closed_when_loopback_web_is_disabled() -> None:
+    handler = web_launch_handlers(gateway_provider=lambda: None)["web/launch"]
+
+    with pytest.raises(PermissionError, match="loopback_web_enabled"):
+        await handler(
+            WebLaunchParams(),
+            ManualCancellationToken(),
+            ApplicationCommandContext(transport="windows-named-pipe", client_id="plugin_1"),
         )
 
 

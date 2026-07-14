@@ -278,10 +278,23 @@ class SkillToolExecutor:
         return _success(call, data, (instruction.source_ref,), f"已按需读取 Skill {descriptor.name!r}")
 
 
-def _effects(workspace_id: str, refs: tuple[str, ...]) -> tuple[SideEffect, ...]:
-    return tuple(
-        SideEffect(SideEffectKind.READ, SideEffectState.OBSERVED, ref, None, None, {"workspaceId": workspace_id})
-        for ref in refs
+def _effects(call: ToolCall, refs: tuple[str, ...]) -> tuple[SideEffect, ...]:
+    """Record one catalog access, never one pseudo-effect per discovered file."""
+
+    return (
+        SideEffect(
+            SideEffectKind.READ,
+            SideEffectState.OBSERVED,
+            f"workspace:{call.workspace_id}:skills",
+            None,
+            None,
+            {
+                "toolCallId": call.tool_call_id,
+                "toolName": call.name,
+                "argsHash": call.args_hash,
+                "sourceCount": len(refs),
+            },
+        ),
     )
 
 
@@ -293,7 +306,7 @@ def _success(call: ToolCall, data: Mapping[str, Any], refs: tuple[str, ...], sum
         user_visible_summary=summary,
         artifact_ids=(),
         source_refs=refs,
-        side_effects=_effects(call.workspace_id, refs),
+        side_effects=_effects(call, refs),
         retryable=False,
         before_state=None,
         after_state=None,

@@ -56,10 +56,6 @@ def _validate_budget(budget: RunBudget) -> None:
             raise TypeError(f"budget.{name} must be an integer")
         if value < 1:
             raise ValueError(f"budget.{name} must be positive")
-    if type(budget.max_subagent_depth) is not int:
-        raise TypeError("budget.max_subagent_depth must be an integer")
-    if budget.max_subagent_depth < 0:
-        raise ValueError("budget.max_subagent_depth cannot be negative")
     if isinstance(budget.max_wall_seconds, bool) or not isinstance(budget.max_wall_seconds, (int, float)):
         raise TypeError("budget.max_wall_seconds must be a number")
     if not math.isfinite(float(budget.max_wall_seconds)) or budget.max_wall_seconds <= 0:

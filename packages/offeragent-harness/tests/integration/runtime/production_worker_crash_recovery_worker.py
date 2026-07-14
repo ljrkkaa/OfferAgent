@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 from collections.abc import AsyncIterator
@@ -24,8 +23,6 @@ from offeragent_harness.permissions import ApprovalRequest
 from offeragent_harness.ports import ApplicationCommandContext, CancellationToken
 from offeragent_harness.ports.worker_runtime import WorkerApplication, WorkerBootstrap, WorkerCompositionRoot
 from offeragent_harness.protocol._base import WireModel
-from offeragent_harness.runtime import loopback_gateway as loopback_gateway_module
-from offeragent_harness.runtime.loopback_gateway import LoopbackAsset
 from offeragent_harness.runtime.production_worker_composition import (
     ProductionWorkerApplication,
     ProductionWorkerCompositionRoot,
@@ -42,19 +39,6 @@ NO_CRASH_EXIT = 74
 WORKSPACE_INSTANCE_ID = "wsi_5814036c-4192-49ea-9e75-b458bd7a53aa"
 BEFORE_CONTENT = b"BEFORE_PAYLOAD\n"
 AFTER_CONTENT = b"BEFORE_PAYLOAD\nAFTER_PAYLOAD\n"
-
-
-def _development_web_assets() -> tuple[LoopbackAsset, ...]:
-    web = Path(__file__).resolve().parents[3] / "web"
-    values: list[LoopbackAsset] = []
-    for route, path, media_type in (
-        ("/", web / "index.html", "text/html; charset=utf-8"),
-        ("/assets/app.js", web / "assets" / "app.js", "text/javascript; charset=utf-8"),
-        ("/assets/app.css", web / "assets" / "app.css", "text/css; charset=utf-8"),
-    ):
-        body = path.read_bytes()
-        values.append(LoopbackAsset(route, media_type, body, f"sha256:{hashlib.sha256(body).hexdigest()}"))
-    return tuple(values)
 
 
 class _CrashRecoveryModel:
@@ -162,7 +146,6 @@ class _ObservedCompositionRoot(WorkerCompositionRoot):
 
 
 def _composition(root: Path, barrier: _CrashAndRecoveryBarrier, model: _CrashRecoveryModel) -> WorkerEntrypoint:
-    loopback_gateway_module.load_packaged_web_assets = _development_web_assets
     vault = root / "vault"
     runtime_config = HarnessConfig.model_validate(
         {

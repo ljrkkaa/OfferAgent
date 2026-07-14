@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import os
 import stat
@@ -179,11 +180,7 @@ class SkillCatalog:
                             )
                         discovered.append(descriptor)
                 except SkillError as error:
-                    if (
-                        error.code is SkillErrorCode.INVALID_ROOT
-                        and root.layer in {SkillLayer.USER, SkillLayer.WORKSPACE}
-                        and _optional_root_is_absent(root.path)
-                    ):
+                    if error.code is SkillErrorCode.INVALID_ROOT and _optional_root_is_absent(root.path):
                         continue
                     diagnostics.append(
                         SkillDiagnostic(SkillDiagnosticSeverity.ERROR, error.code, str(error), root.root_id, error.path)
@@ -507,13 +504,19 @@ def _optional_root_is_absent(path: Path) -> bool:
         current /= part
         try:
             info = os.stat(current, follow_symlinks=False)
-        except FileNotFoundError:
-            return True
-        except OSError:
+        except OSError as error:
+            if _is_missing_path_error(error):
+                return True
             return False
         if stat.S_ISLNK(info.st_mode) or int(getattr(info, "st_file_attributes", 0)) & 0x0400:
             return False
     return False
+
+
+def _is_missing_path_error(error: OSError) -> bool:
+    """Classify only the OS' canonical missing-file and missing-path errors."""
+
+    return error.errno == errno.ENOENT or getattr(error, "winerror", None) in {2, 3}
 
 
 __all__ = ["SkillCatalog", "SkillCatalogStatus"]

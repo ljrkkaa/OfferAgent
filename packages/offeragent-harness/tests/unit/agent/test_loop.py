@@ -298,7 +298,6 @@ def run_budget(*, rounds: int = 8) -> BudgetLedger:
             max_cost=Decimal("1"),
             max_artifact_bytes=1_000,
             max_subagents=2,
-            max_subagent_depth=1,
         ),
         started_at=datetime.now(timezone.utc),
     )
@@ -869,7 +868,7 @@ async def test_recovered_batch_continues_inside_the_canonical_loop_with_original
     second = write_call(tool_call_id="call-second", idempotency_key="idem-second")
     second_result = successful_execution(second).result
     started_at = datetime.now(timezone.utc)
-    budget_definition = RunBudget(8, 10, 4, 60, 100, 100, Decimal("1"), 1_000, 2, 1)
+    budget_definition = RunBudget(8, 10, 4, 60, 100, 100, Decimal("1"), 1_000, 2)
     budget = BudgetLedger.restore(
         budget_definition,
         started_at=started_at,

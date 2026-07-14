@@ -444,7 +444,9 @@ async def production_vault_application(
         overrides=ProductionWorkerOverrides(
             model_gateway_factory=lambda _settings: model,
             start_native_transports=True,
-            runtime_config=HarnessConfig.model_validate({"policy": {"workspace_trusted": True, "read_only": False}}),
+            runtime_config=HarnessConfig.model_validate(
+                {"policy": {"workspace_trusted": True, "read_only": False}, "ui": {"loopback_web_enabled": True}}
+            ),
         ),
     )
     entrypoint = WorkerEntrypoint(root)

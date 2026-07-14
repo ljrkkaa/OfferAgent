@@ -74,6 +74,7 @@ class TurnManager:
         self._slots = asyncio.Semaphore(max_active_runs)
         self._accepting = True
         self._observer = observer
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._notify_active_runs()
 
     async def start(
@@ -110,8 +111,27 @@ class TurnManager:
             self._active_by_session[session_id] = active
             self._active_by_run[run_id] = active
             self._notify_active_runs()
-            task.add_done_callback(lambda _: asyncio.create_task(self._remove(run_id)))
+            task.add_done_callback(lambda completed: self._on_task_finished(run_id, completed))
             return active
+
+    def _on_task_finished(self, run_id: str, task: asyncio.Task[Any]) -> None:
+        """Observe the Run outcome before relinquishing the manager's task reference.
+
+        A Run failure is represented durably by the session lifecycle.  The
+        scheduler must still retrieve the task exception so asyncio does not
+        report it later as an unhandled background failure.
+        """
+
+        if not task.cancelled():
+            task.exception()
+        cleanup = asyncio.create_task(self._remove(run_id), name=f"offeragent-run-cleanup:{run_id}")
+        self._cleanup_tasks.add(cleanup)
+        cleanup.add_done_callback(self._consume_cleanup_task)
+
+    def _consume_cleanup_task(self, task: asyncio.Task[None]) -> None:
+        self._cleanup_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
 
     async def _remove(self, run_id: str) -> None:
         async with self._lock:
@@ -184,6 +204,9 @@ class TurnManager:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+        cleanup = tuple(self._cleanup_tasks)
+        if cleanup:
+            await asyncio.gather(*cleanup, return_exceptions=True)
 
     async def active_runs(self) -> tuple[ActiveRun, ...]:
         async with self._lock:

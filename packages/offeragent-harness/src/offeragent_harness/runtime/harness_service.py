@@ -2550,7 +2550,6 @@ def _subagent_run_budget(
         max_cost=Decimal(value.cost_micros) / Decimal(1_000_000),
         max_artifact_bytes=value.artifact_bytes,
         max_subagents=max(1, value.child_count),
-        max_subagent_depth=max(0, 3 - execution.record.depth),
     )
 
 

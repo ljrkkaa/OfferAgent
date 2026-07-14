@@ -43,7 +43,6 @@ class CompositeParentRunAuthorityProvider:
             for definition in root.tool_definitions
             if definition.name in allowed and definition.version in allowed[definition.name]
         )
-        profile = self._catalog.resolve(record.agent_name).definition
         return ParentRunAuthority(
             workspace_id=record.workspace_id,
             session_id=record.session_id,
@@ -57,13 +56,9 @@ class CompositeParentRunAuthorityProvider:
             deadline_at=min(record.deadline_at, root.deadline_at),
             context=context.content,
             run_config=run.config_snapshot,
-            can_spawn_children=(
-                profile.can_spawn_children
-                and root.active
-                and record.depth < profile.max_depth
-                and record.budget_used.child_count < record.budget_limit.child_count
-                and "agent.spawn" in record.tool_scope.allowed_versions
-            ),
+            # Child Runs are isolated workers, never coordinators.  Recursive
+            # delegation therefore has no configuration or recovery path.
+            can_spawn_children=False,
             active=root.active
             and record.status
             in {

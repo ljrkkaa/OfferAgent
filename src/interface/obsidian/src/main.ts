@@ -288,7 +288,6 @@ export default class OfferAgentPlugin extends Plugin {
                 shell_enabled: settings.shellEnabled,
                 subagents_enabled: settings.subagentsEnabled,
                 max_subagents_per_vault: settings.subagentsEnabled ? 8 : 0,
-                max_subagent_depth: settings.subagentsEnabled ? 3 : 0,
             },
             extensibility: {
                 skills_enabled: settings.enabledSkills.length > 0,

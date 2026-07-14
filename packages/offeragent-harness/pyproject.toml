@@ -87,5 +87,5 @@ packages = ["offeragent_harness"]
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["jsonschema.*"]
+module = ["jsonschema", "jsonschema.*"]
 ignore_missing_imports = true

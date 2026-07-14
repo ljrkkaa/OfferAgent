@@ -144,7 +144,6 @@ def _budget(*, rounds: int = 4) -> BudgetLedger:
             max_cost=Decimal("10"),
             max_artifact_bytes=100_000,
             max_subagents=2,
-            max_subagent_depth=1,
         ),
         started_at=NOW,
     )
@@ -313,6 +312,28 @@ def test_catalog_is_canonical_immutable_and_excludes_harness_security_fields() -
     assert all(str(value["$id"]).startswith("urn:offeragent:tool-input:") for value in embedded.values())
     with pytest.raises(TypeError):
         left.schema["unsafe"] = "mutation"  # type: ignore[index]
+
+
+def test_skill_body_load_is_a_planning_barrier() -> None:
+    catalog = ToolPlanCatalog((_definition("skill.read"), _definition("glob")), max_calls=3)
+    skill_read = {
+        "name": "skill.read",
+        "version": "1",
+        "arguments": {"path": "daily-study-workflow"},
+        "reason": "load the selected Skill body before following it",
+    }
+    glob = {
+        "name": "glob",
+        "version": "1",
+        "arguments": {"path": "daily/*.md"},
+        "reason": "locate the daily notes after loading the workflow",
+    }
+
+    assert catalog.violations({"requiresWriteOutcome": False, "calls": [skill_read], "stopReason": None}) == ()
+    assert catalog.violations({"requiresWriteOutcome": False, "calls": [skill_read, glob], "stopReason": None}) == (
+        "$.calls: a planning step that reads Skill instructions may contain only skill.read calls; "
+        "plan other tools after the Skill body is available",
+    )
 
 
 @pytest.mark.asyncio

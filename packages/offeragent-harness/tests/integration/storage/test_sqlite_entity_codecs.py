@@ -408,7 +408,6 @@ class _Components:
                 max_cost=Decimal("1"),
                 max_artifact_bytes=10_000,
                 max_subagents=2,
-                max_subagent_depth=1,
             ),
         )
 

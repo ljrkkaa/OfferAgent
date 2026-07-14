@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, cast
@@ -89,6 +89,7 @@ class ApplicationRuntimeIdentity:
     runtime_arch: RuntimeArch
     capabilities: CapabilitySet
     build_commit: str
+    capabilities_provider: Callable[[], CapabilitySet] | None = None
 
     def __post_init__(self) -> None:
         # Reuse the wire model as the strict identity invariant checker.
@@ -217,6 +218,9 @@ def compose_application_command_handlers(
         params = cast(InitializeParams, raw)
         if params.workspace_id != identity.workspace_id:
             raise ValueError("initialize Workspace does not match this Worker")
+        server_capabilities = (
+            identity.capabilities_provider() if identity.capabilities_provider is not None else identity.capabilities
+        )
         negotiated = negotiate_protocol(
             client_preferred=params.protocol_version,
             client_range=params.supported_protocol_range,
@@ -225,7 +229,7 @@ def compose_application_command_handlers(
             client_schema_hash=params.schema_hash,
             server_preferred=identity.protocol_version,
             server_range=identity.supported_protocol_range,
-            server_capabilities=identity.capabilities,
+            server_capabilities=server_capabilities,
             server_schema_hash=identity.schema_hash,
         )
         return InitializeResult(
@@ -376,8 +380,11 @@ def conversation_control_handlers(
     return {"session/compact": compact, "turn/retry": retry, "turn/steer": steer}
 
 
-def web_launch_handlers(*, gateway: LoopbackWebGateway) -> Mapping[str, ApplicationCommandHandler]:
-    """Issue one fragment-only launch grant from the already-bound Gateway."""
+def web_launch_handlers(
+    *,
+    gateway_provider: Callable[[], LoopbackWebGateway | None],
+) -> Mapping[str, ApplicationCommandHandler]:
+    """Issue one fragment-only launch grant only while Loopback Web is active."""
 
     async def launch(
         raw: WireModel,
@@ -389,6 +396,9 @@ def web_launch_handlers(*, gateway: LoopbackWebGateway) -> Mapping[str, Applicat
         if context.transport != "windows-named-pipe":
             raise PermissionError("web/launch is available only to the authenticated plugin Pipe")
         cancellation.checkpoint()
+        gateway = gateway_provider()
+        if gateway is None:
+            raise PermissionError("web/launch requires ui.loopback_web_enabled for this Worker")
         value = gateway.issue_launch()
         return WebLaunchResult(
             url=value.url,

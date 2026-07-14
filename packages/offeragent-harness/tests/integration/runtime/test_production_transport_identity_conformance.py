@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import pytest
 
+from offeragent_harness.config import HarnessConfig
 from offeragent_harness.foundation import canonical_json_sha256
 from offeragent_harness.models import (
     ModelEvent,
@@ -336,6 +337,7 @@ async def native_production_application(
         overrides=ProductionWorkerOverrides(
             model_gateway_factory=lambda _settings: fake_model,
             start_native_transports=True,
+            runtime_config=HarnessConfig.model_validate({"ui": {"loopback_web_enabled": True}}),
         ),
     )
     entrypoint = WorkerEntrypoint(root)

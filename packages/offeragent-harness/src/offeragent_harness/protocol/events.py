@@ -11,6 +11,8 @@ from typing import Any, Literal, Protocol
 from pydantic import Field, JsonValue, ValidationError, model_validator
 from typing_extensions import TypeAliasType
 
+from offeragent_harness.foundation import MAX_ARTIFACT_REFERENCES, MAX_AUDIT_EFFECTS, MAX_SOURCE_REFERENCES
+
 from ._base import JsonObject, WireModel, validate_wire
 from .capabilities import CapabilityName
 from .common import (
@@ -177,9 +179,9 @@ class PersistedSideEffectFact(WireModel):
 
 class ToolCompletedPayload(WireModel):
     result: ToolResultDescriptor
-    artifact_ids: list[ArtifactId] = Field(default_factory=list, max_length=256)
-    source_reference_ids: list[str] = Field(default_factory=list, max_length=512)
-    side_effect_facts: list[PersistedSideEffectFact] = Field(default_factory=list, max_length=256)
+    artifact_ids: list[ArtifactId] = Field(default_factory=list, max_length=MAX_ARTIFACT_REFERENCES)
+    source_reference_ids: list[str] = Field(default_factory=list, max_length=MAX_SOURCE_REFERENCES)
+    side_effect_facts: list[PersistedSideEffectFact] = Field(default_factory=list, max_length=MAX_AUDIT_EFFECTS)
 
     @model_validator(mode="after")
     def _completed_status_is_not_a_failure(self) -> ToolCompletedPayload:
@@ -194,9 +196,9 @@ class ToolCompletedPayload(WireModel):
 
 class ToolFailedPayload(WireModel):
     result: ToolResultDescriptor
-    artifact_ids: list[ArtifactId] = Field(default_factory=list, max_length=256)
-    source_reference_ids: list[str] = Field(default_factory=list, max_length=512)
-    side_effect_facts: list[PersistedSideEffectFact] = Field(default_factory=list, max_length=256)
+    artifact_ids: list[ArtifactId] = Field(default_factory=list, max_length=MAX_ARTIFACT_REFERENCES)
+    source_reference_ids: list[str] = Field(default_factory=list, max_length=MAX_SOURCE_REFERENCES)
+    side_effect_facts: list[PersistedSideEffectFact] = Field(default_factory=list, max_length=MAX_AUDIT_EFFECTS)
 
     @model_validator(mode="after")
     def _failed_status_is_a_failure(self) -> ToolFailedPayload:

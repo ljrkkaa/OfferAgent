@@ -28,7 +28,7 @@ NO_BARRIER_EXIT = 74
 
 def _budget() -> BudgetLedger:
     return BudgetLedger(
-        RunBudget(8, 8, 2, 60, 10_000, 10_000, Decimal("1"), 20 * 1024 * 1024, 2, 1),
+        RunBudget(8, 8, 2, 60, 10_000, 10_000, Decimal("1"), 20 * 1024 * 1024, 2),
         started_at=NOW,
     )
 

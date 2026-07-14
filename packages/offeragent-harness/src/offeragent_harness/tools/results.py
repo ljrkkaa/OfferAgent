@@ -7,7 +7,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from offeragent_harness.foundation import MAX_AUDIT_EFFECTS, MAX_SOURCE_REFERENCES
 from offeragent_harness.models.json_types import FrozenJsonObject, JsonValue, freeze_json
+
+MAX_TOOL_RESULT_SOURCE_REFERENCES = MAX_SOURCE_REFERENCES
 
 
 class ToolResultStatus(str, Enum):
@@ -107,8 +110,12 @@ class ToolResult:
             object.__setattr__(self, "before_state", freeze_json(self.before_state))
         if self.after_state is not None:
             object.__setattr__(self, "after_state", freeze_json(self.after_state))
-        if len(self.source_references) > 512:
-            raise ValueError("tool result cannot expose more than 512 source references")
+        if len(self.source_references) > MAX_TOOL_RESULT_SOURCE_REFERENCES:
+            raise ValueError(
+                f"tool result cannot expose more than {MAX_TOOL_RESULT_SOURCE_REFERENCES} source references"
+            )
+        if len(self.side_effects) > MAX_AUDIT_EFFECTS:
+            raise ValueError(f"tool result cannot expose more than {MAX_AUDIT_EFFECTS} audit effects")
         source_references: list[FrozenJsonObject] = []
         for reference in self.source_references:
             frozen = freeze_json(reference)
@@ -129,6 +136,7 @@ class ToolResult:
 
 
 __all__ = [
+    "MAX_TOOL_RESULT_SOURCE_REFERENCES",
     "SideEffect",
     "SideEffectKind",
     "SideEffectState",

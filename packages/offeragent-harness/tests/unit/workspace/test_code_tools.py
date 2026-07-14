@@ -13,6 +13,7 @@ from offeragent_harness.sessions import AgentLineage
 from offeragent_harness.shell import PowerShellToolExecutor, powershell_tool_definitions
 from offeragent_harness.testing import ManualCancellationToken
 from offeragent_harness.tools import ToolCall, ToolDefinition, ToolResult, ToolResultStatus, canonical_json_sha256
+from offeragent_harness.tools.results import MAX_TOOL_RESULT_SOURCE_REFERENCES
 from offeragent_harness.workspace import (
     CodeToolExecutor,
     VaultFileSystem,
@@ -87,6 +88,8 @@ async def test_glob_grep_and_read_use_a_verified_workspace_and_ripgrep(tmp_path:
     assert glob_data["path"] == ""
     assert glob_data["files"] == ("src/main.py",)
     assert glob_data["truncated"] is False
+    assert len(glob.side_effects) == 1
+    assert glob.side_effects[0].metadata["sourceCount"] == 1
     assert grep.status is ToolResultStatus.SUCCEEDED
     grep_data = _data(grep)
     matches = cast(list[dict[str, Any]], grep_data["matches"])
@@ -94,6 +97,34 @@ async def test_glob_grep_and_read_use_a_verified_workspace_and_ripgrep(tmp_path:
     assert read.status is ToolResultStatus.SUCCEEDED
     read_data = _data(read)
     assert read_data["lines"] == ({"number": 2, "text": "    return 'needle'", "truncated": False},)
+
+
+def test_root_search_contract_is_declared_in_tool_schema() -> None:
+    definitions = {item.name: item for item in code_tool_definitions()}
+    for name in ("glob", "grep"):
+        assert "omit the optional path argument" in definitions[name].description
+        assert "'.' and '..' are not valid workspace paths" in definitions[name].description
+
+
+@pytest.mark.asyncio
+async def test_search_tools_truncate_before_exceeding_tool_result_provenance_limit(tmp_path: Path) -> None:
+    for index in range(MAX_TOOL_RESULT_SOURCE_REFERENCES + 1):
+        (tmp_path / f"note-{index:03}.md").write_text("needle\n", encoding="utf-8")
+    executor = CodeToolExecutor(workspace_id="ws_test", source=_source(tmp_path), workspace_root=tmp_path)
+    cancellation = ManualCancellationToken()
+
+    glob = await executor.execute(_call("glob", {"pattern": "*.md"}, definitions=code_tool_definitions()), cancellation)
+    grep = await executor.execute(
+        _call("grep", {"pattern": "needle", "glob": "*.md"}, definitions=code_tool_definitions()), cancellation
+    )
+
+    assert glob.status is ToolResultStatus.SUCCEEDED
+    assert grep.status is ToolResultStatus.SUCCEEDED
+    assert _data(glob)["truncated"] is True
+    assert _data(grep)["truncated"] is True
+    assert len(glob.source_references) == MAX_TOOL_RESULT_SOURCE_REFERENCES
+    assert 0 < len(grep.source_references) <= MAX_TOOL_RESULT_SOURCE_REFERENCES
+    assert len(glob.side_effects) == len(grep.side_effects) == 1
 
 
 @pytest.mark.asyncio

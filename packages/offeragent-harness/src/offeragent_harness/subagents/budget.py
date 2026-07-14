@@ -44,14 +44,10 @@ class SubagentBudgetTree:
         ledger: BudgetLedger | Callable[[str], BudgetLedger],
         *,
         retained_final_budget: AgentBudget,
-        hard_max_depth: int = 3,
     ) -> None:
-        if not 1 <= hard_max_depth <= 3:
-            raise ValueError("hard Subagent depth must be 1..3")
         self._ledger = ledger if isinstance(ledger, BudgetLedger) else None
         self._ledger_for_root = ledger if callable(ledger) else None
         self._retained = retained_final_budget
-        self._hard_depth = hard_max_depth
 
     async def reserve(
         self,
@@ -61,8 +57,8 @@ class SubagentBudgetTree:
         child_depth: int,
         root_run_id: str | None = None,
     ) -> ChildBudgetReservation:
-        if child_depth > self._hard_depth:
-            raise SubagentBudgetError("depth_limit", "Subagent hard depth limit exceeded")
+        if child_depth != 1:
+            raise SubagentBudgetError("depth_limit", "only root Runs may create direct child Runs")
         if not requested.fits_within(parent_remaining):
             raise SubagentBudgetError("parent_budget", "requested child budget exceeds parent remaining budget")
         if not _retains(parent_remaining, requested, self._retained):

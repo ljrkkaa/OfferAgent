@@ -5982,6 +5982,7 @@
     },
     "ReasoningEffort": {
       "enum": [
+        "none",
         "minimal",
         "low",
         "medium",

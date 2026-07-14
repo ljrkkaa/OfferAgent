@@ -129,7 +129,6 @@ class SubagentService:
         event_factory: SubagentEventFactory,
         lifecycle_bindings: SubagentLifecycleBindingProvider | None = None,
         max_per_turn: int = 8,
-        hard_max_depth: int = 3,
         lease_seconds: int = 30,
     ) -> None:
         if (
@@ -137,7 +136,6 @@ class SubagentService:
             or not worker_id
             or catalog.workspace_id != workspace_id
             or not 1 <= max_per_turn <= 128
-            or not 1 <= hard_max_depth <= 3
             or not 5 <= lease_seconds <= 300
         ):
             raise ValueError("SubagentService identity/limits are invalid")
@@ -159,7 +157,6 @@ class SubagentService:
         self._event_factory = event_factory
         self._lifecycle_bindings = lifecycle_bindings
         self._max_per_turn = max_per_turn
-        self._hard_depth = hard_max_depth
         self._lease_seconds = lease_seconds
         self._lock = asyncio.Lock()
         self._reservations: dict[str, ChildBudgetReservation] = {}
@@ -185,8 +182,8 @@ class SubagentService:
             descriptor = self._catalog.resolve(command.profile)
             definition = descriptor.definition
             depth = authority.lineage.depth + 1
-            if depth > min(self._hard_depth, definition.max_depth):
-                raise SubagentServiceError("subagent_depth_limit", "Subagent depth limit exceeded")
+            if depth != 1:
+                raise SubagentServiceError("subagent_depth_limit", "only root Runs may create direct child Runs")
             if not authority.can_spawn_children:
                 raise SubagentServiceError("subagent_spawn_denied", "parent Agent Definition forbids child Runs")
             if (

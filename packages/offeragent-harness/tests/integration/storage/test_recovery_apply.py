@@ -330,7 +330,7 @@ def _bundle(suffix: str, calls: tuple[ToolCall, ...]) -> _RunBundle:
         model_rounds=1,
         assistant_text="已保存的部分回答",
         budget_checkpoint=BudgetCheckpoint(
-            budget=RunBudget(8, 20, 4, 300, 20_000, 8_000, Decimal("10"), 1_000_000, 4, 2),
+            budget=RunBudget(8, 20, 4, 300, 20_000, 8_000, Decimal("10"), 1_000_000, 4),
             started_at=NOW,
             used=BudgetDelta(model_rounds=1, tool_calls=len(calls)),
             reserved=BudgetDelta(model_rounds=1),

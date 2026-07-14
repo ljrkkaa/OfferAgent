@@ -19,6 +19,7 @@ from offeragent_harness.models import thaw_json
 from offeragent_harness.permissions import RiskClass
 from offeragent_harness.ports import CancellationToken, OperationCancelled, VaultEntry, VaultEntryKind, VaultRead
 from offeragent_harness.tools import (
+    MAX_TOOL_RESULT_SOURCE_REFERENCES,
     ApprovalEvidence,
     ExecutorLocation,
     PreflightMode,
@@ -49,10 +50,10 @@ class CodeToolError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class CodeToolLimits:
     max_file_bytes: int = 16 * 1024 * 1024
-    max_glob_results: int = 10_000
+    max_glob_results: int = MAX_TOOL_RESULT_SOURCE_REFERENCES
     max_glob_scan_files: int = 100_000
     max_glob_depth: int = 64
-    max_grep_results: int = 2_000
+    max_grep_results: int = MAX_TOOL_RESULT_SOURCE_REFERENCES
     max_line_chars: int = 16_384
     max_result_bytes: int = 240 * 1024
     grep_timeout_seconds: float = 30.0
@@ -116,12 +117,15 @@ _DEFINITIONS: tuple[ToolDefinition, ...] = (
     ToolDefinition(
         name="glob",
         version=CODE_TOOL_VERSION,
-        description="Find workspace files with an explicit POSIX glob pattern.",
+        description=(
+            "Find workspace files with an explicit POSIX glob pattern. "
+            "To search the Vault root, omit the optional path argument; '.' and '..' are not valid workspace paths."
+        ),
         input_schema=_schema(
             {
                 "pattern": {"type": "string", "minLength": 1, "maxLength": 1024},
                 "path": _OPTIONAL_PATH,
-                "maxResults": {"type": "integer", "minimum": 1, "maximum": 10_000},
+                "maxResults": {"type": "integer", "minimum": 1, "maximum": MAX_TOOL_RESULT_SOURCE_REFERENCES},
             },
             ["pattern"],
         ),
@@ -129,7 +133,7 @@ _DEFINITIONS: tuple[ToolDefinition, ...] = (
             {
                 "pattern": {"type": "string", "minLength": 1, "maxLength": 1024},
                 "path": _OPTIONAL_PATH,
-                "files": {"type": "array", "items": _PATH, "maxItems": 10_000},
+                "files": {"type": "array", "items": _PATH, "maxItems": MAX_TOOL_RESULT_SOURCE_REFERENCES},
                 "truncated": {"type": "boolean"},
             },
             ["pattern", "path", "files", "truncated"],
@@ -151,14 +155,17 @@ _DEFINITIONS: tuple[ToolDefinition, ...] = (
     ToolDefinition(
         name="grep",
         version=CODE_TOOL_VERSION,
-        description="Search workspace text with ripgrep regular-expression semantics.",
+        description=(
+            "Search workspace text with ripgrep regular-expression semantics. "
+            "To search the Vault root, omit the optional path argument; '.' and '..' are not valid workspace paths."
+        ),
         input_schema=_schema(
             {
                 "pattern": {"type": "string", "minLength": 1, "maxLength": 4096},
                 "path": _OPTIONAL_PATH,
                 "glob": {"type": "string", "minLength": 1, "maxLength": 1024},
                 "caseInsensitive": {"type": "boolean"},
-                "maxResults": {"type": "integer", "minimum": 1, "maximum": 2_000},
+                "maxResults": {"type": "integer", "minimum": 1, "maximum": MAX_TOOL_RESULT_SOURCE_REFERENCES},
             },
             ["pattern"],
         ),
@@ -167,7 +174,7 @@ _DEFINITIONS: tuple[ToolDefinition, ...] = (
                 "pattern": {"type": "string", "minLength": 1, "maxLength": 4096},
                 "matches": {
                     "type": "array",
-                    "maxItems": 2_000,
+                    "maxItems": MAX_TOOL_RESULT_SOURCE_REFERENCES,
                     "items": _schema(
                         {
                             "path": _PATH,
@@ -304,16 +311,23 @@ class CodeToolExecutor:
             return self._failure(tool_call, f"workspace_{error.code.value}", str(error))
         except CodeToolError as error:
             return self._failure(tool_call, error.code, str(error))
-        effects = tuple(
+        # A search result is provenance, not an independent state change.  One
+        # auditable observation records the file-access operation while the
+        # result keeps its bounded per-file source references.
+        effects = (
             SideEffect(
                 SideEffectKind.READ,
                 SideEffectState.OBSERVED,
-                source_ref,
+                f"workspace:{self._workspace_id}",
                 None,
                 None,
-                {"workspaceId": self._workspace_id},
-            )
-            for source_ref in source_refs
+                {
+                    "toolCallId": tool_call.tool_call_id,
+                    "toolName": tool_call.name,
+                    "argsHash": tool_call.args_hash,
+                    "sourceCount": len(source_refs),
+                },
+            ),
         )
         return ToolResult(
             tool_call_id=tool_call.tool_call_id,

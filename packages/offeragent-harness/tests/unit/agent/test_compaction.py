@@ -98,7 +98,6 @@ def _budget(*, artifact_bytes: int = 1_000_000, rounds: int = 4) -> BudgetLedger
             max_cost=Decimal("100"),
             max_artifact_bytes=artifact_bytes,
             max_subagents=2,
-            max_subagent_depth=1,
         ),
         started_at=NOW,
     )

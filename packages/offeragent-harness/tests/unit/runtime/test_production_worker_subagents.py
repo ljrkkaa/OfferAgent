@@ -340,7 +340,6 @@ def test_child_components_use_durable_budget_scope_and_exact_root_tool_snapshot(
     assert budget.max_wall_seconds == 30.0
     assert budget.max_artifact_bytes == 8_192
     assert budget.max_subagents == 1
-    assert budget.max_subagent_depth == 2
 
 
 def test_worker_factory_injects_one_gate_and_lock_pool_across_sessions_and_root_child_kernels(

@@ -40,6 +40,7 @@ from offeragent_harness.subagents import (
     builtin_agent_definitions,
     subagent_tool_definitions,
 )
+from offeragent_harness.subagents.budget import SubagentBudgetError
 from offeragent_harness.subagents.catalog import AgentDefinitionTrust
 from offeragent_harness.subagents.mailbox import MailboxConflict
 from offeragent_harness.subagents.models import AgentUsage
@@ -263,7 +264,7 @@ def test_scope_is_exact_to_tool_version_and_argument_constraint() -> None:
 @pytest.mark.asyncio
 async def test_budget_tree_atomically_retains_parent_final_compose_budget() -> None:
     ledger = BudgetLedger(
-        RunBudget(20, 40, 4, 300, 20_000, 10_000, Decimal("10"), 1_000_000, 8, 3),
+        RunBudget(20, 40, 4, 300, 20_000, 10_000, Decimal("10"), 1_000_000, 8),
         started_at=NOW,
     )
     retained = _budget(
@@ -303,8 +304,32 @@ async def test_budget_tree_atomically_retains_parent_final_compose_budget() -> N
 
 
 @pytest.mark.asyncio
+async def test_budget_tree_rejects_recursive_subagent_reservations() -> None:
+    ledger = BudgetLedger(
+        RunBudget(20, 40, 4, 300, 20_000, 10_000, Decimal("10"), 1_000_000, 8),
+        started_at=NOW,
+    )
+    tree = SubagentBudgetTree(
+        ledger,
+        retained_final_budget=_budget(
+            input_tokens=1_000,
+            output_tokens=1_000,
+            model_calls=1,
+            tool_calls=0,
+            wall_time_seconds=10,
+            artifact_bytes=1_024,
+            child_count=0,
+            cost_micros=0,
+        ),
+    )
+
+    with pytest.raises(SubagentBudgetError, match="only root Runs"):
+        await tree.reserve(_budget(), parent_remaining=_budget(), child_depth=2)
+
+
+@pytest.mark.asyncio
 async def test_budget_tree_routes_and_adopts_persisted_reservations_on_the_authoritative_root_ledger() -> None:
-    budget = RunBudget(20, 40, 4, 300, 20_000, 10_000, Decimal("10"), 1_000_000, 8, 3)
+    budget = RunBudget(20, 40, 4, 300, 20_000, 10_000, Decimal("10"), 1_000_000, 8)
     root_a = BudgetLedger(budget, started_at=NOW)
     root_b = BudgetLedger(budget, started_at=NOW)
     retained = _budget(
