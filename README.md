@@ -73,7 +73,23 @@ The production plugin package is emitted to `packages/plugin/dist/` and contains
 - `styles.css`
 - `runtime.js`
 
-For a local manual smoke test, copy those files to `.obsidian/plugins/offeragent/` inside a test Vault, enable OfferAgent in Obsidian, and use the ribbon icon or the `Open OfferAgent sidebar` command.
+## Target Vault deployment
+
+Preview the control-file migration without changing the Vault:
+
+```powershell
+npm.cmd run deploy:target-vault -- --vault "E:\obsidian项目\面试胜利！"
+```
+
+The preview reports the Agent Contract and Vault-local Skill that require explicit confirmation. Apply that whole control-file batch and atomically install or upgrade the packaged plugin with:
+
+```powershell
+npm.cmd run deploy:target-vault -- --vault "E:\obsidian项目\面试胜利！" --confirm-control-migration
+```
+
+Deployment installs to `.obsidian/plugins/offeragent/`. It preserves plugin-local files such as `data.json`, never removes `%LOCALAPPDATA%\OfferAgent\state.db`, and uses OfferAgent's isolated Git index plus hidden checkpoint for the confirmed `agent.md` and `.codex/skills/obsidian-cli/SKILL.md` migration. It does not switch the Vault branch, stage files, clear dirty work, or overwrite the user's Git index. Re-running the command upgrades the four production package files and leaves an already-current control migration unchanged.
+
+After installation, enable OfferAgent in Obsidian and use the ribbon icon or the `Open OfferAgent sidebar` command. Node.js 20+ is discovered from the Obsidian-launched Windows process; the Sidebar shows actionable repair guidance when no supported executable is available.
 
 ## Architecture
 

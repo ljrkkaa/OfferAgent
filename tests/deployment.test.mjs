@@ -1,0 +1,136 @@
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const deployScript = path.join(repositoryRoot, "scripts", "deploy-offeragent.mjs");
+const pluginPackage = path.join(repositoryRoot, "packages", "plugin", "dist");
+
+function command(executable, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      executable,
+      args,
+      { encoding: "utf8", windowsHide: true, ...options },
+      (error, stdout, stderr) => {
+        if (error) {
+          error.message = `${error.message}\n${stderr}`;
+          reject(error);
+        } else resolve(stdout.trim());
+      },
+    );
+  });
+}
+
+function git(root, ...args) {
+  return command("git", ["-C", root, ...args]);
+}
+
+async function deploy(vault, localAppData, confirmed = false) {
+  const output = await command(
+    process.execPath,
+    [
+      deployScript,
+      "--vault",
+      vault,
+      ...(confirmed ? ["--confirm-control-migration"] : []),
+    ],
+    { env: { ...process.env, LOCALAPPDATA: localAppData } },
+  );
+  return JSON.parse(output);
+}
+
+test("deployment preserves Runtime State, plugin data, branch, index, and unrelated dirty work", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-deploy-vault-"));
+  const localAppData = await mkdtemp(path.join(os.tmpdir(), "offeragent-deploy-state-"));
+  t.after(() => Promise.all([
+    rm(root, { recursive: true, force: true }),
+    rm(localAppData, { recursive: true, force: true }),
+  ]));
+
+  await mkdir(path.join(root, ".codex", "skills", "obsidian-cli"), { recursive: true });
+  await mkdir(path.join(root, ".obsidian", "plugins", "offeragent"), { recursive: true });
+  await mkdir(path.join(localAppData, "OfferAgent"), { recursive: true });
+  await writeFile(path.join(root, "agent.md"), "# Legacy Agent\nUse shell commands.\n", "utf8");
+  await writeFile(
+    path.join(root, ".codex", "skills", "obsidian-cli", "SKILL.md"),
+    "# Legacy CLI\nRun `obsidian read file=Note`.\n",
+    "utf8",
+  );
+  await writeFile(
+    path.join(root, ".obsidian", "plugins", "offeragent", "data.json"),
+    '{"vaultPermissionMode":"read_only","conversation":"keep-me"}',
+    "utf8",
+  );
+  await writeFile(path.join(root, "dirty.md"), "baseline\n", "utf8");
+  await writeFile(path.join(root, "staged.md"), "baseline\n", "utf8");
+  const statePath = path.join(localAppData, "OfferAgent", "state.db");
+  await writeFile(statePath, "runtime-state-must-survive", "utf8");
+
+  await git(root, "init", "-q", "-b", "migration-branch");
+  await git(root, "config", "user.name", "Deployment Test");
+  await git(root, "config", "user.email", "deployment@example.invalid");
+  await git(root, "add", ".");
+  await git(root, "commit", "-qm", "baseline");
+  await writeFile(path.join(root, "dirty.md"), "user dirty work\n", "utf8");
+  await writeFile(path.join(root, "staged.md"), "user staged work\n", "utf8");
+  await git(root, "add", "staged.md");
+
+  const beforeBranch = await git(root, "branch", "--show-current");
+  const beforeIndex = await git(root, "diff", "--cached", "--binary");
+  const beforeDirty = await readFile(path.join(root, "dirty.md"), "utf8");
+  const beforeState = await readFile(statePath, "utf8");
+
+  const plan = await deploy(root, localAppData);
+  assert.equal(plan.confirmationRequired, true);
+  assert.deepEqual(plan.controlFiles, [
+    ".codex/skills/obsidian-cli/SKILL.md",
+    "agent.md",
+  ]);
+  assert.equal(await readFile(path.join(root, "agent.md"), "utf8"), "# Legacy Agent\nUse shell commands.\n");
+
+  const result = await deploy(root, localAppData, true);
+  assert.equal(result.installed, true);
+  assert.equal(result.controlMigration.decision, "applied");
+  assert.match(result.controlMigration.checkpointRef, /^refs\/offeragent\/checkpoints\//);
+
+  const installation = path.join(root, ".obsidian", "plugins", "offeragent");
+  for (const file of ["main.js", "manifest.json", "styles.css", "runtime.js"]) {
+    assert.deepEqual(
+      await readFile(path.join(installation, file)),
+      await readFile(path.join(pluginPackage, file)),
+    );
+  }
+  assert.equal(
+    await readFile(path.join(installation, "data.json"), "utf8"),
+    '{"vaultPermissionMode":"read_only","conversation":"keep-me"}',
+  );
+  assert.equal(await readFile(statePath, "utf8"), beforeState);
+  assert.equal(await git(root, "branch", "--show-current"), beforeBranch);
+  assert.equal(await git(root, "diff", "--cached", "--binary"), beforeIndex);
+  assert.equal(await readFile(path.join(root, "dirty.md"), "utf8"), beforeDirty);
+
+  const contract = await readFile(path.join(root, "agent.md"), "utf8");
+  assert.match(contract, /vault_read/);
+  assert.match(contract, /vault_propose_changes/);
+  assert.match(contract, /Trusted Vault/);
+  assert.match(contract, /explicit Resume/i);
+  const skill = await readFile(
+    path.join(root, ".codex", "skills", "obsidian-cli", "SKILL.md"),
+    "utf8",
+  );
+  assert.match(skill, /vault_list/);
+  assert.match(skill, /skill_read/);
+  assert.doesNotMatch(skill, /\bobsidian\s+(?:read|create|append|search|plugin:|dev:|eval)/i);
+
+  await git(root, "cat-file", "-e", `${result.controlMigration.checkpointRef}^{commit}`);
+  await writeFile(path.join(installation, "data.json"), "preserve-on-upgrade", "utf8");
+  const upgrade = await deploy(root, localAppData, true);
+  assert.equal(upgrade.installed, true);
+  assert.equal(upgrade.controlMigration, "unchanged");
+  assert.equal(await readFile(path.join(installation, "data.json"), "utf8"), "preserve-on-upgrade");
+});

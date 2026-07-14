@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import Module from "node:module";
 import os from "node:os";
@@ -13,10 +13,20 @@ const repositoryRoot = path.resolve(
   "..",
 );
 const builtPlugin = path.join(repositoryRoot, "packages", "plugin", "dist");
+const deployScript = path.join(repositoryRoot, "scripts", "deploy-offeragent.mjs");
 
 function git(root, ...args) {
   return new Promise((resolve, reject) => {
     execFile("git", ["-C", root, ...args], { windowsHide: true }, (error, stdout, stderr) => {
+      if (error) reject(new Error(stderr || error.message));
+      else resolve(stdout.toString("utf8").trim());
+    });
+  });
+}
+
+function execute(file, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { windowsHide: true, ...options }, (error, stdout, stderr) => {
       if (error) reject(new Error(stderr || error.message));
       else resolve(stdout.toString("utf8").trim());
     });
@@ -124,7 +134,15 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "plugins",
     "offeragent",
   );
-  await cp(builtPlugin, installation, { recursive: true });
+  const deployment = JSON.parse(await execute(
+    process.execPath,
+    [deployScript, "--vault", temporaryVault, "--confirm-control-migration"],
+    { env: process.env },
+  ));
+  assert.equal(deployment.installed, true);
+  assert.equal(deployment.controlMigration.decision, "applied");
+  const migratedContract = await readFile(path.join(temporaryVault, "agent.md"), "utf8");
+  assert.match(migratedContract, /OfferAgent 面试学习状态维护 Contract/);
 
   let activeView;
   let plugin;
@@ -303,7 +321,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   };
 
   const require = createRequire(import.meta.url);
-  const entryPath = path.join(builtPlugin, "main.js");
+  const entryPath = path.join(installation, "main.js");
   const originalLoad = Module._load;
   Module._load = function loadWithObsidianStub(request, parent, isMain) {
     if (request === "obsidian") return obsidianStub;
@@ -325,8 +343,8 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     {
       path: "agent.md",
       extension: "md",
-      stat: { mtime: 1234, size: 26 },
-      content: "# Test Agent Contract",
+      stat: { mtime: 1234, size: Buffer.byteLength(migratedContract, "utf8") },
+      content: migratedContract,
     },
     {
       path: "notes/example.md",
@@ -335,6 +353,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
       content: "line one\nline two",
     },
   ];
+  const contractReads = [];
   let settingsOpened = 0;
   const app = {
     setting: {
@@ -348,6 +367,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
         return vaultFiles;
       },
       async cachedRead(file) {
+        if (file.path === "agent.md") contractReads.push(file.content);
         return file.content;
       },
       async create(vaultPath, content) {
@@ -502,6 +522,17 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
     "OfferAgent did not finish the first Agent Run",
   );
+  assert.ok(
+    activeView.contentEl
+      .findAllByClass("offeragent-sidebar__tool-activity")
+      .some(
+        (activity) =>
+          activity.dataset.status === "completed" &&
+          activity.children[0]?.text.includes("Read contract agent.md"),
+      ),
+    "The installed Runtime did not read the migrated Agent Contract",
+  );
+  assert.deepEqual(contractReads, [migratedContract]);
   assert.equal(activeView.contentEl.findAllByClass("offeragent-sidebar__run-status").length, 0);
 
   const nextComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
