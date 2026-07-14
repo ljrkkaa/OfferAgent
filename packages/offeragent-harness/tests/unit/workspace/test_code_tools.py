@@ -46,6 +46,14 @@ def _source(root: Path) -> VaultFileSystem:
     )
 
 
+@pytest.fixture(scope="module")
+def ripgrep_executable() -> Path:
+    executable = shutil.which("rg.exe")
+    if executable is None:
+        pytest.skip("ripgrep is unavailable on this test host")
+    return Path(executable).resolve(strict=True)
+
+
 def _call(name: str, arguments: dict[str, object], *, definitions: tuple[ToolDefinition, ...]) -> ToolCall:
     definition = next(item for item in definitions if item.name == name)
     return ToolCall(
@@ -65,11 +73,19 @@ def _call(name: str, arguments: dict[str, object], *, definitions: tuple[ToolDef
 
 
 @pytest.mark.asyncio
-async def test_glob_grep_and_read_use_a_verified_workspace_and_ripgrep(tmp_path: Path) -> None:
+async def test_glob_grep_and_read_use_a_verified_workspace_and_ripgrep(
+    tmp_path: Path,
+    ripgrep_executable: Path,
+) -> None:
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "main.py").write_text("def target():\n    return 'needle'\n", encoding="utf-8")
     (tmp_path / "notes.txt").write_text("needle\n", encoding="utf-8")
-    executor = CodeToolExecutor(workspace_id="ws_test", source=_source(tmp_path), workspace_root=tmp_path)
+    executor = CodeToolExecutor(
+        workspace_id="ws_test",
+        source=_source(tmp_path),
+        workspace_root=tmp_path,
+        ripgrep_path=ripgrep_executable,
+    )
     cancellation = ManualCancellationToken()
 
     glob = await executor.execute(
@@ -107,10 +123,18 @@ def test_root_search_contract_is_declared_in_tool_schema() -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_tools_truncate_before_exceeding_tool_result_provenance_limit(tmp_path: Path) -> None:
+async def test_search_tools_truncate_before_exceeding_tool_result_provenance_limit(
+    tmp_path: Path,
+    ripgrep_executable: Path,
+) -> None:
     for index in range(MAX_TOOL_RESULT_SOURCE_REFERENCES + 1):
         (tmp_path / f"note-{index:03}.md").write_text("needle\n", encoding="utf-8")
-    executor = CodeToolExecutor(workspace_id="ws_test", source=_source(tmp_path), workspace_root=tmp_path)
+    executor = CodeToolExecutor(
+        workspace_id="ws_test",
+        source=_source(tmp_path),
+        workspace_root=tmp_path,
+        ripgrep_path=ripgrep_executable,
+    )
     cancellation = ManualCancellationToken()
 
     glob = await executor.execute(_call("glob", {"pattern": "*.md"}, definitions=code_tool_definitions()), cancellation)

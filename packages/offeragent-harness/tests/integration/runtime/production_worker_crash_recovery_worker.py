@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
@@ -39,6 +40,13 @@ NO_CRASH_EXIT = 74
 WORKSPACE_INSTANCE_ID = "wsi_5814036c-4192-49ea-9e75-b458bd7a53aa"
 BEFORE_CONTENT = b"BEFORE_PAYLOAD\n"
 AFTER_CONTENT = b"BEFORE_PAYLOAD\nAFTER_PAYLOAD\n"
+
+
+def _ripgrep_executable() -> Path:
+    executable = shutil.which("rg.exe")
+    if executable is None:
+        raise RuntimeError("ripgrep is required for the production Worker integration fixture")
+    return Path(executable).resolve(strict=True)
 
 
 class _CrashRecoveryModel:
@@ -165,6 +173,7 @@ def _composition(root: Path, barrier: _CrashAndRecoveryBarrier, model: _CrashRec
             start_native_transports=False,
             runtime_config=runtime_config,
             vault_cas_barrier=cast(VaultCasBarrier, barrier),
+            ripgrep_path=_ripgrep_executable(),
         ),
     )
     return WorkerEntrypoint(_ObservedCompositionRoot(composition, barrier))

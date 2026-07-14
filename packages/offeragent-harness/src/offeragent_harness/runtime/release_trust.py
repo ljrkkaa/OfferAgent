@@ -89,6 +89,20 @@ class InstalledReleaseManifestTrust:
         except (OSError, ReleaseVerificationError):
             return False
 
+    def verify_file(self, path: Path) -> bool:
+        """Re-hash one signed Runtime member before using it as an executable asset."""
+
+        try:
+            candidate = Path(path).resolve(strict=True)
+            relative = candidate.relative_to(self.version_directory).as_posix()
+            record = self.manifest.by_path.get(relative)
+            if record is None:
+                return False
+            _verify_installed_manifest_record(self.version_directory, record)
+            return _manifest_child(self.version_directory, record.path) == candidate
+        except (OSError, ReleaseVerificationError, ValueError):
+            return False
+
     def _verify_current_pointer(self) -> None:
         pointer_path = self.version_directory.parent / "current.json"
         payload = _read_bounded(pointer_path, 64 * 1024)

@@ -134,6 +134,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-date-epoch", type=int, required=True)
     parser.add_argument("--iscc", type=Path, required=True)
+    parser.add_argument("--ripgrep-executable", type=Path, required=True)
     args = parser.parse_args()
     require_release_host(args)
     with tempfile.TemporaryDirectory(prefix="offeragent-release-") as temporary:
@@ -144,7 +145,11 @@ def main() -> int:
             "offeragent-bootstrap",
             work / "bootstrap",
         )
-        static_sources = add_release_assets(runtime)
+        static_sources = add_release_assets(
+            runtime,
+            architecture=args.architecture,
+            ripgrep_executable=args.ripgrep_executable,
+        )
         runtime_transforms = sign_executables(runtime, args)
         sign_executables(bootstrap, args)
         add_release_metadata(runtime, args, frozen_evidence, static_sources, runtime_transforms)
@@ -168,6 +173,8 @@ def require_release_host(args: argparse.Namespace) -> None:
         )
     if not args.sign_tool.is_file() or args.sign_tool.suffix.casefold() != ".exe":
         raise SystemExit("SignTool.exe is required")
+    if not args.ripgrep_executable.is_file() or args.ripgrep_executable.name.casefold() != "rg.exe":
+        raise SystemExit("a concrete rg.exe build input is required")
     if not args.ed25519_private_key.is_file():
         raise SystemExit("external Ed25519 private key is required")
     if args.key_id not in PUBLIC_KEYS_BASE64URL:
@@ -370,7 +377,12 @@ def merge_identical_tree(source: Path, destination: Path) -> None:
             shutil.copy2(item, target)
 
 
-def add_release_assets(runtime: Path) -> dict[str, StaticPayloadSource]:
+def add_release_assets(
+    runtime: Path,
+    *,
+    architecture: str,
+    ripgrep_executable: Path,
+) -> dict[str, StaticPayloadSource]:
     static_sources: dict[str, StaticPayloadSource] = {}
     if not BUILTIN_SKILLS.is_dir() or not any(BUILTIN_SKILLS.rglob("SKILL.md")):
         raise RuntimeError("release source contains no Builtin Skills")
@@ -400,6 +412,22 @@ def add_release_assets(runtime: Path) -> dict[str, StaticPayloadSource]:
         runtime=runtime,
         locator="project:packaging/process-catalog.v1.json",
         static_sources=static_sources,
+    )
+    ripgrep, version = _validated_ripgrep_executable(ripgrep_executable, architecture=architecture)
+    _copy_static_file(
+        source=ripgrep,
+        destination=runtime / "tools" / "rg.exe",
+        runtime=runtime,
+        locator="build-input:ripgrep/rg.exe",
+        static_sources=static_sources,
+        component=Component(
+            "SPDXRef-Package-ripgrep",
+            "third-party",
+            "ripgrep",
+            version,
+            "MIT OR Unlicense",
+        ),
+        kind="third-party-executable",
     )
     licenses = runtime / "LICENSES"
     licenses.mkdir()
@@ -435,6 +463,35 @@ def add_release_assets(runtime: Path) -> dict[str, StaticPayloadSource]:
                 kind="license-evidence",
             )
     return static_sources
+
+
+def _validated_ripgrep_executable(executable: Path, *, architecture: str) -> tuple[Path, str]:
+    """Accept one explicit, native ripgrep input for the sealed Runtime payload."""
+
+    try:
+        resolved = executable.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError("ripgrep build input is unavailable") from error
+    if not resolved.is_file() or resolved.is_symlink() or resolved.name.casefold() != "rg.exe":
+        raise RuntimeError("ripgrep build input must be a regular rg.exe file")
+    if pe_machine(resolved) != windows_pe_machine_for_architecture(architecture):
+        raise RuntimeError("ripgrep build input architecture differs from the Runtime architecture")
+    try:
+        completed = subprocess.run(
+            [str(resolved), "--version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=5,
+            check=False,
+            shell=False,
+        )
+        first_line = completed.stdout.decode("utf-8", errors="strict").splitlines()[0]
+    except (IndexError, OSError, UnicodeError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError("ripgrep build input failed its version handshake") from error
+    match = re.fullmatch(r"ripgrep (\d+\.\d+\.\d+) \(rev [0-9a-f]+\)", first_line)
+    if completed.returncode != 0 or match is None:
+        raise RuntimeError("ripgrep build input failed its version handshake")
+    return resolved, match.group(1)
 
 
 def add_release_metadata(

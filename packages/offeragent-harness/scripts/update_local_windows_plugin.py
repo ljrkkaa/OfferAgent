@@ -49,6 +49,7 @@ class _ProcessEntry32W(ctypes.Structure):
 def main() -> int:
     parser = argparse.ArgumentParser(description="构建并更新个人本机 OfferAgent Obsidian 插件")
     parser.add_argument("--vault-root", type=Path, required=True)
+    parser.add_argument("--ripgrep-executable", type=Path, required=True)
     args = parser.parse_args()
     running = _running_blocking_processes()
     if running:
@@ -57,7 +58,14 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="offeragent-local-plugin-update-") as temporary:
         artifact = Path(temporary) / "offeragent-obsidian-plugin"
         subprocess.run(
-            [sys.executable, str(BUILD_SCRIPT), "--output", str(artifact)],
+            [
+                sys.executable,
+                str(BUILD_SCRIPT),
+                "--output",
+                str(artifact),
+                "--ripgrep-executable",
+                str(args.ripgrep_executable),
+            ],
             cwd=ROOT,
             check=True,
         )

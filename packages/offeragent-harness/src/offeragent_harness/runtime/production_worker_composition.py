@@ -333,6 +333,7 @@ class ProductionWorkerOverrides:
     runtime_config: HarnessConfig | None = None
     skill_trust_verifier: SkillTrustVerifier | None = None
     skill_runtime_root: Path | None = None
+    ripgrep_path: Path | None = None
     skill_user_home: Path | None = None
     process_supervisor: _WorkerProcessSupervisor | None = None
     process_executable_profiles: tuple[ProcessExecutableProfile, ...] = ()
@@ -3498,6 +3499,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             workspace_id=workspace_id,
             source=vault_fs,
             workspace_root=bootstrap.canonical_root,
+            ripgrep_path=_require_ripgrep_path(self._overrides.ripgrep_path),
         )
         powershell_executor = PowerShellToolExecutor(
             workspace_id=workspace_id,
@@ -4086,6 +4088,29 @@ def _resolve_worker_bootstrap(command: WorkerCommandLine) -> WorkerBootstrap:
     return WorkerBootstrap(command.workspace_instance_id, canonical_root, state_directory)
 
 
+def _verified_packaged_ripgrep(
+    release: InstalledReleaseManifestTrust | InstalledDevelopmentRuntimeTrust,
+) -> Path:
+    """Return the Runtime-pinned ripgrep image used exclusively by ``grep``."""
+
+    executable = release.version_directory / "tools" / "rg.exe"
+    if not release.verify_file(executable):
+        raise ProductionWorkerError("Runtime ripgrep image is absent or differs from the trusted manifest")
+    return executable.resolve(strict=True)
+
+
+def _require_ripgrep_path(value: Path | None) -> Path:
+    if value is None:
+        raise ProductionWorkerError("Worker composition has no Runtime-pinned ripgrep image")
+    try:
+        executable = value.resolve(strict=True)
+    except OSError as error:
+        raise ProductionWorkerError("Runtime ripgrep image is unavailable") from error
+    if not executable.is_file() or executable.name.casefold() != "rg.exe":
+        raise ProductionWorkerError("Runtime ripgrep image is invalid")
+    return executable
+
+
 def _installed_release_trust() -> InstalledReleaseManifestTrust:
     from offeragent_harness.runtime.release_manifest import (
         ReleaseKeyring,
@@ -4152,6 +4177,7 @@ async def _run_worker(
         )
     if release.manifest.runtime_version != command.runtime_version:
         raise ProductionWorkerError("Runtime version differs from Host launch identity")
+    ripgrep_path = _verified_packaged_ripgrep(release)
     clock = SystemClock()
     ids = SecureIdGenerator()
     registration_uow = SqliteUnitOfWorkFactory(bootstrap.state_directory / "state.sqlite")
@@ -4197,6 +4223,7 @@ async def _run_worker(
             signed_shell_profiles=catalog.signed_shell_profiles,
             skill_runtime_root=release.version_directory,
             skill_trust_verifier=skill_trust_verifier,
+            ripgrep_path=ripgrep_path,
         ),
     )
     from offeragent_harness.runtime.worker_entrypoint import WorkerEntrypoint

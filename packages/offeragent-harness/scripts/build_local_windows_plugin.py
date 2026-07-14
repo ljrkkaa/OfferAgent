@@ -128,10 +128,11 @@ _FORBIDDEN_FROZEN_DISTRIBUTIONS = (
 def main() -> int:
     parser = argparse.ArgumentParser(description="构建个人本机开发版 OfferAgent 插件 (仅 Windows x64)")
     parser.add_argument("--output", type=Path, required=True, help="不存在的输出目录")
+    parser.add_argument("--ripgrep-executable", type=Path, required=True, help="构建时显式提供的 rg.exe")
     parser.add_argument("--runtime-version", help="可选; 默认由源码指纹生成")
     parser.add_argument("--skip-static-checks", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    require_local_build_host()
+    require_local_build_host(args.ripgrep_executable)
     output = args.output.resolve(strict=False)
     if output.exists():
         raise SystemExit("output already exists; local build never overwrites an existing directory")
@@ -147,7 +148,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="offeragent-local-build-", dir=output.parent) as temporary:
         temporary_root = Path(temporary)
         runtime = build_development_runtime(temporary_root / "runtime-build")
-        add_release_assets(runtime)
+        add_release_assets(
+            runtime,
+            architecture="x64",
+            ripgrep_executable=args.ripgrep_executable,
+        )
         validate_process_catalog_payload((runtime / PROCESS_CATALOG_PATH).read_bytes())
         records = collect_runtime_records(runtime)
         manifest = DevelopmentRuntimeManifest(
@@ -216,7 +221,7 @@ def main() -> int:
     return 0
 
 
-def require_local_build_host() -> None:
+def require_local_build_host(ripgrep_executable: Path) -> None:
     try:
         architecture = native_windows_architecture()
     except RuntimeError as error:
@@ -227,6 +232,8 @@ def require_local_build_host() -> None:
         raise SystemExit("PyInstaller build dependency is unavailable")
     if shutil.which("npm.cmd") is None and shutil.which("npm") is None:
         raise SystemExit("npm is unavailable")
+    if not ripgrep_executable.is_file() or ripgrep_executable.name.casefold() != "rg.exe":
+        raise SystemExit("a concrete rg.exe build input is required")
 
 
 def run_static_gates() -> None:

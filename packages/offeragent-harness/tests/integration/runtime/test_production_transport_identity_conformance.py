@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,6 +60,14 @@ from offeragent_harness.testing import ManualCancellationToken
 from offeragent_harness.workspace import identify_workspace_root
 from offeragent_harness.workspace.portable_config import ensure_portable_workspace_config
 from offeragent_harness.workspace.runtime_identity import workspace_database_identity
+
+
+def _ripgrep_executable() -> Path:
+    executable = shutil.which("rg.exe")
+    if executable is None:
+        pytest.fail("ripgrep is required for the production Worker integration fixture")
+    return Path(executable).resolve(strict=True)
+
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="production transport conformance requires Windows")
 
@@ -338,6 +347,7 @@ async def native_production_application(
             model_gateway_factory=lambda _settings: fake_model,
             start_native_transports=True,
             runtime_config=HarnessConfig.model_validate({"ui": {"loopback_web_enabled": True}}),
+            ripgrep_path=_ripgrep_executable(),
         ),
     )
     entrypoint = WorkerEntrypoint(root)

@@ -6,6 +6,7 @@ import difflib
 import hashlib
 import msvcrt
 import os
+import shutil
 import sqlite3
 from collections import deque
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -70,6 +71,14 @@ from offeragent_harness.vault import ABSENT_HASH, content_hash
 from offeragent_harness.workspace import identify_workspace_root
 from offeragent_harness.workspace.portable_config import ensure_portable_workspace_config
 from offeragent_harness.workspace.runtime_identity import workspace_database_identity
+
+
+def _ripgrep_executable() -> Path:
+    executable = shutil.which("rg.exe")
+    if executable is None:
+        pytest.fail("ripgrep is required for the production Worker integration fixture")
+    return Path(executable).resolve(strict=True)
+
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="production Vault write E2E requires Win32 Named Pipes")
 
@@ -447,6 +456,7 @@ async def production_vault_application(
             runtime_config=HarnessConfig.model_validate(
                 {"policy": {"workspace_trusted": True, "read_only": False}, "ui": {"loopback_web_enabled": True}}
             ),
+            ripgrep_path=_ripgrep_executable(),
         ),
     )
     entrypoint = WorkerEntrypoint(root)

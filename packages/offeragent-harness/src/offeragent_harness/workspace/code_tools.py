@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -266,7 +265,7 @@ class CodeToolExecutor:
         workspace_id: str,
         source: CodeWorkspaceSource,
         workspace_root: Path,
-        ripgrep_path: str | None = None,
+        ripgrep_path: Path,
         limits: CodeToolLimits | None = None,
     ) -> None:
         if not workspace_id or source.workspace_id != workspace_id:
@@ -274,10 +273,9 @@ class CodeToolExecutor:
         root = workspace_root.resolve(strict=True)
         if not root.is_dir():
             raise ValueError("Code tool root must be a directory")
-        executable = ripgrep_path or shutil.which("rg")
-        if executable is None:
-            raise ValueError("ripgrep executable is required for the grep tool")
-        resolved_executable = Path(executable).resolve(strict=True)
+        resolved_executable = ripgrep_path.resolve(strict=True)
+        if not resolved_executable.is_file() or resolved_executable.name.casefold() != "rg.exe":
+            raise ValueError("Code tool ripgrep executable is invalid")
         definitions = code_tool_definitions()
         handlers: tuple[ToolHandler, ...] = (self._glob, self._grep, self._read)
         self._workspace_id = workspace_id
