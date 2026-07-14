@@ -281,6 +281,7 @@ _WORKER_ARGUMENTS = (
 _INSTANCE_ID = re.compile(r"^wsi_[0-9a-f-]{36}$")
 _LOCAL_PROFILE_ID = "profile_local"
 _LOCAL_MANAGED_ID = "managed_local"
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 
 
 class ProductionWorkerError(RuntimeError):
@@ -4057,11 +4058,31 @@ def _resolve_worker_bootstrap(command: WorkerCommandLine) -> WorkerBootstrap:
         raise ProductionWorkerError("Vault identity changed after Host launch")
     if workspace_database_identity(command.workspace_instance_id) != command.database_identity:
         raise ProductionWorkerError("database identity is not derived from this Workspace instance")
-    state_directory = local_root / "workspaces" / command.workspace_instance_id
-    expected_parent = (local_root / "workspaces").resolve(strict=True)
-    state_directory.mkdir(parents=False, exist_ok=True)
-    if state_directory.resolve(strict=True).parent != expected_parent:
-        raise ProductionWorkerError("Worker state directory escaped the current-user Runtime root")
+    state_parent = local_root / "workspaces"
+    state_directory = state_parent / command.workspace_instance_id
+    try:
+        state_parent.mkdir(parents=False, exist_ok=True)
+        parent_info = state_parent.lstat()
+        if (
+            not state_parent.is_dir()
+            or state_parent.is_symlink()
+            or getattr(parent_info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise ProductionWorkerError("Worker state parent is not a local directory")
+        expected_parent = state_parent.resolve(strict=True)
+        if expected_parent.parent != local_root:
+            raise ProductionWorkerError("Worker state parent escaped the current-user Runtime root")
+        state_directory.mkdir(parents=False, exist_ok=True)
+        state_info = state_directory.lstat()
+        if (
+            not state_directory.is_dir()
+            or state_directory.is_symlink()
+            or getattr(state_info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+            or state_directory.resolve(strict=True).parent != expected_parent
+        ):
+            raise ProductionWorkerError("Worker state directory escaped the current-user Runtime root")
+    except OSError as error:
+        raise ProductionWorkerError("Worker state directory is unavailable") from error
     return WorkerBootstrap(command.workspace_instance_id, canonical_root, state_directory)
 
 
@@ -4094,7 +4115,7 @@ def _prepare_process_scratch_root(state_directory: Path) -> Path:
         working.mkdir(exist_ok=True)
         for item in (root, working):
             info = item.lstat()
-            if item.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x0400:
+            if item.is_symlink() or getattr(info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
                 raise ProductionWorkerError("process scratch root contains a reparse point")
         canonical_state = state_directory.resolve(strict=True)
         canonical_root = root.resolve(strict=True)
