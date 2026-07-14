@@ -117,6 +117,50 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   const previousProvider = process.env.OFFERAGENT_RUNTIME_PROVIDER;
   const previousStatePath = process.env.OFFERAGENT_RUNTIME_STATE_PATH;
   const previousLocalAppData = process.env.LOCALAPPDATA;
+  const previousSetInterval = globalThis.setInterval;
+  const previousClearInterval = globalThis.clearInterval;
+  const previousSetTimeout = globalThis.setTimeout;
+  const previousClearTimeout = globalThis.clearTimeout;
+  const browserIntervals = new Map();
+  const browserTimeouts = new Map();
+  let nextBrowserInterval = 0;
+  let nextBrowserTimeout = 10_000;
+  globalThis.setInterval = (callback, milliseconds, ...args) => {
+    const id = ++nextBrowserInterval;
+    browserIntervals.set(id, previousSetInterval(callback, milliseconds, ...args));
+    return id;
+  };
+  globalThis.clearInterval = (id) => {
+    const handle = browserIntervals.get(id);
+    if (handle) {
+      browserIntervals.delete(id);
+      previousClearInterval(handle);
+      return;
+    }
+    previousClearInterval(id);
+  };
+  globalThis.setTimeout = (callback, milliseconds, ...args) => {
+    const id = ++nextBrowserTimeout;
+    browserTimeouts.set(id, previousSetTimeout(callback, milliseconds, ...args));
+    return id;
+  };
+  globalThis.clearTimeout = (id) => {
+    const handle = browserTimeouts.get(id);
+    if (handle) {
+      browserTimeouts.delete(id);
+      previousClearTimeout(handle);
+      return;
+    }
+    previousClearTimeout(id);
+  };
+  t.after(() => {
+    for (const handle of browserIntervals.values()) previousClearInterval(handle);
+    for (const handle of browserTimeouts.values()) previousClearTimeout(handle);
+    globalThis.setInterval = previousSetInterval;
+    globalThis.clearInterval = previousClearInterval;
+    globalThis.setTimeout = previousSetTimeout;
+    globalThis.clearTimeout = previousClearTimeout;
+  });
   process.env.OFFERAGENT_RUNTIME_PROVIDER = "fake";
   const temporaryVault = await mkdtemp(path.join(os.tmpdir(), "offeragent-vault-"));
   const temporaryRuntimeHome = await mkdtemp(

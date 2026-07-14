@@ -1150,12 +1150,21 @@ export class RuntimeStateStore {
     await this.#writeTail;
     const rows =
       this.#database.exec(
-        `SELECT payload_json FROM durable_events
+        `SELECT id, conversation_id, agent_run_id, event_type, sequence, payload_json
+         FROM durable_events
          WHERE acknowledged_at IS NULL${agentRunId ? " AND agent_run_id = ?" : ""}
          ORDER BY rowid`,
         agentRunId ? [agentRunId] : [],
       )[0]?.values ?? [];
-    return rows.map(([payload]) => JSON.parse(payload as string) as AgentRunEvent);
+    return rows.map(([eventId, conversationId, storedAgentRunId, eventType, sequence, payload]) => ({
+      ...(JSON.parse(payload as string) as Record<string, unknown>),
+      type: eventType,
+      protocolVersion: PROTOCOL_VERSION,
+      eventId,
+      conversationId,
+      agentRunId: storedAgentRunId,
+      sequence,
+    }) as AgentRunEvent);
   }
 
   async requestToolCall(
@@ -1861,6 +1870,9 @@ export class RuntimeStateStore {
         throw error;
       }
     }
+    // Early v9/v10 builds could persist the current version before these additive
+    // protocol columns existed. Keep the repair idempotent for already-versioned State.
+    this.#ensureProtocolColumns();
     if (version < 10) this.#database.run("VACUUM");
     await this.#persist();
   }

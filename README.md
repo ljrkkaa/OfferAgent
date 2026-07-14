@@ -81,15 +81,15 @@ Preview the control-file migration without changing the Vault:
 npm.cmd run deploy:target-vault -- --vault "E:\obsidian项目\面试胜利！"
 ```
 
-The preview reports the Agent Contract and Vault-local Skill that require explicit confirmation. Apply that whole control-file batch and atomically install or upgrade the packaged plugin with:
+The preview reports the Agent Contract, Vault-local Skill, and Obsidian enabled-plugin list that require explicit confirmation. Atomically replace the packaged plugin directory, then apply that whole confirmed control-file batch with:
 
 ```powershell
 npm.cmd run deploy:target-vault -- --vault "E:\obsidian项目\面试胜利！" --confirm-control-migration
 ```
 
-Deployment installs to `.obsidian/plugins/offeragent/`. It preserves plugin-local files such as `data.json`, never removes `%LOCALAPPDATA%\OfferAgent\state.db`, and uses OfferAgent's isolated Git index plus hidden checkpoint for the confirmed `agent.md` and `.codex/skills/obsidian-cli/SKILL.md` migration. It does not switch the Vault branch, stage files, clear dirty work, or overwrite the user's Git index. Re-running the command upgrades the four production package files and leaves an already-current control migration unchanged.
+Deployment installs to `.obsidian/plugins/offeragent/` before it changes any controls, so an installation failure leaves the Agent Contract, Vault-local Skill, and enabled-plugin list untouched. It adds `offeragent` to `.obsidian/community-plugins.json` only inside the explicitly confirmed control batch. It preserves every existing enabled plugin, plugin-local files such as `data.json`, and `%LOCALAPPDATA%\OfferAgent\state.db`. OfferAgent's isolated Git index plus hidden checkpoint covers `agent.md`, `.codex/skills/obsidian-cli/SKILL.md`, and the enabled-plugin list without switching the Vault branch, staging files, clearing dirty work, or overwriting the user's Git index. Re-running the command upgrades the four production package files; when OfferAgent is already enabled, it preserves the enabled-plugin file byte-for-byte so Obsidian formatting cannot create a false migration.
 
-After installation, enable OfferAgent in Obsidian and use the ribbon icon or the `Open OfferAgent sidebar` command. Node.js 20+ is discovered from the Obsidian-launched Windows process; the Sidebar shows actionable repair guidance when no supported executable is available.
+After installation, restart or reload Obsidian and use the ribbon icon or the `Open OfferAgent sidebar` command. Node.js 20+ is discovered from the Obsidian-launched Windows process; the Sidebar shows actionable repair guidance when no supported executable is available.
 
 ## Architecture
 

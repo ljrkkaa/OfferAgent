@@ -24,6 +24,9 @@ docs/adr/*
 !docs/specs/
 docs/specs/*
 !docs/specs/*.md
+!docs/acceptance/
+docs/acceptance/*
+!docs/acceptance/*.md
 
 # Local agent/workspace artifacts
 AGENTS.md

@@ -169,7 +169,32 @@ class JsonMigrationJournal {
   }
 }
 
-async function templates() {
+async function enabledPluginsTemplate(vault) {
+  const target = path.join(vault, ".obsidian", "community-plugins.json");
+  let plugins = [];
+  let currentContent;
+  try {
+    currentContent = await readFile(target, "utf8");
+    plugins = JSON.parse(currentContent);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw new Error(`Cannot read Obsidian's enabled-plugin list: ${error.message}`);
+    }
+  }
+  if (!Array.isArray(plugins) || plugins.some((plugin) => typeof plugin !== "string")) {
+    throw new Error("Obsidian's enabled-plugin list must be a JSON array of plugin IDs.");
+  }
+  if (plugins.includes("offeragent")) {
+    return { path: ".obsidian/community-plugins.json", content: currentContent };
+  }
+  plugins.push("offeragent");
+  return {
+    path: ".obsidian/community-plugins.json",
+    content: `${JSON.stringify(plugins, null, 2)}\n`,
+  };
+}
+
+async function templates(vault) {
   return [
     {
       path: ".codex/skills/obsidian-cli/SKILL.md",
@@ -179,6 +204,7 @@ async function templates() {
       path: "agent.md",
       content: await readFile(path.join(migrationDirectory, "agent.md"), "utf8"),
     },
+    await enabledPluginsTemplate(vault),
   ];
 }
 
@@ -289,7 +315,7 @@ async function installPackage(vault) {
 async function main() {
   const { confirmed, vault } = argumentsFrom(process.argv.slice(2));
   await realpath(vault);
-  const files = await templates();
+  const files = await templates(vault);
   const { actions } = await prepareActions(vault, files);
   if (!confirmed) {
     process.stdout.write(JSON.stringify({
@@ -299,8 +325,8 @@ async function main() {
     }));
     return;
   }
-  const controlMigration = await migrateControls(vault, files);
   await installPackage(vault);
+  const controlMigration = await migrateControls(vault, files);
   process.stdout.write(JSON.stringify({ controlMigration, installed: true }));
 }
 

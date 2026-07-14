@@ -130,6 +130,89 @@ test("Runtime State applies explicit schema migrations and rejects newer schemas
   );
 });
 
+test("Runtime State reconstructs legacy compact durable-event envelopes", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-compact-events-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const store = await RuntimeStateStore.open(statePath);
+  await store.beginAgentRun(
+    "compact-conversation",
+    "compact-run",
+    "compact-model",
+    "prepare me",
+    {
+      type: "agent_run.started",
+      protocolVersion: 1,
+      eventId: "compact-started-event",
+      conversationId: "compact-conversation",
+      agentRunId: "compact-run",
+      sequence: 1,
+      model: "compact-model",
+    },
+  );
+  await store.close();
+
+  const SQL = await initSqlJs();
+  const legacy = new SQL.Database(await readFile(statePath));
+  legacy.run(
+    "UPDATE durable_events SET payload_json = ? WHERE id = ?",
+    [JSON.stringify({ model: "compact-model" }), "compact-started-event"],
+  );
+  await writeFile(statePath, legacy.export());
+  legacy.close();
+
+  const reopened = await RuntimeStateStore.open(statePath);
+  const events = await reopened.listUnacknowledgedEvents();
+  assert.deepEqual(events[0], {
+    type: "agent_run.started",
+    protocolVersion: 1,
+    eventId: "compact-started-event",
+    conversationId: "compact-conversation",
+    agentRunId: "compact-run",
+    sequence: 1,
+    model: "compact-model",
+  });
+  assert.equal(events[1].type, "agent_run.interrupted");
+  await reopened.close();
+});
+
+test("Runtime State repairs protocol columns even when the schema version is current", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-current-schema-repair-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const store = await RuntimeStateStore.open(statePath);
+  await store.close();
+
+  const SQL = await initSqlJs();
+  const drifted = new SQL.Database(await readFile(statePath));
+  drifted.run(`
+    DROP INDEX protocol_responses_by_conversation;
+    DROP INDEX protocol_responses_by_owner;
+    ALTER TABLE protocol_responses RENAME TO protocol_responses_current_fixture;
+    CREATE TABLE protocol_responses (
+      request_event_id TEXT PRIMARY KEY,
+      request_type TEXT NOT NULL,
+      conversation_id TEXT NOT NULL,
+      agent_run_id TEXT NOT NULL,
+      response_json TEXT,
+      created_at TEXT NOT NULL
+    );
+    DROP TABLE protocol_responses_current_fixture;
+    PRAGMA user_version = ${CURRENT_SCHEMA_VERSION};
+  `);
+  await writeFile(statePath, drifted.export());
+  drifted.close();
+
+  const repaired = await RuntimeStateStore.open(statePath);
+  await repaired.close();
+  const verified = new SQL.Database(await readFile(statePath));
+  const columns = verified.exec("PRAGMA table_info(protocol_responses)")[0].values
+    .map((column) => column[1]);
+  assert.ok(columns.includes("owner_conversation_id"));
+  assert.ok(columns.includes("request_hash"));
+  verified.close();
+});
+
 test("populated v3 tool and evidence tables survive the current control-tool rebuild", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-v3-evidence-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));

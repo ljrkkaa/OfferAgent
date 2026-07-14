@@ -66,6 +66,11 @@ test("deployment preserves Runtime State, plugin data, branch, index, and unrela
     '{"vaultPermissionMode":"read_only","conversation":"keep-me"}',
     "utf8",
   );
+  await writeFile(
+    path.join(root, ".obsidian", "community-plugins.json"),
+    '["existing-plugin","keep-this-plugin"]',
+    "utf8",
+  );
   await writeFile(path.join(root, "dirty.md"), "baseline\n", "utf8");
   await writeFile(path.join(root, "staged.md"), "baseline\n", "utf8");
   const statePath = path.join(localAppData, "OfferAgent", "state.db");
@@ -90,8 +95,13 @@ test("deployment preserves Runtime State, plugin data, branch, index, and unrela
   assert.deepEqual(plan.controlFiles, [
     ".codex/skills/obsidian-cli/SKILL.md",
     "agent.md",
+    ".obsidian/community-plugins.json",
   ]);
   assert.equal(await readFile(path.join(root, "agent.md"), "utf8"), "# Legacy Agent\nUse shell commands.\n");
+  assert.deepEqual(
+    JSON.parse(await readFile(path.join(root, ".obsidian", "community-plugins.json"), "utf8")),
+    ["existing-plugin", "keep-this-plugin"],
+  );
 
   const result = await deploy(root, localAppData, true);
   assert.equal(result.installed, true);
@@ -113,6 +123,10 @@ test("deployment preserves Runtime State, plugin data, branch, index, and unrela
   assert.equal(await git(root, "branch", "--show-current"), beforeBranch);
   assert.equal(await git(root, "diff", "--cached", "--binary"), beforeIndex);
   assert.equal(await readFile(path.join(root, "dirty.md"), "utf8"), beforeDirty);
+  assert.deepEqual(
+    JSON.parse(await readFile(path.join(root, ".obsidian", "community-plugins.json"), "utf8")),
+    ["existing-plugin", "keep-this-plugin", "offeragent"],
+  );
 
   const contract = await readFile(path.join(root, "agent.md"), "utf8");
   assert.match(contract, /vault_read/);
@@ -129,8 +143,61 @@ test("deployment preserves Runtime State, plugin data, branch, index, and unrela
 
   await git(root, "cat-file", "-e", `${result.controlMigration.checkpointRef}^{commit}`);
   await writeFile(path.join(installation, "data.json"), "preserve-on-upgrade", "utf8");
+  const obsidianNormalizedPlugins =
+    '["existing-plugin","keep-this-plugin","offeragent"]';
+  await writeFile(
+    path.join(root, ".obsidian", "community-plugins.json"),
+    obsidianNormalizedPlugins,
+    "utf8",
+  );
   const upgrade = await deploy(root, localAppData, true);
   assert.equal(upgrade.installed, true);
   assert.equal(upgrade.controlMigration, "unchanged");
   assert.equal(await readFile(path.join(installation, "data.json"), "utf8"), "preserve-on-upgrade");
+  assert.equal(
+    await readFile(path.join(root, ".obsidian", "community-plugins.json"), "utf8"),
+    obsidianNormalizedPlugins,
+  );
+});
+
+test("a package installation failure cannot enable the plugin or migrate controls", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-deploy-failure-vault-"));
+  const localAppData = await mkdtemp(path.join(os.tmpdir(), "offeragent-deploy-failure-state-"));
+  t.after(() => Promise.all([
+    rm(root, { recursive: true, force: true }),
+    rm(localAppData, { recursive: true, force: true }),
+  ]));
+
+  await mkdir(path.join(root, ".codex", "skills", "obsidian-cli"), { recursive: true });
+  await mkdir(path.join(root, ".obsidian"), { recursive: true });
+  await writeFile(path.join(root, "agent.md"), "# Keep legacy contract\n", "utf8");
+  await writeFile(
+    path.join(root, ".codex", "skills", "obsidian-cli", "SKILL.md"),
+    "# Keep legacy skill\n",
+    "utf8",
+  );
+  const enabledPlugins = '["existing-plugin"]';
+  await writeFile(
+    path.join(root, ".obsidian", "community-plugins.json"),
+    enabledPlugins,
+    "utf8",
+  );
+  // A file at the plugins-directory path injects a deterministic staging failure.
+  await writeFile(path.join(root, ".obsidian", "plugins"), "not a directory", "utf8");
+  await git(root, "init", "-q", "-b", "failure-branch");
+  await git(root, "config", "user.name", "Deployment Test");
+  await git(root, "config", "user.email", "deployment@example.invalid");
+  await git(root, "add", ".");
+  await git(root, "commit", "-qm", "baseline");
+
+  await assert.rejects(deploy(root, localAppData, true));
+  assert.equal(await readFile(path.join(root, "agent.md"), "utf8"), "# Keep legacy contract\n");
+  assert.equal(
+    await readFile(path.join(root, ".codex", "skills", "obsidian-cli", "SKILL.md"), "utf8"),
+    "# Keep legacy skill\n",
+  );
+  assert.equal(
+    await readFile(path.join(root, ".obsidian", "community-plugins.json"), "utf8"),
+    enabledPlugins,
+  );
 });

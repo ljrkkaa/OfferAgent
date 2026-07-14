@@ -41,6 +41,11 @@ import {
 const NODE_DIAGNOSTIC =
   "OfferAgent could not find Node.js 20 or newer. Install Node.js and restart Obsidian, or set OFFERAGENT_NODE_PATH to node.exe.";
 
+function unrefTimer(timer: unknown): void {
+  const candidate = timer as { unref?: () => void } | undefined;
+  if (typeof candidate?.unref === "function") candidate.unref();
+}
+
 export interface RuntimeSupervisorOptions {
   nodeCandidates?: string[];
   parentPid?: number;
@@ -596,10 +601,11 @@ export class RuntimeSupervisor implements RuntimeClient {
       await Promise.race([
         exited,
         new Promise<void>((resolve) => {
-          setTimeout(() => {
+          const timeout = setTimeout(() => {
             if (child.exitCode === null) child.kill();
             resolve();
-          }, 3_000).unref();
+          }, 3_000);
+          unrefTimer(timeout);
         }),
       ]);
     } finally {
@@ -1142,7 +1148,8 @@ export class RuntimeSupervisor implements RuntimeClient {
       let lastError = error;
       for (let attempt = 1; attempt <= 5; attempt += 1) {
         await new Promise<void>((resolve) => {
-          setTimeout(resolve, attempt * 100).unref();
+          const timeout = setTimeout(resolve, attempt * 100);
+          unrefTimer(timeout);
         });
         if (this.#stopping || this.#child !== child) return;
         try {
@@ -1216,7 +1223,7 @@ export class RuntimeSupervisor implements RuntimeClient {
         this.#vaultChangeChannels.delete(requestId);
         reject(new Error("OfferAgent Runtime Vault Change request timed out."));
       }, 5_000);
-      timeout.unref();
+      unrefTimer(timeout);
       this.#vaultChangeChannels.set(requestId, {
         command,
         conversationId: command.conversationId,
@@ -1259,7 +1266,7 @@ export class RuntimeSupervisor implements RuntimeClient {
         this.#conversationChannels.delete(requestId);
         reject(new Error("OfferAgent Runtime Conversation request timed out."));
       }, 5_000);
-      timeout.unref();
+      unrefTimer(timeout);
       this.#conversationChannels.set(requestId, {
         command,
         conversationId: command.conversationId,
@@ -1309,7 +1316,7 @@ export class RuntimeSupervisor implements RuntimeClient {
           this.#healthCheckInFlight = false;
         });
     }, 1_000);
-    this.#healthTimer.unref();
+    unrefTimer(this.#healthTimer);
   }
 
   #handleExit(
