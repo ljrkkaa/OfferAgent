@@ -59,10 +59,24 @@ function contractResult() {
   };
 }
 
+function planningMemoryListResult() {
+  return {
+    ok: true,
+    value: { type: "planning_memory_list", topics: [], truncated: false },
+  };
+}
+
+function requiredPreludeResult(event) {
+  if (event.tool.name === "agent_contract_read") return contractResult();
+  if (event.tool.name === "planning_memory_list") return planningMemoryListResult();
+  return undefined;
+}
+
 const contractToolExecutor = {
   async execute(event) {
-    assert.equal(event.tool.name, "agent_contract_read");
-    return contractResult();
+    const result = requiredPreludeResult(event);
+    assert.ok(result, `unexpected tool ${event.tool.name}`);
+    return result;
   },
 };
 
@@ -204,9 +218,10 @@ test("RuntimeSupervisor reconnects and delivers the durable interruption after a
     statePath: path.join(temporaryDirectory, "state.db"),
     toolExecutor: {
       execute: async (event) => {
-        if (event.tool.name === "agent_contract_read") {
-          contractExecutions += 1;
-          return contractResult();
+        const prelude = requiredPreludeResult(event);
+        if (prelude) {
+          if (event.tool.name === "agent_contract_read") contractExecutions += 1;
+          return prelude;
         }
         vaultReadExecutions += 1;
         return delayedRead;
@@ -228,6 +243,8 @@ test("RuntimeSupervisor reconnects and delivers the durable interruption after a
   })[Symbol.asyncIterator]();
   assert.equal((await iterator.next()).value.type, "agent_run.started");
   assert.equal((await iterator.next()).value.tool.name, "agent_contract_read");
+  assert.equal((await iterator.next()).value.type, "tool_call.completed");
+  assert.equal((await iterator.next()).value.tool.name, "planning_memory_list");
   assert.equal((await iterator.next()).value.type, "tool_call.completed");
   assert.equal((await iterator.next()).value.tool.name, "vault_read");
   trackedSockets[0].terminate();
@@ -345,6 +362,8 @@ test("a consumed failed terminal event is durably acknowledged before iterator r
       ["agent_run.started", 1],
       ["tool_call.requested", 1],
       ["tool_call.completed", 1],
+      ["tool_call.requested", 1],
+      ["tool_call.completed", 1],
       ["agent_run.failed", 1],
     ],
   );
@@ -365,18 +384,8 @@ test("a missing connected Vault executor returns a typed tool error and the Run 
     statePath: path.join(temporaryDirectory, "state.db"),
     toolExecutor: {
       async execute(event) {
-        if (event.tool.name === "agent_contract_read") {
-          return {
-            ok: true,
-            value: {
-              type: "agent_contract_read",
-              path: "agent.md",
-              modifiedVersion: "mtime:1:size:24",
-              contentHash: "sha256:test-contract",
-              content: "# Test Agent Contract",
-            },
-          };
-        }
+        const prelude = requiredPreludeResult(event);
+        if (prelude) return prelude;
         return {
           ok: false,
           error: {
@@ -465,6 +474,8 @@ test("returning one Agent Run iterator cancels only that run", async (t) => {
   assert.equal((await iterator.next()).value.type, "agent_run.started");
   assert.equal((await iterator.next()).value.type, "tool_call.requested");
   assert.equal((await iterator.next()).value.type, "tool_call.completed");
+  assert.equal((await iterator.next()).value.type, "tool_call.requested");
+  assert.equal((await iterator.next()).value.type, "tool_call.completed");
   assert.equal((await iterator.next()).value.type, "agent_run.delta");
   await iterator.return();
   await Promise.race([
@@ -502,7 +513,7 @@ test("cancelling during a delayed Vault tool call ignores its late result and te
     statePath,
     toolExecutor: {
       execute: async (event) =>
-        event.tool.name === "agent_contract_read" ? contractResult() : delayedResult,
+        requiredPreludeResult(event) ?? delayedResult,
     },
   });
   t.after(async () => {
@@ -520,6 +531,8 @@ test("cancelling during a delayed Vault tool call ignores its late result and te
     })
     [Symbol.asyncIterator]();
   assert.equal((await iterator.next()).value.type, "agent_run.started");
+  assert.equal((await iterator.next()).value.type, "tool_call.requested");
+  assert.equal((await iterator.next()).value.type, "tool_call.completed");
   assert.equal((await iterator.next()).value.type, "tool_call.requested");
   assert.equal((await iterator.next()).value.type, "tool_call.completed");
   assert.equal((await iterator.next()).value.type, "tool_call.requested");

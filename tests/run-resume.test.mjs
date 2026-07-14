@@ -87,6 +87,15 @@ function toolResult(event, result) {
   };
 }
 
+function respondPlanningMemoryList(socket, event) {
+  if (event.type !== "tool_call.requested" || event.tool.name !== "planning_memory_list") return false;
+  socket.send(JSON.stringify(toolResult(event, {
+    ok: true,
+    value: { type: "planning_memory_list", topics: [], truncated: false },
+  })));
+  return true;
+}
+
 test("an explicit Resume continues one Interrupted Run without repeating a committed tool", async (t) => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "offeragent-run-resume-"));
   const instance = await startRuntime(path.join(directory, "state.db"), "run-resume-token");
@@ -102,6 +111,7 @@ test("an explicit Resume continues one Interrupted Run without repeating a commi
     firstSocket.on("message", function onMessage(data) {
       const event = JSON.parse(data.toString("utf8"));
       if (event.agentRunId !== "resume-run" || event.type !== "tool_call.requested") return;
+      if (respondPlanningMemoryList(firstSocket, event)) return;
       if (event.tool.name === "agent_contract_read") {
         contractExecutions += 1;
         firstSocket.send(JSON.stringify(toolResult(event, {
@@ -163,6 +173,7 @@ test("an explicit Resume continues one Interrupted Run without repeating a commi
     resumedSocket.on("message", function onMessage(data) {
       const event = JSON.parse(data.toString("utf8"));
       if (event.agentRunId !== "resume-run") return;
+      if (respondPlanningMemoryList(resumedSocket, event)) return;
       resumedEvents.push(event);
       if (event.type === "tool_call.requested" && event.tool.name === "agent_contract_read") {
         contractExecutions += 1;
@@ -241,6 +252,7 @@ test("a restored pending confirmation continues from Apply or Reject without a s
     firstSocket.on("message", function onMessage(data) {
       const event = JSON.parse(data.toString("utf8"));
       if (event.agentRunId !== "pending-resume-run" || event.type !== "tool_call.requested") return;
+      if (respondPlanningMemoryList(firstSocket, event)) return;
       if (event.tool.name === "agent_contract_read") {
         firstSocket.send(JSON.stringify(toolResult(event, {
           ok: true,
@@ -291,6 +303,7 @@ test("a restored pending confirmation continues from Apply or Reject without a s
       const event = JSON.parse(data.toString("utf8"));
       if (event.agentRunId !== "pending-resume-run") return;
       if (event.type === "agent_run.resumed") resumeStarted = true;
+      if (resumeStarted && respondPlanningMemoryList(resumedSocket, event)) return;
       if (resumeStarted && event.type === "tool_call.requested" && event.tool.name === "agent_contract_read") {
         resumedSocket.send(JSON.stringify(toolResult(event, {
           ok: true,
@@ -353,6 +366,7 @@ test("Resume revalidates committed Evidence and replans before using a changed s
     firstSocket.on("message", function onMessage(data) {
       const event = JSON.parse(data.toString("utf8"));
       if (event.agentRunId !== "stale-resume-run" || event.type !== "tool_call.requested") return;
+      if (respondPlanningMemoryList(firstSocket, event)) return;
       if (event.tool.name === "agent_contract_read") {
         firstSocket.send(JSON.stringify(toolResult(event, {
           ok: true,
@@ -403,7 +417,9 @@ test("Resume revalidates committed Evidence and replans before using a changed s
       if (event.agentRunId !== "stale-resume-run") return;
       if (event.type === "tool_call.requested") {
         resumedTools.push(event.tool.name);
-        if (event.tool.name === "agent_contract_read") {
+        if (respondPlanningMemoryList(resumedSocket, event)) {
+          return;
+        } else if (event.tool.name === "agent_contract_read") {
           resumedSocket.send(JSON.stringify(toolResult(event, {
             ok: true,
             value: {
@@ -438,7 +454,7 @@ test("Resume revalidates committed Evidence and replans before using a changed s
     conversationId: "stale-resume-conversation", agentRunId: "stale-resume-run", sequence: 0,
   }));
   await completed;
-  assert.deepEqual(resumedTools.slice(0, 2), ["agent_contract_read", "vault_read"]);
+  assert.deepEqual(resumedTools.slice(0, 3), ["agent_contract_read", "planning_memory_list", "vault_read"]);
   assert.ok(resumedTools.includes("vault_search"));
   resumedSocket.close();
 });
@@ -459,6 +475,7 @@ test("an Interrupted Run resumes after the Runtime process itself restarts", asy
     firstSocket.on("message", function onMessage(data) {
       const event = JSON.parse(data.toString("utf8"));
       if (event.agentRunId !== "process-resume-run" || event.type !== "tool_call.requested") return;
+      if (respondPlanningMemoryList(firstSocket, event)) return;
       if (event.tool.name === "agent_contract_read") {
         firstSocket.send(JSON.stringify(toolResult(event, {
           ok: true,
@@ -513,6 +530,8 @@ test("an Interrupted Run resumes after the Runtime process itself restarts", asy
           type: "agent_run.resume", protocolVersion: 1, eventId: "process-explicit-resume",
           conversationId: "process-resume-conversation", agentRunId: "process-resume-run", sequence: 0,
         }));
+      } else if (processResumeStarted && respondPlanningMemoryList(resumedSocket, event)) {
+        return;
       } else if (
         processResumeStarted &&
         event.type === "tool_call.requested" &&
@@ -566,6 +585,7 @@ test("a partial model stream is discarded and its whole Provider step reruns", a
     firstSocket.on("message", function onMessage(data) {
       const event = JSON.parse(data.toString("utf8"));
       if (event.agentRunId !== "partial-resume-run") return;
+      if (respondPlanningMemoryList(firstSocket, event)) return;
       if (event.type === "tool_call.requested" && event.tool.name === "agent_contract_read") {
         firstSocket.send(JSON.stringify(toolResult(event, {
           ok: true,
@@ -605,7 +625,12 @@ test("a partial model stream is discarded and its whole Provider step reruns", a
       } else if (resumeStarted && event.type === "agent_run.delta") {
         resumedDeltas.push(event.delta);
       } else if (resumeStarted && event.type === "tool_call.requested") {
-        const result = event.tool.name === "agent_contract_read"
+        const result = event.tool.name === "planning_memory_list"
+          ? {
+              ok: true,
+              value: { type: "planning_memory_list", topics: [], truncated: false },
+            }
+          : event.tool.name === "agent_contract_read"
           ? {
               ok: true,
               value: {

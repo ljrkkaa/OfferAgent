@@ -97,6 +97,31 @@ function contractResult(event) {
   };
 }
 
+function planningMemoryListResult(event) {
+  return {
+    type: "tool_result",
+    protocolVersion: 1,
+    eventId: `memory-result-${event.toolCallId}`,
+    conversationId: event.conversationId,
+    agentRunId: event.agentRunId,
+    sequence: event.sequence,
+    toolCallId: event.toolCallId,
+    result: { ok: true, value: { type: "planning_memory_list", topics: [], truncated: false } },
+  };
+}
+
+function respondToRequiredPrelude(socket, event) {
+  if (event.type !== "tool_call.requested") return false;
+  const result = event.tool.name === "agent_contract_read"
+    ? contractResult(event)
+    : event.tool.name === "planning_memory_list"
+      ? planningMemoryListResult(event)
+      : undefined;
+  if (!result) return false;
+  socket.send(JSON.stringify(result));
+  return true;
+}
+
 function collectRun(socket, runId) {
   return new Promise((resolve, reject) => {
     const events = [];
@@ -105,9 +130,7 @@ function collectRun(socket, runId) {
       const event = JSON.parse(data.toString("utf8"));
       if (event.agentRunId !== runId) return;
       events.push(event);
-      if (event.type === "tool_call.requested" && event.tool.name === "agent_contract_read") {
-        socket.send(JSON.stringify(contractResult(event)));
-      }
+      respondToRequiredPrelude(socket, event);
       if (["agent_run.completed", "agent_run.failed", "agent_run.interrupted"].includes(event.type)) {
         clearTimeout(timeout);
         socket.off("message", onMessage);
@@ -207,7 +230,9 @@ test("cumulative acknowledgement replays only later durable events in order", as
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.deepEqual(
     replayed.filter((event) => event.agentRunId === "ack-run").map((event) => event.sequence),
-    [events.at(-1).sequence],
+    events
+      .filter((event) => event.sequence > acknowledged.sequence && event.type !== "agent_run.delta")
+      .map((event) => event.sequence),
   );
   replay.close();
 });
@@ -262,9 +287,7 @@ test("duplicate Tool Results are safe and conflicting delayed results are diagno
     socket.on("message", function onMessage(data) {
       const event = JSON.parse(data.toString("utf8"));
       if (event.agentRunId !== "tool-result-run") return;
-      if (event.type === "tool_call.requested" && event.tool.name === "agent_contract_read") {
-        socket.send(JSON.stringify(contractResult(event)));
-      }
+      if (respondToRequiredPrelude(socket, event)) return;
       if (event.type === "tool_call.requested" && event.tool.name === "vault_read") {
         vaultResult = {
           type: "tool_result",
@@ -361,9 +384,7 @@ test("Vault Change recovery uses WebSocket and its former HTTP endpoint is absen
     socket.on("message", function onMessage(data) {
       const event = JSON.parse(data.toString("utf8"));
       if (event.agentRunId !== "vault-decision-run") return;
-      if (event.type === "tool_call.requested" && event.tool.name === "agent_contract_read") {
-        socket.send(JSON.stringify(contractResult(event)));
-      }
+      if (respondToRequiredPrelude(socket, event)) return;
       if (event.type === "tool_call.requested" && event.tool.name === "vault_propose_changes") {
         socket.send(JSON.stringify({
           type: "tool_result",

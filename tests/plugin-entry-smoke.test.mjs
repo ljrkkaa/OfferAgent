@@ -122,6 +122,15 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   const previousSetTimeout = globalThis.setTimeout;
   const previousClearTimeout = globalThis.clearTimeout;
   const previousDate = globalThis.Date;
+  globalThis.Date = class extends previousDate {
+    constructor(...args) {
+      super(...(args.length > 0 ? args : ["2026-07-14T12:00:00"]));
+    }
+
+    static now() {
+      return previousDate.now();
+    }
+  };
   const browserIntervals = new Map();
   const browserTimeouts = new Map();
   let nextBrowserInterval = 0;
