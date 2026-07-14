@@ -14,11 +14,13 @@ import {
 import { interviewDeduplicationEvent } from "./fake-interview-deduplication-scenario";
 import { interviewUrlIngestionEvent } from "./fake-interview-url-scenario";
 import { multiImageInterviewEvent } from "./fake-multi-image-scenario";
+import { publicInterviewResearchEvents } from "./fake-public-interview-research-scenario";
 import { toolResultFor, toolResultForAfter } from "./fake-provider-conversation";
 
 export const FAKE_SCENARIOS = [
   "interview-deduplication",
   "multi-image-interview-ingestion",
+  "public-interview-research",
   "text-interview-ingestion",
   "url-interview-ingestion",
   "single-image",
@@ -90,6 +92,10 @@ export class FakeModelProvider implements ModelProvider {
       );
     }
     if (request.instructions === "This is a minimal Vision Capability probe. Reply only OK.") {
+      yield { type: "output_text.delta", delta: "OK" };
+      return;
+    }
+    if (request.instructions === "This is a minimal capability probe. Reply only OK and do not search.") {
       yield { type: "output_text.delta", delta: "OK" };
       return;
     }
@@ -229,6 +235,15 @@ export class FakeModelProvider implements ModelProvider {
         this.#toolCallSequence += 1;
         return `${prefix}-${this.#toolCallSequence}`;
       });
+      return;
+    }
+    if (this.#scenario === "public-interview-research") {
+      for (const event of publicInterviewResearchEvents(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      })) {
+        yield event;
+      }
       return;
     }
     if (this.#scenario === "text-interview-ingestion") {

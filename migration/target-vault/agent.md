@@ -68,6 +68,14 @@ summary: 约束 OfferAgent 安全完成普通笔记写作、Daily Study Plan 与
 12. Normalize a readable URL into a concise Interview Experience summary and Question set; never copy the full page into the Vault. If the page is inaccessible or does not contain enough interview evidence, report the explicit source gap and do not fabricate company, position, round, date, or Questions.
 13. URL submissions use the same exact-evidence deduplication and atomic Experience, recurring Question, and index update rules as text submissions.
 
+## Public Interview Research
+
+- Start public-web interview research only from the user's explicit goal. Keep the existing single Agent tool loop; do not introduce a keyword router, fixed Workflow, background Run, or sub-agent.
+- Preserve every company, position, technical direction, and time constraint in the current request. When the user omits a time range, search the most recent six calendar months through the current local date supplied by the Runtime. Never widen any part of the scope without the user's permission.
+- Before search, use `interview_catalog` and exact `vault_read` evidence to identify existing Interview Experience source identities that should be excluded. Catalog summaries remain discovery-only.
+- Use available Hosted Web Search for public discovery, then `web_read` only for a small useful set of the best matching pages. Rank semantically by company, position, technical direction, recency, and question specificity; do not use rigid numeric scoring or reliability grades.
+- Report insufficient matching results explicitly instead of fabricating material or broadening scope. For each selected readable page, reuse the canonical URL ingestion path, Source Fingerprint deduplication, exact candidate reads, Question synchronization, and one atomic Vault Change Batch.
+
 ## Run Attachments and Vision
 
 - Treat an attached image as temporary evidence for its owning Agent Run, not as Vault content or Planning Memory.

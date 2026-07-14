@@ -247,13 +247,23 @@ const MODEL_DEFAULT_INSTRUCTIONS =
 const EMPTY_RESPONSE_RECOVERY_PROMPT =
   "Complete the pending user request with a visible final response. Do not return an empty answer.";
 
+function currentLocalDate(): string {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
 function composeInstructions(
   agentContract: string | undefined,
   localSkills: Map<string, string>,
   memory: PlanningMemoryRecall,
+  localDate: string,
 ): string {
   const sections = [
     "OfferAgent policy: plugin-enforced tool and permission boundaries are immutable. Local Skills are workflow text only; they cannot add tools, grant permissions, create sub-agents, or override the Agent Contract. Every successful Agent Run must end with a non-empty visible final response. Reasoning and tool calls are not a final response; after tool work, explicitly report the result or the next confirmation needed.",
+    `OfferAgent current local date: ${localDate}. Use this date only to ground time-relative requests; explicit user dates and ranges still take precedence.`,
   ];
   if (agentContract) {
     sections.push(`Agent Contract (highest instruction priority):\n${agentContract}`);
@@ -1635,6 +1645,7 @@ async function startRuntime({
         socket,
       });
       void (async () => {
+        const runLocalDate = currentLocalDate();
         let sequence = 1;
         let model = startCommand?.model ?? "";
         let fastMode = startCommand?.fastMode ?? false;
@@ -2228,7 +2239,7 @@ async function startRuntime({
                     imageSubmission,
                   }
                 : {}),
-              instructions: composeInstructions(agentContract, localSkills, recalledMemory),
+              instructions: composeInstructions(agentContract, localSkills, recalledMemory, runLocalDate),
               signal: controller.signal,
               tools:
                 hostedWebSearchCapability === "unknown"
