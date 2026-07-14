@@ -69,6 +69,13 @@ def _ripgrep_executable() -> Path:
     return Path(executable).resolve(strict=True)
 
 
+def _powershell_executable() -> Path:
+    executable = shutil.which("powershell.exe")
+    if executable is None:
+        pytest.fail("PowerShell is required for the production Worker integration fixture")
+    return Path(executable).resolve(strict=True)
+
+
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="production transport conformance requires Windows")
 
 
@@ -348,6 +355,7 @@ async def native_production_application(
             start_native_transports=True,
             runtime_config=HarnessConfig.model_validate({"ui": {"loopback_web_enabled": True}}),
             ripgrep_path=_ripgrep_executable(),
+            powershell_path=_powershell_executable(),
         ),
     )
     entrypoint = WorkerEntrypoint(root)

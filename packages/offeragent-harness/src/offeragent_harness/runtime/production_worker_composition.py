@@ -334,6 +334,7 @@ class ProductionWorkerOverrides:
     skill_trust_verifier: SkillTrustVerifier | None = None
     skill_runtime_root: Path | None = None
     ripgrep_path: Path | None = None
+    powershell_path: Path | None = None
     skill_user_home: Path | None = None
     process_supervisor: _WorkerProcessSupervisor | None = None
     process_executable_profiles: tuple[ProcessExecutableProfile, ...] = ()
@@ -3504,6 +3505,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
         powershell_executor = PowerShellToolExecutor(
             workspace_id=workspace_id,
             workspace_root=bootstrap.canonical_root,
+            executable=_require_powershell_path(self._overrides.powershell_path),
         )
         event_hub = _EventHub()
         buffered = BufferedEventSink(
@@ -4111,6 +4113,33 @@ def _require_ripgrep_path(value: Path | None) -> Path:
     return executable
 
 
+def _trusted_windows_powershell() -> Path:
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        raise ProductionWorkerError("SystemRoot is unavailable in the trusted Worker environment")
+    try:
+        root = Path(system_root).resolve(strict=True)
+        executable = (root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe").resolve(strict=True)
+        executable.relative_to(root)
+    except (OSError, ValueError) as error:
+        raise ProductionWorkerError("trusted Windows PowerShell is unavailable") from error
+    if not executable.is_file() or executable.name.casefold() != "powershell.exe":
+        raise ProductionWorkerError("trusted Windows PowerShell is invalid")
+    return executable
+
+
+def _require_powershell_path(value: Path | None) -> Path:
+    if value is None:
+        raise ProductionWorkerError("Worker composition has no trusted Windows PowerShell image")
+    try:
+        executable = value.resolve(strict=True)
+    except OSError as error:
+        raise ProductionWorkerError("trusted Windows PowerShell is unavailable") from error
+    if not executable.is_file() or executable.name.casefold() != "powershell.exe":
+        raise ProductionWorkerError("trusted Windows PowerShell is invalid")
+    return executable
+
+
 def _installed_release_trust() -> InstalledReleaseManifestTrust:
     from offeragent_harness.runtime.release_manifest import (
         ReleaseKeyring,
@@ -4178,6 +4207,7 @@ async def _run_worker(
     if release.manifest.runtime_version != command.runtime_version:
         raise ProductionWorkerError("Runtime version differs from Host launch identity")
     ripgrep_path = _verified_packaged_ripgrep(release)
+    powershell_path = _trusted_windows_powershell()
     clock = SystemClock()
     ids = SecureIdGenerator()
     registration_uow = SqliteUnitOfWorkFactory(bootstrap.state_directory / "state.sqlite")
@@ -4224,6 +4254,7 @@ async def _run_worker(
             skill_runtime_root=release.version_directory,
             skill_trust_verifier=skill_trust_verifier,
             ripgrep_path=ripgrep_path,
+            powershell_path=powershell_path,
         ),
     )
     from offeragent_harness.runtime.worker_entrypoint import WorkerEntrypoint

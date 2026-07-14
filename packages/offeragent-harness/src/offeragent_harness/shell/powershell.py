@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
@@ -85,18 +84,15 @@ _DEFINITION = ToolDefinition(
 class PowerShellToolExecutor:
     """Execute through a discovered PowerShell binary, never through ``shell=True``."""
 
-    def __init__(self, *, workspace_id: str, workspace_root: Path, executable: str | None = None) -> None:
+    def __init__(self, *, workspace_id: str, workspace_root: Path, executable: str | Path) -> None:
         if not workspace_id:
             raise ValueError("workspace_id must not be empty")
         root = workspace_root.resolve(strict=True)
         if not root.is_dir():
             raise ValueError("PowerShell workspace root must be a directory")
-        candidate = executable or shutil.which("powershell.exe")
-        if candidate is None:
-            raise ValueError("PowerShell executable is required")
-        path = Path(candidate).resolve(strict=True)
-        if not path.is_file():
-            raise ValueError("PowerShell executable is not a file")
+        path = Path(executable).resolve(strict=True)
+        if not path.is_file() or path.name.casefold() != "powershell.exe":
+            raise ValueError("PowerShell executable is invalid")
         self._workspace_id = workspace_id
         self._root = root
         self._executable = path

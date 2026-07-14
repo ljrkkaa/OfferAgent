@@ -49,6 +49,13 @@ def _ripgrep_executable() -> Path:
     return Path(executable).resolve(strict=True)
 
 
+def _powershell_executable() -> Path:
+    executable = shutil.which("powershell.exe")
+    if executable is None:
+        raise RuntimeError("PowerShell is required for the production Worker integration fixture")
+    return Path(executable).resolve(strict=True)
+
+
 class _CrashRecoveryModel:
     def __init__(self) -> None:
         self.planning_requests = 0
@@ -174,6 +181,7 @@ def _composition(root: Path, barrier: _CrashAndRecoveryBarrier, model: _CrashRec
             runtime_config=runtime_config,
             vault_cas_barrier=cast(VaultCasBarrier, barrier),
             ripgrep_path=_ripgrep_executable(),
+            powershell_path=_powershell_executable(),
         ),
     )
     return WorkerEntrypoint(_ObservedCompositionRoot(composition, barrier))
