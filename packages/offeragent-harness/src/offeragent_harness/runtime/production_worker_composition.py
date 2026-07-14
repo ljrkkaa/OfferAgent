@@ -2800,9 +2800,9 @@ class ProductionWorkerApplication(WorkerApplication):
 
     @property
     def protocol_capabilities(self) -> CapabilitySet:
-        """Advertise optional Web support only when its listener is actually live."""
+        """Expose the fixed Runtime protocol surface, independent of Workspace policy."""
 
-        return _protocol_capabilities(loopback_web=self.loopback is not None)
+        return _protocol_capabilities()
 
     async def _emit_runtime_log(
         self,
@@ -3879,7 +3879,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             host_pid=host_pid,
             worker_pid=os.getpid(),
             runtime_arch=_runtime_arch(),
-            capabilities=_protocol_capabilities(loopback_web=False),
+            capabilities=_protocol_capabilities(),
             build_commit=self._build_commit,
             capabilities_provider=lambda: application_holder["application"].protocol_capabilities,
         )
@@ -3964,7 +3964,7 @@ async def _runtime_status(
     )
 
 
-def _protocol_capabilities(*, loopback_web: bool) -> CapabilitySet:
+def _protocol_capabilities() -> CapabilitySet:
     return CapabilitySet(
         client_tools=True,
         event_replay=True,
@@ -3976,7 +3976,7 @@ def _protocol_capabilities(*, loopback_web: bool) -> CapabilitySet:
         headless_vault_write=True,
         subagents=True,
         artifacts=True,
-        loopback_web=loopback_web,
+        loopback_web=True,
         reverse_requests=True,
         content_blocks=True,
         cancellation=True,

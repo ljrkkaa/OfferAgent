@@ -8,6 +8,7 @@ import pytest
 
 from offeragent_harness.runtime import development_composition, production_host_composition
 from offeragent_harness.runtime.host_supervisor import RestartPolicy
+from offeragent_harness.runtime.production_worker_composition import _protocol_capabilities
 
 
 def test_development_host_overrides_only_worker_cold_start_budget(
@@ -49,3 +50,10 @@ def test_signed_composition_keeps_shared_host_policy_default() -> None:
         "worker_restart_policy"
     ]
     assert parameter.default is None
+
+
+def test_protocol_capabilities_are_structural_not_workspace_policy() -> None:
+    capabilities = _protocol_capabilities()
+
+    assert capabilities.loopback_web is True
+    assert capabilities.event_replay is True
