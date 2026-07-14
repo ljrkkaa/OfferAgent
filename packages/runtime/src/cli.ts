@@ -42,8 +42,12 @@ import { RuntimeStateStore, type RunCheckpoint } from "./state-store";
 import { WebReader } from "./web-read";
 import { CapabilityGatedModelProvider } from "./capability-gated-provider";
 import {
+  buildMemoryChangeActions,
   PlanningMemoryModule,
+  ProviderSemanticMemoryCapture,
   ProviderSemanticMemorySelector,
+  type MemoryCaptureOperation,
+  type MemoryTopicMetadata,
   type PlanningMemoryRecall,
 } from "./planning-memory";
 
@@ -134,7 +138,7 @@ const LOCAL_TOOLS: LocalToolDefinition[] = [
     kind: "local",
     name: "vault_propose_changes",
     description:
-      "Propose one atomic, user-visible Vault Change Batch. This never writes directly; the plugin validates and applies or rejects the whole batch.",
+      "Propose one atomic, user-visible Vault Change Batch. This never writes directly; the plugin validates and applies or rejects the whole batch. Delete is restricted to superseded Planning Memory topics and requires the concise index in the same batch.",
     parameters: {
       type: "object",
       additionalProperties: false,
@@ -151,7 +155,7 @@ const LOCAL_TOOLS: LocalToolDefinition[] = [
             properties: {
               actionId: { type: "string", minLength: 1, maxLength: 128 },
               idempotencyKey: { type: "string", minLength: 1, maxLength: 128 },
-              operation: { type: "string", enum: ["create", "append", "exact_replace"] },
+              operation: { type: "string", enum: ["create", "append", "delete", "exact_replace"] },
               path: { type: "string", minLength: 1, maxLength: 512 },
               expectedVersion: { type: "string", minLength: 1, maxLength: 256 },
               content: { type: "string" },
@@ -1430,6 +1434,19 @@ async function startRuntime({
           const checkpointSkills = new Set(checkpoint?.localSkills ?? []);
           const localSkills = new Map<string, string>();
           let recalledMemory: PlanningMemoryRecall = { feedback: [], planning: [] };
+          let planningTopics: MemoryTopicMetadata[] = [];
+          let planningTopicsTruncated = false;
+          let memoryHandledByMain = checkpoint?.memoryHandledByMain ?? false;
+          const changedMemoryPaths = new Set(checkpoint?.changedMemoryPaths ?? []);
+          let postResponseOutput = checkpoint?.postResponseOutput;
+          let postResponseCitations = checkpoint?.postResponseCitations ?? [];
+          let resumeAfterFallback = Boolean(
+            checkpoint?.postResponseOutput !== undefined && !checkpoint.pendingToolStep,
+          );
+          if (resumeAfterFallback) {
+            output = postResponseOutput ?? "";
+            citations.push(...postResponseCitations);
+          }
           let completedSteps = checkpoint?.completedSteps ?? 0;
           let pendingToolStep = checkpoint?.pendingToolStep;
           const currentCheckpoint = (): RunCheckpoint => ({
@@ -1442,6 +1459,10 @@ async function startRuntime({
               hostedWebSearchProbeAttempted,
               ...(fastMode ? { fastMode: true } : {}),
               completedSteps,
+              ...(memoryHandledByMain ? { memoryHandledByMain: true } : {}),
+              ...(changedMemoryPaths.size > 0 ? { changedMemoryPaths: [...changedMemoryPaths] } : {}),
+              ...(postResponseOutput !== undefined ? { postResponseOutput } : {}),
+              ...(postResponseCitations.length > 0 ? { postResponseCitations } : {}),
           });
           const saveCheckpoint = async (): Promise<void> => {
             await store.saveRunCheckpoint(runCommand.agentRunId, currentCheckpoint());
@@ -1480,12 +1501,32 @@ async function startRuntime({
               recoveredResult = recovered.result;
             }
             if (recoveredResult) {
-              input.push({
-                type: "local_tool_result",
-                callId: pendingToolStep.providerCallId,
-                result: recoveredResult,
-              });
+              const recoveredFallback = pendingToolStep.providerCallId.startsWith("memory-fallback-");
+              if (!recoveredFallback) {
+                input.push({
+                  type: "local_tool_result",
+                  callId: pendingToolStep.providerCallId,
+                  result: recoveredResult,
+                });
+              }
               completedSteps = pendingToolStep.completedSteps;
+              if (
+                recoveredFallback &&
+                recoveredResult.ok && recoveredResult.value.type === "vault_propose_changes" &&
+                recoveredResult.value.decision === "applied"
+              ) {
+                memoryHandledByMain = true;
+                for (const { path } of recoveredResult.value.targets) {
+                  if (/^memory\/(?:user|feedback|project|study)\/[^/]+\.md$/.test(path)) {
+                    changedMemoryPaths.add(path);
+                  }
+                }
+              }
+              if (recoveredFallback) {
+                output = postResponseOutput ?? "";
+                citations.splice(0, citations.length, ...postResponseCitations);
+                resumeAfterFallback = true;
+              }
             } else {
               input = input.filter(
                 (item) =>
@@ -1674,9 +1715,15 @@ async function startRuntime({
           const planningMemory = new PlanningMemoryModule({
             listTopics: async () => {
               const listed = await executeLocalTool("planning_memory_list", {});
-              return listed.result.ok && listed.result.value.type === "planning_memory_list"
+              planningTopics = listed.result.ok && listed.result.value.type === "planning_memory_list"
                 ? listed.result.value.topics
                 : [];
+              planningTopicsTruncated = Boolean(
+                listed.result.ok &&
+                listed.result.value.type === "planning_memory_list" &&
+                listed.result.value.truncated,
+              );
+              return planningTopics;
             },
             readTopics: async (paths) => {
               const read = await executeLocalTool("planning_memory_read", { paths });
@@ -1743,7 +1790,7 @@ async function startRuntime({
             }
           }
           let finished = false;
-          for (let step = completedSteps; step < 8; step += 1) {
+          for (let step = completedSteps; !resumeAfterFallback && step < 8; step += 1) {
             output = "";
             citations.length = 0;
             let requestedTool = false;
@@ -1913,6 +1960,15 @@ async function startRuntime({
                 callId: providerEvent.callId,
                 result: providerResult,
               });
+              if (result.ok && result.value.type === "vault_propose_changes") {
+                const memoryPaths = result.value.targets
+                  .map(({ path }) => path)
+                  .filter((path) => /^memory\/(?:user|feedback|project|study)\/[^/]+\.md$/.test(path));
+                if (memoryPaths.length > 0 && result.value.decision === "applied") {
+                  memoryHandledByMain = true;
+                    for (const path of memoryPaths) changedMemoryPaths.add(path);
+                }
+              }
               completedSteps = step + 1;
               await saveCheckpoint();
               if (providerEvent.name === "skill_read" && !skillWasLoaded) break;
@@ -1924,6 +1980,83 @@ async function startRuntime({
                 "provider_error",
                 `Vault evidence changed. Reread ${[...requiredRereads].join(", ")} before continuing.`,
               );
+            }
+
+            if (!memoryHandledByMain && !planningTopicsTruncated) {
+              const capture = new ProviderSemanticMemoryCapture({
+                provider,
+                model,
+                fastMode,
+                signal: controller.signal,
+              });
+              const recalledTopics = [...recalledMemory.feedback, ...recalledMemory.planning];
+              let operations: MemoryCaptureOperation[] = [];
+              try {
+                operations = await capture.extract({
+                  newMessages: [
+                    { type: "user_message", text: userInput },
+                    { type: "assistant_message", text: output },
+                  ],
+                  recalledTopics,
+                });
+              } catch {
+                operations = [];
+              }
+              if (operations.length > 0) {
+                const indexRead = await executeLocalTool("vault_read", { path: "memory/MEMORY.md" });
+                const index = indexRead.result.ok && indexRead.result.value.type === "vault_read"
+                  ? {
+                      content: indexRead.result.value.content,
+                      modifiedVersion: indexRead.result.value.modifiedVersion,
+                    }
+                  : undefined;
+                const change = buildMemoryChangeActions({
+                  operations,
+                  topics: planningTopics,
+                  bodies: recalledTopics,
+                  index,
+                });
+                if (change) {
+                  postResponseOutput = output;
+                  postResponseCitations = [...citations];
+                  const memoryBatchId = `planning-memory-${randomUUID()}`;
+                  const fallbackProviderCallId = `memory-fallback-${randomUUID()}`;
+                  const proposed = await executeLocalTool("vault_propose_changes", {
+                    batchId: memoryBatchId,
+                    idempotencyKey: memoryBatchId,
+                    task: "Consolidate durable Planning Memory from this Agent Run",
+                    actions: change.actions.map((action, index) => ({
+                      ...action,
+                      actionId: `${action.actionId}-${index + 1}-${runCommand.agentRunId}`,
+                      idempotencyKey: `${action.idempotencyKey}-${index + 1}-${runCommand.agentRunId}`,
+                    })),
+                  }, { completedSteps, providerCallId: fallbackProviderCallId });
+                  pendingToolStep = undefined;
+                  if (
+                    proposed.result.ok &&
+                    proposed.result.value.type === "vault_propose_changes" &&
+                    proposed.result.value.decision === "applied"
+                  ) {
+                    for (const path of change.changedPaths) changedMemoryPaths.add(path);
+                    memoryHandledByMain = true;
+                  }
+                  await saveCheckpoint();
+                }
+              }
+            }
+
+            if (changedMemoryPaths.size > 0) {
+              const notice = `\n\nPlanning Memory updated: ${[...changedMemoryPaths].join(", ")}`;
+              output += notice;
+              await store.advanceAgentRunSequence(runCommand.agentRunId, sequence);
+              publishEvent({
+                ...base,
+                type: "agent_run.delta",
+                eventId: randomUUID(),
+                sequence,
+                delta: notice,
+              });
+              sequence += 1;
             }
 
             const completedEvent: Extract<AgentRunEvent, { type: "agent_run.completed" }> = {
@@ -1943,6 +2076,37 @@ async function startRuntime({
             publishEvent(completedEvent);
             finished = true;
             break;
+          }
+          if (resumeAfterFallback && !finished) {
+            if (changedMemoryPaths.size > 0) {
+              const notice = `\n\nPlanning Memory updated: ${[...changedMemoryPaths].join(", ")}`;
+              output += notice;
+              await store.advanceAgentRunSequence(runCommand.agentRunId, sequence);
+              publishEvent({
+                ...base,
+                type: "agent_run.delta",
+                eventId: randomUUID(),
+                sequence,
+                delta: notice,
+              });
+              sequence += 1;
+            }
+            const completedEvent: Extract<AgentRunEvent, { type: "agent_run.completed" }> = {
+              ...base,
+              type: "agent_run.completed",
+              eventId: randomUUID(),
+              sequence,
+              output: {
+                role: "assistant",
+                text: output,
+                ...(citations.some((citation) => citation.endIndex <= output.length)
+                  ? { citations: citations.filter((citation) => citation.endIndex <= output.length) }
+                  : {}),
+              },
+            };
+            await store.completeAgentRun(runCommand.agentRunId, output, completedEvent);
+            publishEvent(completedEvent);
+            finished = true;
           }
           if (!finished) {
             throw new Error("The Agent Run exceeded the maximum of 8 Provider steps.");

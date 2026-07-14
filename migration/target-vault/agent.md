@@ -20,7 +20,7 @@ summary: 约束 OfferAgent 安全完成普通笔记写作、Daily Study Plan 与
 - `Read Only` 禁止 Vault 修改，但允许读取、规划和 Planning Memory 召回。
 - `Ask Every Time` 对一个语义批次进行一次整体确认。
 - `Trusted Vault` 可自动应用普通内容的合规批次；`agent.md`、`.codex/**`、`.obsidian/**` 等控制文件在所有模式下都必须明确确认。
-- OfferAgent 是单 Agent 系统；不存在 shell、任意代码执行、删除、移动或子 Agent 能力。
+- OfferAgent 是单 Agent 系统；不存在 shell、任意代码执行、普通 Vault 文件删除、移动或子 Agent 能力。仅允许在 Planning Memory 合并或纠正时删除已被取代的 Memory Topic。
 
 ## 可用能力
 
@@ -30,6 +30,15 @@ summary: 约束 OfferAgent 安全完成普通笔记写作、Daily Study Plan 与
 - `web_read` 与可用时的托管 Web Search：仅在任务需要外部来源时使用。
 - `vault_propose_changes`：提交有界、可审查、全有或全无的 Vault Change Batch。
 - Planning Memory 默认启用并按当前请求与 Conversation Context 自动召回最多五个相关主题；不要要求用户另行启用，也不要把完整索引或无关主题塞入上下文。
+
+## Planning Memory 写入
+
+- 只把跨 Conversation 仍有效的 User、Feedback、Project 或 Study 理解写入 `memory/{user,feedback,project,study}/`；`memory/MEMORY.md` 只保留简短链接索引。
+- 主 Agent 可在当前 Run 内通过一个授权的 Vault Change Batch 创建、更新或删除 Memory Topic。每个 Topic 使用 `name`、`description`、`type` frontmatter，其中 `name` 与 `description` 使用非空 JSON 引号字符串；Topic 与项目符号 Markdown 链接索引必须在同一批次修改。
+- 相关事实合并进现有语义 Topic；纠正应替换或移除已失效理解，不按消息累积文件。历史由 Git checkpoint 保留。
+- 若主 Agent 本轮没有处理记忆，Runtime 可只检查本轮新增的用户与 Agent 消息并进行一次语义兜底；兜底不得修改 `memory/**` 之外的路径。
+- 记忆写入仍受权限、版本、预览、checkpoint、全批次回滚和 guarded undo 约束；实际应用后向用户显示简短的 Memory Topic 更新提示。
+- 不引入 freshness score、到期策略、按年龄删除、自动晋升到 Agent Contract 或后台 dreaming。
 
 ## 普通笔记写作
 

@@ -56,10 +56,14 @@ function runWithToolPeer(
   resultForCall,
   memoryTopics = [],
   contractContent = "# Test Agent Contract",
+  memoryTruncated = false,
 ) {
   return new Promise((resolve, reject) => {
     const events = [];
-    const timeout = setTimeout(() => reject(new Error("Agent tool loop timed out")), 10_000);
+    const timeout = setTimeout(
+      () => reject(new Error(`Agent tool loop timed out: ${JSON.stringify(events.slice(-8))}`)),
+      20_000,
+    );
     socket.on("message", function onMessage(data) {
       const event = JSON.parse(data.toString("utf8"));
       if (event.agentRunId !== requestPayload.agentRunId) return;
@@ -78,7 +82,7 @@ function runWithToolPeer(
                 },
               }
             : event.tool.name === "planning_memory_list"
-              ? { ok: true, value: { type: "planning_memory_list", topics: memoryTopics, truncated: false } }
+              ? { ok: true, value: { type: "planning_memory_list", topics: memoryTopics, truncated: memoryTruncated } }
               : resultForCall(event);
         socket.send(
           JSON.stringify({
@@ -219,6 +223,145 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
     "failed",
   );
   assert.equal(failedToolEvents.at(-1).type, "agent_run.completed");
+
+  let memoryProposal;
+  const memoryCaptureEvents = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "memory-capture-start",
+      conversationId: "memory-capture-conversation",
+      agentRunId: "memory-capture-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "I will study retrieval evaluation across the next three days." },
+    },
+    (event) => {
+      if (event.tool.name === "vault_read") {
+        assert.equal(event.tool.arguments.path, "memory/MEMORY.md");
+        return { ok: false, error: { code: "not_found", message: "Memory index is missing." } };
+      }
+      if (event.tool.name === "vault_propose_changes") {
+        memoryProposal = event.tool.arguments;
+        return {
+          ok: true,
+          value: {
+            type: "vault_propose_changes",
+            batchId: memoryProposal.batchId,
+            decision: "applied",
+            checkpointRef: `refs/offeragent/checkpoints/${memoryProposal.batchId}`,
+            targets: memoryProposal.actions.map(({ path }) => ({
+              path,
+              beforeHash: "missing",
+              afterHash: "sha256:after",
+            })),
+          },
+        };
+      }
+      throw new Error(`Unexpected memory capture tool ${event.tool.name}`);
+    },
+  );
+  assert.deepEqual(
+    memoryProposal.actions.map(({ path }) => path),
+    ["memory/study/retrieval-evaluation.md", "memory/MEMORY.md"],
+  );
+  assert.match(memoryCaptureEvents.at(-1).output.text, /Planning Memory updated/);
+  assert.match(memoryCaptureEvents.at(-1).output.text, /memory\/study\/retrieval-evaluation\.md/);
+
+  let foregroundProposals = 0;
+  const foregroundEvents = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "memory-foreground-start",
+      conversationId: "memory-foreground-conversation",
+      agentRunId: "memory-foreground-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "planning_memory_foreground" },
+    },
+    (event) => {
+      assert.equal(event.tool.name, "vault_propose_changes");
+      foregroundProposals += 1;
+      return {
+        ok: true,
+        value: {
+          type: "vault_propose_changes",
+          batchId: event.tool.arguments.batchId,
+          decision: "applied",
+          checkpointRef: `refs/offeragent/checkpoints/${event.tool.arguments.batchId}`,
+          targets: event.tool.arguments.actions.map(({ path }) => ({
+            path,
+            beforeHash: "missing",
+            afterHash: "sha256:after",
+          })),
+        },
+      };
+    },
+  );
+  assert.equal(foregroundProposals, 1, "semantic fallback must not duplicate foreground memory writes");
+  assert.match(foregroundEvents.at(-1).output.text, /Planning Memory updated/);
+
+  const truncatedEvents = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "memory-truncated-start",
+      conversationId: "memory-truncated-conversation",
+      agentRunId: "memory-truncated-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "I will study retrieval evaluation across the next three days." },
+    },
+    (event) => { throw new Error(`Truncated memory listing must suppress capture, got ${event.tool.name}`); },
+    [],
+    "# Test Agent Contract",
+    true,
+  );
+  assert.doesNotMatch(truncatedEvents.at(-1).output.text, /Planning Memory updated/);
+
+  let rejectedForegroundProposals = 0;
+  const rejectedForegroundEvents = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "memory-rejected-start",
+      conversationId: "memory-rejected-conversation",
+      agentRunId: "memory-rejected-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "planning_memory_foreground" },
+    },
+    (event) => {
+      if (event.tool.name === "vault_read") {
+        return { ok: false, error: { code: "not_found", message: "Memory index is missing." } };
+      }
+      rejectedForegroundProposals += 1;
+      const decision = rejectedForegroundProposals === 1 ? "rejected" : "applied";
+      return {
+        ok: true,
+        value: {
+          type: "vault_propose_changes",
+          batchId: event.tool.arguments.batchId,
+          decision,
+          ...(decision === "applied"
+            ? { checkpointRef: `refs/offeragent/checkpoints/${event.tool.arguments.batchId}` }
+            : {}),
+          targets: event.tool.arguments.actions.map(({ path }) => ({
+            path,
+            beforeHash: "missing",
+            afterHash: "sha256:after",
+          })),
+        },
+      };
+    },
+  );
+  assert.equal(rejectedForegroundProposals, 2, JSON.stringify(rejectedForegroundEvents));
+  assert.match(rejectedForegroundEvents.at(-1).output.text, /Planning Memory updated/);
 
   const webReadEvents = await runWithToolPeer(
     socket,
@@ -523,7 +666,7 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
   const database = new SQL.Database(await readFile(statePath));
   assert.deepEqual(
     database.exec(
-      "SELECT status FROM tool_calls WHERE name IN ('vault_read', 'vault_search') ORDER BY agent_run_id",
+      "SELECT status FROM tool_calls WHERE conversation_id = 'tool-conversation' AND name IN ('vault_read', 'vault_search') ORDER BY agent_run_id",
     )[0].values,
     [["completed"], ["failed"], ["completed"], ["completed"]],
   );
@@ -535,7 +678,9 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
   assert.deepEqual(
     database.exec(
       `SELECT id, idempotency_key, state, checkpoint_ref
-       FROM vault_change_batches ORDER BY created_at, id`,
+       FROM vault_change_batches
+       WHERE id IN ('batch-applied', 'batch-rejected')
+       ORDER BY created_at, id`,
     )[0].values,
     [
       [
@@ -563,8 +708,12 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
     (await readFile(statePath)).includes(Buffer.from("first\nsecond\nthird\nfourth")),
     false,
   );
+  assert.equal(
+    (await readFile(statePath)).includes(Buffer.from("Study retrieval evaluation across the next three days")),
+    false,
+  );
   database.run("PRAGMA foreign_keys = ON");
-  database.run("DELETE FROM conversations WHERE id = 'tool-conversation'");
+  database.run("DELETE FROM conversations");
   for (const table of ["tool_calls", "evidence_snapshots"]) {
     assert.equal(database.exec(`SELECT COUNT(*) FROM ${table}`)[0].values[0][0], 0);
   }

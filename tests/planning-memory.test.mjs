@@ -6,7 +6,12 @@ import { fileURLToPath } from "node:url";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
-const { PlanningMemoryModule } = require(
+const {
+  buildMemoryChangeActions,
+  PlanningMemoryModule,
+  ProviderSemanticMemoryCapture,
+  validateCaptureOperations,
+} = require(
   path.join(repositoryRoot, "packages", "runtime", "dist", "planning-memory.js"),
 );
 
@@ -108,4 +113,97 @@ test("recall rejects selector paths and stale or oversized topic bodies", async 
     feedback: [],
     planning: [],
   });
+});
+
+test("semantic capture receives only current-run messages and validates confined typed operations", async () => {
+  const requests = [];
+  const capture = new ProviderSemanticMemoryCapture({
+    provider: {
+      stream: async function* (request) {
+        requests.push(request);
+        yield { type: "output_text.delta", delta: JSON.stringify([{
+          kind: "upsert",
+          path: "memory/study/retrieval.md",
+          type: "study",
+          name: "Retrieval",
+          description: "Cross-day direction",
+          content: "Continue retrieval evaluation tomorrow.",
+        }]) };
+      },
+    },
+    model: "test",
+    fastMode: false,
+    signal: new AbortController().signal,
+  });
+  const operations = await capture.extract({
+    newMessages: [
+      { type: "user_message", text: "new user message" },
+      { type: "assistant_message", text: "new assistant message" },
+    ],
+    recalledTopics: [],
+  });
+  assert.equal(operations[0].path, "memory/study/retrieval.md");
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].tools, []);
+  assert.match(requests[0].input[0].text, /new user message/);
+  assert.doesNotMatch(requests[0].input[0].text, /older conversation/);
+  assert.deepEqual(validateCaptureOperations([{ kind: "delete", path: "../outside.md" }]), []);
+});
+
+test("capture batches consolidate, delete, and keep the concise index atomic", () => {
+  const existing = {
+    path: "memory/study/old.md",
+    type: "study",
+    name: "Old",
+    description: "Superseded direction",
+    modifiedVersion: "v1",
+    content: "---\nname: Old\ndescription: Superseded direction\ntype: study\n---\nOld direction.\n",
+  };
+  const change = buildMemoryChangeActions({
+    operations: [
+      { kind: "delete", path: existing.path },
+      {
+        kind: "upsert",
+        path: "memory/study/current.md",
+        type: "study",
+        name: "Current",
+        description: "Current direction",
+        content: "Current consolidated direction.",
+      },
+    ],
+    topics: [existing],
+    bodies: [existing],
+    index: { content: "# Planning Memory\n\n- [Old](study/old.md) - Superseded direction\n", modifiedVersion: "index-v1" },
+  });
+  assert.deepEqual(change.changedPaths, ["memory/study/old.md", "memory/study/current.md"]);
+  assert.equal(change.actions[0].operation, "delete");
+  assert.equal(change.actions[1].operation, "create");
+  assert.equal(change.actions[2].path, "memory/MEMORY.md");
+  assert.match(change.actions[2].replacement, /study\/current\.md/);
+  assert.doesNotMatch(change.actions[2].replacement, /study\/old\.md/);
+});
+
+test("identical semantic capture is a no-op without a redundant checkpoint batch", () => {
+  const content = "---\nname: \"Retrieval\"\ndescription: \"Current direction\"\ntype: study\n---\n\nContinue retrieval.\n";
+  const existing = {
+    path: "memory/study/retrieval.md",
+    type: "study",
+    name: "Retrieval",
+    description: "Current direction",
+    modifiedVersion: "v1",
+    content,
+  };
+  assert.equal(buildMemoryChangeActions({
+    operations: [{
+      kind: "upsert",
+      path: existing.path,
+      type: "study",
+      name: existing.name,
+      description: existing.description,
+      content: "Continue retrieval.",
+    }],
+    topics: [existing],
+    bodies: [existing],
+    index: { content: "# Planning Memory\n\n- [Retrieval](study/retrieval.md) - Current direction\n", modifiedVersion: "i1" },
+  }), undefined);
 });

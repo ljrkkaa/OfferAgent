@@ -210,6 +210,9 @@ interface VaultActionBase {
 
 export type VaultAction =
   | (VaultActionBase & {
+      operation: "delete";
+    })
+  | (VaultActionBase & {
       content: string;
       operation: "append" | "create";
     })

@@ -6,7 +6,11 @@ import {
   type ModelRequest,
   type ModelStreamEvent,
 } from "./model-provider";
-import { MEMORY_SELECTOR_INSTRUCTIONS, type MemorySelectionInput } from "./planning-memory";
+import {
+  MEMORY_CAPTURE_INSTRUCTIONS,
+  MEMORY_SELECTOR_INSTRUCTIONS,
+  type MemorySelectionInput,
+} from "./planning-memory";
 
 function findLatest<T extends ModelConversationItem>(
   input: ModelConversationItem[],
@@ -48,6 +52,29 @@ export class FakeModelProvider implements ModelProvider {
       (item): item is Extract<ModelConversationItem, { type: "user_message" }> =>
         item.type === "user_message",
     )?.text ?? "";
+    if (request.instructions === MEMORY_CAPTURE_INSTRUCTIONS) {
+      let durable = false;
+      try {
+        const payload = JSON.parse(userInput) as { newMessages?: Array<{ text?: string }> };
+        const messages = payload.newMessages?.map(({ text }) => text ?? "").join("\n") ?? "";
+        durable = /I will study retrieval evaluation across the next three days/i.test(messages) ||
+          /planning_memory_foreground/.test(messages);
+      } catch {
+        durable = false;
+      }
+      yield {
+        type: "output_text.delta",
+        delta: durable ? JSON.stringify([{
+          kind: "upsert",
+          path: "memory/study/retrieval-evaluation.md",
+          type: "study",
+          name: "Retrieval evaluation",
+          description: "Current cross-day retrieval evaluation direction",
+          content: "Study retrieval evaluation across the next three days; keep daily schedules in Daily Notes.",
+        }]) : "[]",
+      };
+      return;
+    }
     if (request.instructions === MEMORY_SELECTOR_INSTRUCTIONS) {
       let selected: string[] = [];
       try {
@@ -90,6 +117,44 @@ export class FakeModelProvider implements ModelProvider {
             ? "OfferAgent applied relevant Planning Memory to this response."
           : "OfferAgent found no relevant Planning Memory.",
       };
+      return;
+    }
+    if (userInput.trim() === "planning_memory_foreground") {
+      const applied = toolResultFor(request.input, "vault_propose_changes");
+      if (!applied) {
+        this.#toolCallSequence += 1;
+        const batchId = `foreground-memory-batch-${this.#toolCallSequence}`;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-memory-foreground-${this.#toolCallSequence}`,
+          name: "vault_propose_changes",
+          arguments: {
+            batchId,
+            idempotencyKey: batchId,
+            task: "Remember the durable project direction",
+            actions: [
+              {
+                actionId: "foreground-memory-topic",
+                idempotencyKey: "foreground-memory-topic",
+                operation: "create",
+                path: "memory/project/offeragent.md",
+                expectedVersion: "missing",
+                content: "---\nname: OfferAgent\ndescription: Current project direction\ntype: project\n---\n\nShip the local plugin.\n",
+              },
+              {
+                actionId: "foreground-memory-index",
+                idempotencyKey: "foreground-memory-index",
+                operation: "create",
+                path: "memory/MEMORY.md",
+                expectedVersion: "missing",
+                content: "# Planning Memory\n\n- [OfferAgent](project/offeragent.md) - Current project direction\n",
+              },
+            ],
+          },
+        };
+        return;
+      }
+      yield { type: "output_text.delta", delta: "Saved the durable project direction." };
       return;
     }
     const precedence = /^planning_memory_precedence\s+(\w+)$/i.exec(userInput.trim());

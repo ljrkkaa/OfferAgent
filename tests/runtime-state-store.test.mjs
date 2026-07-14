@@ -822,6 +822,33 @@ test("Run Checkpoints do not persist Agent Contract, Local Skill, or pending pro
   assert.equal(databaseText.includes(instructionMarker), false);
 });
 
+test("post-response fallback phase survives interruption for direct finalization", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-post-response-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const store = await RuntimeStateStore.open(path.join(temporaryDirectory, "state.db"));
+  await store.beginAgentRun("post-response-conversation", "post-response-run", "fake-interview-model", "remember this");
+  await store.saveRunCheckpoint("post-response-run", {
+    version: 1,
+    input: [{ type: "user_message", text: "remember this" }],
+    localSkills: [],
+    canonicalReadPaths: [],
+    requiredRereads: [],
+    hostedWebSearchProbeAttempted: false,
+    completedSteps: 1,
+    memoryHandledByMain: true,
+    changedMemoryPaths: ["memory/study/current.md"],
+    postResponseOutput: "The answer produced before fallback.",
+    postResponseCitations: [],
+  });
+  await store.interruptActiveRuns();
+  const resumed = await store.resumeAgentRun("post-response-conversation", "post-response-run");
+  assert.equal(resumed.checkpoint.postResponseOutput, "The answer produced before fallback.");
+  assert.equal(resumed.checkpoint.memoryHandledByMain, true);
+  assert.deepEqual(resumed.checkpoint.changedMemoryPaths, ["memory/study/current.md"]);
+  assert.equal(resumed.checkpoint.pendingToolStep, undefined);
+  await store.close();
+});
+
 test("a committed Tool Result remains recoverable when the following checkpoint write is lost", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-committed-tool-gap-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));

@@ -16,6 +16,7 @@ import {
   type VaultChangeTargetResult,
   type VaultChangeTransactionState,
   type VaultToolErrorCode,
+  type WebCitation,
 } from "@offeragent/protocol";
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.js";
 import type { ModelConversationItem } from "./model-provider";
@@ -30,6 +31,10 @@ export interface RunCheckpoint {
   hostedWebSearchProbeAttempted: boolean;
   input: ModelConversationItem[];
   localSkills: string[];
+  changedMemoryPaths?: string[];
+  memoryHandledByMain?: boolean;
+  postResponseCitations?: WebCitation[];
+  postResponseOutput?: string;
   pendingToolStep?: {
     completedSteps: number;
     name: ToolCallRecord["name"];
@@ -106,6 +111,16 @@ function persistedRunCheckpoint(checkpoint: RunCheckpoint): RunCheckpoint {
     requiredRereads: checkpoint.requiredRereads,
     hostedWebSearchProbeAttempted: checkpoint.hostedWebSearchProbeAttempted,
     completedSteps: checkpoint.completedSteps,
+    ...(checkpoint.memoryHandledByMain ? { memoryHandledByMain: true } : {}),
+    ...(checkpoint.changedMemoryPaths?.length
+      ? { changedMemoryPaths: [...new Set(checkpoint.changedMemoryPaths)] }
+      : {}),
+    ...(checkpoint.postResponseOutput !== undefined
+      ? { postResponseOutput: checkpoint.postResponseOutput }
+      : {}),
+    ...(checkpoint.postResponseCitations?.length
+      ? { postResponseCitations: checkpoint.postResponseCitations }
+      : {}),
     ...(checkpoint.fastMode ? { fastMode: true } : {}),
     ...(checkpoint.pendingToolStep ? { pendingToolStep: checkpoint.pendingToolStep } : {}),
   };
