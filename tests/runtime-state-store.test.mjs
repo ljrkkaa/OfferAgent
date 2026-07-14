@@ -484,6 +484,51 @@ test("concurrent first runs create their shared Conversation exactly once", asyn
   await store.close();
 });
 
+test("Conversation Context trims interleaved messages as complete Agent Run turns", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-context-turns-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const store = await RuntimeStateStore.open(path.join(temporaryDirectory, "state.db"));
+  const olderUser = "A".repeat(20_000);
+  const newerUser = "B".repeat(20_000);
+  const olderAssistant = "a".repeat(20_000);
+  const newerAssistant = "b".repeat(20_000);
+
+  await store.beginAgentRun("interleaved-context", "older-run", "model", olderUser);
+  await store.beginAgentRun("interleaved-context", "newer-run", "model", newerUser);
+  await store.completeAgentRun("newer-run", newerAssistant);
+  await store.completeAgentRun("older-run", olderAssistant);
+  await store.beginAgentRun("interleaved-context", "current-run", "model", "current");
+
+  assert.deepEqual(
+    await store.getConversationContext("interleaved-context", "current-run"),
+    [
+      { type: "user_message", text: newerUser },
+      { type: "assistant_message", text: newerAssistant },
+      { type: "user_message", text: "current" },
+    ],
+  );
+  await store.close();
+});
+
+test("Conversation Context remains bounded when completed messages are empty", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-context-empty-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const store = await RuntimeStateStore.open(
+    path.join(temporaryDirectory, "state.db"),
+    async () => {},
+  );
+  for (let index = 0; index < 1_000; index += 1) {
+    await store.beginAgentRun("empty-context", `empty-run-${index}`, "model", "");
+    await store.completeAgentRun(`empty-run-${index}`, "");
+  }
+  await store.beginAgentRun("empty-context", "empty-current", "model", "current");
+
+  const context = await store.getConversationContext("empty-context", "empty-current");
+  assert.ok(context.length < 2_001);
+  assert.deepEqual(context.at(-1), { type: "user_message", text: "current" });
+  await store.close();
+});
+
 test("a failed atomic file replacement restores the pre-transaction in-memory state", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-persist-failure-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
@@ -775,6 +820,37 @@ test("Run Checkpoints do not persist Agent Contract, Local Skill, or pending pro
   const databaseText = (await readFile(statePath)).toString("utf8");
   assert.equal(databaseText.includes(proposalMarker), false);
   assert.equal(databaseText.includes(instructionMarker), false);
+});
+
+test("post-response fallback phase survives interruption for direct finalization", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-post-response-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const store = await RuntimeStateStore.open(path.join(temporaryDirectory, "state.db"));
+  await store.beginAgentRun("post-response-conversation", "post-response-run", "fake-interview-model", "remember this");
+  await store.saveRunCheckpoint("post-response-run", {
+    version: 1,
+    input: [{ type: "user_message", text: "remember this" }],
+    localSkills: [],
+    canonicalReadPaths: [],
+    requiredRereads: [],
+    hostedWebSearchProbeAttempted: false,
+    completedSteps: 1,
+    dailyPlanApplied: true,
+    memoryHandledByMain: true,
+    resolvedDailyNotePaths: ["journal/2026-07-14.md"],
+    changedMemoryPaths: ["memory/study/current.md"],
+    postResponseOutput: "The answer produced before fallback.",
+    postResponseCitations: [],
+  });
+  await store.interruptActiveRuns();
+  const resumed = await store.resumeAgentRun("post-response-conversation", "post-response-run");
+  assert.equal(resumed.checkpoint.postResponseOutput, "The answer produced before fallback.");
+  assert.equal(resumed.checkpoint.memoryHandledByMain, true);
+  assert.equal(resumed.checkpoint.dailyPlanApplied, true);
+  assert.deepEqual(resumed.checkpoint.resolvedDailyNotePaths, ["journal/2026-07-14.md"]);
+  assert.deepEqual(resumed.checkpoint.changedMemoryPaths, ["memory/study/current.md"]);
+  assert.equal(resumed.checkpoint.pendingToolStep, undefined);
+  await store.close();
 });
 
 test("a committed Tool Result remains recoverable when the following checkpoint write is lost", async (t) => {

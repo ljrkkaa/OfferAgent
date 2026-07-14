@@ -68,7 +68,10 @@ export interface AgentRunRecord {
 
 export type LocalToolName =
   | "agent_contract_read"
+  | "daily_note_context"
   | "hosted_web_search_probe"
+  | "planning_memory_list"
+  | "planning_memory_read"
   | "skill_read"
   | "vault_list"
   | "vault_propose_changes"
@@ -153,6 +156,41 @@ export interface AgentContractResult {
   type: "agent_contract_read";
 }
 
+export interface DailyNoteContextResult {
+  dateFormat: string;
+  resolvedDate: string;
+  targetExists: boolean;
+  targetPath: string;
+  targetVersion: string;
+  templateContent: string | null;
+  templatePath: string | null;
+  templateVersion: string | null;
+  type: "daily_note_context";
+}
+
+export type MemoryTopicType = "feedback" | "project" | "study" | "user";
+
+export interface PlanningMemoryListResult {
+  topics: Array<{
+    description: string;
+    modifiedVersion: string;
+    name: string;
+    path: string;
+    type: MemoryTopicType;
+  }>;
+  truncated: boolean;
+  type: "planning_memory_list";
+}
+
+export interface PlanningMemoryReadResult {
+  topics: Array<{
+    content: string;
+    modifiedVersion: string;
+    path: string;
+  }>;
+  type: "planning_memory_read";
+}
+
 export interface SkillReadResult {
   content: string;
   contentHash: string;
@@ -171,6 +209,9 @@ interface VaultActionBase {
 }
 
 export type VaultAction =
+  | (VaultActionBase & {
+      operation: "delete";
+    })
   | (VaultActionBase & {
       content: string;
       operation: "append" | "create";
@@ -292,7 +333,10 @@ export type LocalToolResultPayload =
       ok: true;
       value:
         | AgentContractResult
+        | DailyNoteContextResult
         | HostedWebSearchProbeResult
+        | PlanningMemoryListResult
+        | PlanningMemoryReadResult
         | SkillReadResult
         | VaultListResult
         | VaultChangeResult

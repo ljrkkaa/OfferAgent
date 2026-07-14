@@ -78,7 +78,7 @@ export interface VaultChangeJournal {
 
 interface PreparedAction {
   action: VaultAction;
-  afterContent: string;
+  afterContent?: string;
   afterHash: string;
   beforeContent?: string;
   beforeHash: string;
@@ -1063,16 +1063,21 @@ export class VaultChangeCoordinator {
     try {
       for (const [index, prepared] of currentPreparation.actions.entries()) {
         if (prepared.beforeContent === undefined) {
-          await this.#vault.create(prepared.action.path, prepared.afterContent);
+          await this.#vault.create(prepared.action.path, prepared.afterContent!);
         } else {
-          await this.#vault.modify(prepared.action.path, prepared.afterContent);
+          if (prepared.afterContent === undefined) await this.#vault.remove(prepared.action.path);
+          else await this.#vault.modify(prepared.action.path, prepared.afterContent);
         }
         changed.push(prepared);
         await this.#injectCrash(`action:${index}`);
       }
       for (const prepared of currentPreparation.actions) {
         const applied = await this.#vault.read(prepared.action.path);
-        if (!applied || digest(applied.content) !== prepared.afterHash) {
+        if (
+          (prepared.afterContent === undefined && applied) ||
+          (prepared.afterContent !== undefined &&
+            (!applied || digest(applied.content) !== prepared.afterHash))
+        ) {
           throw new Error(`Vault file '${prepared.action.path}' did not match its applied hash.`);
         }
       }
@@ -1082,7 +1087,9 @@ export class VaultChangeCoordinator {
       for (const prepared of changed.reverse()) {
         try {
           if (prepared.beforeContent === undefined) await this.#vault.remove(prepared.action.path);
-          else await this.#vault.modify(prepared.action.path, prepared.beforeContent);
+          else if (prepared.afterContent === undefined) {
+            await this.#vault.create(prepared.action.path, prepared.beforeContent);
+          } else await this.#vault.modify(prepared.action.path, prepared.beforeContent);
         } catch (caught) {
           rollbackError ??= caught;
         }
@@ -1310,6 +1317,9 @@ export class VaultChangeCoordinator {
       }
       const action = candidate as Partial<VaultAction>;
       const vaultPath = safeVaultPath(action.path);
+      const lexicalMemoryTopic = vaultPath
+        ? /^memory\/(user|feedback|project|study)\/[^/]+\.md$/.test(vaultPath)
+        : false;
       if (
         !vaultPath ||
         !validId(action.actionId) ||
@@ -1319,7 +1329,8 @@ export class VaultChangeCoordinator {
         paths.has(vaultPath) ||
         actionIds.has(action.actionId) ||
         idempotencyKeys.has(action.idempotencyKey) ||
-        !["append", "create", "exact_replace"].includes(action.operation as string)
+        !["append", "create", "delete", "exact_replace"].includes(action.operation as string) ||
+        (action.operation === "delete" && !lexicalMemoryTopic)
       ) {
         return failure("invalid_change", "A Vault Action has an invalid or duplicate field.");
       }
@@ -1337,6 +1348,21 @@ export class VaultChangeCoordinator {
           .relative(canonical.root, canonical.target)
           .split(path.sep)
           .join("/");
+        const lexicalMemoryScoped =
+          /^memory\/(?:user|feedback|project|study)\/[^/]+\.md$/.test(vaultPath) ||
+          vaultPath === "memory/MEMORY.md";
+        const canonicalMemoryScoped =
+          /^memory\/(?:user|feedback|project|study)\/[^/]+\.md$/.test(canonicalVaultPath) ||
+          canonicalVaultPath === "memory/MEMORY.md";
+        if ((lexicalMemoryScoped || canonicalMemoryScoped) && canonicalVaultPath !== vaultPath) {
+          return failure("invalid_path", "Planning Memory paths cannot resolve through an alias.");
+        }
+        if (
+          action.operation === "delete" &&
+          !/^memory\/(user|feedback|project|study)\/[^/]+\.md$/.test(canonicalVaultPath)
+        ) {
+          return failure("invalid_change", "Delete is restricted to canonical Planning Memory topics.");
+        }
         if (isProtectedPermissionPath(canonicalVaultPath)) {
           return failure("invalid_path", `Vault path '${vaultPath}' resolves to protected settings.`);
         }
@@ -1344,7 +1370,8 @@ export class VaultChangeCoordinator {
       } catch {
         return failure("invalid_path", `Vault path '${vaultPath}' could not be resolved safely.`);
       }
-      let afterContent: string;
+      controlFile ||= action.operation === "delete";
+      let afterContent: string | undefined;
       if (action.operation === "create") {
         if (
           current ||
@@ -1358,7 +1385,9 @@ export class VaultChangeCoordinator {
         if (!current || current.modifiedVersion !== action.expectedVersion) {
           return failure("stale_evidence", `Vault source '${vaultPath}' changed before application.`);
         }
-        if (action.operation === "append") {
+        if (action.operation === "delete") {
+          afterContent = undefined;
+        } else if (action.operation === "append") {
           if (typeof (action as { content?: unknown }).content !== "string") {
             return failure("invalid_change", `Append action '${action.actionId}' has no content.`);
           }
@@ -1379,7 +1408,7 @@ export class VaultChangeCoordinator {
           afterContent = current.content.replace(exact.expectedContent, exact.replacement);
         }
       }
-      if (Buffer.byteLength(afterContent, "utf8") > MAX_FILE_BYTES) {
+      if (afterContent !== undefined && Buffer.byteLength(afterContent, "utf8") > MAX_FILE_BYTES) {
         return failure("request_too_large", `Vault result '${vaultPath}' exceeds its size limit.`);
       }
       actions.push({
@@ -1388,11 +1417,151 @@ export class VaultChangeCoordinator {
         beforeHash: current ? digest(current.content) : "missing",
         controlFile,
         afterContent,
-        afterHash: digest(afterContent),
+        afterHash: afterContent === undefined ? "missing" : digest(afterContent),
       });
+    }
+    const changesMemoryTopic = [...paths].some((vaultPath) =>
+      /^memory\/(user|feedback|project|study)\/[^/]+\.md$/.test(vaultPath),
+    );
+    if (changesMemoryTopic && !paths.has("memory/MEMORY.md")) {
+      return failure(
+        "invalid_change",
+        "Planning Memory topic changes must update memory/MEMORY.md in the same batch.",
+      );
+    }
+    if (changesMemoryTopic) {
+      const index = actions.find(({ action }) => action.path === "memory/MEMORY.md");
+      if (!index?.afterContent) {
+        return failure("invalid_change", "Planning Memory index content is required.");
+      }
+      const changedTopics = actions.filter(({ action }) =>
+        /^memory\/(user|feedback|project|study)\/[^/]+\.md$/.test(action.path),
+      );
+      const changedTopicLinks = new Map(changedTopics.map((prepared) => [
+        prepared.action.path.replace(/^memory\//, ""),
+        prepared.action.operation,
+      ]));
+      const beforeIndex = planningMemoryIndexLinks(index.beforeContent ?? "");
+      const afterIndex = planningMemoryIndexLinks(index.afterContent);
+      if (afterIndex.invalid || afterIndex.duplicate) {
+        return failure("invalid_change", "Planning Memory index contains invalid or duplicate links.");
+      }
+      for (const priorLink of beforeIndex.links) {
+        if (!changedTopicLinks.has(priorLink) && !afterIndex.links.has(priorLink)) {
+          return failure("invalid_change", `Planning Memory index dropped unchanged topic '${priorLink}'.`);
+        }
+      }
+      for (const nextLink of afterIndex.links) {
+        if (!beforeIndex.links.has(nextLink) && !changedTopicLinks.has(nextLink)) {
+          return failure("invalid_change", `Planning Memory index added unvalidated topic '${nextLink}'.`);
+        }
+      }
+      for (const prepared of changedTopics) {
+        const type = /^memory\/(user|feedback|project|study)\//.exec(prepared.action.path)?.[1];
+        const relativePath = prepared.action.path.replace(/^memory\//, "");
+        if (prepared.action.operation !== "delete") {
+          const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---/.exec(prepared.afterContent ?? "")?.[1] ?? "";
+          const declaredType = strictFrontmatterValue(frontmatter, "type", 16, true);
+          const name = strictFrontmatterValue(frontmatter, "name", 128);
+          const description = strictFrontmatterValue(frontmatter, "description", 512);
+          if (declaredType !== type || !name || !description) {
+            return failure(
+              "invalid_change",
+              `Planning Memory topic metadata is invalid for '${prepared.action.path}'.`,
+            );
+          }
+          const indexEntry = afterIndex.entries.get(relativePath);
+          if (indexEntry?.label !== name || indexEntry.description !== description) {
+            return failure(
+              "invalid_change",
+              `Planning Memory index metadata is stale for '${prepared.action.path}'.`,
+            );
+          }
+        }
+        const linked = afterIndex.links.has(relativePath);
+        if ((prepared.action.operation === "delete" && linked) ||
+            (prepared.action.operation !== "delete" && !linked)) {
+          return failure(
+            "invalid_change",
+            `Planning Memory index is not synchronized for '${prepared.action.path}'.`,
+          );
+        }
+      }
     }
     return { proposal: proposal as VaultChangeBatchProposal, actions };
   }
+}
+
+function strictFrontmatterValue(
+  frontmatter: string,
+  key: string,
+  maxBytes: number,
+  allowBareEnum = false,
+): string | undefined {
+  const matches = frontmatter.split(/\r?\n/).flatMap((line) => {
+    const match = new RegExp(`^${key}:\\s*(.+?)\\s*$`).exec(line);
+    return match ? [match[1]!] : [];
+  });
+  if (matches.length !== 1) return undefined;
+  const raw = matches[0]!.trim();
+  if (!raw) return undefined;
+  if (allowBareEnum) {
+    return /^(user|feedback|project|study)$/.test(raw) ? raw : undefined;
+  }
+  if (raw.startsWith('"')) {
+    try {
+      const parsed = JSON.parse(raw);
+      return typeof parsed === "string" && parsed.trim() &&
+        !/[\r\n]/.test(parsed) &&
+        Buffer.byteLength(parsed, "utf8") <= maxBytes
+        ? parsed.trim()
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function planningMemoryIndexLinks(content: string): {
+  duplicate: boolean;
+  entries: Map<string, { description: string; label: string }>;
+  invalid: boolean;
+  links: Set<string>;
+} {
+  const entries = new Map<string, { description: string; label: string }>();
+  const links = new Set<string>();
+  let duplicate = false;
+  let invalid = false;
+  if (/^\s*(?:```|~~~)/m.test(content)) invalid = true;
+  let fenced = false;
+  for (const line of content.split(/\r?\n/)) {
+    if (/^\s*(?:```|~~~)/.test(line)) {
+      fenced = !fenced;
+      continue;
+    }
+    if (fenced || line.includes("`")) continue;
+    const bulletLink = /^-\s+\[([^\]\r\n]+)\]\(([^)\r\n]+)\)\s+-\s+(.+?)\s*$/.exec(line);
+    if (!bulletLink) {
+      if (/^-\s+!?\[[^\]\r\n]+\]\([^)\r\n]+\)/.test(line)) invalid = true;
+      continue;
+    }
+    const label = bulletLink[1]!.trim();
+    const target = bulletLink[2]!;
+    const description = bulletLink[3]!.trim();
+    if (!label || !description) {
+      invalid = true;
+      continue;
+    }
+    if (!/^(?:user|feedback|project|study)\/[^/()]+\.md$/.test(target)) {
+      invalid = true;
+      continue;
+    }
+    if (links.has(target)) duplicate = true;
+    links.add(target);
+    entries.set(target, { description, label });
+  }
+  return { duplicate, entries, invalid, links };
 }
 
 export { MAX_ACTIONS, MAX_BATCH_BYTES, MAX_FILE_BYTES };

@@ -8,15 +8,41 @@ import type {
 } from "@offeragent/protocol";
 
 export const MAX_LOCAL_TOOL_ARGUMENT_BYTES = 8_192;
+export const MAX_PROVIDER_REASONING_BYTES = 256 * 1_024;
+
+export interface ProviderReasoningItem {
+  content: unknown[];
+  encrypted_content: string;
+  id: string;
+  summary: unknown[];
+  type: "reasoning";
+}
 
 export type ModelConversationItem =
   | { type: "user_message"; text: string }
-  | { type: "local_tool_call"; callId: string; name: LocalToolName; arguments: unknown }
+  | { type: "assistant_message"; text: string }
+  | { type: "provider_reasoning"; item: ProviderReasoningItem }
+  | {
+      type: "local_tool_call";
+      callId: string;
+      name: LocalToolName;
+      arguments: unknown;
+      providerItemId?: string;
+      providerStatus?: "completed" | "in_progress";
+    }
   | { type: "local_tool_result"; callId: string; result: LocalToolResultPayload };
 
 export type ModelStreamEvent =
   | { type: "output_text.delta"; delta: string }
-  | { type: "local_tool_call"; callId: string; name: LocalToolName; arguments: unknown }
+  | { type: "provider_reasoning"; item: ProviderReasoningItem }
+  | {
+      type: "local_tool_call";
+      callId: string;
+      name: LocalToolName;
+      arguments: unknown;
+      providerItemId?: string;
+      providerStatus?: "completed" | "in_progress";
+    }
   | { type: "hosted_web_search_call"; callId: string; sources: WebSearchSource[] }
   | { type: "url_citation"; citation: WebCitation };
 

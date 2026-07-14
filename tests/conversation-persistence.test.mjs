@@ -89,9 +89,21 @@ async function connectRuntimeSocket(handshake, token) {
 function installContractResponder(socket) {
   socket.on("message", (data) => {
     const event = JSON.parse(data.toString("utf8"));
-    if (event.type !== "tool_call.requested" || event.tool.name !== "agent_contract_read") {
+    if (event.type !== "tool_call.requested") return;
+    if (event.tool.name === "planning_memory_list") {
+      socket.send(JSON.stringify({
+        type: "tool_result",
+        protocolVersion: 1,
+        eventId: `memory-list-result-${event.toolCallId}`,
+        conversationId: event.conversationId,
+        agentRunId: event.agentRunId,
+        sequence: event.sequence,
+        toolCallId: event.toolCallId,
+        result: { ok: true, value: { type: "planning_memory_list", topics: [], truncated: false } },
+      }));
       return;
     }
+    if (event.tool.name !== "agent_contract_read") return;
     socket.send(
       JSON.stringify({
         type: "tool_result",
@@ -109,6 +121,38 @@ function installContractResponder(socket) {
             modifiedVersion: "mtime:1:size:24",
             contentHash: "sha256:test-contract",
             content: "# Test Agent Contract",
+          },
+        },
+      }),
+    );
+  });
+}
+
+function installVaultReadResponder(socket, onRead) {
+  socket.on("message", (data) => {
+    const event = JSON.parse(data.toString("utf8"));
+    if (event.type !== "tool_call.requested" || event.tool.name !== "vault_read") return;
+    onRead();
+    socket.send(
+      JSON.stringify({
+        type: "tool_result",
+        protocolVersion: 1,
+        eventId: `read-result-${event.toolCallId}`,
+        conversationId: event.conversationId,
+        agentRunId: event.agentRunId,
+        sequence: event.sequence,
+        toolCallId: event.toolCallId,
+        result: {
+          ok: true,
+          value: {
+            type: "vault_read",
+            path: "notes/context.md",
+            lineStart: 1,
+            lineEnd: 1,
+            modifiedVersion: "mtime:1:size:15",
+            contentHash: "sha256:context-evidence",
+            content: "private evidence",
+            truncated: false,
           },
         },
       }),
@@ -137,6 +181,140 @@ async function stopRuntime(instance, token) {
   });
   await exited;
 }
+
+async function runAgent(socket, { agentRunId, conversationId, eventId, text }) {
+  const completed = waitForEvent(
+    socket,
+    (event) => event.type === "agent_run.completed" && event.agentRunId === agentRunId,
+  );
+  socket.send(
+    JSON.stringify({
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId,
+      conversationId,
+      agentRunId,
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text },
+    }),
+  );
+  return completed;
+}
+
+test("a follow-up Run receives the ordered user and Agent messages from its Conversation", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-context-"));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const token = "conversation-context-token";
+  const conversationId = "conversation-context";
+  let instance = await startRuntime(statePath, token);
+  installContractResponder(instance.socket);
+  t.after(async () => {
+    if (instance.runtime.exitCode === null) instance.runtime.kill();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+
+  const first = await runAgent(instance.socket, {
+    agentRunId: "context-run-1",
+    conversationId,
+    eventId: "context-run-1-start",
+    text: "Help me prepare today.",
+  });
+  assert.equal(first.output.text, "OfferAgent received: Help me prepare today.");
+
+  await stopRuntime(instance, token);
+  instance = await startRuntime(statePath, token);
+  installContractResponder(instance.socket);
+
+  const second = await runAgent(instance.socket, {
+    agentRunId: "context-run-2",
+    conversationId,
+    eventId: "context-run-2-start",
+    text: "可以的",
+  });
+  assert.equal(
+    second.output.text,
+    "OfferAgent confirmed: OfferAgent received: Help me prepare today.",
+  );
+
+  await stopRuntime(instance, token);
+});
+
+test("Conversation Context trims the oldest complete turns and retains the current request", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-context-limit-"));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const token = "conversation-context-limit-token";
+  const conversationId = "conversation-context-limit";
+  const instance = await startRuntime(statePath, token);
+  installContractResponder(instance.socket);
+  t.after(async () => {
+    if (instance.runtime.exitCode === null) instance.runtime.kill();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+
+  for (const [index, marker] of ["A", "B", "C"].entries()) {
+    await runAgent(instance.socket, {
+      agentRunId: `context-limit-run-${index + 1}`,
+      conversationId,
+      eventId: `context-limit-run-${index + 1}-start`,
+      text: marker.repeat(20_000),
+    });
+  }
+
+  const inspected = await runAgent(instance.socket, {
+    agentRunId: "context-limit-inspection",
+    conversationId,
+    eventId: "context-limit-inspection-start",
+    text: "conversation_context",
+  });
+  assert.deepEqual(JSON.parse(inspected.output.text), [
+    { role: "user", marker: "C", length: 20_000 },
+    { role: "assistant", marker: "O", length: 20_021 },
+    { role: "user", marker: "c", length: 20 },
+  ]);
+
+  await stopRuntime(instance, token);
+});
+
+test("a new Run excludes prior tool results and Evidence from Conversation Context", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-context-tools-"));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const token = "conversation-context-tools-token";
+  const conversationId = "conversation-context-tools";
+  const instance = await startRuntime(statePath, token);
+  installContractResponder(instance.socket);
+  let readCount = 0;
+  installVaultReadResponder(instance.socket, () => {
+    readCount += 1;
+  });
+  t.after(async () => {
+    if (instance.runtime.exitCode === null) instance.runtime.kill();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+
+  const toolRun = await runAgent(instance.socket, {
+    agentRunId: "context-tools-run-1",
+    conversationId,
+    eventId: "context-tools-run-1-start",
+    text: "context_tool_demo",
+  });
+  assert.equal(readCount, 1);
+  assert.equal(toolRun.output.text, "Tool completed.");
+
+  const inspected = await runAgent(instance.socket, {
+    agentRunId: "context-tools-inspection",
+    conversationId,
+    eventId: "context-tools-inspection-start",
+    text: "conversation_context",
+  });
+  assert.deepEqual(JSON.parse(inspected.output.text), [
+    { role: "user", marker: "c", length: 17 },
+    { role: "assistant", marker: "T", length: 15 },
+    { role: "user", marker: "c", length: 20 },
+  ]);
+
+  await stopRuntime(instance, token);
+});
 
 test("a Conversation and its completed Agent Run survive restart and delete transactionally", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-state-"));
@@ -390,6 +568,8 @@ test("only committed Agent Run boundary events replay with stable identities", a
     )[0].values,
     [
       ["agent_run.started"],
+      ["tool_call.requested"],
+      ["tool_call.completed"],
       ["tool_call.requested"],
       ["tool_call.completed"],
       ["agent_run.completed"],

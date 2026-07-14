@@ -41,6 +41,15 @@ import {
 import { RuntimeStateStore, type RunCheckpoint } from "./state-store";
 import { WebReader } from "./web-read";
 import { CapabilityGatedModelProvider } from "./capability-gated-provider";
+import {
+  buildMemoryChangeActions,
+  PlanningMemoryModule,
+  ProviderSemanticMemoryCapture,
+  ProviderSemanticMemorySelector,
+  type MemoryCaptureOperation,
+  type MemoryTopicMetadata,
+  type PlanningMemoryRecall,
+} from "./planning-memory";
 
 interface RuntimeOptions {
   parentPid: number;
@@ -51,6 +60,19 @@ interface RuntimeOptions {
 }
 
 const LOCAL_TOOLS: LocalToolDefinition[] = [
+  {
+    kind: "local",
+    name: "daily_note_context",
+    description:
+      "Resolve the configured Obsidian Daily Note and template for an optional YYYY-MM-DD date. This read-only capability does not create or modify files.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+      },
+    },
+  },
   {
     kind: "local",
     name: "web_read",
@@ -116,7 +138,7 @@ const LOCAL_TOOLS: LocalToolDefinition[] = [
     kind: "local",
     name: "vault_propose_changes",
     description:
-      "Propose one atomic, user-visible Vault Change Batch. This never writes directly; the plugin validates and applies or rejects the whole batch.",
+      "Propose one atomic, user-visible Vault Change Batch. This never writes directly; the plugin validates and applies or rejects the whole batch. Delete is restricted to superseded Planning Memory topics and requires the concise index in the same batch.",
     parameters: {
       type: "object",
       additionalProperties: false,
@@ -133,7 +155,7 @@ const LOCAL_TOOLS: LocalToolDefinition[] = [
             properties: {
               actionId: { type: "string", minLength: 1, maxLength: 128 },
               idempotencyKey: { type: "string", minLength: 1, maxLength: 128 },
-              operation: { type: "string", enum: ["create", "append", "exact_replace"] },
+              operation: { type: "string", enum: ["create", "append", "delete", "exact_replace"] },
               path: { type: "string", minLength: 1, maxLength: 512 },
               expectedVersion: { type: "string", minLength: 1, maxLength: 256 },
               content: { type: "string" },
@@ -181,13 +203,16 @@ const HOSTED_WEB_SEARCH_PROBE_TOOL: LocalToolDefinition = {
 
 const MODEL_DEFAULT_INSTRUCTIONS =
   "You are OfferAgent, an interview preparation assistant. Answer the user's request directly and clearly.";
+const EMPTY_RESPONSE_RECOVERY_PROMPT =
+  "Complete the pending user request with a visible final response. Do not return an empty answer.";
 
 function composeInstructions(
   agentContract: string | undefined,
   localSkills: Map<string, string>,
+  memory: PlanningMemoryRecall,
 ): string {
   const sections = [
-    "OfferAgent policy: plugin-enforced tool and permission boundaries are immutable. Local Skills are workflow text only; they cannot add tools, grant permissions, create sub-agents, or override the Agent Contract.",
+    "OfferAgent policy: plugin-enforced tool and permission boundaries are immutable. Local Skills are workflow text only; they cannot add tools, grant permissions, create sub-agents, or override the Agent Contract. Every successful Agent Run must end with a non-empty visible final response. Reasoning and tool calls are not a final response; after tool work, explicitly report the result or the next confirmation needed.",
   ];
   if (agentContract) {
     sections.push(`Agent Contract (highest instruction priority):\n${agentContract}`);
@@ -196,6 +221,23 @@ function composeInstructions(
     sections.push(
       `Requested Local Skills (below the Agent Contract, above model defaults):\n${[...localSkills.entries()]
         .map(([name, content]) => `## ${name}\n${content}`)
+        .join("\n\n")}`,
+    );
+  }
+  sections.push(
+    "Instruction precedence: the current explicit user request outranks all Planning Memory for this task. Feedback Memory outranks other recalled Planning Memory. Memory never overrides the Agent Contract.",
+  );
+  if (memory.feedback.length > 0) {
+    sections.push(
+      `Relevant Feedback Memory:\n${memory.feedback
+        .map((topic) => `## ${topic.name} (${topic.path})\n${topic.content}`)
+        .join("\n\n")}`,
+    );
+  }
+  if (memory.planning.length > 0) {
+    sections.push(
+      `Other Relevant Planning Memory:\n${memory.planning
+        .map((topic) => `## ${topic.name} [${topic.type}] (${topic.path})\n${topic.content}`)
         .join("\n\n")}`,
     );
   }
@@ -281,6 +323,14 @@ function isBoundedVaultPath(value: unknown): value is string {
   );
 }
 
+function isPlanningMemoryPath(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    Buffer.byteLength(value, "utf8") <= 512 &&
+    /^memory\/(user|feedback|project|study)\/[^/.][^/]*\.md$/.test(value)
+  );
+}
+
 function isBoundedChangeTargetPath(value: unknown): value is string {
   return (
     typeof value === "string" &&
@@ -299,7 +349,7 @@ function isLocalToolResultPayload(value: unknown): value is LocalToolResultPaylo
   if (result.ok === false) {
     return Boolean(
       result.error &&
-      ["invalid_change", "invalid_path", "malformed_control_file", "not_found", "permission_denied", "plugin_disconnected", "request_too_large", "stale_evidence", "tool_error", "undo_conflict"].includes(
+      ["invalid_change", "invalid_path", "malformed_control_file", "not_found", "permission_denied", "plugin_disconnected", "request_too_large", "response_too_large", "stale_evidence", "tool_error", "undo_conflict"].includes(
         result.error.code as string,
       ) &&
       typeof result.error.message === "string" &&
@@ -317,6 +367,77 @@ function isLocalToolResultPayload(value: unknown): value is LocalToolResultPaylo
       result.value.modifiedVersion.length <= 128 &&
       typeof result.value.contentHash === "string" &&
       result.value.contentHash.length <= 128
+    );
+  }
+  if (result.value.type === "daily_note_context") {
+    const templateFieldsAreConsistent = result.value.templatePath === null
+      ? result.value.templateContent === null && result.value.templateVersion === null
+      : isBoundedVaultPath(result.value.templatePath) &&
+        (result.value.templateContent === null
+          ? result.value.templateVersion === null
+          : typeof result.value.templateContent === "string" &&
+            Buffer.byteLength(result.value.templateContent, "utf8") <= 32_768 &&
+            typeof result.value.templateVersion === "string" &&
+            result.value.templateVersion.length <= 128);
+    return (
+      /^\d{4}-\d{2}-\d{2}$/.test(result.value.resolvedDate) &&
+      typeof result.value.dateFormat === "string" &&
+      result.value.dateFormat.length > 0 &&
+      Buffer.byteLength(result.value.dateFormat, "utf8") <= 128 &&
+      isBoundedVaultPath(result.value.targetPath) &&
+      typeof result.value.targetExists === "boolean" &&
+      typeof result.value.targetVersion === "string" &&
+      result.value.targetVersion.length > 0 &&
+      result.value.targetVersion.length <= 128 &&
+      (result.value.targetExists
+        ? result.value.targetVersion !== "missing"
+        : result.value.targetVersion === "missing") &&
+      templateFieldsAreConsistent
+    );
+  }
+  if (result.value.type === "planning_memory_list") {
+    return (
+      Array.isArray(result.value.topics) &&
+      result.value.topics.length <= 100 &&
+      typeof result.value.truncated === "boolean" &&
+      result.value.topics.every((topic) => {
+        const pathType = isPlanningMemoryPath(topic.path)
+          ? topic.path.split("/")[1]
+          : undefined;
+        return (
+          pathType === topic.type &&
+          typeof topic.name === "string" &&
+          topic.name.trim().length > 0 &&
+          Buffer.byteLength(topic.name, "utf8") <= 128 &&
+          typeof topic.description === "string" &&
+          topic.description.trim().length > 0 &&
+          Buffer.byteLength(topic.description, "utf8") <= 512 &&
+          typeof topic.modifiedVersion === "string" &&
+          topic.modifiedVersion.length > 0 &&
+          topic.modifiedVersion.length <= 128
+        );
+      })
+    );
+  }
+  if (result.value.type === "planning_memory_read") {
+    return (
+      Array.isArray(result.value.topics) &&
+      result.value.topics.length > 0 &&
+      result.value.topics.length <= 5 &&
+      new Set(result.value.topics.map(({ path }) => path)).size === result.value.topics.length &&
+      result.value.topics.reduce(
+        (total, topic) => total + (typeof topic.content === "string" ? Buffer.byteLength(topic.content, "utf8") : 65_537),
+        0,
+      ) <= 65_536 &&
+      result.value.topics.every(
+        (topic) =>
+          isPlanningMemoryPath(topic.path) &&
+          typeof topic.content === "string" &&
+          Buffer.byteLength(topic.content, "utf8") <= 32_768 &&
+          typeof topic.modifiedVersion === "string" &&
+          topic.modifiedVersion.length > 0 &&
+          topic.modifiedVersion.length <= 128,
+      )
     );
   }
   if (result.value.type === "skill_read") {
@@ -1302,9 +1423,11 @@ async function startRuntime({
           sequence += 1;
         }
         try {
-          let input: ModelConversationItem[] = checkpoint?.input ?? [
-            { type: "user_message", text: userInput },
-          ];
+          let input: ModelConversationItem[] = checkpoint?.input ??
+            await store.getConversationContext(
+              runCommand.conversationId,
+              runCommand.agentRunId,
+            );
           const requiredRereads = new Set(checkpoint?.requiredRereads ?? []);
           const canonicalReadPaths = new Map(checkpoint?.canonicalReadPaths ?? []);
           let agentContract: string | undefined;
@@ -1312,6 +1435,22 @@ async function startRuntime({
             checkpoint?.hostedWebSearchProbeAttempted ?? false;
           const checkpointSkills = new Set(checkpoint?.localSkills ?? []);
           const localSkills = new Map<string, string>();
+          let recalledMemory: PlanningMemoryRecall = { feedback: [], planning: [] };
+          let planningTopics: MemoryTopicMetadata[] = [];
+          let planningTopicsTruncated = false;
+          let memoryHandledByMain = checkpoint?.memoryHandledByMain ?? false;
+          let dailyPlanApplied = checkpoint?.dailyPlanApplied ?? false;
+          const resolvedDailyNotePaths = new Set(checkpoint?.resolvedDailyNotePaths ?? []);
+          const changedMemoryPaths = new Set(checkpoint?.changedMemoryPaths ?? []);
+          let postResponseOutput = checkpoint?.postResponseOutput;
+          let postResponseCitations = checkpoint?.postResponseCitations ?? [];
+          let resumeAfterFallback = Boolean(
+            checkpoint?.postResponseOutput !== undefined && !checkpoint.pendingToolStep,
+          );
+          if (resumeAfterFallback) {
+            output = postResponseOutput ?? "";
+            citations.push(...postResponseCitations);
+          }
           let completedSteps = checkpoint?.completedSteps ?? 0;
           let pendingToolStep = checkpoint?.pendingToolStep;
           const currentCheckpoint = (): RunCheckpoint => ({
@@ -1324,6 +1463,14 @@ async function startRuntime({
               hostedWebSearchProbeAttempted,
               ...(fastMode ? { fastMode: true } : {}),
               completedSteps,
+              ...(memoryHandledByMain ? { memoryHandledByMain: true } : {}),
+              ...(dailyPlanApplied ? { dailyPlanApplied: true } : {}),
+              ...(resolvedDailyNotePaths.size > 0
+                ? { resolvedDailyNotePaths: [...resolvedDailyNotePaths] }
+                : {}),
+              ...(changedMemoryPaths.size > 0 ? { changedMemoryPaths: [...changedMemoryPaths] } : {}),
+              ...(postResponseOutput !== undefined ? { postResponseOutput } : {}),
+              ...(postResponseCitations.length > 0 ? { postResponseCitations } : {}),
           });
           const saveCheckpoint = async (): Promise<void> => {
             await store.saveRunCheckpoint(runCommand.agentRunId, currentCheckpoint());
@@ -1362,12 +1509,44 @@ async function startRuntime({
               recoveredResult = recovered.result;
             }
             if (recoveredResult) {
-              input.push({
-                type: "local_tool_result",
-                callId: pendingToolStep.providerCallId,
-                result: recoveredResult,
-              });
+              const recoveredFallback = pendingToolStep.providerCallId.startsWith("memory-fallback-");
+              if (recoveredResult.ok && recoveredResult.value.type === "daily_note_context") {
+                resolvedDailyNotePaths.add(recoveredResult.value.targetPath);
+              }
+              if (!recoveredFallback) {
+                input.push({
+                  type: "local_tool_result",
+                  callId: pendingToolStep.providerCallId,
+                  result: recoveredResult,
+                });
+              }
               completedSteps = pendingToolStep.completedSteps;
+              if (
+                recoveredFallback &&
+                recoveredResult.ok && recoveredResult.value.type === "vault_propose_changes" &&
+                recoveredResult.value.decision === "applied"
+              ) {
+                memoryHandledByMain = true;
+                for (const { path } of recoveredResult.value.targets) {
+                  if (/^memory\/(?:user|feedback|project|study)\/[^/]+\.md$/.test(path)) {
+                    changedMemoryPaths.add(path);
+                  }
+                }
+              }
+              if (
+                !recoveredFallback &&
+                recoveredResult.ok &&
+                recoveredResult.value.type === "vault_propose_changes" &&
+                recoveredResult.value.decision === "applied" &&
+                recoveredResult.value.targets.some(({ path }) => resolvedDailyNotePaths.has(path))
+              ) {
+                dailyPlanApplied = true;
+              }
+              if (recoveredFallback) {
+                output = postResponseOutput ?? "";
+                citations.splice(0, citations.length, ...postResponseCitations);
+                resumeAfterFallback = true;
+              }
             } else {
               input = input.filter(
                 (item) =>
@@ -1553,6 +1732,39 @@ async function startRuntime({
             localSkills.set(skill, loadedSkill.result.value.content);
           }
           if (checkpointSkills.size > 0) await saveCheckpoint();
+          const planningMemory = new PlanningMemoryModule({
+            listTopics: async () => {
+              const listed = await executeLocalTool("planning_memory_list", {});
+              planningTopics = listed.result.ok && listed.result.value.type === "planning_memory_list"
+                ? listed.result.value.topics
+                : [];
+              planningTopicsTruncated = Boolean(
+                listed.result.ok &&
+                listed.result.value.type === "planning_memory_list" &&
+                listed.result.value.truncated,
+              );
+              return planningTopics;
+            },
+            readTopics: async (paths) => {
+              const read = await executeLocalTool("planning_memory_read", { paths });
+              return read.result.ok && read.result.value.type === "planning_memory_read"
+                ? read.result.value.topics
+                : [];
+            },
+            selector: new ProviderSemanticMemorySelector({
+              fastMode,
+              model,
+              provider,
+              signal: controller.signal,
+            }),
+          });
+          recalledMemory = await planningMemory.recall({
+            request: userInput,
+            conversationContext: input.filter(
+              (item): item is Extract<ModelConversationItem, { type: "assistant_message" | "user_message" }> =>
+                item.type === "assistant_message" || item.type === "user_message",
+            ),
+          });
           if (checkpoint && canonicalReadPaths.size > 0) {
             for (const [priorCallId, path] of [...canonicalReadPaths]) {
               const priorCall = input.find(
@@ -1598,17 +1810,22 @@ async function startRuntime({
             }
           }
           let finished = false;
-          for (let step = completedSteps; step < 8; step += 1) {
+          for (let step = completedSteps; !resumeAfterFallback && step < 12; step += 1) {
             output = "";
             citations.length = 0;
             let requestedTool = false;
+            const providerStepItems = new Set<ModelConversationItem>();
+            const appendProviderStepItems = (...items: ModelConversationItem[]): void => {
+              for (const item of items) providerStepItems.add(item);
+              input.push(...items);
+            };
             const hostedWebSearchCapability =
               await provider.getHostedWebSearchCapability(model);
             for await (const providerEvent of provider.stream({
               model,
               ...(fastMode ? { fastMode: true } : {}),
               input,
-              instructions: composeInstructions(agentContract, localSkills),
+              instructions: composeInstructions(agentContract, localSkills, recalledMemory),
               signal: controller.signal,
               tools:
                 hostedWebSearchCapability === "unknown"
@@ -1652,6 +1869,20 @@ async function startRuntime({
                 }
                 continue;
               }
+              if (providerEvent.type === "provider_reasoning") {
+                appendProviderStepItems({ type: "provider_reasoning", item: providerEvent.item });
+                continue;
+              }
+
+              if (
+                providerEvent.name === "planning_memory_list" ||
+                providerEvent.name === "planning_memory_read"
+              ) {
+                throw new ModelProviderError(
+                  "provider_error",
+                  "Planning Memory storage tools are internal and cannot be requested by the main model.",
+                );
+              }
 
               requestedTool = true;
               const skillRequest =
@@ -1675,7 +1906,7 @@ async function startRuntime({
                   skill: skillRequest.skill,
                 });
                 if (!loadedSkill.result.ok) {
-                  input.push(providerEvent, {
+                  appendProviderStepItems(providerEvent, {
                     type: "local_tool_result",
                     callId: providerEvent.callId,
                     result: loadedSkill.result,
@@ -1699,11 +1930,123 @@ async function startRuntime({
                 await saveCheckpoint();
                 break;
               }
-              assertBoundedToolArguments(providerEvent.arguments);
-              input.push(providerEvent);
+              let effectiveProviderEvent = providerEvent;
+              if (
+                providerEvent.name === "vault_propose_changes" &&
+                providerEvent.arguments &&
+                typeof providerEvent.arguments === "object" &&
+                !Array.isArray(providerEvent.arguments)
+              ) {
+                const proposal = providerEvent.arguments as Record<string, unknown>;
+                const rawProposalActions = Array.isArray(proposal.actions) ? proposal.actions : [];
+                const proposalActionsAreObjects = rawProposalActions.every(
+                  (candidate) => Boolean(candidate) && typeof candidate === "object" && !Array.isArray(candidate),
+                );
+                if (!proposalActionsAreObjects) {
+                  throw new ModelProviderError(
+                    "provider_error",
+                    "The model returned a Vault proposal with malformed actions. Replan a valid batch without altering the original request.",
+                  );
+                }
+                const proposalActions = rawProposalActions as Record<string, unknown>[];
+                const touchesResolvedDaily = proposalActions.some(
+                  ({ path }) => typeof path === "string" && resolvedDailyNotePaths.has(path),
+                );
+                const proposedMemoryPaths = new Set(
+                  proposalActions.flatMap(({ path }) =>
+                    typeof path === "string" &&
+                    /^(?:memory\/MEMORY\.md|memory\/(?:user|feedback|project|study)\/[^/]+\.md)$/.test(path)
+                      ? [path]
+                      : [],
+                  ),
+                );
+                const hasProposedStudyTopic = proposalActions.some(({ path, operation }) =>
+                  typeof path === "string" &&
+                  /^memory\/study\/[^/]+\.md$/.test(path) &&
+                  (operation === "create" || operation === "append" || operation === "exact_replace"),
+                );
+                const hasProposedMemoryIndex = proposedMemoryPaths.has("memory/MEMORY.md");
+                if (
+                  touchesResolvedDaily &&
+                  planningTopicsTruncated &&
+                  (!hasProposedStudyTopic || !hasProposedMemoryIndex)
+                ) {
+                  throw new ModelProviderError(
+                    "provider_error",
+                    "Cannot safely apply a Daily plan while Planning Memory metadata is truncated. Replan with an explicit atomic Daily, Study topic, and Planning Memory index batch.",
+                  );
+                }
+                if (touchesResolvedDaily && !planningTopicsTruncated) {
+                  const capture = new ProviderSemanticMemoryCapture({
+                    provider,
+                    model,
+                    fastMode,
+                    signal: controller.signal,
+                  });
+                  const recalledTopics = [...recalledMemory.feedback, ...recalledMemory.planning];
+                  let operations: MemoryCaptureOperation[];
+                  try {
+                    operations = await capture.extractStrict({
+                      newMessages: [
+                        { type: "user_message", text: userInput },
+                        {
+                          type: "assistant_message",
+                          text: `${output}\n\nProposed atomic Daily plan:\n${JSON.stringify(proposalActions)}`,
+                        },
+                      ],
+                      recalledTopics,
+                    });
+                    operations = operations.filter(({ path }) => !proposedMemoryPaths.has(path));
+                    if (operations.length > 0 && proposedMemoryPaths.size > 0) {
+                      throw new Error(
+                        "The Daily proposal already owns Planning Memory but omits other durable memory. Replan one complete atomic batch.",
+                      );
+                    }
+                  } catch (error) {
+                    throw new ModelProviderError(
+                      "provider_error",
+                      "Could not verify durable Planning Memory before applying the Daily plan.",
+                      { cause: error },
+                    );
+                  }
+                  if (operations.length > 0) {
+                    const indexRead = await executeLocalTool("vault_read", { path: "memory/MEMORY.md" });
+                    const index = indexRead.result.ok && indexRead.result.value.type === "vault_read"
+                      ? {
+                          content: indexRead.result.value.content,
+                          modifiedVersion: indexRead.result.value.modifiedVersion,
+                        }
+                      : undefined;
+                    const change = buildMemoryChangeActions({
+                      operations,
+                      topics: planningTopics,
+                      bodies: recalledTopics,
+                      index,
+                    });
+                    if (change) {
+                      effectiveProviderEvent = {
+                        ...providerEvent,
+                        arguments: {
+                          ...proposal,
+                          actions: [
+                            ...proposalActions,
+                            ...change.actions.map((action, index) => ({
+                              ...action,
+                              actionId: `${action.actionId}-daily-${index + 1}-${runCommand.agentRunId}`,
+                              idempotencyKey: `${action.idempotencyKey}-daily-${index + 1}-${runCommand.agentRunId}`,
+                            })),
+                          ],
+                        },
+                      };
+                    }
+                  }
+                }
+              }
+              assertBoundedToolArguments(effectiveProviderEvent.arguments);
+              appendProviderStepItems(providerEvent);
               const { result, stalePaths } = await executeLocalTool(
-                providerEvent.name,
-                providerEvent.arguments,
+                effectiveProviderEvent.name,
+                effectiveProviderEvent.arguments,
                 { completedSteps: step + 1, providerCallId: providerEvent.callId },
               );
               pendingToolStep = undefined;
@@ -1741,6 +2084,9 @@ async function startRuntime({
                 for (const stalePath of stalePaths) requiredRereads.add(stalePath);
               }
               if (currentReadPath) requiredRereads.delete(currentReadPath);
+              if (result.ok && result.value.type === "daily_note_context") {
+                resolvedDailyNotePaths.add(result.value.targetPath);
+              }
               const providerResult: LocalToolResultPayload =
                 stalePaths.length > 0 &&
                 !currentReadPath &&
@@ -1753,22 +2099,153 @@ async function startRuntime({
                       },
                     }
                   : result;
-              input.push({
+              appendProviderStepItems({
                 type: "local_tool_result",
                 callId: providerEvent.callId,
                 result: providerResult,
               });
+              if (result.ok && result.value.type === "vault_propose_changes") {
+                const memoryPaths = result.value.targets
+                  .map(({ path }) => path)
+                  .filter((path) => /^memory\/(?:user|feedback|project|study)\/[^/]+\.md$/.test(path));
+                if (memoryPaths.length > 0 && result.value.decision === "applied") {
+                  memoryHandledByMain = true;
+                    for (const path of memoryPaths) changedMemoryPaths.add(path);
+                }
+                if (
+                  result.value.decision === "applied" &&
+                  result.value.targets.some(({ path }) => resolvedDailyNotePaths.has(path))
+                ) {
+                  dailyPlanApplied = true;
+                }
+              }
               completedSteps = step + 1;
               await saveCheckpoint();
               if (providerEvent.name === "skill_read" && !skillWasLoaded) break;
             }
-            if (requestedTool) continue;
+            if (requestedTool) {
+              const currentStepItems = input.filter((item) => providerStepItems.has(item));
+              input = input.filter((item) => !providerStepItems.has(item));
+              const orderedStepItems = [
+                ...currentStepItems.filter((item) => item.type !== "local_tool_result"),
+                ...currentStepItems.filter((item) => item.type === "local_tool_result"),
+              ];
+              if (output.length > 0) {
+                const firstToolCall = orderedStepItems.findIndex(
+                  (item) => item.type === "local_tool_call",
+                );
+                orderedStepItems.splice(
+                  firstToolCall >= 0 ? firstToolCall : orderedStepItems.length,
+                  0,
+                  { type: "assistant_message", text: output },
+                );
+              }
+              input.push(...orderedStepItems);
+              await saveCheckpoint();
+              continue;
+            }
+
+            if (output.trim().length === 0) {
+              const alreadyRequestedRecovery = input.some(
+                (item) => item.type === "user_message" && item.text === EMPTY_RESPONSE_RECOVERY_PROMPT,
+              );
+              if (alreadyRequestedRecovery) {
+                throw new ModelProviderError(
+                  "provider_error",
+                  "The model completed without a visible final response after one recovery attempt.",
+                );
+              }
+              input.push({ type: "user_message", text: EMPTY_RESPONSE_RECOVERY_PROMPT });
+              completedSteps = step + 1;
+              await saveCheckpoint();
+              continue;
+            }
 
             if (requiredRereads.size > 0) {
               throw new ModelProviderError(
                 "provider_error",
                 `Vault evidence changed. Reread ${[...requiredRereads].join(", ")} before continuing.`,
               );
+            }
+
+            if (!memoryHandledByMain && !planningTopicsTruncated) {
+              const capture = new ProviderSemanticMemoryCapture({
+                provider,
+                model,
+                fastMode,
+                signal: controller.signal,
+              });
+              const recalledTopics = [...recalledMemory.feedback, ...recalledMemory.planning];
+              let operations: MemoryCaptureOperation[] = [];
+              try {
+                operations = await capture.extract({
+                  newMessages: [
+                    { type: "user_message", text: userInput },
+                    { type: "assistant_message", text: output },
+                  ],
+                  recalledTopics,
+                });
+              } catch {
+                operations = [];
+              }
+              if (dailyPlanApplied) {
+                operations = operations.filter(({ path }) => !path.startsWith("memory/study/"));
+              }
+              if (operations.length > 0) {
+                const indexRead = await executeLocalTool("vault_read", { path: "memory/MEMORY.md" });
+                const index = indexRead.result.ok && indexRead.result.value.type === "vault_read"
+                  ? {
+                      content: indexRead.result.value.content,
+                      modifiedVersion: indexRead.result.value.modifiedVersion,
+                    }
+                  : undefined;
+                const change = buildMemoryChangeActions({
+                  operations,
+                  topics: planningTopics,
+                  bodies: recalledTopics,
+                  index,
+                });
+                if (change) {
+                  postResponseOutput = output;
+                  postResponseCitations = [...citations];
+                  const memoryBatchId = `planning-memory-${randomUUID()}`;
+                  const fallbackProviderCallId = `memory-fallback-${randomUUID()}`;
+                  const proposed = await executeLocalTool("vault_propose_changes", {
+                    batchId: memoryBatchId,
+                    idempotencyKey: memoryBatchId,
+                    task: "Consolidate durable Planning Memory from this Agent Run",
+                    actions: change.actions.map((action, index) => ({
+                      ...action,
+                      actionId: `${action.actionId}-${index + 1}-${runCommand.agentRunId}`,
+                      idempotencyKey: `${action.idempotencyKey}-${index + 1}-${runCommand.agentRunId}`,
+                    })),
+                  }, { completedSteps, providerCallId: fallbackProviderCallId });
+                  pendingToolStep = undefined;
+                  if (
+                    proposed.result.ok &&
+                    proposed.result.value.type === "vault_propose_changes" &&
+                    proposed.result.value.decision === "applied"
+                  ) {
+                    for (const path of change.changedPaths) changedMemoryPaths.add(path);
+                    memoryHandledByMain = true;
+                  }
+                  await saveCheckpoint();
+                }
+              }
+            }
+
+            if (changedMemoryPaths.size > 0) {
+              const notice = `\n\nPlanning Memory updated: ${[...changedMemoryPaths].join(", ")}`;
+              output += notice;
+              await store.advanceAgentRunSequence(runCommand.agentRunId, sequence);
+              publishEvent({
+                ...base,
+                type: "agent_run.delta",
+                eventId: randomUUID(),
+                sequence,
+                delta: notice,
+              });
+              sequence += 1;
             }
 
             const completedEvent: Extract<AgentRunEvent, { type: "agent_run.completed" }> = {
@@ -1789,8 +2266,39 @@ async function startRuntime({
             finished = true;
             break;
           }
+          if (resumeAfterFallback && !finished) {
+            if (changedMemoryPaths.size > 0) {
+              const notice = `\n\nPlanning Memory updated: ${[...changedMemoryPaths].join(", ")}`;
+              output += notice;
+              await store.advanceAgentRunSequence(runCommand.agentRunId, sequence);
+              publishEvent({
+                ...base,
+                type: "agent_run.delta",
+                eventId: randomUUID(),
+                sequence,
+                delta: notice,
+              });
+              sequence += 1;
+            }
+            const completedEvent: Extract<AgentRunEvent, { type: "agent_run.completed" }> = {
+              ...base,
+              type: "agent_run.completed",
+              eventId: randomUUID(),
+              sequence,
+              output: {
+                role: "assistant",
+                text: output,
+                ...(citations.some((citation) => citation.endIndex <= output.length)
+                  ? { citations: citations.filter((citation) => citation.endIndex <= output.length) }
+                  : {}),
+              },
+            };
+            await store.completeAgentRun(runCommand.agentRunId, output, completedEvent);
+            publishEvent(completedEvent);
+            finished = true;
+          }
           if (!finished) {
-            throw new Error("The Agent Run exceeded the maximum of 8 Provider steps.");
+            throw new Error("The Agent Run exceeded the maximum of 12 Provider steps.");
           }
         } catch (error) {
           const run = activeRuns.get(runCommand.agentRunId);

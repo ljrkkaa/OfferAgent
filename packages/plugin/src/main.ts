@@ -8,6 +8,7 @@ import {
   Plugin,
   PluginSettingTab,
   Setting,
+  moment,
   type WorkspaceLeaf,
 } from "obsidian";
 import {
@@ -22,8 +23,13 @@ import {
   VaultChangeCoordinator,
   type VaultPermissionMode,
 } from "./vault-change-coordinator";
+import { resolveLocalToday } from "./daily-note-context";
 
 const SIDEBAR_VIEW_TYPE = "offeragent-sidebar";
+const localMoment = moment as unknown as {
+  (): { format(format: string): string };
+  (date: string, format: string, strict: boolean): { format(format: string): string };
+};
 const DEFAULT_SETTINGS: OfferAgentPluginSettings = {
   fastMode: false,
   vaultPermissionMode: "trusted_vault",
@@ -449,7 +455,20 @@ export default class OfferAgentPlugin extends Plugin {
 
     const runtimePath = this.#runtimePath();
     const vaultRoot = this.#vaultRoot();
-    const readTools = new ObsidianVaultToolAdapter(this.app.vault, this.app.metadataCache);
+    const readTools = new ObsidianVaultToolAdapter(
+      this.app.vault,
+      this.app.metadataCache,
+      undefined,
+      {
+        readConfiguration: async () => {
+          const configurationPath = `${this.app.vault.configDir}/daily-notes.json`;
+          if (!(await this.app.vault.adapter.exists(configurationPath))) return undefined;
+          return JSON.parse(await this.app.vault.adapter.read(configurationPath)) as unknown;
+        },
+        resolveToday: () => resolveLocalToday(),
+        formatDate: (date, format) => localMoment(date, "YYYY-MM-DD", true).format(format),
+      },
+    );
     let runtime!: RuntimeSupervisor;
     const checkpointStore = new GitCheckpointStore(vaultRoot);
     const changeCoordinator = new VaultChangeCoordinator(

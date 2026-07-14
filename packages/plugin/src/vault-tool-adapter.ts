@@ -5,6 +5,7 @@ import type { MetadataCache, TFile, Vault } from "obsidian";
 import type {
   AgentRunEvent,
   LocalToolResultPayload,
+  MemoryTopicType,
   VaultToolErrorCode,
 } from "@offeragent/protocol";
 
@@ -21,13 +22,25 @@ const DEFAULT_SEARCH_SNIPPET_BYTES = 240;
 const MAX_SEARCH_SNIPPET_BYTES = 512;
 const MAX_SEARCH_QUERY_BYTES = 512;
 const MAX_CONTROL_FILE_BYTES = 32_768;
+const MAX_DAILY_TEMPLATE_BYTES = 32_768;
+const MAX_MEMORY_TOPICS = 100;
+const MAX_MEMORY_READ_TOPICS = 5;
+const MAX_MEMORY_TOPIC_BYTES = 32_768;
+const MAX_MEMORY_READ_BYTES = 65_536;
 const MAX_SKILL_NAME_LENGTH = 64;
 const EXCLUDED_SEGMENTS = new Set([".git", ".obsidian", ".codex", "node_modules"]);
+const MEMORY_TOPIC_PATH = /^memory\/(user|feedback|project|study)\/[^/.][^/]*\.md$/;
 
 type VaultToolCall = Extract<AgentRunEvent, { type: "tool_call.requested" }>;
 type VaultApi = Pick<Vault, "cachedRead" | "getFiles">;
 type MetadataApi = Pick<MetadataCache, "getFileCache">;
 type CanonicalizeVaultPath = (vaultPath: string) => Promise<string>;
+
+export interface DailyNotesApi {
+  formatDate(date: string, format: string): string;
+  readConfiguration(): Promise<unknown>;
+  resolveToday(): string;
+}
 
 function failure(
   code: VaultToolErrorCode,
@@ -83,7 +96,23 @@ function defaultCanonicalizer(vault: VaultApi): CanonicalizeVaultPath | undefine
   const adapter = (vault as VaultApi & { adapter?: { getBasePath?: () => string } }).adapter;
   if (!adapter || typeof adapter.getBasePath !== "function") return undefined;
   const basePath = adapter.getBasePath();
-  return (vaultPath) => realpath(path.resolve(basePath, vaultPath));
+  return async (vaultPath) => {
+    let existingAncestor = path.resolve(basePath, vaultPath);
+    const missingSegments: string[] = [];
+    while (true) {
+      try {
+        const canonicalAncestor = await realpath(existingAncestor);
+        return path.resolve(canonicalAncestor, ...missingSegments);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+        const parent = path.dirname(existingAncestor);
+        if (parent === existingAncestor) throw error;
+        missingSegments.unshift(path.basename(existingAncestor));
+        existingAncestor = parent;
+      }
+    }
+  };
 }
 
 function isContained(root: string, target: string): boolean {
@@ -91,6 +120,17 @@ function isContained(root: string, target: string): boolean {
   return (
     relative === "" ||
     (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))
+  );
+}
+
+function isIsoDate(value: unknown): value is string {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return (
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day
   );
 }
 
@@ -176,22 +216,34 @@ function boundedUtf8(value: string, maximumBytes: number): { content: string; tr
 export class ObsidianVaultToolAdapter {
   readonly #canonicalize?: CanonicalizeVaultPath;
   readonly #metadata?: MetadataApi;
+  readonly #dailyNotes?: DailyNotesApi;
   readonly #vault: VaultApi;
 
   constructor(
     vault: VaultApi,
     metadata?: MetadataApi,
     canonicalize: CanonicalizeVaultPath | undefined = defaultCanonicalizer(vault),
+    dailyNotes?: DailyNotesApi,
   ) {
     this.#vault = vault;
     this.#metadata = metadata;
     this.#canonicalize = canonicalize;
+    this.#dailyNotes = dailyNotes;
   }
 
   async execute(call: VaultToolCall): Promise<LocalToolResultPayload> {
     try {
       if (call.tool.name === "vault_list") return await this.#list(call.tool.arguments);
       if (call.tool.name === "vault_search") return await this.#search(call.tool.arguments);
+      if (call.tool.name === "daily_note_context") {
+        return await this.#dailyNoteContext(call.tool.arguments);
+      }
+      if (call.tool.name === "planning_memory_list") {
+        return await this.#listPlanningMemory(call.tool.arguments);
+      }
+      if (call.tool.name === "planning_memory_read") {
+        return await this.#readPlanningMemory(call.tool.arguments);
+      }
       if (call.tool.name === "agent_contract_read") {
         return await this.#readAgentContract(call.tool.arguments);
       }
@@ -203,6 +255,240 @@ export class ObsidianVaultToolAdapter {
         error instanceof Error ? error.message : "The Vault tool could not complete the request.",
       );
     }
+  }
+
+  async #listPlanningMemory(arguments_: unknown): Promise<LocalToolResultPayload> {
+    if (
+      !arguments_ ||
+      typeof arguments_ !== "object" ||
+      Array.isArray(arguments_) ||
+      Object.keys(arguments_).length > 0
+    ) {
+      return failure("request_too_large", "planning_memory_list accepts an empty object.");
+    }
+    const topics = this.#vault
+      .getFiles()
+      .filter((candidate) => MEMORY_TOPIC_PATH.test(candidate.path))
+      .sort((left, right) => left.path.localeCompare(right.path))
+      .flatMap((candidate) => {
+        const match = MEMORY_TOPIC_PATH.exec(candidate.path);
+        const frontmatter = this.#metadata?.getFileCache(candidate)?.frontmatter;
+        if (!match || !frontmatter || typeof frontmatter !== "object") return [];
+        const { name, description, type } = frontmatter as Record<string, unknown>;
+        if (
+          type !== match[1] ||
+          typeof name !== "string" ||
+          !name.trim() ||
+          Buffer.byteLength(name, "utf8") > 128 ||
+          typeof description !== "string" ||
+          !description.trim() ||
+          Buffer.byteLength(description, "utf8") > 512
+        ) {
+          return [];
+        }
+        return [{
+          path: candidate.path,
+          name: name.trim(),
+          description: description.trim(),
+          type: type as MemoryTopicType,
+          modifiedVersion: fileVersion(candidate),
+        }];
+      });
+    return {
+      ok: true,
+      value: {
+        type: "planning_memory_list",
+        topics: topics.slice(0, MAX_MEMORY_TOPICS),
+        truncated: topics.length > MAX_MEMORY_TOPICS,
+      },
+    };
+  }
+
+  async #readPlanningMemory(arguments_: unknown): Promise<LocalToolResultPayload> {
+    if (
+      !arguments_ ||
+      typeof arguments_ !== "object" ||
+      Array.isArray(arguments_) ||
+      Object.keys(arguments_).some((key) => key !== "paths")
+    ) {
+      return failure("request_too_large", "planning_memory_read requires only selected topic paths.");
+    }
+    const paths = (arguments_ as { paths?: unknown }).paths;
+    if (
+      !Array.isArray(paths) ||
+      paths.length === 0 ||
+      paths.length > MAX_MEMORY_READ_TOPICS ||
+      paths.some((candidate) => typeof candidate !== "string" || !MEMORY_TOPIC_PATH.test(candidate)) ||
+      new Set(paths).size !== paths.length
+    ) {
+      return failure("invalid_path", "Select between one and five distinct Planning Memory topic paths.");
+    }
+    const filesByPath = new Map(this.#vault.getFiles().map((candidate) => [candidate.path, candidate]));
+    const files = paths.map((candidate) => filesByPath.get(candidate));
+    if (files.some((candidate) => !candidate || !isReadableFile(candidate))) {
+      return failure("not_found", "A selected Planning Memory topic is missing or unreadable.");
+    }
+    if (!this.#canonicalize) {
+      return failure("tool_error", "Planning Memory path containment could not be verified safely.");
+    }
+    try {
+      const root = await this.#canonicalize("");
+      const canonicalTopics = await Promise.all(
+        files.map((candidate) => this.#canonicalize!(candidate!.path)),
+      );
+      if (canonicalTopics.some((candidate) => !isContained(root, candidate))) {
+        return failure("invalid_path", "A selected Planning Memory topic resolves outside the Vault root.");
+      }
+    } catch {
+      return failure("invalid_path", "A selected Planning Memory topic could not be resolved safely.");
+    }
+    const contents = await Promise.all(files.map((candidate) => this.#vault.cachedRead(candidate!)));
+    if (
+      contents.some((content) => Buffer.byteLength(content, "utf8") > MAX_MEMORY_TOPIC_BYTES) ||
+      contents.reduce((total, content) => total + Buffer.byteLength(content, "utf8"), 0) >
+        MAX_MEMORY_READ_BYTES
+    ) {
+      return failure("response_too_large", "Selected Planning Memory topic content is too large.");
+    }
+    return {
+      ok: true,
+      value: {
+        type: "planning_memory_read",
+        topics: files.map((candidate, index) => ({
+          path: candidate!.path,
+          content: contents[index]!,
+          modifiedVersion: fileVersion(candidate!),
+        })),
+      },
+    };
+  }
+
+  async #dailyNoteContext(arguments_: unknown): Promise<LocalToolResultPayload> {
+    if (
+      !arguments_ ||
+      typeof arguments_ !== "object" ||
+      Array.isArray(arguments_) ||
+      Object.keys(arguments_).some((key) => key !== "date")
+    ) {
+      return failure(
+        "request_too_large",
+        "daily_note_context accepts an object containing only an optional ISO date.",
+      );
+    }
+    if (!this.#dailyNotes) {
+      return failure(
+        "not_found",
+        "Daily Notes configuration is unavailable. Enable and configure Obsidian Daily Notes.",
+      );
+    }
+    const input = arguments_ as { date?: unknown };
+    const resolvedDate = input.date === undefined ? this.#dailyNotes.resolveToday() : input.date;
+    if (!isIsoDate(resolvedDate)) {
+      return failure("request_too_large", "daily_note_context date must be a valid YYYY-MM-DD date.");
+    }
+    let configuration: unknown;
+    try {
+      configuration = await this.#dailyNotes.readConfiguration();
+    } catch {
+      return failure(
+        "malformed_control_file",
+        "Daily Notes configuration could not be read or parsed. Review the Daily Notes settings in Obsidian.",
+      );
+    }
+    if (!configuration || typeof configuration !== "object" || Array.isArray(configuration)) {
+      return failure(
+        "malformed_control_file",
+        "Daily Notes configuration is missing or invalid. Configure a folder and date format in Obsidian.",
+      );
+    }
+    const options = configuration as { folder?: unknown; format?: unknown; template?: unknown };
+    const folder = safePath(options.folder, true);
+    if (folder === undefined) {
+      return failure("invalid_path", "The configured Daily Notes folder is invalid or outside the Vault.");
+    }
+    if (
+      typeof options.format !== "string" ||
+      !options.format.trim() ||
+      Buffer.byteLength(options.format, "utf8") > 128
+    ) {
+      return failure(
+        "malformed_control_file",
+        "The configured Daily Notes date format is missing or invalid.",
+      );
+    }
+    const dateFormat = options.format.trim();
+    const formattedDate = this.#dailyNotes.formatDate(resolvedDate, dateFormat);
+    if (typeof formattedDate !== "string" || !formattedDate.trim()) {
+      return failure("malformed_control_file", "The configured Daily Notes date format could not be resolved.");
+    }
+    const filename = formattedDate.endsWith(".md") ? formattedDate : `${formattedDate}.md`;
+    const targetPath = safePath(folder ? `${folder}/${filename}` : filename);
+    if (!targetPath) {
+      return failure("invalid_path", "The configured Daily Note path is invalid or outside the Vault.");
+    }
+
+    const target = this.#vault.getFiles().find((candidate) => candidate.path === targetPath);
+    if (target && !isReadableFile(target)) {
+      return failure("unreadable_content", `Daily Note target '${targetPath}' is not a Markdown file.`);
+    }
+    const templateSetting: string | null =
+      typeof options.template === "string" && options.template.trim()
+        ? safePath(options.template.trim()) ?? null
+        : null;
+    if (typeof options.template !== "undefined" && options.template !== "" && !templateSetting) {
+      return failure("invalid_path", "The configured Daily Notes template path is invalid.");
+    }
+    const template = templateSetting
+      ? this.#vault.getFiles().find(
+          (candidate) =>
+            candidate.path === templateSetting ||
+            (!path.posix.extname(templateSetting) && candidate.path === `${templateSetting}.md`),
+        )
+      : undefined;
+
+    if (!this.#canonicalize) {
+      return failure("tool_error", "Daily Note path containment could not be verified safely.");
+    }
+    const containmentPaths = new Set<string>([folder || ""]);
+    if (target) containmentPaths.add(target.path);
+    if (template) containmentPaths.add(template.path);
+    if (templateSetting) {
+      const templateParent = path.posix.dirname(templateSetting);
+      containmentPaths.add(templateParent === "." ? "" : templateParent);
+    }
+    try {
+      const vaultRoot = await this.#canonicalize("");
+      const canonicalPaths = await Promise.all(
+        [...containmentPaths].map((candidate) => this.#canonicalize!(candidate)),
+      );
+      if (canonicalPaths.some((candidate) => !isContained(vaultRoot, candidate))) {
+        return failure("invalid_path", "A configured Daily Note path resolves outside the Vault root.");
+      }
+    } catch {
+      return failure("invalid_path", "A configured Daily Note path could not be resolved safely.");
+    }
+
+    const templateContent = template ? await this.#vault.cachedRead(template) : null;
+    if (templateContent !== null && Buffer.byteLength(templateContent, "utf8") > MAX_DAILY_TEMPLATE_BYTES) {
+      return failure(
+        "response_too_large",
+        `The configured Daily Notes template exceeds ${MAX_DAILY_TEMPLATE_BYTES} UTF-8 bytes.`,
+      );
+    }
+    return {
+      ok: true,
+      value: {
+        type: "daily_note_context",
+        resolvedDate,
+        dateFormat,
+        targetPath,
+        targetExists: Boolean(target),
+        targetVersion: target ? fileVersion(target) : "missing",
+        templatePath: template?.path ?? templateSetting,
+        templateContent,
+        templateVersion: template ? fileVersion(template) : null,
+      },
+    };
   }
 
   async #list(arguments_: unknown): Promise<LocalToolResultPayload> {

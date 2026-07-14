@@ -6,6 +6,7 @@ import type { LocalToolName, ModelDescriptor } from "@offeragent/protocol";
 import { EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
 import {
   MAX_LOCAL_TOOL_ARGUMENT_BYTES,
+  MAX_PROVIDER_REASONING_BYTES,
   ModelProviderError,
   type ModelConversationItem,
   type ModelProvider,
@@ -202,6 +203,7 @@ export class CodexSubscriptionProvider implements ModelProvider {
           ),
           tool_choice: "auto",
           reasoning: { effort: "low", summary: "auto" },
+          include: ["reasoning.encrypted_content"],
           store: false,
           stream: true,
         }),
@@ -223,7 +225,14 @@ export class CodexSubscriptionProvider implements ModelProvider {
     const decoder = new TextDecoder();
     let buffer = "";
     let completed = false;
+    let emittedOutputText = false;
     const functionArguments = new Map<string, string>();
+    const pendingOutputEvents: Array<{
+      arrivalOrder: number;
+      events: ModelStreamEvent[];
+      outputIndex: number;
+    }> = [];
+    let outputItemArrivalOrder = 0;
     try {
       for await (const chunk of response.body) {
         buffer += decoder.decode(chunk, { stream: true });
@@ -246,6 +255,7 @@ export class CodexSubscriptionProvider implements ModelProvider {
               );
             }
             if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
+              if (event.delta.length > 0) emittedOutputText = true;
               yield { type: "output_text.delta", delta: event.delta };
             } else if (
               event.type === "response.function_call_arguments.delta" &&
@@ -258,9 +268,34 @@ export class CodexSubscriptionProvider implements ModelProvider {
               );
             } else if (event.type === "response.output_item.done") {
               const item = event.item;
+              const itemEvents: ModelStreamEvent[] = [];
               if (item && typeof item === "object") {
                 const call = item as Record<string, unknown>;
-                if (call.type === "web_search_call" && typeof call.id === "string") {
+                if (
+                  call.type === "reasoning" &&
+                  typeof call.id === "string" &&
+                  Array.isArray(call.content) &&
+                  typeof call.encrypted_content === "string" &&
+                  Array.isArray(call.summary)
+                ) {
+                  const reasoningItem = {
+                    type: "reasoning" as const,
+                    id: call.id,
+                    content: call.content,
+                    encrypted_content: call.encrypted_content,
+                    summary: call.summary,
+                  };
+                  if (
+                    Buffer.byteLength(JSON.stringify(reasoningItem), "utf8") >
+                    MAX_PROVIDER_REASONING_BYTES
+                  ) {
+                    throw new ModelProviderError(
+                      "provider_error",
+                      `Codex reasoning context exceeds ${MAX_PROVIDER_REASONING_BYTES} UTF-8 bytes.`,
+                    );
+                  }
+                  itemEvents.push({ type: "provider_reasoning", item: reasoningItem });
+                } else if (call.type === "web_search_call" && typeof call.id === "string") {
                   const action = call.action && typeof call.action === "object"
                     ? call.action as Record<string, unknown>
                     : {};
@@ -278,11 +313,15 @@ export class CodexSubscriptionProvider implements ModelProvider {
                         }];
                       })
                     : [];
-                  yield { type: "hosted_web_search_call", callId: call.id, sources };
+                  itemEvents.push({ type: "hosted_web_search_call", callId: call.id, sources });
                 } else if (call.type === "message" && Array.isArray(call.content)) {
+                  const completedText: string[] = [];
                   for (const content of call.content) {
                     if (!content || typeof content !== "object") continue;
                     const output = content as Record<string, unknown>;
+                    if (output.type === "output_text" && typeof output.text === "string") {
+                      completedText.push(output.text);
+                    }
                     if (!Array.isArray(output.annotations)) continue;
                     for (const candidate of output.annotations) {
                       if (!candidate || typeof candidate !== "object") continue;
@@ -297,7 +336,7 @@ export class CodexSubscriptionProvider implements ModelProvider {
                         annotation.start_index >= 0 &&
                         annotation.end_index >= annotation.start_index
                       ) {
-                        yield {
+                        itemEvents.push({
                           type: "url_citation",
                           citation: {
                             url: annotation.url,
@@ -305,8 +344,15 @@ export class CodexSubscriptionProvider implements ModelProvider {
                             startIndex: annotation.start_index,
                             endIndex: annotation.end_index,
                           },
-                        };
+                        });
                       }
+                    }
+                  }
+                  if (!emittedOutputText && completedText.length > 0) {
+                    const text = completedText.join("");
+                    if (text.length > 0) {
+                      emittedOutputText = true;
+                      itemEvents.push({ type: "output_text.delta", delta: text });
                     }
                   }
                 } else if (
@@ -331,15 +377,41 @@ export class CodexSubscriptionProvider implements ModelProvider {
                       { cause: error },
                     );
                   }
-                  yield {
+                  itemEvents.push({
                     type: "local_tool_call",
                     callId: call.call_id,
                     name: call.name,
                     arguments: arguments_,
-                  };
+                    ...(typeof call.id === "string" ? { providerItemId: call.id } : {}),
+                    ...(call.status === "completed" || call.status === "in_progress"
+                      ? { providerStatus: call.status }
+                      : {}),
+                  });
                 }
               }
+              if (itemEvents.length > 0) {
+                const arrivalOrder = outputItemArrivalOrder;
+                outputItemArrivalOrder += 1;
+                pendingOutputEvents.push({
+                  arrivalOrder,
+                  events: itemEvents,
+                  outputIndex:
+                    typeof event.output_index === "number" &&
+                    Number.isSafeInteger(event.output_index) &&
+                    event.output_index >= 0
+                      ? event.output_index
+                      : Number.MAX_SAFE_INTEGER,
+                });
+              }
             } else if (event.type === "response.completed") {
+              pendingOutputEvents.sort(
+                (left, right) =>
+                  left.outputIndex - right.outputIndex || left.arrivalOrder - right.arrivalOrder,
+              );
+              for (const pending of pendingOutputEvents) {
+                for (const pendingEvent of pending.events) yield pendingEvent;
+              }
+              pendingOutputEvents.length = 0;
               completed = true;
             } else if (
               event.type === "response.incomplete" ||
@@ -497,6 +569,7 @@ export class CodexSubscriptionProvider implements ModelProvider {
 
 function isLocalToolName(value: unknown): value is LocalToolName {
   return (
+    value === "daily_note_context" ||
     value === "skill_read" ||
     value === "hosted_web_search_probe" ||
     value === "vault_list" ||
@@ -514,12 +587,21 @@ function encodeConversationItem(item: ModelConversationItem): Record<string, unk
       content: [{ type: "input_text", text: item.text }],
     };
   }
+  if (item.type === "assistant_message") {
+    return {
+      role: "assistant",
+      content: [{ type: "output_text", text: item.text }],
+    };
+  }
+  if (item.type === "provider_reasoning") return { ...item.item };
   if (item.type === "local_tool_call") {
     return {
       type: "function_call",
+      ...(item.providerItemId ? { id: item.providerItemId } : {}),
       call_id: item.callId,
       name: item.name,
       arguments: JSON.stringify(item.arguments),
+      ...(item.providerStatus ? { status: item.providerStatus } : {}),
     };
   }
   return {

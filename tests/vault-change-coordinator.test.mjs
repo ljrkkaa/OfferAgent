@@ -226,6 +226,272 @@ async function fixture(t, journal, injectCrash, getPermissionMode) {
   return { checkpoints, coordinator, root, vault };
 }
 
+test("Planning Memory delete and index update apply atomically and undo restores both", async (t) => {
+  const journal = new MemoryJournal();
+  const { checkpoints, coordinator, root, vault } = await fixture(t, journal, () => {}, () => "trusted_vault");
+  await mkdir(path.join(root, "memory", "study"), { recursive: true });
+  const topicPath = "memory/study/old.md";
+  const indexPath = "memory/MEMORY.md";
+  const topic = "---\nname: \"Old\"\ndescription: \"Superseded\"\ntype: study\n---\nOld direction.\n";
+  const index = "# Planning Memory\n\n- [Old](study/old.md) - Superseded\n";
+  await writeFile(path.join(root, topicPath), topic, "utf8");
+  await writeFile(path.join(root, indexPath), index, "utf8");
+  const proposal = batch("memory-delete", [
+    {
+      operation: "delete",
+      path: topicPath,
+      expectedVersion: (await vault.read(topicPath)).modifiedVersion,
+    },
+    {
+      operation: "exact_replace",
+      path: indexPath,
+      expectedVersion: (await vault.read(indexPath)).modifiedVersion,
+      expectedContent: index,
+      replacement: "# Planning Memory\n",
+    },
+  ]);
+  const execution = coordinator.execute(toolCall("memory-delete-tool", proposal));
+  await coordinator.waitUntilPending("memory-delete-tool");
+  const applied = await coordinator.decide("memory-delete-tool", "apply");
+  await execution;
+  assert.equal(applied.ok, true);
+  assert.equal(applied.value.decision, "applied");
+  await assert.rejects(readFile(path.join(root, topicPath), "utf8"), { code: "ENOENT" });
+  assert.equal(await readFile(path.join(root, indexPath), "utf8"), "# Planning Memory\n");
+  assert.equal((await coordinator.undo(proposal.batchId)).ok, true);
+  assert.equal(await readFile(path.join(root, topicPath), "utf8"), topic);
+  assert.equal(await readFile(path.join(root, indexPath), "utf8"), index);
+
+  const invalid = await coordinator.execute(toolCall("memory-no-index-tool", batch("memory-no-index", [{
+    operation: "delete",
+    path: topicPath,
+    expectedVersion: (await vault.read(topicPath)).modifiedVersion,
+  }])));
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.error.code, "invalid_change");
+  const staleIndex = await coordinator.execute(toolCall("memory-stale-index-tool", batch("memory-stale-index", [
+    {
+      operation: "delete",
+      path: topicPath,
+      expectedVersion: (await vault.read(topicPath)).modifiedVersion,
+    },
+    {
+      operation: "exact_replace",
+      path: indexPath,
+      expectedVersion: (await vault.read(indexPath)).modifiedVersion,
+      expectedContent: index,
+      replacement: index,
+    },
+  ])));
+  assert.equal(staleIndex.ok, false);
+  assert.equal(staleIndex.error.code, "invalid_change");
+
+  const malformedTopic = await coordinator.execute(toolCall("memory-malformed-tool", batch("memory-malformed", [
+    {
+      operation: "create",
+      path: "memory/study/malformed.md",
+      expectedVersion: "missing",
+      content: "---\nname: \"\"\ndescription: \"\"\ntype: study\n---\nInvisible.\n",
+    },
+    {
+      operation: "exact_replace",
+      path: indexPath,
+      expectedVersion: (await vault.read(indexPath)).modifiedVersion,
+      expectedContent: index,
+      replacement: `${index}- [Malformed](study/malformed.md) - Invalid\n`,
+    },
+  ])));
+  assert.equal(malformedTopic.ok, false);
+  assert.equal(malformedTopic.error.code, "invalid_change");
+
+  const staleMetadataIndex = await coordinator.execute(toolCall("memory-stale-metadata-index-tool", batch("memory-stale-metadata-index", [
+    {
+      operation: "create",
+      path: "memory/study/current.md",
+      expectedVersion: "missing",
+      content: "---\nname: \"Current\"\ndescription: \"Current direction\"\ntype: study\n---\nCurrent direction.\n",
+    },
+    {
+      operation: "exact_replace",
+      path: indexPath,
+      expectedVersion: (await vault.read(indexPath)).modifiedVersion,
+      expectedContent: index,
+      replacement: `${index}- [Obsolete](study/current.md) - Superseded direction\n`,
+    },
+  ])));
+  assert.equal(staleMetadataIndex.ok, false);
+  assert.equal(staleMetadataIndex.error.code, "invalid_change");
+
+  const multilineMetadata = await coordinator.execute(toolCall("memory-multiline-metadata-tool", batch("memory-multiline-metadata", [
+    {
+      operation: "create",
+      path: "memory/study/multiline.md",
+      expectedVersion: "missing",
+      content: "---\nname: \"Line\\nBreak\"\ndescription: \"Current direction\"\ntype: study\n---\nCurrent direction.\n",
+    },
+    {
+      operation: "exact_replace",
+      path: indexPath,
+      expectedVersion: (await vault.read(indexPath)).modifiedVersion,
+      expectedContent: index,
+      replacement: `${index}- [Line Break](study/multiline.md) - Current direction\n`,
+    },
+  ])));
+  assert.equal(multilineMetadata.ok, false);
+  assert.equal(multilineMetadata.error.code, "invalid_change");
+
+  vault.failPath = indexPath;
+  const rollbackProposal = batch("memory-delete-rollback", [
+    {
+      operation: "delete",
+      path: topicPath,
+      expectedVersion: (await vault.read(topicPath)).modifiedVersion,
+    },
+    {
+      operation: "exact_replace",
+      path: indexPath,
+      expectedVersion: (await vault.read(indexPath)).modifiedVersion,
+      expectedContent: index,
+      replacement: "# Planning Memory\n",
+    },
+  ]);
+  const rollbackExecution = coordinator.execute(toolCall("memory-delete-rollback-tool", rollbackProposal));
+  await coordinator.waitUntilPending("memory-delete-rollback-tool");
+  const rolledBack = await coordinator.decide("memory-delete-rollback-tool", "apply");
+  await rollbackExecution;
+  assert.equal(rolledBack.ok, false);
+  assert.equal(rolledBack.error.code, "tool_error");
+  assert.equal(await readFile(path.join(root, topicPath), "utf8"), topic);
+  assert.equal(await readFile(path.join(root, indexPath), "utf8"), index);
+  assert.equal(journal.entries.get(rollbackProposal.batchId).state, "rolled_back");
+  vault.failPath = undefined;
+
+  const validNewTopic = "---\nname: \"New\"\ndescription: \"Valid topic\"\ntype: study\n---\nNew direction.\n";
+  const plainTextLink = await coordinator.execute(toolCall("memory-plain-link-tool", batch("memory-plain-link", [
+    {
+      operation: "create",
+      path: "memory/study/new.md",
+      expectedVersion: "missing",
+      content: validNewTopic,
+    },
+    {
+      operation: "exact_replace",
+      path: indexPath,
+      expectedVersion: (await vault.read(indexPath)).modifiedVersion,
+      expectedContent: index,
+      replacement: `${index}\n- ![New](study/new.md) - An image is not an index link.\n`,
+    },
+  ])));
+  assert.equal(plainTextLink.ok, false);
+  assert.equal(plainTextLink.error.code, "invalid_change");
+
+  const otherPath = "memory/study/other.md";
+  const other = "---\nname: \"Other\"\ndescription: \"Unchanged topic\"\ntype: study\n---\nOther direction.\n";
+  await writeFile(path.join(root, otherPath), other, "utf8");
+  const indexWithOther = `${index.trimEnd()}\n- [Other](study/other.md) - Unchanged topic\n`;
+  await writeFile(path.join(root, indexPath), indexWithOther, "utf8");
+  const dropsUnchanged = await coordinator.execute(toolCall("memory-drop-other-tool", batch("memory-drop-other", [
+    {
+      operation: "exact_replace",
+      path: topicPath,
+      expectedVersion: (await vault.read(topicPath)).modifiedVersion,
+      expectedContent: topic,
+      replacement: topic.replace("Old direction.", "Updated direction."),
+    },
+    {
+      operation: "exact_replace",
+      path: indexPath,
+      expectedVersion: (await vault.read(indexPath)).modifiedVersion,
+      expectedContent: indexWithOther,
+      replacement: index,
+    },
+  ])));
+  assert.equal(dropsUnchanged.ok, false);
+  assert.equal(dropsUnchanged.error.code, "invalid_change");
+
+  const aliasingVault = Object.create(vault);
+  aliasingVault.canonicalize = async (vaultPath, exists) => {
+    if (vaultPath === topicPath) {
+      const rootPath = await realpath(root);
+      return { root: rootPath, target: await realpath(path.join(root, "notes", "a.md")) };
+    }
+    return vault.canonicalize(vaultPath, exists);
+  };
+  const aliasCoordinator = new VaultChangeCoordinator(
+    aliasingVault,
+    checkpoints,
+    journal,
+    () => {},
+    () => "trusted_vault",
+    checkpoints,
+  );
+  const canonicalEscape = await aliasCoordinator.execute(toolCall("memory-canonical-delete-tool", batch("memory-canonical-delete", [
+    {
+      operation: "delete",
+      path: topicPath,
+      expectedVersion: (await vault.read(topicPath)).modifiedVersion,
+    },
+    {
+      operation: "exact_replace",
+      path: indexPath,
+      expectedVersion: (await vault.read(indexPath)).modifiedVersion,
+      expectedContent: indexWithOther,
+      replacement: "# Planning Memory\n\n- [Other](study/other.md) - Unchanged topic\n",
+    },
+  ])));
+  assert.equal(canonicalEscape.ok, false);
+  assert.equal(canonicalEscape.error.code, "invalid_path");
+});
+
+test("a failed Daily and Study Memory batch rolls every target back atomically", async (t) => {
+  const journal = new MemoryJournal();
+  const { coordinator, root, vault } = await fixture(t, journal, () => {}, () => "trusted_vault");
+  const dailyPath = "daily/2026-07-15.md";
+  const topicPath = "memory/study/retrieval-evaluation.md";
+  const indexPath = "memory/MEMORY.md";
+  const daily = "# 2026-07-15\n\n## 今日学习计划\n";
+  const topic = "---\nname: \"Retrieval Evaluation\"\ndescription: \"Current cross-day direction\"\ntype: study\n---\n\nCurrent direction: Retrieval Evaluation.\n";
+  const index = "# Planning Memory\n\n- [Retrieval Evaluation](study/retrieval-evaluation.md) - Current cross-day direction\n";
+  await mkdir(path.join(root, "daily"), { recursive: true });
+  await mkdir(path.join(root, "memory", "study"), { recursive: true });
+  await writeFile(path.join(root, dailyPath), daily, "utf8");
+  await writeFile(path.join(root, topicPath), topic, "utf8");
+  await writeFile(path.join(root, indexPath), index, "utf8");
+  vault.failPath = topicPath;
+
+  const proposal = batch("daily-study-rollback", [
+    {
+      operation: "exact_replace",
+      path: dailyPath,
+      expectedVersion: (await vault.read(dailyPath)).modifiedVersion,
+      expectedContent: daily,
+      replacement: `${daily}\n- [ ] Retrieval Evaluation\n`,
+    },
+    {
+      operation: "exact_replace",
+      path: topicPath,
+      expectedVersion: (await vault.read(topicPath)).modifiedVersion,
+      expectedContent: topic,
+      replacement: topic.replace("Current direction: Retrieval Evaluation.", "Current direction: RAG evaluation."),
+    },
+    {
+      operation: "exact_replace",
+      path: indexPath,
+      expectedVersion: (await vault.read(indexPath)).modifiedVersion,
+      expectedContent: index,
+      replacement: index,
+    },
+  ]);
+  const result = await coordinator.execute(toolCall("daily-study-rollback-tool", proposal));
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "tool_error");
+  assert.equal(await readFile(path.join(root, dailyPath), "utf8"), daily);
+  assert.equal(await readFile(path.join(root, topicPath), "utf8"), topic);
+  assert.equal(await readFile(path.join(root, indexPath), "utf8"), index);
+  assert.equal(journal.entries.get(proposal.batchId).state, "rolled_back");
+});
+
 test("a pending confirmation is rehydrated from plugin-owned durable storage", async (t) => {
   const journal = new MemoryJournal();
   const { checkpoints, coordinator, root, vault } = await fixture(

@@ -1,24 +1,41 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
 import Module from "node:module";
 import path from "node:path";
+import { tmpdir } from "node:os";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
 const modulePath = path.join(repositoryRoot, "packages", "plugin", "dist", "vault-tool-adapter.js");
+const dateModulePath = path.join(repositoryRoot, "packages", "plugin", "dist", "daily-note-context.js");
 const originalLoad = Module._load;
 Module._load = function loadWithObsidianStub(request, parent, isMain) {
   if (request === "obsidian") return {};
   return originalLoad.call(this, request, parent, isMain);
 };
 let ObsidianVaultToolAdapter;
+let resolveLocalToday;
 try {
   ({ ObsidianVaultToolAdapter } = require(modulePath));
+  ({ resolveLocalToday } = require(dateModulePath));
 } finally {
   Module._load = originalLoad;
 }
+
+test("local today crosses the configured timezone boundary deterministically", () => {
+  const previousTimezone = process.env.TZ;
+  process.env.TZ = "Asia/Shanghai";
+  try {
+    assert.equal(resolveLocalToday(new Date("2026-07-14T15:59:59.999Z")), "2026-07-14");
+    assert.equal(resolveLocalToday(new Date("2026-07-14T16:00:00.000Z")), "2026-07-15");
+  } finally {
+    if (previousTimezone === undefined) delete process.env.TZ;
+    else process.env.TZ = previousTimezone;
+  }
+});
 
 function file(pathname, content, mtime = 1234) {
   return {
@@ -46,6 +63,7 @@ function adapter(
   files,
   metadata = {},
   canonicalize = async (vaultPath) => `C:/vault/${vaultPath}`,
+  dailyNotes,
 ) {
   return new ObsidianVaultToolAdapter(
     {
@@ -56,8 +74,229 @@ function adapter(
       getFileCache: (target) => metadata[target.path],
     },
     canonicalize,
+    dailyNotes,
   );
 }
+
+function dailyNotes(configuration, today = "2026-07-14") {
+  return {
+    readConfiguration: async () => configuration,
+    resolveToday: () => today,
+    formatDate: (date, format) => {
+      const [year, month, day] = date.split("-");
+      return format.replaceAll("YYYY", year).replaceAll("MM", month).replaceAll("DD", day);
+    },
+  };
+}
+
+test("daily_note_context resolves an explicit configured Daily Note and template", async () => {
+  const template = "# {{date}}\n\n## Plan\n";
+  const subject = adapter(
+    [
+      file("daily/2026-07-14.md", "# 2026-07-14\n", 7001),
+      file("templates/daily.md", template, 7002),
+    ],
+    {},
+    async (vaultPath) => `C:/vault/${vaultPath}`,
+    dailyNotes({ folder: "daily", format: "YYYY-MM-DD", template: "templates/daily.md" }),
+  );
+
+  const result = await subject.execute(call("daily_note_context", { date: "2026-07-14" }));
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, {
+    type: "daily_note_context",
+    resolvedDate: "2026-07-14",
+    dateFormat: "YYYY-MM-DD",
+    targetPath: "daily/2026-07-14.md",
+    targetExists: true,
+    targetVersion: "mtime:7001:size:13",
+    templatePath: "templates/daily.md",
+    templateContent: template,
+    templateVersion: `mtime:7002:size:${Buffer.byteLength(template, "utf8")}`,
+  });
+});
+
+test("daily_note_context uses the plugin-local today and represents missing files explicitly", async () => {
+  const subject = adapter(
+    [],
+    {},
+    async (vaultPath) => `C:/vault/${vaultPath}`,
+    dailyNotes(
+      { folder: "daily", format: "YYYY/MM/DD", template: "templates/missing" },
+      "2026-07-15",
+    ),
+  );
+
+  const result = await subject.execute(call("daily_note_context", {}));
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, {
+    type: "daily_note_context",
+    resolvedDate: "2026-07-15",
+    dateFormat: "YYYY/MM/DD",
+    targetPath: "daily/2026/07/15.md",
+    targetExists: false,
+    targetVersion: "missing",
+    templatePath: "templates/missing",
+    templateContent: null,
+    templateVersion: null,
+  });
+});
+
+test("daily_note_context permits a missing configured folder after canonical containment", async (t) => {
+  const vaultRoot = await mkdtemp(path.join(tmpdir(), "offeragent-daily-context-"));
+  t.after(() => rm(vaultRoot, { recursive: true, force: true }));
+  const subject = new ObsidianVaultToolAdapter(
+    {
+      adapter: { getBasePath: () => vaultRoot },
+      getFiles: () => [],
+      cachedRead: async (target) => target.content,
+    },
+    { getFileCache: () => undefined },
+    undefined,
+    dailyNotes({ folder: "daily", format: "YYYY-MM-DD", template: "templates/daily" }),
+  );
+
+  const result = await subject.execute(call("daily_note_context", { date: "2026-07-14" }));
+  assert.equal(result.ok, true);
+  assert.equal(result.value.targetPath, "daily/2026-07-14.md");
+  assert.equal(result.value.targetExists, false);
+  assert.equal(result.value.templateContent, null);
+});
+
+test("daily_note_context rejects invalid configuration, escapes, and oversized templates", async () => {
+  const ordinaryFiles = [file("templates/large.md", "x".repeat(32_769))];
+  const cases = [
+    [
+      adapter([], {}, undefined, {
+        ...dailyNotes({}),
+        readConfiguration: async () => {
+          throw new Error("invalid JSON");
+        },
+      }),
+      { date: "2026-07-14" },
+      "malformed_control_file",
+    ],
+    [
+      adapter([], {}, undefined, dailyNotes(undefined)),
+      { date: "2026-07-14" },
+      "malformed_control_file",
+    ],
+    [
+      adapter([], {}, undefined, dailyNotes({ folder: "daily", format: "" })),
+      { date: "2026-07-14" },
+      "malformed_control_file",
+    ],
+    [
+      adapter([], {}, undefined, dailyNotes({ folder: "../outside", format: "YYYY-MM-DD" })),
+      { date: "2026-07-14" },
+      "invalid_path",
+    ],
+    [
+      adapter(
+        [file("daily/2026-07-14.md", "safe")],
+        {},
+        async (vaultPath) =>
+          vaultPath === "daily/2026-07-14.md" ? "C:/outside/daily.md" : "C:/vault",
+        dailyNotes({ folder: "daily", format: "YYYY-MM-DD" }),
+      ),
+      { date: "2026-07-14" },
+      "invalid_path",
+    ],
+    [
+      adapter(
+        [],
+        {},
+        async (vaultPath) => (vaultPath === "daily" ? "C:/outside/daily" : "C:/vault"),
+        dailyNotes({ folder: "daily", format: "YYYY-MM-DD" }),
+      ),
+      { date: "2026-07-14" },
+      "invalid_path",
+    ],
+    [
+      adapter(
+        ordinaryFiles,
+        {},
+        async (vaultPath) => `C:/vault/${vaultPath}`,
+        dailyNotes({ folder: "daily", format: "YYYY-MM-DD", template: "templates/large.md" }),
+      ),
+      { date: "2026-07-14" },
+      "response_too_large",
+    ],
+  ];
+  for (const [subject, arguments_, expectedCode] of cases) {
+    const result = await subject.execute(call("daily_note_context", arguments_));
+    assert.equal(result.ok, false);
+    assert.equal(result.error.code, expectedCode);
+    assert.ok(Buffer.byteLength(result.error.message, "utf8") <= 2_048);
+  }
+
+  const invalidDate = await adapter(
+    [],
+    {},
+    undefined,
+    dailyNotes({ folder: "daily", format: "YYYY-MM-DD" }),
+  ).execute(call("daily_note_context", { date: "2026-02-30" }));
+  assert.equal(invalidDate.ok, false);
+  assert.equal(invalidDate.error.code, "request_too_large");
+});
+
+test("Planning Memory tools expose typed metadata and only selected topic bodies", async () => {
+  const topics = [
+    file("memory/user/profile.md", "---\nname: Profile\ndescription: Stable user profile\ntype: user\n---\nPrefers concise plans."),
+    file("memory/feedback/planning.md", "---\nname: Planning feedback\ndescription: Corrections for study plans\ntype: feedback\n---\nDo not invent completion."),
+    file("memory/project/offeragent.md", "---\nname: OfferAgent\ndescription: Product direction\ntype: project\n---\nShip the local plugin."),
+    file("memory/study/agentic-rl.md", "---\nname: Agentic RL\ndescription: Cross-day study sequence\ntype: study\n---\nContinue with policy gradients."),
+    file("memory/MEMORY.md", "# Full index must not be returned"),
+    file("memory/study/malformed.md", "missing frontmatter"),
+  ];
+  const memoryMetadata = Object.fromEntries(topics.slice(0, 4).map((topic) => {
+    const [type] = topic.path.split("/").slice(1);
+    return [topic.path, { frontmatter: {
+      name: type === "user" ? "Profile" : type === "feedback" ? "Planning feedback" : type === "project" ? "OfferAgent" : "Agentic RL",
+      description: type === "user" ? "Stable user profile" : type === "feedback" ? "Corrections for study plans" : type === "project" ? "Product direction" : "Cross-day study sequence",
+      type,
+    } }];
+  }));
+  const subject = adapter(topics, memoryMetadata);
+
+  const listed = await subject.execute(call("planning_memory_list", {}));
+  assert.equal(listed.ok, true);
+  assert.deepEqual(listed.value.topics.map(({ path, type }) => [path, type]), [
+    ["memory/feedback/planning.md", "feedback"],
+    ["memory/project/offeragent.md", "project"],
+    ["memory/study/agentic-rl.md", "study"],
+    ["memory/user/profile.md", "user"],
+  ]);
+  assert.equal(JSON.stringify(listed).includes("Full index"), false);
+  assert.equal(JSON.stringify(listed).includes("policy gradients"), false);
+
+  const read = await subject.execute(call("planning_memory_read", {
+    paths: ["memory/feedback/planning.md", "memory/study/agentic-rl.md"],
+  }));
+  assert.equal(read.ok, true);
+  assert.deepEqual(read.value.topics.map(({ path }) => path), [
+    "memory/feedback/planning.md",
+    "memory/study/agentic-rl.md",
+  ]);
+  assert.match(read.value.topics[1].content, /policy gradients/);
+});
+
+test("Planning Memory reads reject indexes, malformed requests, escapes, and oversized bodies", async () => {
+  const large = file("memory/study/large.md", "x".repeat(32_769));
+  const subject = adapter([large, file("memory/MEMORY.md", "index")]);
+  for (const arguments_ of [
+    { paths: ["memory/MEMORY.md"] },
+    { paths: ["../outside.md"] },
+    { paths: [] },
+    { paths: Array.from({ length: 6 }, (_, index) => `memory/study/${index}.md`) },
+  ]) {
+    const result = await subject.execute(call("planning_memory_read", arguments_));
+    assert.equal(result.ok, false);
+  }
+  const oversized = await subject.execute(call("planning_memory_read", { paths: [large.path] }));
+  assert.equal(oversized.ok, false);
+  assert.equal(oversized.error.code, "response_too_large");
+});
 
 test("vault_read returns bounded exact evidence with stable source metadata", async () => {
   const subject = adapter([file("notes/interview.md", "first\nsecond\nthird\nfourth", 5678)]);

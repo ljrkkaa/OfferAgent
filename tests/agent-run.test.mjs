@@ -94,9 +94,23 @@ function collectRunEvents(socket, agentRunId) {
 function installContractResponder(socket, content = "# Test Agent Contract") {
   socket.on("message", (data) => {
     const event = JSON.parse(data.toString("utf8"));
-    if (event.type !== "tool_call.requested" || event.tool.name !== "agent_contract_read") {
+    if (event.type !== "tool_call.requested") {
       return;
     }
+    if (event.tool.name === "planning_memory_list") {
+      socket.send(JSON.stringify({
+        type: "tool_result",
+        protocolVersion: 1,
+        eventId: `memory-list-result-${event.toolCallId}`,
+        conversationId: event.conversationId,
+        agentRunId: event.agentRunId,
+        sequence: event.sequence,
+        toolCallId: event.toolCallId,
+        result: { ok: true, value: { type: "planning_memory_list", topics: [], truncated: false } },
+      }));
+      return;
+    }
+    if (event.tool.name !== "agent_contract_read") return;
     socket.send(
       JSON.stringify({
         type: "tool_result",
@@ -184,11 +198,13 @@ test("a deterministic Provider lists models and streams one Agent Run", async (t
     "agent_run.started",
     "tool_call.requested",
     "tool_call.completed",
+    "tool_call.requested",
+    "tool_call.completed",
     "agent_run.delta",
     "agent_run.delta",
     "agent_run.completed",
   ]);
-  assert.deepEqual(events.map((event) => event.sequence), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(events.map((event) => event.sequence), [1, 2, 3, 4, 5, 6, 7, 8]);
   for (const event of events) {
     assert.equal(event.protocolVersion, 1);
     assert.equal(event.conversationId, conversationId);
@@ -196,9 +212,10 @@ test("a deterministic Provider lists models and streams one Agent Run", async (t
     assert.equal(typeof event.eventId, "string");
   }
   assert.equal(events[1].tool.name, "agent_contract_read");
-  assert.equal(events[3].delta, "OfferAgent received: ");
-  assert.equal(events[4].delta, "Help me prepare.");
-  assert.equal(events[5].output.text, "OfferAgent received: Help me prepare.");
+  assert.equal(events[3].tool.name, "planning_memory_list");
+  assert.equal(events[5].delta, "OfferAgent received: ");
+  assert.equal(events[6].delta, "Help me prepare.");
+  assert.equal(events[7].output.text, "OfferAgent received: Help me prepare.");
 
   const failedRun = new Promise((resolve) => {
     socket.on("message", function onMessage(data) {
@@ -238,7 +255,15 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   );
 
   const upstreamRequests = [];
+  const mainResponseRequestsSince = (start = 0) => upstreamRequests
+    .slice(start)
+    .filter((candidate) => {
+      if (candidate.url !== "/responses") return false;
+      const payload = JSON.parse(candidate.body);
+      return !payload.instructions?.includes("OfferAgent Planning Memory semantic fallback");
+    });
   let responseMode = "complete";
+  let emptyResponseCount = 0;
   const upstream = createServer((incoming, response) => {
     let body = "";
     incoming.setEncoding("utf8");
@@ -264,6 +289,14 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
       }
       if (incoming.url === "/responses") {
         const requestPayload = JSON.parse(body);
+        if (requestPayload.instructions?.includes("OfferAgent Planning Memory semantic fallback")) {
+          response.writeHead(200, { "content-type": "text/event-stream" });
+          response.end(
+            'data: {"type":"response.output_text.delta","delta":"[]"}\r\n\r\n' +
+            'data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n',
+          );
+          return;
+        }
         if (
           responseMode === "unsupported" &&
           requestPayload.tools.some((tool) => tool.type === "web_search")
@@ -357,8 +390,39 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
             response.write('data: {"type":"response.output_text.delta","delta":"Used Vault evidence"}\r\n\r\n');
           } else {
             response.write(
-              'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"item-vault-read","call_id":"codex-vault-call","name":"vault_read","arguments":"{\\"path\\":\\"notes/a.md\\",\\"lineStart\\":1,\\"lineEnd\\":2}"}}\r\n\r\n',
+              'data: {"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","id":"item-vault-read-2","call_id":"codex-vault-call-2","name":"vault_read","status":"completed","arguments":"{\\"path\\":\\"notes/b.md\\",\\"lineStart\\":1,\\"lineEnd\\":2}"}}\r\n\r\n',
             );
+            response.write(
+              'data: {"type":"response.output_text.delta","delta":"Reading evidence. "}\r\n\r\n',
+            );
+            response.write(
+              'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"reasoning-tool","content":[],"encrypted_content":"opaque-reasoning-token","summary":[]}}\r\n\r\n',
+            );
+            response.write(
+              'data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"item-daily-context","call_id":"codex-daily-context-call","name":"daily_note_context","status":"completed","arguments":"{}"}}\r\n\r\n',
+            );
+          }
+          response.end('data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n');
+          return;
+        }
+        if (responseMode === "stale-order") {
+          const calls = requestPayload.input.filter((item) => item.type === "function_call");
+          const outputs = requestPayload.input.filter((item) => item.type === "function_call_output");
+          if (outputs.length === 0) {
+            response.write(
+              'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"item-stale-read","call_id":"codex-stale-read","name":"vault_read","status":"completed","arguments":"{\\"path\\":\\"notes/stale.md\\",\\"lineStart\\":1,\\"lineEnd\\":1}"}}\r\n\r\n',
+            );
+          } else if (!calls.some((item) => item.name === "vault_search")) {
+            response.write('data: {"type":"response.output_text.delta","delta":"Checking freshness. "}\r\n\r\n');
+            response.write(
+              'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"item-stale-search","call_id":"codex-stale-search","name":"vault_search","status":"completed","arguments":"{\\"query\\":\\"fresh content\\",\\"exactPhrase\\":true}"}}\r\n\r\n',
+            );
+          } else if (!calls.some((item) => item.id === "item-stale-reread")) {
+            response.write(
+              'data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"item-stale-reread","call_id":"codex-stale-reread","name":"vault_read","status":"completed","arguments":"{\\"path\\":\\"notes/stale.md\\",\\"lineStart\\":1,\\"lineEnd\\":1}"}}\r\n\r\n',
+            );
+          } else {
+            response.write('data: {"type":"response.output_text.delta","delta":"Fresh evidence verified"}\r\n\r\n');
           }
           response.end('data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n');
           return;
@@ -413,6 +477,23 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
             'data: {"type":"response.output_item.done","item":{"type":"message","id":"message-web","content":[{"type":"output_text","text":"Current answer [1]","annotations":[{"type":"url_citation","url":"https://example.com/source","title":"Primary source","start_index":15,"end_index":18}]}]}}\r\n\r\n',
           );
           response.end('data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n');
+          return;
+        }
+        if (responseMode === "message-only") {
+          response.end(
+            'data: {"type":"response.output_item.done","item":{"type":"message","id":"message-only","content":[{"type":"output_text","text":"Recovered full response","annotations":[]}]}}\r\n\r\n' +
+            'data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n',
+          );
+          return;
+        }
+        if (responseMode === "empty-then-message") {
+          emptyResponseCount += 1;
+          response.end(
+            (emptyResponseCount > 1
+              ? 'data: {"type":"response.output_text.delta","delta":"Recovered empty response"}\r\n\r\n'
+              : "") +
+            'data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n',
+          );
           return;
         }
         response.write('data: {"type":"response.output_text.delta","delta":"Interview "}\r\n\r\n');
@@ -499,7 +580,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   assert.equal(events.at(-1).output.text, "Interview answer");
   assert.equal(JSON.stringify(events).includes(accessToken), false);
   assert.equal(runtimeStderr.includes(accessToken), false);
-  assert.equal(upstreamRequests.length, 2);
+  assert.equal(upstreamRequests.length, 3);
   for (const upstreamRequest of upstreamRequests) {
     assert.equal(upstreamRequest.headers.authorization, `Bearer ${accessToken}`);
     assert.equal(upstreamRequest.headers["chatgpt-account-id"], "account-test-1");
@@ -510,10 +591,13 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   assert.equal(responseRequest.model, "gpt-5.4");
   assert.equal(responseRequest.service_tier, "priority");
   assert.equal(responseRequest.store, false);
+  assert.deepEqual(responseRequest.include, ["reasoning.encrypted_content"]);
   assert.equal(responseRequest.stream, true);
   assert.equal(responseRequest.input[0].content[0].text, "Prepare me.");
   assert.match(responseRequest.instructions, /CONTRACT_RULE/);
+  assert.match(responseRequest.instructions, /non-empty visible final response/i);
   assert.deepEqual(responseRequest.tools.filter((tool) => tool.type === "function").map((tool) => tool.name), [
+    "daily_note_context",
     "web_read",
     "vault_list",
     "vault_search",
@@ -524,6 +608,72 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   ]);
   assert.equal(responseRequest.tools.some((tool) => tool.type === "web_search"), false);
   assert.ok(responseRequest.tools.filter((tool) => tool.type === "function").every((tool) => tool.strict === false));
+
+  responseMode = "message-only";
+  const messageOnlyRun = collectRunEvents(socket, "agent-run-codex-message-only");
+  socket.send(JSON.stringify({
+    type: "agent_run.start",
+    protocolVersion: 1,
+    eventId: "client-codex-message-only",
+    conversationId: "conversation-codex-message-only",
+    agentRunId: "agent-run-codex-message-only",
+    sequence: 0,
+    model: "gpt-5.4",
+    input: { role: "user", text: "Recover the completed message item." },
+  }));
+  assert.equal((await messageOnlyRun).at(-1).output.text, "Recovered full response");
+  responseMode = "complete";
+
+  const emptyResponseStart = upstreamRequests.length;
+  responseMode = "empty-then-message";
+  emptyResponseCount = 0;
+  const emptyResponseRun = collectRunEvents(socket, "agent-run-codex-empty-response");
+  socket.send(JSON.stringify({
+    type: "agent_run.start",
+    protocolVersion: 1,
+    eventId: "client-codex-empty-response",
+    conversationId: "conversation-codex-empty-response",
+    agentRunId: "agent-run-codex-empty-response",
+    sequence: 0,
+    model: "gpt-5.4",
+    input: { role: "user", text: "Do not complete silently." },
+  }));
+  assert.equal((await emptyResponseRun).at(-1).output.text, "Recovered empty response");
+  const emptyResponseRequests = mainResponseRequestsSince(emptyResponseStart);
+  assert.equal(emptyResponseRequests.length, 2);
+  assert.match(
+    JSON.parse(emptyResponseRequests[1].body).input.at(-1).content[0].text,
+    /visible final response/i,
+  );
+  responseMode = "complete";
+
+  const followup = collectRunEvents(socket, "agent-run-codex-context");
+  socket.send(
+    JSON.stringify({
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "client-codex-context-event",
+      conversationId: "conversation-codex-1",
+      agentRunId: "agent-run-codex-context",
+      sequence: 0,
+      model: "gpt-5.4",
+      input: { role: "user", text: "Continue." },
+    }),
+  );
+  assert.equal((await followup).at(-1).output.text, "Interview answer");
+  const contextRequest = JSON.parse(mainResponseRequestsSince().at(-1).body);
+  assert.deepEqual(
+    contextRequest.input.map((item) => ({
+      role: item.role,
+      contentType: item.content?.[0]?.type,
+      text: item.content?.[0]?.text,
+    })),
+    [
+      { role: "user", contentType: "input_text", text: "Prepare me." },
+      { role: "assistant", contentType: "output_text", text: "Interview answer" },
+      { role: "user", contentType: "input_text", text: "Continue." },
+    ],
+  );
 
   assert.deepEqual(await getJson(
     handshake.port,
@@ -556,7 +706,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   assert.equal(failedProbeTool.status, "failed");
   assert.equal(failedProbeTool.error.code, "tool_error");
   assert.equal(
-    upstreamRequests.slice(failedProbeStart).filter((candidate) => candidate.url === "/responses").length,
+    mainResponseRequestsSince(failedProbeStart).length,
     3,
   );
   assert.deepEqual(await getJson(
@@ -624,7 +774,8 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   const fallbackRequests = upstreamRequests
     .slice(unsupportedStart)
     .filter((candidate) => candidate.url === "/responses")
-    .map((candidate) => JSON.parse(candidate.body));
+    .map((candidate) => JSON.parse(candidate.body))
+    .filter((payload) => !payload.instructions?.includes("OfferAgent Planning Memory semantic fallback"));
   assert.equal(fallbackRequests.length, 2);
   assert.equal(fallbackRequests[0].tools.some((tool) => tool.type === "web_search"), true);
   assert.equal(fallbackRequests[1].tools.some((tool) => tool.type === "web_search"), false);
@@ -647,25 +798,40 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
       if (event.agentRunId !== "agent-run-codex-tool") return;
       toolRunEvents.push(event);
       if (event.type === "tool_call.requested") {
-        if (event.tool.name === "agent_contract_read") return;
-        const result = {
-          ok: true,
-          value: {
-            type: "vault_read",
-            path: "notes/a.md",
-            lineStart: 1,
-            lineEnd: 2,
-            modifiedVersion: "mtime:1:size:3",
-            contentHash: "sha256:test",
-            content: "A\nB",
-            truncated: false,
-          },
-        };
+        if (event.tool.name === "agent_contract_read" || event.tool.name === "planning_memory_list") return;
+        const result = event.tool.name === "daily_note_context"
+          ? {
+              ok: true,
+              value: {
+                type: "daily_note_context",
+                resolvedDate: "2026-07-14",
+                dateFormat: "YYYY-MM-DD",
+                targetPath: "daily/2026-07-14.md",
+                targetExists: false,
+                targetVersion: "missing",
+                templatePath: null,
+                templateContent: null,
+                templateVersion: null,
+              },
+            }
+          : {
+              ok: true,
+              value: {
+                type: "vault_read",
+                path: "notes/b.md",
+                lineStart: 1,
+                lineEnd: 2,
+                modifiedVersion: "mtime:1:size:3",
+                contentHash: "sha256:test",
+                content: "A\nB",
+                truncated: false,
+              },
+            };
         socket.send(
           JSON.stringify({
             type: "tool_result",
             protocolVersion: 1,
-            eventId: `codex-tool-result-${event.tool.name}`,
+            eventId: `codex-tool-result-${event.toolCallId}`,
             conversationId: event.conversationId,
             agentRunId: event.agentRunId,
             sequence: event.sequence,
@@ -701,18 +867,125 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   await toolRun;
   assert.equal(
     toolRunEvents.find(
+      (event) => event.type === "tool_call.requested" && event.tool.name === "daily_note_context",
+    ).tool.name,
+    "daily_note_context",
+  );
+  assert.equal(
+    toolRunEvents.find(
       (event) => event.type === "tool_call.requested" && event.tool.name === "vault_read",
     ).tool.name,
     "vault_read",
   );
   assert.equal(toolRunEvents.at(-1).output.text, "Used Vault evidence");
-  const toolFollowupRequest = JSON.parse(upstreamRequests.at(-1).body);
-  assert.deepEqual(
-    toolFollowupRequest.input.slice(-2).map((item) => item.type),
-    ["function_call", "function_call_output"],
+  const toolFollowupRequest = JSON.parse(mainResponseRequestsSince().at(-1).body);
+  assert.deepEqual(toolFollowupRequest.input.slice(-6).map((item) => item.type ?? item.role), [
+    "reasoning",
+    "assistant",
+    "function_call",
+    "function_call",
+    "function_call_output",
+    "function_call_output",
+  ]);
+  assert.equal(toolFollowupRequest.input.at(-6).encrypted_content, "opaque-reasoning-token");
+  assert.deepEqual(toolFollowupRequest.input.at(-6).content, []);
+  assert.equal(toolFollowupRequest.input.at(-5).content[0].text, "Reading evidence. ");
+  assert.equal(toolFollowupRequest.input.at(-4).id, "item-daily-context");
+  assert.equal(toolFollowupRequest.input.at(-4).status, "completed");
+  assert.equal(toolFollowupRequest.input.at(-3).id, "item-vault-read-2");
+
+  responseMode = "stale-order";
+  const staleOrderStart = upstreamRequests.length;
+  const staleOrderEvents = [];
+  let staleReadCount = 0;
+  const staleOrderRun = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Timed out waiting for stale ordering run")), 5_000);
+    socket.on("message", function onMessage(data) {
+      const event = JSON.parse(data.toString("utf8"));
+      if (event.agentRunId !== "agent-run-codex-stale-order") return;
+      staleOrderEvents.push(event);
+      if (event.type === "tool_call.requested") {
+        if (event.tool.name === "agent_contract_read" || event.tool.name === "planning_memory_list") return;
+        const result = event.tool.name === "vault_read"
+          ? (() => {
+              staleReadCount += 1;
+              return {
+              ok: true,
+              value: {
+                type: "vault_read",
+                path: "notes/stale.md",
+                lineStart: 1,
+                lineEnd: 1,
+                modifiedVersion: staleReadCount === 1 ? "mtime:1:size:3" : "mtime:2:size:5",
+                contentHash: staleReadCount === 1 ? "sha256:old" : "sha256:new",
+                content: staleReadCount === 1 ? "old" : "fresh",
+                truncated: false,
+              },
+            };
+            })()
+          : {
+              ok: true,
+              value: {
+                type: "vault_search",
+                entries: [{
+                  path: "notes/stale.md",
+                  modifiedVersion: "mtime:2:size:5",
+                  contentHash: "sha256:new",
+                  matchTier: "body",
+                  snippets: [{ lineStart: 1, lineEnd: 1, content: "fresh", truncated: false }],
+                }],
+                truncated: false,
+              },
+            };
+        socket.send(JSON.stringify({
+          type: "tool_result",
+          protocolVersion: 1,
+          eventId: `codex-stale-order-result-${event.toolCallId}`,
+          conversationId: event.conversationId,
+          agentRunId: event.agentRunId,
+          sequence: event.sequence,
+          toolCallId: event.toolCallId,
+          result,
+        }));
+      }
+      if (event.type === "agent_run.completed") {
+        clearTimeout(timeout);
+        socket.off("message", onMessage);
+        resolve();
+      } else if (event.type === "agent_run.failed") {
+        clearTimeout(timeout);
+        socket.off("message", onMessage);
+        reject(new Error(event.error.message));
+      }
+    });
+  });
+  socket.send(JSON.stringify({
+    type: "agent_run.start",
+    protocolVersion: 1,
+    eventId: "client-codex-stale-order",
+    conversationId: "conversation-codex-stale-order",
+    agentRunId: "agent-run-codex-stale-order",
+    sequence: 0,
+    model: "gpt-5.4",
+    input: { role: "user", text: "Check stale evidence ordering." },
+  }));
+  await staleOrderRun;
+  assert.equal(staleOrderEvents.at(-1).output.text, "Fresh evidence verified");
+  const staleOrderRequests = mainResponseRequestsSince(staleOrderStart).map((entry) => JSON.parse(entry.body));
+  const staleSearchFollowup = staleOrderRequests.find((request) =>
+    request.input.some((item) => item.type === "function_call" && item.name === "vault_search"),
   );
+  assert.equal(staleSearchFollowup.input.some((item) => item.id === "item-stale-read"), false);
+  assert.deepEqual(staleSearchFollowup.input.slice(-3).map((item) => item.type ?? item.role), [
+    "assistant",
+    "function_call",
+    "function_call_output",
+  ]);
+  assert.equal(staleSearchFollowup.input.at(-3).content[0].text, "Checking freshness. ");
+  assert.equal(staleSearchFollowup.input.at(-2).name, "vault_search");
 
   responseMode = "skill";
+  const skillRequestStart = upstreamRequests.length;
   const skillRunEvents = [];
   const skillRun = new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("Timed out waiting for instruction precedence run")), 5_000);
@@ -721,7 +994,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
       if (event.agentRunId !== "agent-run-codex-skill") return;
       skillRunEvents.push(event);
       if (event.type === "tool_call.requested") {
-        if (event.tool.name === "agent_contract_read") return;
+        if (event.tool.name === "agent_contract_read" || event.tool.name === "planning_memory_list") return;
         const result =
           event.tool.name === "skill_read"
             ? {
@@ -791,10 +1064,10 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
     skillRunEvents
       .filter((event) => event.type === "tool_call.requested")
       .map((event) => event.tool.name),
-    ["agent_contract_read", "skill_read", "vault_read"],
+    ["agent_contract_read", "planning_memory_list", "skill_read", "vault_read"],
   );
   assert.equal(JSON.stringify(skillRunEvents).includes("SKILL_WORKFLOW"), false);
-  const instructionRequests = upstreamRequests.slice(-3).map((entry) => JSON.parse(entry.body));
+  const instructionRequests = mainResponseRequestsSince(skillRequestStart).map((entry) => JSON.parse(entry.body));
   assert.match(instructionRequests[0].instructions, /CONTRACT_RULE/);
   assert.doesNotMatch(instructionRequests[0].instructions, /SKILL_WORKFLOW/);
   assert.match(instructionRequests[1].instructions, /SKILL_WORKFLOW/);
@@ -806,7 +1079,15 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
     instructionRequests[2].tools
       .filter((tool) => tool.type === "function")
       .map((tool) => tool.name),
-    ["web_read", "vault_list", "vault_search", "skill_read", "vault_propose_changes", "vault_read"],
+    [
+      "daily_note_context",
+      "web_read",
+      "vault_list",
+      "vault_search",
+      "skill_read",
+      "vault_propose_changes",
+      "vault_read",
+    ],
   );
   assert.equal(instructionRequests[2].tools.some((tool) => tool.type === "web_search"), false);
   assert.equal(instructionRequests[2].tools.some((tool) => tool.name === "shell"), false);
@@ -848,7 +1129,10 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
         event.agentRunId === "agent-run-codex-oversized" &&
         (event.type === "agent_run.failed" || event.type === "tool_call.requested")
       ) {
-        if (event.type === "tool_call.requested" && event.tool.name === "agent_contract_read") return;
+        if (
+          event.type === "tool_call.requested" &&
+          (event.tool.name === "agent_contract_read" || event.tool.name === "planning_memory_list")
+        ) return;
         socket.off("message", onMessage);
         resolve(event);
       }
