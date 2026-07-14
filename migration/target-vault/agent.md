@@ -64,6 +64,9 @@ summary: 约束 OfferAgent 安全完成普通笔记写作、Daily Study Plan 与
 8. The Agent owns semantic identity. Different candidates, dates, or rounds remain distinct Interview Experiences, and ambiguous evidence defaults to no merge.
 9. A duplicate Interview Experience creates no second note and does not increment Question frequency. It may fill only missing minimal Source Metadata directly supported by the submission.
 10. A genuinely recurring Interview Question adds one occurrence context and increments frequency in the same atomic batch as the distinct Experience and affected indexes. Any stale or failed action leaves the whole knowledge batch unchanged.
+11. For a user-supplied Interview Submission URL, call `web_read` first and use its final canonical URL and bounded Source Fingerprint when querying the Interview Catalog. Store only that canonical URL, fingerprint, a source title when present, and other minimal metadata directly supported by the page.
+12. Normalize a readable URL into a concise Interview Experience summary and Question set; never copy the full page into the Vault. If the page is inaccessible or does not contain enough interview evidence, report the explicit source gap and do not fabricate company, position, round, date, or Questions.
+13. URL submissions use the same exact-evidence deduplication and atomic Experience, recurring Question, and index update rules as text submissions.
 
 ## Daily Study Plan
 

@@ -1,53 +1,17 @@
-import type {
-  ModelConversationItem,
-  ModelRequest,
-  ModelStreamEvent,
-} from "./model-provider";
+import type { ModelRequest, ModelStreamEvent } from "./model-provider";
 import { toolResultFor } from "./fake-provider-conversation";
-
-function output(delta: string): ModelStreamEvent {
-  return { type: "output_text.delta", delta };
-}
-
-function readResultFor(input: ModelConversationItem[], path: string) {
-  return toolResultFor(
-    input,
-    "vault_read",
-    (call) => (call.arguments as { path?: unknown }).path === path,
-  );
-}
-
-function readRequest(path: string, nextCallId: (prefix: string) => string): ModelStreamEvent {
-  return {
-    type: "local_tool_call",
-    callId: nextCallId("fake-dedup-read"),
-    name: "vault_read",
-    arguments: { path },
-  };
-}
-
-function frontmatterField(content: string, name: string): string | undefined {
-  const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u.exec(content)?.[1];
-  if (!frontmatter) return undefined;
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-  return new RegExp(`^${escaped}:\\s*(.+?)\\s*$`, "mu").exec(frontmatter)?.[1]?.trim();
-}
-
-function questionIdentity(content: string): string | undefined {
-  const title = frontmatterField(content, "title") ?? /^#\s+(.+)$/mu.exec(content)?.[1]?.trim();
-  return title?.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
-}
-
-function experienceIdentity(content: string) {
-  const candidate = frontmatterField(content, "candidate")?.toLocaleLowerCase();
-  const date = frontmatterField(content, "date");
-  const round = frontmatterField(content, "round")?.toLocaleLowerCase();
-  return {
-    ...(candidate ? { candidate } : {}),
-    ...(date ? { date } : {}),
-    ...(round ? { round } : {}),
-  };
-}
+import {
+  experienceIdentity,
+  frontmatterField,
+  incrementFrequency,
+} from "./fake-interview-evidence";
+import {
+  candidateReadStep,
+  interviewOutput as output,
+  interviewReadRequest as readRequest,
+  interviewReadResultFor as readResultFor,
+  matchingQuestionCandidates,
+} from "./fake-interview-workflow";
 
 export function interviewDeduplicationEvent(
   request: ModelRequest,
@@ -78,15 +42,8 @@ export function interviewDeduplicationEvent(
     ...catalogValue.experienceCandidates.map(({ path }) => path),
     ...catalogValue.questionCandidates.map(({ path }) => path),
   ];
-  for (const candidatePath of candidatePaths) {
-    const candidateRead = readResultFor(request.input, candidatePath);
-    if (!candidateRead) return readRequest(candidatePath, nextCallId);
-    if (!candidateRead.result.ok || candidateRead.result.value.type !== "vault_read") {
-      return candidateRead.result.ok
-        ? output("Candidate evidence returned an invalid result.")
-        : output(`Candidate evidence failed: ${candidateRead.result.error.message}`);
-    }
-  }
+  const candidateStep = candidateReadStep(request.input, candidatePaths, nextCallId);
+  if (candidateStep) return candidateStep;
 
   const proposalResult = toolResultFor(request.input, "vault_propose_changes");
   const experienceEvidence = catalogValue.experienceCandidates.map((candidate) => {
@@ -163,12 +120,11 @@ export function interviewDeduplicationEvent(
     return output("Ambiguous identity; no merge or Vault changes proposed.");
   }
   const targetQuestionIdentity = "distributedcacheconsistency";
-  const recurringQuestions = catalogValue.questionCandidates.filter((candidate) => {
-    const candidateRead = readResultFor(request.input, candidate.path);
-    return candidateRead?.result.ok &&
-      candidateRead.result.value.type === "vault_read" &&
-      questionIdentity(candidateRead.result.value.content) === targetQuestionIdentity;
-  });
+  const recurringQuestions = matchingQuestionCandidates(
+    request.input,
+    catalogValue.questionCandidates,
+    targetQuestionIdentity,
+  );
   if (recurringQuestions.length !== 1) {
     return output("Ambiguous recurring Question identity; no merge or Vault changes proposed.");
   }
@@ -187,13 +143,11 @@ export function interviewDeduplicationEvent(
     if (!questionRead?.result.ok || questionRead.result.value.type !== "vault_read") {
       return output("Recurring Question evidence is unavailable.");
     }
-    const frequencyMatch = /^frequency:\s*(\d+)\s*$/mu.exec(questionRead.result.value.content);
-    const currentFrequency = frequencyMatch ? Number(frequencyMatch[1]) : Number.NaN;
-    if (!frequencyMatch || !Number.isSafeInteger(currentFrequency) || currentFrequency < 0) {
+    const incrementedQuestion = incrementFrequency(questionRead.result.value.content);
+    if (!incrementedQuestion) {
       return output("Recurring Question frequency is missing or invalid; no merge proposed.");
     }
-    const questionReplacement = questionRead.result.value.content
-      .replace(frequencyMatch[0], `frequency: ${currentFrequency + 1}`)
+    const questionReplacement = incrementedQuestion
       .replace(
         /\s*$/u,
         "\n- [[experiences/backend-final-round]] — candidate-b, 2026-07-01 final round\n",

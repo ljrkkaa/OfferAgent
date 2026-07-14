@@ -12,9 +12,14 @@ import {
   type MemorySelectionInput,
 } from "./planning-memory";
 import { interviewDeduplicationEvent } from "./fake-interview-deduplication-scenario";
+import { interviewUrlIngestionEvent } from "./fake-interview-url-scenario";
 import { toolResultFor, toolResultForAfter } from "./fake-provider-conversation";
 
-export const FAKE_SCENARIOS = ["interview-deduplication", "text-interview-ingestion"] as const;
+export const FAKE_SCENARIOS = [
+  "interview-deduplication",
+  "text-interview-ingestion",
+  "url-interview-ingestion",
+] as const;
 export type FakeScenario = (typeof FAKE_SCENARIOS)[number];
 
 export function isFakeScenario(value: string): value is FakeScenario {
@@ -134,6 +139,13 @@ export class FakeModelProvider implements ModelProvider {
     }
     if (this.#scenario === "interview-deduplication") {
       yield interviewDeduplicationEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
+      return;
+    }
+    if (this.#scenario === "url-interview-ingestion") {
+      yield interviewUrlIngestionEvent(request, (prefix) => {
         this.#toolCallSequence += 1;
         return `${prefix}-${this.#toolCallSequence}`;
       });

@@ -44,6 +44,11 @@ import {
 } from "./model-provider";
 import { RuntimeStateStore, type RunCheckpoint } from "./state-store";
 import { WebReader } from "./web-read";
+import {
+  createFakeWebReader,
+  isFakeWebFixture,
+  type FakeWebFixture,
+} from "./fake-web-fixture";
 import { CapabilityGatedModelProvider } from "./capability-gated-provider";
 import {
   buildMemoryChangeActions,
@@ -57,6 +62,7 @@ import {
 
 interface RuntimeOptions {
   fakeScenario?: FakeScenario;
+  fakeWebFixture?: FakeWebFixture;
   parentPid: number;
   port: number;
   provider: "codex" | "fake";
@@ -679,8 +685,18 @@ function readOptions(): RuntimeOptions {
   if (fakeScenario && provider !== "fake") {
     throw new Error("--fake-scenario requires --provider fake");
   }
+  const fakeWebFixture = process.argv.includes("--fake-web-fixture")
+    ? readOption("--fake-web-fixture")
+    : undefined;
+  if (fakeWebFixture !== undefined && !isFakeWebFixture(fakeWebFixture)) {
+    throw new Error(`Unsupported fake Web fixture: ${fakeWebFixture}`);
+  }
+  if (fakeWebFixture && provider !== "fake") {
+    throw new Error("--fake-web-fixture requires --provider fake");
+  }
   return {
     ...(fakeScenario ? { fakeScenario } : {}),
+    ...(fakeWebFixture ? { fakeWebFixture } : {}),
     parentPid: parseIntegerOption("--parent-pid"),
     port: parseIntegerOption("--port", true),
     provider,
@@ -1077,6 +1093,7 @@ async function handleVaultChangeCommand(
 
 async function startRuntime({
   fakeScenario,
+  fakeWebFixture,
   parentPid,
   port,
   provider: providerName,
@@ -1206,7 +1223,7 @@ async function startRuntime({
   const publishEvent = (event: AgentRunEvent): void => {
     for (const subscriber of sockets) sendEvent(subscriber, event);
   };
-  const webReader = new WebReader();
+  const webReader = fakeWebFixture ? createFakeWebReader(fakeWebFixture) : new WebReader();
   const webSockets = new WebSocketServer({ maxPayload: 1_048_576, noServer: true });
 
   server.on("upgrade", (request, socket, head) => {

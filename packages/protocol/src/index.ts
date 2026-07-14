@@ -138,6 +138,7 @@ export interface WebReadResult {
   content: string;
   contentType: string;
   finalUrl: string;
+  sourceFingerprint: string;
   sourceTitle?: string;
   truncated: boolean;
   type: "web_read";
