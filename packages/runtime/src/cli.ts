@@ -53,6 +53,19 @@ interface RuntimeOptions {
 const LOCAL_TOOLS: LocalToolDefinition[] = [
   {
     kind: "local",
+    name: "daily_note_context",
+    description:
+      "Resolve the configured Obsidian Daily Note and template for an optional YYYY-MM-DD date. This read-only capability does not create or modify files.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+      },
+    },
+  },
+  {
+    kind: "local",
     name: "web_read",
     description:
       "Read bounded extracted text from a user-supplied public HTTP or HTTPS page. This remains available even when hosted Web Search is unavailable.",
@@ -299,7 +312,7 @@ function isLocalToolResultPayload(value: unknown): value is LocalToolResultPaylo
   if (result.ok === false) {
     return Boolean(
       result.error &&
-      ["invalid_change", "invalid_path", "malformed_control_file", "not_found", "permission_denied", "plugin_disconnected", "request_too_large", "stale_evidence", "tool_error", "undo_conflict"].includes(
+      ["invalid_change", "invalid_path", "malformed_control_file", "not_found", "permission_denied", "plugin_disconnected", "request_too_large", "response_too_large", "stale_evidence", "tool_error", "undo_conflict"].includes(
         result.error.code as string,
       ) &&
       typeof result.error.message === "string" &&
@@ -317,6 +330,32 @@ function isLocalToolResultPayload(value: unknown): value is LocalToolResultPaylo
       result.value.modifiedVersion.length <= 128 &&
       typeof result.value.contentHash === "string" &&
       result.value.contentHash.length <= 128
+    );
+  }
+  if (result.value.type === "daily_note_context") {
+    const templateFieldsAreConsistent = result.value.templatePath === null
+      ? result.value.templateContent === null && result.value.templateVersion === null
+      : isBoundedVaultPath(result.value.templatePath) &&
+        (result.value.templateContent === null
+          ? result.value.templateVersion === null
+          : typeof result.value.templateContent === "string" &&
+            Buffer.byteLength(result.value.templateContent, "utf8") <= 32_768 &&
+            typeof result.value.templateVersion === "string" &&
+            result.value.templateVersion.length <= 128);
+    return (
+      /^\d{4}-\d{2}-\d{2}$/.test(result.value.resolvedDate) &&
+      typeof result.value.dateFormat === "string" &&
+      result.value.dateFormat.length > 0 &&
+      Buffer.byteLength(result.value.dateFormat, "utf8") <= 128 &&
+      isBoundedVaultPath(result.value.targetPath) &&
+      typeof result.value.targetExists === "boolean" &&
+      typeof result.value.targetVersion === "string" &&
+      result.value.targetVersion.length > 0 &&
+      result.value.targetVersion.length <= 128 &&
+      (result.value.targetExists
+        ? result.value.targetVersion !== "missing"
+        : result.value.targetVersion === "missing") &&
+      templateFieldsAreConsistent
     );
   }
   if (result.value.type === "skill_read") {

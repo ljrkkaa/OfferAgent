@@ -68,6 +68,7 @@ export interface AgentRunRecord {
 
 export type LocalToolName =
   | "agent_contract_read"
+  | "daily_note_context"
   | "hosted_web_search_probe"
   | "skill_read"
   | "vault_list"
@@ -151,6 +152,18 @@ export interface AgentContractResult {
   modifiedVersion: string;
   path: "agent.md";
   type: "agent_contract_read";
+}
+
+export interface DailyNoteContextResult {
+  dateFormat: string;
+  resolvedDate: string;
+  targetExists: boolean;
+  targetPath: string;
+  targetVersion: string;
+  templateContent: string | null;
+  templatePath: string | null;
+  templateVersion: string | null;
+  type: "daily_note_context";
 }
 
 export interface SkillReadResult {
@@ -292,6 +305,7 @@ export type LocalToolResultPayload =
       ok: true;
       value:
         | AgentContractResult
+        | DailyNoteContextResult
         | HostedWebSearchProbeResult
         | SkillReadResult
         | VaultListResult

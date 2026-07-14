@@ -230,6 +230,13 @@ export class FakeModelProvider implements ModelProvider {
 }
 
 function fakeToolRequest(input: string): { name: LocalToolName; arguments: unknown } | undefined {
+  const dailyContext = /^daily_note_context(?:\s+([^\s]+))?$/i.exec(input.trim());
+  if (dailyContext) {
+    return {
+      name: "daily_note_context",
+      arguments: dailyContext[1] ? { date: dailyContext[1] } : {},
+    };
+  }
   const webRead = /^web_read\s+(.+)$/i.exec(input.trim());
   if (webRead) {
     return { name: "web_read", arguments: { url: webRead[1].trim() } };

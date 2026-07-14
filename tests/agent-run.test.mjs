@@ -514,6 +514,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   assert.equal(responseRequest.input[0].content[0].text, "Prepare me.");
   assert.match(responseRequest.instructions, /CONTRACT_RULE/);
   assert.deepEqual(responseRequest.tools.filter((tool) => tool.type === "function").map((tool) => tool.name), [
+    "daily_note_context",
     "web_read",
     "vault_list",
     "vault_search",
@@ -834,7 +835,15 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
     instructionRequests[2].tools
       .filter((tool) => tool.type === "function")
       .map((tool) => tool.name),
-    ["web_read", "vault_list", "vault_search", "skill_read", "vault_propose_changes", "vault_read"],
+    [
+      "daily_note_context",
+      "web_read",
+      "vault_list",
+      "vault_search",
+      "skill_read",
+      "vault_propose_changes",
+      "vault_read",
+    ],
   );
   assert.equal(instructionRequests[2].tools.some((tool) => tool.type === "web_search"), false);
   assert.equal(instructionRequests[2].tools.some((tool) => tool.name === "shell"), false);

@@ -560,6 +560,71 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
   database.close();
 });
 
+test("the Runtime carries bounded Daily Note Context across the plugin tool protocol", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-daily-context-"));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const token = "daily-context-token";
+  const runtime = spawn(
+    process.execPath,
+    [
+      runtimeEntry,
+      "--port", "0",
+      "--token", token,
+      "--parent-pid", `${process.pid}`,
+      "--provider", "fake",
+      "--state-path", statePath,
+    ],
+    { stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
+  );
+  t.after(async () => {
+    if (runtime.exitCode === null) runtime.kill();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+  const ready = await handshake(runtime.stdout);
+  const socket = new WebSocket(`ws://127.0.0.1:${ready.port}/events`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  await once(socket, "open");
+
+  const events = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "daily-context-start",
+      conversationId: "daily-context-conversation",
+      agentRunId: "daily-context-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "daily_note_context 2026-07-14" },
+    },
+    () => ({
+      ok: true,
+      value: {
+        type: "daily_note_context",
+        resolvedDate: "2026-07-14",
+        dateFormat: "YYYY-MM-DD",
+        targetPath: "daily/2026-07-14.md",
+        targetExists: false,
+        targetVersion: "missing",
+        templatePath: "templates/daily.md",
+        templateContent: "# {{date}}\n",
+        templateVersion: "mtime:2:size:13",
+      },
+    }),
+  );
+  assert.equal(events.at(-1).type, "agent_run.completed");
+  assert.equal(
+    events.find(
+      (event) => event.type === "tool_call.requested" && event.tool.name === "daily_note_context",
+    ).tool.name,
+    "daily_note_context",
+  );
+  assert.match(events.at(-1).output.text, /daily\/2026-07-14\.md/);
+
+  await stopRuntime(runtime, ready.port, token);
+});
+
 test("a real plugin socket drop leaves an incomplete tool step uncommitted for Resume", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-tool-drop-"));
   const statePath = path.join(temporaryDirectory, "state.db");
@@ -841,6 +906,91 @@ test("malformed nested search results close only the offending socket", async (t
   const [code] = await closed;
   assert.equal(code, 1008);
   await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(runtime.exitCode, null);
+  assert.equal(await runtimeHealth(ready.port, token), 200);
+  await stopRuntime(runtime, ready.port, token);
+});
+
+test("oversized Daily Note Context closes only the offending plugin socket", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-malformed-daily-"));
+  const token = "malformed-daily-token";
+  const runtime = spawn(
+    process.execPath,
+    [
+      runtimeEntry,
+      "--port", "0",
+      "--token", token,
+      "--parent-pid", `${process.pid}`,
+      "--provider", "fake",
+      "--state-path", path.join(temporaryDirectory, "state.db"),
+    ],
+    { stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
+  );
+  t.after(async () => {
+    if (runtime.exitCode === null) runtime.kill();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+  const ready = await handshake(runtime.stdout);
+  const socket = new WebSocket(`ws://127.0.0.1:${ready.port}/events`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  await once(socket, "open");
+  const closed = once(socket, "close");
+  socket.on("message", (data) => {
+    const event = JSON.parse(data.toString("utf8"));
+    if (event.type !== "tool_call.requested") return;
+    const result = event.tool.name === "agent_contract_read"
+      ? {
+          ok: true,
+          value: {
+            type: "agent_contract_read",
+            path: "agent.md",
+            modifiedVersion: "mtime:1:size:24",
+            contentHash: "sha256:test-contract",
+            content: "# Test Agent Contract",
+          },
+        }
+      : {
+          ok: true,
+          value: {
+            type: "daily_note_context",
+            resolvedDate: "2026-07-14",
+            dateFormat: "YYYY-MM-DD",
+            targetPath: "daily/2026-07-14.md",
+            targetExists: false,
+            targetVersion: "missing",
+            templatePath: "templates/daily.md",
+            templateContent: "x".repeat(32_769),
+            templateVersion: "mtime:2:size:32769",
+          },
+        };
+    socket.send(
+      JSON.stringify({
+        type: "tool_result",
+        protocolVersion: 1,
+        eventId: `malformed-daily-${event.toolCallId}`,
+        conversationId: event.conversationId,
+        agentRunId: event.agentRunId,
+        sequence: event.sequence,
+        toolCallId: event.toolCallId,
+        result,
+      }),
+    );
+  });
+  socket.send(
+    JSON.stringify({
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "malformed-daily-start",
+      conversationId: "malformed-daily-conversation",
+      agentRunId: "malformed-daily-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "daily_note_context 2026-07-14" },
+    }),
+  );
+  const [code] = await closed;
+  assert.equal(code, 1008);
   assert.equal(runtime.exitCode, null);
   assert.equal(await runtimeHealth(ready.port, token), 200);
   await stopRuntime(runtime, ready.port, token);
