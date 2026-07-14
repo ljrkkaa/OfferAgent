@@ -27,8 +27,10 @@ docs/specs/*
 !docs/acceptance/
 docs/acceptance/*
 !docs/acceptance/*.md
+!docs/agents/
+docs/agents/*
+!docs/agents/*.md
 
 # Local agent/workspace artifacts
-AGENTS.md
 .understand-anything
 reference
