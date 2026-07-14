@@ -43,7 +43,17 @@ def test_main_blocks_before_build_or_install_when_process_host_is_running(
         "install_local_plugin",
         lambda *args, **kwargs: install_calls.append((args, kwargs)),
     )
-    monkeypatch.setattr(sys, "argv", ["update_local_windows_plugin.py", "--vault-root", str(tmp_path)])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "update_local_windows_plugin.py",
+            "--vault-root",
+            str(tmp_path),
+            "--ripgrep-executable",
+            str(tmp_path / "rg.exe"),
+        ],
+    )
 
     with pytest.raises(SystemExit, match=r"offeragent-process-host\.exe"):
         updater.main()
