@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
+from offeragent_harness.error_codes import ResourceConflictCause
 from offeragent_harness.models.json_types import FrozenJsonObject, freeze_json
 
 
@@ -14,7 +15,7 @@ class EventStoreError(RuntimeError):
     pass
 
 
-class SequenceConflict(EventStoreError):
+class SequenceConflict(EventStoreError, ResourceConflictCause):
     def __init__(self, stream_id: str, expected: int, actual: int) -> None:
         self.stream_id = stream_id
         self.expected = expected
@@ -22,15 +23,15 @@ class SequenceConflict(EventStoreError):
         super().__init__(f"stream {stream_id!r} expected sequence {expected}, actual {actual}")
 
 
-class TerminalEventConflict(EventStoreError):
+class TerminalEventConflict(EventStoreError, ResourceConflictCause):
     pass
 
 
-class EventIdConflict(EventStoreError):
+class EventIdConflict(EventStoreError, ResourceConflictCause):
     pass
 
 
-class EventIdempotencyConflict(EventStoreError):
+class EventIdempotencyConflict(EventStoreError, ResourceConflictCause):
     pass
 
 

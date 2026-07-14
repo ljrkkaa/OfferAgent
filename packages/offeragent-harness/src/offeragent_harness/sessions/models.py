@@ -154,16 +154,25 @@ class Turn:
     input_blocks: tuple[Mapping[str, Any], ...]
     created_at: datetime
     updated_at: datetime
+    revision: int = 1
+    client_context: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.ordinal < 1:
             raise ValueError("turn ordinal starts at 1")
+        if self.revision < 1:
+            raise ValueError("turn revision starts at 1")
         _require_aware(self.created_at, "created_at")
         _require_aware(self.updated_at, "updated_at")
         frozen_blocks = tuple(freeze_json(block) for block in self.input_blocks)
         if any(not isinstance(block, FrozenJsonObject) for block in frozen_blocks):
             raise TypeError("turn input blocks must be JSON objects")
         object.__setattr__(self, "input_blocks", frozen_blocks)
+        if self.client_context is not None:
+            frozen_context = freeze_json(self.client_context)
+            if not isinstance(frozen_context, FrozenJsonObject):
+                raise TypeError("turn client_context must be a JSON object")
+            object.__setattr__(self, "client_context", frozen_context)
 
 
 @dataclass(frozen=True)

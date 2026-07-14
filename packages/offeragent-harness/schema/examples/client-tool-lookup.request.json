@@ -1,0 +1,9 @@
+{
+  "id": "rpc_89",
+  "jsonrpc": "2.0",
+  "method": "client/tool/lookup",
+  "params": {
+    "invocationId": "inv_01",
+    "runId": "run_01"
+  }
+}

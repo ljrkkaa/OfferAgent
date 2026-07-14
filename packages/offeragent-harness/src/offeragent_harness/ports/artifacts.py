@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterable, AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
 from offeragent_harness.models.json_types import FrozenJsonObject, freeze_json
+
+from .cancellation import CancellationToken
 
 
 class ArtifactState(str, Enum):
@@ -59,4 +61,19 @@ class ArtifactStore(Protocol):
     def read(self, artifact_id: str, *, offset: int = 0, limit: int | None = None) -> AsyncIterator[bytes]: ...
 
 
-__all__ = ["ArtifactMetadata", "ArtifactState", "ArtifactStore", "Sensitivity"]
+@runtime_checkable
+class StreamingArtifactStore(ArtifactStore, Protocol):
+    """Extended port for bounded producers that must not materialize large content."""
+
+    async def put_stream(
+        self,
+        metadata: ArtifactMetadata,
+        content: AsyncIterable[bytes],
+        *,
+        idempotency_key: str,
+        max_bytes: int,
+        cancellation: CancellationToken,
+    ) -> ArtifactMetadata: ...
+
+
+__all__ = ["ArtifactMetadata", "ArtifactState", "ArtifactStore", "Sensitivity", "StreamingArtifactStore"]

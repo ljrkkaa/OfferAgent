@@ -1,0 +1,3 @@
+from offeragent_harness.runtime.development_composition import process_host_main_entry
+
+raise SystemExit(process_host_main_entry())

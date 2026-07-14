@@ -5,21 +5,39 @@ from __future__ import annotations
 from enum import Enum
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, AnyHttpUrl, Field, StringConstraints, model_validator
+from pydantic import AfterValidator, Field, StringConstraints, model_validator
 from typing_extensions import TypeAliasType
 
 from ._base import WireModel
-from .ids import ArtifactId, Rfc3339DateTime, Sha256Digest, WorkspaceId
+from .ids import ArtifactId, Sha256Digest, WorkspaceId
+
+_WINDOWS_FORBIDDEN = frozenset('<>"|?*')
+_WINDOWS_RESERVED_BASENAMES = frozenset(
+    {
+        "CON",
+        "CONIN$",
+        "CONOUT$",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{suffix}" for suffix in "123456789¹²³"),
+        *(f"LPT{suffix}" for suffix in "123456789¹²³"),
+    }
+)
 
 
 def _validate_relative_path(value: str) -> str:
-    if "\\" in value or any(ord(character) < 0x20 for character in value):
+    if "\\" in value or any(ord(character) < 0x20 or character in _WINDOWS_FORBIDDEN for character in value):
         raise ValueError("path must be a control-free relative POSIX path")
     if value.startswith("/") or ":" in value:
         raise ValueError("path must not be absolute, a drive path, or an ADS path")
     components = value.split("/")
     if any(component in {"", ".", ".."} for component in components):
         raise ValueError("path must not contain empty, current, or parent components")
+    if any(component[-1] in {".", " "} for component in components):
+        raise ValueError("path must not contain Windows-ambiguous trailing dots or spaces")
+    if any(component.split(".", maxsplit=1)[0].upper() in _WINDOWS_RESERVED_BASENAMES for component in components):
+        raise ValueError("path must not contain a reserved Windows device name")
     return value
 
 
@@ -42,6 +60,7 @@ class Freshness(str, Enum):
     FRESH = "fresh"
     STALE = "stale"
     PARTIAL = "partial"
+    STALE_PARTIAL = "stale_partial"
     UNKNOWN = "unknown"
 
 
@@ -101,39 +120,16 @@ class VaultSourceRef(WireModel):
     label: str | None = Field(default=None, min_length=1, max_length=512)
 
 
-class WebSourceRef(WireModel):
-    type: Literal["web"]
-    url: AnyHttpUrl
-    title: str | None = Field(default=None, min_length=1, max_length=512)
-    content_hash: Sha256Digest | None = None
-    retrieved_at: Rfc3339DateTime | None = None
-
-
 class ArtifactSourceRef(WireModel):
     type: Literal["artifact"]
     artifact: ArtifactRef
     label: str | None = Field(default=None, min_length=1, max_length=512)
 
 
-class MemorySourceRef(WireModel):
-    type: Literal["memory"]
-    memory_id: str = Field(min_length=1, max_length=128, pattern=r"^mem_[A-Za-z0-9][A-Za-z0-9_-]*$")
-    scope: Literal["session", "workspace", "profile"]
-    label: str | None = Field(default=None, min_length=1, max_length=512)
-
-
-class McpSourceRef(WireModel):
-    type: Literal["mcp"]
-    server_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-    resource_uri: str = Field(min_length=1, max_length=4096)
-    content_hash: Sha256Digest | None = None
-    label: str | None = Field(default=None, min_length=1, max_length=512)
-
-
 SourceRef = TypeAliasType(
     "SourceRef",
     Annotated[
-        VaultSourceRef | WebSourceRef | ArtifactSourceRef | MemorySourceRef | McpSourceRef,
+        VaultSourceRef | ArtifactSourceRef,
         Field(discriminator="type"),
     ],
 )
@@ -192,12 +188,9 @@ __all__ = [
     "FileRef",
     "Freshness",
     "ImageContentBlock",
-    "McpSourceRef",
-    "MemorySourceRef",
     "NonEmptyText",
     "RelativeVaultPath",
     "SourceRef",
     "TextContentBlock",
     "VaultSourceRef",
-    "WebSourceRef",
 ]

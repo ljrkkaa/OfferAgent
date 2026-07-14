@@ -5,9 +5,12 @@
     "author": "OfferAgent",
     "license": "GPL-3.0-or-later",
     "main": "main.js",
+    "packageManager": "yarn@1.22.22",
     "scripts": {
         "dev": "node esbuild.config.mjs",
-        "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+        "protocol:generate": "node scripts/generate-protocol-identity.mjs && node scripts/generate-protocol-types.mjs",
+        "build": "npm run protocol:generate && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+        "build:local": "npm run protocol:generate && tsc -noEmit -skipLibCheck && node esbuild.config.mjs local-development",
         "test": "node --test tests/*.test.cjs",
         "version": "node version-bump.mjs && git add manifest.json versions.json"
     },

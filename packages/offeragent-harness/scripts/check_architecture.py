@@ -7,6 +7,9 @@ from pathlib import Path
 
 CORE_FORBIDDEN_ROOTS = {"django", "khoj", "langchain", "psycopg", "psycopg2"}
 MODEL_FORBIDDEN_ROOTS = {"os", "pathlib", "shutil", "subprocess"}
+MODEL_BOUNDARY_DIRECTORIES = {"models", "providers"}
+MODEL_CLIENT_ROOTS = {"httpx", "anthropic", "openai"}
+REMOVED_AGENT_LOOP_MODULES = {"interactive.py"}
 
 
 def import_names(tree: ast.AST) -> set[str]:
@@ -37,6 +40,8 @@ def check(package_root: Path) -> list[str]:
         relative = path.relative_to(source)
         if "testing" in relative.parts:
             continue
+        if relative.name in REMOVED_AGENT_LOOP_MODULES:
+            problems.append(f"{relative}: standalone Agent loop modules are forbidden")
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         imports = import_names(tree)
         roots = {name.split(".", 1)[0] for name in imports}
@@ -47,7 +52,7 @@ def check(package_root: Path) -> list[str]:
             name == "offeragent_harness.testing" or name.startswith("offeragent_harness.testing.") for name in imports
         ):
             problems.append(f"{relative}: production code imports test fakes")
-        if relative.parts and relative.parts[0] == "models":
+        if relative.parts and relative.parts[0] in MODEL_BOUNDARY_DIRECTORIES:
             model_illegal = roots & MODEL_FORBIDDEN_ROOTS
             if model_illegal:
                 problems.append(f"{relative}: model boundary imports {sorted(model_illegal)}")
@@ -55,6 +60,11 @@ def check(package_root: Path) -> list[str]:
                 name == "offeragent_harness.tools" or name.startswith("offeragent_harness.tools.") for name in imports
             ):
                 problems.append(f"{relative}: model boundary imports tool implementation")
+        elif roots & MODEL_CLIENT_ROOTS:
+            problems.append(
+                f"{relative}: direct model client imports are only allowed inside provider adapters "
+                f"({sorted(roots & MODEL_CLIENT_ROOTS)})"
+            )
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
                 decorator_name(decorator) == "agent_loop_entrypoint" for decorator in node.decorator_list

@@ -34,7 +34,13 @@ from offeragent_harness.testing import (
     ScriptMismatch,
     ToolScriptStep,
 )
-from offeragent_harness.tools import ToolCall, ToolResult, ToolResultStatus, canonical_json_sha256
+from offeragent_harness.tools import (
+    ResultSensitivity,
+    ToolCall,
+    ToolResult,
+    ToolResultStatus,
+    canonical_json_sha256,
+)
 
 NOW = datetime(2026, 7, 12, tzinfo=timezone.utc)
 
@@ -68,6 +74,8 @@ def call(number: int, *, value: int | None = None, idempotency_key: str | None =
         idempotency_key=idempotency_key or f"idem_{number}",
         deadline=None,
         lineage=AgentLineage.root("run_1"),
+        definition_fingerprint=canonical_json_sha256({"name": "fake.tool", "version": "1"}),
+        result_sensitivity=ResultSensitivity.WORKSPACE,
     )
 
 

@@ -31,6 +31,8 @@ class RunBudget:
         )
         if any(value < 1 for value in integer_limits):
             raise ValueError("run budget limits must be positive")
+        if self.max_parallel_reads > 256:
+            raise ValueError("max_parallel_reads cannot exceed 256")
         if self.max_wall_seconds <= 0 or self.max_cost < 0 or self.max_subagent_depth < 0:
             raise ValueError("wall time must be positive; cost and depth cannot be negative")
 
@@ -97,9 +99,10 @@ class BudgetExceeded(RuntimeError):
 
 
 class BudgetReservation:
-    def __init__(self, ledger: BudgetLedger, amount: BudgetDelta) -> None:
+    def __init__(self, ledger: BudgetLedger, amount: BudgetDelta, *, adopted: bool = False) -> None:
         self._ledger = ledger
         self.amount = amount
+        self._adopted = adopted
         self._closed = False
 
     async def consume(self, actual: BudgetDelta) -> None:
@@ -107,14 +110,28 @@ class BudgetReservation:
             raise RuntimeError("reservation is already closed")
         if not _fits(actual, self.amount):
             raise ValueError("actual usage exceeds reservation")
-        await self._ledger._settle_reservation(self.amount, actual)
+        await self._ledger._settle_reservation(self.amount, actual, adopted=self._adopted)
         self._closed = True
 
     async def release(self) -> None:
         if self._closed:
             return
-        await self._ledger._settle_reservation(self.amount, BudgetDelta())
+        await self._ledger._settle_reservation(self.amount, BudgetDelta(), adopted=self._adopted)
         self._closed = True
+
+
+class ArtifactByteReservation:
+    """Narrow reservation facade exposed to Artifact-producing components."""
+
+    def __init__(self, reservation: BudgetReservation, byte_length: int) -> None:
+        self._reservation = reservation
+        self._byte_length = byte_length
+
+    async def commit(self) -> None:
+        await self._reservation.consume(BudgetDelta(artifact_bytes=self._byte_length))
+
+    async def release(self) -> None:
+        await self._reservation.release()
 
 
 class BudgetLedger:
@@ -127,7 +144,23 @@ class BudgetLedger:
         self.started_at = started_at
         self._used = BudgetDelta()
         self._reserved = BudgetDelta()
+        self._adopted = BudgetDelta()
         self._lock = asyncio.Lock()
+
+    @classmethod
+    def restore(
+        cls,
+        budget: RunBudget,
+        *,
+        started_at: datetime,
+        used: BudgetDelta,
+        reserved: BudgetDelta,
+    ) -> BudgetLedger:
+        ledger = cls(budget, started_at=started_at)
+        ledger._enforce(used + reserved)
+        ledger._used = used
+        ledger._reserved = reserved
+        return ledger
 
     async def consume(self, delta: BudgetDelta) -> BudgetSnapshot:
         async with self._lock:
@@ -143,15 +176,40 @@ class BudgetLedger:
             self._reserved = self._reserved + amount
         return BudgetReservation(self, amount)
 
-    async def _settle_reservation(self, reserved: BudgetDelta, actual: BudgetDelta) -> None:
+    async def adopt_reservation(self, amount: BudgetDelta) -> BudgetReservation:
+        """Reclaim an already-persisted reservation after Worker recovery."""
+
+        async with self._lock:
+            available = self._reserved.subtract(self._adopted)
+            if not _fits(amount, available):
+                raise ValueError("persisted budget does not contain the requested reservation")
+            self._adopted = self._adopted + amount
+        return BudgetReservation(self, amount, adopted=True)
+
+    async def reserve_artifact_bytes(self, byte_length: int) -> ArtifactByteReservation:
+        if byte_length < 0:
+            raise ValueError("artifact byte length cannot be negative")
+        reservation = await self.reserve(BudgetDelta(artifact_bytes=byte_length))
+        return ArtifactByteReservation(reservation, byte_length)
+
+    async def _settle_reservation(
+        self,
+        reserved: BudgetDelta,
+        actual: BudgetDelta,
+        *,
+        adopted: bool,
+    ) -> None:
         async with self._lock:
             self._reserved = self._reserved.subtract(reserved)
+            if adopted:
+                self._adopted = self._adopted.subtract(reserved)
             self._used = self._used + actual
             self._enforce(self._used + self._reserved)
 
     async def snapshot(self, *, now: datetime) -> BudgetSnapshot:
-        elapsed = self._elapsed(now)
-        return BudgetSnapshot(self._used, self._reserved, elapsed)
+        async with self._lock:
+            elapsed = self._elapsed(now)
+            return BudgetSnapshot(self._used, self._reserved, elapsed)
 
     async def enforce_wall_time(self, *, now: datetime) -> None:
         elapsed = self._elapsed(now)

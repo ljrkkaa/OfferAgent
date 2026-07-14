@@ -11,19 +11,18 @@
       "contentBlocks": true,
       "diagnostics": true,
       "eventReplay": true,
-      "mcp": true,
+      "headlessVaultWrite": true,
       "multiSession": true,
       "reverseRequests": true,
       "shell": true,
-      "subagents": true,
-      "workspaceChanges": true
+      "subagents": true
     },
     "coreVersion": "2.0.0",
     "hostPid": 12000,
     "protocolVersion": "1.0",
     "runtimeArch": "win-x64",
     "runtimeVersion": "2.0.0",
-    "schemaHash": "sha256:4974063a92f1134a4a10b42cbcdfab38043a84b82eb590dd4765c6b704db94c7",
+    "schemaHash": "sha256:b1469ac3702490341f8d5d8907faed1a05b990354a57461e53f1ce388c32327a",
     "supportedProtocolRange": {
       "maximum": "1.0",
       "minimum": "1.0"

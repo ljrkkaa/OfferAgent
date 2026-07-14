@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -11,8 +12,11 @@ from offeragent_harness.models import thaw_json
 from offeragent_harness.permissions import RiskClass
 from offeragent_harness.sessions import AgentLineage
 from offeragent_harness.tools import (
+    ApprovalEvidence,
     CanonicalJsonError,
     ExecutorLocation,
+    PreflightMode,
+    ResultSensitivity,
     SideEffectClass,
     ToolCall,
     ToolDefinition,
@@ -60,6 +64,7 @@ def definition(
         name="vault.patch",
         version="1",
         description="Patch a Vault note with an expected hash",
+        result_sensitivity=ResultSensitivity.WORKSPACE,
         input_schema=default_input_schema if input_schema is None else input_schema,
         output_schema={
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -77,6 +82,9 @@ def definition(
         retryable=retryable,
         timeout_ms=30_000,
         output_limit_bytes=output_limit_bytes,
+        preflight_mode=PreflightMode.NONE,
+        preflight_provider=None,
+        approval_evidence=ApprovalEvidence.NONE,
     )
 
 
@@ -92,8 +100,54 @@ def test_every_security_field_is_explicitly_required() -> None:
         "retryable",
         "timeout_ms",
         "output_limit_bytes",
+        "preflight_mode",
+        "preflight_provider",
+        "approval_evidence",
+        "result_sensitivity",
     ):
         assert parameters[name].default is inspect.Parameter.empty
+
+
+def test_definition_fingerprint_is_stable_and_covers_execution_safety_snapshot() -> None:
+    first = definition()
+    same = definition()
+    changed_limit = definition(output_limit_bytes=2048)
+    changed_sensitivity = replace(first, result_sensitivity=ResultSensitivity.PRIVATE)
+
+    assert first.fingerprint == same.fingerprint
+    assert first.fingerprint.startswith("sha256:")
+    assert first.fingerprint != changed_limit.fingerprint
+    assert first.fingerprint != changed_sensitivity.fingerprint
+
+
+def test_legacy_unknown_preserves_preclassification_fingerprints_but_is_explicit() -> None:
+    tool = replace(definition(), result_sensitivity=ResultSensitivity.UNKNOWN)
+    call = ToolCall(
+        tool_call_id="call_legacy",
+        run_id="run_1",
+        workspace_id="ws_1",
+        name=tool.name,
+        version=tool.version,
+        arguments={"path": "notes/a.md", "mode": "read"},
+        args_hash=canonical_json_sha256({"path": "notes/a.md", "mode": "read"}),
+        idempotency_key="idem_legacy",
+        deadline=None,
+        lineage=AgentLineage.root("run_1"),
+        definition_fingerprint=tool.fingerprint,
+    )
+
+    assert call.result_sensitivity is ResultSensitivity.UNKNOWN
+    assert call.idempotency_fingerprint == canonical_json_sha256(
+        {
+            "workspaceId": "ws_1",
+            "rootRunId": "run_1",
+            "runId": "run_1",
+            "name": tool.name,
+            "version": tool.version,
+            "definitionFingerprint": tool.fingerprint,
+            "argsHash": call.args_hash,
+        }
+    )
 
 
 def test_unknown_side_effects_fail_closed() -> None:
@@ -108,6 +162,16 @@ def test_retry_and_concurrency_flags_cannot_contradict_side_effect_safety() -> N
         definition(concurrency_safe=True)
     with pytest.raises(ToolDefinitionError, match="capability"):
         definition(required_capabilities=frozenset())
+
+
+def test_preflight_and_approval_evidence_metadata_fail_closed() -> None:
+    tool = definition()
+    with pytest.raises(ToolDefinitionError, match="forbids"):
+        replace(tool, preflight_provider="vault.transaction.v1")
+    with pytest.raises(ToolDefinitionError, match="valid provider"):
+        replace(tool, preflight_mode=PreflightMode.REQUIRED, preflight_provider=None)
+    with pytest.raises(ToolDefinitionError, match="forbids"):
+        replace(tool, approval_evidence=ApprovalEvidence.DIFF)
 
 
 def test_invalid_or_open_input_schema_is_rejected_at_registration() -> None:
@@ -164,6 +228,7 @@ def test_canonical_json_matches_ecmascript_number_rules_used_by_typescript() -> 
 
 def test_tool_call_recomputes_and_verifies_args_hash() -> None:
     arguments = {"path": "notes/a.md", "mode": "read"}
+    tool = definition()
     call = ToolCall(
         tool_call_id="call_1",
         run_id="run_1",
@@ -175,6 +240,8 @@ def test_tool_call_recomputes_and_verifies_args_hash() -> None:
         idempotency_key="idem_1",
         deadline=None,
         lineage=AgentLineage.root("run_1"),
+        definition_fingerprint=tool.fingerprint,
+        result_sensitivity=tool.result_sensitivity,
     )
     assert call.args_hash == canonical_json_sha256(arguments)
     with pytest.raises(ValueError, match="args_hash"):
@@ -189,6 +256,8 @@ def test_tool_call_recomputes_and_verifies_args_hash() -> None:
             idempotency_key="idem_2",
             deadline=None,
             lineage=AgentLineage.root("run_1"),
+            definition_fingerprint=tool.fingerprint,
+            result_sensitivity=tool.result_sensitivity,
         )
 
 

@@ -49,6 +49,42 @@ async def test_unused_child_reservation_is_returned() -> None:
 
 
 @pytest.mark.asyncio
+async def test_artifact_bytes_are_reserved_before_write_and_committed_exactly_once() -> None:
+    started = datetime.now(timezone.utc)
+    ledger = BudgetLedger(budget(), started_at=started)
+    reservation = await ledger.reserve_artifact_bytes(900_000)
+
+    with pytest.raises(BudgetExceeded, match="artifact_bytes"):
+        await ledger.reserve_artifact_bytes(100_001)
+
+    await reservation.commit()
+    snapshot = await ledger.snapshot(now=started)
+    assert snapshot.used.artifact_bytes == 900_000
+    assert snapshot.reserved.artifact_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_restart_restores_usage_and_adopts_each_persisted_reservation_once() -> None:
+    started = datetime.now(timezone.utc)
+    restored = BudgetLedger.restore(
+        budget(),
+        started_at=started,
+        used=BudgetDelta(model_rounds=2, tool_calls=3),
+        reserved=BudgetDelta(model_rounds=1),
+    )
+
+    composer = await restored.adopt_reservation(BudgetDelta(model_rounds=1))
+    with pytest.raises(ValueError, match="does not contain"):
+        await restored.adopt_reservation(BudgetDelta(model_rounds=1))
+    await composer.consume(BudgetDelta(model_rounds=1))
+
+    snapshot = await restored.snapshot(now=started + timedelta(seconds=7))
+    assert snapshot.used == BudgetDelta(model_rounds=3, tool_calls=3)
+    assert snapshot.reserved == BudgetDelta()
+    assert snapshot.elapsed_seconds == 7
+
+
+@pytest.mark.asyncio
 async def test_wall_time_is_checked_before_new_work() -> None:
     started = datetime.now(timezone.utc)
     ledger = BudgetLedger(budget(), started_at=started)

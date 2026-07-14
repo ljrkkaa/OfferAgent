@@ -93,6 +93,10 @@ class ToolResult:
     before_state: JsonValue | None
     after_state: JsonValue | None
     error: ToolError | None
+    # Protocol-shaped, user-displayable provenance. ``source_refs`` above is
+    # intentionally retained as the opaque identifier set consumed by
+    # Context/Memory/Compaction; it is not safe to project directly into UI.
+    source_references: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.tool_call_id or not self.user_visible_summary:
@@ -103,6 +107,15 @@ class ToolResult:
             object.__setattr__(self, "before_state", freeze_json(self.before_state))
         if self.after_state is not None:
             object.__setattr__(self, "after_state", freeze_json(self.after_state))
+        if len(self.source_references) > 512:
+            raise ValueError("tool result cannot expose more than 512 source references")
+        source_references: list[FrozenJsonObject] = []
+        for reference in self.source_references:
+            frozen = freeze_json(reference)
+            if not isinstance(frozen, FrozenJsonObject):
+                raise TypeError("tool result source references must be JSON objects")
+            source_references.append(frozen)
+        object.__setattr__(self, "source_references", tuple(source_references))
         if self.status is ToolResultStatus.SUCCEEDED and self.error is not None:
             raise ValueError("successful tool result cannot contain an error")
         if self.status is not ToolResultStatus.SUCCEEDED and self.error is None:

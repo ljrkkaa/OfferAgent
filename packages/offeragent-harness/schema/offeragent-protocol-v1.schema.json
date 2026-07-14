@@ -212,12 +212,19 @@
           "minLength": 1,
           "title": "Reason",
           "type": "string"
+        },
+        "resolverId": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Resolverid",
+          "type": "string"
         }
       },
       "required": [
         "approvalId",
         "expiredAt",
-        "reason"
+        "reason",
+        "resolverId"
       ],
       "title": "ApprovalExpiredPayload",
       "type": "object"
@@ -233,6 +240,14 @@
       "properties": {
         "approval": {
           "$ref": "#/$defs/ApprovalDescriptor"
+        },
+        "diffArtifactIds": {
+          "items": {
+            "$ref": "#/$defs/ArtifactId"
+          },
+          "maxItems": 256,
+          "title": "Diffartifactids",
+          "type": "array"
         },
         "explanation": {
           "maxLength": 8192,
@@ -297,12 +312,33 @@
         "approvalId": {
           "$ref": "#/$defs/ApprovalId"
         },
+        "operationId": {
+          "anyOf": [
+            {
+              "pattern": "^op_[a-z][A-Za-z0-9_-]{0,119}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Operationid"
+        },
         "resumed": {
           "title": "Resumed",
           "type": "boolean"
         },
         "runId": {
-          "$ref": "#/$defs/RunId"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "status": {
           "enum": [
@@ -319,7 +355,6 @@
       "required": [
         "approvalId",
         "status",
-        "runId",
         "resumed"
       ],
       "title": "ApprovalResolveResult",
@@ -334,6 +369,24 @@
         "decision": {
           "$ref": "#/$defs/ApprovalDecision"
         },
+        "includeDescendants": {
+          "default": false,
+          "title": "Includedescendants",
+          "type": "boolean"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
         "resolvedAt": {
           "$ref": "#/$defs/Rfc3339DateTime"
         },
@@ -346,8 +399,23 @@
           "title": "Resolvedby",
           "type": "string"
         },
+        "resolverId": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Resolverid",
+          "type": "string"
+        },
         "scope": {
           "$ref": "#/$defs/ApprovalScope"
+        },
+        "status": {
+          "enum": [
+            "approved",
+            "denied",
+            "cancelled"
+          ],
+          "title": "Status",
+          "type": "string"
         }
       },
       "required": [
@@ -355,7 +423,9 @@
         "decision",
         "scope",
         "resolvedAt",
-        "resolvedBy"
+        "resolvedBy",
+        "status",
+        "resolverId"
       ],
       "title": "ApprovalResolvedPayload",
       "type": "object"
@@ -779,11 +849,12 @@
         "eventReplay",
         "multiSession",
         "approvals",
-        "mcp",
+        "skills",
         "shell",
+        "hooks",
+        "headlessVaultWrite",
         "subagents",
         "artifacts",
-        "workspaceChanges",
         "loopbackWeb",
         "reverseRequests",
         "contentBlocks",
@@ -831,14 +902,19 @@
           "title": "Eventreplay",
           "type": "boolean"
         },
+        "headlessVaultWrite": {
+          "default": false,
+          "title": "Headlessvaultwrite",
+          "type": "boolean"
+        },
+        "hooks": {
+          "default": false,
+          "title": "Hooks",
+          "type": "boolean"
+        },
         "loopbackWeb": {
           "default": false,
           "title": "Loopbackweb",
-          "type": "boolean"
-        },
-        "mcp": {
-          "default": false,
-          "title": "Mcp",
           "type": "boolean"
         },
         "multiSession": {
@@ -856,14 +932,14 @@
           "title": "Shell",
           "type": "boolean"
         },
+        "skills": {
+          "default": false,
+          "title": "Skills",
+          "type": "boolean"
+        },
         "subagents": {
           "default": false,
           "title": "Subagents",
-          "type": "boolean"
-        },
-        "workspaceChanges": {
-          "default": false,
-          "title": "Workspacechanges",
           "type": "boolean"
         }
       },
@@ -1015,6 +1091,26 @@
       "title": "ClientApprovalPresentResult",
       "type": "object"
     },
+    "ClientBacklinkSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Count",
+          "type": "integer"
+        },
+        "path": {
+          "$ref": "#/$defs/RelativeVaultPath"
+        }
+      },
+      "required": [
+        "path",
+        "count"
+      ],
+      "title": "ClientBacklinkSnapshot",
+      "type": "object"
+    },
     "ClientContextGetParams": {
       "additionalProperties": false,
       "properties": {
@@ -1109,6 +1205,22 @@
           "default": null,
           "title": "Activefilerevision"
         },
+        "backlinks": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ClientBacklinkSnapshot"
+              },
+              "maxItems": 2048,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Backlinks"
+        },
         "cursorOffset": {
           "anyOf": [
             {
@@ -1126,6 +1238,17 @@
           "default": false,
           "title": "Hasunsavedchanges",
           "type": "boolean"
+        },
+        "metadata": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientMetadataSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "metadataCacheRevision": {
           "anyOf": [
@@ -1166,6 +1289,45 @@
         }
       },
       "title": "ClientContextSnapshot",
+      "type": "object"
+    },
+    "ClientMetadataSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "frontmatter": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "maxProperties": 256,
+          "title": "Frontmatter",
+          "type": "object"
+        },
+        "links": {
+          "items": {
+            "$ref": "#/$defs/RelativeVaultPath"
+          },
+          "maxItems": 2048,
+          "title": "Links",
+          "type": "array"
+        },
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 1024,
+          "title": "Tags",
+          "type": "array"
+        },
+        "unresolvedLinks": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 2048,
+          "title": "Unresolvedlinks",
+          "type": "array"
+        }
+      },
+      "title": "ClientMetadataSnapshot",
       "type": "object"
     },
     "ClientToolCancelParams": {
@@ -1213,6 +1375,169 @@
         "alreadyTerminal"
       ],
       "title": "ClientToolCancelResult",
+      "type": "object"
+    },
+    "ClientToolCommitObserveParams": {
+      "additionalProperties": false,
+      "properties": {
+        "deadline": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "invocationId": {
+          "$ref": "#/$defs/InvocationId"
+        },
+        "paths": {
+          "items": {
+            "$ref": "#/$defs/RelativeVaultPath"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Paths",
+          "type": "array"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "toolCallId": {
+          "$ref": "#/$defs/ToolCallId"
+        },
+        "traceId": {
+          "$ref": "#/$defs/TraceId"
+        }
+      },
+      "required": [
+        "invocationId",
+        "toolCallId",
+        "runId",
+        "paths",
+        "deadline",
+        "traceId"
+      ],
+      "title": "ClientToolCommitObserveParams",
+      "type": "object"
+    },
+    "ClientToolCommitObserveResult": {
+      "additionalProperties": false,
+      "properties": {
+        "hasOpenEditors": {
+          "title": "Hasopeneditors",
+          "type": "boolean"
+        },
+        "hasUnsavedEditors": {
+          "title": "Hasunsavededitors",
+          "type": "boolean"
+        },
+        "invocationId": {
+          "$ref": "#/$defs/InvocationId"
+        },
+        "pathStates": {
+          "items": {
+            "$ref": "#/$defs/ClientToolCommitPathState"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Pathstates",
+          "type": "array"
+        },
+        "paths": {
+          "items": {
+            "$ref": "#/$defs/RelativeVaultPath"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Paths",
+          "type": "array"
+        },
+        "toolCallId": {
+          "$ref": "#/$defs/ToolCallId"
+        }
+      },
+      "required": [
+        "invocationId",
+        "toolCallId",
+        "paths",
+        "hasUnsavedEditors",
+        "hasOpenEditors",
+        "pathStates"
+      ],
+      "title": "ClientToolCommitObserveResult",
+      "type": "object"
+    },
+    "ClientToolCommitPathState": {
+      "additionalProperties": false,
+      "properties": {
+        "observedHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "const": "absent",
+              "type": "string"
+            }
+          ],
+          "title": "Observedhash"
+        },
+        "openEditor": {
+          "title": "Openeditor",
+          "type": "boolean"
+        },
+        "path": {
+          "$ref": "#/$defs/RelativeVaultPath"
+        },
+        "unsavedEditor": {
+          "title": "Unsavededitor",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "observedHash",
+        "unsavedEditor",
+        "openEditor"
+      ],
+      "title": "ClientToolCommitPathState",
+      "type": "object"
+    },
+    "ClientToolError": {
+      "additionalProperties": false,
+      "properties": {
+        "cancelled": {
+          "title": "Cancelled",
+          "type": "boolean"
+        },
+        "code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_.-]*$",
+          "title": "Code",
+          "type": "string"
+        },
+        "details": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Details",
+          "type": "object"
+        },
+        "message": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "retryable": {
+          "title": "Retryable",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "retryable",
+        "cancelled"
+      ],
+      "title": "ClientToolError",
       "type": "object"
     },
     "ClientToolInvokeParams": {
@@ -1293,6 +1618,17 @@
           ],
           "default": null
         },
+        "afterState": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonValue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "artifactIds": {
           "items": {
             "$ref": "#/$defs/ArtifactId"
@@ -1312,10 +1648,10 @@
           ],
           "default": null
         },
-        "error": {
+        "beforeState": {
           "anyOf": [
             {
-              "$ref": "#/$defs/ErrorEnvelope"
+              "$ref": "#/$defs/JsonValue"
             },
             {
               "type": "null"
@@ -1323,8 +1659,58 @@
           ],
           "default": null
         },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientToolError"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "invocationId": {
+          "$ref": "#/$defs/InvocationId"
+        },
+        "output": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonValue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "sideEffectFacts": {
+          "items": {
+            "$ref": "#/$defs/PersistedSideEffectFact"
+          },
+          "maxItems": 256,
+          "title": "Sideeffectfacts",
+          "type": "array"
+        },
+        "sourceReferenceIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 512,
+          "title": "Sourcereferenceids",
+          "type": "array"
+        },
         "status": {
           "$ref": "#/$defs/ToolCallStatus"
+        },
+        "toolCallId": {
+          "$ref": "#/$defs/ToolCallId"
+        },
+        "userVisibleSummary": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "title": "Uservisiblesummary",
+          "type": "string"
         },
         "workspaceRevision": {
           "anyOf": [
@@ -1341,9 +1727,222 @@
         }
       },
       "required": [
-        "status"
+        "invocationId",
+        "toolCallId",
+        "status",
+        "userVisibleSummary"
       ],
       "title": "ClientToolInvokeResult",
+      "type": "object"
+    },
+    "ClientToolLookupParams": {
+      "additionalProperties": false,
+      "properties": {
+        "invocationId": {
+          "$ref": "#/$defs/InvocationId"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "invocationId",
+        "runId"
+      ],
+      "title": "ClientToolLookupParams",
+      "type": "object"
+    },
+    "ClientToolLookupResult": {
+      "additionalProperties": false,
+      "properties": {
+        "found": {
+          "title": "Found",
+          "type": "boolean"
+        },
+        "invocationId": {
+          "$ref": "#/$defs/InvocationId"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientToolInvokeResult"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "invocationId",
+        "found"
+      ],
+      "title": "ClientToolLookupResult",
+      "type": "object"
+    },
+    "ClientToolPathState": {
+      "additionalProperties": false,
+      "properties": {
+        "afterHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "const": "absent",
+              "type": "string"
+            }
+          ],
+          "title": "Afterhash"
+        },
+        "beforeHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "const": "absent",
+              "type": "string"
+            }
+          ],
+          "title": "Beforehash"
+        },
+        "openEditor": {
+          "title": "Openeditor",
+          "type": "boolean"
+        },
+        "path": {
+          "$ref": "#/$defs/RelativeVaultPath"
+        },
+        "unsavedEditor": {
+          "title": "Unsavededitor",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "beforeHash",
+        "afterHash",
+        "unsavedEditor",
+        "openEditor"
+      ],
+      "title": "ClientToolPathState",
+      "type": "object"
+    },
+    "ClientToolPreviewParams": {
+      "additionalProperties": false,
+      "properties": {
+        "argsHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "arguments": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Arguments",
+          "type": "object"
+        },
+        "deadline": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "invocationId": {
+          "$ref": "#/$defs/InvocationId"
+        },
+        "name": {
+          "maxLength": 256,
+          "minLength": 3,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "toolCallId": {
+          "$ref": "#/$defs/ToolCallId"
+        },
+        "traceId": {
+          "$ref": "#/$defs/TraceId"
+        }
+      },
+      "required": [
+        "invocationId",
+        "toolCallId",
+        "runId",
+        "name",
+        "arguments",
+        "argsHash",
+        "deadline",
+        "traceId"
+      ],
+      "title": "ClientToolPreviewParams",
+      "type": "object"
+    },
+    "ClientToolPreviewResult": {
+      "additionalProperties": false,
+      "properties": {
+        "afterStateHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "diff": {
+          "maxLength": 4194304,
+          "minLength": 1,
+          "title": "Diff",
+          "type": "string"
+        },
+        "diffSha256": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "hasOpenEditors": {
+          "title": "Hasopeneditors",
+          "type": "boolean"
+        },
+        "hasUnsavedEditors": {
+          "title": "Hasunsavededitors",
+          "type": "boolean"
+        },
+        "invocationId": {
+          "$ref": "#/$defs/InvocationId"
+        },
+        "pathStates": {
+          "items": {
+            "$ref": "#/$defs/ClientToolPathState"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Pathstates",
+          "type": "array"
+        },
+        "paths": {
+          "items": {
+            "$ref": "#/$defs/RelativeVaultPath"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Paths",
+          "type": "array"
+        },
+        "stateHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "toolCallId": {
+          "$ref": "#/$defs/ToolCallId"
+        }
+      },
+      "required": [
+        "invocationId",
+        "toolCallId",
+        "stateHash",
+        "afterStateHash",
+        "paths",
+        "diff",
+        "diffSha256",
+        "hasUnsavedEditors",
+        "hasOpenEditors",
+        "pathStates"
+      ],
+      "title": "ClientToolPreviewResult",
       "type": "object"
     },
     "CompactBoundaryId": {
@@ -1600,7 +2199,6 @@
             "host",
             "worker",
             "shell",
-            "mcp",
             "parser"
           ],
           "title": "Role",
@@ -1622,10 +2220,102 @@
       "title": "DiagnosticProcessSnapshot",
       "type": "object"
     },
+    "DiagnosticsExportParams": {
+      "additionalProperties": false,
+      "properties": {
+        "includeRecentErrors": {
+          "default": true,
+          "title": "Includerecenterrors",
+          "type": "boolean"
+        },
+        "ownerRunId": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "ownerRunId"
+      ],
+      "title": "DiagnosticsExportParams",
+      "type": "object"
+    },
+    "DiagnosticsExportPreviewParams": {
+      "additionalProperties": false,
+      "properties": {
+        "includeRecentErrors": {
+          "default": true,
+          "title": "Includerecenterrors",
+          "type": "boolean"
+        }
+      },
+      "title": "DiagnosticsExportPreviewParams",
+      "type": "object"
+    },
+    "DiagnosticsExportPreviewResult": {
+      "additionalProperties": false,
+      "properties": {
+        "containsContent": {
+          "const": false,
+          "title": "Containscontent",
+          "type": "boolean"
+        },
+        "containsPaths": {
+          "const": false,
+          "title": "Containspaths",
+          "type": "boolean"
+        },
+        "estimatedBytes": {
+          "minimum": 0,
+          "title": "Estimatedbytes",
+          "type": "integer"
+        },
+        "files": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Files",
+          "type": "array"
+        },
+        "uploadDestination": {
+          "default": null,
+          "title": "Uploaddestination",
+          "type": "null"
+        }
+      },
+      "required": [
+        "files",
+        "estimatedBytes",
+        "containsPaths",
+        "containsContent"
+      ],
+      "title": "DiagnosticsExportPreviewResult",
+      "type": "object"
+    },
+    "DiagnosticsExportResult": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "uploaded": {
+          "const": false,
+          "default": false,
+          "title": "Uploaded",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "artifact"
+      ],
+      "title": "DiagnosticsExportResult",
+      "type": "object"
+    },
     "DiagnosticsGetParams": {
       "additionalProperties": false,
       "properties": {
         "includePaths": {
+          "const": false,
           "default": false,
           "title": "Includepaths",
           "type": "boolean"
@@ -1645,16 +2335,16 @@
         "generatedAt": {
           "$ref": "#/$defs/Rfc3339DateTime"
         },
-        "logArtifact": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ArtifactRef"
+        "metrics": {
+          "items": {
+            "additionalProperties": {
+              "$ref": "#/$defs/JsonValue"
             },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
+            "type": "object"
+          },
+          "maxItems": 10000,
+          "title": "Metrics",
+          "type": "array"
         },
         "processes": {
           "items": {
@@ -1666,14 +2356,21 @@
         },
         "recentErrors": {
           "items": {
-            "$ref": "#/$defs/ErrorEnvelope"
+            "additionalProperties": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "type": "object"
           },
           "maxItems": 1000,
           "title": "Recenterrors",
           "type": "array"
         },
         "runtime": {
-          "$ref": "#/$defs/RuntimeStatusResult"
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Runtime",
+          "type": "object"
         }
       },
       "required": [
@@ -1682,6 +2379,70 @@
         "processes"
       ],
       "title": "DiagnosticsGetResult",
+      "type": "object"
+    },
+    "DiagnosticsSnapshotParams": {
+      "additionalProperties": false,
+      "properties": {
+        "includeRecentErrors": {
+          "default": true,
+          "title": "Includerecenterrors",
+          "type": "boolean"
+        }
+      },
+      "title": "DiagnosticsSnapshotParams",
+      "type": "object"
+    },
+    "DiagnosticsSnapshotResult": {
+      "additionalProperties": false,
+      "properties": {
+        "generatedAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "metrics": {
+          "items": {
+            "additionalProperties": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "type": "object"
+          },
+          "maxItems": 10000,
+          "title": "Metrics",
+          "type": "array"
+        },
+        "processes": {
+          "items": {
+            "$ref": "#/$defs/DiagnosticProcessSnapshot"
+          },
+          "maxItems": 10000,
+          "title": "Processes",
+          "type": "array"
+        },
+        "recentErrors": {
+          "items": {
+            "additionalProperties": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "type": "object"
+          },
+          "maxItems": 1000,
+          "title": "Recenterrors",
+          "type": "array"
+        },
+        "runtime": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Runtime",
+          "type": "object"
+        }
+      },
+      "required": [
+        "generatedAt",
+        "runtime",
+        "processes"
+      ],
+      "title": "DiagnosticsSnapshotResult",
       "type": "object"
     },
     "EditorSelection": {
@@ -1737,6 +2498,8 @@
         "tool.unknown_outcome",
         "provider.unreachable",
         "provider.auth_required",
+        "provider.context_overflow",
+        "provider.unsupported",
         "internal.error"
       ],
       "title": "ErrorCode",
@@ -2043,16 +2806,34 @@
           "$ref": "#/$defs/TurnFailedPayload"
         },
         {
+          "$ref": "#/$defs/TurnInterruptedPayload"
+        },
+        {
           "$ref": "#/$defs/RuntimeWarningPayload"
         },
         {
-          "$ref": "#/$defs/IndexStartedPayload"
+          "$ref": "#/$defs/SkillCatalogUpdatedPayload"
         },
         {
-          "$ref": "#/$defs/IndexProgressPayload"
+          "$ref": "#/$defs/SkillTrustChangedPayload"
         },
         {
-          "$ref": "#/$defs/IndexCompletedPayload"
+          "$ref": "#/$defs/ModelAttemptPayload"
+        },
+        {
+          "$ref": "#/$defs/ModelCompositionStartedPayload"
+        },
+        {
+          "$ref": "#/$defs/ToolCallsAcceptedPayload"
+        },
+        {
+          "$ref": "#/$defs/WriteOutcomeRequiredPayload"
+        },
+        {
+          "$ref": "#/$defs/RunContinuationRequiredPayload"
+        },
+        {
+          "$ref": "#/$defs/TurnSteeredPayload"
         }
       ]
     },
@@ -2076,6 +2857,8 @@
         "usage.updated",
         "context.compacted",
         "session.updated",
+        "skill.catalog_updated",
+        "skill.trust_changed",
         "subagent.queued",
         "subagent.started",
         "subagent.progress",
@@ -2093,9 +2876,13 @@
         "turn.cancelled",
         "turn.failed",
         "runtime.warning",
-        "index.started",
-        "index.progress",
-        "index.completed"
+        "model.attempt",
+        "model.composition.started",
+        "tool.calls.accepted",
+        "write.outcome_required",
+        "run.continuation_required",
+        "turn.interrupted",
+        "turn.steered"
       ],
       "title": "EventType",
       "type": "string"
@@ -2115,6 +2902,17 @@
           "minimum": 1,
           "title": "Limit",
           "type": "integer"
+        },
+        "runCursors": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "maxProperties": 10000,
+          "propertyNames": {
+            "$ref": "#/$defs/RunId"
+          },
+          "title": "Runcursors",
+          "type": "object"
         },
         "runId": {
           "anyOf": [
@@ -2166,14 +2964,32 @@
           "type": "boolean"
         },
         "lastSequence": {
-          "minimum": 0,
-          "title": "Lastsequence",
-          "type": "integer"
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lastsequence"
+        },
+        "runCursors": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "maxProperties": 10000,
+          "propertyNames": {
+            "$ref": "#/$defs/RunId"
+          },
+          "title": "Runcursors",
+          "type": "object"
         }
       },
       "required": [
         "events",
-        "lastSequence",
         "hasMore"
       ],
       "title": "EventsReplayResult",
@@ -2348,10 +3164,790 @@
         "fresh",
         "stale",
         "partial",
+        "stale_partial",
         "unknown"
       ],
       "title": "Freshness",
       "type": "string"
+    },
+    "HeadlessVaultWriteActivateParams": {
+      "additionalProperties": false,
+      "properties": {
+        "approvalId": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "expectedArgsHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "expectedRevision": {
+          "minimum": 1,
+          "title": "Expectedrevision",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "approvalId",
+        "expectedArgsHash",
+        "expectedRevision"
+      ],
+      "title": "HeadlessVaultWriteActivateParams",
+      "type": "object"
+    },
+    "HeadlessVaultWriteRequestParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "confirmation": {
+          "const": "obsidian_closed_disk_authoritative",
+          "title": "Confirmation",
+          "type": "string"
+        },
+        "expectedBaselineFingerprint": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "ttlSeconds": {
+          "maximum": 3600,
+          "minimum": 60,
+          "title": "Ttlseconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "confirmation",
+        "ttlSeconds",
+        "expectedBaselineFingerprint"
+      ],
+      "title": "HeadlessVaultWriteRequestParams",
+      "type": "object"
+    },
+    "HeadlessVaultWriteRevokeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "approvalId": {
+          "$ref": "#/$defs/ApprovalId"
+        },
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "expectedRevision": {
+          "minimum": 1,
+          "title": "Expectedrevision",
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "approvalId",
+        "expectedRevision",
+        "reason"
+      ],
+      "title": "HeadlessVaultWriteRevokeParams",
+      "type": "object"
+    },
+    "HeadlessVaultWriteState": {
+      "enum": [
+        "read_only",
+        "pipe_client_tool",
+        "ambiguous_pipe",
+        "baseline_unreliable",
+        "pending_approval",
+        "approved",
+        "active",
+        "claimed",
+        "denied",
+        "expired",
+        "revoked",
+        "consumed"
+      ],
+      "title": "HeadlessVaultWriteState",
+      "type": "string"
+    },
+    "HeadlessVaultWriteStatusParams": {
+      "additionalProperties": false,
+      "properties": {},
+      "title": "HeadlessVaultWriteStatusParams",
+      "type": "object"
+    },
+    "HeadlessVaultWriteStatusResult": {
+      "additionalProperties": false,
+      "properties": {
+        "approvalId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApprovalId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "argsHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "baselineFingerprint": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "baselineReliable": {
+          "title": "Baselinereliable",
+          "type": "boolean"
+        },
+        "canActivate": {
+          "title": "Canactivate",
+          "type": "boolean"
+        },
+        "canRequest": {
+          "title": "Canrequest",
+          "type": "boolean"
+        },
+        "canRevoke": {
+          "title": "Canrevoke",
+          "type": "boolean"
+        },
+        "expiresAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Rfc3339DateTime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "operationId": {
+          "anyOf": [
+            {
+              "pattern": "^op_headless_[0-9a-f]{32}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Operationid"
+        },
+        "pipeConnectionCount": {
+          "maximum": 16,
+          "minimum": 0,
+          "title": "Pipeconnectioncount",
+          "type": "integer"
+        },
+        "reasonCode": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "title": "Reasoncode",
+          "type": "string"
+        },
+        "revision": {
+          "minimum": 0,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/HeadlessVaultWriteState"
+        },
+        "userMessage": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Usermessage",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "pipeConnectionCount",
+        "baselineReliable",
+        "baselineFingerprint",
+        "revision",
+        "reasonCode",
+        "userMessage",
+        "canRequest",
+        "canActivate",
+        "canRevoke"
+      ],
+      "title": "HeadlessVaultWriteStatusResult",
+      "type": "object"
+    },
+    "HookCommandInput": {
+      "additionalProperties": false,
+      "properties": {
+        "allowedEnvironment": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "title": "Allowedenvironment",
+          "type": "array"
+        },
+        "arguments": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "title": "Arguments",
+          "type": "array"
+        },
+        "artifactOutputLimitBytes": {
+          "default": 1048576,
+          "maximum": 16777216,
+          "minimum": 1,
+          "title": "Artifactoutputlimitbytes",
+          "type": "integer"
+        },
+        "cwd": {
+          "default": "",
+          "maxLength": 1024,
+          "title": "Cwd",
+          "type": "string"
+        },
+        "cwdRootId": {
+          "default": "vault",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Cwdrootid",
+          "type": "string"
+        },
+        "environmentProfileId": {
+          "default": "minimal",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Environmentprofileid",
+          "type": "string"
+        },
+        "executableId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Executableid",
+          "type": "string"
+        },
+        "executableProfileFingerprint": {
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "required": [
+        "executableId",
+        "executableProfileFingerprint"
+      ],
+      "title": "HookCommandInput",
+      "type": "object"
+    },
+    "HookDefinitionInput": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HookCommandInput"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "event": {
+          "enum": [
+            "SessionStart",
+            "TurnStart",
+            "BeforeModel",
+            "AfterModel",
+            "PreToolUse",
+            "PostToolUse",
+            "ApprovalRequired",
+            "SubagentStart",
+            "SubagentStop",
+            "BeforeCompact",
+            "TurnStop",
+            "RuntimeShutdown"
+          ],
+          "title": "Event",
+          "type": "string"
+        },
+        "handlerId": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Handlerid"
+        },
+        "hookId": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Hookid",
+          "type": "string"
+        },
+        "implementation": {
+          "enum": [
+            "builtin",
+            "command"
+          ],
+          "title": "Implementation",
+          "type": "string"
+        },
+        "outputLimitBytes": {
+          "default": 65536,
+          "maximum": 1048576,
+          "minimum": 1,
+          "title": "Outputlimitbytes",
+          "type": "integer"
+        },
+        "priority": {
+          "default": 0,
+          "maximum": 1000000,
+          "minimum": -1000000,
+          "title": "Priority",
+          "type": "integer"
+        },
+        "timeoutMs": {
+          "default": 5000,
+          "maximum": 300000,
+          "minimum": 1,
+          "title": "Timeoutms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "hookId",
+        "event",
+        "implementation"
+      ],
+      "title": "HookDefinitionInput",
+      "type": "object"
+    },
+    "HookDefinitionSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HookCommandInput"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "definitionHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "event": {
+          "enum": [
+            "SessionStart",
+            "TurnStart",
+            "BeforeModel",
+            "AfterModel",
+            "PreToolUse",
+            "PostToolUse",
+            "ApprovalRequired",
+            "SubagentStart",
+            "SubagentStop",
+            "BeforeCompact",
+            "TurnStop",
+            "RuntimeShutdown"
+          ],
+          "title": "Event",
+          "type": "string"
+        },
+        "handlerId": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Handlerid"
+        },
+        "hookId": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Hookid",
+          "type": "string"
+        },
+        "implementation": {
+          "enum": [
+            "builtin",
+            "command"
+          ],
+          "title": "Implementation",
+          "type": "string"
+        },
+        "outputLimitBytes": {
+          "default": 65536,
+          "maximum": 1048576,
+          "minimum": 1,
+          "title": "Outputlimitbytes",
+          "type": "integer"
+        },
+        "priority": {
+          "default": 0,
+          "maximum": 1000000,
+          "minimum": -1000000,
+          "title": "Priority",
+          "type": "integer"
+        },
+        "timeoutMs": {
+          "default": 5000,
+          "maximum": 300000,
+          "minimum": 1,
+          "title": "Timeoutms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "hookId",
+        "event",
+        "implementation",
+        "definitionHash"
+      ],
+      "title": "HookDefinitionSnapshot",
+      "type": "object"
+    },
+    "HookLayerInput": {
+      "additionalProperties": false,
+      "properties": {
+        "hooks": {
+          "items": {
+            "$ref": "#/$defs/HookDefinitionInput"
+          },
+          "maxItems": 256,
+          "title": "Hooks",
+          "type": "array"
+        },
+        "ownerId": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Ownerid",
+          "type": "string"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "scope": {
+          "enum": [
+            "user",
+            "workspace",
+            "session"
+          ],
+          "title": "Scope",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "ownerId",
+        "revision"
+      ],
+      "title": "HookLayerInput",
+      "type": "object"
+    },
+    "HookLayerSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "commandConfirmations": {
+          "additionalProperties": {
+            "$ref": "#/$defs/Sha256Digest"
+          },
+          "title": "Commandconfirmations",
+          "type": "object"
+        },
+        "contentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "deniedEvents": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "title": "Deniedevents",
+          "type": "array"
+        },
+        "deniedHookIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Deniedhookids",
+          "type": "array"
+        },
+        "hooks": {
+          "items": {
+            "$ref": "#/$defs/HookDefinitionSnapshot"
+          },
+          "maxItems": 256,
+          "title": "Hooks",
+          "type": "array"
+        },
+        "ownerId": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Ownerid",
+          "type": "string"
+        },
+        "recordRevision": {
+          "minimum": 1,
+          "title": "Recordrevision",
+          "type": "integer"
+        },
+        "revision": {
+          "minimum": 0,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "scope": {
+          "enum": [
+            "managed",
+            "user",
+            "workspace",
+            "session"
+          ],
+          "title": "Scope",
+          "type": "string"
+        },
+        "trust": {
+          "enum": [
+            "signed",
+            "confirmed",
+            "confirmation_required",
+            "workspace_trust"
+          ],
+          "title": "Trust",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "ownerId",
+        "revision",
+        "trust",
+        "contentHash",
+        "recordRevision"
+      ],
+      "title": "HookLayerSnapshot",
+      "type": "object"
+    },
+    "HooksConfirmLayerParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "contentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "expectedRevision": {
+          "minimum": 1,
+          "title": "Expectedrevision",
+          "type": "integer"
+        },
+        "ownerId": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Ownerid",
+          "type": "string"
+        },
+        "scope": {
+          "enum": [
+            "user",
+            "session"
+          ],
+          "title": "Scope",
+          "type": "string"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "scope",
+        "ownerId",
+        "contentHash",
+        "expectedRevision"
+      ],
+      "title": "HooksConfirmLayerParams",
+      "type": "object"
+    },
+    "HooksConfirmWorkspaceCommandParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "definitionHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "expectedRevision": {
+          "minimum": 1,
+          "title": "Expectedrevision",
+          "type": "integer"
+        },
+        "hookId": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Hookid",
+          "type": "string"
+        },
+        "ownerId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "ownerId",
+        "hookId",
+        "definitionHash",
+        "expectedRevision"
+      ],
+      "title": "HooksConfirmWorkspaceCommandParams",
+      "type": "object"
+    },
+    "HooksInstallParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "expectedRevision": {
+          "minimum": 0,
+          "title": "Expectedrevision",
+          "type": "integer"
+        },
+        "layer": {
+          "$ref": "#/$defs/HookLayerInput"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "expectedRevision",
+        "layer"
+      ],
+      "title": "HooksInstallParams",
+      "type": "object"
+    },
+    "HooksListParams": {
+      "additionalProperties": false,
+      "properties": {},
+      "title": "HooksListParams",
+      "type": "object"
+    },
+    "HooksListResult": {
+      "additionalProperties": false,
+      "properties": {
+        "builtinHandlerIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Builtinhandlerids",
+          "type": "array"
+        },
+        "layers": {
+          "items": {
+            "$ref": "#/$defs/HookLayerSnapshot"
+          },
+          "maxItems": 512,
+          "title": "Layers",
+          "type": "array"
+        },
+        "profileId": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Profileid",
+          "type": "string"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "snapshotHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "profileId",
+        "revision",
+        "snapshotHash"
+      ],
+      "title": "HooksListResult",
+      "type": "object"
+    },
+    "HooksMutationResult": {
+      "additionalProperties": false,
+      "properties": {
+        "catalogRevision": {
+          "minimum": 1,
+          "title": "Catalogrevision",
+          "type": "integer"
+        },
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "layer": {
+          "$ref": "#/$defs/HookLayerSnapshot"
+        },
+        "snapshotHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "catalogRevision",
+        "snapshotHash",
+        "layer"
+      ],
+      "title": "HooksMutationResult",
+      "type": "object"
     },
     "ImageContentBlock": {
       "additionalProperties": false,
@@ -2383,206 +3979,6 @@
         "artifact"
       ],
       "title": "ImageContentBlock",
-      "type": "object"
-    },
-    "IndexCompletedPayload": {
-      "additionalProperties": false,
-      "properties": {
-        "chunkCount": {
-          "minimum": 0,
-          "title": "Chunkcount",
-          "type": "integer"
-        },
-        "documentCount": {
-          "minimum": 0,
-          "title": "Documentcount",
-          "type": "integer"
-        },
-        "durationMs": {
-          "minimum": 0,
-          "title": "Durationms",
-          "type": "integer"
-        },
-        "failedDocumentCount": {
-          "minimum": 0,
-          "title": "Faileddocumentcount",
-          "type": "integer"
-        },
-        "generation": {
-          "minimum": 1,
-          "title": "Generation",
-          "type": "integer"
-        },
-        "partial": {
-          "title": "Partial",
-          "type": "boolean"
-        },
-        "workspaceRevision": {
-          "minimum": 0,
-          "title": "Workspacerevision",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "generation",
-        "workspaceRevision",
-        "documentCount",
-        "chunkCount",
-        "failedDocumentCount",
-        "partial",
-        "durationMs"
-      ],
-      "title": "IndexCompletedPayload",
-      "type": "object"
-    },
-    "IndexProgressPayload": {
-      "additionalProperties": false,
-      "properties": {
-        "completedDocuments": {
-          "minimum": 0,
-          "title": "Completeddocuments",
-          "type": "integer"
-        },
-        "currentPath": {
-          "anyOf": [
-            {
-              "maxLength": 1024,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Currentpath"
-        },
-        "failedDocuments": {
-          "default": 0,
-          "minimum": 0,
-          "title": "Faileddocuments",
-          "type": "integer"
-        },
-        "generation": {
-          "minimum": 1,
-          "title": "Generation",
-          "type": "integer"
-        },
-        "totalDocuments": {
-          "minimum": 0,
-          "title": "Totaldocuments",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "generation",
-        "completedDocuments",
-        "totalDocuments"
-      ],
-      "title": "IndexProgressPayload",
-      "type": "object"
-    },
-    "IndexStartedPayload": {
-      "additionalProperties": false,
-      "properties": {
-        "generation": {
-          "minimum": 1,
-          "title": "Generation",
-          "type": "integer"
-        },
-        "reason": {
-          "enum": [
-            "initial",
-            "manual",
-            "change",
-            "overflow",
-            "corruption",
-            "model_changed"
-          ],
-          "title": "Reason",
-          "type": "string"
-        },
-        "totalDocuments": {
-          "anyOf": [
-            {
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Totaldocuments"
-        }
-      },
-      "required": [
-        "generation",
-        "reason"
-      ],
-      "title": "IndexStartedPayload",
-      "type": "object"
-    },
-    "IndexStatusSnapshot": {
-      "additionalProperties": false,
-      "properties": {
-        "documentCount": {
-          "minimum": 0,
-          "title": "Documentcount",
-          "type": "integer"
-        },
-        "generation": {
-          "anyOf": [
-            {
-              "minimum": 1,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Generation"
-        },
-        "lastError": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ErrorEnvelope"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "pendingChanges": {
-          "minimum": 0,
-          "title": "Pendingchanges",
-          "type": "integer"
-        },
-        "state": {
-          "enum": [
-            "not_started",
-            "indexing",
-            "ready",
-            "stale",
-            "failed"
-          ],
-          "title": "State",
-          "type": "string"
-        },
-        "workspaceRevision": {
-          "minimum": 0,
-          "title": "Workspacerevision",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "workspaceRevision",
-        "state",
-        "documentCount",
-        "pendingChanges"
-      ],
-      "title": "IndexStatusSnapshot",
       "type": "object"
     },
     "InitializeParams": {
@@ -2862,10 +4258,63 @@
       "type": "object"
     },
     "JsonValue": {},
-    "McpSourceRef": {
+    "MessageId": {
+      "maxLength": 128,
+      "minLength": 5,
+      "pattern": "^msg_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "ModelAttemptPayload": {
       "additionalProperties": false,
       "properties": {
-        "contentHash": {
+        "errorCode": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Errorcode"
+        },
+        "omittedContextIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 4096,
+          "title": "Omittedcontextids",
+          "type": "array"
+        },
+        "outcome": {
+          "enum": [
+            "succeeded",
+            "invalid",
+            "failed"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "projection": {
+          "anyOf": [
+            {
+              "enum": [
+                "normal",
+                "overflow_references"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Projection"
+        },
+        "projectionHash": {
           "anyOf": [
             {
               "$ref": "#/$defs/Sha256Digest"
@@ -2876,10 +4325,16 @@
           ],
           "default": null
         },
-        "label": {
+        "repairIndex": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Repairindex",
+          "type": "integer"
+        },
+        "requestId": {
           "anyOf": [
             {
-              "maxLength": 512,
+              "maxLength": 256,
               "minLength": 1,
               "type": "string"
             },
@@ -2888,42 +4343,165 @@
             }
           ],
           "default": null,
-          "title": "Label"
+          "title": "Requestid"
         },
-        "resourceUri": {
-          "maxLength": 4096,
-          "minLength": 1,
-          "title": "Resourceuri",
-          "type": "string"
+        "retryOfRequestId": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Retryofrequestid"
         },
-        "serverId": {
-          "maxLength": 128,
-          "minLength": 1,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
-          "title": "Serverid",
-          "type": "string"
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelAttemptUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
-        "type": {
-          "const": "mcp",
-          "title": "Type",
-          "type": "string"
+        "violations": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Violations",
+          "type": "array"
         }
       },
       "required": [
-        "type",
-        "serverId",
-        "resourceUri"
+        "repairIndex",
+        "outcome"
       ],
-      "title": "McpSourceRef",
+      "title": "ModelAttemptPayload",
       "type": "object"
     },
-    "MemorySourceRef": {
+    "ModelAttemptUsage": {
       "additionalProperties": false,
       "properties": {
-        "label": {
+        "cachedInputTokens": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Cachedinputtokens",
+          "type": "integer"
+        },
+        "cost": {
           "anyOf": [
             {
-              "maxLength": 512,
+              "pattern": "^(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cost"
+        },
+        "currency": {
+          "anyOf": [
+            {
+              "maxLength": 16,
+              "minLength": 3,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Currency"
+        },
+        "inputTokens": {
+          "minimum": 0,
+          "title": "Inputtokens",
+          "type": "integer"
+        },
+        "outputTokens": {
+          "minimum": 0,
+          "title": "Outputtokens",
+          "type": "integer"
+        },
+        "reasoningTokens": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Reasoningtokens",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "inputTokens",
+        "outputTokens"
+      ],
+      "title": "ModelAttemptUsage",
+      "type": "object"
+    },
+    "ModelCompositionStartedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "omittedContextIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 4096,
+          "title": "Omittedcontextids",
+          "type": "array"
+        },
+        "partial": {
+          "title": "Partial",
+          "type": "boolean"
+        },
+        "projection": {
+          "anyOf": [
+            {
+              "const": "overflow_references",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Projection"
+        },
+        "projectionHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "const": "context_overflow",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "requestId": {
+          "anyOf": [
+            {
+              "maxLength": 256,
               "minLength": 1,
               "type": "string"
             },
@@ -2932,43 +4510,28 @@
             }
           ],
           "default": null,
-          "title": "Label"
+          "title": "Requestid"
         },
-        "memoryId": {
-          "maxLength": 128,
-          "minLength": 1,
-          "pattern": "^mem_[A-Za-z0-9][A-Za-z0-9_-]*$",
-          "title": "Memoryid",
-          "type": "string"
-        },
-        "scope": {
-          "enum": [
-            "session",
-            "workspace",
-            "profile"
+        "retryOfRequestId": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
           ],
-          "title": "Scope",
-          "type": "string"
-        },
-        "type": {
-          "const": "memory",
-          "title": "Type",
-          "type": "string"
+          "default": null,
+          "title": "Retryofrequestid"
         }
       },
       "required": [
-        "type",
-        "memoryId",
-        "scope"
+        "partial"
       ],
-      "title": "MemorySourceRef",
+      "title": "ModelCompositionStartedPayload",
       "type": "object"
-    },
-    "MessageId": {
-      "maxLength": 128,
-      "minLength": 5,
-      "pattern": "^msg_[A-Za-z0-9][A-Za-z0-9_-]*$",
-      "type": "string"
     },
     "ModelDescriptor": {
       "additionalProperties": false,
@@ -3036,6 +4599,9 @@
     "ModelsHealthParams": {
       "additionalProperties": false,
       "properties": {
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
         "deadline": {
           "anyOf": [
             {
@@ -3069,7 +4635,8 @@
         }
       },
       "required": [
-        "provider"
+        "provider",
+        "clientRequestId"
       ],
       "title": "ModelsHealthParams",
       "type": "object"
@@ -3194,6 +4761,21 @@
       "title": "ModelsListResult",
       "type": "object"
     },
+    "NoWriteIntent": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "none",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "NoWriteIntent",
+      "type": "object"
+    },
     "NonEmptyText": {
       "maxLength": 1048576,
       "minLength": 1,
@@ -3209,6 +4791,204 @@
       ],
       "title": "PermissionMode",
       "type": "string"
+    },
+    "PersistedSideEffectFact": {
+      "additionalProperties": false,
+      "properties": {
+        "afterState": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonValue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "beforeState": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JsonValue"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "kind": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Kind",
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Metadata",
+          "type": "object"
+        },
+        "resourceId": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Resourceid",
+          "type": "string"
+        },
+        "state": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "state",
+        "resourceId"
+      ],
+      "title": "PersistedSideEffectFact",
+      "type": "object"
+    },
+    "PersistedToolCall": {
+      "additionalProperties": false,
+      "properties": {
+        "argsHash": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Argshash",
+          "type": "string"
+        },
+        "arguments": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Arguments",
+          "type": "object"
+        },
+        "deadline": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Rfc3339DateTime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "definitionFingerprint": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Definitionfingerprint",
+          "type": "string"
+        },
+        "idempotencyKey": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Idempotencykey",
+          "type": "string"
+        },
+        "lineage": {
+          "$ref": "#/$defs/PersistedToolCallLineage"
+        },
+        "name": {
+          "maxLength": 256,
+          "minLength": 3,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "resultSensitivity": {
+          "anyOf": [
+            {
+              "enum": [
+                "public",
+                "workspace",
+                "private",
+                "secret"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Resultsensitivity"
+        },
+        "toolCallId": {
+          "$ref": "#/$defs/ToolCallId"
+        },
+        "version": {
+          "maxLength": 32,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "title": "Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "toolCallId",
+        "name",
+        "version",
+        "arguments",
+        "argsHash",
+        "definitionFingerprint",
+        "idempotencyKey",
+        "lineage"
+      ],
+      "title": "PersistedToolCall",
+      "type": "object"
+    },
+    "PersistedToolCallLineage": {
+      "additionalProperties": false,
+      "properties": {
+        "agentName": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Agentname",
+          "type": "string"
+        },
+        "ancestorRunIds": {
+          "items": {
+            "$ref": "#/$defs/RunId"
+          },
+          "maxItems": 32,
+          "title": "Ancestorrunids",
+          "type": "array"
+        },
+        "depth": {
+          "maximum": 32,
+          "minimum": 0,
+          "title": "Depth",
+          "type": "integer"
+        },
+        "parentRunId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "rootRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        }
+      },
+      "required": [
+        "rootRunId",
+        "runId",
+        "depth",
+        "agentName"
+      ],
+      "title": "PersistedToolCallLineage",
+      "type": "object"
     },
     "PhaseChangedPayload": {
       "additionalProperties": false,
@@ -3245,6 +5025,908 @@
         "phase"
       ],
       "title": "PhaseChangedPayload",
+      "type": "object"
+    },
+    "ProcessEnvironmentProbeSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "allowedNames": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Allowednames",
+          "type": "array"
+        },
+        "allowedSecretNames": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Allowedsecretnames",
+          "type": "array"
+        },
+        "profileId": {
+          "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
+          "title": "Profileid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "profileId"
+      ],
+      "title": "ProcessEnvironmentProbeSnapshot",
+      "type": "object"
+    },
+    "ProcessEnvironmentRegistrationInput": {
+      "additionalProperties": false,
+      "properties": {
+        "allowedNames": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Allowednames",
+          "type": "array"
+        },
+        "allowedSecretNames": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Allowedsecretnames",
+          "type": "array"
+        },
+        "expectedContentHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "expectedRevision": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Expectedrevision",
+          "type": "integer"
+        },
+        "profileId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
+          "title": "Profileid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "profileId"
+      ],
+      "title": "ProcessEnvironmentRegistrationInput",
+      "type": "object"
+    },
+    "ProcessEnvironmentRegistrationSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "allowedNames": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Allowednames",
+          "type": "array"
+        },
+        "allowedSecretNames": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Allowedsecretnames",
+          "type": "array"
+        },
+        "available": {
+          "title": "Available",
+          "type": "boolean"
+        },
+        "contentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "profileId": {
+          "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
+          "title": "Profileid",
+          "type": "string"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "unavailableReason": {
+          "anyOf": [
+            {
+              "const": "configuration_drift",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailablereason"
+        }
+      },
+      "required": [
+        "profileId",
+        "revision",
+        "contentHash",
+        "available"
+      ],
+      "title": "ProcessEnvironmentRegistrationSnapshot",
+      "type": "object"
+    },
+    "ProcessExecutableProbeSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "allowNetwork": {
+          "const": false,
+          "default": false,
+          "title": "Allownetwork",
+          "type": "boolean"
+        },
+        "allowedCwdRootIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Allowedcwdrootids",
+          "type": "array"
+        },
+        "allowedStdinModes": {
+          "items": {
+            "enum": [
+              "closed",
+              "fixed_payload",
+              "duplex"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "title": "Allowedstdinmodes",
+          "type": "array"
+        },
+        "appcontainerFilesystem": {
+          "items": {
+            "$ref": "#/$defs/ProcessFilesystemRegistrationInput"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Appcontainerfilesystem",
+          "type": "array"
+        },
+        "authenticodeVerified": {
+          "title": "Authenticodeverified",
+          "type": "boolean"
+        },
+        "canonicalPath": {
+          "maxLength": 32767,
+          "minLength": 3,
+          "title": "Canonicalpath",
+          "type": "string"
+        },
+        "environmentProfileIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Environmentprofileids",
+          "type": "array"
+        },
+        "executableId": {
+          "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
+          "title": "Executableid",
+          "type": "string"
+        },
+        "fileDevice": {
+          "pattern": "^(?:0|[1-9][0-9]{0,31})$",
+          "title": "Filedevice",
+          "type": "string"
+        },
+        "fileIndex": {
+          "pattern": "^[1-9][0-9]{0,31}$",
+          "title": "Fileindex",
+          "type": "string"
+        },
+        "fileSha256": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "fileSize": {
+          "maximum": 2147483648,
+          "minimum": 1,
+          "title": "Filesize",
+          "type": "integer"
+        },
+        "fixedArguments": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Fixedarguments",
+          "type": "array"
+        },
+        "fixedRoot": {
+          "maxLength": 32767,
+          "minLength": 3,
+          "title": "Fixedroot",
+          "type": "string"
+        },
+        "maximumVariableArguments": {
+          "maximum": 128,
+          "minimum": 0,
+          "title": "Maximumvariablearguments",
+          "type": "integer"
+        },
+        "minimumVariableArguments": {
+          "maximum": 128,
+          "minimum": 0,
+          "title": "Minimumvariablearguments",
+          "type": "integer"
+        },
+        "profileFingerprint": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "trust": {
+          "enum": [
+            "fixed_hash",
+            "os_authenticode"
+          ],
+          "title": "Trust",
+          "type": "string"
+        },
+        "variableArgumentPattern": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Variableargumentpattern",
+          "type": "string"
+        }
+      },
+      "required": [
+        "executableId",
+        "canonicalPath",
+        "fixedRoot",
+        "trust",
+        "authenticodeVerified",
+        "fileSha256",
+        "fileDevice",
+        "fileIndex",
+        "fileSize",
+        "profileFingerprint",
+        "minimumVariableArguments",
+        "maximumVariableArguments",
+        "variableArgumentPattern",
+        "environmentProfileIds",
+        "allowedStdinModes",
+        "allowedCwdRootIds",
+        "appcontainerFilesystem"
+      ],
+      "title": "ProcessExecutableProbeSnapshot",
+      "type": "object"
+    },
+    "ProcessExecutableRegistrationInput": {
+      "additionalProperties": false,
+      "properties": {
+        "allowNetwork": {
+          "const": false,
+          "default": false,
+          "title": "Allownetwork",
+          "type": "boolean"
+        },
+        "allowedCwdRootIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Allowedcwdrootids",
+          "type": "array"
+        },
+        "allowedStdinModes": {
+          "items": {
+            "enum": [
+              "closed",
+              "fixed_payload",
+              "duplex"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "title": "Allowedstdinmodes",
+          "type": "array"
+        },
+        "appcontainerFilesystem": {
+          "items": {
+            "$ref": "#/$defs/ProcessFilesystemRegistrationInput"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Appcontainerfilesystem",
+          "type": "array"
+        },
+        "environmentProfileIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Environmentprofileids",
+          "type": "array"
+        },
+        "executableId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
+          "title": "Executableid",
+          "type": "string"
+        },
+        "executablePath": {
+          "maxLength": 32767,
+          "minLength": 3,
+          "title": "Executablepath",
+          "type": "string"
+        },
+        "expectedContentHash": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "expectedRevision": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Expectedrevision",
+          "type": "integer"
+        },
+        "fixedArguments": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Fixedarguments",
+          "type": "array"
+        },
+        "maximumVariableArguments": {
+          "default": 0,
+          "maximum": 128,
+          "minimum": 0,
+          "title": "Maximumvariablearguments",
+          "type": "integer"
+        },
+        "minimumVariableArguments": {
+          "default": 0,
+          "maximum": 128,
+          "minimum": 0,
+          "title": "Minimumvariablearguments",
+          "type": "integer"
+        },
+        "variableArgumentPattern": {
+          "default": "^[^\\x00-\\x1f\\x7f&|<>^;`]{0,4096}$",
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Variableargumentpattern",
+          "type": "string"
+        }
+      },
+      "required": [
+        "executableId",
+        "executablePath",
+        "environmentProfileIds",
+        "allowedStdinModes",
+        "allowedCwdRootIds",
+        "appcontainerFilesystem"
+      ],
+      "title": "ProcessExecutableRegistrationInput",
+      "type": "object"
+    },
+    "ProcessExecutableRegistrationSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "allowNetwork": {
+          "const": false,
+          "default": false,
+          "title": "Allownetwork",
+          "type": "boolean"
+        },
+        "allowedCwdRootIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Allowedcwdrootids",
+          "type": "array"
+        },
+        "allowedStdinModes": {
+          "items": {
+            "enum": [
+              "closed",
+              "fixed_payload",
+              "duplex"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "title": "Allowedstdinmodes",
+          "type": "array"
+        },
+        "appcontainerFilesystem": {
+          "items": {
+            "$ref": "#/$defs/ProcessFilesystemRegistrationInput"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Appcontainerfilesystem",
+          "type": "array"
+        },
+        "authenticodeVerified": {
+          "title": "Authenticodeverified",
+          "type": "boolean"
+        },
+        "available": {
+          "title": "Available",
+          "type": "boolean"
+        },
+        "canonicalPath": {
+          "maxLength": 32767,
+          "minLength": 3,
+          "title": "Canonicalpath",
+          "type": "string"
+        },
+        "contentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "environmentProfileIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "minItems": 1,
+          "title": "Environmentprofileids",
+          "type": "array"
+        },
+        "executableId": {
+          "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
+          "title": "Executableid",
+          "type": "string"
+        },
+        "fileDevice": {
+          "pattern": "^(?:0|[1-9][0-9]{0,31})$",
+          "title": "Filedevice",
+          "type": "string"
+        },
+        "fileIndex": {
+          "pattern": "^[1-9][0-9]{0,31}$",
+          "title": "Fileindex",
+          "type": "string"
+        },
+        "fileSha256": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "fileSize": {
+          "maximum": 2147483648,
+          "minimum": 1,
+          "title": "Filesize",
+          "type": "integer"
+        },
+        "fixedArguments": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Fixedarguments",
+          "type": "array"
+        },
+        "fixedRoot": {
+          "maxLength": 32767,
+          "minLength": 3,
+          "title": "Fixedroot",
+          "type": "string"
+        },
+        "maximumVariableArguments": {
+          "maximum": 128,
+          "minimum": 0,
+          "title": "Maximumvariablearguments",
+          "type": "integer"
+        },
+        "minimumVariableArguments": {
+          "maximum": 128,
+          "minimum": 0,
+          "title": "Minimumvariablearguments",
+          "type": "integer"
+        },
+        "profileFingerprint": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "trust": {
+          "enum": [
+            "fixed_hash",
+            "os_authenticode"
+          ],
+          "title": "Trust",
+          "type": "string"
+        },
+        "unavailableReason": {
+          "anyOf": [
+            {
+              "enum": [
+                "file_or_profile_drift",
+                "configuration_drift"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailablereason"
+        },
+        "variableArgumentPattern": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Variableargumentpattern",
+          "type": "string"
+        }
+      },
+      "required": [
+        "executableId",
+        "revision",
+        "contentHash",
+        "canonicalPath",
+        "fixedRoot",
+        "trust",
+        "authenticodeVerified",
+        "fileSha256",
+        "fileDevice",
+        "fileIndex",
+        "fileSize",
+        "profileFingerprint",
+        "minimumVariableArguments",
+        "maximumVariableArguments",
+        "variableArgumentPattern",
+        "environmentProfileIds",
+        "allowedStdinModes",
+        "allowedCwdRootIds",
+        "appcontainerFilesystem",
+        "available"
+      ],
+      "title": "ProcessExecutableRegistrationSnapshot",
+      "type": "object"
+    },
+    "ProcessFilesystemRegistrationInput": {
+      "additionalProperties": false,
+      "properties": {
+        "access": {
+          "enum": [
+            "read",
+            "read_write"
+          ],
+          "title": "Access",
+          "type": "string"
+        },
+        "relativePath": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Relativepath",
+          "type": "string"
+        },
+        "rootId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
+          "title": "Rootid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rootId",
+        "relativePath",
+        "access"
+      ],
+      "title": "ProcessFilesystemRegistrationInput",
+      "type": "object"
+    },
+    "ProcessRegistrationsConfirmParams": {
+      "additionalProperties": false,
+      "properties": {
+        "challengeId": {
+          "pattern": "^process-probe_[A-Za-z0-9_-]{16,128}$",
+          "title": "Challengeid",
+          "type": "string"
+        },
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "expectedCatalogRevision": {
+          "minimum": 0,
+          "title": "Expectedcatalogrevision",
+          "type": "integer"
+        },
+        "expectedProbeContentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "required": [
+        "challengeId",
+        "expectedProbeContentHash",
+        "expectedCatalogRevision",
+        "clientRequestId"
+      ],
+      "title": "ProcessRegistrationsConfirmParams",
+      "type": "object"
+    },
+    "ProcessRegistrationsDeleteParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "expectedCatalogRevision": {
+          "minimum": 0,
+          "title": "Expectedcatalogrevision",
+          "type": "integer"
+        },
+        "expectedContentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "expectedRevision": {
+          "minimum": 1,
+          "title": "Expectedrevision",
+          "type": "integer"
+        },
+        "kind": {
+          "enum": [
+            "executable",
+            "environment"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "registrationId": {
+          "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
+          "title": "Registrationid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "registrationId",
+        "expectedCatalogRevision",
+        "expectedRevision",
+        "expectedContentHash",
+        "clientRequestId"
+      ],
+      "title": "ProcessRegistrationsDeleteParams",
+      "type": "object"
+    },
+    "ProcessRegistrationsListParams": {
+      "additionalProperties": false,
+      "properties": {},
+      "title": "ProcessRegistrationsListParams",
+      "type": "object"
+    },
+    "ProcessRegistrationsListResult": {
+      "additionalProperties": false,
+      "properties": {
+        "activeCatalogRevision": {
+          "minimum": 0,
+          "title": "Activecatalogrevision",
+          "type": "integer"
+        },
+        "catalogRevision": {
+          "minimum": 0,
+          "title": "Catalogrevision",
+          "type": "integer"
+        },
+        "environments": {
+          "items": {
+            "$ref": "#/$defs/ProcessEnvironmentRegistrationSnapshot"
+          },
+          "maxItems": 128,
+          "title": "Environments",
+          "type": "array"
+        },
+        "executables": {
+          "items": {
+            "$ref": "#/$defs/ProcessExecutableRegistrationSnapshot"
+          },
+          "maxItems": 128,
+          "title": "Executables",
+          "type": "array"
+        },
+        "restartRequired": {
+          "title": "Restartrequired",
+          "type": "boolean"
+        },
+        "snapshotHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "catalogRevision",
+        "activeCatalogRevision",
+        "snapshotHash",
+        "restartRequired"
+      ],
+      "title": "ProcessRegistrationsListResult",
+      "type": "object"
+    },
+    "ProcessRegistrationsMutationResult": {
+      "additionalProperties": false,
+      "properties": {
+        "catalogRevision": {
+          "minimum": 1,
+          "title": "Catalogrevision",
+          "type": "integer"
+        },
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "deleted": {
+          "title": "Deleted",
+          "type": "boolean"
+        },
+        "kind": {
+          "enum": [
+            "executable",
+            "environment"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "recordContentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "recordRevision": {
+          "minimum": 1,
+          "title": "Recordrevision",
+          "type": "integer"
+        },
+        "registrationId": {
+          "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
+          "title": "Registrationid",
+          "type": "string"
+        },
+        "restartRequired": {
+          "const": true,
+          "title": "Restartrequired",
+          "type": "boolean"
+        },
+        "snapshotHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "kind",
+        "registrationId",
+        "catalogRevision",
+        "snapshotHash",
+        "recordRevision",
+        "recordContentHash",
+        "deleted",
+        "restartRequired"
+      ],
+      "title": "ProcessRegistrationsMutationResult",
+      "type": "object"
+    },
+    "ProcessRegistrationsProbeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "environment": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessEnvironmentRegistrationInput"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "executable": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessExecutableRegistrationInput"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "ProcessRegistrationsProbeParams",
+      "type": "object"
+    },
+    "ProcessRegistrationsProbeResult": {
+      "additionalProperties": false,
+      "properties": {
+        "challengeId": {
+          "pattern": "^process-probe_[A-Za-z0-9_-]{16,128}$",
+          "title": "Challengeid",
+          "type": "string"
+        },
+        "contentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "environment": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessEnvironmentProbeSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "executable": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProcessExecutableProbeSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "expiresAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "kind": {
+          "enum": [
+            "executable",
+            "environment"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "registrationId": {
+          "pattern": "^[a-z][a-z0-9_.-]{0,127}$",
+          "title": "Registrationid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "challengeId",
+        "kind",
+        "registrationId",
+        "contentHash",
+        "expiresAt"
+      ],
+      "title": "ProcessRegistrationsProbeResult",
       "type": "object"
     },
     "ProposedAction": {
@@ -3370,6 +6052,44 @@
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
       "type": "string"
     },
+    "RpcCancelNotification": {
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0",
+          "title": "Jsonrpc",
+          "type": "string"
+        },
+        "method": {
+          "const": "rpc/cancel",
+          "title": "Method",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/$defs/RpcCancelParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ],
+      "title": "RpcCancelNotification",
+      "type": "object"
+    },
+    "RpcCancelParams": {
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "$ref": "#/$defs/RpcId"
+        }
+      },
+      "required": [
+        "requestId"
+      ],
+      "title": "RpcCancelParams",
+      "type": "object"
+    },
     "RpcId": {
       "anyOf": [
         {
@@ -3409,14 +6129,6 @@
           ],
           "default": null
         },
-        "enabledMcpServers": {
-          "items": {
-            "type": "string"
-          },
-          "maxItems": 128,
-          "title": "Enabledmcpservers",
-          "type": "array"
-        },
         "enabledSkills": {
           "items": {
             "type": "string"
@@ -3451,6 +6163,25 @@
         "model"
       ],
       "title": "RunConfigSnapshot",
+      "type": "object"
+    },
+    "RunContinuationRequiredPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "blockers": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Blockers",
+          "type": "array"
+        }
+      },
+      "required": [
+        "blockers"
+      ],
+      "title": "RunContinuationRequiredPayload",
       "type": "object"
     },
     "RunId": {
@@ -3656,7 +6387,6 @@
       "enum": [
         "cold",
         "starting",
-        "indexing",
         "ready",
         "busy",
         "idle",
@@ -3695,9 +6425,6 @@
           "title": "Hostpid",
           "type": "integer"
         },
-        "index": {
-          "$ref": "#/$defs/IndexStatusSnapshot"
-        },
         "protocolVersion": {
           "$ref": "#/$defs/ProtocolVersion"
         },
@@ -3706,6 +6433,9 @@
         },
         "schemaHash": {
           "$ref": "#/$defs/Sha256Digest"
+        },
+        "skills": {
+          "$ref": "#/$defs/SkillCatalogStatusSnapshot"
         },
         "state": {
           "$ref": "#/$defs/RuntimeState"
@@ -3741,7 +6471,7 @@
         "protocolVersion",
         "schemaHash",
         "databaseIdentity",
-        "index"
+        "skills"
       ],
       "title": "RuntimeStatusResult",
       "type": "object"
@@ -3796,6 +6526,227 @@
       "minLength": 1,
       "pattern": "^(?:0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "SecretMetadataSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "createdAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "handle": {
+          "pattern": "^secret:v1:[0-9a-f]{32}$",
+          "title": "Handle",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "model-provider",
+            "update"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "providerId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$",
+          "title": "Providerid",
+          "type": "string"
+        },
+        "rotatedAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "handle",
+        "kind",
+        "providerId",
+        "version",
+        "createdAt",
+        "rotatedAt"
+      ],
+      "title": "SecretMetadataSnapshot",
+      "type": "object"
+    },
+    "SecretsDeleteParams": {
+      "additionalProperties": false,
+      "properties": {
+        "expectedVersion": {
+          "minimum": 1,
+          "title": "Expectedversion",
+          "type": "integer"
+        },
+        "handle": {
+          "pattern": "^secret:v1:[0-9a-f]{32}$",
+          "title": "Handle",
+          "type": "string"
+        }
+      },
+      "required": [
+        "handle",
+        "expectedVersion"
+      ],
+      "title": "SecretsDeleteParams",
+      "type": "object"
+    },
+    "SecretsDeleteResult": {
+      "additionalProperties": false,
+      "properties": {
+        "deleted": {
+          "const": true,
+          "title": "Deleted",
+          "type": "boolean"
+        },
+        "handle": {
+          "pattern": "^secret:v1:[0-9a-f]{32}$",
+          "title": "Handle",
+          "type": "string"
+        }
+      },
+      "required": [
+        "handle",
+        "deleted"
+      ],
+      "title": "SecretsDeleteResult",
+      "type": "object"
+    },
+    "SecretsListParams": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "model-provider",
+                "update"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kind"
+        },
+        "providerId": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[a-z][a-z0-9_.-]{0,63}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Providerid"
+        }
+      },
+      "title": "SecretsListParams",
+      "type": "object"
+    },
+    "SecretsListResult": {
+      "additionalProperties": false,
+      "properties": {
+        "secrets": {
+          "items": {
+            "$ref": "#/$defs/SecretMetadataSnapshot"
+          },
+          "maxItems": 1024,
+          "title": "Secrets",
+          "type": "array"
+        }
+      },
+      "required": [
+        "secrets"
+      ],
+      "title": "SecretsListResult",
+      "type": "object"
+    },
+    "SecretsPutParams": {
+      "additionalProperties": false,
+      "properties": {
+        "expectedVersion": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expectedversion"
+        },
+        "handle": {
+          "anyOf": [
+            {
+              "pattern": "^secret:v1:[0-9a-f]{32}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Handle"
+        },
+        "kind": {
+          "enum": [
+            "model-provider",
+            "update"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "providerId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$",
+          "title": "Providerid",
+          "type": "string"
+        },
+        "secret": {
+          "format": "password",
+          "title": "Secret",
+          "type": "string",
+          "writeOnly": true
+        }
+      },
+      "required": [
+        "providerId",
+        "kind",
+        "secret"
+      ],
+      "title": "SecretsPutParams",
+      "type": "object"
+    },
+    "SecretsPutResult": {
+      "additionalProperties": false,
+      "properties": {
+        "created": {
+          "title": "Created",
+          "type": "boolean"
+        },
+        "secret": {
+          "$ref": "#/$defs/SecretMetadataSnapshot"
+        }
+      },
+      "required": [
+        "secret",
+        "created"
+      ],
+      "title": "SecretsPutResult",
+      "type": "object"
     },
     "SemanticVersion": {
       "maxLength": 64,
@@ -4021,6 +6972,45 @@
         "clientRequestId"
       ],
       "title": "SessionForkParams",
+      "type": "object"
+    },
+    "SessionForkReferencePayload": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactLinkIds": {
+          "items": {
+            "$ref": "#/$defs/ArtifactId"
+          },
+          "maxItems": 10000,
+          "title": "Artifactlinkids",
+          "type": "array"
+        },
+        "sourceEventSequence": {
+          "minimum": 1,
+          "title": "Sourceeventsequence",
+          "type": "integer"
+        },
+        "sourceRunId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "sourceSessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "sourceTurnId": {
+          "$ref": "#/$defs/TurnId"
+        },
+        "sourceWorkspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "sourceWorkspaceId",
+        "sourceSessionId",
+        "sourceTurnId",
+        "sourceRunId",
+        "sourceEventSequence"
+      ],
+      "title": "SessionForkReferencePayload",
       "type": "object"
     },
     "SessionForkResult": {
@@ -4250,12 +7240,14 @@
         "changedFields": {
           "items": {
             "enum": [
+              "created",
               "title",
               "activeRunId",
               "turnCount",
               "updatedAt",
               "deleted",
-              "compaction"
+              "compaction",
+              "forkReference"
             ],
             "type": "string"
           },
@@ -4263,6 +7255,17 @@
           "minItems": 1,
           "title": "Changedfields",
           "type": "array"
+        },
+        "forkReference": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionForkReferencePayload"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "session": {
           "$ref": "#/$defs/SessionSummary"
@@ -4280,6 +7283,500 @@
       "minLength": 71,
       "pattern": "^sha256:[0-9a-f]{64}$",
       "type": "string"
+    },
+    "ShellConfirmParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "contentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "expectedRevision": {
+          "minimum": 1,
+          "title": "Expectedrevision",
+          "type": "integer"
+        },
+        "profileId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "title": "Profileid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "profileId",
+        "contentHash",
+        "expectedRevision"
+      ],
+      "title": "ShellConfirmParams",
+      "type": "object"
+    },
+    "ShellEnvironmentRegistrationSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "allowedNames": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Allowednames",
+          "type": "array"
+        },
+        "allowedSecretNames": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Allowedsecretnames",
+          "type": "array"
+        },
+        "profileId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Profileid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "profileId"
+      ],
+      "title": "ShellEnvironmentRegistrationSnapshot",
+      "type": "object"
+    },
+    "ShellExecutableRegistrationSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "allowNetwork": {
+          "title": "Allownetwork",
+          "type": "boolean"
+        },
+        "allowedCwdRootIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Allowedcwdrootids",
+          "type": "array"
+        },
+        "allowedStdinModes": {
+          "items": {
+            "enum": [
+              "closed",
+              "fixed_payload",
+              "duplex"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "title": "Allowedstdinmodes",
+          "type": "array"
+        },
+        "environmentProfileIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Environmentprofileids",
+          "type": "array"
+        },
+        "executableId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Executableid",
+          "type": "string"
+        },
+        "fingerprint": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "fixedArguments": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Fixedarguments",
+          "type": "array"
+        },
+        "maximumVariableArguments": {
+          "maximum": 128,
+          "minimum": 0,
+          "title": "Maximumvariablearguments",
+          "type": "integer"
+        },
+        "minimumVariableArguments": {
+          "maximum": 128,
+          "minimum": 0,
+          "title": "Minimumvariablearguments",
+          "type": "integer"
+        },
+        "variableArgumentPattern": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Variableargumentpattern",
+          "type": "string"
+        }
+      },
+      "required": [
+        "executableId",
+        "fingerprint",
+        "minimumVariableArguments",
+        "maximumVariableArguments",
+        "variableArgumentPattern",
+        "allowedCwdRootIds",
+        "environmentProfileIds",
+        "allowedStdinModes",
+        "allowNetwork"
+      ],
+      "title": "ShellExecutableRegistrationSnapshot",
+      "type": "object"
+    },
+    "ShellInstallParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "expectedRevision": {
+          "minimum": 0,
+          "title": "Expectedrevision",
+          "type": "integer"
+        },
+        "profile": {
+          "$ref": "#/$defs/ShellProfileInput"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "expectedRevision",
+        "profile"
+      ],
+      "title": "ShellInstallParams",
+      "type": "object"
+    },
+    "ShellListParams": {
+      "additionalProperties": false,
+      "properties": {
+        "includeDisabled": {
+          "default": true,
+          "title": "Includedisabled",
+          "type": "boolean"
+        }
+      },
+      "title": "ShellListParams",
+      "type": "object"
+    },
+    "ShellListResult": {
+      "additionalProperties": false,
+      "properties": {
+        "environments": {
+          "items": {
+            "$ref": "#/$defs/ShellEnvironmentRegistrationSnapshot"
+          },
+          "maxItems": 128,
+          "title": "Environments",
+          "type": "array"
+        },
+        "executables": {
+          "items": {
+            "$ref": "#/$defs/ShellExecutableRegistrationSnapshot"
+          },
+          "maxItems": 128,
+          "title": "Executables",
+          "type": "array"
+        },
+        "profiles": {
+          "items": {
+            "$ref": "#/$defs/ShellProfileSnapshot"
+          },
+          "maxItems": 256,
+          "title": "Profiles",
+          "type": "array"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "snapshotHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "revision",
+        "snapshotHash"
+      ],
+      "title": "ShellListResult",
+      "type": "object"
+    },
+    "ShellMutationResult": {
+      "additionalProperties": false,
+      "properties": {
+        "catalogRevision": {
+          "minimum": 1,
+          "title": "Catalogrevision",
+          "type": "integer"
+        },
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "profile": {
+          "$ref": "#/$defs/ShellProfileSnapshot"
+        },
+        "snapshotHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "catalogRevision",
+        "snapshotHash",
+        "profile"
+      ],
+      "title": "ShellMutationResult",
+      "type": "object"
+    },
+    "ShellProfileInput": {
+      "additionalProperties": false,
+      "properties": {
+        "allowNetwork": {
+          "default": false,
+          "title": "Allownetwork",
+          "type": "boolean"
+        },
+        "artifactOutputLimitBytes": {
+          "default": 16777216,
+          "maximum": 16777216,
+          "minimum": 1,
+          "title": "Artifactoutputlimitbytes",
+          "type": "integer"
+        },
+        "concurrencySafe": {
+          "default": false,
+          "title": "Concurrencysafe",
+          "type": "boolean"
+        },
+        "cwdRootId": {
+          "default": "vault",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "title": "Cwdrootid",
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "environmentProfileId": {
+          "default": "minimal",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "title": "Environmentprofileid",
+          "type": "string"
+        },
+        "executableId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "title": "Executableid",
+          "type": "string"
+        },
+        "executableProfileFingerprint": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "fixedArguments": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 128,
+          "title": "Fixedarguments",
+          "type": "array"
+        },
+        "idempotent": {
+          "default": false,
+          "title": "Idempotent",
+          "type": "boolean"
+        },
+        "inlineOutputLimitBytes": {
+          "default": 65536,
+          "maximum": 1048576,
+          "minimum": 1,
+          "title": "Inlineoutputlimitbytes",
+          "type": "integer"
+        },
+        "maximumVariableArguments": {
+          "default": 16,
+          "maximum": 128,
+          "minimum": 0,
+          "title": "Maximumvariablearguments",
+          "type": "integer"
+        },
+        "minimumVariableArguments": {
+          "default": 0,
+          "maximum": 128,
+          "minimum": 0,
+          "title": "Minimumvariablearguments",
+          "type": "integer"
+        },
+        "profileId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "title": "Profileid",
+          "type": "string"
+        },
+        "retryable": {
+          "default": false,
+          "title": "Retryable",
+          "type": "boolean"
+        },
+        "risk": {
+          "enum": [
+            "read",
+            "network",
+            "write",
+            "execute",
+            "destructive",
+            "external_path",
+            "secret_access"
+          ],
+          "title": "Risk",
+          "type": "string"
+        },
+        "sideEffectClass": {
+          "enum": [
+            "none",
+            "read",
+            "network",
+            "write",
+            "execute",
+            "destructive",
+            "unknown"
+          ],
+          "title": "Sideeffectclass",
+          "type": "string"
+        },
+        "timeoutMs": {
+          "default": 30000,
+          "maximum": 300000,
+          "minimum": 1,
+          "title": "Timeoutms",
+          "type": "integer"
+        },
+        "variableArgumentPattern": {
+          "default": "^[^\\x00-\\x1f\\x7f&|<>^;`]{0,4096}$",
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Variableargumentpattern",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "#/$defs/SemanticVersion",
+          "default": "1.0.0"
+        }
+      },
+      "required": [
+        "profileId",
+        "description",
+        "executableId",
+        "executableProfileFingerprint",
+        "risk",
+        "sideEffectClass"
+      ],
+      "title": "ShellProfileInput",
+      "type": "object"
+    },
+    "ShellProfileSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "contentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "profile": {
+          "$ref": "#/$defs/ShellProfileInput"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "source": {
+          "enum": [
+            "signed_builtin",
+            "user"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "trust": {
+          "enum": [
+            "signed",
+            "confirmed",
+            "confirmation_required"
+          ],
+          "title": "Trust",
+          "type": "string"
+        }
+      },
+      "required": [
+        "profile",
+        "source",
+        "trust",
+        "enabled",
+        "revision",
+        "contentHash"
+      ],
+      "title": "ShellProfileSnapshot",
+      "type": "object"
+    },
+    "ShellSetEnabledParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "expectedRevision": {
+          "minimum": 1,
+          "title": "Expectedrevision",
+          "type": "integer"
+        },
+        "profileId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "title": "Profileid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "profileId",
+        "enabled",
+        "expectedRevision"
+      ],
+      "title": "ShellSetEnabledParams",
+      "type": "object"
     },
     "ShutdownParams": {
       "additionalProperties": false,
@@ -4387,14 +7884,433 @@
       "title": "SideEffect",
       "type": "object"
     },
+    "SkillCatalogStatusSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "diagnostics": {
+          "items": {
+            "$ref": "#/$defs/SkillDiagnosticSnapshot"
+          },
+          "maxItems": 1000,
+          "title": "Diagnostics",
+          "type": "array"
+        },
+        "discoveredCount": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Discoveredcount",
+          "type": "integer"
+        },
+        "enabledCount": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Enabledcount",
+          "type": "integer"
+        },
+        "partial": {
+          "title": "Partial",
+          "type": "boolean"
+        },
+        "revision": {
+          "minimum": 0,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "snapshotHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "required": [
+        "revision",
+        "snapshotHash",
+        "discoveredCount",
+        "enabledCount",
+        "partial"
+      ],
+      "title": "SkillCatalogStatusSnapshot",
+      "type": "object"
+    },
+    "SkillCatalogUpdatedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "discoveredCount": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Discoveredcount",
+          "type": "integer"
+        },
+        "enabledCount": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Enabledcount",
+          "type": "integer"
+        },
+        "partial": {
+          "title": "Partial",
+          "type": "boolean"
+        },
+        "recordRevision": {
+          "minimum": 1,
+          "title": "Recordrevision",
+          "type": "integer"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "snapshotHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "required": [
+        "revision",
+        "snapshotHash",
+        "recordRevision",
+        "discoveredCount",
+        "enabledCount",
+        "partial"
+      ],
+      "title": "SkillCatalogUpdatedPayload",
+      "type": "object"
+    },
+    "SkillDiagnosticSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_.-]*$",
+          "title": "Code",
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        },
+        "rootId": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rootid"
+        },
+        "severity": {
+          "enum": [
+            "warning",
+            "error"
+          ],
+          "title": "Severity",
+          "type": "string"
+        }
+      },
+      "required": [
+        "severity",
+        "code",
+        "message"
+      ],
+      "title": "SkillDiagnosticSnapshot",
+      "type": "object"
+    },
+    "SkillSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "allowedTools": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "title": "Allowedtools",
+          "type": "array"
+        },
+        "description": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "layer": {
+          "enum": [
+            "builtin",
+            "user",
+            "workspace"
+          ],
+          "title": "Layer",
+          "type": "string"
+        },
+        "metadataHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9-]{0,63}$",
+          "title": "Name",
+          "type": "string"
+        },
+        "packagePath": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Packagepath",
+          "type": "string"
+        },
+        "rootId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9._-]{0,63}$",
+          "title": "Rootid",
+          "type": "string"
+        },
+        "trustState": {
+          "enum": [
+            "verified",
+            "confirmed",
+            "confirmation_required"
+          ],
+          "title": "Truststate",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rootId",
+        "packagePath",
+        "layer",
+        "name",
+        "description",
+        "metadataHash",
+        "trustState",
+        "enabled"
+      ],
+      "title": "SkillSnapshot",
+      "type": "object"
+    },
+    "SkillTrustChangedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "confirmed": {
+          "title": "Confirmed",
+          "type": "boolean"
+        },
+        "metadataHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "name": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "packagePath": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Packagepath",
+          "type": "string"
+        },
+        "recordRevision": {
+          "minimum": 1,
+          "title": "Recordrevision",
+          "type": "integer"
+        },
+        "rootId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_-]*$",
+          "title": "Rootid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "rootId",
+        "packagePath",
+        "name",
+        "metadataHash",
+        "confirmed",
+        "recordRevision"
+      ],
+      "title": "SkillTrustChangedPayload",
+      "type": "object"
+    },
+    "SkillsConfirmTrustParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "confirmed": {
+          "title": "Confirmed",
+          "type": "boolean"
+        },
+        "expectedMetadataHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "expectedRevision": {
+          "minimum": 0,
+          "title": "Expectedrevision",
+          "type": "integer"
+        },
+        "packagePath": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Packagepath",
+          "type": "string"
+        },
+        "rootId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9._-]{0,63}$",
+          "title": "Rootid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "rootId",
+        "packagePath",
+        "expectedMetadataHash",
+        "expectedRevision",
+        "confirmed"
+      ],
+      "title": "SkillsConfirmTrustParams",
+      "type": "object"
+    },
+    "SkillsListParams": {
+      "additionalProperties": false,
+      "properties": {},
+      "title": "SkillsListParams",
+      "type": "object"
+    },
+    "SkillsListResult": {
+      "additionalProperties": false,
+      "properties": {
+        "diagnostics": {
+          "items": {
+            "$ref": "#/$defs/SkillDiagnosticSnapshot"
+          },
+          "maxItems": 1000,
+          "title": "Diagnostics",
+          "type": "array"
+        },
+        "revision": {
+          "minimum": 0,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "skills": {
+          "items": {
+            "$ref": "#/$defs/SkillSnapshot"
+          },
+          "maxItems": 1000,
+          "title": "Skills",
+          "type": "array"
+        },
+        "snapshotHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "revision",
+        "snapshotHash"
+      ],
+      "title": "SkillsListResult",
+      "type": "object"
+    },
+    "SkillsMutationResult": {
+      "additionalProperties": false,
+      "properties": {
+        "applied": {
+          "title": "Applied",
+          "type": "boolean"
+        },
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "status": {
+          "$ref": "#/$defs/SkillCatalogStatusSnapshot"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "applied",
+        "status"
+      ],
+      "title": "SkillsMutationResult",
+      "type": "object"
+    },
+    "SkillsRescanParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "expectedRevision": {
+          "minimum": 0,
+          "title": "Expectedrevision",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "clientRequestId",
+        "expectedRevision"
+      ],
+      "title": "SkillsRescanParams",
+      "type": "object"
+    },
+    "SkillsStatusParams": {
+      "additionalProperties": false,
+      "properties": {},
+      "title": "SkillsStatusParams",
+      "type": "object"
+    },
+    "SkillsStatusResult": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/SkillCatalogStatusSnapshot"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "title": "SkillsStatusResult",
+      "type": "object"
+    },
     "SourceRef": {
       "discriminator": {
         "mapping": {
           "artifact": "#/$defs/ArtifactSourceRef",
-          "mcp": "#/$defs/McpSourceRef",
-          "memory": "#/$defs/MemorySourceRef",
-          "vault": "#/$defs/VaultSourceRef",
-          "web": "#/$defs/WebSourceRef"
+          "vault": "#/$defs/VaultSourceRef"
         },
         "propertyName": "type"
       },
@@ -4403,16 +8319,7 @@
           "$ref": "#/$defs/VaultSourceRef"
         },
         {
-          "$ref": "#/$defs/WebSourceRef"
-        },
-        {
           "$ref": "#/$defs/ArtifactSourceRef"
-        },
-        {
-          "$ref": "#/$defs/MemorySourceRef"
-        },
-        {
-          "$ref": "#/$defs/McpSourceRef"
         }
       ]
     },
@@ -4707,6 +8614,17 @@
           ],
           "default": null
         },
+        "evidence": {
+          "items": {
+            "additionalProperties": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "type": "object"
+          },
+          "maxItems": 512,
+          "title": "Evidence",
+          "type": "array"
+        },
         "findings": {
           "items": {
             "$ref": "#/$defs/Finding"
@@ -4994,11 +8912,54 @@
       "title": "ToolCallStatus",
       "type": "string"
     },
+    "ToolCallsAcceptedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "calls": {
+          "items": {
+            "$ref": "#/$defs/PersistedToolCall"
+          },
+          "maxItems": 1024,
+          "minItems": 1,
+          "title": "Calls",
+          "type": "array"
+        }
+      },
+      "required": [
+        "calls"
+      ],
+      "title": "ToolCallsAcceptedPayload",
+      "type": "object"
+    },
     "ToolCompletedPayload": {
       "additionalProperties": false,
       "properties": {
+        "artifactIds": {
+          "items": {
+            "$ref": "#/$defs/ArtifactId"
+          },
+          "maxItems": 256,
+          "title": "Artifactids",
+          "type": "array"
+        },
         "result": {
           "$ref": "#/$defs/ToolResultDescriptor"
+        },
+        "sideEffectFacts": {
+          "items": {
+            "$ref": "#/$defs/PersistedSideEffectFact"
+          },
+          "maxItems": 256,
+          "title": "Sideeffectfacts",
+          "type": "array"
+        },
+        "sourceReferenceIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 512,
+          "title": "Sourcereferenceids",
+          "type": "array"
         }
       },
       "required": [
@@ -5010,8 +8971,32 @@
     "ToolFailedPayload": {
       "additionalProperties": false,
       "properties": {
+        "artifactIds": {
+          "items": {
+            "$ref": "#/$defs/ArtifactId"
+          },
+          "maxItems": 256,
+          "title": "Artifactids",
+          "type": "array"
+        },
         "result": {
           "$ref": "#/$defs/ToolResultDescriptor"
+        },
+        "sideEffectFacts": {
+          "items": {
+            "$ref": "#/$defs/PersistedSideEffectFact"
+          },
+          "maxItems": 256,
+          "title": "Sideeffectfacts",
+          "type": "array"
+        },
+        "sourceReferenceIds": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 512,
+          "title": "Sourcereferenceids",
+          "type": "array"
         }
       },
       "required": [
@@ -5206,12 +9191,6 @@
       "pattern": "^trace_[A-Za-z0-9][A-Za-z0-9_-]*$",
       "type": "string"
     },
-    "TransactionId": {
-      "maxLength": 128,
-      "minLength": 4,
-      "pattern": "^tx_[A-Za-z0-9][A-Za-z0-9_-]*$",
-      "type": "string"
-    },
     "TransportKind": {
       "enum": [
         "windows-named-pipe",
@@ -5283,6 +9262,20 @@
     "TurnCancelledPayload": {
       "additionalProperties": false,
       "properties": {
+        "code": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Code"
+        },
         "partialContent": {
           "items": {
             "$ref": "#/$defs/ContentBlock"
@@ -5395,6 +9388,36 @@
       "minLength": 6,
       "pattern": "^turn_[A-Za-z0-9][A-Za-z0-9_-]*$",
       "type": "string"
+    },
+    "TurnInterruptedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/ErrorEnvelope"
+        },
+        "partialContent": {
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "maxItems": 256,
+          "title": "Partialcontent",
+          "type": "array"
+        },
+        "safeCheckpointAvailable": {
+          "title": "Safecheckpointavailable",
+          "type": "boolean"
+        },
+        "usage": {
+          "$ref": "#/$defs/UsageSnapshot"
+        }
+      },
+      "required": [
+        "error",
+        "usage",
+        "safeCheckpointAvailable"
+      ],
+      "title": "TurnInterruptedPayload",
+      "type": "object"
     },
     "TurnRetryParams": {
       "additionalProperties": false,
@@ -5575,6 +9598,24 @@
         },
         "turnId": {
           "$ref": "#/$defs/TurnId"
+        },
+        "writeIntent": {
+          "discriminator": {
+            "mapping": {
+              "none": "#/$defs/NoWriteIntent",
+              "vault_write_required": "#/$defs/VaultWriteRequiredIntent"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/NoWriteIntent"
+            },
+            {
+              "$ref": "#/$defs/VaultWriteRequiredIntent"
+            }
+          ],
+          "title": "Writeintent"
         }
       },
       "required": [
@@ -5582,7 +9623,8 @@
         "turnId",
         "idempotencyKey",
         "input",
-        "runConfig"
+        "runConfig",
+        "writeIntent"
       ],
       "title": "TurnStartParams",
       "type": "object"
@@ -5731,6 +9773,44 @@
       "title": "TurnSteerResult",
       "type": "object"
     },
+    "TurnSteeredPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "applyAfterSequence": {
+          "minimum": 0,
+          "title": "Applyaftersequence",
+          "type": "integer"
+        },
+        "input": {
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Input",
+          "type": "array"
+        },
+        "messageId": {
+          "$ref": "#/$defs/MessageId"
+        },
+        "mode": {
+          "enum": [
+            "append",
+            "steer"
+          ],
+          "title": "Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "messageId",
+        "mode",
+        "input",
+        "applyAfterSequence"
+      ],
+      "title": "TurnSteeredPayload",
+      "type": "object"
+    },
     "UsageSnapshot": {
       "additionalProperties": false,
       "properties": {
@@ -5869,245 +9949,69 @@
       "title": "VaultSourceRef",
       "type": "object"
     },
-    "WebSourceRef": {
+    "VaultWriteRequiredIntent": {
       "additionalProperties": false,
       "properties": {
-        "contentHash": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Sha256Digest"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "retrievedAt": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Rfc3339DateTime"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "title": {
-          "anyOf": [
-            {
-              "maxLength": 512,
-              "minLength": 1,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Title"
-        },
-        "type": {
-          "const": "web",
-          "title": "Type",
-          "type": "string"
-        },
-        "url": {
-          "format": "uri",
-          "minLength": 1,
-          "title": "Url",
-          "type": "string"
-        }
-      },
-      "required": [
-        "type",
-        "url"
-      ],
-      "title": "WebSourceRef",
-      "type": "object"
-    },
-    "WorkspaceChange": {
-      "additionalProperties": false,
-      "properties": {
-        "changeId": {
-          "$ref": "#/$defs/EventId"
-        },
-        "contentHash": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Sha256Digest"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
+        "intentHash": {
+          "$ref": "#/$defs/Sha256Digest"
         },
         "kind": {
-          "$ref": "#/$defs/WorkspaceChangeKind"
+          "const": "vault_write_required",
+          "title": "Kind",
+          "type": "string"
         },
-        "mtimeNs": {
-          "anyOf": [
-            {
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Mtimens"
-        },
-        "path": {
-          "$ref": "#/$defs/RelativeVaultPath"
-        },
-        "previousPath": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RelativeVaultPath"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "sizeBytes": {
-          "anyOf": [
-            {
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Sizebytes"
-        },
-        "transactionId": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TransactionId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        }
-      },
-      "required": [
-        "changeId",
-        "kind",
-        "path"
-      ],
-      "title": "WorkspaceChange",
-      "type": "object"
-    },
-    "WorkspaceChangeKind": {
-      "enum": [
-        "create",
-        "modify",
-        "delete",
-        "rename"
-      ],
-      "title": "WorkspaceChangeKind",
-      "type": "string"
-    },
-    "WorkspaceContextChangedParams": {
-      "additionalProperties": false,
-      "properties": {
-        "context": {
-          "$ref": "#/$defs/ClientContextSnapshot"
-        },
-        "contextRevision": {
-          "minimum": 1,
-          "title": "Contextrevision",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "contextRevision",
-        "context"
-      ],
-      "title": "WorkspaceContextChangedParams",
-      "type": "object"
-    },
-    "WorkspaceContextChangedResult": {
-      "additionalProperties": false,
-      "properties": {
-        "acceptedRevision": {
-          "minimum": 0,
-          "title": "Acceptedrevision",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "acceptedRevision"
-      ],
-      "title": "WorkspaceContextChangedResult",
-      "type": "object"
-    },
-    "WorkspaceDidChangeParams": {
-      "additionalProperties": false,
-      "properties": {
-        "baseRevision": {
-          "minimum": 0,
-          "title": "Baserevision",
-          "type": "integer"
-        },
-        "changes": {
+        "targetPaths": {
           "items": {
-            "$ref": "#/$defs/WorkspaceChange"
+            "$ref": "#/$defs/RelativeVaultPath"
           },
-          "maxItems": 10000,
+          "maxItems": 20,
           "minItems": 1,
-          "title": "Changes",
+          "title": "Targetpaths",
           "type": "array"
-        },
-        "revision": {
-          "minimum": 1,
-          "title": "Revision",
-          "type": "integer"
         }
       },
       "required": [
-        "baseRevision",
-        "revision",
-        "changes"
+        "kind",
+        "targetPaths",
+        "intentHash"
       ],
-      "title": "WorkspaceDidChangeParams",
+      "title": "VaultWriteRequiredIntent",
       "type": "object"
     },
-    "WorkspaceDidChangeResult": {
+    "WebLaunchParams": {
+      "additionalProperties": false,
+      "properties": {},
+      "title": "WebLaunchParams",
+      "type": "object"
+    },
+    "WebLaunchResult": {
       "additionalProperties": false,
       "properties": {
-        "acceptedRevision": {
-          "minimum": 0,
-          "title": "Acceptedrevision",
+        "expiresAt": {
+          "$ref": "#/$defs/Rfc3339DateTime"
+        },
+        "url": {
+          "maxLength": 2048,
+          "minLength": 32,
+          "title": "Url",
+          "type": "string"
+        },
+        "workerPid": {
+          "minimum": 1,
+          "title": "Workerpid",
           "type": "integer"
         },
-        "duplicateChangeIds": {
-          "items": {
-            "$ref": "#/$defs/EventId"
-          },
-          "maxItems": 10000,
-          "title": "Duplicatechangeids",
-          "type": "array"
-        },
-        "rescanRequired": {
-          "title": "Rescanrequired",
-          "type": "boolean"
+        "workspaceInstanceId": {
+          "$ref": "#/$defs/WorkspaceInstanceId"
         }
       },
       "required": [
-        "acceptedRevision",
-        "rescanRequired"
+        "url",
+        "workerPid",
+        "workspaceInstanceId",
+        "expiresAt"
       ],
-      "title": "WorkspaceDidChangeResult",
+      "title": "WebLaunchResult",
       "type": "object"
     },
     "WorkspaceId": {
@@ -6122,50 +10026,23 @@
       "pattern": "^wsi_[A-Za-z0-9][A-Za-z0-9_-]*$",
       "type": "string"
     },
-    "WorkspaceRescanParams": {
+    "WriteOutcomeRequiredPayload": {
       "additionalProperties": false,
       "properties": {
-        "full": {
-          "default": false,
-          "title": "Full",
-          "type": "boolean"
-        },
-        "reason": {
-          "enum": [
-            "user",
-            "revision_gap",
-            "watcher_overflow",
-            "corruption",
-            "policy_changed"
-          ],
-          "title": "Reason",
-          "type": "string"
+        "reasons": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Reasons",
+          "type": "array"
         }
       },
       "required": [
-        "reason"
+        "reasons"
       ],
-      "title": "WorkspaceRescanParams",
-      "type": "object"
-    },
-    "WorkspaceRescanResult": {
-      "additionalProperties": false,
-      "properties": {
-        "accepted": {
-          "title": "Accepted",
-          "type": "boolean"
-        },
-        "generation": {
-          "minimum": 1,
-          "title": "Generation",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "accepted",
-        "generation"
-      ],
-      "title": "WorkspaceRescanResult",
+      "title": "WriteOutcomeRequiredPayload",
       "type": "object"
     }
   },
@@ -6233,6 +10110,24 @@
         "$ref": "#/$defs/ConfigUpdateResult"
       }
     },
+    "diagnostics/export": {
+      "params": {
+        "$ref": "#/$defs/DiagnosticsExportParams"
+      },
+      "requiredCapability": "diagnostics",
+      "result": {
+        "$ref": "#/$defs/DiagnosticsExportResult"
+      }
+    },
+    "diagnostics/export-preview": {
+      "params": {
+        "$ref": "#/$defs/DiagnosticsExportPreviewParams"
+      },
+      "requiredCapability": "diagnostics",
+      "result": {
+        "$ref": "#/$defs/DiagnosticsExportPreviewResult"
+      }
+    },
     "diagnostics/get": {
       "params": {
         "$ref": "#/$defs/DiagnosticsGetParams"
@@ -6242,6 +10137,15 @@
         "$ref": "#/$defs/DiagnosticsGetResult"
       }
     },
+    "diagnostics/snapshot": {
+      "params": {
+        "$ref": "#/$defs/DiagnosticsSnapshotParams"
+      },
+      "requiredCapability": "diagnostics",
+      "result": {
+        "$ref": "#/$defs/DiagnosticsSnapshotResult"
+      }
+    },
     "events/replay": {
       "params": {
         "$ref": "#/$defs/EventsReplayParams"
@@ -6249,6 +10153,42 @@
       "requiredCapability": "eventReplay",
       "result": {
         "$ref": "#/$defs/EventsReplayResult"
+      }
+    },
+    "hooks/confirm-layer": {
+      "params": {
+        "$ref": "#/$defs/HooksConfirmLayerParams"
+      },
+      "requiredCapability": "hooks",
+      "result": {
+        "$ref": "#/$defs/HooksMutationResult"
+      }
+    },
+    "hooks/confirm-workspace-command": {
+      "params": {
+        "$ref": "#/$defs/HooksConfirmWorkspaceCommandParams"
+      },
+      "requiredCapability": "hooks",
+      "result": {
+        "$ref": "#/$defs/HooksMutationResult"
+      }
+    },
+    "hooks/install": {
+      "params": {
+        "$ref": "#/$defs/HooksInstallParams"
+      },
+      "requiredCapability": "hooks",
+      "result": {
+        "$ref": "#/$defs/HooksMutationResult"
+      }
+    },
+    "hooks/list": {
+      "params": {
+        "$ref": "#/$defs/HooksListParams"
+      },
+      "requiredCapability": "hooks",
+      "result": {
+        "$ref": "#/$defs/HooksListResult"
       }
     },
     "initialize": {
@@ -6275,6 +10215,38 @@
         "$ref": "#/$defs/ModelsListResult"
       }
     },
+    "process/registrations/confirm": {
+      "params": {
+        "$ref": "#/$defs/ProcessRegistrationsConfirmParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ProcessRegistrationsMutationResult"
+      }
+    },
+    "process/registrations/delete": {
+      "params": {
+        "$ref": "#/$defs/ProcessRegistrationsDeleteParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ProcessRegistrationsMutationResult"
+      }
+    },
+    "process/registrations/list": {
+      "params": {
+        "$ref": "#/$defs/ProcessRegistrationsListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ProcessRegistrationsListResult"
+      }
+    },
+    "process/registrations/probe": {
+      "params": {
+        "$ref": "#/$defs/ProcessRegistrationsProbeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ProcessRegistrationsProbeResult"
+      }
+    },
     "runtime/ping": {
       "params": {
         "$ref": "#/$defs/RuntimePingParams"
@@ -6289,6 +10261,30 @@
       },
       "result": {
         "$ref": "#/$defs/RuntimeStatusResult"
+      }
+    },
+    "secrets/delete": {
+      "params": {
+        "$ref": "#/$defs/SecretsDeleteParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SecretsDeleteResult"
+      }
+    },
+    "secrets/list": {
+      "params": {
+        "$ref": "#/$defs/SecretsListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SecretsListResult"
+      }
+    },
+    "secrets/put": {
+      "params": {
+        "$ref": "#/$defs/SecretsPutParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SecretsPutResult"
       }
     },
     "session/compact": {
@@ -6354,12 +10350,84 @@
         "$ref": "#/$defs/SessionRenameResult"
       }
     },
+    "shell/confirm": {
+      "params": {
+        "$ref": "#/$defs/ShellConfirmParams"
+      },
+      "requiredCapability": "shell",
+      "result": {
+        "$ref": "#/$defs/ShellMutationResult"
+      }
+    },
+    "shell/install": {
+      "params": {
+        "$ref": "#/$defs/ShellInstallParams"
+      },
+      "requiredCapability": "shell",
+      "result": {
+        "$ref": "#/$defs/ShellMutationResult"
+      }
+    },
+    "shell/list": {
+      "params": {
+        "$ref": "#/$defs/ShellListParams"
+      },
+      "requiredCapability": "shell",
+      "result": {
+        "$ref": "#/$defs/ShellListResult"
+      }
+    },
+    "shell/set-enabled": {
+      "params": {
+        "$ref": "#/$defs/ShellSetEnabledParams"
+      },
+      "requiredCapability": "shell",
+      "result": {
+        "$ref": "#/$defs/ShellMutationResult"
+      }
+    },
     "shutdown": {
       "params": {
         "$ref": "#/$defs/ShutdownParams"
       },
       "result": {
         "$ref": "#/$defs/ShutdownResult"
+      }
+    },
+    "skills/confirm-trust": {
+      "params": {
+        "$ref": "#/$defs/SkillsConfirmTrustParams"
+      },
+      "requiredCapability": "skills",
+      "result": {
+        "$ref": "#/$defs/SkillsMutationResult"
+      }
+    },
+    "skills/list": {
+      "params": {
+        "$ref": "#/$defs/SkillsListParams"
+      },
+      "requiredCapability": "skills",
+      "result": {
+        "$ref": "#/$defs/SkillsListResult"
+      }
+    },
+    "skills/rescan": {
+      "params": {
+        "$ref": "#/$defs/SkillsRescanParams"
+      },
+      "requiredCapability": "skills",
+      "result": {
+        "$ref": "#/$defs/SkillsMutationResult"
+      }
+    },
+    "skills/status": {
+      "params": {
+        "$ref": "#/$defs/SkillsStatusParams"
+      },
+      "requiredCapability": "skills",
+      "result": {
+        "$ref": "#/$defs/SkillsStatusResult"
       }
     },
     "turn/cancel": {
@@ -6403,31 +10471,48 @@
         "$ref": "#/$defs/TurnSteerResult"
       }
     },
-    "workspace/contextChanged": {
+    "vault/headless/activate": {
       "params": {
-        "$ref": "#/$defs/WorkspaceContextChangedParams"
+        "$ref": "#/$defs/HeadlessVaultWriteActivateParams"
       },
-      "requiredCapability": "clientTools",
+      "requiredCapability": "headlessVaultWrite",
       "result": {
-        "$ref": "#/$defs/WorkspaceContextChangedResult"
+        "$ref": "#/$defs/HeadlessVaultWriteStatusResult"
       }
     },
-    "workspace/didChange": {
+    "vault/headless/request": {
       "params": {
-        "$ref": "#/$defs/WorkspaceDidChangeParams"
+        "$ref": "#/$defs/HeadlessVaultWriteRequestParams"
       },
-      "requiredCapability": "workspaceChanges",
+      "requiredCapability": "headlessVaultWrite",
       "result": {
-        "$ref": "#/$defs/WorkspaceDidChangeResult"
+        "$ref": "#/$defs/HeadlessVaultWriteStatusResult"
       }
     },
-    "workspace/rescan": {
+    "vault/headless/revoke": {
       "params": {
-        "$ref": "#/$defs/WorkspaceRescanParams"
+        "$ref": "#/$defs/HeadlessVaultWriteRevokeParams"
       },
-      "requiredCapability": "workspaceChanges",
+      "requiredCapability": "headlessVaultWrite",
       "result": {
-        "$ref": "#/$defs/WorkspaceRescanResult"
+        "$ref": "#/$defs/HeadlessVaultWriteStatusResult"
+      }
+    },
+    "vault/headless/status": {
+      "params": {
+        "$ref": "#/$defs/HeadlessVaultWriteStatusParams"
+      },
+      "requiredCapability": "headlessVaultWrite",
+      "result": {
+        "$ref": "#/$defs/HeadlessVaultWriteStatusResult"
+      }
+    },
+    "web/launch": {
+      "params": {
+        "$ref": "#/$defs/WebLaunchParams"
+      },
+      "result": {
+        "$ref": "#/$defs/WebLaunchResult"
       }
     }
   },
@@ -6450,6 +10535,9 @@
     },
     "request": {
       "$ref": "#/$defs/JsonRpcRequest"
+    },
+    "rpcCancelNotification": {
+      "$ref": "#/$defs/RpcCancelNotification"
     },
     "successResponse": {
       "$ref": "#/$defs/JsonRpcSuccessResponse"
@@ -6491,19 +10579,14 @@
         "$ref": "#/$defs/ContextCompactedPayload"
       }
     },
-    "index.completed": {
+    "model.attempt": {
       "payload": {
-        "$ref": "#/$defs/IndexCompletedPayload"
+        "$ref": "#/$defs/ModelAttemptPayload"
       }
     },
-    "index.progress": {
+    "model.composition.started": {
       "payload": {
-        "$ref": "#/$defs/IndexProgressPayload"
-      }
-    },
-    "index.started": {
-      "payload": {
-        "$ref": "#/$defs/IndexStartedPayload"
+        "$ref": "#/$defs/ModelCompositionStartedPayload"
       }
     },
     "phase.changed": {
@@ -6521,6 +10604,11 @@
         "$ref": "#/$defs/ReferencesUpdatedPayload"
       }
     },
+    "run.continuation_required": {
+      "payload": {
+        "$ref": "#/$defs/RunContinuationRequiredPayload"
+      }
+    },
     "runtime.warning": {
       "payload": {
         "$ref": "#/$defs/RuntimeWarningPayload"
@@ -6529,6 +10617,16 @@
     "session.updated": {
       "payload": {
         "$ref": "#/$defs/SessionUpdatedPayload"
+      }
+    },
+    "skill.catalog_updated": {
+      "payload": {
+        "$ref": "#/$defs/SkillCatalogUpdatedPayload"
+      }
+    },
+    "skill.trust_changed": {
+      "payload": {
+        "$ref": "#/$defs/SkillTrustChangedPayload"
       }
     },
     "subagent.cancel_requested": {
@@ -6596,6 +10694,11 @@
         "$ref": "#/$defs/SubagentWaitingPayload"
       }
     },
+    "tool.calls.accepted": {
+      "payload": {
+        "$ref": "#/$defs/ToolCallsAcceptedPayload"
+      }
+    },
     "tool.completed": {
       "payload": {
         "$ref": "#/$defs/ToolCompletedPayload"
@@ -6636,14 +10739,29 @@
         "$ref": "#/$defs/TurnFailedPayload"
       }
     },
+    "turn.interrupted": {
+      "payload": {
+        "$ref": "#/$defs/TurnInterruptedPayload"
+      }
+    },
     "turn.started": {
       "payload": {
         "$ref": "#/$defs/TurnStartedPayload"
       }
     },
+    "turn.steered": {
+      "payload": {
+        "$ref": "#/$defs/TurnSteeredPayload"
+      }
+    },
     "usage.updated": {
       "payload": {
         "$ref": "#/$defs/UsageUpdatedPayload"
+      }
+    },
+    "write.outcome_required": {
+      "payload": {
+        "$ref": "#/$defs/WriteOutcomeRequiredPayload"
       }
     }
   },
@@ -6676,6 +10794,15 @@
         "$ref": "#/$defs/ClientToolCancelResult"
       }
     },
+    "client/tool/commit-observe": {
+      "params": {
+        "$ref": "#/$defs/ClientToolCommitObserveParams"
+      },
+      "requiredCapability": "clientTools",
+      "result": {
+        "$ref": "#/$defs/ClientToolCommitObserveResult"
+      }
+    },
     "client/tool/invoke": {
       "params": {
         "$ref": "#/$defs/ClientToolInvokeParams"
@@ -6683,6 +10810,24 @@
       "requiredCapability": "clientTools",
       "result": {
         "$ref": "#/$defs/ClientToolInvokeResult"
+      }
+    },
+    "client/tool/lookup": {
+      "params": {
+        "$ref": "#/$defs/ClientToolLookupParams"
+      },
+      "requiredCapability": "clientTools",
+      "result": {
+        "$ref": "#/$defs/ClientToolLookupResult"
+      }
+    },
+    "client/tool/preview": {
+      "params": {
+        "$ref": "#/$defs/ClientToolPreviewParams"
+      },
+      "requiredCapability": "clientTools",
+      "result": {
+        "$ref": "#/$defs/ClientToolPreviewResult"
       }
     }
   },

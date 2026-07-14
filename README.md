@@ -1,140 +1,97 @@
-# Khoj 面试版个人知识库 Agent
+# OfferAgent Windows Local Runtime
 
-这是一个基于 Khoj 精简改造的个人知识库 Agent 项目，当前目标是跑通第一阶段 demo 主链路：
+本仓库正在把旧的服务器型 OfferAgent 重构为 Windows 完全本地化产品。完整架构与不可变红线以
+外层工作区的 [`task.md`](../task.md) 为权威；当前交付目标已经收敛为项目所有者的 Windows x64
+个人本机插件，完成判定见
+[`docs/architecture/personal-local-scope.md`](docs/architecture/personal-local-scope.md)。完整公开发行
+DoD 继续保留作长期蓝图，但不再阻塞个人版本。
 
-`Obsidian 同步 -> 本地文件 evidence -> OpenKB evidence -> Chat 问答 -> 工具调用 -> 记忆 -> 评估`
+## 产品边界
 
-项目保留 Khoj 原有的核心 Agent 能力，但去掉或隐藏了商业化、多客户端和部分外部服务功能，让仓库更适合展示个人知识库、Agent 工具编排和本地优先的产品思路。
+- 一座 Vault 只有一个 Windows Worker、一个 `HarnessService`、一份 SQLite 和一个活动 Run 所有权边界。
+- Obsidian 插件通过当前 Windows SID 专属 Named Pipe 连接 Worker；本地 Web UI 由同一 Worker 在随机 Loopback 端口提供。
+- 唯一 Agent Loop、Planner、Composer、Tool Kernel、Policy、Approval、Memory、Skills、Hooks、Shell 与 Subagent 全部在本机 Runtime 中运行。
+- Codex、OpenAI 和本地模型只通过 `ModelGateway` 提供推理，不能执行工具、访问 Vault、管理 Session 或拥有第二套 Agent Runtime。
+- 正式运行路径和发行依赖不得包含 Django、PostgreSQL、Khoj Server、远程 Conversation/Workspace Store、内容检索服务或内容同步。
+- 除用户选择的模型 Provider 与可关闭的签名更新检查外，Runtime 不允许产生网络出口。
 
-## 当前已有功能
+## 目录入口
 
-### 1. Obsidian 知识库同步
-
-当前保留 Obsidian 插件和同步链路，可用于把本地 Obsidian 项目库中的内容同步到服务端。
-
-- 支持通过 Obsidian 客户端上传内容。
-- 默认主线面向 Markdown、PDF 和纯文本资料。
-- 服务端负责内容解析、切分、索引和后续检索。
-
-### 2. 本地文档索引
-
-项目目前聚焦个人知识库最小闭环，支持以下内容类型：
-
-- Markdown
-- PDF
-- Plaintext / HTML-like plaintext
-
-相关处理逻辑位于 `src/khoj/processor/content`，搜索和过滤能力位于 `src/khoj/search_type`、`src/khoj/search_filter`。
-
-### 3. Web/API Chat
-
-项目保留 Web 和 API 聊天入口，可通过统一的后端 Agent 链路处理用户问题。
-
-- API 聊天入口：`/api/chat`
-- Web 路由和页面仍保留在 `src/interface/web`
-- 支持会话历史、模型配置、文件上下文和流式回答等基础能力
-
-### 4. File/OpenKB evidence 引用
-
-当前主线能力是基于本地知识库收集可审计证据。
-
-- 支持从本地文件库读取真实文件行。
-- 支持从 OpenKB compiled wiki 收集摘要、概念和页码证据。
-- 回答可携带知识库引用，便于追踪答案来源。
-- 支持文本搜索、过滤条件和 Agent 上下文组合。
-
-这部分是面试展示的核心：用户提问后，系统先收集本地 evidence，再把相关上下文交给模型生成回答。
-
-### 5. Agent 配置与工具能力
-
-项目保留 Agent 配置、工具权限和工具调用相关逻辑。
-
-当前可作为高级能力保留的工具包括：
-
-- Online search / webpage 工具
-- Code tool
-- MCP tool
-- Operator/browser/computer 相关能力
-- Deep Research 多轮研究链路
-
-这些能力适合在本地知识库主流程稳定后作为进阶演示。默认演示路径仍建议先走本地知识库问答。
-
-### 6. Memory 长期记忆
-
-项目保留用户记忆能力，可用于记录用户偏好、长期事实和可复用上下文。
-
-- 支持查看、修改和删除记忆。
-- 支持 Agent/用户维度的上下文隔离。
-- 可作为个人助理能力的一部分展示。
-
-### 7. Deep Research
-
-项目保留 `/research` 研究链路，用于展示更复杂的 Agent 规划和工具执行能力。
-
-Deep Research 可以多轮选择工具、收集资料、记录中间步骤，并在最后汇总结果。它适合展示“模型不只是聊天，而是能规划任务并调用工具”。
-
-### 8. 测试与评估
-
-项目保留 pytest 测试和 eval 相关入口。
-
-- 单元/集成测试位于 `tests`
-- 测试数据位于 `tests/data`
-- 评估脚本位于 `tests/evals`
-
-后续可以补充一组本地知识库 gold set，用于衡量回答质量、引用准确性和工具选择效果。
-
-## 本地运行
-
-初始化开发环境：
-
-```bash
-bash scripts/dev_setup.sh
+```text
+packages/offeragent-harness/       Windows 本地 Agent Core、Worker、Host、协议与发行工具
+src/interface/obsidian/            Obsidian 本地客户端源码
+docs/architecture/                 新 Runtime 的架构与发行说明
 ```
 
-启动本地服务：
+主分支不保存旧 Khoj Server、服务端 Web UI 或第二套 Agent Loop。旧实现只通过 Git
+对照分支 `archive/khoj-server-baseline-20260713` 和外层只读 snapshot 追溯；一次性数据导出使用独立的
+`packages/offeragent-harness/scripts/legacy_exporter`，它不 import 或启动旧服务器。
 
-```bash
-bash scripts/run_local.sh
+真实开发与测试边界不在本仓库目录内混用：
+
+- 代码根目录：`E:\Projects\offeragent\repo`
+- 真实 Vault：`E:\面试胜利！`
+- 插件测试部署目录：`E:\面试胜利！\.obsidian\plugins\offeragent-obsidian-plugin`
+- Runtime 状态：`%LOCALAPPDATA%\OfferAgent\workspaces\<workspace-instance-id>`
+
+真实 Vault 默认只读。写入测试前必须阅读 `E:\面试胜利！\AGENTS.md`，不得修改或删除已有 `notes/` 内容，也不得读取插件 `data.json` 中的凭据。
+
+## Harness 开发
+
+```powershell
+cd packages/offeragent-harness
+uv sync --extra dev --locked --python 3.12
+uv run pytest -q
+uv run ruff check src tests scripts
+uv run ruff format --check src tests scripts
+uv run mypy src tests
+uv run lint-imports --config .importlinter --no-cache
+uv run python -m offeragent_harness.protocol.schemas check
+uv run python scripts/audit_repository_closure.py
+uv run python scripts/check_architecture.py
+uv run python scripts/check_forbidden_dependencies.py
+uv run semgrep --config semgrep.yml --no-git-ignore --exclude .venv --exclude .mypy_cache --exclude ../../src/interface/obsidian/node_modules src scripts ../../src/interface/obsidian/src
+uv run python scripts/build_web_assets.py check
+uv build
 ```
 
-默认本地服务会读取 `.env`，使用嵌入式数据库配置，并监听 `127.0.0.1:42110`。可通过环境变量覆盖主机、端口、模型和 API 配置。
+架构检查要求生产包中只有一个标记的 Agent Loop，并禁止旧框架依赖或测试 Fake 进入生产代码。协议 Schema、示例、插件协议身份和本地 Web 资源必须在同一次变更中重新生成并校验。
 
-运行测试：
+遵守真实 Vault 的 `AGENTS.md` 后，可执行隐私安全的 Worker 侧零写入验收：
 
-```bash
-uv run pytest
+```powershell
+uv run python scripts/validate_real_vault_readonly.py `
+  --vault-root 'E:\面试胜利！' `
+  --expected-vault-root 'E:\面试胜利！' `
+  --query "验证本地文件读取"
 ```
 
-运行单个测试文件：
+该命令不输出笔记路径或内容，并在前后核对可见 Markdown 的身份、hash 和 mtime。活动文件、选区与
+MetadataCache revision 属于真实 Obsidian E2E，不能由无插件的命令行验收代替。
 
-```bash
-uv run pytest tests/test_local_kb.py
+## Obsidian 插件开发
+
+```powershell
+cd src/interface/obsidian
+corepack yarn install --frozen-lockfile
+corepack yarn test
+corepack yarn build
 ```
 
-## 当前暂不支持或已隐藏的功能
+长期修改必须落在这里的 TypeScript 源码中；真实 Vault 下的 `main.js` 是安装产物，不能作为目标源码直接维护。插件不得直接调用模型、执行 Shell，或实现 `while model -> tool -> model`。
 
-为了让项目更聚焦，当前分支已经删除、隐藏或暂不作为主线展示以下能力：
+## Windows 发行
 
-- Android、Desktop、Emacs 多客户端
-- Stripe 订阅计费
-- Twilio、WhatsApp、短信/手机号登录
-- S3 上传路径
-- 外发 telemetry 服务
-- 语音转文字、文字转语音
-- creative image generation 入口
-- Notion/GitHub 内容源 UI 和 API
-- DOCX、图片 OCR、Org-mode 的第一阶段外露入口
-- QQ bot 实际接入
+个人本机版本与正式发行严格分开：个人版本允许使用明确标识、按 hash 固定的本地开发安装路径；
+它只能用于当前机器，不能被命名、打包或展示为签名发行物。个人安装流程见交付范围文档和后续
+本机安装脚本。
 
-注意：当前分支不保留旧向量检索兼容层；旧数据库需要按新的初始迁移重建。
+正式发行由 `packages/offeragent-harness/scripts/build_windows_release.py --architecture x64|arm64` 在对应原生 Windows 机器上统一生成签名的 PyInstaller onedir Runtime、架构专属完整离线 ZIP、插件 payload、SBOM 和 Setup 安装器。构建脚本拒绝跨架构伪装且没有无签名生产模式：缺少 Ed25519 私钥、Authenticode 证书、SignTool 或 Inno Setup 时必须失败，不能产出降级包。
 
-## 项目状态
+发行前还必须完成干净 Windows VM 上的断网安装、升级、回滚、恢复、卸载、进程树清理、抓包与长期压力 E2E。详细流程见 [`docs/architecture/windows-runtime-release.md`](docs/architecture/windows-runtime-release.md)。
 
-当前仓库是一个面试/演示导向的精简分支，重点展示：
+## 迁移规则
 
-1. 本地优先的个人知识库同步与索引。
-2. 基于本地资料的 evidence 引用回答。
-3. Agent 工具选择、长期记忆和 Deep Research 等进阶能力。
-4. 可测试、可评估、可继续扩展到 QQ bot 或其他入口的架构。
-
-完整端到端效果仍依赖真实 LLM 和本地知识库配置。建议演示顺序为：先配置本地文件库或导入 Obsidian/Markdown/PDF 资料，再展示 evidence 引用问答，最后展示 Memory、Deep Research 或 MCP/Operator 等高级能力。
+旧服务器源码不在主分支正式树中。行为对照从只读 Git 归档/snapshot 进行；会话、Memory
+和 VaultAction audit 只能先导成规范 JSONL，再由本地 importer 读取。Runtime、插件与 Web
+均不得连接旧服务器或提供远程降级。服务器默认只读；任何服务器写操作仍需用户明确授权。

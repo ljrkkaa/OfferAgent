@@ -8,6 +8,14 @@
       "kind": "response",
       "method": "client/tool/invoke"
     },
+    "examples/client-tool-lookup.request.json": {
+      "kind": "request",
+      "method": "client/tool/lookup"
+    },
+    "examples/client-tool-lookup.response.json": {
+      "kind": "response",
+      "method": "client/tool/lookup"
+    },
     "examples/initialize.request.json": {
       "kind": "request",
       "method": "initialize"
@@ -15,6 +23,10 @@
     "examples/initialize.response.json": {
       "kind": "response",
       "method": "initialize"
+    },
+    "examples/rpc-cancel.notification.json": {
+      "kind": "notification",
+      "method": "rpc/cancel"
     },
     "examples/tool-completed.event.json": {
       "kind": "event",
@@ -35,38 +47,50 @@
       "sizeBytes": 488
     },
     "examples/client-tool-invoke.response.json": {
-      "sha256": "sha256:d93c5bfc59af9ae759a6c5e21fb393c9ddf235f1ca363cd4aa8eb6dacfa89e4f",
-      "sizeBytes": 755
+      "sha256": "sha256:08c90c37457758ad8bc7b0279a09fa2c1a41ad07fe4c26df1bf1ba4f3b3375a3",
+      "sizeBytes": 1626
+    },
+    "examples/client-tool-lookup.request.json": {
+      "sha256": "sha256:4a99e8ba9f83a32276d553d807b68079b01c69182824e76bfca0adfcf123eb42",
+      "sizeBytes": 146
+    },
+    "examples/client-tool-lookup.response.json": {
+      "sha256": "sha256:064d052d34a3bcefbaa43a86d7b120093d3728aa2f4f00935bf53592dd29e49b",
+      "sizeBytes": 129
     },
     "examples/initialize.request.json": {
-      "sha256": "sha256:979f24c0d648155c6063cbf881b6b5c0fed3a3c096fa1f6fb870fb3ba7c71b6f",
-      "sizeBytes": 302
+      "sha256": "sha256:9c1e5d02bcad85e7963f8b3a2ae5f7665e240b48b83066001760bffad36a0c77",
+      "sizeBytes": 336
     },
     "examples/initialize.response.json": {
-      "sha256": "sha256:a77f35b70d939356bad0add4cf3854437325e56224ff222d3f4d76aea341d5e2",
-      "sizeBytes": 937
+      "sha256": "sha256:50c35535d4e911f30529cebcb0afaa63af63f8051fb3ea9c345d90b97a865c06",
+      "sizeBytes": 920
+    },
+    "examples/rpc-cancel.notification.json": {
+      "sha256": "sha256:0b95354d44f009fc0dee3afe519288c1428015c874253bfd3d0f92c61074c0e2",
+      "sizeBytes": 104
     },
     "examples/tool-completed.event.json": {
       "sha256": "sha256:1e746018acd376da089ecfbf6cee748a844af1937994d405e578b88f0ef966d2",
       "sizeBytes": 1011
     },
     "examples/turn-start.request.json": {
-      "sha256": "sha256:6051aafa63a79577bc09ae85b3d368d1ada8fa9d2d76f4a1df5fa96dd9e40cee",
-      "sizeBytes": 495
+      "sha256": "sha256:7dff74702df655e2c51ecdba8287278ae65800e9cf50372f37a9254386d566b1",
+      "sizeBytes": 708
     },
     "examples/turn-start.response.json": {
       "sha256": "sha256:9ba30042ddf17b1cee7fd0ff5a79876a29ba06792f0ae4d682b1c7e9401480b0",
       "sizeBytes": 150
     },
     "offeragent-protocol-v1.schema.json": {
-      "sha256": "sha256:4974063a92f1134a4a10b42cbcdfab38043a84b82eb590dd4765c6b704db94c7",
-      "sizeBytes": 151303
+      "sha256": "sha256:b1469ac3702490341f8d5d8907faed1a05b990354a57461e53f1ce388c32327a",
+      "sizeBytes": 252733
     }
   },
   "generatorVersion": "1",
   "manifestVersion": 1,
   "protocolVersion": "1.0",
   "schemaBundle": "offeragent-protocol-v1.schema.json",
-  "schemaHash": "sha256:4974063a92f1134a4a10b42cbcdfab38043a84b82eb590dd4765c6b704db94c7",
+  "schemaHash": "sha256:b1469ac3702490341f8d5d8907faed1a05b990354a57461e53f1ce388c32327a",
   "schemaVersion": "1"
 }

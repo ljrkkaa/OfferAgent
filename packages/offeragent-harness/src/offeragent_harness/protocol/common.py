@@ -154,13 +154,24 @@ class RunConfigSnapshot(WireModel):
     permission_mode: PermissionMode = PermissionMode.NORMAL
     budgets: BudgetSnapshot | None = None
     enabled_skills: list[str] = Field(default_factory=list, max_length=256)
-    enabled_mcp_servers: list[str] = Field(default_factory=list, max_length=128)
 
 
 class EditorSelection(WireModel):
     text: str = Field(max_length=262_144)
     anchor_offset: int = Field(ge=0)
     head_offset: int = Field(ge=0)
+
+
+class ClientMetadataSnapshot(WireModel):
+    frontmatter: JsonObject = Field(default_factory=dict, max_length=256)
+    tags: list[str] = Field(default_factory=list, max_length=1024)
+    links: list[RelativeVaultPath] = Field(default_factory=list, max_length=2048)
+    unresolved_links: list[str] = Field(default_factory=list, max_length=2048)
+
+
+class ClientBacklinkSnapshot(WireModel):
+    path: RelativeVaultPath
+    count: int = Field(ge=1, le=1_000_000)
 
 
 class ClientContextSnapshot(WireModel):
@@ -172,6 +183,8 @@ class ClientContextSnapshot(WireModel):
     cursor_offset: int | None = Field(default=None, ge=0)
     has_unsaved_changes: bool = False
     metadata_cache_revision: int | None = Field(default=None, ge=0)
+    metadata: ClientMetadataSnapshot | None = None
+    backlinks: list[ClientBacklinkSnapshot] | None = Field(default=None, max_length=2048)
 
 
 class UsageSnapshot(WireModel):
@@ -301,6 +314,7 @@ class SubagentResult(WireModel):
     status: RunStatus
     summary: str = Field(min_length=1, max_length=16_384)
     findings: list[Finding] = Field(default_factory=list, max_length=512)
+    evidence: list[JsonObject] = Field(default_factory=list, max_length=512)
     artifacts: list[ArtifactRef] = Field(default_factory=list, max_length=256)
     proposed_actions: list[ProposedAction] = Field(default_factory=list, max_length=256)
     unresolved_questions: list[str] = Field(default_factory=list, max_length=256)
@@ -314,7 +328,9 @@ __all__ = [
     "ApprovalScope",
     "ApprovalStatus",
     "BudgetSnapshot",
+    "ClientBacklinkSnapshot",
     "ClientContextSnapshot",
+    "ClientMetadataSnapshot",
     "EditorSelection",
     "Finding",
     "PermissionMode",

@@ -1,0 +1,591 @@
+import { PROTOCOL_EVENT_TYPES } from "./generated_protocol";
+import type { EventEnvelope as GeneratedEventEnvelope, SourceRef } from "./generated_protocol";
+import { JsonObject, JsonValue, requireJsonObject, requireJsonValue } from "./json_rpc";
+import { mergeSourceReferences, sourceReferenceArray } from "./source_references";
+
+type NullableLineageField = "sessionId" | "turnId" | "runId" | "rootRunId" | "parentRunId";
+export type EventEnvelope = Omit<GeneratedEventEnvelope, "payload" | NullableLineageField> & {
+    readonly payload: JsonObject;
+    readonly sessionId: string | null;
+    readonly turnId: string | null;
+    readonly runId: string | null;
+    readonly rootRunId: string | null;
+    readonly parentRunId: string | null;
+};
+
+const EVENT_TYPES: ReadonlySet<string> = new Set(PROTOCOL_EVENT_TYPES);
+
+export interface ToolCardState {
+    readonly toolCallId: string;
+    name: string;
+    status: string;
+    arguments: JsonObject;
+    progressMessage: string | null;
+    completedUnits: number | null;
+    totalUnits: number | null;
+    artifactIds: string[];
+    sourceReferenceIds: string[];
+    sideEffects: JsonObject[];
+    result: JsonObject | null;
+    error: JsonObject | null;
+}
+
+export interface ApprovalCardState {
+    readonly approvalId: string;
+    status: string;
+    explanation: string;
+    expectedArgsHash: string | null;
+    diffArtifactIds: string[];
+    scope: string | null;
+}
+
+export interface RunViewState {
+    readonly runId: string;
+    rootRunId: string;
+    parentRunId: string | null;
+    sessionId: string;
+    turnId: string;
+    status: string;
+    phase: string | null;
+    userBlocks: string[];
+    reasoningSummary: string;
+    assistantBlocks: string[];
+    tools: Map<string, ToolCardState>;
+    approvals: Map<string, ApprovalCardState>;
+    references: SourceRef[];
+    artifacts: Map<string, JsonObject>;
+    usage: JsonObject | null;
+    childRunIds: Set<string>;
+    warnings: JsonObject[];
+    termination: JsonObject | null;
+}
+
+export interface SessionViewState {
+    readonly sessionId: string;
+    summary: JsonObject | null;
+    runIds: Set<string>;
+}
+
+export interface ProjectionState {
+    readonly workspaceId: string;
+    readonly sessions: Map<string, SessionViewState>;
+    readonly runs: Map<string, RunViewState>;
+    skillCatalog: JsonObject | null;
+    readonly skillTrust: Map<string, JsonObject>;
+    readonly workspaceWarnings: JsonObject[];
+}
+
+interface EventStream {
+    lastSequence: number;
+    pending: Map<number, EventEnvelope>;
+    appliedBySequence: Map<number, string>;
+}
+
+export interface EventReducerOptions {
+    maxPendingPerStream?: number;
+    maxSeenEventIds?: number;
+    onGap?: (streamKey: string, afterSequence: number) => void;
+}
+
+export class EventProjectionError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "EventProjectionError";
+    }
+}
+
+export class EventReducer {
+    readonly state: ProjectionState;
+    private readonly streams = new Map<string, EventStream>();
+    private readonly seenIds = new Map<string, true>();
+    private readonly maxPendingPerStream: number;
+    private readonly maxSeenEventIds: number;
+    private readonly onGap: ((streamKey: string, afterSequence: number) => void) | undefined;
+    private readonly listeners = new Set<(event: EventEnvelope, state: ProjectionState) => void>();
+
+    constructor(workspaceId: string, options: EventReducerOptions = {}) {
+        requireIdentifier(workspaceId, "workspaceId");
+        this.maxPendingPerStream = positiveInteger(options.maxPendingPerStream ?? 2_048, "maxPendingPerStream");
+        this.maxSeenEventIds = positiveInteger(options.maxSeenEventIds ?? 100_000, "maxSeenEventIds");
+        this.onGap = options.onGap;
+        this.state = {
+            workspaceId,
+            sessions: new Map(),
+            runs: new Map(),
+            skillCatalog: null,
+            skillTrust: new Map(),
+            workspaceWarnings: [],
+        };
+    }
+
+    accept(raw: unknown): boolean {
+        const event = parseEventEnvelope(raw);
+        if (event.workspaceId !== this.state.workspaceId) {
+            throw new EventProjectionError("event belongs to a different Workspace");
+        }
+        if (this.seenIds.has(event.eventId)) return false;
+        const key = streamKey(event);
+        const stream = this.streams.get(key) ?? {
+            lastSequence: 0,
+            pending: new Map<number, EventEnvelope>(),
+            appliedBySequence: new Map<number, string>(),
+        };
+        this.streams.set(key, stream);
+        const appliedId = stream.appliedBySequence.get(event.sequence);
+        if (appliedId !== undefined) {
+            if (appliedId !== event.eventId) throw new EventProjectionError("event sequence was reused with another id");
+            this.rememberId(event.eventId);
+            return false;
+        }
+        const pending = stream.pending.get(event.sequence);
+        if (pending !== undefined) {
+            if (pending.eventId !== event.eventId) throw new EventProjectionError("pending event sequence collision");
+            this.rememberId(event.eventId);
+            return false;
+        }
+        if (event.sequence <= stream.lastSequence) throw new EventProjectionError("event sequence regressed");
+        if (stream.pending.size >= this.maxPendingPerStream) {
+            throw new EventProjectionError("out-of-order event buffer exceeded its hard limit");
+        }
+        stream.pending.set(event.sequence, event);
+        this.rememberId(event.eventId);
+        const applied = this.drain(key, stream);
+        if (stream.pending.size > 0 && !stream.pending.has(stream.lastSequence + 1)) {
+            this.onGap?.(key, stream.lastSequence);
+        }
+        return applied;
+    }
+
+    lastSequence(streamKeyValue: string): number {
+        return this.streams.get(streamKeyValue)?.lastSequence ?? 0;
+    }
+
+    runLastSequence(runId: string): number {
+        requireIdentifier(runId, "runId");
+        return this.lastSequence(`run:${runId}`);
+    }
+
+    sessionRunCursors(sessionId: string): Readonly<Record<string, number>> {
+        requireIdentifier(sessionId, "sessionId");
+        return Object.fromEntries(
+            [...this.state.runs.values()]
+                .filter((run) => run.sessionId === sessionId)
+                .map((run) => [run.runId, this.runLastSequence(run.runId)] as const)
+                .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0),
+        );
+    }
+
+    pendingCount(streamKeyValue?: string): number {
+        if (streamKeyValue !== undefined) return this.streams.get(streamKeyValue)?.pending.size ?? 0;
+        let total = 0;
+        for (const stream of this.streams.values()) total += stream.pending.size;
+        return total;
+    }
+
+    subscribe(listener: (event: EventEnvelope, state: ProjectionState) => void): () => void {
+        this.listeners.add(listener);
+        return () => this.listeners.delete(listener);
+    }
+
+    private drain(key: string, stream: EventStream): boolean {
+        let applied = false;
+        while (true) {
+            const sequence = stream.lastSequence + 1;
+            const event = stream.pending.get(sequence);
+            if (!event) break;
+            stream.pending.delete(sequence);
+            this.apply(event);
+            stream.lastSequence = sequence;
+            stream.appliedBySequence.set(sequence, event.eventId);
+            for (const listener of this.listeners) listener(event, this.state);
+            applied = true;
+        }
+        if (stream.appliedBySequence.size > this.maxSeenEventIds) {
+            const cutoff = stream.lastSequence - this.maxSeenEventIds;
+            for (const sequence of stream.appliedBySequence.keys()) {
+                if (sequence <= cutoff) stream.appliedBySequence.delete(sequence);
+            }
+        }
+        return applied;
+    }
+
+    private apply(event: EventEnvelope): void {
+        const payload = event.payload;
+        if (event.type === "session.updated") {
+            const summary = objectField(payload, "session");
+            const sessionId = textField(summary, "sessionId");
+            const session = this.state.sessions.get(sessionId) ?? { sessionId, summary: null, runIds: new Set<string>() };
+            session.summary = summary;
+            this.state.sessions.set(sessionId, session);
+            return;
+        }
+        if (event.type === "skill.catalog_updated") {
+            this.state.skillCatalog = payload;
+            return;
+        }
+        if (event.type === "skill.trust_changed") {
+            const skillId = optionalText(payload, "skillId") ?? optionalText(payload, "name");
+            if (!skillId) throw new EventProjectionError("skill trust event has no identity");
+            this.state.skillTrust.set(skillId, payload);
+            return;
+        }
+        if (event.type === "runtime.warning" && event.runId === null) {
+            this.state.workspaceWarnings.push(payload);
+            return;
+        }
+        if (event.runId === null || event.sessionId === null || event.turnId === null || event.rootRunId === null) {
+            throw new EventProjectionError(`run event ${event.type} lacks lineage`);
+        }
+        const run = this.ensureRun(event);
+        this.applyRun(run, event.type, payload);
+    }
+
+    private ensureRun(event: EventEnvelope): RunViewState {
+        const runId = event.runId as string;
+        let run = this.state.runs.get(runId);
+        if (run) {
+            if (run.rootRunId !== event.rootRunId || run.parentRunId !== event.parentRunId ||
+                run.sessionId !== event.sessionId || run.turnId !== event.turnId) {
+                throw new EventProjectionError("Run lineage changed across events");
+            }
+            return run;
+        }
+        run = {
+            runId,
+            rootRunId: event.rootRunId as string,
+            parentRunId: event.parentRunId,
+            sessionId: event.sessionId as string,
+            turnId: event.turnId as string,
+            status: "running",
+            phase: null,
+            userBlocks: [],
+            reasoningSummary: "",
+            assistantBlocks: [],
+            tools: new Map(),
+            approvals: new Map(),
+            references: [],
+            artifacts: new Map(),
+            usage: null,
+            childRunIds: new Set(),
+            warnings: [],
+            termination: null,
+        };
+        this.state.runs.set(runId, run);
+        const session = this.state.sessions.get(run.sessionId) ?? {
+            sessionId: run.sessionId,
+            summary: null,
+            runIds: new Set<string>(),
+        };
+        session.runIds.add(runId);
+        this.state.sessions.set(run.sessionId, session);
+        if (run.parentRunId) this.state.runs.get(run.parentRunId)?.childRunIds.add(runId);
+        return run;
+    }
+
+    private applyRun(run: RunViewState, type: string, payload: JsonObject): void {
+        switch (type) {
+            case "turn.started":
+                run.userBlocks = contentText(arrayField(payload, "input"));
+                run.status = type;
+                return;
+            case "subagent.queued":
+            case "subagent.started":
+            case "subagent.recovered":
+                run.status = type;
+                return;
+            case "phase.changed":
+                run.phase = textField(payload, "phase");
+                return;
+            case "reasoning.summary":
+                run.reasoningSummary = textField(payload, "summary");
+                return;
+            case "assistant.delta": {
+                const index = integerField(payload, "blockIndex", 0);
+                const offset = integerField(payload, "offset", 0);
+                while (run.assistantBlocks.length <= index) run.assistantBlocks.push("");
+                if (run.assistantBlocks[index].length !== offset) {
+                    throw new EventProjectionError("assistant delta offset is non-contiguous");
+                }
+                run.assistantBlocks[index] += textField(payload, "delta");
+                return;
+            }
+            case "assistant.completed":
+                run.assistantBlocks = contentText(arrayField(payload, "content"));
+                return;
+            case "tool.queued":
+            case "tool.started": {
+                const call = objectField(payload, "call");
+                const toolCallId = textField(call, "toolCallId");
+                const existing = run.tools.get(toolCallId);
+                const card = existing ?? {
+                    toolCallId,
+                    name: textField(call, "name"),
+                    status: type,
+                    arguments: objectField(call, "arguments"),
+                    progressMessage: null,
+                    completedUnits: null,
+                    totalUnits: null,
+                    artifactIds: [],
+                    sourceReferenceIds: [],
+                    sideEffects: [],
+                    result: null,
+                    error: null,
+                };
+                card.status = type;
+                run.tools.set(toolCallId, card);
+                return;
+            }
+            case "tool.progress": {
+                const card = requireTool(run, textField(payload, "toolCallId"));
+                card.status = type;
+                card.progressMessage = textField(payload, "message");
+                card.completedUnits = optionalInteger(payload, "completedUnits");
+                card.totalUnits = optionalInteger(payload, "totalUnits");
+                return;
+            }
+            case "tool.completed":
+            case "tool.failed": {
+                const result = objectField(payload, "result");
+                const card = requireTool(run, textField(result, "toolCallId"));
+                card.status = textField(result, "status");
+                card.result = result;
+                card.error = payload.error && typeof payload.error === "object" && !Array.isArray(payload.error)
+                    ? objectField(payload, "error")
+                    : null;
+                card.artifactIds = textArray(payload, "artifactIds");
+                card.sourceReferenceIds = textArray(payload, "sourceReferenceIds");
+                card.sideEffects = objectArray(payload, "sideEffectFacts");
+                run.references = mergeSourceReferences(
+                    run.references,
+                    sourceReferenceArray(result.sourceRefs),
+                );
+                return;
+            }
+            case "approval.required": {
+                const approval = objectField(payload, "approval");
+                const approvalId = textField(approval, "approvalId");
+                run.approvals.set(approvalId, {
+                    approvalId,
+                    status: "pending",
+                    explanation: textField(payload, "explanation"),
+                    expectedArgsHash: optionalText(approval, "argsHash"),
+                    diffArtifactIds: textArray(payload, "diffArtifactIds"),
+                    scope: null,
+                });
+                return;
+            }
+            case "approval.resolved":
+            case "approval.expired": {
+                const approvalId = textField(payload, "approvalId");
+                const approval = run.approvals.get(approvalId);
+                if (!approval) throw new EventProjectionError("approval terminal event has no pending projection");
+                approval.status = optionalText(payload, "status") ?? "expired";
+                approval.scope = optionalText(payload, "scope");
+                return;
+            }
+            case "references.updated": {
+                const incoming = sourceReferenceArray(payload.references);
+                run.references = payload.replace === true
+                    ? incoming
+                    : mergeSourceReferences(run.references, incoming);
+                return;
+            }
+            case "artifact.created": {
+                const artifact = objectField(payload, "artifact");
+                run.artifacts.set(textField(artifact, "artifactId"), artifact);
+                return;
+            }
+            case "usage.updated":
+                run.usage = objectField(payload, "usage");
+                return;
+            case "runtime.warning":
+                run.warnings.push(payload);
+                return;
+            case "turn.completed":
+            case "subagent.completed":
+                terminal(run, "completed", payload);
+                return;
+            case "turn.cancelled":
+            case "subagent.cancelled":
+                terminal(run, "cancelled", payload);
+                return;
+            case "turn.failed":
+            case "subagent.failed":
+                terminal(run, "failed", payload);
+                return;
+            case "turn.interrupted":
+            case "subagent.interrupted":
+            case "subagent.orphaned":
+                terminal(run, type.endsWith("orphaned") ? "orphaned" : "interrupted", payload);
+                return;
+            default:
+                // Durable recovery/audit events remain in the event store. They do not
+                // mutate visual state, and must never be interpreted as completion.
+                return;
+        }
+    }
+
+    private rememberId(eventId: string): void {
+        this.seenIds.delete(eventId);
+        this.seenIds.set(eventId, true);
+        while (this.seenIds.size > this.maxSeenEventIds) {
+            const oldest = this.seenIds.keys().next().value as string | undefined;
+            if (oldest === undefined) break;
+            this.seenIds.delete(oldest);
+        }
+    }
+}
+
+export function parseEventEnvelope(raw: unknown): EventEnvelope {
+    const value = requireJsonObject(raw);
+    const keys = [
+        "protocolVersion", "schemaVersion", "eventId", "sequence", "timestamp", "traceId", "workspaceId",
+        "sessionId", "turnId", "runId", "rootRunId", "parentRunId", "type", "payload",
+    ];
+    if (Object.keys(value).length !== keys.length || keys.some((key) => !(key in value))) {
+        throw new EventProjectionError("event envelope fields do not match the protocol");
+    }
+    const event: EventEnvelope = {
+        protocolVersion: textField(value, "protocolVersion"),
+        schemaVersion: textField(value, "schemaVersion"),
+        eventId: textField(value, "eventId"),
+        sequence: integerField(value, "sequence", 1),
+        timestamp: timestampField(value, "timestamp"),
+        traceId: textField(value, "traceId"),
+        workspaceId: textField(value, "workspaceId"),
+        sessionId: nullableText(value, "sessionId"),
+        turnId: nullableText(value, "turnId"),
+        runId: nullableText(value, "runId"),
+        rootRunId: nullableText(value, "rootRunId"),
+        parentRunId: nullableText(value, "parentRunId"),
+        type: eventTypeField(value),
+        payload: objectField(value, "payload"),
+    };
+    if (event.runId !== null && (event.sessionId === null || event.turnId === null || event.rootRunId === null)) {
+        throw new EventProjectionError("run event lineage is incomplete");
+    }
+    if (event.parentRunId !== null && event.runId === null) throw new EventProjectionError("parentRunId requires runId");
+    return event;
+}
+
+function eventTypeField(value: JsonObject): EventEnvelope["type"] {
+    const type = textField(value, "type");
+    if (!EVENT_TYPES.has(type)) throw new EventProjectionError("event type is absent from the generated protocol");
+    return type as EventEnvelope["type"];
+}
+
+export function eventStreamKey(event: EventEnvelope): string {
+    return streamKey(event);
+}
+
+function streamKey(event: EventEnvelope): string {
+    return event.runId ? `run:${event.runId}` : event.sessionId ? `session:${event.sessionId}` : `workspace:${event.workspaceId}`;
+}
+
+function terminal(run: RunViewState, status: string, payload: JsonObject): void {
+    if (["completed", "cancelled", "failed", "interrupted", "orphaned"].includes(run.status)) {
+        if (run.status !== status) throw new EventProjectionError("Run terminal status changed");
+        return;
+    }
+    run.status = status;
+    run.termination = payload;
+}
+
+function requireTool(run: RunViewState, toolCallId: string): ToolCardState {
+    const card = run.tools.get(toolCallId);
+    if (!card) throw new EventProjectionError("tool event has no queued/started projection");
+    return card;
+}
+
+function contentText(content: JsonValue[]): string[] {
+    return content.map((raw) => {
+        const block = objectValue(raw);
+        const type = textField(block, "type");
+        if (type === "text") return textField(block, "text");
+        if (type === "artifact") return `[Artifact: ${textField(block, "artifactId")}]`;
+        if (type === "image") return `[Image: ${optionalText(block, "alt") ?? "image"}]`;
+        return `[${type}]`;
+    });
+}
+
+function textField(value: JsonObject, key: string): string {
+    const field = value[key];
+    if (typeof field !== "string" || field.length === 0) throw new EventProjectionError(`${key} must be non-empty text`);
+    return field;
+}
+
+function optionalText(value: JsonObject, key: string): string | null {
+    const field = value[key];
+    if (field === null || field === undefined) return null;
+    return textField(value, key);
+}
+
+function nullableText(value: JsonObject, key: string): string | null {
+    if (!(key in value) || value[key] === null) return null;
+    return textField(value, key);
+}
+
+function integerField(value: JsonObject, key: string, minimum: number): number {
+    const field = value[key];
+    if (typeof field !== "number" || !Number.isSafeInteger(field) || field < minimum) {
+        throw new EventProjectionError(`${key} must be an integer >= ${minimum}`);
+    }
+    return field;
+}
+
+function optionalInteger(value: JsonObject, key: string): number | null {
+    const field = value[key];
+    if (field === null || field === undefined) return null;
+    return integerField(value, key, 0);
+}
+
+function objectField(value: JsonObject, key: string): JsonObject {
+    const field = value[key];
+    if (field === null || typeof field !== "object" || Array.isArray(field)) {
+        throw new EventProjectionError(`${key} must be an object`);
+    }
+    return field;
+}
+
+function objectValue(value: JsonValue): JsonObject {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new EventProjectionError("expected an object");
+    }
+    return value;
+}
+
+function arrayField(value: JsonObject, key: string): JsonValue[] {
+    const field = value[key];
+    if (!Array.isArray(field)) throw new EventProjectionError(`${key} must be an array`);
+    return field;
+}
+
+function textArray(value: JsonObject, key: string): string[] {
+    return arrayField(value, key).map((item) => {
+        if (typeof item !== "string" || item.length === 0) throw new EventProjectionError(`${key} has invalid text`);
+        return item;
+    });
+}
+
+function objectArray(value: JsonObject, key: string): JsonObject[] {
+    return arrayField(value, key).map(objectValue);
+}
+
+function timestampField(value: JsonObject, key: string): string {
+    const field = textField(value, key);
+    if (!Number.isFinite(Date.parse(field)) || !/(?:Z|[+-]\d{2}:\d{2})$/.test(field)) {
+        throw new EventProjectionError(`${key} must be an RFC3339 timestamp`);
+    }
+    return field;
+}
+
+function requireIdentifier(value: string, name: string): void {
+    if (!value || value.length > 256 || /[\0\r\n]/.test(value)) throw new TypeError(`invalid ${name}`);
+}
+
+function positiveInteger(value: number, name: string): number {
+    if (!Number.isSafeInteger(value) || value < 1) throw new RangeError(`${name} must be a positive integer`);
+    return value;
+}
+
+void requireJsonValue;

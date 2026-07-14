@@ -7,5 +7,5 @@
 	"author": "OfferAgent",
 	"authorUrl": "",
 	"main": "main.js",
-	"isDesktopOnly": false
+	"isDesktopOnly": true
 }

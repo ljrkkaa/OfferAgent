@@ -24,10 +24,21 @@ app / cli composition root
 - 生产模块不得 import `offeragent_harness.testing`。
 - Core 不读取全局 Vault/Model 环境变量；Workspace 与 RunConfig 通过不可变快照注入。
 
+## 主分支闭包
+
+- 主分支不得存在 `src/khoj`、旧服务端 Web、根 Khoj distribution/lock/test、Docker/Gunicorn
+  启动器或旧插件 HTTP/sync 文件；它们只能从对照分支
+  `archive/khoj-server-baseline-20260713` 与只读 snapshot 查看。
+- `scripts/audit_repository_closure.py` 对正式路径、Python AST、动态 import、子进程命令、
+  console entry point、`uv.lock`、Runtime SBOM 和 UI 边界做 fail-closed 检查。
+- 迁移文档可以描述旧类型和命令；任何可执行 Python/TypeScript、package script、CI 或发行脚本
+  都不能 import、动态加载、启动或打包这些历史入口。
+- 一次性 `packages/offeragent-harness/scripts/legacy_exporter` 只接受离线 JSONL 或调用方注入的只读 iterable；它不拥有
+  Django 配置、数据库连接、Router 或服务器生命周期。
+
 ## 状态与副作用
 
 - 状态、事件、预算、审批与 invocation journal 通过同一个 Unit of Work 原子提交。
 - Artifact blob 先以内容寻址方式幂等 stage，随后在 Unit of Work 中提交 metadata/link；未链接 blob 由 GC 清理。
 - Event Store 是 UI 恢复事实来源，EventSink 断线不能回滚已提交事件。
 - 未声明安全属性的工具构造失败；不得根据工具名推断并发、幂等或风险。
-

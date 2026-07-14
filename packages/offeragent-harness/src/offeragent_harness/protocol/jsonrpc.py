@@ -60,6 +60,16 @@ class JsonRpcNotification(WireModel):
     params: JsonObject = Field(default_factory=dict)
 
 
+class RpcCancelParams(WireModel):
+    request_id: RpcId
+
+
+class RpcCancelNotification(WireModel):
+    jsonrpc: Literal["2.0"]
+    method: Literal["rpc/cancel"]
+    params: RpcCancelParams
+
+
 class EventNotification(WireModel):
     jsonrpc: Literal["2.0"]
     method: Literal["event"]
@@ -80,7 +90,12 @@ class JsonRpcErrorResponse(WireModel):
 
 JsonRpcMessage = TypeAliasType(
     "JsonRpcMessage",
-    JsonRpcRequest | JsonRpcNotification | EventNotification | JsonRpcSuccessResponse | JsonRpcErrorResponse,
+    JsonRpcRequest
+    | JsonRpcNotification
+    | RpcCancelNotification
+    | EventNotification
+    | JsonRpcSuccessResponse
+    | JsonRpcErrorResponse,
 )
 
 
@@ -178,6 +193,8 @@ def parse_jsonrpc_message(value: object) -> JsonRpcMessage:
         if "method" in raw:
             if raw.get("method") == "event" and "id" not in raw:
                 return validate_wire(EventNotification, raw)
+            if raw.get("method") == "rpc/cancel" and "id" not in raw:
+                return validate_wire(RpcCancelNotification, raw)
             if "id" in raw:
                 return validate_wire(JsonRpcRequest, raw)
             notification = validate_wire(JsonRpcNotification, raw)
@@ -297,6 +314,8 @@ __all__ = [
     "JsonRpcRequest",
     "JsonRpcSuccessResponse",
     "RequestDirection",
+    "RpcCancelNotification",
+    "RpcCancelParams",
     "RpcId",
     "ValidatedRequest",
     "ValidatedResponse",

@@ -1,5 +1,6 @@
 import esbuild from "esbuild";
 import process from "process";
+import path from "path";
 import builtins from 'builtin-modules'
 
 const banner =
@@ -9,7 +10,35 @@ if you want to view the source, please visit the github repository of this plugi
 */
 `;
 
-const prod = (process.argv[2] === 'production');
+const localDevelopment = (process.argv[2] === 'local-development');
+const prod = (process.argv[2] === 'production') || localDevelopment;
+const extraArguments = process.argv.slice(3);
+const outputArguments = extraArguments.filter((value) => value.startsWith('--outfile='));
+const manifestArguments = extraArguments.filter((value) => value.startsWith('--development-manifest-sha256='));
+if (outputArguments.length > 1 || manifestArguments.length > 1 || extraArguments.some((value) =>
+    !value.startsWith('--outfile=') && !value.startsWith('--development-manifest-sha256='))) {
+    throw new Error('unsupported or duplicate build argument');
+}
+const requestedOutput = outputArguments.length === 1 ? outputArguments[0].slice('--outfile='.length) : 'main.js';
+if (!requestedOutput || requestedOutput.includes('\0')) throw new Error('invalid build outfile');
+const outfile = path.resolve(requestedOutput);
+const developmentManifestSha256 = manifestArguments.length === 1
+    ? manifestArguments[0].slice('--development-manifest-sha256='.length)
+    : '';
+if (localDevelopment && !/^sha256:[0-9a-f]{64}$/.test(developmentManifestSha256)) {
+    throw new Error('local development build requires a canonical manifest SHA-256 anchor');
+}
+if (!localDevelopment && developmentManifestSha256) {
+    throw new Error('production build rejects the local development manifest anchor');
+}
+const installerSelection = localDevelopment ? [{
+    name: "offeragent-local-development-installer",
+    setup(build) {
+        build.onResolve({ filter: /^\.\/runtime\/installer_mode$/ }, () => ({
+            path: path.resolve("src/runtime/installer_mode.local_development.ts"),
+        }));
+    },
+}] : [];
 
 esbuild.build({
     banner: {
@@ -41,6 +70,7 @@ esbuild.build({
         'node:zlib',
         'node:buffer',
         'node:net',
+        'node:*',
         ...builtins],
     format: 'cjs',
     watch: !prod,
@@ -48,5 +78,9 @@ esbuild.build({
     logLevel: "info",
     sourcemap: prod ? false : 'inline',
     treeShaking: true,
-    outfile: 'main.js',
+    plugins: installerSelection,
+    define: localDevelopment ? {
+        __OFFERAGENT_DEVELOPMENT_MANIFEST_SHA256__: JSON.stringify(developmentManifestSha256),
+    } : {},
+    outfile,
 }).catch(() => process.exit(1));

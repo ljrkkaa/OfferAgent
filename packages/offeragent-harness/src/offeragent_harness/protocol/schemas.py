@@ -13,6 +13,8 @@ from pathlib import Path
 
 from pydantic.json_schema import models_json_schema
 
+from offeragent_harness.foundation import vault_write_intent_hash
+
 from ._base import WireModel
 from .content import (
     ArtifactContentBlock,
@@ -21,11 +23,8 @@ from .content import (
     FileContentBlock,
     FileRef,
     ImageContentBlock,
-    McpSourceRef,
-    MemorySourceRef,
     TextContentBlock,
     VaultSourceRef,
-    WebSourceRef,
 )
 from .errors import ErrorEnvelope
 from .events import EVENT_REGISTRY, EventEnvelope
@@ -36,6 +35,8 @@ from .jsonrpc import (
     JsonRpcNotification,
     JsonRpcRequest,
     JsonRpcSuccessResponse,
+    RpcCancelNotification,
+    RpcCancelParams,
 )
 from .messages import ALL_METHOD_REGISTRY, CommandDirection
 
@@ -88,6 +89,8 @@ def _schema_models() -> list[type[WireModel]]:
             JsonRpcRequest,
             JsonRpcNotification,
             EventNotification,
+            RpcCancelParams,
+            RpcCancelNotification,
             JsonRpcSuccessResponse,
             JsonRpcErrorResponse,
             ArtifactRef,
@@ -97,10 +100,7 @@ def _schema_models() -> list[type[WireModel]]:
             ImageContentBlock,
             ArtifactContentBlock,
             VaultSourceRef,
-            WebSourceRef,
             ArtifactSourceRef,
-            MemorySourceRef,
-            McpSourceRef,
         )
     )
     # Preserve first occurrence so generated references and traversal are stable.
@@ -156,6 +156,7 @@ def build_schema_bundle() -> dict[str, object]:
             "request": model_ref(JsonRpcRequest),
             "notification": model_ref(JsonRpcNotification),
             "eventNotification": model_ref(EventNotification),
+            "rpcCancelNotification": model_ref(RpcCancelNotification),
             "successResponse": model_ref(JsonRpcSuccessResponse),
             "errorResponse": model_ref(JsonRpcErrorResponse),
             "event": model_ref(EventEnvelope),
@@ -191,6 +192,7 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
                     "clientTools": True,
                     "eventReplay": True,
                     "multiSession": True,
+                    "headlessVaultWrite": True,
                     "subagents": True,
                 },
             },
@@ -216,17 +218,21 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
                     "eventReplay": True,
                     "multiSession": True,
                     "approvals": True,
-                    "mcp": True,
                     "shell": True,
+                    "headlessVaultWrite": True,
                     "subagents": True,
                     "artifacts": True,
-                    "workspaceChanges": True,
                     "reverseRequests": True,
                     "contentBlocks": True,
                     "cancellation": True,
                     "diagnostics": True,
                 },
             },
+        },
+        "rpc-cancel.notification.json": {
+            "jsonrpc": "2.0",
+            "method": "rpc/cancel",
+            "params": {"requestId": "rpc_cancelled_01"},
         },
         "turn-start.request.json": {
             "jsonrpc": "2.0",
@@ -245,6 +251,11 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
                     "model": "gpt-5.5",
                     "reasoningEffort": "high",
                     "permissionMode": "normal",
+                },
+                "writeIntent": {
+                    "kind": "vault_write_required",
+                    "targetPaths": ["raw/xxx.md"],
+                    "intentHash": vault_write_intent_hash(("raw/xxx.md",)),
                 },
             },
         },
@@ -317,11 +328,28 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
             "jsonrpc": "2.0",
             "id": "rpc_88",
             "result": {
+                "invocationId": "inv_01",
+                "toolCallId": "call_04",
                 "status": "succeeded",
+                "output": {"transactionId": "tx_01", "applied": True},
+                "userVisibleSummary": "已应用经审批的 Vault 事务。",
                 "beforeHash": h_b,
                 "afterHash": h_c,
+                "beforeState": {"workspaceRevision": 103},
+                "afterState": {"workspaceRevision": 104},
                 "workspaceRevision": 104,
                 "artifactIds": ["art_diff_01"],
+                "sourceReferenceIds": ["vault:raw/xxx.md"],
+                "sideEffectFacts": [
+                    {
+                        "kind": "file_write",
+                        "state": "committed",
+                        "resourceId": "vault:raw/xxx.md",
+                        "beforeState": {"hash": h_b},
+                        "afterState": {"hash": h_c},
+                        "metadata": {"workspaceRevision": 104},
+                    }
+                ],
                 "actualOperations": [
                     {
                         "operationId": "op_01",
@@ -333,6 +361,22 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
                         "summary": "已应用经审批的 patch。",
                     }
                 ],
+                "error": None,
+            },
+        },
+        "client-tool-lookup.request.json": {
+            "jsonrpc": "2.0",
+            "id": "rpc_89",
+            "method": "client/tool/lookup",
+            "params": {"invocationId": "inv_01", "runId": "run_01"},
+        },
+        "client-tool-lookup.response.json": {
+            "jsonrpc": "2.0",
+            "id": "rpc_89",
+            "result": {
+                "invocationId": "inv_01",
+                "found": False,
+                "result": None,
             },
         },
     }
@@ -341,11 +385,14 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
 EXAMPLE_METHODS: Mapping[str, tuple[str, str]] = {
     "initialize.request.json": ("request", "initialize"),
     "initialize.response.json": ("response", "initialize"),
+    "rpc-cancel.notification.json": ("notification", "rpc/cancel"),
     "turn-start.request.json": ("request", "turn/start"),
     "turn-start.response.json": ("response", "turn/start"),
     "tool-completed.event.json": ("event", "event"),
     "client-tool-invoke.request.json": ("request", "client/tool/invoke"),
     "client-tool-invoke.response.json": ("response", "client/tool/invoke"),
+    "client-tool-lookup.request.json": ("request", "client/tool/lookup"),
+    "client-tool-lookup.response.json": ("response", "client/tool/lookup"),
 }
 
 

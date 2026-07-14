@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any
 
 from offeragent_harness.ports import (
+    EntityRecord,
     EntityRevisionConflict,
     EventIdConflict,
     EventIdempotencyConflict,
@@ -187,6 +188,24 @@ class _EntityView:
         row = self._state.entities.get((collection, entity_id))
         return None if row is None else copy.deepcopy(row.value)
 
+    async def list(
+        self,
+        collection: str,
+        after_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[EntityRecord, ...]:
+        if limit < 1 or limit > 1_000:
+            raise ValueError("entity page limit must be between 1 and 1000")
+        rows = sorted(
+            (
+                (entity_id, row)
+                for (row_collection, entity_id), row in self._state.entities.items()
+                if row_collection == collection and (after_id is None or entity_id > after_id)
+            ),
+            key=lambda item: item[0],
+        )[:limit]
+        return tuple(EntityRecord(entity_id, row.revision, copy.deepcopy(row.value)) for entity_id, row in rows)
+
     async def put(self, collection: str, entity_id: str, value: Any, *, expected_revision: int | None) -> int:
         key = (collection, entity_id)
         row = self._state.entities.get(key)
@@ -279,7 +298,7 @@ class _JournalView:
         existing = self._state.journal.get(key)
         if existing is None or existing.request_hash != request_hash:
             raise InvocationJournalConflict(f"journal key {key!r} is missing or bound to different arguments")
-        if existing.state is JournalState.COMPLETED:
+        if existing.state in {JournalState.COMPLETED, JournalState.UNKNOWN}:
             return existing
         record = InvocationRecord(
             scope,
@@ -367,6 +386,15 @@ class InMemoryUnitOfWorkFactory:
         async with self._database.lock:
             row = self._database.state.entities.get((collection, entity_id))
             return 0 if row is None else row.revision
+
+    async def list_entities(
+        self,
+        collection: str,
+        after_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[EntityRecord, ...]:
+        async with self._database.lock:
+            return await _EntityView(self._database.state).list(collection, after_id, limit)
 
     async def get_journal(self, scope: str, idempotency_key: str) -> InvocationRecord | None:
         async with self._database.lock:

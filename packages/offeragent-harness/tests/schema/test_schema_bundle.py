@@ -12,6 +12,7 @@ from offeragent_harness.protocol.jsonrpc import (
     EventNotification,
     JsonRpcRequest,
     JsonRpcSuccessResponse,
+    RpcCancelNotification,
     parse_jsonrpc_message,
     validate_request,
     validate_response,
@@ -108,6 +109,19 @@ def test_bundle_registries_are_complete_and_use_refs_to_closed_models() -> None:
         assert definition["additionalProperties"] is False
 
 
+def test_transport_cancel_notification_has_a_stable_closed_schema_and_manifest_example() -> None:
+    bundle = build_schema_bundle()
+    envelopes = _object(bundle["envelopes"])
+    definitions = _object(bundle["$defs"])
+    cancel_ref = _object(envelopes["rpcCancelNotification"])["$ref"]
+    assert cancel_ref == "#/$defs/RpcCancelNotification"
+    cancel_definition = _object(definitions["RpcCancelNotification"])
+    params_definition = _object(definitions["RpcCancelParams"])
+    assert cancel_definition["additionalProperties"] is False
+    assert params_definition["additionalProperties"] is False
+    assert EXAMPLE_METHODS["rpc-cancel.notification.json"] == ("notification", "rpc/cancel")
+
+
 def test_all_committed_examples_validate_against_dto_and_json_schema() -> None:
     bundle = build_schema_bundle()
     definitions = _object(bundle["$defs"])
@@ -136,11 +150,17 @@ def test_all_committed_examples_validate_against_dto_and_json_schema() -> None:
             result_schema = _object(method_schema["result"])
             schema_ref = result_schema["$ref"]
             instance = validated_response.result.to_wire()
-        else:
+        elif kind == "event":
             assert isinstance(message, EventNotification)
             event_schema = _object(envelopes["event"])
             schema_ref = event_schema["$ref"]
             instance = message.params.to_wire()
+        else:
+            assert kind == "notification"
+            assert isinstance(message, RpcCancelNotification)
+            cancel_schema = _object(envelopes["rpcCancelNotification"])
+            schema_ref = cancel_schema["$ref"]
+            instance = message.to_wire()
         assert isinstance(schema_ref, str)
         validator = Draft202012Validator({"$ref": schema_ref, "$defs": definitions})
         assert list(validator.iter_errors(instance)) == [], name

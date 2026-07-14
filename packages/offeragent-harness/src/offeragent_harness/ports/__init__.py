@@ -1,9 +1,21 @@
 """Dependency-inversion ports for the Windows-local Harness core."""
 
-from .approvals import ApprovalPort
-from .artifacts import ArtifactMetadata, ArtifactState, ArtifactStore, Sensitivity
+from .application_commands import ApplicationCommandContext, ApplicationCommandDispatcher
+from .approvals import ApprovalObserver, ApprovalPort
+from .artifacts import ArtifactMetadata, ArtifactState, ArtifactStore, Sensitivity, StreamingArtifactStore
 from .cancellation import CancellationCodeLike, CancellationReasonLike, CancellationToken, OperationCancelled
-from .client_tools import ClientToolInvocation, ClientToolPort
+from .capabilities import CapabilityAuditRecord, CapabilityAuditSink, NullCapabilityAuditSink
+from .client_tools import (
+    ClientToolCommitObservation,
+    ClientToolCommitObservationPort,
+    ClientToolCommitPathState,
+    ClientToolInvocation,
+    ClientToolPathState,
+    ClientToolPort,
+    ClientToolPreview,
+    ClientToolPreviewLeasePort,
+    ClientToolPreviewPort,
+)
 from .events import (
     EventIdConflict,
     EventIdempotencyConflict,
@@ -15,11 +27,32 @@ from .events import (
     StoredEvent,
     TerminalEventConflict,
 )
-from .knowledge import KnowledgeHit, KnowledgeQuery, KnowledgeSource
+from .hooks import HookHandler, HookLayerSource, HookLifecyclePort
 from .model import ModelGateway
+from .network_audit import NetworkAuditSink
 from .policy import PolicyEvaluator
-from .sessions import ConversationStore
+from .processes import (
+    ProcessArtifactBudget,
+    ProcessArtifactReservation,
+    ProcessLifecycleState,
+    ProcessOutputEncoding,
+    ProcessOwnerKind,
+    ProcessStdinMode,
+    ProcessSupervisor,
+    SupervisedProcessRequest,
+    SupervisedProcessResult,
+)
+from .secrets import SecretConsumer, SecretHandle, SecretInput, SecretKind, SecretMetadata, SecretResolver, SecretStore
+from .skills import (
+    SkillStateStore,
+    SkillTrustDecision,
+    SkillTrustRecord,
+    SkillTrustVerificationRequest,
+    SkillTrustVerificationResult,
+    SkillTrustVerifier,
+)
 from .storage import (
+    EntityRecord,
     EntityRevisionConflict,
     EntityStore,
     InvocationJournal,
@@ -28,11 +61,14 @@ from .storage import (
     JournalState,
 )
 from .system import Clock, IdGenerator
-from .tool import ToolExecutor
+from .tool import ToolExecutor, ToolLifecycleObserver, ToolObservabilitySink
 from .unit_of_work import UnitOfWork, UnitOfWorkFactory
 from .vault import VaultEntry, VaultEntryKind, VaultPort, VaultRead, VaultTransaction
 
 __all__ = [
+    "ApplicationCommandContext",
+    "ApplicationCommandDispatcher",
+    "ApprovalObserver",
     "ApprovalPort",
     "ArtifactMetadata",
     "ArtifactState",
@@ -40,10 +76,19 @@ __all__ = [
     "CancellationCodeLike",
     "CancellationReasonLike",
     "CancellationToken",
+    "CapabilityAuditRecord",
+    "CapabilityAuditSink",
+    "ClientToolCommitObservation",
+    "ClientToolCommitObservationPort",
+    "ClientToolCommitPathState",
     "ClientToolInvocation",
+    "ClientToolPathState",
     "ClientToolPort",
+    "ClientToolPreview",
+    "ClientToolPreviewLeasePort",
+    "ClientToolPreviewPort",
     "Clock",
-    "ConversationStore",
+    "EntityRecord",
     "EntityRevisionConflict",
     "EntityStore",
     "EventIdConflict",
@@ -51,23 +96,50 @@ __all__ = [
     "EventSink",
     "EventStore",
     "EventStoreError",
+    "HookHandler",
+    "HookLayerSource",
+    "HookLifecyclePort",
     "IdGenerator",
     "InvocationJournal",
     "InvocationJournalConflict",
     "InvocationRecord",
     "JournalState",
-    "KnowledgeHit",
-    "KnowledgeQuery",
-    "KnowledgeSource",
     "ModelGateway",
+    "NetworkAuditSink",
     "NewEvent",
+    "NullCapabilityAuditSink",
     "OperationCancelled",
     "PolicyEvaluator",
+    "ProcessArtifactBudget",
+    "ProcessArtifactReservation",
+    "ProcessLifecycleState",
+    "ProcessOutputEncoding",
+    "ProcessOwnerKind",
+    "ProcessStdinMode",
+    "ProcessSupervisor",
+    "SecretConsumer",
+    "SecretHandle",
+    "SecretInput",
+    "SecretKind",
+    "SecretMetadata",
+    "SecretResolver",
+    "SecretStore",
     "Sensitivity",
     "SequenceConflict",
+    "SkillStateStore",
+    "SkillTrustDecision",
+    "SkillTrustRecord",
+    "SkillTrustVerificationRequest",
+    "SkillTrustVerificationResult",
+    "SkillTrustVerifier",
     "StoredEvent",
+    "StreamingArtifactStore",
+    "SupervisedProcessRequest",
+    "SupervisedProcessResult",
     "TerminalEventConflict",
     "ToolExecutor",
+    "ToolLifecycleObserver",
+    "ToolObservabilitySink",
     "UnitOfWork",
     "UnitOfWorkFactory",
     "VaultEntry",

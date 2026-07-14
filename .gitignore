@@ -1,71 +1,46 @@
-# Khoj artifacts
-*.gz
-*.pt
-tests/data/models
-tests/data/embeddings
-tests/evals/**.txt
-tests/evals/**.csv
-pgserver_data/
-
-# External app artifacts
-__pycache__
-.DS_Store
-.emacs.desktop*
+# Python/runtime development artifacts
+__pycache__/
 *.py[cod]
-.vscode
-.env
-.venv/*
-.obsidian
-todesktop.json
-
-# Build artifacts
-/src/khoj/interface/web/images
-/src/khoj/interface/built/
-/src/khoj/interface/compiled/404.html
-/build/
-/dist/
-khoj_assistant.egg-info
-/config/khoj*.yml
-.pytest_cache
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
 *.log
-/src/khoj/static
+.env
 
-# Obsidian plugin artifacts
-# ---
-# npm
-node_modules
-
-# Don't include the compiled obsidian main.js file in the repo.
-# They should be uploaded to GitHub releases instead.
-src/interface/obsidian/main.js
-
-# Exclude sourcemaps
-*.map
-# IntelliJ
-.idea
-
-# obsidian
+# Editor and local application state
+.DS_Store
+.idea/
+.vscode/
+.obsidian/
 data.json
 
-# Android
-src/interface/android/.gradle
-src/interface/android/app/build
-src/interface/android/build
-src/interface/android/*.aab
-src/interface/android/*.apk
-src/interface/android/*.apk.idsig
-src/interface/android/*.keystore
-src/interface/android/local.properties
+# Node/Obsidian build artifacts
+node_modules/
+src/interface/obsidian/main.js
+*.map
 
-INTERVIEW_PERSONAL_KB_AGENT.md
+# Local release outputs are generated from signed inputs and are not source.
+packages/offeragent-harness/release/
+packages/offeragent-harness/release-out/
 
+# Only reviewed architecture/baseline documents from the imported repository
+# are tracked here; the outer workspace owns the authoritative project docs.
 docs/
 !docs/
 docs/*
 !docs/WINDOWS_LOCAL_BASELINE.md
 !docs/architecture/
 !docs/architecture/**
-demos
-reference/
+
 AGENTS.md
-.understand-anything
+INTERVIEW_PERSONAL_KB_AGENT.md
+demos/
+reference/
+.understand-anything/

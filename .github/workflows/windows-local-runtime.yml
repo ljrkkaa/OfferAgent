@@ -1,0 +1,256 @@
+name: OfferAgent Windows Local Runtime
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+    inputs:
+      run_native_x64_release:
+        description: Run the signed release gate on a physical/native Windows x64 self-hosted runner
+        required: true
+        default: false
+        type: boolean
+      run_native_arm64_release:
+        description: Run the signed release gate on a physical/native Windows ARM64 self-hosted runner
+        required: true
+        default: false
+        type: boolean
+      runtime_version:
+        description: Runtime version for the signed ARM64 candidate
+        required: true
+        default: 2.0.0
+        type: string
+      plugin_minimum_version:
+        description: Minimum compatible plugin version
+        required: true
+        default: 2.0.0
+        type: string
+      plugin_maximum_version:
+        description: Maximum compatible plugin version
+        required: true
+        default: 2.9.9
+        type: string
+      release_key_id:
+        description: Embedded Ed25519 release key id
+        required: true
+        default: release-2026
+        type: string
+
+concurrency:
+  group: windows-local-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  harness:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: packages/offeragent-harness
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: packages/offeragent-harness/uv.lock
+      - run: uv sync --extra dev --locked
+      - run: uv run python scripts/audit_repository_closure.py
+      - run: uv run python scripts/check_forbidden_dependencies.py
+      - run: uv run python scripts/check_architecture.py
+      - run: >-
+          uv run semgrep --config semgrep.yml --no-git-ignore
+          --exclude .venv --exclude .mypy_cache --exclude ../../src/interface/obsidian/node_modules
+          src scripts ../../src/interface/obsidian/src
+      - run: uv run lint-imports --config .importlinter --no-cache
+      - run: uv run python -m offeragent_harness.protocol.schemas check
+      - run: uv run python scripts/build_web_assets.py check
+      - run: uv run ruff check src tests scripts
+      - run: uv run ruff format --check src tests scripts
+      - run: uv run mypy src tests
+      - run: uv run pytest -q
+      - run: uv build
+
+  obsidian:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src/interface/obsidian
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: yarn
+          cache-dependency-path: src/interface/obsidian/yarn.lock
+      - run: corepack enable
+      - run: corepack yarn install --frozen-lockfile
+      - run: corepack yarn test
+      - run: corepack yarn build
+
+  native-arm64-signed-release:
+    name: Native Windows ARM64 signed release gate
+    if: github.event_name == 'workflow_dispatch' && inputs.run_native_arm64_release
+    runs-on: [self-hosted, Windows, ARM64, offeragent-release]
+    environment: arm64-release-signing
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: packages/offeragent-harness
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: packages/offeragent-harness/uv.lock
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: yarn
+          cache-dependency-path: src/interface/obsidian/yarn.lock
+      - name: Install locked build dependencies
+        run: |
+          uv sync --extra dev --locked
+          corepack enable
+          corepack yarn --cwd ..\..\src\interface\obsidian install --frozen-lockfile
+      - name: Prove native ARM64 before accessing signing material
+        run: >-
+          uv run python -c "from offeragent_harness.runtime.release_manifest import
+          native_windows_architecture; assert native_windows_architecture() == 'arm64'"
+      - name: Materialize ephemeral Ed25519 release key
+        shell: pwsh
+        env:
+          RELEASE_KEY_PEM: ${{ secrets.OFFERAGENT_ED25519_PRIVATE_KEY_PEM }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RELEASE_KEY_PEM)) { throw 'release key secret is unavailable' }
+          $keyPath = Join-Path $env:RUNNER_TEMP 'offeragent-release-ed25519.pem'
+          [IO.File]::WriteAllText($keyPath, $env:RELEASE_KEY_PEM, [Text.UTF8Encoding]::new($false))
+      - name: Build, sign and audit native ARM64 release
+        shell: pwsh
+        env:
+          BUILD_COMMIT: ${{ github.sha }}
+          CERTIFICATE_SHA1: ${{ secrets.OFFERAGENT_AUTHENTICODE_CERTIFICATE_SHA1 }}
+          ISCC_PATH: ${{ vars.OFFERAGENT_ISCC_PATH }}
+          PLUGIN_MAXIMUM_VERSION: ${{ inputs.plugin_maximum_version }}
+          PLUGIN_MINIMUM_VERSION: ${{ inputs.plugin_minimum_version }}
+          RELEASE_KEY_ID: ${{ inputs.release_key_id }}
+          RUNTIME_VERSION: ${{ inputs.runtime_version }}
+          SIGNTOOL_PATH: ${{ vars.OFFERAGENT_SIGNTOOL_PATH }}
+          TIMESTAMP_URL: ${{ vars.OFFERAGENT_TIMESTAMP_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_SHA1)) { throw 'Authenticode certificate identity is unavailable' }
+          if ([string]::IsNullOrWhiteSpace($env:TIMESTAMP_URL)) { throw 'timestamp URL is unavailable' }
+          $epoch = git show -s --format=%ct HEAD
+          uv run python scripts/build_windows_release.py `
+            --architecture arm64 `
+            --runtime-version $env:RUNTIME_VERSION `
+            --plugin-minimum-version $env:PLUGIN_MINIMUM_VERSION `
+            --plugin-maximum-version $env:PLUGIN_MAXIMUM_VERSION `
+            --build-commit $env:BUILD_COMMIT `
+            --key-id $env:RELEASE_KEY_ID `
+            --ed25519-private-key (Join-Path $env:RUNNER_TEMP 'offeragent-release-ed25519.pem') `
+            --sign-tool $env:SIGNTOOL_PATH `
+            --certificate-sha1 $env:CERTIFICATE_SHA1 `
+            --timestamp-url $env:TIMESTAMP_URL `
+            --output (Join-Path $PWD 'dist\windows') `
+            --source-date-epoch $epoch `
+            --iscc $env:ISCC_PATH
+          uv run python scripts/audit_windows_release.py `
+            --architecture arm64 `
+            --payload (Join-Path $PWD 'dist\windows\windows-arm64\plugin-runtime\windows-arm64') `
+            --plugin-version $env:PLUGIN_MINIMUM_VERSION
+      - name: Remove ephemeral release key
+        if: always()
+        shell: pwsh
+        run: Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'offeragent-release-ed25519.pem') -Force -ErrorAction SilentlyContinue
+      - uses: actions/upload-artifact@v4
+        with:
+          name: offeragent-native-windows-arm64-${{ inputs.runtime_version }}
+          path: packages/offeragent-harness/dist/windows/windows-arm64
+          if-no-files-found: error
+          retention-days: 14
+
+  native-x64-signed-release:
+    name: Native Windows x64 signed release gate
+    if: github.event_name == 'workflow_dispatch' && inputs.run_native_x64_release
+    runs-on: [self-hosted, Windows, X64, offeragent-release]
+    environment: x64-release-signing
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: packages/offeragent-harness
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: packages/offeragent-harness/uv.lock
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: yarn
+          cache-dependency-path: src/interface/obsidian/yarn.lock
+      - name: Install locked build dependencies
+        run: |
+          uv sync --extra dev --locked
+          corepack enable
+          corepack yarn --cwd ..\..\src\interface\obsidian install --frozen-lockfile
+      - name: Prove native x64 before accessing signing material
+        run: >-
+          uv run python -c "from offeragent_harness.runtime.release_manifest import
+          native_windows_architecture; assert native_windows_architecture() == 'x64'"
+      - name: Materialize ephemeral Ed25519 release key
+        shell: pwsh
+        env:
+          RELEASE_KEY_PEM: ${{ secrets.OFFERAGENT_ED25519_PRIVATE_KEY_PEM }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RELEASE_KEY_PEM)) { throw 'release key secret is unavailable' }
+          $keyPath = Join-Path $env:RUNNER_TEMP 'offeragent-release-ed25519.pem'
+          [IO.File]::WriteAllText($keyPath, $env:RELEASE_KEY_PEM, [Text.UTF8Encoding]::new($false))
+      - name: Build, sign and audit native x64 release
+        shell: pwsh
+        env:
+          BUILD_COMMIT: ${{ github.sha }}
+          CERTIFICATE_SHA1: ${{ secrets.OFFERAGENT_AUTHENTICODE_CERTIFICATE_SHA1 }}
+          ISCC_PATH: ${{ vars.OFFERAGENT_ISCC_PATH }}
+          PLUGIN_MAXIMUM_VERSION: ${{ inputs.plugin_maximum_version }}
+          PLUGIN_MINIMUM_VERSION: ${{ inputs.plugin_minimum_version }}
+          RELEASE_KEY_ID: ${{ inputs.release_key_id }}
+          RUNTIME_VERSION: ${{ inputs.runtime_version }}
+          SIGNTOOL_PATH: ${{ vars.OFFERAGENT_SIGNTOOL_PATH }}
+          TIMESTAMP_URL: ${{ vars.OFFERAGENT_TIMESTAMP_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_SHA1)) { throw 'Authenticode certificate identity is unavailable' }
+          if ([string]::IsNullOrWhiteSpace($env:TIMESTAMP_URL)) { throw 'timestamp URL is unavailable' }
+          $epoch = git show -s --format=%ct HEAD
+          uv run python scripts/build_windows_release.py `
+            --architecture x64 `
+            --runtime-version $env:RUNTIME_VERSION `
+            --plugin-minimum-version $env:PLUGIN_MINIMUM_VERSION `
+            --plugin-maximum-version $env:PLUGIN_MAXIMUM_VERSION `
+            --build-commit $env:BUILD_COMMIT `
+            --key-id $env:RELEASE_KEY_ID `
+            --ed25519-private-key (Join-Path $env:RUNNER_TEMP 'offeragent-release-ed25519.pem') `
+            --sign-tool $env:SIGNTOOL_PATH `
+            --certificate-sha1 $env:CERTIFICATE_SHA1 `
+            --timestamp-url $env:TIMESTAMP_URL `
+            --output (Join-Path $PWD 'dist\windows') `
+            --source-date-epoch $epoch `
+            --iscc $env:ISCC_PATH
+          uv run python scripts/audit_windows_release.py `
+            --architecture x64 `
+            --payload (Join-Path $PWD 'dist\windows\windows-x64\plugin-runtime\windows-x64') `
+            --plugin-version $env:PLUGIN_MINIMUM_VERSION
+      - name: Remove ephemeral release key
+        if: always()
+        shell: pwsh
+        run: Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'offeragent-release-ed25519.pem') -Force -ErrorAction SilentlyContinue
+      - uses: actions/upload-artifact@v4
+        with:
+          name: offeragent-native-windows-x64-${{ inputs.runtime_version }}
+          path: packages/offeragent-harness/dist/windows/windows-x64
+          if-no-files-found: error
+          retention-days: 14

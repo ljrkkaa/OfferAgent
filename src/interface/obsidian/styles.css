@@ -1699,3 +1699,380 @@ button.reference-button:hover {
     font-size: x-small;
     vertical-align: middle;
 }
+/* Windows-local OfferAgent view ------------------------------------------------ */
+.offeragent-local-root {
+    --oa-border: color-mix(in srgb, var(--background-modifier-border) 82%, transparent);
+    --oa-soft: color-mix(in srgb, var(--background-secondary) 86%, transparent);
+    display: grid;
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    height: 100%;
+    min-height: 0;
+    background: var(--background-primary);
+    color: var(--text-normal);
+}
+
+.offeragent-local-header,
+.offeragent-tabs,
+.offeragent-composer-controls,
+.offeragent-tool-header,
+.offeragent-run-footer,
+.offeragent-approval-actions {
+    display: flex;
+    align-items: center;
+}
+
+.offeragent-approval-diff pre {
+    max-height: 24rem;
+    overflow: auto;
+    white-space: pre;
+    font-size: var(--font-ui-smaller);
+    background: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: var(--radius-s);
+    padding: var(--size-4-2);
+}
+
+.offeragent-reference-link {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: var(--link-color);
+    padding: 0;
+    text-align: left;
+    cursor: pointer;
+}
+
+.offeragent-local-header {
+    justify-content: space-between;
+    min-height: 44px;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--oa-border);
+}
+
+.offeragent-local-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 650;
+}
+
+.offeragent-local-title-icon,
+.offeragent-local-header-actions button,
+.offeragent-tab-add,
+.offeragent-tab-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.offeragent-local-title-icon svg,
+.offeragent-local-header-actions svg,
+.offeragent-tabs svg {
+    width: 16px;
+    height: 16px;
+}
+
+.offeragent-local-header-actions {
+    display: flex;
+    gap: 4px;
+}
+
+.offeragent-local-header-actions button,
+.offeragent-tab-add,
+.offeragent-tab-close {
+    padding: 5px;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+}
+
+.offeragent-tabs {
+    gap: 4px;
+    overflow-x: auto;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--oa-border);
+}
+
+.offeragent-tab {
+    display: flex;
+    align-items: center;
+    min-width: 92px;
+    max-width: 210px;
+    border: 1px solid transparent;
+    border-radius: 7px;
+}
+
+.offeragent-tab.is-active {
+    border-color: var(--oa-border);
+    background: var(--background-secondary);
+}
+
+.offeragent-tab > button:first-child {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    padding: 5px 7px;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.offeragent-runtime-state,
+.offeragent-empty {
+    margin: auto;
+    max-width: 520px;
+    padding: 24px;
+    text-align: center;
+    color: var(--text-muted);
+}
+
+.offeragent-timeline {
+    overflow-y: auto;
+    min-height: 0;
+    padding: 18px clamp(12px, 4vw, 42px) 36px;
+}
+
+.offeragent-run {
+    display: grid;
+    gap: 10px;
+    max-width: 920px;
+    margin: 0 auto 26px;
+}
+
+.offeragent-message {
+    min-width: 0;
+}
+
+.offeragent-user {
+    justify-self: end;
+    max-width: min(84%, 720px);
+    padding: 10px 12px;
+    border-radius: 14px 14px 4px 14px;
+    background: var(--interactive-accent);
+    color: var(--text-on-accent);
+}
+
+.offeragent-assistant {
+    max-width: 100%;
+}
+
+.offeragent-message-label {
+    margin-bottom: 5px;
+    font-size: var(--font-ui-smaller);
+    font-weight: 650;
+    opacity: .78;
+}
+
+.offeragent-message-body {
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+.offeragent-thinking {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.offeragent-reasoning,
+.offeragent-references,
+.offeragent-tool-card,
+.offeragent-approval {
+    border: 1px solid var(--oa-border);
+    border-radius: 9px;
+    background: var(--oa-soft);
+}
+
+.offeragent-reasoning,
+.offeragent-references {
+    margin: 7px 0;
+    padding: 8px 10px;
+}
+
+.offeragent-reasoning p {
+    color: var(--text-muted);
+    white-space: pre-wrap;
+}
+
+.offeragent-tool-card,
+.offeragent-approval {
+    padding: 9px 11px;
+}
+
+.offeragent-tool-card.status-failed,
+.offeragent-tool-card.status-conflict,
+.offeragent-tool-card.status-unknown_outcome,
+.offeragent-approval.status-denied {
+    border-color: var(--color-red);
+}
+
+.offeragent-tool-header,
+.offeragent-run-footer {
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.offeragent-tool-status,
+.offeragent-run-footer {
+    color: var(--text-muted);
+    font-size: var(--font-ui-smaller);
+}
+
+.offeragent-tool-card pre {
+    overflow: auto;
+    max-height: 240px;
+    padding: 8px;
+    border-radius: 6px;
+    background: var(--background-primary-alt);
+    white-space: pre-wrap;
+}
+
+.offeragent-tool-card progress {
+    width: 100%;
+}
+
+.offeragent-approval-actions {
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.offeragent-composer {
+    position: sticky;
+    bottom: 0;
+    padding: 10px clamp(10px, 4vw, 40px) 12px;
+    border-top: 1px solid var(--oa-border);
+    background: color-mix(in srgb, var(--background-primary) 94%, transparent);
+    backdrop-filter: blur(10px);
+}
+
+.offeragent-composer-input {
+    width: 100%;
+    max-height: 260px;
+    resize: vertical;
+    border-radius: 10px;
+}
+
+.offeragent-permission-warning,
+.offeragent-permission-status {
+    margin: 0 0 7px;
+    font-size: var(--font-ui-smaller);
+}
+
+.offeragent-permission-warning {
+    color: var(--text-warning);
+}
+
+.offeragent-permission-status {
+    color: var(--text-muted);
+}
+
+.offeragent-write-intent {
+    display: grid;
+    gap: 6px;
+    margin-top: 7px;
+    padding: 7px 9px;
+    border: 1px solid var(--oa-border);
+    border-radius: 8px;
+    background: var(--background-secondary);
+    color: var(--text-muted);
+    font-size: var(--font-ui-smaller);
+}
+
+.offeragent-write-intent-toggle {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+}
+
+.offeragent-write-intent-targets {
+    width: 100%;
+    resize: vertical;
+}
+
+.offeragent-composer-controls {
+    justify-content: flex-end;
+    gap: 7px;
+    margin-top: 7px;
+}
+
+.offeragent-settings-description {
+    color: var(--text-muted);
+}
+
+.offeragent-extension-settings {
+    display: grid;
+    gap: 10px;
+    margin-top: 18px;
+}
+
+.offeragent-extension-actions,
+.offeragent-extension-hook {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.offeragent-extension-status {
+    color: var(--text-muted);
+    font-size: var(--font-ui-smaller);
+}
+
+.offeragent-extension-section,
+.offeragent-extension-card,
+.offeragent-extension-form {
+    padding: 10px;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 8px;
+}
+
+.offeragent-extension-section {
+    display: grid;
+    gap: 8px;
+}
+
+.offeragent-extension-card p {
+    margin: 4px 0;
+}
+
+.offeragent-extension-form {
+    display: grid;
+    gap: 8px;
+}
+
+.offeragent-extension-form summary {
+    cursor: pointer;
+    font-weight: var(--font-semibold);
+}
+
+.offeragent-extension-field {
+    display: grid;
+    gap: 4px;
+    color: var(--text-muted);
+    font-size: var(--font-ui-small);
+}
+
+.offeragent-extension-field input,
+.offeragent-extension-form select,
+.offeragent-extension-arguments {
+    width: 100%;
+}
+
+.offeragent-extension-warning {
+    color: var(--text-warning);
+}
+
+.offeragent-extension-error {
+    color: var(--text-error);
+}
+
+@media (max-width: 520px) {
+    .offeragent-timeline {
+        padding-inline: 9px;
+    }
+
+    .offeragent-user {
+        max-width: 94%;
+    }
+}

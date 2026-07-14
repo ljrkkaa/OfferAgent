@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
 import pytest
 
+from offeragent_harness.observability import MetricName, MetricsRegistry, ProductionRunObservability
 from offeragent_harness.runtime.cancellation import CancellationCode, CancellationReason, CancellationScope
 from offeragent_harness.runtime.turn_manager import SessionRunConflict, TurnManager
+from offeragent_harness.testing import ManualClock
 
 
 @pytest.mark.asyncio
@@ -51,3 +54,76 @@ async def test_different_sessions_share_bounded_scheduler() -> None:
     await one.task
     await two.task
     assert second_entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_settle_terminal_waits_for_cleanup_but_never_waits_for_a_live_run() -> None:
+    manager = TurnManager()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def finishing(_scope: CancellationScope) -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+
+    first = await manager.start(session_id="s1", run_id="r1", factory=finishing)
+    await cleanup_started.wait()
+
+    async def not_terminal(_run_id: str) -> bool:
+        return False
+
+    assert not await manager.settle_terminal("s1", not_terminal)
+    with pytest.raises(SessionRunConflict):
+        await manager.start(session_id="s1", run_id="r2", factory=finishing)
+
+    observed: list[str] = []
+
+    async def terminal(run_id: str) -> bool:
+        observed.append(run_id)
+        return True
+
+    settling = asyncio.create_task(manager.settle_terminal("s1", terminal))
+    await asyncio.sleep(0)
+    assert not settling.done()
+    release_cleanup.set()
+    assert await settling
+    assert observed == ["r1"]
+    await first.task
+
+    async def next_run(_scope: CancellationScope) -> None:
+        return None
+
+    second = await manager.start(session_id="s1", run_id="r2", factory=next_run)
+    await second.task
+
+
+@pytest.mark.asyncio
+async def test_turn_manager_observer_records_active_count_and_cleanup_complete_cancel_latency() -> None:
+    clock = ManualClock()
+    metrics = MetricsRegistry()
+    observer = ProductionRunObservability(clock=clock, metrics=metrics)
+    manager = TurnManager(observer=observer)
+    entered = asyncio.Event()
+
+    async def run(scope: CancellationScope) -> None:
+        entered.set()
+        await scope.wait()
+        clock.advance(timedelta(milliseconds=275))
+
+    active = await manager.start(session_id="s1", run_id="r1", factory=run)
+    await entered.wait()
+    assert await manager.cancel("r1", CancellationReason.now(CancellationCode.USER, "cancel"))
+    await active.task
+    for _ in range(10):
+        if not await manager.active_runs():
+            break
+        await asyncio.sleep(0)
+
+    rows = {item.name: item for item in metrics.snapshots()}
+    assert rows[MetricName.CANCELLATION_LATENCY_MS].p50 == 275
+    assert rows[MetricName.ACTIVE_RUNS].current == 0
+
+    observer.run_depth_registered(1)
+    observer.run_depth_registered(3)
+    observer.run_depth_registered(2)
+    assert {item.name: item for item in metrics.snapshots()}[MetricName.SUBAGENT_DEPTH].current == 3
