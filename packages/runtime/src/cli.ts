@@ -51,6 +51,7 @@ import {
 } from "./fake-web-fixture";
 import { CapabilityGatedModelProvider } from "./capability-gated-provider";
 import {
+  orderedImageSubmissionMetadata,
   RunAttachmentError,
   RunAttachmentModule,
   type MaterializedRunAttachment,
@@ -868,7 +869,7 @@ function isAgentRunStart(value: unknown): value is AgentRunStart {
     typeof message.input.text === "string" &&
     (message.input.attachments === undefined || (
       Array.isArray(message.input.attachments) &&
-      message.input.attachments.length <= 1 &&
+      message.input.attachments.length <= 20 &&
       message.input.attachments.every((attachment, index) =>
         isProtocolIdentifier(attachment.attachmentId) &&
         attachment.order === index
@@ -1681,14 +1682,13 @@ async function startRuntime({
               usedAttachmentIds.add(retained.attachmentId);
               return { attachmentId: retained.attachmentId, order: metadata.order };
             });
-            materializedAttachments = await Promise.all(
-              attachmentReferences.map((attachment) => attachments.materialize({
-                agentRunId: runCommand.agentRunId,
-                attachmentId: attachment.attachmentId,
-                conversationId: runCommand.conversationId,
-                order: attachment.order,
-              })),
-            );
+            materializedAttachments = attachmentReferences.length > 0
+              ? await attachments.materializeSubmission({
+                  agentRunId: runCommand.agentRunId,
+                  attachments: attachmentReferences,
+                  conversationId: runCommand.conversationId,
+                })
+              : [];
             const resumable = await store.resumeAgentRun(
               resumeCommand.conversationId,
               resumeCommand.agentRunId,
@@ -1729,16 +1729,13 @@ async function startRuntime({
             model,
           };
           try {
-            materializedAttachments = await Promise.all(
-              (startCommand.input.attachments ?? []).map((attachment) =>
-                attachments.materialize({
+            materializedAttachments = startCommand.input.attachments?.length
+              ? await attachments.materializeSubmission({
                   agentRunId: startCommand.agentRunId,
-                  attachmentId: attachment.attachmentId,
+                  attachments: startCommand.input.attachments,
                   conversationId: startCommand.conversationId,
-                  order: attachment.order,
                 })
-              ),
-            );
+              : [];
             const began = await store.beginAgentRun(
               startCommand.conversationId,
               startCommand.agentRunId,
@@ -1806,6 +1803,9 @@ async function startRuntime({
                 : item,
             );
           }
+          const imageSubmission = materializedAttachments.length > 0
+            ? orderedImageSubmissionMetadata(materializedAttachments)
+            : undefined;
           const requiredRereads = new Set(checkpoint?.requiredRereads ?? []);
           const canonicalReadPaths = new Map(checkpoint?.canonicalReadPaths ?? []);
           let agentContract: string | undefined;
@@ -2221,6 +2221,7 @@ async function startRuntime({
                       mediaType: attachment.mediaType,
                       order: attachment.order,
                     })),
+                    imageSubmission,
                   }
                 : {}),
               instructions: composeInstructions(agentContract, localSkills, recalledMemory),

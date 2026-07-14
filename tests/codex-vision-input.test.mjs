@@ -76,6 +76,10 @@ test("the Codex Provider sends ordered Responses image content without OCR", asy
       },
     ],
     imageInputs: [{ attachmentId, dataUrl, mediaType: "image/png", order: 0 }],
+    imageSubmission: {
+      imageCount: 1,
+      sourceFingerprint: `sha256:${"a".repeat(64)}`,
+    },
     tools: [],
   })) {
     events.push(event);
@@ -95,6 +99,10 @@ test("the Codex Provider sends ordered Responses image content without OCR", asy
     },
   ]);
   assert.equal(requests[0].init.body.includes(attachmentId), false);
+  assert.match(requests[0].body.instructions, /Runtime-verified Interview Submission metadata/);
+  assert.match(requests[0].body.instructions, /ordered image count: 1/);
+  assert.match(requests[0].body.instructions, new RegExp(`source fingerprint: sha256:${"a".repeat(64)}`));
+  assert.match(requests[0].body.instructions, /pass this exact fingerprint to interview_catalog/);
   assert.deepEqual(requests[0].body.tools, []);
   assert.deepEqual(events, [{ type: "output_text.delta", delta: "image understood" }]);
 });

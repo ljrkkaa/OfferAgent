@@ -34,6 +34,16 @@ function isHttpUrl(value: unknown): value is string {
   }
 }
 
+function providerInstructions(request: ModelRequest): string {
+  if (!request.imageSubmission) return request.instructions;
+  return `${request.instructions}\n\nRuntime-verified Interview Submission metadata:\n` +
+    `- ordered image count: ${request.imageSubmission.imageCount}\n` +
+    `- source fingerprint: ${request.imageSubmission.sourceFingerprint}\n` +
+    "When cataloging this image submission, pass this exact fingerprint to interview_catalog " +
+    "before proposing any Vault changes. Treat this metadata as authoritative and do not derive " +
+    "a replacement fingerprint from image text.";
+}
+
 function isUnsupportedVisionDetail(detail: string): boolean {
   if (!/(input_image|image input|vision)/i.test(detail)) return false;
   return /(unsupported|not supported|does not support|not allowed|unavailable)/i.test(detail) ||
@@ -195,7 +205,7 @@ export class CodexSubscriptionProvider implements ModelProvider {
         body: JSON.stringify({
           model: request.model,
           ...(request.fastMode ? { service_tier: "priority" } : {}),
-          instructions: request.instructions,
+          instructions: providerInstructions(request),
           input: request.input.map((item) => encodeConversationItem(item, request.imageInputs)),
           tools: request.tools.map((tool) =>
             tool.kind === "hosted"

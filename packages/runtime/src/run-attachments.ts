@@ -3,6 +3,8 @@ import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:
 import path from "node:path";
 
 const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const DEFAULT_MAX_SUBMISSION_BYTES = 50 * 1024 * 1024;
+const MAX_SUBMISSION_IMAGES = 20;
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1_000;
 
 export type SupportedImageMediaType = "image/gif" | "image/jpeg" | "image/png" | "image/webp";
@@ -87,6 +89,25 @@ export interface MaterializedRunAttachment extends StagedRunAttachment {
   order: number;
 }
 
+export interface ImageSubmissionMetadata {
+  imageCount: number;
+  sourceFingerprint: string;
+}
+
+export function orderedImageSubmissionMetadata(
+  attachments: Array<Pick<MaterializedRunAttachment, "contentHash" | "order">>,
+): ImageSubmissionMetadata {
+  const ordered = [...attachments].sort((left, right) => left.order - right.order);
+  const hash = createHash("sha256");
+  for (const attachment of ordered) {
+    hash.update(`${attachment.order}\0${attachment.contentHash}\n`, "utf8");
+  }
+  return {
+    imageCount: ordered.length,
+    sourceFingerprint: `sha256:${hash.digest("hex")}`,
+  };
+}
+
 function detectedMediaType(bytes: Uint8Array): SupportedImageMediaType | undefined {
   if (
     bytes.length >= 8 &&
@@ -153,6 +174,7 @@ function contentHash(bytes: Uint8Array): string {
 export class RunAttachmentModule {
   readonly #directory: string;
   readonly #maxImageBytes: number;
+  readonly #maxSubmissionBytes: number;
   readonly #metadata: RunAttachmentMetadataStore;
   readonly #now: () => Date;
   readonly #ttlMs: number;
@@ -160,12 +182,14 @@ export class RunAttachmentModule {
   constructor(options: {
     directory: string;
     maxImageBytes?: number;
+    maxSubmissionBytes?: number;
     metadata: RunAttachmentMetadataStore;
     now?: () => Date;
     ttlMs?: number;
   }) {
     this.#directory = path.resolve(options.directory);
     this.#maxImageBytes = options.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES;
+    this.#maxSubmissionBytes = options.maxSubmissionBytes ?? DEFAULT_MAX_SUBMISSION_BYTES;
     this.#metadata = options.metadata;
     this.#now = options.now ?? (() => new Date());
     this.#ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
@@ -267,6 +291,63 @@ export class RunAttachmentModule {
     }
     const { agentRunId: _run, conversationId: _conversation, createdAt: _created, ...staged } = metadata;
     return { ...staged, bytes, order: input.order };
+  }
+
+  async materializeSubmission(input: {
+    agentRunId: string;
+    attachments: Array<{ attachmentId: string; order: number }>;
+    conversationId: string;
+  }): Promise<MaterializedRunAttachment[]> {
+    if (input.attachments.length === 0 || input.attachments.length > MAX_SUBMISSION_IMAGES) {
+      throw new RunAttachmentError(
+        "attachment_too_large",
+        `An Interview Submission accepts between 1 and ${MAX_SUBMISSION_IMAGES} images.`,
+      );
+    }
+    const attachmentIds = new Set<string>();
+    for (const [index, attachment] of input.attachments.entries()) {
+      if (attachment.order !== index) {
+        throw new RunAttachmentError(
+          "invalid_image",
+          "Run Attachments must use one contiguous submitted image order.",
+        );
+      }
+      if (attachmentIds.has(attachment.attachmentId)) {
+        throw new RunAttachmentError(
+          "ownership_mismatch",
+          "A Run Attachment cannot be reused within one Interview Submission.",
+        );
+      }
+      attachmentIds.add(attachment.attachmentId);
+    }
+    let declaredBytes = 0;
+    for (const attachment of input.attachments) {
+      const metadata = await this.#metadata.getAttachment(attachment.attachmentId);
+      if (!metadata) {
+        throw new RunAttachmentError("attachment_missing", "The Run Attachment is missing or expired.");
+      }
+      if (metadata.agentRunId !== input.agentRunId || metadata.conversationId !== input.conversationId) {
+        throw new RunAttachmentError(
+          "ownership_mismatch",
+          "The Run Attachment does not belong to this Conversation and Agent Run.",
+        );
+      }
+      declaredBytes += metadata.size;
+    }
+    if (declaredBytes > this.#maxSubmissionBytes) {
+      throw new RunAttachmentError(
+        "attachment_too_large",
+        "The ordered image submission exceeds the 50 MiB total limit.",
+      );
+    }
+    return Promise.all(input.attachments.map((attachment) =>
+      this.materialize({
+        agentRunId: input.agentRunId,
+        attachmentId: attachment.attachmentId,
+        conversationId: input.conversationId,
+        order: attachment.order,
+      })
+    ));
   }
 
   async retainInterruptedRun(agentRunId: string): Promise<void> {

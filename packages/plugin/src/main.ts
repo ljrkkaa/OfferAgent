@@ -156,6 +156,7 @@ class OfferAgentSettingTab extends PluginSettingTab {
 class OfferAgentSidebarView extends ItemView {
   readonly #controller: SidebarController;
   readonly #openSettings: () => void;
+  readonly #previewUrls: string[] = [];
   #unsubscribe?: () => void;
 
   constructor(leaf: WorkspaceLeaf, controller: SidebarController, openSettings: () => void) {
@@ -185,10 +186,16 @@ class OfferAgentSidebarView extends ItemView {
   async onClose(): Promise<void> {
     this.#unsubscribe?.();
     this.#unsubscribe = undefined;
+    this.#revokePreviewUrls();
+  }
+
+  #revokePreviewUrls(): void {
+    for (const url of this.#previewUrls.splice(0)) URL.revokeObjectURL(url);
   }
 
   #render(viewModel: SidebarViewModel): void {
     const container = this.contentEl;
+    this.#revokePreviewUrls();
     container.empty();
     container.addClass("offeragent-sidebar");
 
@@ -392,61 +399,94 @@ class OfferAgentSidebarView extends ItemView {
     input.value = viewModel.presentation.composer.draftText;
     input.disabled = viewModel.presentation.composer.primaryAction.kind !== "send";
     input.addEventListener("input", () => this.#controller.setComposerDraft(input.value));
-    const acceptImage = async (file: File): Promise<void> => {
+    const acceptImages = async (files: File[]): Promise<void> => {
       this.#controller.setComposerDraft(input.value);
+      let finishImport: (() => void) | undefined;
       try {
-        this.#controller.attachImage({
+        finishImport = this.#controller.beginAttachmentImport(files.map((file) => ({
+          mediaType: file.type,
+          size: file.size,
+        })));
+        const images = await Promise.all(files.map(async (file) => ({
           bytes: new Uint8Array(await file.arrayBuffer()),
           fileName: file.name,
           mediaType: file.type,
-        });
+        })));
+        this.#controller.attachImages(images);
       } catch {
-        // The controller keeps the draft and publishes an actionable composer error.
+        // The controller preserves the prior complete draft and publishes validation errors.
+      } finally {
+        finishImport?.();
       }
     };
     input.addEventListener("paste", (event) => {
-      const file = [...(event.clipboardData?.files ?? [])][0];
-      if (!file) return;
+      const files = [...(event.clipboardData?.files ?? [])];
+      if (files.length === 0) return;
       event.preventDefault();
-      void acceptImage(file);
+      void acceptImages(files);
     });
     composer.addEventListener("dragover", (event) => {
       if (event.dataTransfer?.files.length) event.preventDefault();
     });
     composer.addEventListener("drop", (event) => {
-      const file = [...(event.dataTransfer?.files ?? [])][0];
-      if (!file) return;
+      const files = [...(event.dataTransfer?.files ?? [])];
+      if (files.length === 0) return;
       event.preventDefault();
-      void acceptImage(file);
+      void acceptImages(files);
     });
-    if (viewModel.presentation.composer.attachment) {
+    for (const [index, presented] of viewModel.presentation.composer.attachments.entries()) {
       const attachment = composer.createDiv({ cls: "offeragent-sidebar__attachment" });
-      attachment.createDiv({
-        text: `${viewModel.presentation.composer.attachment.fileName} (${Math.ceil(viewModel.presentation.composer.attachment.size / 1024)} KiB)`,
+      const previewBytes = Uint8Array.from(presented.previewBytes);
+      const previewUrl = URL.createObjectURL(new Blob([previewBytes.buffer], {
+        type: presented.mediaType,
+      }));
+      this.#previewUrls.push(previewUrl);
+      const preview = attachment.createEl("img", {
+        cls: "offeragent-sidebar__attachment-preview",
       });
+      preview.src = previewUrl;
+      preview.setAttribute("alt", `Preview ${index + 1}: ${presented.fileName}`);
+      attachment.createDiv({
+        text: `${index + 1}. ${presented.fileName} (${Math.ceil(presented.size / 1024)} KiB)`,
+      });
+      const moveUp = attachment.createEl("button", { text: "Up" });
+      moveUp.type = "button";
+      moveUp.disabled = viewModel.presentation.composer.isPreparingAttachments || index === 0;
+      moveUp.setAttribute("aria-label", `Move ${presented.fileName} earlier`);
+      moveUp.addEventListener("click", () => this.#controller.moveDraftImage(index, -1));
+      const moveDown = attachment.createEl("button", { text: "Down" });
+      moveDown.type = "button";
+      moveDown.disabled = viewModel.presentation.composer.isPreparingAttachments ||
+        index === viewModel.presentation.composer.attachments.length - 1;
+      moveDown.setAttribute("aria-label", `Move ${presented.fileName} later`);
+      moveDown.addEventListener("click", () => this.#controller.moveDraftImage(index, 1));
       const removeAttachment = attachment.createEl("button", {
         cls: "offeragent-sidebar__attachment-remove",
         text: "Remove",
       });
       removeAttachment.type = "button";
-      removeAttachment.setAttribute("aria-label", "Remove attached image");
-      removeAttachment.addEventListener("click", () => this.#controller.removeDraftImage());
+      removeAttachment.disabled = viewModel.presentation.composer.isPreparingAttachments;
+      removeAttachment.setAttribute("aria-label", `Remove ${presented.fileName}`);
+      removeAttachment.addEventListener("click", () => this.#controller.removeDraftImage(index));
     }
     const controls = composer.createDiv({ cls: "offeragent-sidebar__composer-controls" });
     const filePicker = controls.createEl("input", { cls: "offeragent-sidebar__file-picker" });
     filePicker.type = "file";
+    filePicker.multiple = true;
     filePicker.accept = "image/png,image/jpeg,image/webp,image/gif";
-    filePicker.setAttribute("aria-label", "Choose one image");
+    filePicker.setAttribute("aria-label", "Choose up to 20 images");
+    filePicker.disabled = viewModel.presentation.composer.isPreparingAttachments;
     filePicker.addEventListener("change", () => {
-      const file = filePicker.files?.[0];
-      if (file) void acceptImage(file);
+      const files = [...(filePicker.files ?? [])];
+      if (files.length > 0) void acceptImages(files);
     });
     const attachButton = controls.createEl("button", {
       cls: "offeragent-sidebar__attach",
-      text: "Attach image",
+      text: "Attach images",
     });
     attachButton.type = "button";
-    attachButton.disabled = viewModel.presentation.composer.primaryAction.kind !== "send";
+    attachButton.disabled = viewModel.presentation.composer.primaryAction.kind !== "send" ||
+      viewModel.presentation.composer.isPreparingAttachments;
     attachButton.addEventListener("click", () => filePicker.click());
     const modelSelect = controls.createEl("select", {
       cls: "offeragent-sidebar__model-select",
@@ -475,7 +515,9 @@ class OfferAgentSidebarView extends ItemView {
     primaryButton.type = primary.kind === "send" ? "submit" : "button";
     primaryButton.disabled =
       viewModel.runtime.state !== "connected" ||
-      (primary.kind === "send" && !viewModel.conversation.selectedModelId);
+      (primary.kind === "send" &&
+        (!viewModel.conversation.selectedModelId ||
+          viewModel.presentation.composer.isPreparingAttachments));
     if (primary.kind === "stop") {
       primaryButton.addEventListener("click", () => this.#controller.stopAgentRun());
     } else if (primary.kind === "resume" && primary.agentRunId) {
@@ -487,7 +529,7 @@ class OfferAgentSidebarView extends ItemView {
       event.preventDefault();
       if (primary.kind !== "send") return;
       const text = input.value;
-      if (!text.trim() && !viewModel.presentation.composer.attachment) return;
+      if (!text.trim() && viewModel.presentation.composer.attachments.length === 0) return;
       this.#controller.setComposerDraft(text);
       void this.#controller.sendMessage(text);
     });

@@ -610,7 +610,39 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     activeView.contentEl.findByClass("offeragent-sidebar__file-picker")?.listeners.has("change"),
     true,
   );
-  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__attach")?.text, "Attach image");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__attach")?.text, "Attach images");
+  const imagePicker = activeView.contentEl.findByClass("offeragent-sidebar__file-picker");
+  imagePicker.files = [
+    {
+      name: "first-preview.png",
+      size: 3,
+      type: "image/png",
+      async arrayBuffer() { return new Uint8Array([1, 2, 3]).buffer; },
+    },
+    {
+      name: "second-preview.png",
+      size: 3,
+      type: "image/png",
+      async arrayBuffer() { return new Uint8Array([4, 5, 6]).buffer; },
+    },
+  ];
+  imagePicker.dispatch("change");
+  const imagePreviews = await waitUntil(
+    () => {
+      const previews = activeView.contentEl.findAllByClass("offeragent-sidebar__attachment-preview");
+      return previews.length === 2 ? previews : undefined;
+    },
+    "OfferAgent did not render ordered image thumbnails",
+  );
+  assert.deepEqual(imagePreviews.map(({ tagName }) => tagName), ["img", "img"]);
+  assert.deepEqual(
+    imagePreviews.map((preview) => preview.getAttribute("alt")),
+    ["Preview 1: first-preview.png", "Preview 2: second-preview.png"],
+  );
+  assert.ok(imagePreviews.every(({ src }) => /^blob:/.test(src)));
+  activeView.contentEl.findByClass("offeragent-sidebar__attachment-remove").dispatch("click");
+  activeView.contentEl.findByClass("offeragent-sidebar__attachment-remove").dispatch("click");
+  assert.equal(activeView.contentEl.findAllByClass("offeragent-sidebar__attachment-preview").length, 0);
   assert.equal(
     activeView.contentEl.findByClass("offeragent-sidebar__context-chip")?.text,
     "Vault context",

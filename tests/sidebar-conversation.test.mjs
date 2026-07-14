@@ -465,6 +465,214 @@ test("the Sidebar serializes sends while an image upload is pending", async () =
   assert.equal(controller.getViewModel().presentation.composer.draftText, "Only once.");
 });
 
+test("the Sidebar previews, removes, reorders, and submits an ordered image set", async () => {
+  const stagedNames = [];
+  let runRequest;
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async discardAttachment() {},
+    async listConversations() {
+      return [{ id: "ordered-images-conversation", title: "Images", modelId: "model-a" }];
+    },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: { id: "ordered-images-conversation", title: "Images", modelId: "model-a" },
+        agentRuns: [], messages: [], toolCalls: [],
+      };
+    },
+    async *resumeAgentRun() {},
+    async *runAgent(request) {
+      runRequest = request;
+      yield { type: "agent_run.started", model: request.model };
+      yield { type: "agent_run.completed", output: { role: "assistant", text: "Done" } };
+    },
+    async stageAttachment({ fileName }) {
+      stagedNames.push(fileName);
+      return {
+        attachmentId: `attachment-${fileName}`,
+        contentHash: `sha256:${"a".repeat(64)}`,
+        fileName,
+        mediaType: "image/png",
+        size: 8,
+      };
+    },
+    async start() {},
+    async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Images", modelId };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+  for (const fileName of ["first.png", "second.png", "third.png"]) {
+    controller.attachImage({ bytes: new Uint8Array(8), fileName, mediaType: "image/png" });
+  }
+  assert.deepEqual(
+    controller.getViewModel().presentation.composer.attachments.map(({ fileName }) => fileName),
+    ["first.png", "second.png", "third.png"],
+  );
+  controller.moveDraftImage(2, -1);
+  controller.removeDraftImage(0);
+  assert.deepEqual(
+    controller.getViewModel().presentation.composer.attachments.map(({ fileName }) => fileName),
+    ["third.png", "second.png"],
+  );
+
+  await controller.sendMessage("Treat these screenshots as one Interview Experience.");
+
+  assert.deepEqual(stagedNames, ["third.png", "second.png"]);
+  assert.deepEqual(runRequest.attachments, [
+    { attachmentId: "attachment-third.png", order: 0 },
+    { attachmentId: "attachment-second.png", order: 1 },
+  ]);
+  assert.deepEqual(controller.getViewModel().presentation.composer.attachments, []);
+});
+
+test("a partial multi-image staging failure discards staged bytes and preserves the ordered draft", async () => {
+  const discarded = [];
+  const stagedNames = [];
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async discardAttachment(request) { discarded.push(request); },
+    async listConversations() {
+      return [{ id: "partial-staging-conversation", title: "Images", modelId: "model-a" }];
+    },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: { id: "partial-staging-conversation", title: "Images", modelId: "model-a" },
+        agentRuns: [], messages: [], toolCalls: [],
+      };
+    },
+    async *resumeAgentRun() { },
+    async *runAgent() { throw new Error("The Run must not start after staging failure."); },
+    async stageAttachment({ fileName }) {
+      stagedNames.push(fileName);
+      if (fileName === "second.png") throw new Error("Animated GIF images are not supported.");
+      return {
+        attachmentId: `attachment-${fileName}`,
+        contentHash: `sha256:${"a".repeat(64)}`,
+        fileName, mediaType: "image/png", size: 8,
+      };
+    },
+    async start() {}, async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Images", modelId };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+  controller.setComposerDraft("Keep all three screenshots.");
+  for (const fileName of ["first.png", "second.png", "third.png"]) {
+    controller.attachImage({ bytes: new Uint8Array(8), fileName, mediaType: "image/png" });
+  }
+
+  await assert.rejects(controller.sendMessage(), /Animated GIF/);
+
+  assert.deepEqual(stagedNames, ["first.png", "second.png"]);
+  assert.deepEqual(discarded.map(({ attachmentId }) => attachmentId), ["attachment-first.png"]);
+  assert.deepEqual(
+    controller.getViewModel().presentation.composer.attachments.map(({ fileName }) => fileName),
+    ["first.png", "second.png", "third.png"],
+  );
+  assert.equal(controller.getViewModel().presentation.composer.draftText, "Keep all three screenshots.");
+  assert.deepEqual(controller.getViewModel().conversation.agentRuns, []);
+});
+
+test("the Sidebar rejects more than 20 images or more than 50 MiB without losing the draft", async () => {
+  const runtime = {
+    cancelAgentRun() {}, async createConversation(value) { return value; },
+    async deleteConversation() {}, async discardAttachment() {},
+    async listConversations() { return []; }, async listModels() { return []; },
+    onUnavailable() { return () => {}; }, async openConversation() {},
+    async *resumeAgentRun() {}, async *runAgent() {}, async stageAttachment() {},
+    async start() {}, async stop() {},
+  };
+  const controller = new SidebarController(runtime);
+  controller.setComposerDraft("Keep this submission draft.");
+  for (let index = 0; index < 20; index += 1) {
+    controller.attachImage({
+      bytes: new Uint8Array(1), fileName: `${index}.png`, mediaType: "image/png",
+    });
+  }
+  assert.throws(
+    () => controller.attachImage({
+      bytes: new Uint8Array(1), fileName: "overflow.png", mediaType: "image/png",
+    }),
+    /20 images/i,
+  );
+  for (let index = 0; index < 20; index += 1) controller.removeDraftImage(0);
+  const tenMiB = new Uint8Array(10 * 1024 * 1024);
+  for (let index = 0; index < 5; index += 1) {
+    controller.attachImage({ bytes: tenMiB, fileName: `large-${index}.png`, mediaType: "image/png" });
+  }
+  assert.throws(
+    () => controller.attachImage({
+      bytes: new Uint8Array(1),
+      fileName: "total-overflow.png",
+      mediaType: "image/png",
+    }),
+    /50 MiB/i,
+  );
+  assert.equal(controller.getViewModel().presentation.composer.draftText, "Keep this submission draft.");
+  assert.equal(controller.getViewModel().presentation.composer.attachments.length, 5);
+});
+
+test("one attachment import is atomic and blocks Send until every image is decoded", async () => {
+  const runtime = {
+    cancelAgentRun() {}, async createConversation(value) { return value; },
+    async deleteConversation() {}, async discardAttachment() {},
+    async listConversations() {
+      return [{ id: "atomic-import", title: "Images", modelId: "model-a" }];
+    },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: { id: "atomic-import", title: "Images", modelId: "model-a" },
+        agentRuns: [], messages: [], toolCalls: [],
+      };
+    },
+    async *resumeAgentRun() {}, async *runAgent() {}, async stageAttachment() {},
+    async start() {}, async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Images", modelId };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+  const finishImport = controller.beginAttachmentImport();
+
+  assert.equal(controller.getViewModel().presentation.composer.isPreparingAttachments, true);
+  await assert.rejects(controller.sendMessage("Do not send a partial selection."), /images are ready/i);
+  assert.throws(
+    () => controller.attachImages([
+      { bytes: new Uint8Array(8), fileName: "valid.png", mediaType: "image/png" },
+      { bytes: new Uint8Array(8), fileName: "invalid.bmp", mediaType: "image/bmp" },
+    ]),
+    /PNG, JPEG, WEBP, or GIF/,
+  );
+  assert.deepEqual(controller.getViewModel().presentation.composer.attachments, []);
+
+  controller.attachImages([
+    { bytes: new Uint8Array([1, 2, 3]), fileName: "first.png", mediaType: "image/png" },
+    { bytes: new Uint8Array([4, 5, 6]), fileName: "second.png", mediaType: "image/png" },
+  ]);
+  finishImport();
+
+  const composer = controller.getViewModel().presentation.composer;
+  assert.equal(composer.isPreparingAttachments, false);
+  assert.deepEqual(composer.attachments.map(({ fileName }) => fileName), ["first.png", "second.png"]);
+  assert.deepEqual([...composer.attachments[0].previewBytes], [1, 2, 3]);
+});
+
 test("the Sidebar selects a model and renders a streamed Agent Run", async () => {
   let unavailableSubscriber;
   const runtime = {
@@ -1489,7 +1697,7 @@ test("failed and cancelled Vault Change requests cannot remain actionable", asyn
   assert.equal(controller.getViewModel().conversation.vaultChanges[0].status, "failed");
 });
 
-test("a failed Vault Change tool event disables its confirmation card", async () => {
+test("a failed Vault Change tool event disables its card and restores the ordered image draft", async () => {
   const proposal = {
     batchId: "failed-batch",
     idempotencyKey: "failed-batch-key",
@@ -1507,6 +1715,7 @@ test("a failed Vault Change tool event disables its confirmation card", async ()
     cancelAgentRun() {},
     async createConversation(conversation) { return conversation; },
     async deleteConversation() {},
+    async discardAttachment() {},
     async listConversations() {
       return [{ id: "conversation-failed-change", title: "Failed change", modelId: "model-a" }];
     },
@@ -1537,6 +1746,15 @@ test("a failed Vault Change tool event disables its confirmation card", async ()
         output: { role: "assistant", text: "I will re-read the file." },
       };
     },
+    async stageAttachment({ fileName, mediaType, bytes }) {
+      return {
+        attachmentId: `attachment-${fileName}`,
+        contentHash: `sha256:${"a".repeat(64)}`,
+        fileName,
+        mediaType,
+        size: bytes.byteLength,
+      };
+    },
     async start() {}, async stop() {},
     async updateConversationModel(conversationId, modelId) {
       return { id: conversationId, title: "Failed change", modelId };
@@ -1544,8 +1762,21 @@ test("a failed Vault Change tool event disables its confirmation card", async ()
   };
   const controller = new SidebarController(runtime);
   await controller.start();
+  controller.setComposerDraft("Keep this submission if the Vault rejects it.");
+  controller.attachImages([
+    { bytes: new Uint8Array([1, 2, 3]), fileName: "first.png", mediaType: "image/png" },
+    { bytes: new Uint8Array([4, 5, 6]), fileName: "second.png", mediaType: "image/png" },
+  ]);
   await controller.sendMessage("Try a stale change.");
   assert.equal(controller.getViewModel().conversation.vaultChanges[0].status, "failed");
+  assert.equal(
+    controller.getViewModel().presentation.composer.draftText,
+    "Keep this submission if the Vault rejects it.",
+  );
+  assert.deepEqual(
+    controller.getViewModel().presentation.composer.attachments.map(({ fileName }) => fileName),
+    ["first.png", "second.png"],
+  );
 });
 
 test("guarded undo exposes a conflict diff instead of overwriting later edits", async () => {

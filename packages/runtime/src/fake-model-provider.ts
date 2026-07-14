@@ -13,10 +13,12 @@ import {
 } from "./planning-memory";
 import { interviewDeduplicationEvent } from "./fake-interview-deduplication-scenario";
 import { interviewUrlIngestionEvent } from "./fake-interview-url-scenario";
+import { multiImageInterviewEvent } from "./fake-multi-image-scenario";
 import { toolResultFor, toolResultForAfter } from "./fake-provider-conversation";
 
 export const FAKE_SCENARIOS = [
   "interview-deduplication",
+  "multi-image-interview-ingestion",
   "text-interview-ingestion",
   "url-interview-ingestion",
   "single-image",
@@ -87,10 +89,7 @@ export class FakeModelProvider implements ModelProvider {
         { capability: "vision" },
       );
     }
-    if (
-      this.#scenario === "single-image" &&
-      request.instructions === "This is a minimal Vision Capability probe. Reply only OK."
-    ) {
+    if (request.instructions === "This is a minimal Vision Capability probe. Reply only OK.") {
       yield { type: "output_text.delta", delta: "OK" };
       return;
     }
@@ -213,6 +212,13 @@ export class FakeModelProvider implements ModelProvider {
     }
     if (this.#scenario === "interview-deduplication") {
       yield interviewDeduplicationEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
+      return;
+    }
+    if (this.#scenario === "multi-image-interview-ingestion") {
+      yield multiImageInterviewEvent(request, (prefix) => {
         this.#toolCallSequence += 1;
         return `${prefix}-${this.#toolCallSequence}`;
       });

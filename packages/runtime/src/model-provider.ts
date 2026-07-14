@@ -64,11 +64,17 @@ export type ModelToolDefinition = HostedToolDefinition | LocalToolDefinition;
 export interface ModelRequest {
   fastMode?: boolean;
   imageInputs?: ModelImageInput[];
+  imageSubmission?: ModelImageSubmission;
   input: ModelConversationItem[];
   instructions: string;
   model: string;
   signal: AbortSignal;
   tools: ModelToolDefinition[];
+}
+
+export interface ModelImageSubmission {
+  imageCount: number;
+  sourceFingerprint: string;
 }
 
 export interface ModelImageInput {

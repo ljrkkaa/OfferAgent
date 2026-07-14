@@ -308,6 +308,14 @@
   font-size: var(--font-ui-smaller);
 }
 
+.offeragent-sidebar__attachment-preview {
+  flex: 0 0 auto;
+  width: 3rem;
+  height: 3rem;
+  border-radius: var(--radius-s);
+  object-fit: cover;
+}
+
 .offeragent-sidebar__attachment > span {
   overflow: hidden;
   text-overflow: ellipsis;

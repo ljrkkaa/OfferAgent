@@ -162,3 +162,84 @@ test("Run Attachments validate, bind, retain, and clean temporary image bytes", 
   await attachments.deleteConversation("conversation-c");
   assert.deepEqual(await readdir(root), []);
 });
+
+test("one ordered image submission enforces count, order, and total-byte limits", async (t) => {
+  const {
+    MemoryRunAttachmentMetadataStore,
+    orderedImageSubmissionMetadata,
+    RunAttachmentError,
+    RunAttachmentModule,
+  } = await import(pathToFileURL(modulePath));
+  const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-run-attachment-batch-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const metadata = new MemoryRunAttachmentMetadataStore();
+  const attachments = new RunAttachmentModule({
+    directory: root,
+    maxSubmissionBytes: PNG.length * 2,
+    metadata,
+  });
+  const staged = [];
+  for (let index = 0; index < 3; index += 1) {
+    staged.push(await attachments.stage({
+      agentRunId: "ordered-run",
+      bytes: PNG,
+      claimedMediaType: "image/png",
+      conversationId: "ordered-conversation",
+      fileName: `${index}.png`,
+    }));
+  }
+  const references = staged.map(({ attachmentId }, order) => ({ attachmentId, order }));
+  const ordered = await attachments.materializeSubmission({
+    agentRunId: "ordered-run",
+    attachments: references.slice(0, 2),
+    conversationId: "ordered-conversation",
+  });
+  assert.deepEqual(ordered.map(({ fileName, order }) => ({ fileName, order })), [
+    { fileName: "0.png", order: 0 },
+    { fileName: "1.png", order: 1 },
+  ]);
+  const submission = orderedImageSubmissionMetadata(ordered);
+  assert.deepEqual(submission, {
+    imageCount: 2,
+    sourceFingerprint: `sha256:${createHash("sha256")
+      .update(`0\0${ordered[0].contentHash}\n1\0${ordered[1].contentHash}\n`, "utf8")
+      .digest("hex")}`,
+  });
+  assert.notEqual(
+    orderedImageSubmissionMetadata([
+      { contentHash: `sha256:${"a".repeat(64)}`, order: 0 },
+      { contentHash: `sha256:${"b".repeat(64)}`, order: 1 },
+    ]).sourceFingerprint,
+    orderedImageSubmissionMetadata([
+      { contentHash: `sha256:${"b".repeat(64)}`, order: 0 },
+      { contentHash: `sha256:${"a".repeat(64)}`, order: 1 },
+    ]).sourceFingerprint,
+  );
+  await assert.rejects(
+    attachments.materializeSubmission({
+      agentRunId: "ordered-run",
+      attachments: references,
+      conversationId: "ordered-conversation",
+    }),
+    (error) => error instanceof RunAttachmentError && /50 MiB|total/i.test(error.message),
+  );
+  await assert.rejects(
+    attachments.materializeSubmission({
+      agentRunId: "ordered-run",
+      attachments: [references[1], references[0]],
+      conversationId: "ordered-conversation",
+    }),
+    (error) => error instanceof RunAttachmentError && /order/i.test(error.message),
+  );
+  await assert.rejects(
+    attachments.materializeSubmission({
+      agentRunId: "ordered-run",
+      attachments: Array.from({ length: 21 }, (_, order) => ({
+        attachmentId: staged[0].attachmentId,
+        order,
+      })),
+      conversationId: "ordered-conversation",
+    }),
+    (error) => error instanceof RunAttachmentError && /20 images/i.test(error.message),
+  );
+});
