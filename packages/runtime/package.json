@@ -1,0 +1,12 @@
+{
+  "name": "@offeragent/runtime",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/cli.js",
+  "dependencies": {
+    "@offeragent/protocol": "0.1.0",
+    "sql.js": "^1.14.1",
+    "undici": "^6.21.0",
+    "ws": "^8.18.0"
+  }
+}
