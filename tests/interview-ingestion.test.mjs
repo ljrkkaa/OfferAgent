@@ -74,6 +74,7 @@ test("a text Interview Submission becomes one normalized atomic knowledge batch"
               {
                 path: "experiences/unrelated-frontend.md",
                 title: "Frontend interview",
+                matchKinds: ["repost-candidate"],
                 position: "Frontend engineer",
                 modifiedVersion: "mtime:8:size:30",
                 contentHash: "sha256:frontend-experience",
@@ -83,6 +84,7 @@ test("a text Interview Submission becomes one normalized atomic knowledge batch"
               {
                 path: "interview/database-isolation.md",
                 title: "Database isolation",
+                matchKinds: ["semantic-candidate"],
                 answerState: "verified",
                 modifiedVersion: "mtime:9:size:28",
                 contentHash: "sha256:database-question",
@@ -287,6 +289,7 @@ test("a text Interview Submission becomes one normalized atomic knowledge batch"
               {
                 path: "experiences/existing-backend.md",
                 title: "Existing backend interview",
+                matchKinds: ["repost-candidate"],
                 modifiedVersion: "mtime:20:size:40",
                 contentHash: "sha256:existing-backend",
               },

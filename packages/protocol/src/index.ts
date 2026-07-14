@@ -174,6 +174,7 @@ export interface InterviewCatalogResult {
     company?: string;
     contentHash: string;
     date?: string;
+    matchKinds: Array<"canonical-url" | "repost-candidate" | "source-fingerprint">;
     modifiedVersion: string;
     path: string;
     position?: string;
@@ -190,6 +191,7 @@ export interface InterviewCatalogResult {
   questionCandidates: Array<{
     answerState?: "draft" | "needs-research" | "verified";
     contentHash: string;
+    matchKinds: Array<"semantic-candidate">;
     modifiedVersion: string;
     path: string;
     title: string;

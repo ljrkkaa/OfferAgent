@@ -28,7 +28,11 @@ import {
   type VaultChangeStateRequest,
   type WebCitation,
 } from "@offeragent/protocol";
-import { FakeModelProvider } from "./fake-model-provider";
+import {
+  FakeModelProvider,
+  isFakeScenario,
+  type FakeScenario,
+} from "./fake-model-provider";
 import { CodexSubscriptionProvider } from "./codex-subscription-provider";
 import {
   asModelProviderError,
@@ -52,7 +56,7 @@ import {
 } from "./planning-memory";
 
 interface RuntimeOptions {
-  fakeScenario?: "text-interview-ingestion";
+  fakeScenario?: FakeScenario;
   parentPid: number;
   port: number;
   provider: "codex" | "fake";
@@ -84,6 +88,13 @@ const LOCAL_TOOLS: LocalToolDefinition[] = [
       additionalProperties: false,
       properties: {
         query: { type: "string", minLength: 1, maxLength: 512 },
+        canonicalUrl: { type: "string", minLength: 1, maxLength: 2_048 },
+        sourceFingerprint: {
+          type: "string",
+          minLength: 71,
+          maxLength: 71,
+          pattern: "^sha256:[A-Fa-f0-9]{64}$",
+        },
         limit: { type: "integer", minimum: 1, maximum: 20 },
       },
       required: ["query"],
@@ -435,6 +446,14 @@ function isLocalToolResultPayload(value: unknown): value is LocalToolResultPaylo
       result.value.experienceCandidates.every(
         (candidate) =>
           commonCandidate(candidate, "experiences") &&
+          Array.isArray(candidate.matchKinds) &&
+          candidate.matchKinds.length >= 1 &&
+          candidate.matchKinds.length <= 2 &&
+          new Set(candidate.matchKinds).size === candidate.matchKinds.length &&
+          (!candidate.matchKinds.includes("repost-candidate") || candidate.matchKinds.length === 1) &&
+          candidate.matchKinds.every((kind) =>
+            ["canonical-url", "source-fingerprint", "repost-candidate"].includes(kind),
+          ) &&
           [candidate.company, candidate.position, candidate.round, candidate.date].every(
             (field) => field === undefined || boundedText(field, 256),
           ),
@@ -444,6 +463,9 @@ function isLocalToolResultPayload(value: unknown): value is LocalToolResultPaylo
       result.value.questionCandidates.every(
         (candidate) =>
           commonCandidate(candidate, "interview") &&
+          Array.isArray(candidate.matchKinds) &&
+          candidate.matchKinds.length === 1 &&
+          candidate.matchKinds[0] === "semantic-candidate" &&
           (candidate.answerState === undefined ||
             ["needs-research", "draft", "verified"].includes(candidate.answerState)),
       ) &&
@@ -651,7 +673,7 @@ function readOptions(): RuntimeOptions {
   const fakeScenario = process.argv.includes("--fake-scenario")
     ? readOption("--fake-scenario")
     : undefined;
-  if (fakeScenario !== undefined && fakeScenario !== "text-interview-ingestion") {
+  if (fakeScenario !== undefined && !isFakeScenario(fakeScenario)) {
     throw new Error(`Unsupported fake Provider scenario: ${fakeScenario}`);
   }
   if (fakeScenario && provider !== "fake") {

@@ -21,6 +21,8 @@ const MAX_SEARCH_SNIPPETS = 3;
 const DEFAULT_SEARCH_SNIPPET_BYTES = 240;
 const MAX_SEARCH_SNIPPET_BYTES = 512;
 const MAX_SEARCH_QUERY_BYTES = 512;
+const MAX_CANONICAL_URL_BYTES = 2_048;
+const MAX_SOURCE_FINGERPRINT_BYTES = 256;
 const MAX_CONTROL_FILE_BYTES = 32_768;
 const MAX_DAILY_TEMPLATE_BYTES = 32_768;
 const DEFAULT_INTERVIEW_CATALOG_RESULTS = 10;
@@ -215,6 +217,42 @@ function boundedUtf8(value: string, maximumBytes: number): { content: string; tr
   return { content: value.slice(0, end), truncated: true };
 }
 
+function normalizeCanonicalUrl(value: unknown): string | undefined {
+  if (
+    typeof value !== "string" ||
+    !value.trim() ||
+    Buffer.byteLength(value.trim(), "utf8") > MAX_CANONICAL_URL_BYTES
+  ) {
+    return undefined;
+  }
+  try {
+    const normalized = new URL(value.trim());
+    if (
+      (normalized.protocol !== "http:" && normalized.protocol !== "https:") ||
+      normalized.username ||
+      normalized.password
+    ) {
+      return undefined;
+    }
+    normalized.hash = "";
+    if (normalized.pathname.length > 1) {
+      normalized.pathname = normalized.pathname.replace(/\/+$/u, "");
+    }
+    return normalized.href;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeSourceFingerprint(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return Buffer.byteLength(normalized, "utf8") <= MAX_SOURCE_FINGERPRINT_BYTES &&
+    /^sha256:[a-f0-9]{64}$/u.test(normalized)
+    ? normalized
+    : undefined;
+}
+
 export class ObsidianVaultToolAdapter {
   readonly #canonicalize?: CanonicalizeVaultPath;
   readonly #metadata?: MetadataApi;
@@ -313,9 +351,21 @@ export class ObsidianVaultToolAdapter {
     if (!arguments_ || typeof arguments_ !== "object" || Array.isArray(arguments_)) {
       return failure("request_too_large", "interview_catalog arguments must be an object.");
     }
-    const input = arguments_ as { limit?: unknown; query?: unknown };
-    if (Object.keys(input).some((key) => key !== "limit" && key !== "query")) {
-      return failure("request_too_large", "interview_catalog accepts only query and limit.");
+    const input = arguments_ as {
+      canonicalUrl?: unknown;
+      limit?: unknown;
+      query?: unknown;
+      sourceFingerprint?: unknown;
+    };
+    if (
+      Object.keys(input).some(
+        (key) => !["canonicalUrl", "limit", "query", "sourceFingerprint"].includes(key),
+      )
+    ) {
+      return failure(
+        "request_too_large",
+        "interview_catalog accepts only query, canonicalUrl, sourceFingerprint, and limit.",
+      );
     }
     const query = typeof input.query === "string" ? input.query.trim().toLocaleLowerCase() : "";
     if (!query || Buffer.byteLength(query, "utf8") > MAX_SEARCH_QUERY_BYTES) {
@@ -335,6 +385,21 @@ export class ObsidianVaultToolAdapter {
         `interview_catalog limit must be between 1 and ${MAX_INTERVIEW_CATALOG_RESULTS}.`,
       );
     }
+    const canonicalUrl = input.canonicalUrl === undefined
+      ? undefined
+      : normalizeCanonicalUrl(input.canonicalUrl);
+    if (input.canonicalUrl !== undefined && !canonicalUrl) {
+      return failure("request_too_large", "interview_catalog canonicalUrl must be a bounded HTTP(S) URL.");
+    }
+    const sourceFingerprint = input.sourceFingerprint === undefined
+      ? undefined
+      : normalizeSourceFingerprint(input.sourceFingerprint);
+    if (input.sourceFingerprint !== undefined && !sourceFingerprint) {
+      return failure(
+        "request_too_large",
+        "interview_catalog sourceFingerprint must be a bounded sha256 fingerprint.",
+      );
+    }
 
     const terms = query.split(/\s+/u).filter(Boolean);
     const score = (value: string): number =>
@@ -343,6 +408,7 @@ export class ObsidianVaultToolAdapter {
       company?: string;
       contentHash: string;
       date?: string;
+      matchKinds: Array<"canonical-url" | "repost-candidate" | "source-fingerprint">;
       modifiedVersion: string;
       path: string;
       position?: string;
@@ -353,6 +419,7 @@ export class ObsidianVaultToolAdapter {
     const questionMatches: Array<{
       answerState?: "draft" | "needs-research" | "verified";
       contentHash: string;
+      matchKinds: Array<"semantic-candidate">;
       modifiedVersion: string;
       path: string;
       score: number;
@@ -368,13 +435,43 @@ export class ObsidianVaultToolAdapter {
       const metadata = frontmatter && typeof frontmatter === "object" ? frontmatter : {};
       const searchable = `${file.path} ${metadataValues(metadata).join(" ")} ${content}`.toLocaleLowerCase();
       const matchScore = score(searchable);
-      if (matchScore === 0) continue;
-      const textField = (name: string): string | undefined => {
+      const metadataText = (
+        name: string,
+        maximumBytes: number,
+        truncate = false,
+      ): string | undefined => {
         const value = (metadata as Record<string, unknown>)[name];
-        return typeof value === "string" && value.trim()
-          ? boundedUtf8(value.trim(), 256).content
-          : undefined;
+        if (typeof value !== "string" || !value.trim()) return undefined;
+        const text = value.trim();
+        if (Buffer.byteLength(text, "utf8") <= maximumBytes) return text;
+        return truncate ? boundedUtf8(text, maximumBytes).content : undefined;
       };
+      const textField = (name: string): string | undefined => metadataText(name, 256, true);
+      const experienceMatchKinds: Array<
+        "canonical-url" | "repost-candidate" | "source-fingerprint"
+      > = [];
+      if (isExperience) {
+        const storedCanonicalUrl = normalizeCanonicalUrl(
+          metadataText("source-url", MAX_CANONICAL_URL_BYTES) ??
+          metadataText("sourceUrl", MAX_CANONICAL_URL_BYTES),
+        );
+        const storedSourceFingerprint = normalizeSourceFingerprint(
+          metadataText("source-fingerprint", MAX_SOURCE_FINGERPRINT_BYTES) ??
+          metadataText("sourceFingerprint", MAX_SOURCE_FINGERPRINT_BYTES),
+        );
+        if (canonicalUrl && storedCanonicalUrl === canonicalUrl) {
+          experienceMatchKinds.push("canonical-url");
+        }
+        if (sourceFingerprint && storedSourceFingerprint === sourceFingerprint) {
+          experienceMatchKinds.push("source-fingerprint");
+        }
+        if (matchScore > 0 && experienceMatchKinds.length === 0) {
+          experienceMatchKinds.push("repost-candidate");
+        }
+        if (experienceMatchKinds.length === 0) continue;
+      } else if (matchScore === 0) {
+        continue;
+      }
       const title = textField("title") ?? file.path.split("/").at(-1)!.replace(/\.md$/iu, "");
       const common = {
         path: file.path,
@@ -386,6 +483,7 @@ export class ObsidianVaultToolAdapter {
       if (isExperience) {
         experienceMatches.push({
           ...common,
+          matchKinds: experienceMatchKinds,
           ...(textField("company") ? { company: textField("company") } : {}),
           ...(textField("position") ? { position: textField("position") } : {}),
           ...(textField("round") ? { round: textField("round") } : {}),
@@ -395,6 +493,7 @@ export class ObsidianVaultToolAdapter {
         const answerState = textField("answer-state");
         questionMatches.push({
           ...common,
+          matchKinds: ["semantic-candidate"],
           ...(answerState === "needs-research" || answerState === "draft" || answerState === "verified"
             ? { answerState }
             : {}),
@@ -404,7 +503,12 @@ export class ObsidianVaultToolAdapter {
 
     const byScoreThenPath = <T extends { path: string; score: number }>(left: T, right: T) =>
       right.score - left.score || left.path.localeCompare(right.path);
-    experienceMatches.sort(byScoreThenPath);
+    experienceMatches.sort((left, right) => {
+      const identityPriority = (entry: typeof left) =>
+        (entry.matchKinds.includes("canonical-url") ? 2 : 0) +
+        (entry.matchKinds.includes("source-fingerprint") ? 1 : 0);
+      return identityPriority(right) - identityPriority(left) || byScoreThenPath(left, right);
+    });
     questionMatches.sort(byScoreThenPath);
     const selectedExperiences = experienceMatches.slice(0, limit as number).map(({ score: _, ...entry }) => entry);
     const selectedQuestions = questionMatches.slice(0, limit as number).map(({ score: _, ...entry }) => entry);

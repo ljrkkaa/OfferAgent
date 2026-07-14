@@ -136,6 +136,9 @@ test("deployment preserves Runtime State, plugin data, branch, index, and unrela
   assert.match(contract, /vault_read/);
   assert.match(contract, /interview_catalog/);
   assert.match(contract, /Interview Submission/);
+  assert.match(contract, /Source Fingerprint/);
+  assert.match(contract, /duplicate Interview Experience/);
+  assert.match(contract, /recurring Interview Question/);
   assert.match(contract, /needs-research/);
   assert.match(contract, /原始.*(?:全文|文本).*不.*(?:复制|写入).*Vault/);
   assert.match(contract, /vault_propose_changes/);

@@ -60,6 +60,11 @@ summary: 约束 OfferAgent 安全完成普通笔记写作、Daily Study Plan 与
 5. Experience、Question 和受影响索引必须在一个 `vault_propose_changes` 批次中全有或全无地创建或更新。新文件使用 `expectedVersion: "missing"`，索引使用精确读取到的版本。
 6. Catalog 候选只缩小读取范围，语义身份判断仍由 Agent 根据精确证据完成；不因词语相似而自动合并。
 
+7. Deduplication starts with exact canonical URL and Source Fingerprint matches, then bounded repost and semantic-Question candidates. Candidate summaries remain discovery-only; read every candidate used for an identity decision.
+8. The Agent owns semantic identity. Different candidates, dates, or rounds remain distinct Interview Experiences, and ambiguous evidence defaults to no merge.
+9. A duplicate Interview Experience creates no second note and does not increment Question frequency. It may fill only missing minimal Source Metadata directly supported by the submission.
+10. A genuinely recurring Interview Question adds one occurrence context and increments frequency in the same atomic batch as the distinct Experience and affected indexes. Any stale or failed action leaves the whole knowledge batch unchanged.
+
 ## Daily Study Plan
 
 Daily Study Plan 是前瞻性的学习安排，不是学习完成记录。用户说“学习日记”并表达安排今天学习内容的意图时，应按本工作流理解；不得把它与 Study-State Synchronization 混为一谈。

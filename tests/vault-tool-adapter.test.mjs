@@ -426,6 +426,141 @@ test("Interview Catalog bounds metadata and reports both missing index versions"
   ]);
 });
 
+test("Interview Catalog prioritizes exact source identities and labels bounded deduplication candidates", async () => {
+  const fingerprint = `sha256:${"a".repeat(64)}`;
+  const canonical = file(
+    "experiences/canonical-source.md",
+    "A distinct frontend interview whose body does not match the requested backend terms.",
+    2101,
+  );
+  const fingerprintMatch = file(
+    "experiences/fingerprint-source.md",
+    "A distinct mobile interview whose body does not match the requested backend terms.",
+    2102,
+  );
+  const repost = file(
+    "experiences/backend-repost.md",
+    "Backend platform interview covering distributed locks and cache consistency.",
+    2103,
+  );
+  const distinctRound = file(
+    "experiences/backend-later-round.md",
+    "Backend platform interview covering cache consistency in a final round.",
+    2104,
+  );
+  const question = file(
+    "interview/cache-consistency.md",
+    "How do you keep a distributed cache consistent?",
+    2105,
+  );
+  const subject = adapter(
+    [
+      canonical,
+      fingerprintMatch,
+      repost,
+      distinctRound,
+      question,
+      file("experiences/index.md", "# Interview Experiences", 2106),
+      file("interview/index.md", "# Interview Questions", 2107),
+    ],
+    {
+      [canonical.path]: {
+        frontmatter: {
+          title: "Canonical source",
+          "source-url": "HTTPS://EXAMPLE.COM/interviews/42/#shared",
+        },
+      },
+      [fingerprintMatch.path]: {
+        frontmatter: {
+          title: "Fingerprint source",
+          "source-fingerprint": fingerprint,
+        },
+      },
+      [repost.path]: {
+        frontmatter: {
+          title: "Backend platform repost",
+          company: "Example Corp",
+          position: "Backend Engineer",
+          round: "second",
+          date: "2026-06-10",
+        },
+      },
+      [distinctRound.path]: {
+        frontmatter: {
+          title: "Backend platform final round",
+          company: "Example Corp",
+          position: "Backend Engineer",
+          round: "final",
+          date: "2026-06-11",
+        },
+      },
+      [question.path]: {
+        frontmatter: {
+          title: "Distributed cache consistency",
+          "answer-state": "draft",
+        },
+      },
+    },
+  );
+
+  const result = await subject.execute(
+    call("interview_catalog", {
+      query: "backend distributed cache consistency",
+      canonicalUrl: "https://example.com/interviews/42",
+      sourceFingerprint: fingerprint.toUpperCase(),
+      limit: 4,
+    }),
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    result.value.experienceCandidates.map(({ path, matchKinds }) => ({ path, matchKinds })),
+    [
+      { path: canonical.path, matchKinds: ["canonical-url"] },
+      { path: fingerprintMatch.path, matchKinds: ["source-fingerprint"] },
+      { path: repost.path, matchKinds: ["repost-candidate"] },
+      { path: distinctRound.path, matchKinds: ["repost-candidate"] },
+    ],
+  );
+  assert.deepEqual(
+    result.value.questionCandidates.map(({ path, matchKinds }) => ({ path, matchKinds })),
+    [{ path: question.path, matchKinds: ["semantic-candidate"] }],
+  );
+  assert.equal(JSON.stringify(result).includes("distinct frontend interview"), false);
+  assert.equal(JSON.stringify(result).includes("distributed locks"), false);
+
+  for (const arguments_ of [
+    { query: "backend", canonicalUrl: "file:///private/interview.txt" },
+    { query: "backend", canonicalUrl: `https://example.com/${"x".repeat(2_100)}` },
+    { query: "backend", sourceFingerprint: "sha256:not-a-fingerprint" },
+  ]) {
+    const invalid = await subject.execute(call("interview_catalog", arguments_));
+    assert.equal(invalid.ok, false);
+    assert.equal(invalid.error.code, "request_too_large");
+  }
+
+  const boundedUrl = `https://example.com/${"a".repeat(2_028)}`;
+  assert.equal(Buffer.byteLength(boundedUrl, "utf8"), 2_048);
+  const oversizedStoredUrl = `${boundedUrl}different-source`;
+  const oversizedIdentity = file("experiences/oversized-source-url.md", "unrelated identity");
+  const oversizedSubject = adapter(
+    [oversizedIdentity],
+    {
+      [oversizedIdentity.path]: {
+        frontmatter: {
+          title: "Oversized stored source URL",
+          "source-url": oversizedStoredUrl,
+        },
+      },
+    },
+  );
+  const noFalseExactMatch = await oversizedSubject.execute(
+    call("interview_catalog", { query: "never-matches", canonicalUrl: boundedUrl }),
+  );
+  assert.equal(noFalseExactMatch.ok, true);
+  assert.deepEqual(noFalseExactMatch.value.experienceCandidates, []);
+});
+
 test("vault_read returns bounded exact evidence with stable source metadata", async () => {
   const subject = adapter([file("notes/interview.md", "first\nsecond\nthird\nfourth", 5678)]);
   const result = await subject.execute(

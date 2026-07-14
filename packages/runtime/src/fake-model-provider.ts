@@ -11,6 +11,15 @@ import {
   MEMORY_SELECTOR_INSTRUCTIONS,
   type MemorySelectionInput,
 } from "./planning-memory";
+import { interviewDeduplicationEvent } from "./fake-interview-deduplication-scenario";
+import { toolResultFor, toolResultForAfter } from "./fake-provider-conversation";
+
+export const FAKE_SCENARIOS = ["interview-deduplication", "text-interview-ingestion"] as const;
+export type FakeScenario = (typeof FAKE_SCENARIOS)[number];
+
+export function isFakeScenario(value: string): value is FakeScenario {
+  return (FAKE_SCENARIOS as readonly string[]).includes(value);
+}
 
 function findLatest<T extends ModelConversationItem>(
   input: ModelConversationItem[],
@@ -43,10 +52,10 @@ const MODEL: ModelDescriptor = {
 
 export class FakeModelProvider implements ModelProvider {
   readonly backendId = "fake";
-  readonly #scenario?: "text-interview-ingestion";
+  readonly #scenario?: FakeScenario;
   #toolCallSequence = 0;
 
-  constructor(options: { scenario?: "text-interview-ingestion" } = {}) {
+  constructor(options: { scenario?: FakeScenario } = {}) {
     this.#scenario = options.scenario;
   }
 
@@ -121,6 +130,13 @@ export class FakeModelProvider implements ModelProvider {
         selected = [];
       }
       yield { type: "output_text.delta", delta: JSON.stringify(selected) };
+      return;
+    }
+    if (this.#scenario === "interview-deduplication") {
+      yield interviewDeduplicationEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
       return;
     }
     if (this.#scenario === "text-interview-ingestion") {
@@ -1148,46 +1164,6 @@ function replaceMemoryIndexEntry(
     return `- [${name}](${relativePath}) - ${description}`;
   });
   return replaced ? lines.join("\n") : undefined;
-}
-
-function toolResultFor(
-  input: ModelConversationItem[],
-  name: LocalToolName,
-  predicate: (call: Extract<ModelConversationItem, { type: "local_tool_call" }>) => boolean = () => true,
-): Extract<ModelConversationItem, { type: "local_tool_result" }> | undefined {
-  for (let index = input.length - 1; index >= 0; index -= 1) {
-    const result = input[index];
-    if (result.type !== "local_tool_result") continue;
-    const call = input.find(
-      (candidate): candidate is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
-        candidate.type === "local_tool_call" &&
-        candidate.callId === result.callId &&
-        candidate.name === name,
-    );
-    if (call && predicate(call)) return result;
-  }
-  return undefined;
-}
-
-function toolResultForAfter(
-  input: ModelConversationItem[],
-  name: LocalToolName,
-  afterIndex: number,
-  predicate: (call: Extract<ModelConversationItem, { type: "local_tool_call" }>) => boolean,
-): Extract<ModelConversationItem, { type: "local_tool_result" }> | undefined {
-  for (let index = input.length - 1; index > afterIndex; index -= 1) {
-    const result = input[index];
-    if (result.type !== "local_tool_result") continue;
-    const call = input.find(
-      (candidate, callIndex): candidate is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
-        callIndex > afterIndex &&
-        candidate.type === "local_tool_call" &&
-        candidate.callId === result.callId &&
-        candidate.name === name,
-    );
-    if (call && predicate(call)) return result;
-  }
-  return undefined;
 }
 
 function dailyPlanAction(
