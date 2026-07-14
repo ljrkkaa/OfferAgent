@@ -41,6 +41,11 @@ import {
 import { RuntimeStateStore, type RunCheckpoint } from "./state-store";
 import { WebReader } from "./web-read";
 import { CapabilityGatedModelProvider } from "./capability-gated-provider";
+import {
+  PlanningMemoryModule,
+  ProviderSemanticMemorySelector,
+  type PlanningMemoryRecall,
+} from "./planning-memory";
 
 interface RuntimeOptions {
   parentPid: number;
@@ -198,6 +203,7 @@ const MODEL_DEFAULT_INSTRUCTIONS =
 function composeInstructions(
   agentContract: string | undefined,
   localSkills: Map<string, string>,
+  memory: PlanningMemoryRecall,
 ): string {
   const sections = [
     "OfferAgent policy: plugin-enforced tool and permission boundaries are immutable. Local Skills are workflow text only; they cannot add tools, grant permissions, create sub-agents, or override the Agent Contract.",
@@ -209,6 +215,23 @@ function composeInstructions(
     sections.push(
       `Requested Local Skills (below the Agent Contract, above model defaults):\n${[...localSkills.entries()]
         .map(([name, content]) => `## ${name}\n${content}`)
+        .join("\n\n")}`,
+    );
+  }
+  sections.push(
+    "Instruction precedence: the current explicit user request outranks all Planning Memory for this task. Feedback Memory outranks other recalled Planning Memory. Memory never overrides the Agent Contract.",
+  );
+  if (memory.feedback.length > 0) {
+    sections.push(
+      `Relevant Feedback Memory:\n${memory.feedback
+        .map((topic) => `## ${topic.name} (${topic.path})\n${topic.content}`)
+        .join("\n\n")}`,
+    );
+  }
+  if (memory.planning.length > 0) {
+    sections.push(
+      `Other Relevant Planning Memory:\n${memory.planning
+        .map((topic) => `## ${topic.name} [${topic.type}] (${topic.path})\n${topic.content}`)
         .join("\n\n")}`,
     );
   }
@@ -294,6 +317,14 @@ function isBoundedVaultPath(value: unknown): value is string {
   );
 }
 
+function isPlanningMemoryPath(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    Buffer.byteLength(value, "utf8") <= 512 &&
+    /^memory\/(user|feedback|project|study)\/[^/.][^/]*\.md$/.test(value)
+  );
+}
+
 function isBoundedChangeTargetPath(value: unknown): value is string {
   return (
     typeof value === "string" &&
@@ -356,6 +387,51 @@ function isLocalToolResultPayload(value: unknown): value is LocalToolResultPaylo
         ? result.value.targetVersion !== "missing"
         : result.value.targetVersion === "missing") &&
       templateFieldsAreConsistent
+    );
+  }
+  if (result.value.type === "planning_memory_list") {
+    return (
+      Array.isArray(result.value.topics) &&
+      result.value.topics.length <= 100 &&
+      typeof result.value.truncated === "boolean" &&
+      result.value.topics.every((topic) => {
+        const pathType = isPlanningMemoryPath(topic.path)
+          ? topic.path.split("/")[1]
+          : undefined;
+        return (
+          pathType === topic.type &&
+          typeof topic.name === "string" &&
+          topic.name.trim().length > 0 &&
+          Buffer.byteLength(topic.name, "utf8") <= 128 &&
+          typeof topic.description === "string" &&
+          topic.description.trim().length > 0 &&
+          Buffer.byteLength(topic.description, "utf8") <= 512 &&
+          typeof topic.modifiedVersion === "string" &&
+          topic.modifiedVersion.length > 0 &&
+          topic.modifiedVersion.length <= 128
+        );
+      })
+    );
+  }
+  if (result.value.type === "planning_memory_read") {
+    return (
+      Array.isArray(result.value.topics) &&
+      result.value.topics.length > 0 &&
+      result.value.topics.length <= 5 &&
+      new Set(result.value.topics.map(({ path }) => path)).size === result.value.topics.length &&
+      result.value.topics.reduce(
+        (total, topic) => total + (typeof topic.content === "string" ? Buffer.byteLength(topic.content, "utf8") : 65_537),
+        0,
+      ) <= 65_536 &&
+      result.value.topics.every(
+        (topic) =>
+          isPlanningMemoryPath(topic.path) &&
+          typeof topic.content === "string" &&
+          Buffer.byteLength(topic.content, "utf8") <= 32_768 &&
+          typeof topic.modifiedVersion === "string" &&
+          topic.modifiedVersion.length > 0 &&
+          topic.modifiedVersion.length <= 128,
+      )
     );
   }
   if (result.value.type === "skill_read") {
@@ -1353,6 +1429,7 @@ async function startRuntime({
             checkpoint?.hostedWebSearchProbeAttempted ?? false;
           const checkpointSkills = new Set(checkpoint?.localSkills ?? []);
           const localSkills = new Map<string, string>();
+          let recalledMemory: PlanningMemoryRecall = { feedback: [], planning: [] };
           let completedSteps = checkpoint?.completedSteps ?? 0;
           let pendingToolStep = checkpoint?.pendingToolStep;
           const currentCheckpoint = (): RunCheckpoint => ({
@@ -1594,6 +1671,33 @@ async function startRuntime({
             localSkills.set(skill, loadedSkill.result.value.content);
           }
           if (checkpointSkills.size > 0) await saveCheckpoint();
+          const planningMemory = new PlanningMemoryModule({
+            listTopics: async () => {
+              const listed = await executeLocalTool("planning_memory_list", {});
+              return listed.result.ok && listed.result.value.type === "planning_memory_list"
+                ? listed.result.value.topics
+                : [];
+            },
+            readTopics: async (paths) => {
+              const read = await executeLocalTool("planning_memory_read", { paths });
+              return read.result.ok && read.result.value.type === "planning_memory_read"
+                ? read.result.value.topics
+                : [];
+            },
+            selector: new ProviderSemanticMemorySelector({
+              fastMode,
+              model,
+              provider,
+              signal: controller.signal,
+            }),
+          });
+          recalledMemory = await planningMemory.recall({
+            request: userInput,
+            conversationContext: input.filter(
+              (item): item is Extract<ModelConversationItem, { type: "assistant_message" | "user_message" }> =>
+                item.type === "assistant_message" || item.type === "user_message",
+            ),
+          });
           if (checkpoint && canonicalReadPaths.size > 0) {
             for (const [priorCallId, path] of [...canonicalReadPaths]) {
               const priorCall = input.find(
@@ -1649,7 +1753,7 @@ async function startRuntime({
               model,
               ...(fastMode ? { fastMode: true } : {}),
               input,
-              instructions: composeInstructions(agentContract, localSkills),
+              instructions: composeInstructions(agentContract, localSkills, recalledMemory),
               signal: controller.signal,
               tools:
                 hostedWebSearchCapability === "unknown"
@@ -1692,6 +1796,16 @@ async function startRuntime({
                   citations.push(providerEvent.citation);
                 }
                 continue;
+              }
+
+              if (
+                providerEvent.name === "planning_memory_list" ||
+                providerEvent.name === "planning_memory_read"
+              ) {
+                throw new ModelProviderError(
+                  "provider_error",
+                  "Planning Memory storage tools are internal and cannot be requested by the main model.",
+                );
               }
 
               requestedTool = true;

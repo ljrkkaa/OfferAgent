@@ -94,9 +94,23 @@ function collectRunEvents(socket, agentRunId) {
 function installContractResponder(socket, content = "# Test Agent Contract") {
   socket.on("message", (data) => {
     const event = JSON.parse(data.toString("utf8"));
-    if (event.type !== "tool_call.requested" || event.tool.name !== "agent_contract_read") {
+    if (event.type !== "tool_call.requested") {
       return;
     }
+    if (event.tool.name === "planning_memory_list") {
+      socket.send(JSON.stringify({
+        type: "tool_result",
+        protocolVersion: 1,
+        eventId: `memory-list-result-${event.toolCallId}`,
+        conversationId: event.conversationId,
+        agentRunId: event.agentRunId,
+        sequence: event.sequence,
+        toolCallId: event.toolCallId,
+        result: { ok: true, value: { type: "planning_memory_list", topics: [], truncated: false } },
+      }));
+      return;
+    }
+    if (event.tool.name !== "agent_contract_read") return;
     socket.send(
       JSON.stringify({
         type: "tool_result",
@@ -184,11 +198,13 @@ test("a deterministic Provider lists models and streams one Agent Run", async (t
     "agent_run.started",
     "tool_call.requested",
     "tool_call.completed",
+    "tool_call.requested",
+    "tool_call.completed",
     "agent_run.delta",
     "agent_run.delta",
     "agent_run.completed",
   ]);
-  assert.deepEqual(events.map((event) => event.sequence), [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual(events.map((event) => event.sequence), [1, 2, 3, 4, 5, 6, 7, 8]);
   for (const event of events) {
     assert.equal(event.protocolVersion, 1);
     assert.equal(event.conversationId, conversationId);
@@ -196,9 +212,10 @@ test("a deterministic Provider lists models and streams one Agent Run", async (t
     assert.equal(typeof event.eventId, "string");
   }
   assert.equal(events[1].tool.name, "agent_contract_read");
-  assert.equal(events[3].delta, "OfferAgent received: ");
-  assert.equal(events[4].delta, "Help me prepare.");
-  assert.equal(events[5].output.text, "OfferAgent received: Help me prepare.");
+  assert.equal(events[3].tool.name, "planning_memory_list");
+  assert.equal(events[5].delta, "OfferAgent received: ");
+  assert.equal(events[6].delta, "Help me prepare.");
+  assert.equal(events[7].output.text, "OfferAgent received: Help me prepare.");
 
   const failedRun = new Promise((resolve) => {
     socket.on("message", function onMessage(data) {
@@ -676,7 +693,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
       if (event.agentRunId !== "agent-run-codex-tool") return;
       toolRunEvents.push(event);
       if (event.type === "tool_call.requested") {
-        if (event.tool.name === "agent_contract_read") return;
+        if (event.tool.name === "agent_contract_read" || event.tool.name === "planning_memory_list") return;
         const result = {
           ok: true,
           value: {
@@ -750,7 +767,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
       if (event.agentRunId !== "agent-run-codex-skill") return;
       skillRunEvents.push(event);
       if (event.type === "tool_call.requested") {
-        if (event.tool.name === "agent_contract_read") return;
+        if (event.tool.name === "agent_contract_read" || event.tool.name === "planning_memory_list") return;
         const result =
           event.tool.name === "skill_read"
             ? {
@@ -820,7 +837,7 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
     skillRunEvents
       .filter((event) => event.type === "tool_call.requested")
       .map((event) => event.tool.name),
-    ["agent_contract_read", "skill_read", "vault_read"],
+    ["agent_contract_read", "planning_memory_list", "skill_read", "vault_read"],
   );
   assert.equal(JSON.stringify(skillRunEvents).includes("SKILL_WORKFLOW"), false);
   const instructionRequests = upstreamRequests.slice(-3).map((entry) => JSON.parse(entry.body));
@@ -885,7 +902,10 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
         event.agentRunId === "agent-run-codex-oversized" &&
         (event.type === "agent_run.failed" || event.type === "tool_call.requested")
       ) {
-        if (event.type === "tool_call.requested" && event.tool.name === "agent_contract_read") return;
+        if (
+          event.type === "tool_call.requested" &&
+          (event.tool.name === "agent_contract_read" || event.tool.name === "planning_memory_list")
+        ) return;
         socket.off("message", onMessage);
         resolve(event);
       }

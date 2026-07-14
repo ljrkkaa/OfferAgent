@@ -6,6 +6,7 @@ import {
   type ModelRequest,
   type ModelStreamEvent,
 } from "./model-provider";
+import { MEMORY_SELECTOR_INSTRUCTIONS, type MemorySelectionInput } from "./planning-memory";
 
 function findLatest<T extends ModelConversationItem>(
   input: ModelConversationItem[],
@@ -47,6 +48,66 @@ export class FakeModelProvider implements ModelProvider {
       (item): item is Extract<ModelConversationItem, { type: "user_message" }> =>
         item.type === "user_message",
     )?.text ?? "";
+    if (request.instructions === MEMORY_SELECTOR_INSTRUCTIONS) {
+      let selected: string[] = [];
+      try {
+        const selection = JSON.parse(userInput) as MemorySelectionInput;
+        const context = [
+          selection.request,
+          ...selection.conversationContext.map(({ text }) => text),
+        ].join(" ");
+        const contextFeatures = textFeatures(context);
+        const scored = selection.topics
+          .map((topic, index) => ({
+            index,
+            path: topic.path,
+            score: overlapScore(contextFeatures, textFeatures(`${topic.name} ${topic.description}`)),
+          }))
+        const maximumScore = Math.max(0, ...scored.map(({ score }) => score));
+        selected = scored
+          .filter(({ score }) => score >= Math.max(8, maximumScore * 0.2))
+          .sort((left, right) => right.score - left.score || left.index - right.index)
+          .slice(0, 5)
+          .map(({ path }) => path);
+      } catch {
+        selected = [];
+      }
+      yield { type: "output_text.delta", delta: JSON.stringify(selected) };
+      return;
+    }
+    if (userInput.trim() === "planning_memory_acceptance") {
+      const feedback = /Relevant Feedback Memory:\n([\s\S]*?)(?:\n\nOther Relevant Planning Memory:|\n\nModel defaults)/.exec(
+        request.instructions,
+      )?.[1];
+      const planning = /Other Relevant Planning Memory:\n([\s\S]*?)(?:\n\nModel defaults)/.exec(
+        request.instructions,
+      )?.[1];
+      yield {
+        type: "output_text.delta",
+        delta: feedback
+          ? "OfferAgent applied relevant Feedback Memory: planned study remains future work, not completed evidence."
+          : planning
+            ? "OfferAgent applied relevant Planning Memory to this response."
+          : "OfferAgent found no relevant Planning Memory.",
+      };
+      return;
+    }
+    const precedence = /^planning_memory_precedence\s+(\w+)$/i.exec(userInput.trim());
+    if (precedence) {
+      const contract = /Agent Contract \(highest instruction priority\):\n([\s\S]*?)(?:\n\nRequested Local Skills|\n\nInstruction precedence)/.exec(
+        request.instructions,
+      )?.[1];
+      const contractChoice = /PRECEDENCE_CHOICE:\s*(\w+)/.exec(contract ?? "")?.[1];
+      const feedback = /Relevant Feedback Memory:\n([\s\S]*?)(?:\n\nOther Relevant Planning Memory:|\n\nModel defaults)/.exec(
+        request.instructions,
+      )?.[1];
+      const memoryChoice = /PRECEDENCE_CHOICE:\s*(\w+)/.exec(feedback ?? "")?.[1];
+      yield {
+        type: "output_text.delta",
+        delta: `PRECEDENCE_CHOICE: ${contractChoice ?? precedence[1] ?? memoryChoice ?? "default"}`,
+      };
+      return;
+    }
     if (userInput.trim() === "conversation_context") {
       yield {
         type: "output_text.delta",
@@ -227,6 +288,24 @@ export class FakeModelProvider implements ModelProvider {
       delta: toolResult ? JSON.stringify(toolResult.result) : userInput,
     };
   }
+}
+
+function textFeatures(value: string): Set<string> {
+  const normalized = value.toLocaleLowerCase().replace(/\s+/g, " ").trim();
+  const features = new Set(normalized.match(/[\p{L}\p{N}]{2,}/gu) ?? []);
+  const compact = normalized.replace(/[^\p{L}\p{N}]/gu, "");
+  for (let size = 2; size <= 4; size += 1) {
+    for (let index = 0; index + size <= compact.length; index += 1) {
+      features.add(compact.slice(index, index + size));
+    }
+  }
+  return features;
+}
+
+function overlapScore(left: Set<string>, right: Set<string>): number {
+  let score = 0;
+  for (const feature of right) if (left.has(feature)) score += feature.length;
+  return score;
 }
 
 function fakeToolRequest(input: string): { name: LocalToolName; arguments: unknown } | undefined {

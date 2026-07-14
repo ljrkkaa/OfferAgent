@@ -240,6 +240,64 @@ test("daily_note_context rejects invalid configuration, escapes, and oversized t
   assert.equal(invalidDate.error.code, "request_too_large");
 });
 
+test("Planning Memory tools expose typed metadata and only selected topic bodies", async () => {
+  const topics = [
+    file("memory/user/profile.md", "---\nname: Profile\ndescription: Stable user profile\ntype: user\n---\nPrefers concise plans."),
+    file("memory/feedback/planning.md", "---\nname: Planning feedback\ndescription: Corrections for study plans\ntype: feedback\n---\nDo not invent completion."),
+    file("memory/project/offeragent.md", "---\nname: OfferAgent\ndescription: Product direction\ntype: project\n---\nShip the local plugin."),
+    file("memory/study/agentic-rl.md", "---\nname: Agentic RL\ndescription: Cross-day study sequence\ntype: study\n---\nContinue with policy gradients."),
+    file("memory/MEMORY.md", "# Full index must not be returned"),
+    file("memory/study/malformed.md", "missing frontmatter"),
+  ];
+  const memoryMetadata = Object.fromEntries(topics.slice(0, 4).map((topic) => {
+    const [type] = topic.path.split("/").slice(1);
+    return [topic.path, { frontmatter: {
+      name: type === "user" ? "Profile" : type === "feedback" ? "Planning feedback" : type === "project" ? "OfferAgent" : "Agentic RL",
+      description: type === "user" ? "Stable user profile" : type === "feedback" ? "Corrections for study plans" : type === "project" ? "Product direction" : "Cross-day study sequence",
+      type,
+    } }];
+  }));
+  const subject = adapter(topics, memoryMetadata);
+
+  const listed = await subject.execute(call("planning_memory_list", {}));
+  assert.equal(listed.ok, true);
+  assert.deepEqual(listed.value.topics.map(({ path, type }) => [path, type]), [
+    ["memory/feedback/planning.md", "feedback"],
+    ["memory/project/offeragent.md", "project"],
+    ["memory/study/agentic-rl.md", "study"],
+    ["memory/user/profile.md", "user"],
+  ]);
+  assert.equal(JSON.stringify(listed).includes("Full index"), false);
+  assert.equal(JSON.stringify(listed).includes("policy gradients"), false);
+
+  const read = await subject.execute(call("planning_memory_read", {
+    paths: ["memory/feedback/planning.md", "memory/study/agentic-rl.md"],
+  }));
+  assert.equal(read.ok, true);
+  assert.deepEqual(read.value.topics.map(({ path }) => path), [
+    "memory/feedback/planning.md",
+    "memory/study/agentic-rl.md",
+  ]);
+  assert.match(read.value.topics[1].content, /policy gradients/);
+});
+
+test("Planning Memory reads reject indexes, malformed requests, escapes, and oversized bodies", async () => {
+  const large = file("memory/study/large.md", "x".repeat(32_769));
+  const subject = adapter([large, file("memory/MEMORY.md", "index")]);
+  for (const arguments_ of [
+    { paths: ["memory/MEMORY.md"] },
+    { paths: ["../outside.md"] },
+    { paths: [] },
+    { paths: Array.from({ length: 6 }, (_, index) => `memory/study/${index}.md`) },
+  ]) {
+    const result = await subject.execute(call("planning_memory_read", arguments_));
+    assert.equal(result.ok, false);
+  }
+  const oversized = await subject.execute(call("planning_memory_read", { paths: [large.path] }));
+  assert.equal(oversized.ok, false);
+  assert.equal(oversized.error.code, "response_too_large");
+});
+
 test("vault_read returns bounded exact evidence with stable source metadata", async () => {
   const subject = adapter([file("notes/interview.md", "first\nsecond\nthird\nfourth", 5678)]);
   const result = await subject.execute(

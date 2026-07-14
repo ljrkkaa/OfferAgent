@@ -5,6 +5,7 @@ import type { MetadataCache, TFile, Vault } from "obsidian";
 import type {
   AgentRunEvent,
   LocalToolResultPayload,
+  MemoryTopicType,
   VaultToolErrorCode,
 } from "@offeragent/protocol";
 
@@ -22,8 +23,13 @@ const MAX_SEARCH_SNIPPET_BYTES = 512;
 const MAX_SEARCH_QUERY_BYTES = 512;
 const MAX_CONTROL_FILE_BYTES = 32_768;
 const MAX_DAILY_TEMPLATE_BYTES = 32_768;
+const MAX_MEMORY_TOPICS = 100;
+const MAX_MEMORY_READ_TOPICS = 5;
+const MAX_MEMORY_TOPIC_BYTES = 32_768;
+const MAX_MEMORY_READ_BYTES = 65_536;
 const MAX_SKILL_NAME_LENGTH = 64;
 const EXCLUDED_SEGMENTS = new Set([".git", ".obsidian", ".codex", "node_modules"]);
+const MEMORY_TOPIC_PATH = /^memory\/(user|feedback|project|study)\/[^/.][^/]*\.md$/;
 
 type VaultToolCall = Extract<AgentRunEvent, { type: "tool_call.requested" }>;
 type VaultApi = Pick<Vault, "cachedRead" | "getFiles">;
@@ -232,6 +238,12 @@ export class ObsidianVaultToolAdapter {
       if (call.tool.name === "daily_note_context") {
         return await this.#dailyNoteContext(call.tool.arguments);
       }
+      if (call.tool.name === "planning_memory_list") {
+        return await this.#listPlanningMemory(call.tool.arguments);
+      }
+      if (call.tool.name === "planning_memory_read") {
+        return await this.#readPlanningMemory(call.tool.arguments);
+      }
       if (call.tool.name === "agent_contract_read") {
         return await this.#readAgentContract(call.tool.arguments);
       }
@@ -243,6 +255,112 @@ export class ObsidianVaultToolAdapter {
         error instanceof Error ? error.message : "The Vault tool could not complete the request.",
       );
     }
+  }
+
+  async #listPlanningMemory(arguments_: unknown): Promise<LocalToolResultPayload> {
+    if (
+      !arguments_ ||
+      typeof arguments_ !== "object" ||
+      Array.isArray(arguments_) ||
+      Object.keys(arguments_).length > 0
+    ) {
+      return failure("request_too_large", "planning_memory_list accepts an empty object.");
+    }
+    const topics = this.#vault
+      .getFiles()
+      .filter((candidate) => MEMORY_TOPIC_PATH.test(candidate.path))
+      .sort((left, right) => left.path.localeCompare(right.path))
+      .flatMap((candidate) => {
+        const match = MEMORY_TOPIC_PATH.exec(candidate.path);
+        const frontmatter = this.#metadata?.getFileCache(candidate)?.frontmatter;
+        if (!match || !frontmatter || typeof frontmatter !== "object") return [];
+        const { name, description, type } = frontmatter as Record<string, unknown>;
+        if (
+          type !== match[1] ||
+          typeof name !== "string" ||
+          !name.trim() ||
+          Buffer.byteLength(name, "utf8") > 128 ||
+          typeof description !== "string" ||
+          !description.trim() ||
+          Buffer.byteLength(description, "utf8") > 512
+        ) {
+          return [];
+        }
+        return [{
+          path: candidate.path,
+          name: name.trim(),
+          description: description.trim(),
+          type: type as MemoryTopicType,
+          modifiedVersion: fileVersion(candidate),
+        }];
+      });
+    return {
+      ok: true,
+      value: {
+        type: "planning_memory_list",
+        topics: topics.slice(0, MAX_MEMORY_TOPICS),
+        truncated: topics.length > MAX_MEMORY_TOPICS,
+      },
+    };
+  }
+
+  async #readPlanningMemory(arguments_: unknown): Promise<LocalToolResultPayload> {
+    if (
+      !arguments_ ||
+      typeof arguments_ !== "object" ||
+      Array.isArray(arguments_) ||
+      Object.keys(arguments_).some((key) => key !== "paths")
+    ) {
+      return failure("request_too_large", "planning_memory_read requires only selected topic paths.");
+    }
+    const paths = (arguments_ as { paths?: unknown }).paths;
+    if (
+      !Array.isArray(paths) ||
+      paths.length === 0 ||
+      paths.length > MAX_MEMORY_READ_TOPICS ||
+      paths.some((candidate) => typeof candidate !== "string" || !MEMORY_TOPIC_PATH.test(candidate)) ||
+      new Set(paths).size !== paths.length
+    ) {
+      return failure("invalid_path", "Select between one and five distinct Planning Memory topic paths.");
+    }
+    const filesByPath = new Map(this.#vault.getFiles().map((candidate) => [candidate.path, candidate]));
+    const files = paths.map((candidate) => filesByPath.get(candidate));
+    if (files.some((candidate) => !candidate || !isReadableFile(candidate))) {
+      return failure("not_found", "A selected Planning Memory topic is missing or unreadable.");
+    }
+    if (!this.#canonicalize) {
+      return failure("tool_error", "Planning Memory path containment could not be verified safely.");
+    }
+    try {
+      const root = await this.#canonicalize("");
+      const canonicalTopics = await Promise.all(
+        files.map((candidate) => this.#canonicalize!(candidate!.path)),
+      );
+      if (canonicalTopics.some((candidate) => !isContained(root, candidate))) {
+        return failure("invalid_path", "A selected Planning Memory topic resolves outside the Vault root.");
+      }
+    } catch {
+      return failure("invalid_path", "A selected Planning Memory topic could not be resolved safely.");
+    }
+    const contents = await Promise.all(files.map((candidate) => this.#vault.cachedRead(candidate!)));
+    if (
+      contents.some((content) => Buffer.byteLength(content, "utf8") > MAX_MEMORY_TOPIC_BYTES) ||
+      contents.reduce((total, content) => total + Buffer.byteLength(content, "utf8"), 0) >
+        MAX_MEMORY_READ_BYTES
+    ) {
+      return failure("response_too_large", "Selected Planning Memory topic content is too large.");
+    }
+    return {
+      ok: true,
+      value: {
+        type: "planning_memory_read",
+        topics: files.map((candidate, index) => ({
+          path: candidate!.path,
+          content: contents[index]!,
+          modifiedVersion: fileVersion(candidate!),
+        })),
+      },
+    };
   }
 
   async #dailyNoteContext(arguments_: unknown): Promise<LocalToolResultPayload> {
