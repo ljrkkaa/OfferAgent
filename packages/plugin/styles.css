@@ -5,6 +5,7 @@
   gap: var(--size-4-2);
   height: 100%;
   min-width: 0;
+  overflow-x: hidden;
   padding: var(--size-4-2);
   color: var(--text-normal);
   background: var(--background-primary);
@@ -85,9 +86,49 @@
 
 .offeragent-sidebar__new-conversation,
 .offeragent-sidebar__delete-conversation,
-.offeragent-sidebar__settings {
+.offeragent-sidebar__settings,
+.offeragent-sidebar__header-overflow {
   flex: 0 0 auto;
-  padding-inline: 0.55rem;
+}
+
+.offeragent-sidebar__header-overflow,
+.offeragent-sidebar__history-overflow {
+  position: relative;
+}
+
+.offeragent-sidebar__header-overflow > summary,
+.offeragent-sidebar__history-overflow > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 0.2rem 0.55rem;
+}
+
+.offeragent-sidebar__header-overflow > summary::-webkit-details-marker,
+.offeragent-sidebar__history-overflow > summary::-webkit-details-marker {
+  display: none;
+}
+
+.offeragent-sidebar__header-overflow-menu,
+.offeragent-sidebar__history-overflow-menu {
+  position: absolute;
+  z-index: var(--layer-popover);
+  right: 0;
+  display: grid;
+  min-width: 8rem;
+  gap: var(--size-4-1);
+  padding: var(--size-4-1);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+  box-shadow: var(--shadow-s);
+}
+
+.offeragent-sidebar__header-overflow-menu {
+  top: calc(100% + var(--size-4-1));
+}
+
+.offeragent-sidebar__history-overflow-menu {
+  top: 100%;
 }
 
 .offeragent-sidebar__transcript {
@@ -275,7 +316,9 @@
 
 .offeragent-sidebar__tool-activity > summary:focus-visible,
 .offeragent-sidebar button:focus-visible,
+.offeragent-sidebar input:focus-visible,
 .offeragent-sidebar select:focus-visible,
+.offeragent-sidebar summary:focus-visible,
 .offeragent-sidebar textarea:focus-visible,
 .offeragent-settings__advanced > summary:focus-visible {
   outline: 2px solid var(--interactive-accent);
@@ -357,7 +400,7 @@
 
 .offeragent-sidebar__history-item {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   gap: var(--size-4-1);
   align-items: center;
 }
@@ -378,6 +421,24 @@
 
 .offeragent-sidebar__revise-stopped {
   margin-inline-start: var(--size-4-2);
+}
+
+.offeragent-sidebar__message-revise {
+  margin-block-start: var(--size-4-1);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.offeragent-sidebar__message--user:hover .offeragent-sidebar__message-revise,
+.offeragent-sidebar__message--user:focus-within .offeragent-sidebar__message-revise,
+.offeragent-sidebar__message-revise:focus-visible {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .offeragent-sidebar__message-revise {
+    opacity: 1;
+  }
 }
 
 .offeragent-sidebar__change-batch {
@@ -542,9 +603,11 @@
 }
 
 .offeragent-sidebar__attachment {
-  display: flex;
+  position: relative;
+  display: grid;
+  flex: 0 0 7rem;
+  grid-template-columns: 1fr auto auto auto;
   align-items: center;
-  justify-content: space-between;
   gap: var(--size-4-2);
   min-width: 0;
   border: 1px solid var(--background-modifier-border);
@@ -555,10 +618,19 @@
   font-size: var(--font-ui-smaller);
 }
 
+.offeragent-sidebar__attachment-strip {
+  display: flex;
+  gap: var(--size-4-2);
+  min-width: 0;
+  padding-block: var(--size-4-1);
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+}
+
 .offeragent-sidebar__attachment-preview {
-  flex: 0 0 auto;
-  width: 3rem;
-  height: 3rem;
+  grid-column: 1 / -1;
+  width: 100%;
+  height: 5rem;
   border-radius: var(--radius-s);
   object-fit: cover;
 }
@@ -652,6 +724,23 @@
 
   .offeragent-sidebar__message--compact_user {
     max-width: 92%;
+  }
+
+  .offeragent-sidebar__history-item {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .offeragent-sidebar__history-select,
+  .offeragent-sidebar__history-updated {
+    grid-column: 1 / -1;
+  }
+
+  .offeragent-sidebar__attachment {
+    flex-basis: 6rem;
+  }
+
+  .offeragent-sidebar__attachment > span {
+    flex: 1 1 calc(100% - 4rem);
   }
 
   .offeragent-sidebar__primary {

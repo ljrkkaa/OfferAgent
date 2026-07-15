@@ -500,9 +500,11 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     }
   }
 
+  const notices = [];
   class Notice {
     constructor(message) {
       this.message = message;
+      notices.push(message);
     }
   }
 
@@ -698,6 +700,14 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   };
   const OfferAgentPlugin = loaded.default ?? loaded;
   plugin = new OfferAgentPlugin(app, manifest);
+  await assert.rejects(
+    plugin.getHostedWebSearchCapability(),
+    /检查 Hosted Web Search 前请选择模型/,
+  );
+  await assert.rejects(
+    plugin.reprobeHostedWebSearch(),
+    /重新探测 Hosted Web Search 前请选择模型/,
+  );
   t.after(async () => {
     await plugin?.onunload();
     if (previousProvider === undefined) delete process.env.OFFERAGENT_RUNTIME_PROVIDER;
@@ -724,23 +734,41 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   const commonSettingNames = plugin.settingTabs[0].containerEl
     .findAllByClass("setting-item-name")
     .map(({ text }) => text);
-  assert.ok(commonSettingNames.includes("Runtime status"));
-  assert.ok(commonSettingNames.includes("Provider status"));
-  assert.ok(commonSettingNames.includes("Model"));
-  assert.ok(commonSettingNames.includes("Vault Permission Mode"));
+  assert.ok(commonSettingNames.includes("Runtime 状态"));
+  assert.ok(commonSettingNames.includes("Provider 状态"));
+  assert.ok(commonSettingNames.includes("模型"));
+  assert.ok(commonSettingNames.includes("Vault 权限模式"));
   assert.ok(plugin.settingTabs[0].containerEl.findByClass("offeragent-settings__advanced"));
 
+  assert.equal(plugin.commands.get("open-offeragent-sidebar")?.name, "打开 OfferAgent 侧栏");
+  assert.equal(plugin.commands.get("pin-selection-to-offeragent")?.name, "将选区固定到 OfferAgent");
   plugin.commands.get("open-offeragent-sidebar").callback();
   await waitUntil(() => activeView, "OfferAgent did not open its sidebar");
-  const connectedStatus = await waitUntil(
+  await waitUntil(
     () => {
       const status = activeView.contentEl.findByClass("offeragent-sidebar__status");
-      return status?.dataset.state === "connected" ? status : undefined;
+      return status === undefined && activeView.contentEl.findByClass("offeragent-sidebar__empty")
+        ? true
+        : undefined;
     },
-    "OfferAgent sidebar did not report a connected Runtime",
+    "OfferAgent sidebar did not become quietly connected",
   );
-  assert.equal(connectedStatus.text, "connected");
-  const settingsButton = activeView.contentEl.findByClass("offeragent-sidebar__settings");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__status"), undefined);
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__empty")?.text,
+    "准备好开始新对话了。",
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__permission")?.text,
+    "信任 Vault",
+  );
+  const headerOverflow = activeView.contentEl.findByClass("offeragent-sidebar__header-overflow");
+  assert.ok(headerOverflow);
+  assert.equal(
+    headerOverflow.findByClass("offeragent-sidebar__header-overflow-toggle")?.getAttribute("aria-label"),
+    "打开侧栏菜单",
+  );
+  const settingsButton = headerOverflow.findByClass("offeragent-sidebar__settings");
   assert.ok(settingsButton);
   settingsButton.dispatch("click");
   assert.equal(settingsOpened, 1);
@@ -764,6 +792,14 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__input").value, "");
   let pinnedChip = activeView.contentEl.findByClass("offeragent-sidebar__context-chip--pinned");
   assert.match(pinnedChip.text, /notes\/example\.md/);
+  assert.equal(
+    pinnedChip.findByClass("offeragent-sidebar__context-open").getAttribute("aria-label"),
+    "打开已固定来源 notes/example.md",
+  );
+  assert.equal(
+    pinnedChip.findByClass("offeragent-sidebar__context-remove").getAttribute("aria-label"),
+    "移除已固定来源 notes/example.md",
+  );
   pinnedChip.findByClass("offeragent-sidebar__context-open").dispatch("click");
   assert.deepEqual(openedPaths, ["notes/example.md"]);
   pinnedChip.findByClass("offeragent-sidebar__context-remove").dispatch("click");
@@ -802,8 +838,9 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
 
   activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
   const addMenu = activeView.contentEl.findByClass("offeragent-sidebar__add-menu");
-  assert.ok(addMenu.findByClass("offeragent-sidebar__pin-current"));
-  assert.ok(addMenu.findByClass("offeragent-sidebar__choose-document"));
+  assert.equal(addMenu.findByClass("offeragent-sidebar__pin-current")?.text, "固定当前笔记");
+  assert.equal(addMenu.findByClass("offeragent-sidebar__choose-document")?.text, "选择 Vault 文档");
+  assert.equal(addMenu.findByClass("offeragent-sidebar__attach")?.text, "添加图片");
   addMenu.findByClass("offeragent-sidebar__pin-current").dispatch("click");
   assert.match(
     activeView.contentEl.findByClass("offeragent-sidebar__context-chip--pinned").text,
@@ -837,6 +874,8 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     });
   }
   const chooserSearch = chooser.findByClass("offeragent-sidebar__document-search");
+  assert.equal(chooserSearch.placeholder, "搜索 Vault 文档");
+  assert.equal(chooserSearch.getAttribute("aria-label"), "搜索要固定的 Vault 文档");
   chooserSearch.value = "deep-choice-11";
   chooserSearch.dispatch("input");
   const deepChoice = chooser.findAllByClass("offeragent-sidebar__document-choice")
@@ -906,6 +945,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   const capacityChoice = capacityChooser.findAllByClass("offeragent-sidebar__document-choice")
     .find(({ text }) => text === "zzz/deep-choice-0.md");
   assert.doesNotThrow(() => capacityChoice.dispatch("click"));
+  assert.equal(notices.at(-1), "每次运行最多固定 8 份 Vault 来源。");
   assert.equal(
     activeView.contentEl.findByClass("offeragent-sidebar__document-chooser"),
     capacityChooser,
@@ -936,6 +976,15 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "OfferAgent did not render its model selector",
   );
   assert.equal(modelSelect.value, "fake-interview-model");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__status"), undefined);
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__settings")?.text,
+    "设置",
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__settings")?.getAttribute("aria-label"),
+    "打开 OfferAgent 设置",
+  );
   const historyButton = activeView.contentEl.findByClass("offeragent-sidebar__history");
   assert.ok(historyButton);
   assert.equal(historyButton.getAttribute("aria-expanded"), "false");
@@ -965,24 +1014,28 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   assert.ok(
     plugin.settingTabs[0].containerEl
       .findAllByClass("setting-item-name")
-      .some(({ text }) => text === "Fast Mode"),
+      .some(({ text }) => text === "快速模式"),
   );
   const capabilityStatus = await waitUntil(
     () => plugin.settingTabs[0].containerEl
       .findAllByClass("setting-item-description")
-      .find((description) => description.text.includes("fake-interview-model: unknown")),
+      .find((description) =>
+        description.text.includes("fake-interview-model") && description.text.includes("未知")
+      ),
     "OfferAgent settings did not show the unknown Hosted Web Search capability",
   );
-  assert.match(capabilityStatus.text, /unknown/);
+  assert.match(capabilityStatus.text, /未知/);
   const reprobe = plugin.settingTabs[0].containerEl
     .findAllByClass("setting-item-button")
-    .find((button) => button.text === "Reprobe");
+    .find((button) => button.text === "重新探测");
   assert.ok(reprobe);
   reprobe.dispatch("click");
   await waitUntil(
     () => reprobe.disabled === false && plugin.settingTabs[0].containerEl
       .findAllByClass("setting-item-description")
-      .some((description) => description.text.includes("fake-interview-model: available")),
+      .some((description) =>
+        description.text.includes("fake-interview-model") && description.text.includes("可用")
+      ),
     "OfferAgent settings did not complete a Hosted Web Search reprobe",
   );
   const composer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
@@ -998,10 +1051,11 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   );
   assert.equal(
     activeView.contentEl.findByClass("offeragent-sidebar__add")?.getAttribute("aria-label"),
-    "Add context or images",
+    "添加上下文或图片",
   );
   assert.equal(modelSelect.getAttribute("aria-label"), "选择对话模型");
   const imagePicker = activeView.contentEl.findByClass("offeragent-sidebar__file-picker");
+  assert.equal(imagePicker.tabIndex, -1);
   let releaseFirstImageImport;
   const firstImageImport = new Promise((resolve) => {
     releaseFirstImageImport = () => resolve(new Uint8Array([1, 2, 3]).buffer);
@@ -1049,11 +1103,29 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   assert.deepEqual(imagePreviews.map(({ tagName }) => tagName), ["img", "img"]);
   assert.deepEqual(
     imagePreviews.map((preview) => preview.getAttribute("alt")),
-    ["Preview 1: first-preview.png", "Preview 2: second-preview.png"],
+    ["图片预览 1：first-preview.png", "图片预览 2：second-preview.png"],
   );
   assert.ok(imagePreviews.every(({ src }) => /^blob:/.test(src)));
+  const attachmentStrip = activeView.contentEl.findByClass("offeragent-sidebar__attachment-strip");
+  assert.ok(attachmentStrip, "draft images must render in one horizontal thumbnail strip");
+  assert.equal(
+    attachmentStrip.findAllByClass("offeragent-sidebar__attachment").length,
+    2,
+  );
   const draftCards = activeView.contentEl.findAllByClass("offeragent-sidebar__attachment");
   assert.ok(draftCards.every(({ draggable }) => draggable === true));
+  assert.equal(
+    draftCards[0].findByClass("offeragent-sidebar__attachment-move-up")?.getAttribute("aria-label"),
+    "将 first-preview.png 前移",
+  );
+  assert.equal(
+    draftCards[0].findByClass("offeragent-sidebar__attachment-move-down")?.getAttribute("aria-label"),
+    "将 first-preview.png 后移",
+  );
+  assert.equal(
+    draftCards[0].findByClass("offeragent-sidebar__attachment-remove")?.getAttribute("aria-label"),
+    "移除 first-preview.png",
+  );
   draftCards[1].dispatch("drop", {
     dataTransfer: {
       files: [{ name: "external.png", type: "image/png" }],
@@ -1065,7 +1137,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     activeView.contentEl
       .findAllByClass("offeragent-sidebar__attachment-preview")
       .map((preview) => preview.getAttribute("alt")),
-    ["Preview 1: first-preview.png", "Preview 2: second-preview.png"],
+    ["图片预览 1：first-preview.png", "图片预览 2：second-preview.png"],
     "an external file drop on a thumbnail must not reorder the first draft image",
   );
   let draggedIndex = "";
@@ -1081,7 +1153,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     activeView.contentEl
       .findAllByClass("offeragent-sidebar__attachment-preview")
       .map((preview) => preview.getAttribute("alt")),
-    ["Preview 1: second-preview.png", "Preview 2: first-preview.png"],
+    ["图片预览 1：second-preview.png", "图片预览 2：first-preview.png"],
   );
   activeView.contentEl.findByClass("offeragent-sidebar__attachment-remove").dispatch("click");
   activeView.contentEl.findByClass("offeragent-sidebar__attachment-remove").dispatch("click");
@@ -1119,10 +1191,10 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     () => activeView.contentEl.findByClass("offeragent-sidebar__message-attachment"),
     "Sent user message did not render its image immediately",
   );
-  assert.equal(sentAttachment.getAttribute("alt"), "Attachment 1: clipboard.png");
+  assert.equal(sentAttachment.getAttribute("alt"), "附件 1：clipboard.png");
   assert.match(sentAttachment.src, /^blob:/);
   await waitUntil(
-    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.text === "Send",
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.text === "发送",
     "Image message Agent Run did not return to idle",
   );
   const visibleAttachment = activeView.contentEl.findByClass("offeragent-sidebar__message-attachment");
@@ -1146,21 +1218,21 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__context-chip"), undefined);
   assert.match(
     activeView.contentEl.findByClass("offeragent-sidebar__permission")?.text ?? "",
-    /Trusted Vault/,
+    /信任 Vault/,
   );
   await plugin.setFastMode(true);
   await waitUntil(
-    () => activeView.contentEl.findByClass("offeragent-sidebar__context-chip--fast"),
+    () => activeView.contentEl.findByClass("offeragent-sidebar__context-chip--fast")?.text === "快速模式",
     "Fast Mode setting did not refresh the idle Sidebar presentation",
   );
   await plugin.setFastMode(false);
   await plugin.setVaultPermissionMode("read_only");
   await waitUntil(
-    () => activeView.contentEl.findByClass("offeragent-sidebar__permission")?.text === "Read Only",
+    () => activeView.contentEl.findByClass("offeragent-sidebar__permission")?.text === "只读",
     "Vault Permission setting did not refresh the idle Sidebar presentation",
   );
   await plugin.setVaultPermissionMode("trusted_vault");
-  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__send")?.text, "Send");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__send")?.text, "发送");
   assert.equal(
     activeView.contentEl.findByClass("offeragent-sidebar__permission")?.getAttribute("aria-label"),
     "Vault 权限模式：信任 Vault",
@@ -1232,6 +1304,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "停止当前运行",
   );
   const streamingDrawer = activeView.contentEl.findByClass("offeragent-sidebar__history-drawer");
+  assert.ok(streamingDrawer.findByClass("offeragent-sidebar__history-overflow"));
   for (const className of [
     "offeragent-sidebar__history-select",
     "offeragent-sidebar__history-rename",
@@ -1308,13 +1381,35 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
         (activity) =>
           activity
             .findAllByClass("offeragent-sidebar__tool-activity-label")
-            .some((label) => label.text.includes("Read contract agent.md")),
+            .some((label) => label.text.includes("读取约定 agent.md")),
       ),
     "The installed Runtime did not read the migrated Agent Contract",
   );
   assert.equal(contractReads.length, 2);
   assert.ok(contractReads.every((content) => content === migratedContract));
   assert.equal(activeView.contentEl.findAllByClass("offeragent-sidebar__run-status").length, 0);
+
+  const reviseRecent = activeView.contentEl.findByClass("offeragent-sidebar__message-revise");
+  assert.ok(reviseRecent, "The latest user message did not expose Put in Composer");
+  assert.equal(reviseRecent.text, "放入输入框");
+  assert.equal(reviseRecent.getAttribute("aria-label"), "将最近一条用户消息放入输入框");
+  const recentDraft = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  recentDraft.value = "Protect this recent draft.";
+  recentDraft.dispatch("input");
+  const previousRecentWindow = globalThis.window;
+  globalThis.window = { confirm: () => false };
+  reviseRecent.dispatch("click");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input").value,
+    "Protect this recent draft.",
+  );
+  globalThis.window.confirm = () => true;
+  reviseRecent.dispatch("click");
+  globalThis.window = previousRecentWindow;
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input").value,
+    "Practice my introduction.",
+  );
 
   const stoppedComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const stoppedInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
@@ -1339,16 +1434,31 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     activeView.contentEl.findByClass("offeragent-sidebar__run-status")?.text.includes("已停止"),
     true,
   );
-  assert.equal(reviseStopped.disabled, true);
+  assert.equal(reviseStopped.disabled, false);
   assert.equal(
     reviseStopped.getAttribute("title"),
-    "请先清空当前草稿和图片，再放入原提示词",
+    "当前草稿或图片会在确认后被原提示词替换",
   );
-  const protectedDraft = activeView.contentEl.findByClass("offeragent-sidebar__input");
-  protectedDraft.value = "";
-  protectedDraft.dispatch("input");
-  assert.equal(reviseStopped.disabled, false);
+  const previousWindow = globalThis.window;
+  globalThis.window = { confirm: () => false };
   reviseStopped.dispatch("click");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input").value,
+    "Protect this existing draft.",
+  );
+  const dynamicDraft = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  dynamicDraft.value = "";
+  dynamicDraft.dispatch("input");
+  assert.equal(reviseStopped.getAttribute("title"), "");
+  dynamicDraft.value = "Protect this newer draft.";
+  dynamicDraft.dispatch("input");
+  assert.equal(
+    reviseStopped.getAttribute("title"),
+    "当前草稿或图片会在确认后被原提示词替换",
+  );
+  globalThis.window.confirm = () => true;
+  reviseStopped.dispatch("click");
+  globalThis.window = previousWindow;
   assert.equal(
     activeView.contentEl.findByClass("offeragent-sidebar__input").value,
     "stop_and_revise_demo",
@@ -1404,7 +1514,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
           activity.dataset.status === "completed" &&
           activity
             .findAllByClass("offeragent-sidebar__tool-activity-label")
-            .some((label) => label.text.includes("Read notes/example.md")),
+            .some((label) => label.text.includes("读取 notes/example.md")),
       );
     },
     "OfferAgent did not execute and render the Vault tool activity",
@@ -1428,7 +1538,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   assert.ok(
     completedTool
       .findAllByClass("offeragent-sidebar__tool-activity-label")
-      .some((label) => /Read notes\/example\.md · completed/.test(label.text)),
+      .some((label) => /读取 notes\/example\.md · 完成/.test(label.text)),
   );
   assert.equal(completedTool.children[0].getAttribute("aria-expanded"), "false");
   completedTool.open = true;
@@ -1959,10 +2069,18 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "OfferAgent did not render the pending whole-batch confirmation card",
   );
   assert.match(pendingBatch.children[0].text, /Append one smoke-test line/);
+  assert.equal(
+    pendingBatch.findByClass("offeragent-sidebar__change-batch-status")?.text,
+    "Vault 变更：等待确认",
+  );
+  assert.match(
+    pendingBatch.findByClass("offeragent-sidebar__change-actions")?.text ?? "",
+    /追加：notes\/example\.md/,
+  );
   const applyAll = activeView.contentEl.findByClass("offeragent-sidebar__change-apply");
   const rejectAll = activeView.contentEl.findByClass("offeragent-sidebar__change-reject");
-  assert.equal(applyAll.text, "Apply all");
-  assert.equal(rejectAll.text, "Reject all");
+  assert.equal(applyAll.text, "全部应用");
+  assert.equal(rejectAll.text, "全部拒绝");
   rejectAll.dispatch("click");
   const rejectedBatch = await waitUntil(
     () =>
@@ -2088,7 +2206,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     .filter((activity) =>
       activity
         .findAllByClass("offeragent-sidebar__tool-activity-label")
-        .some((label) => label.text.includes("Read notes/example.md"))
+        .some((label) => label.text.includes("读取 notes/example.md"))
     ).length;
   const readOnlyComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const readOnlyInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
@@ -2103,7 +2221,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
             activity.dataset.status === "completed" &&
             activity
               .findAllByClass("offeragent-sidebar__tool-activity-label")
-              .some((label) => label.text.includes("Read notes/example.md")),
+              .some((label) => label.text.includes("读取 notes/example.md")),
         ).length === readActivityCount + 1,
     "Read Only blocked a permitted Vault read",
   );
@@ -2180,6 +2298,12 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   );
 
   await plugin.onunload();
+  const getRightLeaf = workspace.getRightLeaf;
+  workspace.getRightLeaf = () => undefined;
+  plugin.commands.get("open-offeragent-sidebar").callback();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(notices.at(-1), "OfferAgent 无法打开右侧栏。");
+  workspace.getRightLeaf = getRightLeaf;
   plugin = undefined;
   assert.equal(activeView, undefined);
 });

@@ -1,5 +1,9 @@
 import path from "node:path";
-import type { ConversationSummary, PinnedContextReference } from "@offeragent/protocol";
+import type {
+  ConversationSummary,
+  PinnedContextReference,
+  ProviderCapabilityStatus,
+} from "@offeragent/protocol";
 import {
   Component,
   type App,
@@ -17,6 +21,7 @@ import {
 import {
   RuntimeSupervisor,
   SidebarController,
+  type RuntimeViewState,
   type SidebarViewModel,
 } from "./sidebar-controller";
 import { ObsidianVaultToolAdapter } from "./vault-tool-adapter";
@@ -68,15 +73,51 @@ function permissionMode(value: unknown): VaultPermissionMode {
 }
 
 const PERMISSION_LABELS: Record<VaultPermissionMode, string> = {
-  ask_every_time: "Ask Every Time",
-  read_only: "Read Only",
-  trusted_vault: "Trusted Vault",
+  ask_every_time: "每次询问",
+  read_only: "只读",
+  trusted_vault: "信任 Vault",
 };
 
 const PERMISSION_ACCESSIBLE_LABELS: Record<VaultPermissionMode, string> = {
   ask_every_time: "Vault 权限模式：每次询问",
   read_only: "Vault 权限模式：只读",
   trusted_vault: "Vault 权限模式：信任 Vault",
+};
+
+const RUNTIME_STATE_LABELS: Record<RuntimeViewState, string> = {
+  connected: "已连接",
+  idle: "未启动",
+  starting: "正在启动",
+  unavailable: "不可用",
+};
+
+const CAPABILITY_STATUS_LABELS: Record<ProviderCapabilityStatus, string> = {
+  available: "可用",
+  unavailable: "不可用",
+  unknown: "未知",
+};
+
+const VAULT_CHANGE_STATUS_LABELS: Record<
+  SidebarViewModel["conversation"]["vaultChanges"][number]["status"],
+  string
+> = {
+  applied: "已应用",
+  applying: "正在应用",
+  conflicted: "存在冲突",
+  expired: "已过期",
+  failed: "失败",
+  pending: "等待确认",
+  rejected: "已拒绝",
+  rejecting: "正在拒绝",
+  undone: "已撤销",
+};
+
+const VAULT_ACTION_LABELS: Record<string, string> = {
+  append: "追加",
+  create: "创建",
+  delete: "删除",
+  replace: "替换",
+  update: "更新",
 };
 
 class OfferAgentSettingTab extends PluginSettingTab {
@@ -93,22 +134,22 @@ class OfferAgentSettingTab extends PluginSettingTab {
     const presentation = viewModel.presentation.settings;
     this.containerEl.createEl("h2", { text: "OfferAgent" });
     new Setting(this.containerEl)
-      .setName("Runtime status")
+      .setName("Runtime 状态")
       .setDesc(
         presentation.runtimeStatus === "connected"
-          ? "Connected to the local OfferAgent Runtime."
+          ? "已连接本地 OfferAgent Runtime。"
           : presentation.advanced.diagnostics,
       );
     new Setting(this.containerEl)
-      .setName("Provider status")
+      .setName("Provider 状态")
       .setDesc(
         presentation.providerStatus === "connected"
-          ? "Codex subscription Provider is available."
-          : "Provider is unavailable; check authentication and Runtime diagnostics.",
+          ? "Codex 订阅 Provider 可用。"
+          : "Provider 不可用；请检查登录状态和 Runtime 诊断信息。",
       );
     new Setting(this.containerEl)
-      .setName("Model")
-      .setDesc("Model used for this Conversation.")
+      .setName("模型")
+      .setDesc("当前对话使用的模型。")
       .addDropdown((dropdown) => {
         for (const model of viewModel.conversation.models) {
           dropdown.addOption(model.id, model.label);
@@ -119,8 +160,8 @@ class OfferAgentSettingTab extends PluginSettingTab {
       });
     if (presentation.fastMode) {
       new Setting(this.containerEl)
-        .setName("Fast Mode")
-        .setDesc("Uses the Provider's faster priority processing and may consume more credits.")
+        .setName("快速模式")
+        .setDesc("使用 Provider 的优先加速处理，可能消耗更多额度。")
         .addToggle((toggle) =>
           toggle
             .setValue(presentation.fastMode!.enabled)
@@ -128,13 +169,13 @@ class OfferAgentSettingTab extends PluginSettingTab {
         );
     }
     new Setting(this.containerEl)
-      .setName("Vault Permission Mode")
-      .setDesc("Controls Agent-requested writes for this Vault. Control files always require confirmation.")
+      .setName("Vault 权限模式")
+      .setDesc("控制 Agent 对此 Vault 发起的写入；控制文件始终需要确认。")
       .addDropdown((dropdown) =>
         dropdown
-          .addOption("trusted_vault", "Trusted Vault")
-          .addOption("ask_every_time", "Ask Every Time")
-          .addOption("read_only", "Read Only")
+          .addOption("trusted_vault", "信任 Vault")
+          .addOption("ask_every_time", "每次询问")
+          .addOption("read_only", "只读")
           .setValue(this.#owner.getVaultPermissionMode())
           .onChange(async (value) => {
             await this.#owner.setVaultPermissionMode(permissionMode(value));
@@ -143,27 +184,29 @@ class OfferAgentSettingTab extends PluginSettingTab {
     const advanced = this.containerEl.createEl("details", {
       cls: "offeragent-settings__advanced",
     });
-    advanced.createEl("summary", { text: "Advanced" });
+    advanced.createEl("summary", { text: "高级设置" });
     const advancedContent = advanced.createDiv({ cls: "offeragent-settings__advanced-content" });
     new Setting(advancedContent)
-      .setName("Git Checkpoint retention")
+      .setName("Git Checkpoint 保留策略")
       .setDesc(presentation.advanced.gitRetention);
     new Setting(advancedContent)
-      .setName("Diagnostics")
+      .setName("诊断")
       .setDesc(presentation.advanced.diagnostics);
     const hostedSearch = new Setting(advancedContent)
       .setName("Hosted Web Search")
-      .setDesc("Capability status: unknown. Status is discovered from the active backend and model.")
+      .setDesc("能力状态：未知。状态根据当前后端和模型探测。")
       .addButton((button) =>
-        button.setButtonText("Reprobe").onClick(async () => {
+        button.setButtonText("重新探测").onClick(async () => {
           button.setDisabled(true);
-          hostedSearch.setDesc("Capability status: probing…");
+          hostedSearch.setDesc("能力状态：正在探测…");
           try {
             const result = await this.#owner.reprobeHostedWebSearch();
-            hostedSearch.setDesc(`Capability status for ${result.modelId}: ${result.status}.`);
+            hostedSearch.setDesc(
+              `模型 ${result.modelId} 的能力状态：${CAPABILITY_STATUS_LABELS[result.status]}。`,
+            );
           } catch (error) {
             hostedSearch.setDesc(
-              `Capability probe failed: ${error instanceof Error ? error.message : String(error)}`,
+              `能力探测失败：${error instanceof Error ? error.message : String(error)}`,
             );
           } finally {
             button.setDisabled(false);
@@ -171,10 +214,12 @@ class OfferAgentSettingTab extends PluginSettingTab {
         }),
       );
     void this.#owner.getHostedWebSearchCapability().then((result) => {
-      hostedSearch.setDesc(`Capability status for ${result.modelId}: ${result.status}.`);
+      hostedSearch.setDesc(
+        `模型 ${result.modelId} 的能力状态：${CAPABILITY_STATUS_LABELS[result.status]}。`,
+      );
     }).catch((error: unknown) => {
       hostedSearch.setDesc(
-        `Capability status unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        `无法获取能力状态：${error instanceof Error ? error.message : String(error)}`,
       );
     });
   }
@@ -396,7 +441,7 @@ class OfferAgentSidebarView extends ItemView {
         preview.loading = "lazy";
         preview.setAttribute(
           "alt",
-          `Attachment ${attachmentIndex + 1}: ${attachment.fileName}`,
+          `附件 ${attachmentIndex + 1}：${attachment.fileName}`,
         );
         const previewKey = this.#messageAttachmentKey(message, attachment);
         this.#messagePreviewElements.set(previewKey, preview);
@@ -446,6 +491,25 @@ class OfferAgentSidebarView extends ItemView {
       messageBody.addClass("markdown-rendered");
       this.#scheduleMarkdownRender(key, messageBody, message.text, 0);
     } else messageBody.setText(message.text);
+    if (item.presentation.revision?.enabled) {
+      const revise = messageElement.createEl("button", {
+        cls: "offeragent-sidebar__message-revise",
+        text: item.presentation.revision.label,
+      });
+      revise.type = "button";
+      revise.setAttribute("aria-label", "将最近一条用户消息放入输入框");
+      revise.addEventListener("click", () => {
+        const requiresConfirmation =
+          this.#controller.userMessageRevisionRequiresConfirmation(message.agentRunId);
+        if (
+          requiresConfirmation &&
+          !window.confirm("当前草稿和图片会被最近一条用户消息替换。继续吗？")
+        ) return;
+        if (this.#controller.reviseUserMessage(message.agentRunId, requiresConfirmation)) {
+          this.#composerInput?.focus();
+        }
+      });
+    }
     if (item.presentation.copyable && message.text) {
       const copy = messageElement.createEl("button", {
         cls: "offeragent-sidebar__message-copy",
@@ -780,11 +844,13 @@ class OfferAgentSidebarView extends ItemView {
       cls: "offeragent-sidebar__title",
       text: viewModel.title,
     });
-    const status = brand.createDiv({
-      cls: "offeragent-sidebar__status",
-      text: viewModel.runtime.state,
-    });
-    status.dataset.state = viewModel.runtime.state;
+    if (viewModel.runtime.state !== "connected") {
+      const status = brand.createDiv({
+        cls: "offeragent-sidebar__status",
+        text: RUNTIME_STATE_LABELS[viewModel.runtime.state],
+      });
+      status.dataset.state = viewModel.runtime.state;
+    }
 
     if (viewModel.runtime.message) {
       container.createDiv({
@@ -828,12 +894,23 @@ class OfferAgentSidebarView extends ItemView {
     newConversation.addEventListener("click", () => {
       void this.#controller.createConversation();
     });
-    const settings = conversationRow.createEl("button", {
+    const headerOverflow = conversationRow.createEl("details", {
+      cls: "offeragent-sidebar__header-overflow",
+    });
+    const headerOverflowToggle = headerOverflow.createEl("summary", {
+      cls: "offeragent-sidebar__header-overflow-toggle",
+      text: "⋯",
+    });
+    headerOverflowToggle.setAttribute("aria-label", "打开侧栏菜单");
+    const headerOverflowMenu = headerOverflow.createDiv({
+      cls: "offeragent-sidebar__header-overflow-menu",
+    });
+    const settings = headerOverflowMenu.createEl("button", {
       cls: "offeragent-sidebar__settings",
-      text: "Settings",
+      text: "设置",
     });
     settings.type = "button";
-    settings.setAttribute("aria-label", "Open OfferAgent settings");
+    settings.setAttribute("aria-label", "打开 OfferAgent 设置");
     settings.addEventListener("click", this.#openSettings);
 
     if (this.#historyOpen) {
@@ -884,9 +961,13 @@ class OfferAgentSidebarView extends ItemView {
           select.dataset.titleOrigin = conversation.titleOrigin;
           select.disabled = conversationActionsDisabled;
           select.addEventListener("click", () => {
-            this.#historyOpen = false;
-            this.#restoreHistoryFocus = true;
-            void this.#controller.openConversation(conversation.id);
+            void this.#controller.openConversation(conversation.id).then(() => {
+              this.#historyOpen = false;
+              this.#restoreHistoryFocus = true;
+              this.#render(this.#controller.getViewModel());
+            }).catch((error) => {
+              new Notice(`打开对话失败：${error instanceof Error ? error.message : String(error)}`);
+            });
           });
           const updated = item.createEl("time", {
             cls: "offeragent-sidebar__history-updated",
@@ -898,33 +979,52 @@ class OfferAgentSidebarView extends ItemView {
             }).format(new Date(conversation.updatedAt)),
           });
           updated.dateTime = conversation.updatedAt;
-          const rename = item.createEl("button", { cls: "offeragent-sidebar__history-rename", text: "重命名" });
+          const itemOverflow = item.createEl("details", {
+            cls: "offeragent-sidebar__history-overflow",
+          });
+          const itemOverflowToggle = itemOverflow.createEl("summary", {
+            cls: "offeragent-sidebar__history-overflow-toggle",
+            text: "⋯",
+          });
+          itemOverflowToggle.setAttribute("aria-label", `打开 ${conversation.title} 的操作菜单`);
+          const itemOverflowMenu = itemOverflow.createDiv({
+            cls: "offeragent-sidebar__history-overflow-menu",
+          });
+          const rename = itemOverflowMenu.createEl("button", { cls: "offeragent-sidebar__history-rename", text: "重命名" });
           rename.type = "button";
           rename.disabled = conversationActionsDisabled;
           rename.addEventListener("click", () => {
             const title = window.prompt("重命名对话", conversation.title);
-            if (title !== null) void this.#controller.renameConversation(conversation.id, title);
+            if (title !== null) {
+              void this.#controller.renameConversation(conversation.id, title).catch((error) => {
+                new Notice(`重命名对话失败：${error instanceof Error ? error.message : String(error)}`);
+              });
+            }
           });
-          const archive = item.createEl("button", {
+          const archive = itemOverflowMenu.createEl("button", {
             cls: "offeragent-sidebar__history-archive",
             text: conversation.archived ? "恢复" : "归档",
           });
           archive.type = "button";
           archive.disabled = conversationActionsDisabled;
           archive.addEventListener("click", () => {
-            void this.#controller.setConversationArchived(conversation.id, !conversation.archived);
+            void this.#controller.setConversationArchived(
+              conversation.id,
+              !conversation.archived,
+            ).catch((error) => {
+              new Notice(`${conversation.archived ? "恢复" : "归档"}对话失败：${
+                error instanceof Error ? error.message : String(error)
+              }`);
+            });
           });
-          const remove = item.createEl("button", { cls: "offeragent-sidebar__history-delete", text: "删除" });
+          const remove = itemOverflowMenu.createEl("button", { cls: "offeragent-sidebar__history-delete", text: "删除" });
           remove.type = "button";
           remove.disabled = conversationActionsDisabled;
           remove.addEventListener("click", () => {
             if (!window.confirm(`确定永久删除“${conversation.title}”吗？`)) return;
-            if (conversation.id === viewModel.conversation.activeConversationId) {
-              void this.#controller.deleteCurrentConversation();
-            } else {
-              void this.#controller.openConversation(conversation.id)
-                .then(() => this.#controller.deleteCurrentConversation());
-            }
+            void this.#controller.deleteConversation(conversation.id).catch((error) => {
+              new Notice(`删除对话失败：${error instanceof Error ? error.message : String(error)}`);
+            });
           });
           searchable.push({ element: item, title: conversation.title.toLocaleLowerCase() });
         }
@@ -946,7 +1046,7 @@ class OfferAgentSidebarView extends ItemView {
     if (viewModel.presentation.transcript.length === 0) {
       transcript.createDiv({
         cls: "offeragent-sidebar__empty",
-        text: "OfferAgent is ready for a conversation.",
+        text: "准备好开始新对话了。",
       });
     }
 
@@ -974,7 +1074,7 @@ class OfferAgentSidebarView extends ItemView {
         card.createEl("h3", { text: batch.task });
         card.createDiv({
           cls: "offeragent-sidebar__change-batch-status",
-          text: `Vault Change Batch: ${batch.status}`,
+          text: `Vault 变更：${VAULT_CHANGE_STATUS_LABELS[batch.status]}`,
         });
         if (batch.message) {
           card.createDiv({
@@ -984,7 +1084,9 @@ class OfferAgentSidebarView extends ItemView {
         }
         const actions = card.createEl("ul", { cls: "offeragent-sidebar__change-actions" });
         for (const action of batch.actions) {
-          actions.createEl("li", { text: `${action.operation}: ${action.path}` });
+          actions.createEl("li", {
+            text: `${VAULT_ACTION_LABELS[action.operation] ?? action.operation}：${action.path}`,
+          });
         }
         for (const conflict of batch.conflicts ?? []) {
           card.createEl("pre", {
@@ -995,7 +1097,7 @@ class OfferAgentSidebarView extends ItemView {
         if (batch.status === "pending") {
           const apply = card.createEl("button", {
             cls: "offeragent-sidebar__change-apply",
-            text: "Apply all",
+            text: "全部应用",
           });
           apply.type = "button";
           apply.addEventListener("click", () => {
@@ -1003,7 +1105,7 @@ class OfferAgentSidebarView extends ItemView {
           });
           const reject = card.createEl("button", {
             cls: "offeragent-sidebar__change-reject",
-            text: "Reject all",
+            text: "全部拒绝",
           });
           reject.type = "button";
           reject.addEventListener("click", () => {
@@ -1012,7 +1114,7 @@ class OfferAgentSidebarView extends ItemView {
         } else if (batch.status === "applied") {
           const undo = card.createEl("button", {
             cls: "offeragent-sidebar__change-undo",
-            text: "Undo",
+            text: "撤销",
           });
           undo.type = "button";
           undo.addEventListener("click", () => {
@@ -1038,12 +1140,21 @@ class OfferAgentSidebarView extends ItemView {
           revise.type = "button";
           revise.disabled = !item.revision.enabled;
           revise.setAttribute("aria-label", "将已停止运行的原提示词放入输入框");
-          if (!item.revision.enabled) {
-            revise.setAttribute("title", "请先清空当前草稿和图片，再放入原提示词");
+          if (item.revision.requiresConfirmation) {
+            revise.setAttribute("title", "当前草稿或图片会在确认后被原提示词替换");
           }
           stoppedRevisionButtons.push({ agentRunId: item.agentRunId, button: revise });
           revise.addEventListener("click", () => {
-            this.#controller.reviseStoppedRun(item.agentRunId);
+            const requiresConfirmation =
+              this.#controller.stoppedRunRevisionRequiresConfirmation(item.agentRunId);
+            if (
+              requiresConfirmation &&
+              !window.confirm("当前草稿和图片会被已停止运行的原提示词替换。继续吗？")
+            ) return;
+            this.#controller.reviseStoppedRun(
+              item.agentRunId,
+              requiresConfirmation,
+            );
           });
         }
         itemElement = runStatus;
@@ -1074,20 +1185,20 @@ class OfferAgentSidebarView extends ItemView {
         text: chip.label,
       });
       open.type = "button";
-      open.setAttribute("aria-label", `Open pinned source ${chip.label}`);
+      open.setAttribute("aria-label", `打开已固定来源 ${chip.label}`);
       open.addEventListener("click", () => void this.#contextSources.openDocument(chip.path));
       const remove = chipElement.createEl("button", {
         cls: "offeragent-sidebar__context-remove",
         text: "×",
       });
       remove.type = "button";
-      remove.setAttribute("aria-label", `Remove pinned source ${chip.label}`);
+      remove.setAttribute("aria-label", `移除已固定来源 ${chip.label}`);
       remove.addEventListener("click", () => this.#controller.removePinnedContext(index));
     }
     if (viewModel.presentation.settings.fastMode?.enabled) {
       context.createDiv({
         cls: "offeragent-sidebar__context-chip offeragent-sidebar__context-chip--fast",
-        text: "Fast Mode",
+        text: "快速模式",
       });
     }
     const input = composer.createEl("textarea", { cls: "offeragent-sidebar__input" });
@@ -1103,9 +1214,11 @@ class OfferAgentSidebarView extends ItemView {
       this.#controller.setComposerDraft(input.value);
       for (const { agentRunId, button } of stoppedRevisionButtons) {
         button.disabled = !this.#controller.canReviseStoppedRun(agentRunId);
+        const requiresConfirmation =
+          this.#controller.stoppedRunRevisionRequiresConfirmation(agentRunId);
         button.setAttribute(
           "title",
-          button.disabled ? "请先清空当前草稿和图片，再放入原提示词" : "",
+          requiresConfirmation ? "当前草稿或图片会在确认后被原提示词替换" : "",
         );
       }
       const activeMention = mentionQuery(input.value, input.selectionStart ?? input.value.length);
@@ -1177,8 +1290,11 @@ class OfferAgentSidebarView extends ItemView {
       event.preventDefault();
       void acceptImages(files);
     });
+    const attachmentStrip = viewModel.presentation.composer.attachments.length > 0
+      ? composer.createDiv({ cls: "offeragent-sidebar__attachment-strip" })
+      : undefined;
     for (const [index, presented] of viewModel.presentation.composer.attachments.entries()) {
-      const attachment = composer.createDiv({ cls: "offeragent-sidebar__attachment" });
+      const attachment = attachmentStrip!.createDiv({ cls: "offeragent-sidebar__attachment" });
       attachment.draggable = !viewModel.presentation.composer.isPreparingAttachments;
       attachment.addEventListener("dragstart", (event) => {
         event.dataTransfer?.setData("application/x-offeragent-attachment-index", `${index}`);
@@ -1207,33 +1323,40 @@ class OfferAgentSidebarView extends ItemView {
         cls: "offeragent-sidebar__attachment-preview",
       });
       preview.src = previewUrl;
-      preview.setAttribute("alt", `Preview ${index + 1}: ${presented.fileName}`);
-      attachment.createDiv({
+      preview.setAttribute("alt", `图片预览 ${index + 1}：${presented.fileName}`);
+      attachment.createEl("span", {
         text: `${index + 1}. ${presented.fileName} (${Math.ceil(presented.size / 1024)} KiB)`,
       });
-      const moveUp = attachment.createEl("button", { text: "Up" });
+      const moveUp = attachment.createEl("button", {
+        cls: "offeragent-sidebar__attachment-move-up",
+        text: "↑",
+      });
       moveUp.type = "button";
       moveUp.disabled = viewModel.presentation.composer.isPreparingAttachments || index === 0;
-      moveUp.setAttribute("aria-label", `Move ${presented.fileName} earlier`);
+      moveUp.setAttribute("aria-label", `将 ${presented.fileName} 前移`);
       moveUp.addEventListener("click", () => this.#controller.moveDraftImage(index, -1));
-      const moveDown = attachment.createEl("button", { text: "Down" });
+      const moveDown = attachment.createEl("button", {
+        cls: "offeragent-sidebar__attachment-move-down",
+        text: "↓",
+      });
       moveDown.type = "button";
       moveDown.disabled = viewModel.presentation.composer.isPreparingAttachments ||
         index === viewModel.presentation.composer.attachments.length - 1;
-      moveDown.setAttribute("aria-label", `Move ${presented.fileName} later`);
+      moveDown.setAttribute("aria-label", `将 ${presented.fileName} 后移`);
       moveDown.addEventListener("click", () => this.#controller.moveDraftImage(index, 1));
       const removeAttachment = attachment.createEl("button", {
         cls: "offeragent-sidebar__attachment-remove",
-        text: "Remove",
+        text: "×",
       });
       removeAttachment.type = "button";
       removeAttachment.disabled = viewModel.presentation.composer.isPreparingAttachments;
-      removeAttachment.setAttribute("aria-label", `Remove ${presented.fileName}`);
+      removeAttachment.setAttribute("aria-label", `移除 ${presented.fileName}`);
       removeAttachment.addEventListener("click", () => this.#controller.removeDraftImage(index));
     }
     const controls = composer.createDiv({ cls: "offeragent-sidebar__composer-controls" });
     const filePicker = controls.createEl("input", { cls: "offeragent-sidebar__file-picker" });
     filePicker.type = "file";
+    filePicker.tabIndex = -1;
     filePicker.multiple = true;
     filePicker.accept = "image/png,image/jpeg,image/webp,image/gif";
     filePicker.setAttribute("aria-label", "添加图片（最多 20 张）");
@@ -1247,7 +1370,7 @@ class OfferAgentSidebarView extends ItemView {
       text: "+",
     });
     addButton.type = "button";
-    addButton.setAttribute("aria-label", "Add context or images");
+    addButton.setAttribute("aria-label", "添加上下文或图片");
     addButton.disabled = viewModel.presentation.composer.primaryAction.kind !== "send" ||
       viewModel.presentation.composer.isPreparingAttachments;
     addButton.addEventListener("click", () => {
@@ -1259,7 +1382,7 @@ class OfferAgentSidebarView extends ItemView {
       const addMenu = composer.createDiv({ cls: "offeragent-sidebar__add-menu" });
       const pinCurrent = addMenu.createEl("button", {
         cls: "offeragent-sidebar__pin-current",
-        text: "Pin current note",
+        text: "固定当前笔记",
       });
       pinCurrent.type = "button";
       pinCurrent.addEventListener("click", () => {
@@ -1270,11 +1393,11 @@ class OfferAgentSidebarView extends ItemView {
             this.#render(this.#controller.getViewModel());
           }
         }
-        else new Notice("Open a Vault note before pinning the current note.");
+        else new Notice("请先打开一篇 Vault 笔记，再固定当前笔记。");
       });
       const chooseDocument = addMenu.createEl("button", {
         cls: "offeragent-sidebar__choose-document",
-        text: "Choose Vault document",
+        text: "选择 Vault 文档",
       });
       chooseDocument.type = "button";
       chooseDocument.addEventListener("click", () => {
@@ -1285,7 +1408,7 @@ class OfferAgentSidebarView extends ItemView {
       });
       const addImages = addMenu.createEl("button", {
         cls: "offeragent-sidebar__attach",
-        text: "Add images",
+        text: "添加图片",
       });
       addImages.type = "button";
       addImages.addEventListener("click", () => filePicker.click());
@@ -1305,8 +1428,8 @@ class OfferAgentSidebarView extends ItemView {
       });
       search.type = "search";
       search.value = this.#documentChooserQuery;
-      search.placeholder = "Search Vault documents";
-      search.setAttribute("aria-label", "Search Vault documents to pin");
+      search.placeholder = "搜索 Vault 文档";
+      search.setAttribute("aria-label", "搜索要固定的 Vault 文档");
       const results = chooser.createDiv({ cls: "offeragent-sidebar__document-results" });
       const renderResults = (): void => {
         results.empty();
@@ -1582,24 +1705,24 @@ export default class OfferAgentPlugin extends Plugin {
         },
       ),
     );
-    this.addRibbonIcon("sparkles", "Open OfferAgent", () => {
+    this.addRibbonIcon("sparkles", "打开 OfferAgent", () => {
       void this.#openSidebar();
     });
     this.addCommand({
       id: "open-offeragent-sidebar",
-      name: "Open OfferAgent sidebar",
+      name: "打开 OfferAgent 侧栏",
       callback: () => {
         void this.#openSidebar();
       },
     });
     this.addCommand({
       id: "pin-selection-to-offeragent",
-      name: "Pin selection to OfferAgent",
+      name: "将选区固定到 OfferAgent",
       editorCallback: (editor, view) => {
         const path = view.file?.path;
         const selectedText = editor.getSelection();
         if (!path || !selectedText.trim()) {
-          new Notice("Select text in a Vault note before pinning it to OfferAgent.");
+          new Notice("请先在 Vault 笔记中选择文本，再固定到 OfferAgent。");
           return;
         }
         const from = editor.getCursor("from");
@@ -1656,15 +1779,15 @@ export default class OfferAgentPlugin extends Plugin {
 
   async getHostedWebSearchCapability() {
     const modelId = this.#controller?.getViewModel().conversation.selectedModelId;
-    if (!modelId) throw new Error("Select a model before checking Hosted Web Search.");
-    if (!this.#runtime) throw new Error("OfferAgent Runtime is not connected.");
+    if (!modelId) throw new Error("检查 Hosted Web Search 前请选择模型。");
+    if (!this.#runtime) throw new Error("OfferAgent Runtime 尚未连接。");
     return this.#runtime.getHostedWebSearchCapability(modelId);
   }
 
   async reprobeHostedWebSearch() {
     const modelId = this.#controller?.getViewModel().conversation.selectedModelId;
-    if (!modelId) throw new Error("Select a model before probing Hosted Web Search.");
-    if (!this.#runtime) throw new Error("OfferAgent Runtime is not connected.");
+    if (!modelId) throw new Error("重新探测 Hosted Web Search 前请选择模型。");
+    if (!this.#runtime) throw new Error("OfferAgent Runtime 尚未连接。");
     return this.#runtime.reprobeHostedWebSearch(modelId);
   }
 
@@ -1691,7 +1814,7 @@ export default class OfferAgentPlugin extends Plugin {
 
     const leaf = this.app.workspace.getRightLeaf(false);
     if (!leaf) {
-      new Notice("OfferAgent could not open the right sidebar.");
+      new Notice("OfferAgent 无法打开右侧栏。");
       return;
     }
     await leaf.setViewState({ type: SIDEBAR_VIEW_TYPE, active: true });
@@ -1699,7 +1822,7 @@ export default class OfferAgentPlugin extends Plugin {
   }
 
   #requiredController(): SidebarController {
-    if (!this.#controller) throw new Error("OfferAgent controller is not initialized.");
+    if (!this.#controller) throw new Error("OfferAgent 控制器尚未初始化。");
     return this.#controller;
   }
 

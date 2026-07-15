@@ -32,4 +32,9 @@ test("Conversation titles are local, useful, bounded, and image-aware", () => {
     generateConversationTitle({ text: "", date: new Date("2026-07-15T00:00:00Z") }),
     "图片分析 · 7月15日",
   );
+  assert.equal(
+    generateConversationTitle({ text: "请帮我分析一下" }),
+    "请帮我分析一下",
+    "a text-only prompt must not fall back to an image title",
+  );
 });

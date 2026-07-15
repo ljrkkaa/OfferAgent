@@ -89,7 +89,7 @@ export interface SidebarViewModel {
       primaryAction: {
         agentRunId?: string;
         kind: "resume" | "send" | "stop";
-        label: "Resume" | "Send" | "Stop";
+        label: "发送" | "停止" | "继续";
       };
     };
     settings: {
@@ -127,6 +127,11 @@ export interface SidebarViewModel {
             copyable: boolean;
             format: "markdown" | "plain_text";
             layout: "compact_user" | "full_width_agent";
+            revision?: {
+              enabled: boolean;
+              label: "放入输入框";
+              requiresConfirmation: boolean;
+            };
             sourceLabel?: string;
             usedSources?: EvidenceSnapshotSource[];
           };
@@ -136,7 +141,11 @@ export interface SidebarViewModel {
           agentRunId: string;
           label: string;
           message?: string;
-          revision?: { enabled: boolean; label: "放入输入框" };
+          revision?: {
+            enabled: boolean;
+            label: "放入输入框";
+            requiresConfirmation: boolean;
+          };
           status: Exclude<AgentRunRecord["status"], "completed" | "running">;
         }
       | {
@@ -161,22 +170,35 @@ const DEFAULT_ENVIRONMENT: SidebarEnvironment = {
 };
 
 const TOOL_ACTIONS: Record<ToolCallRecord["name"], string> = {
-  agent_contract_read: "Read contract",
-  daily_note_context: "Resolve Daily Note",
-  interview_catalog: "Search interview catalog",
-  planning_memory_list: "Scan Planning Memory",
-  planning_memory_read: "Recall Planning Memory",
-  project_list: "List Project Evidence",
-  project_read: "Read Project Evidence",
-  project_search: "Search Project Evidence",
-  research_browser: "Research in browser",
-  hosted_web_search_probe: "Probe web search",
-  skill_read: "Read skill",
-  vault_list: "List",
-  vault_propose_changes: "Change Vault",
-  vault_read: "Read",
-  vault_search: "Search",
-  web_read: "Read web page",
+  agent_contract_read: "读取约定",
+  daily_note_context: "解析 Daily Note",
+  interview_catalog: "搜索面试目录",
+  planning_memory_list: "扫描 Planning Memory",
+  planning_memory_read: "回忆 Planning Memory",
+  project_list: "列出 Project Evidence",
+  project_read: "读取 Project Evidence",
+  project_search: "搜索 Project Evidence",
+  research_browser: "浏览器研究",
+  hosted_web_search_probe: "探测网页搜索",
+  skill_read: "读取技能",
+  vault_list: "列出",
+  vault_propose_changes: "更改 Vault",
+  vault_read: "读取",
+  vault_search: "搜索",
+  web_read: "读取网页",
+};
+
+const TOOL_STATUS_LABELS: Record<ToolCallRecord["status"], string> = {
+  completed: "完成",
+  failed: "失败",
+  requested: "进行中",
+};
+
+const RUNTIME_STATE_LABELS: Record<RuntimeViewState, string> = {
+  connected: "已连接",
+  idle: "未启动",
+  starting: "正在启动",
+  unavailable: "不可用",
 };
 
 function toolTarget(call: ToolCallRecord): string | undefined {
@@ -194,7 +216,7 @@ function toolTarget(call: ToolCallRecord): string | undefined {
   }
   if (call.name === "agent_contract_read") return "agent.md";
   if (call.name === "vault_list") return "Vault";
-  if (call.name === "hosted_web_search_probe") return "active model";
+  if (call.name === "hosted_web_search_probe") return "当前模型";
   return undefined;
 }
 
@@ -274,7 +296,7 @@ export class SidebarController {
 
   addPinnedContext(reference: PinnedContextReference): void {
     if (this.#viewModel.conversation.runState === "streaming" || this.#sendPending) {
-      throw new Error("Wait for the current Agent Run to finish before changing Pinned Context.");
+      throw new Error("请等待当前 Agent Run 结束后再更改固定上下文。");
     }
     const path = reference.path.replaceAll("\\", "/").trim();
     if (
@@ -284,7 +306,7 @@ export class SidebarController {
         (segment) => !segment || segment === "." || segment === ".." || segment.startsWith("."),
       )
     ) {
-      throw new Error("Pinned Context must be a bounded path inside the current Vault.");
+      throw new Error("固定上下文必须是当前 Vault 内的受限路径。");
     }
     const normalized: PinnedContextReference = reference.kind === "selection"
       ? {
@@ -300,7 +322,7 @@ export class SidebarController {
         !Number.isSafeInteger(normalized.lineEnd) || normalized.lineEnd < normalized.lineStart ||
         normalized.lineEnd > 1_000_000)
     ) {
-      throw new Error("Pinned Context selection lines are invalid.");
+      throw new Error("固定上下文选区行号无效。");
     }
     if (this.#pinnedContext.some((candidate) =>
       JSON.stringify(candidate) === JSON.stringify(normalized)
@@ -309,7 +331,7 @@ export class SidebarController {
       return;
     }
     if (this.#pinnedContext.length >= 8) {
-      throw new Error("Pinned Context accepts at most 8 Vault sources for one Agent Run.");
+      throw new Error("每次运行最多固定 8 份 Vault 来源。");
     }
     this.#pinnedContext = [...this.#pinnedContext, normalized];
     this.refreshPresentation();
@@ -318,7 +340,7 @@ export class SidebarController {
   removePinnedContext(index: number): void {
     if (!Number.isSafeInteger(index) || index < 0 || index >= this.#pinnedContext.length) return;
     if (this.#viewModel.conversation.runState === "streaming" || this.#sendPending) {
-      throw new Error("Wait for the current Agent Run to finish before changing Pinned Context.");
+      throw new Error("请等待当前 Agent Run 结束后再更改固定上下文。");
     }
     this.#pinnedContext = this.#pinnedContext.filter((_reference, candidate) => candidate !== index);
     this.refreshPresentation();
@@ -371,7 +393,7 @@ export class SidebarController {
 
   #validateImageBatch(images: Array<{ mediaType: string; size: number }>): void {
     if (this.#draftImages.length + images.length > 20) {
-      this.#rejectImage("An Interview Submission accepts at most 20 images.");
+      this.#rejectImage("一次面试材料最多包含 20 张图片。");
     }
     let totalBytes = this.#draftImages.reduce(
       (total, draft) => total + draft.bytes.byteLength,
@@ -379,15 +401,15 @@ export class SidebarController {
     );
     for (const image of images) {
       if (!new Set(["image/gif", "image/jpeg", "image/png", "image/webp"]).has(image.mediaType)) {
-        this.#rejectImage("Choose a PNG, JPEG, WEBP, or GIF image.");
+        this.#rejectImage("请选择 PNG、JPEG、WEBP 或 GIF 图片。");
       }
       if (!Number.isSafeInteger(image.size) || image.size <= 0 || image.size > 10 * 1024 * 1024) {
-        this.#rejectImage("The image must be non-empty and no larger than 10 MiB.");
+        this.#rejectImage("图片不能为空，且单张不得超过 10 MiB。");
       }
       totalBytes += image.size;
     }
     if (totalBytes > 50 * 1024 * 1024) {
-      this.#rejectImage("An Interview Submission accepts at most 50 MiB of images in total.");
+      this.#rejectImage("一次面试材料的图片总大小最多为 50 MiB。");
     }
   }
 
@@ -464,11 +486,11 @@ export class SidebarController {
   ): Promise<Uint8Array> {
     if (message.id) {
       const conversationId = this.#viewModel.conversation.activeConversationId;
-      if (!conversationId) throw new Error("Choose a Conversation before loading its image.");
+    if (!conversationId) throw new Error("请先选择一条对话，再加载其中的图片。");
       return this.#runtime.readConversationAttachment({ conversationId, messageId: message.id, order });
     }
     const bytes = this.#optimisticAttachmentPreviews.get(message.agentRunId)?.get(order);
-    if (!bytes) throw new Error("The message image is not available yet.");
+    if (!bytes) throw new Error("消息图片暂不可用。");
     return new Uint8Array(bytes);
   }
 
@@ -507,7 +529,7 @@ export class SidebarController {
       this.#attachmentImportPending || this.#sendPending ||
       this.#viewModel.conversation.runState === "streaming"
     ) {
-      throw new Error("Wait for the current attachment import or Agent Run to finish.");
+      throw new Error("请等待当前附件导入或 Agent Run 结束。");
     }
     if (files.length > 0) this.#validateImageBatch(files);
     this.#attachmentImportPending = true;
@@ -629,10 +651,10 @@ export class SidebarController {
 
   async createConversation(title = "新对话"): Promise<void> {
     if (this.#attachmentImportPending || this.#sendPending) {
-      throw new Error("Wait for attachment import or sending to finish before creating a Conversation.");
+      throw new Error("请等待附件导入或发送完成后再新建对话。");
     }
     const modelId = this.#viewModel.conversation.selectedModelId;
-    if (!modelId) throw new Error("Choose an available model before creating a Conversation.");
+    if (!modelId) throw new Error("新建对话前请选择可用模型。");
     const conversation = await this.#runtime.createConversation({
       id: randomUUID(),
       title,
@@ -660,10 +682,10 @@ export class SidebarController {
 
   async openConversation(conversationId: string): Promise<void> {
     if (this.#viewModel.conversation.runState === "streaming") {
-      throw new Error("Stop the current Agent Run before switching Conversations.");
+      throw new Error("切换对话前请先停止当前 Agent Run。");
     }
     if (this.#attachmentImportPending || this.#sendPending) {
-      throw new Error("Wait for attachment import or sending to finish before switching Conversations.");
+      throw new Error("请等待附件导入或发送完成后再切换对话。");
     }
     const snapshot = await this.#runtime.openConversation(conversationId);
     this.#optimisticAttachmentPreviews.clear();
@@ -692,10 +714,10 @@ export class SidebarController {
     const conversationId = this.#viewModel.conversation.activeConversationId;
     if (!conversationId) return;
     if (this.#viewModel.conversation.runState === "streaming") {
-      throw new Error("Stop the current Agent Run before deleting its Conversation.");
+      throw new Error("删除对话前请先停止当前 Agent Run。");
     }
     if (this.#attachmentImportPending || this.#sendPending) {
-      throw new Error("Wait for attachment import or sending to finish before deleting this Conversation.");
+      throw new Error("请等待附件导入或发送完成后再删除对话。");
     }
     const proposalCalls = this.#viewModel.conversation.toolCalls.filter(
       (call) => call.name === "vault_propose_changes",
@@ -727,6 +749,32 @@ export class SidebarController {
     else await this.createConversation();
   }
 
+  async deleteConversation(conversationId: string): Promise<void> {
+    if (conversationId === this.#viewModel.conversation.activeConversationId) {
+      await this.deleteCurrentConversation();
+      return;
+    }
+    if (this.#viewModel.conversation.runState === "streaming") {
+      throw new Error("删除对话前请先停止当前 Agent Run。");
+    }
+    if (this.#attachmentImportPending || this.#sendPending) {
+      throw new Error("请等待附件导入或发送完成后再删除对话。");
+    }
+    const snapshot = await this.#runtime.openConversation(conversationId);
+    for (const call of snapshot.toolCalls ?? []) {
+      if (call.name !== "vault_propose_changes") continue;
+      if (call.status === "requested") this.#vaultChanges?.cancel(call.id);
+      await this.#vaultChanges?.acknowledge?.(call.id);
+    }
+    await this.#runtime.deleteConversation(conversationId);
+    this.#updateConversation({
+      ...this.#viewModel.conversation,
+      conversations: this.#viewModel.conversation.conversations.filter(
+        (conversation) => conversation.id !== conversationId,
+      ),
+    });
+  }
+
   async renameConversation(conversationId: string, title: string): Promise<void> {
     const trimmed = title.trim();
     if (!trimmed) return;
@@ -739,7 +787,7 @@ export class SidebarController {
 
   async setConversationArchived(conversationId: string, archived: boolean): Promise<void> {
     if (this.#viewModel.conversation.runState === "streaming") {
-      throw new Error("Stop the current Agent Run before archiving Conversations.");
+      throw new Error("归档对话前请先停止当前 Agent Run。");
     }
     const updated = await this.#runtime.updateConversation(conversationId, { archived });
     this.#replaceConversationSummary(updated);
@@ -799,13 +847,13 @@ export class SidebarController {
     const selectedModelId = this.#viewModel.conversation.selectedModelId;
     const conversationId = this.#viewModel.conversation.activeConversationId;
     if (this.#attachmentImportPending) {
-      throw new Error("Wait until all selected images are ready before sending.");
+      throw new Error("发送前请等待所有所选图片准备完成。");
     }
     if (!text && this.#draftImages.length === 0) return;
-    if (!selectedModelId) throw new Error("Choose an available model before sending a message.");
-    if (!conversationId) throw new Error("Create a Conversation before sending a message.");
+    if (!selectedModelId) throw new Error("发送消息前请选择可用模型。");
+    if (!conversationId) throw new Error("发送消息前请先新建对话。");
     if (this.#viewModel.conversation.runState === "streaming" || this.#sendPending) {
-      throw new Error("Wait for the current Agent Run to finish.");
+      throw new Error("请等待当前 Agent Run 结束。");
     }
     this.#sendPending = true;
     this.refreshPresentation();
@@ -1112,9 +1160,9 @@ export class SidebarController {
     },
   ): Promise<void> {
     const conversationId = this.#viewModel.conversation.activeConversationId;
-    if (!conversationId) throw new Error("Create a Conversation before resuming an Agent Run.");
+    if (!conversationId) throw new Error("继续 Agent Run 前请先新建对话。");
     if (this.#viewModel.conversation.runState === "streaming") {
-      throw new Error("Wait for the current Agent Run to finish.");
+      throw new Error("请等待当前 Agent Run 结束。");
     }
     const run = this.#viewModel.conversation.agentRuns.find((candidate) => candidate.id === agentRunId);
     if (!run || run.status !== "interrupted") {
@@ -1256,22 +1304,77 @@ export class SidebarController {
   }
 
   canReviseStoppedRun(agentRunId: string): boolean {
+    if (this.#attachmentImportPending || this.#sendPending) return false;
     const run = this.#viewModel.conversation.agentRuns.find(({ id }) => id === agentRunId);
     const prompt = this.#viewModel.conversation.messages.find(
       (message) => message.agentRunId === agentRunId && message.role === "user",
     )?.text;
-    if (!run || run.status !== "cancelled" || !prompt) return false;
-    if (this.#draftImages.length > 0) return false;
-    return this.#draftText.length === 0 || this.#draftText === prompt;
+    return Boolean(run && run.status === "cancelled" && prompt);
   }
 
-  reviseStoppedRun(agentRunId: string): boolean {
+  stoppedRunRevisionRequiresConfirmation(agentRunId: string): boolean {
+    if (!this.canReviseStoppedRun(agentRunId)) return false;
+    const prompt = this.#viewModel.conversation.messages.find(
+      (message) => message.agentRunId === agentRunId && message.role === "user",
+    )?.text;
+    return Boolean(
+      prompt && (
+        this.#draftImages.length > 0 ||
+        (this.#draftText.length > 0 && this.#draftText !== prompt)
+      ),
+    );
+  }
+
+  reviseStoppedRun(agentRunId: string, replaceExisting = false): boolean {
     if (!this.canReviseStoppedRun(agentRunId)) return false;
     const prompt = this.#viewModel.conversation.messages.find(
       (message) => message.agentRunId === agentRunId && message.role === "user",
     )?.text;
     if (!prompt) return false;
-    if (this.#draftText === prompt) return true;
+    const wouldReplace = this.stoppedRunRevisionRequiresConfirmation(agentRunId);
+    if (wouldReplace && !replaceExisting) return false;
+    if (this.#draftText === prompt && this.#draftImages.length === 0) return true;
+    this.#draftImages = [];
+    this.#draftText = prompt;
+    this.#draftRevision += 1;
+    this.refreshPresentation();
+    return true;
+  }
+
+  canReviseUserMessage(agentRunId: string): boolean {
+    if (
+      this.#attachmentImportPending || this.#sendPending ||
+      this.#viewModel.conversation.runState === "streaming"
+    ) return false;
+    const latestUserMessage = this.#viewModel.conversation.messages
+      .filter(({ role }) => role === "user")
+      .at(-1);
+    return Boolean(latestUserMessage?.agentRunId === agentRunId && latestUserMessage.text);
+  }
+
+  userMessageRevisionRequiresConfirmation(agentRunId: string): boolean {
+    if (!this.canReviseUserMessage(agentRunId)) return false;
+    const prompt = this.#viewModel.conversation.messages
+      .filter(({ role }) => role === "user")
+      .at(-1)?.text;
+    return Boolean(
+      prompt && (
+        this.#draftImages.length > 0 ||
+        (this.#draftText.length > 0 && this.#draftText !== prompt)
+      ),
+    );
+  }
+
+  reviseUserMessage(agentRunId: string, replaceExisting = false): boolean {
+    if (!this.canReviseUserMessage(agentRunId)) return false;
+    const prompt = this.#viewModel.conversation.messages
+      .filter(({ role }) => role === "user")
+      .at(-1)?.text;
+    if (!prompt) return false;
+    const wouldReplace = this.userMessageRevisionRequiresConfirmation(agentRunId);
+    if (wouldReplace && !replaceExisting) return false;
+    if (this.#draftText === prompt && this.#draftImages.length === 0) return true;
+    this.#draftImages = [];
     this.#draftText = prompt;
     this.#draftRevision += 1;
     this.refreshPresentation();
@@ -1279,7 +1382,7 @@ export class SidebarController {
   }
 
   async decideVaultChange(toolCallId: string, decision: "apply" | "reject"): Promise<void> {
-    if (!this.#vaultChanges) throw new Error("Vault Change decisions are unavailable.");
+    if (!this.#vaultChanges) throw new Error("当前无法处理 Vault 变更决定。");
     const call = this.#viewModel.conversation.toolCalls.find((candidate) => candidate.id === toolCallId);
     const run = call
       ? this.#viewModel.conversation.agentRuns.find((candidate) => candidate.id === call.agentRunId)
@@ -1306,7 +1409,7 @@ export class SidebarController {
     } else if (result.value.type === "vault_propose_changes") {
       this.#setVaultChangeStatus(toolCallId, result.value.decision);
     } else {
-      throw new Error("The Vault Change decision returned the wrong Tool Result type.");
+      throw new Error("Vault 变更决定返回了错误的工具结果类型。");
     }
     if (call && run?.status === "interrupted") {
       const recoveredToolResult = {
@@ -1320,7 +1423,7 @@ export class SidebarController {
   }
 
   async undoVaultChange(batchId: string): Promise<void> {
-    if (!this.#vaultChanges) throw new Error("Vault Change undo is unavailable.");
+    if (!this.#vaultChanges) throw new Error("当前无法撤销 Vault 变更。");
     const result = await this.#vaultChanges.undo(batchId);
     const change = this.#viewModel.conversation.vaultChanges.find(
       (candidate) => candidate.batchId === batchId,
@@ -1433,7 +1536,7 @@ export class SidebarController {
           2,
         ),
         id: call.id,
-        label: `${action}${target ? ` ${target}` : ""} · ${call.status}`,
+        label: `${action}${target ? ` ${target}` : ""} · ${TOOL_STATUS_LABELS[call.status]}`,
         status: call.status,
         ...(target ? { target } : {}),
       }];
@@ -1454,11 +1557,11 @@ export class SidebarController {
       ? {
           ...(this.#activeRun ? { agentRunId: this.#activeRun.agentRunId } : {}),
           kind: "stop" as const,
-          label: "Stop" as const,
+          label: "停止" as const,
         }
       : resumable
-        ? { agentRunId: resumable.id, kind: "resume" as const, label: "Resume" as const }
-        : { kind: "send" as const, label: "Send" as const };
+        ? { agentRunId: resumable.id, kind: "resume" as const, label: "继续" as const }
+        : { kind: "send" as const, label: "发送" as const };
     const selectedModel = this.#viewModel.conversation.models.find(
       ({ id }) => id === this.#viewModel.conversation.selectedModelId,
     );
@@ -1489,7 +1592,7 @@ export class SidebarController {
       message: SidebarViewModel["conversation"]["messages"][number],
     ): Extract<SidebarViewModel["presentation"]["transcript"][number], { kind: "message" }> => {
       const key = messageKeys.get(message);
-      if (!key) throw new Error("Sidebar message presentation requires a stable key.");
+      if (!key) throw new Error("侧栏消息展示需要稳定标识。");
       return {
         key,
         kind: "message",
@@ -1506,7 +1609,21 @@ export class SidebarController {
                 usedSources,
               } as const;
             })()
-          : { copyable: false, format: "plain_text", layout: "compact_user" },
+          : {
+              copyable: false,
+              format: "plain_text",
+              layout: "compact_user",
+              ...(this.canReviseUserMessage(message.agentRunId)
+                ? {
+                    revision: {
+                      enabled: true,
+                      label: "放入输入框" as const,
+                      requiresConfirmation:
+                        this.userMessageRevisionRequiresConfirmation(message.agentRunId),
+                    },
+                  }
+                : {}),
+            },
       };
     };
     const includedMessages = new Set<SidebarViewModel["conversation"]["messages"][number]>();
@@ -1548,8 +1665,8 @@ export class SidebarController {
       if (run.status !== "completed" && run.status !== "running") {
         const labels = {
           cancelled: "已停止",
-          failed: "Run failed.",
-          interrupted: "Run interrupted. Resume when ready.",
+          failed: "运行失败",
+          interrupted: "运行中断，可继续",
         } as const;
         transcript.push({
           kind: "run_status",
@@ -1559,11 +1676,10 @@ export class SidebarController {
           ...(run.status === "cancelled" && originatingPrompt
             ? {
                 revision: {
-                  enabled:
-                    this.#draftImages.length === 0 &&
-                    (this.#draftText.length === 0 ||
-                      this.#draftText === originatingPrompt),
+                  enabled: this.canReviseStoppedRun(run.id),
                   label: "放入输入框" as const,
+                  requiresConfirmation:
+                    this.stoppedRunRevisionRequiresConfirmation(run.id),
                 },
               }
             : {}),
@@ -1637,9 +1753,10 @@ export class SidebarController {
       settings: {
         advanced: {
           diagnostics:
-            this.#viewModel.runtime.message ?? `Runtime is ${this.#viewModel.runtime.state}.`,
-          gitRetention: "Git Checkpoints: 30 days or the most recent 100 batches.",
-          hostedWebSearch: "Hosted Web Search capability is probed per backend and model.",
+            this.#viewModel.runtime.message ??
+              `Runtime 状态：${RUNTIME_STATE_LABELS[this.#viewModel.runtime.state]}。`,
+          gitRetention: "Git Checkpoint：保留 30 天或最近 100 个批次。",
+          hostedWebSearch: "Hosted Web Search 能力按后端和模型分别探测。",
         },
         ...(selectedModel?.supportsFastMode
           ? { fastMode: { enabled: this.#environment.getFastModeEnabled() } }

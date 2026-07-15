@@ -73,6 +73,7 @@ export function generateConversationTitle(input: {
     .filter((line) => line.length > 0);
   let candidate = cleanedLines.find((line) => !/^https?:\/\/\S+$/i.test(line)) ??
     cleanedLines[0] ?? "";
+  const originalCandidate = candidate;
   const usesStandaloneUrl = /^https?:\/\/\S+$/i.test(candidate);
   if (!usesStandaloneUrl) {
     candidate = candidate
@@ -85,6 +86,9 @@ export function generateConversationTitle(input: {
   if (!candidate && input.imageFileName) {
     candidate = input.imageFileName.replace(/\.[^.]+$/, "").trim();
     usesImageFileName = true;
+  }
+  if (!candidate && originalCandidate) {
+    candidate = originalCandidate.split(/[。！？?!：:；;.]/u)[0]?.trim() ?? originalCandidate;
   }
   if (!candidate) {
     const date = input.date ?? new Date();

@@ -421,6 +421,108 @@ test("attachment staging is quota-bounded, deletion-safe, and namespaced by Stat
   assert.ok(afterRollback.attachmentId);
 });
 
+test("Conversation deletion reports attachment cleanup failures", async (t) => {
+  const {
+    MemoryRunAttachmentMetadataStore,
+    RunAttachmentModule,
+  } = await import(pathToFileURL(modulePath));
+  const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-attachment-delete-failure-"));
+  const backingMetadata = new MemoryRunAttachmentMetadataStore();
+  const metadata = new Proxy(backingMetadata, {
+    get(target, property) {
+      if (property === "deleteAttachment") {
+        return async () => { throw new Error("injected metadata cleanup failure"); };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const attachments = new RunAttachmentModule({ directory: root, metadata });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await attachments.stage({
+    agentRunId: "cleanup-run",
+    bytes: PNG,
+    claimedMediaType: "image/png",
+    conversationId: "cleanup-conversation",
+    fileName: "cleanup.png",
+  });
+  const deletion = await attachments.prepareConversationDeletion("cleanup-conversation");
+  await assert.rejects(deletion.commit(), /injected metadata cleanup failure/);
+});
+
+test("a failed post-delete cleanup remains recoverable without restoring a deleted Conversation", async (t) => {
+  const {
+    MemoryRunAttachmentMetadataStore,
+    RunAttachmentModule,
+  } = await import(pathToFileURL(modulePath));
+  const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-attachment-delete-recovery-"));
+  const backingMetadata = new MemoryRunAttachmentMetadataStore();
+  let failCleanup = true;
+  const metadata = new Proxy(backingMetadata, {
+    get(target, property) {
+      if (property === "conversationExists") return async () => false;
+      if (property === "deleteAttachment") {
+        return async (...arguments_) => {
+          if (failCleanup) throw new Error("transient metadata cleanup failure");
+          return target.deleteAttachment(...arguments_);
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const attachments = new RunAttachmentModule({ directory: root, metadata });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const staged = await attachments.stage({
+    agentRunId: "recovery-run",
+    bytes: PNG,
+    claimedMediaType: "image/png",
+    conversationId: "deleted-conversation",
+    fileName: "recovery.png",
+  });
+  const deletion = await attachments.prepareConversationDeletion("deleted-conversation");
+  await assert.rejects(deletion.commit(), /transient metadata cleanup failure/);
+  assert.deepEqual(await readdir(root), [`${staged.attachmentId}.deleting`]);
+
+  failCleanup = false;
+  await attachments.recoverPendingDeletions();
+  assert.deepEqual(await readdir(root), []);
+  assert.equal(await backingMetadata.getAttachment(staged.attachmentId), undefined);
+});
+
+test("pending deletion recovery reports a tombstone unlink failure", async (t) => {
+  const {
+    MemoryRunAttachmentMetadataStore,
+    RunAttachmentModule,
+  } = await import(pathToFileURL(modulePath));
+  const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-attachment-tombstone-failure-"));
+  const metadata = new MemoryRunAttachmentMetadataStore();
+  const attachments = new RunAttachmentModule({
+    directory: root,
+    metadata,
+    removeFile: async (filePath) => {
+      if (filePath.endsWith(".deleting")) throw new Error("injected tombstone unlink failure");
+      await rm(filePath);
+    },
+  });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const staged = await attachments.stage({
+    agentRunId: "tombstone-run",
+    bytes: PNG,
+    claimedMediaType: "image/png",
+    conversationId: "deleted-conversation",
+    fileName: "tombstone.png",
+  });
+  await attachments.prepareConversationDeletion("deleted-conversation");
+  await metadata.deleteAttachment(staged.attachmentId);
+
+  await assert.rejects(
+    attachments.recoverPendingDeletions(),
+    /injected tombstone unlink failure/,
+  );
+  assert.deepEqual(await readdir(root), [`${staged.attachmentId}.deleting`]);
+});
+
 test("legacy default attachment bytes migrate only when owned by the current State", async (t) => {
   const {
     MemoryRunAttachmentMetadataStore,

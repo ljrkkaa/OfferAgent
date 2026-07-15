@@ -1262,10 +1262,26 @@ async function handleConversationCommand(
     const deletion = await attachments.prepareConversationDeletion(command.conversationId);
     try {
       await store.deleteConversation(command.conversationId);
-      await deletion.commit();
     } catch (error) {
       await deletion.rollback();
       throw error;
+    }
+    try {
+      await deletion.commit();
+    } catch (error) {
+      process.stderr.write(
+        `OfferAgent deleted Conversation '${command.conversationId}', but attachment cleanup ` +
+        `requires recovery: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      try {
+        await attachments.recoverPendingDeletions();
+      } catch (recoveryError) {
+        process.stderr.write(
+          `OfferAgent attachment recovery remains pending: ${
+            recoveryError instanceof Error ? recoveryError.message : String(recoveryError)
+          }\n`,
+        );
+      }
     }
     event = { ...base, type: "conversation.deleted" };
   }

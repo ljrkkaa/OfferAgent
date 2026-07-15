@@ -1360,6 +1360,14 @@ export class RuntimeStateStore {
     });
   }
 
+  async conversationExists(conversationId: string): Promise<boolean> {
+    return Boolean(firstRow(
+      this.#database,
+      "SELECT 1 FROM conversations WHERE id = ?",
+      [conversationId],
+    ));
+  }
+
   async ensureConversation(conversationId: string, modelId: string): Promise<void> {
     await this.#write(() => {
       const timestamp = now();

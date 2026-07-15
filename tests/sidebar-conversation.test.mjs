@@ -110,7 +110,16 @@ test("the Sidebar presentation keeps activity, composer, and common settings com
       { id: "presentation-tool", target: longPath },
       { id: "presentation-skill", target: "interview-coach/rubric.md" },
       { id: "presentation-list", target: "Vault" },
-      { id: "presentation-probe", target: "active model" },
+      { id: "presentation-probe", target: "当前模型" },
+    ],
+  );
+  assert.deepEqual(
+    presentation.activities.map(({ label }) => label),
+    [
+      `读取 ${longPath} · 失败`,
+      "读取技能 interview-coach/rubric.md · 完成",
+      "列出 Vault · 完成",
+      "探测网页搜索 当前模型 · 完成",
     ],
   );
   assert.match(presentation.activities[0].details, /not_found.*no longer exists/s);
@@ -133,7 +142,17 @@ test("the Sidebar presentation keeps activity, composer, and common settings com
         ...messagePresentation,
       })),
     [
-      { role: "user", copyable: false, format: "plain_text", layout: "compact_user" },
+      {
+        role: "user",
+        copyable: false,
+        format: "plain_text",
+        layout: "compact_user",
+        revision: {
+          enabled: true,
+          label: "放入输入框",
+          requiresConfirmation: false,
+        },
+      },
       {
         role: "assistant", copyable: false, format: "markdown", layout: "full_width_agent",
         sourceLabel: "使用了 0 份文档", usedSources: [],
@@ -153,14 +172,20 @@ test("the Sidebar presentation keeps activity, composer, and common settings com
   assert.equal(
     presentation.transcript.find(
       (item) => item.kind === "run_status" && item.agentRunId === "failed-presentation-run",
-    )?.message,
-    "The earlier Provider request failed.",
+    )?.label,
+    "运行失败",
+  );
+  assert.equal(
+    presentation.transcript.find(
+      (item) => item.kind === "run_status" && item.agentRunId === "presentation-run",
+    )?.label,
+    "运行中断，可继续",
   );
   assert.deepEqual(presentation.composer.contextChips, []);
   assert.deepEqual(presentation.composer.primaryAction, {
     agentRunId: "presentation-run",
     kind: "resume",
-    label: "Resume",
+    label: "继续",
   });
   assert.equal(presentation.composer.permissionMode, "read_only");
   assert.deepEqual(presentation.settings.model, { id: "model-fast", label: "Fast Model" });
@@ -168,8 +193,8 @@ test("the Sidebar presentation keeps activity, composer, and common settings com
   assert.equal(presentation.settings.providerStatus, "connected");
   assert.equal(presentation.settings.runtimeStatus, "connected");
   assert.equal(presentation.settings.permissionMode, "read_only");
-  assert.match(presentation.settings.advanced.gitRetention, /30 days.*100/i);
-  assert.match(presentation.settings.advanced.diagnostics, /connected/i);
+  assert.match(presentation.settings.advanced.gitRetention, /30 天.*100/);
+  assert.match(presentation.settings.advanced.diagnostics, /Runtime 状态：已连接/);
 
   fastModeEnabled = false;
   vaultPermissionMode = "ask_every_time";
@@ -273,18 +298,18 @@ test("Pinned Context is inspectable, removable, and sent only with the next Agen
   );
   assert.throws(
     () => controller.addPinnedContext({ kind: "document", path: "../outside.md" }),
-    /inside the current Vault/,
+    /当前 Vault 内的受限路径/,
   );
   assert.throws(
     () => controller.addPinnedContext({ kind: "document", path: "agent.md" }),
-    /inside the current Vault/,
+    /当前 Vault 内的受限路径/,
   );
   for (let index = 0; index < 8; index += 1) {
     controller.addPinnedContext({ kind: "document", path: `notes/${index}.md` });
   }
   assert.throws(
     () => controller.addPinnedContext({ kind: "document", path: "notes/overflow.md" }),
-    /at most 8/,
+    /最多固定 8 份/,
   );
 });
 
@@ -880,7 +905,7 @@ test("the Sidebar serializes sends while an image upload is pending", async () =
   const firstSend = controller.sendMessage();
   await started;
   assert.equal(controller.getViewModel().presentation.composer.isSending, true);
-  await assert.rejects(controller.sendMessage(), /Wait for the current Agent Run/);
+  await assert.rejects(controller.sendMessage(), /请等待当前 Agent Run 结束/);
   failUpload(new Error("Upload stopped for test."));
   await assert.rejects(firstSend, /Upload stopped/);
   assert.equal(controller.getViewModel().presentation.composer.isSending, false);
@@ -1028,7 +1053,11 @@ test("the Sidebar rejects more than 20 images or more than 50 MiB without losing
     () => controller.attachImage({
       bytes: new Uint8Array(1), fileName: "overflow.png", mediaType: "image/png",
     }),
-    /20 images/i,
+    /最多包含 20 张图片/,
+  );
+  assert.equal(
+    controller.getViewModel().conversation.error.message,
+    "一次面试材料最多包含 20 张图片。",
   );
   for (let index = 0; index < 20; index += 1) controller.removeDraftImage(0);
   const tenMiB = new Uint8Array(10 * 1024 * 1024);
@@ -1041,7 +1070,11 @@ test("the Sidebar rejects more than 20 images or more than 50 MiB without losing
       fileName: "total-overflow.png",
       mediaType: "image/png",
     }),
-    /50 MiB/i,
+    /总大小最多为 50 MiB/,
+  );
+  assert.equal(
+    controller.getViewModel().conversation.error.message,
+    "一次面试材料的图片总大小最多为 50 MiB。",
   );
   assert.equal(controller.getViewModel().presentation.composer.draftText, "Keep this submission draft.");
   assert.equal(controller.getViewModel().presentation.composer.attachments.length, 5);
@@ -1074,15 +1107,15 @@ test("one attachment import is atomic and blocks Send until every image is decod
   const finishImport = controller.beginAttachmentImport();
 
   assert.equal(controller.getViewModel().presentation.composer.isPreparingAttachments, true);
-  await assert.rejects(controller.sendMessage("Do not send a partial selection."), /images are ready/i);
-  await assert.rejects(controller.deleteCurrentConversation(), /attachment import or sending/i);
+  await assert.rejects(controller.sendMessage("Do not send a partial selection."), /所有所选图片准备完成/);
+  await assert.rejects(controller.deleteCurrentConversation(), /附件导入或发送完成/);
   assert.equal(deleteCalls, 0);
   assert.throws(
     () => controller.attachImages([
       { bytes: new Uint8Array(8), fileName: "valid.png", mediaType: "image/png" },
       { bytes: new Uint8Array(8), fileName: "invalid.bmp", mediaType: "image/bmp" },
     ]),
-    /PNG, JPEG, WEBP, or GIF/,
+    /PNG、JPEG、WEBP 或 GIF/,
   );
   assert.deepEqual(controller.getViewModel().presentation.composer.attachments, []);
 
@@ -1816,6 +1849,11 @@ test("the Sidebar creates, switches, and deletes Conversations", async () => {
     },
   ]);
 
+  await controller.deleteConversation("conversation-a");
+  assert.equal(controller.getViewModel().conversation.activeConversationId, "conversation-b");
+  assert.equal(controller.getViewModel().conversation.conversations.length, 1);
+  assert.equal(controller.getViewModel().conversation.messages[0].text, "history conversation-b");
+
   await controller.createConversation("Fresh Conversation");
   const createdId = controller.getViewModel().conversation.activeConversationId;
   assert.equal(controller.getViewModel().conversation.conversations[0].title, "Fresh Conversation");
@@ -1823,7 +1861,7 @@ test("the Sidebar creates, switches, and deletes Conversations", async () => {
 
   await controller.deleteCurrentConversation();
   assert.notEqual(controller.getViewModel().conversation.activeConversationId, createdId);
-  assert.equal(controller.getViewModel().conversation.conversations.length, 2);
+  assert.equal(controller.getViewModel().conversation.conversations.length, 1);
 });
 
 test("the Sidebar titles a first message and manages archived Conversation metadata", async () => {
@@ -1924,7 +1962,7 @@ test("the Sidebar titles a first message and manages archived Conversation metad
   const updateCount = updates.length;
   await assert.rejects(
     controller.setConversationArchived("conversation-placeholder", true),
-    /Stop the current Agent Run/,
+    /归档对话前请先停止当前 Agent Run/,
   );
   assert.equal(updates.length, updateCount);
   assert.equal(
@@ -2105,15 +2143,52 @@ test("stopping an active Sidebar run makes it visibly cancelled", async () => {
     (item) => item.kind === "run_status" && item.agentRunId === cancelledRequest.agentRunId,
   );
   assert.equal(stoppedStatus.label, "已停止");
-  assert.deepEqual(stoppedStatus.revision, { enabled: true, label: "放入输入框" });
+  assert.deepEqual(stoppedStatus.revision, {
+    enabled: true,
+    label: "放入输入框",
+    requiresConfirmation: false,
+  });
+
+  const finishAttachmentImport = controller.beginAttachmentImport();
+  assert.equal(
+    controller.canReviseStoppedRun(cancelledRequest.agentRunId),
+    false,
+    "Stop-and-Revise must wait for an atomic image import to finish",
+  );
+  assert.equal(
+    controller.getViewModel().presentation.transcript.find(
+      (item) => item.kind === "run_status" && item.agentRunId === cancelledRequest.agentRunId,
+    ).revision.enabled,
+    false,
+  );
+  finishAttachmentImport();
+  assert.equal(controller.canReviseStoppedRun(cancelledRequest.agentRunId), true);
+  assert.equal(
+    controller.getViewModel().presentation.transcript.find(
+      (item) => item.kind === "run_status" && item.agentRunId === cancelledRequest.agentRunId,
+    ).revision.enabled,
+    true,
+  );
 
   controller.setComposerDraft("Keep my current draft.");
-  assert.equal(controller.canReviseStoppedRun(cancelledRequest.agentRunId), false);
+  assert.equal(controller.canReviseStoppedRun(cancelledRequest.agentRunId), true);
+  assert.equal(
+    controller.stoppedRunRevisionRequiresConfirmation(cancelledRequest.agentRunId),
+    true,
+  );
+  assert.equal(
+    controller.getViewModel().presentation.transcript.find(
+      (item) => item.kind === "run_status" && item.agentRunId === cancelledRequest.agentRunId,
+    ).revision.requiresConfirmation,
+    true,
+  );
   assert.equal(controller.reviseStoppedRun(cancelledRequest.agentRunId), false);
   assert.equal(controller.getViewModel().presentation.composer.draftText, "Keep my current draft.");
-  controller.setComposerDraft("");
-  assert.equal(controller.canReviseStoppedRun(cancelledRequest.agentRunId), true);
-  assert.equal(controller.reviseStoppedRun(cancelledRequest.agentRunId), true);
+  assert.equal(controller.reviseStoppedRun(cancelledRequest.agentRunId, true), true);
+  assert.equal(
+    controller.stoppedRunRevisionRequiresConfirmation(cancelledRequest.agentRunId),
+    false,
+  );
   assert.equal(controller.getViewModel().presentation.composer.draftText, "Cancel this run.");
 
   await controller.sendMessage("Revise and try again.");
@@ -2125,6 +2200,35 @@ test("stopping an active Sidebar run makes it visibly cancelled", async () => {
       ({ agentRunId, role }) => agentRunId === cancelledRequest.agentRunId && role === "assistant",
     ).text,
     "Partial stopped answer.",
+  );
+
+  const userMessages = controller.getViewModel().presentation.transcript.filter(
+    (item) => item.kind === "message" && item.message.role === "user",
+  );
+  assert.equal(userMessages[0].presentation.revision, undefined);
+  assert.deepEqual(userMessages[1].presentation.revision, {
+    enabled: true,
+    label: "放入输入框",
+    requiresConfirmation: false,
+  });
+  controller.setComposerDraft("Preserve this newer draft.");
+  assert.equal(
+    controller.userMessageRevisionRequiresConfirmation(
+      controller.getViewModel().conversation.agentRuns[1].id,
+    ),
+    true,
+  );
+  assert.equal(
+    controller.reviseUserMessage(controller.getViewModel().conversation.agentRuns[1].id),
+    false,
+  );
+  assert.equal(
+    controller.reviseUserMessage(controller.getViewModel().conversation.agentRuns[1].id, true),
+    true,
+  );
+  assert.equal(
+    controller.getViewModel().presentation.composer.draftText,
+    "Revise and try again.",
   );
 });
 
@@ -2170,7 +2274,11 @@ test("a restored Stopped Run keeps its partial output and guarded revision actio
     ({ kind }) => kind === "run_status",
   );
   assert.equal(status.label, "已停止");
-  assert.deepEqual(status.revision, { enabled: true, label: "放入输入框" });
+  assert.deepEqual(status.revision, {
+    enabled: true,
+    label: "放入输入框",
+    requiresConfirmation: false,
+  });
   assert.equal(controller.reviseStoppedRun("restored-stopped-run"), true);
   assert.equal(controller.getViewModel().presentation.composer.draftText, "Original prompt");
   assert.deepEqual(

@@ -32,6 +32,7 @@ export interface RunAttachmentMetadata {
 }
 
 export interface RunAttachmentMetadataStore {
+  conversationExists?(conversationId: string): Promise<boolean>;
   claimAttachments(input: {
     agentRunId: string;
     attachments: Array<{ attachmentId: string; order: number }>;
@@ -292,6 +293,7 @@ export class RunAttachmentModule {
   readonly #metadata: RunAttachmentMetadataStore;
   #mutationTail: Promise<void> = Promise.resolve();
   readonly #now: () => Date;
+  readonly #removeFile: (filePath: string) => Promise<void>;
   readonly #ttlMs: number;
 
   constructor(options: {
@@ -302,6 +304,7 @@ export class RunAttachmentModule {
     maxTotalBytes?: number;
     metadata: RunAttachmentMetadataStore;
     now?: () => Date;
+    removeFile?: (filePath: string) => Promise<void>;
     ttlMs?: number;
   }) {
     this.#directory = path.resolve(options.directory);
@@ -311,6 +314,7 @@ export class RunAttachmentModule {
     this.#maxTotalBytes = options.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
     this.#metadata = options.metadata;
     this.#now = options.now ?? (() => new Date());
+    this.#removeFile = options.removeFile ?? unlink;
     this.#ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
   }
 
@@ -381,7 +385,7 @@ export class RunAttachmentModule {
     try {
       await rename(temporaryPath, finalPath);
     } catch (error) {
-      await unlink(temporaryPath).catch(() => undefined);
+      await this.#removeFile(temporaryPath).catch(() => undefined);
       throw error;
     }
     const metadata: RunAttachmentMetadata = {
@@ -397,7 +401,7 @@ export class RunAttachmentModule {
     try {
       await this.#metadata.createAttachment(metadata);
     } catch (error) {
-      await unlink(finalPath).catch(() => undefined);
+      await this.#removeFile(finalPath).catch(() => undefined);
       throw error;
     }
     const { agentRunId: _run, conversationId: _conversation, createdAt: _created, ...staged } = metadata;
@@ -619,14 +623,32 @@ export class RunAttachmentModule {
       commit: async () => {
         await this.#withMutation(async () => {
           if (settled) return;
-          for (const item of moved) {
-            await unlink(this.#pathFor(`${item.attachmentId}.deleting`)).catch(() => undefined);
-          }
+          const cleanupErrors: unknown[] = [];
+          const movedIds = new Set(moved.map(({ attachmentId }) => attachmentId));
           for (const item of items) {
-            await this.#metadata.deleteAttachment(item.attachmentId).catch(() => undefined);
+            try {
+              await this.#metadata.deleteAttachment(item.attachmentId);
+            } catch (error) {
+              cleanupErrors.push(error);
+              continue;
+            }
+            if (!movedIds.has(item.attachmentId)) continue;
+            try {
+              await this.#removeFile(this.#pathFor(`${item.attachmentId}.deleting`));
+            } catch (error) {
+              cleanupErrors.push(error);
+            }
           }
           settled = true;
           this.#deletingConversations.delete(conversationId);
+          if (cleanupErrors.length > 0) {
+            throw new AggregateError(
+              cleanupErrors,
+              `Conversation '${conversationId}' attachment cleanup failed: ${cleanupErrors
+                .map((error) => error instanceof Error ? error.message : String(error))
+                .join("; ")}`,
+            );
+          }
         });
       },
       rollback: async () => {
@@ -652,12 +674,28 @@ export class RunAttachmentModule {
       const tombstonePath = this.#pathFor(entry.name);
       const metadata = await this.#metadata.getAttachment(attachmentId);
       if (!metadata) {
-        await unlink(tombstonePath).catch(() => undefined);
+        await this.#removeFile(tombstonePath).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+        });
+        continue;
+      }
+      if (
+        this.#metadata.conversationExists &&
+        !await this.#metadata.conversationExists(metadata.conversationId)
+      ) {
+        await this.#metadata.deleteAttachment(attachmentId);
+        await this.#removeFile(tombstonePath).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+        });
         continue;
       }
       const finalPath = this.#pathFor(attachmentId);
       const finalExists = await stat(finalPath).then(() => true, () => false);
-      if (finalExists) await unlink(tombstonePath).catch(() => undefined);
+      if (finalExists) {
+        await this.#removeFile(tombstonePath).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+        });
+      }
       else await rename(tombstonePath, finalPath);
     }
   }
@@ -678,7 +716,7 @@ export class RunAttachmentModule {
       if (!information || information.mtimeMs >= new Date(cutoff).getTime()) continue;
       const attachmentId = entry.name.endsWith(".tmp") ? undefined : entry.name;
       if (attachmentId && await this.#metadata.getAttachment(attachmentId)) continue;
-      await unlink(filePath).catch((error: NodeJS.ErrnoException) => {
+      await this.#removeFile(filePath).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== "ENOENT") throw error;
       });
       removed.push(entry.name);
@@ -693,7 +731,7 @@ export class RunAttachmentModule {
   async #delete(items: RunAttachmentMetadata[]): Promise<void> {
     for (const item of items) {
       try {
-        await unlink(this.#pathFor(item.attachmentId));
+        await this.#removeFile(this.#pathFor(item.attachmentId));
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
