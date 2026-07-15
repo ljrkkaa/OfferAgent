@@ -603,12 +603,26 @@ export interface AgentRunStart {
   conversationId: string;
   eventId: string;
   fastMode?: boolean;
-  input: { attachments?: RunAttachmentReference[]; role: "user"; text: string };
+  input: {
+    attachments?: RunAttachmentReference[];
+    pinnedContext?: PinnedContextReference[];
+    role: "user";
+    text: string;
+  };
   model: string;
   protocolVersion: typeof PROTOCOL_VERSION;
   sequence: 0;
   type: "agent_run.start";
 }
+
+export type PinnedContextReference =
+  | { kind: "document"; path: string }
+  | {
+      kind: "selection";
+      lineEnd: number;
+      lineStart: number;
+      path: string;
+    };
 
 export interface AgentRunCancel {
   agentRunId: string;

@@ -1,5 +1,5 @@
 import path from "node:path";
-import type { ConversationSummary } from "@offeragent/protocol";
+import type { ConversationSummary, PinnedContextReference } from "@offeragent/protocol";
 import {
   Component,
   type App,
@@ -43,6 +43,22 @@ const DEFAULT_SETTINGS: OfferAgentPluginSettings = {
 interface OfferAgentPluginSettings {
   fastMode: boolean;
   vaultPermissionMode: VaultPermissionMode;
+}
+
+interface SidebarContextSources {
+  currentDocumentPath(): string | undefined;
+  listDocuments(query: string): string[];
+  openDocument(path: string): Promise<void>;
+}
+
+function mentionQuery(
+  text: string,
+  cursor: number,
+): { end: number; query: string; start: number } | undefined {
+  const prefix = text.slice(0, cursor);
+  const match = /(?:^|\s)@([^\s@]*)$/u.exec(prefix);
+  if (!match) return undefined;
+  return { end: cursor, query: match[1] ?? "", start: prefix.lastIndexOf("@") };
 }
 
 function permissionMode(value: unknown): VaultPermissionMode {
@@ -166,6 +182,7 @@ class OfferAgentSettingTab extends PluginSettingTab {
 
 class OfferAgentSidebarView extends ItemView {
   readonly #controller: SidebarController;
+  readonly #contextSources: SidebarContextSources;
   readonly #openSettings: () => void;
   readonly #markdownRenders = new Map<string, {
     owner?: Component;
@@ -184,6 +201,12 @@ class OfferAgentSidebarView extends ItemView {
   #composerInput?: HTMLTextAreaElement;
   #focusHistorySearch = false;
   #historyOpen = false;
+  #addMenuOpen = false;
+  #documentChooserOpen = false;
+  #documentChooserQuery = "";
+  #mentionDismissed = false;
+  #mentionVisible = false;
+  #mentionIndex = 0;
   #restoreHistoryFocus = false;
   #showArchived = false;
   #newContentButton?: HTMLButtonElement;
@@ -191,10 +214,16 @@ class OfferAgentSidebarView extends ItemView {
   #transcriptElement?: HTMLDivElement;
   #unsubscribe?: () => void;
 
-  constructor(leaf: WorkspaceLeaf, controller: SidebarController, openSettings: () => void) {
+  constructor(
+    leaf: WorkspaceLeaf,
+    controller: SidebarController,
+    openSettings: () => void,
+    contextSources: SidebarContextSources,
+  ) {
     super(leaf);
     this.#controller = controller;
     this.#openSettings = openSettings;
+    this.#contextSources = contextSources;
   }
 
   getViewType(): string {
@@ -207,6 +236,16 @@ class OfferAgentSidebarView extends ItemView {
 
   getIcon(): string {
     return "sparkles";
+  }
+
+  #tryAddPinnedContext(reference: PinnedContextReference): boolean {
+    try {
+      this.#controller.addPinnedContext(reference);
+      return true;
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : String(error));
+      return false;
+    }
   }
 
   async onOpen(): Promise<void> {
@@ -981,11 +1020,24 @@ class OfferAgentSidebarView extends ItemView {
 
     const composer = container.createEl("form", { cls: "offeragent-sidebar__composer" });
     const context = composer.createDiv({ cls: "offeragent-sidebar__context" });
-    for (const chip of viewModel.presentation.composer.contextChips) {
-      context.createDiv({
-        cls: "offeragent-sidebar__context-chip",
+    for (const [index, chip] of viewModel.presentation.composer.contextChips.entries()) {
+      const chipElement = context.createDiv({
+        cls: "offeragent-sidebar__context-chip offeragent-sidebar__context-chip--pinned",
+      });
+      const open = chipElement.createEl("button", {
+        cls: "offeragent-sidebar__context-open",
         text: chip.label,
       });
+      open.type = "button";
+      open.setAttribute("aria-label", `Open pinned source ${chip.label}`);
+      open.addEventListener("click", () => void this.#contextSources.openDocument(chip.path));
+      const remove = chipElement.createEl("button", {
+        cls: "offeragent-sidebar__context-remove",
+        text: "×",
+      });
+      remove.type = "button";
+      remove.setAttribute("aria-label", `Remove pinned source ${chip.label}`);
+      remove.addEventListener("click", () => this.#controller.removePinnedContext(index));
     }
     if (viewModel.presentation.settings.fastMode?.enabled) {
       context.createDiv({
@@ -998,7 +1050,11 @@ class OfferAgentSidebarView extends ItemView {
     input.placeholder = "向 OfferAgent 提问…";
     input.setAttribute("aria-label", "给 OfferAgent 的消息");
     input.value = viewModel.presentation.composer.draftText;
+    let isComposing = false;
+    let mentionRenderPending = false;
     input.addEventListener("input", () => {
+      this.#mentionDismissed = false;
+      this.#mentionIndex = 0;
       this.#controller.setComposerDraft(input.value);
       for (const { agentRunId, button } of stoppedRevisionButtons) {
         button.disabled = !this.#controller.canReviseStoppedRun(agentRunId);
@@ -1007,8 +1063,15 @@ class OfferAgentSidebarView extends ItemView {
           button.disabled ? "请先清空当前草稿和图片，再放入原提示词" : "",
         );
       }
+      const activeMention = mentionQuery(input.value, input.selectionStart ?? input.value.length);
+      const shouldReconcileMention = Boolean(activeMention) || this.#mentionVisible;
+      this.#mentionVisible = Boolean(activeMention);
+      if (isComposing) {
+        mentionRenderPending ||= shouldReconcileMention;
+      } else if (shouldReconcileMention) {
+        this.#render(this.#controller.getViewModel());
+      }
     });
-    let isComposing = false;
     let suppressCompositionEnter = false;
     input.addEventListener("compositionstart", () => {
       isComposing = true;
@@ -1017,6 +1080,10 @@ class OfferAgentSidebarView extends ItemView {
     input.addEventListener("compositionend", () => {
       isComposing = false;
       suppressCompositionEnter = true;
+      if (mentionRenderPending) {
+        mentionRenderPending = false;
+        this.#render(this.#controller.getViewModel());
+      }
       setTimeout(() => {
         suppressCompositionEnter = false;
       }, 0);
@@ -1130,15 +1197,114 @@ class OfferAgentSidebarView extends ItemView {
       const files = [...(filePicker.files ?? [])];
       if (files.length > 0) void acceptImages(files);
     });
-    const attachButton = controls.createEl("button", {
-      cls: "offeragent-sidebar__attach",
-      text: "添加图片",
+    const addButton = controls.createEl("button", {
+      cls: "offeragent-sidebar__add",
+      text: "+",
     });
-    attachButton.type = "button";
-    attachButton.setAttribute("aria-label", "添加图片（最多 20 张）");
-    attachButton.disabled = viewModel.presentation.composer.primaryAction.kind !== "send" ||
+    addButton.type = "button";
+    addButton.setAttribute("aria-label", "Add context or images");
+    addButton.disabled = viewModel.presentation.composer.primaryAction.kind !== "send" ||
       viewModel.presentation.composer.isPreparingAttachments;
-    attachButton.addEventListener("click", () => filePicker.click());
+    addButton.addEventListener("click", () => {
+      this.#addMenuOpen = !this.#addMenuOpen;
+      this.#documentChooserOpen = false;
+      this.#render(this.#controller.getViewModel());
+    });
+    if (this.#addMenuOpen) {
+      const addMenu = composer.createDiv({ cls: "offeragent-sidebar__add-menu" });
+      const pinCurrent = addMenu.createEl("button", {
+        cls: "offeragent-sidebar__pin-current",
+        text: "Pin current note",
+      });
+      pinCurrent.type = "button";
+      pinCurrent.addEventListener("click", () => {
+        const path = this.#contextSources.currentDocumentPath();
+        if (path) {
+          if (this.#tryAddPinnedContext({ kind: "document", path })) {
+            this.#addMenuOpen = false;
+            this.#render(this.#controller.getViewModel());
+          }
+        }
+        else new Notice("Open a Vault note before pinning the current note.");
+      });
+      const chooseDocument = addMenu.createEl("button", {
+        cls: "offeragent-sidebar__choose-document",
+        text: "Choose Vault document",
+      });
+      chooseDocument.type = "button";
+      chooseDocument.addEventListener("click", () => {
+        this.#addMenuOpen = false;
+        this.#documentChooserOpen = true;
+        this.#documentChooserQuery = "";
+        this.#render(this.#controller.getViewModel());
+      });
+      const addImages = addMenu.createEl("button", {
+        cls: "offeragent-sidebar__attach",
+        text: "Add images",
+      });
+      addImages.type = "button";
+      addImages.addEventListener("click", () => filePicker.click());
+    }
+    const mention = !this.#mentionDismissed
+      ? mentionQuery(
+          input.value,
+          restoreComposerFocus ? selectionStart ?? input.value.length : input.value.length,
+        )
+      : undefined;
+    this.#mentionVisible = Boolean(mention);
+    if (this.#documentChooserOpen) {
+      const chooser = composer.createDiv({ cls: "offeragent-sidebar__document-chooser" });
+      chooser.setAttribute("role", "listbox");
+      const search = chooser.createEl("input", {
+        cls: "offeragent-sidebar__document-search",
+      });
+      search.type = "search";
+      search.value = this.#documentChooserQuery;
+      search.placeholder = "Search Vault documents";
+      search.setAttribute("aria-label", "Search Vault documents to pin");
+      const results = chooser.createDiv({ cls: "offeragent-sidebar__document-results" });
+      const renderResults = (): void => {
+        results.empty();
+        for (const path of this.#contextSources.listDocuments(search.value)) {
+          const choice = results.createEl("button", {
+            cls: "offeragent-sidebar__document-choice",
+            text: path,
+          });
+          choice.type = "button";
+          choice.addEventListener("click", () => {
+            if (!this.#tryAddPinnedContext({ kind: "document", path })) return;
+            this.#documentChooserOpen = false;
+            this.#documentChooserQuery = "";
+            this.#render(this.#controller.getViewModel());
+          });
+        }
+      };
+      search.addEventListener("input", () => {
+        this.#documentChooserQuery = search.value;
+        renderResults();
+      });
+      renderResults();
+    } else if (mention) {
+      const chooser = composer.createDiv({ cls: "offeragent-sidebar__document-chooser" });
+      chooser.setAttribute("role", "listbox");
+      for (const [index, path] of this.#contextSources.listDocuments(mention.query).entries()) {
+        const choice = chooser.createEl("button", {
+          cls: index === this.#mentionIndex
+            ? "offeragent-sidebar__document-choice is-selected"
+            : "offeragent-sidebar__document-choice",
+          text: path,
+        });
+        choice.type = "button";
+        choice.addEventListener("click", () => {
+          if (!this.#tryAddPinnedContext({ kind: "document", path })) return;
+          const next = `${input.value.slice(0, mention.start)}${input.value.slice(mention.end)}`;
+          this.#mentionDismissed = true;
+          this.#mentionVisible = false;
+          this.#controller.setComposerDraft(next);
+          this.#render(this.#controller.getViewModel());
+        });
+      }
+    }
     const modelSelect = controls.createEl("select", {
       cls: "offeragent-sidebar__model-select",
     });
@@ -1201,6 +1367,42 @@ class OfferAgentSidebarView extends ItemView {
       void this.#controller.sendMessage(text).catch(() => undefined);
     };
     input.addEventListener("keydown", (event) => {
+      const activeMention = !this.#mentionDismissed
+        ? mentionQuery(input.value, input.selectionStart ?? input.value.length)
+        : undefined;
+      const matches = activeMention
+        ? this.#contextSources.listDocuments(activeMention.query)
+        : [];
+      if (activeMention && matches.length > 0 && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        this.#mentionIndex = (this.#mentionIndex + direction + matches.length) % matches.length;
+        for (const [index, choice] of Array.from(
+          composer.querySelectorAll<HTMLButtonElement>(".offeragent-sidebar__document-choice"),
+        ).entries()) {
+          choice.classList.toggle("is-selected", index === this.#mentionIndex);
+        }
+        return;
+      }
+      if (activeMention && matches.length > 0 && event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        const selectedPath = matches[Math.min(this.#mentionIndex, matches.length - 1)]!;
+        if (!this.#tryAddPinnedContext({ kind: "document", path: selectedPath })) return;
+        const cursor = input.selectionStart ?? input.value.length;
+        const next = `${input.value.slice(0, activeMention.start)}${input.value.slice(cursor)}`;
+        this.#mentionDismissed = true;
+        this.#mentionVisible = false;
+        this.#controller.setComposerDraft(next);
+        this.#render(this.#controller.getViewModel());
+        return;
+      }
+      if (activeMention && event.key === "Escape") {
+        event.preventDefault();
+        this.#mentionDismissed = true;
+        this.#mentionVisible = false;
+        this.#render(this.#controller.getViewModel());
+        return;
+      }
       if (
         event.key !== "Enter" ||
         event.shiftKey ||
@@ -1309,6 +1511,21 @@ export default class OfferAgentPlugin extends Plugin {
         leaf,
         this.#requiredController(),
         () => this.#openSettings(),
+        {
+          currentDocumentPath: () => this.app.workspace.getActiveFile()?.path,
+          listDocuments: (query) => {
+            const normalized = query.trim().toLocaleLowerCase();
+            return this.app.vault.getFiles()
+              .filter((file) => file.extension === "md" && file.path.toLocaleLowerCase() !== "agent.md")
+              .map((file) => file.path)
+              .filter((path) => !normalized || path.toLocaleLowerCase().includes(normalized))
+              .sort((left, right) => left.localeCompare(right))
+              .slice(0, 8);
+          },
+          openDocument: async (path) => {
+            await this.app.workspace.openLinkText(path, "", false);
+          },
+        },
       ),
     );
     this.addRibbonIcon("sparkles", "Open OfferAgent", () => {
@@ -1318,6 +1535,33 @@ export default class OfferAgentPlugin extends Plugin {
       id: "open-offeragent-sidebar",
       name: "Open OfferAgent sidebar",
       callback: () => {
+        void this.#openSidebar();
+      },
+    });
+    this.addCommand({
+      id: "pin-selection-to-offeragent",
+      name: "Pin selection to OfferAgent",
+      editorCallback: (editor, view) => {
+        const path = view.file?.path;
+        const selectedText = editor.getSelection();
+        if (!path || !selectedText.trim()) {
+          new Notice("Select text in a Vault note before pinning it to OfferAgent.");
+          return;
+        }
+        const from = editor.getCursor("from");
+        const to = editor.getCursor("to");
+        const inclusiveEndLine = to.ch === 0 && to.line > from.line ? to.line : to.line + 1;
+        try {
+          this.#requiredController().addPinnedContext({
+            kind: "selection",
+            path,
+            lineStart: from.line + 1,
+            lineEnd: inclusiveEndLine,
+          });
+        } catch (error) {
+          new Notice(error instanceof Error ? error.message : String(error));
+          return;
+        }
         void this.#openSidebar();
       },
     });

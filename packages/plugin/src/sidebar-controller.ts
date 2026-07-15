@@ -7,6 +7,7 @@ import type {
   ConversationSummary,
   ModelDescriptor,
   PersistedRunAttachmentMetadata,
+  PinnedContextReference,
   StagedRunAttachment,
   ProviderErrorCode,
   ToolCallRecord,
@@ -72,7 +73,13 @@ export interface SidebarViewModel {
         previewBytes: Uint8Array;
         size: number;
       }>;
-      contextChips: Array<{ kind: "scope"; label: string }>;
+      contextChips: Array<{
+        kind: "pinned";
+        label: string;
+        lineEnd?: number;
+        lineStart?: number;
+        path: string;
+      }>;
       draftText: string;
       isPreparingAttachments: boolean;
       isSending: boolean;
@@ -224,6 +231,7 @@ export class SidebarController {
   #providerStatus: "connected" | "unavailable" = "unavailable";
   #draftText = "";
   #draftImages: Array<{ bytes: Uint8Array; fileName: string; mediaType: string }> = [];
+  #pinnedContext: PinnedContextReference[] = [];
   #draftRevision = 0;
   #attachmentImportPending = false;
   #sendPending = false;
@@ -258,6 +266,58 @@ export class SidebarController {
     this.#subscribers.add(subscriber);
     subscriber(this.getViewModel());
     return () => this.#subscribers.delete(subscriber);
+  }
+
+  addPinnedContext(reference: PinnedContextReference): void {
+    if (this.#viewModel.conversation.runState === "streaming" || this.#sendPending) {
+      throw new Error("Wait for the current Agent Run to finish before changing Pinned Context.");
+    }
+    const path = reference.path.replaceAll("\\", "/").trim();
+    if (
+      !path || path.length > 512 || path.startsWith("/") || /^[A-Za-z]:/u.test(path) ||
+      path.toLocaleLowerCase() === "agent.md" ||
+      path.split("/").some(
+        (segment) => !segment || segment === "." || segment === ".." || segment.startsWith("."),
+      )
+    ) {
+      throw new Error("Pinned Context must be a bounded path inside the current Vault.");
+    }
+    const normalized: PinnedContextReference = reference.kind === "selection"
+      ? {
+          kind: "selection",
+          path,
+          lineStart: reference.lineStart,
+          lineEnd: reference.lineEnd,
+        }
+      : { kind: "document", path };
+    if (
+      normalized.kind === "selection" &&
+      (!Number.isSafeInteger(normalized.lineStart) || normalized.lineStart < 1 ||
+        !Number.isSafeInteger(normalized.lineEnd) || normalized.lineEnd < normalized.lineStart ||
+        normalized.lineEnd > 1_000_000)
+    ) {
+      throw new Error("Pinned Context selection lines are invalid.");
+    }
+    if (this.#pinnedContext.some((candidate) =>
+      JSON.stringify(candidate) === JSON.stringify(normalized)
+    )) {
+      this.refreshPresentation();
+      return;
+    }
+    if (this.#pinnedContext.length >= 8) {
+      throw new Error("Pinned Context accepts at most 8 Vault sources for one Agent Run.");
+    }
+    this.#pinnedContext = [...this.#pinnedContext, normalized];
+    this.refreshPresentation();
+  }
+
+  removePinnedContext(index: number): void {
+    if (!Number.isSafeInteger(index) || index < 0 || index >= this.#pinnedContext.length) return;
+    if (this.#viewModel.conversation.runState === "streaming" || this.#sendPending) {
+      throw new Error("Wait for the current Agent Run to finish before changing Pinned Context.");
+    }
+    this.#pinnedContext = this.#pinnedContext.filter((_reference, candidate) => candidate !== index);
+    this.refreshPresentation();
   }
 
   refreshPresentation(): void {
@@ -698,6 +758,7 @@ export class SidebarController {
         bytes: new Uint8Array(image.bytes),
       })),
       text: this.#draftText,
+      pinnedContext: this.#pinnedContext.map((reference) => ({ ...reference })),
     };
     const submittedDraftRevision = this.#draftRevision;
     let clearedDraftRevision: number | undefined;
@@ -706,6 +767,7 @@ export class SidebarController {
       if (clearedDraftRevision === undefined || this.#draftRevision !== clearedDraftRevision) return;
       this.#draftText = submittedDraft.text;
       this.#draftImages = submittedDraft.images;
+      this.#pinnedContext = submittedDraft.pinnedContext;
       this.#draftRevision += 1;
     };
     let attachments: Array<{ attachmentId: string; order: number }> | undefined;
@@ -798,6 +860,9 @@ export class SidebarController {
           : {}),
         input: text,
         ...(attachments ? { attachments } : {}),
+        ...(submittedDraft.pinnedContext.length > 0
+          ? { pinnedContext: submittedDraft.pinnedContext }
+          : {}),
       })) {
         if (event.type === "agent_run.started") {
           runStarted = true;
@@ -827,6 +892,9 @@ export class SidebarController {
             this.#draftRevision += 1;
             clearedDraftRevision = this.#draftRevision;
           }
+          if (
+            JSON.stringify(this.#pinnedContext) === JSON.stringify(submittedDraft.pinnedContext)
+          ) this.#pinnedContext = [];
           this.#providerStatus = "connected";
           this.refreshPresentation();
         } else if (event.type === "agent_run.delta") {
@@ -1475,7 +1543,16 @@ export class SidebarController {
           previewBytes: new Uint8Array(image.bytes),
           size: image.bytes.byteLength,
         })),
-        contextChips: [{ kind: "scope", label: "Vault context" }],
+        contextChips: this.#pinnedContext.map((reference) => ({
+          kind: "pinned" as const,
+          path: reference.path,
+          label: reference.kind === "selection"
+            ? `${reference.path}:${reference.lineStart}-${reference.lineEnd}`
+            : reference.path,
+          ...(reference.kind === "selection"
+            ? { lineStart: reference.lineStart, lineEnd: reference.lineEnd }
+            : {}),
+        })),
         draftText: this.#draftText,
         isPreparingAttachments: this.#attachmentImportPending,
         isSending: this.#sendPending,

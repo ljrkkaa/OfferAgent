@@ -21,6 +21,7 @@ import {
   type DurableEventAck,
   type LocalToolResultPayload,
   type ModelDescriptor,
+  type PinnedContextReference,
   type ProviderErrorCode,
   type RunAttachmentReference,
   type RuntimeError,
@@ -73,6 +74,7 @@ export interface AgentRunRequest {
   fastMode?: boolean;
   input: string;
   model: string;
+  pinnedContext?: PinnedContextReference[];
 }
 
 export interface AgentRunResumeRequest extends Pick<AgentRunRequest, "agentRunId" | "conversationId"> {
@@ -971,6 +973,7 @@ export class RuntimeSupervisor implements RuntimeClient {
         role: "user",
         text: request.input,
         ...(request.attachments?.length ? { attachments: request.attachments } : {}),
+        ...(request.pinnedContext?.length ? { pinnedContext: request.pinnedContext } : {}),
       },
     };
     yield* this.#runAgentCommand(request, command);

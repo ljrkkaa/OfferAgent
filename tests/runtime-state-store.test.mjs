@@ -1257,6 +1257,10 @@ test("Run Checkpoints resume only Interrupted Runs from the latest committed ste
     requiredRereads: [],
     hostedWebSearchProbeAttempted: false,
     completedSteps: 0,
+    runInput: {
+      text: "resume me",
+      pinnedContext: [{ kind: "document", path: "notes/resume-source.md" }],
+    },
   };
   await store.saveRunCheckpoint("checkpoint-run", first);
   const latest = { ...first, completedSteps: 1 };

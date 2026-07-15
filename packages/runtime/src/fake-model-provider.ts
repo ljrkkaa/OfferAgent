@@ -35,6 +35,7 @@ export const FAKE_SCENARIOS = [
   "url-interview-ingestion",
   "single-image",
   "vision-unavailable",
+  "pinned-context",
 ] as const;
 export type FakeScenario = (typeof FAKE_SCENARIOS)[number];
 
@@ -180,6 +181,49 @@ export class FakeModelProvider implements ModelProvider {
       yield {
         type: "output_text.delta",
         delta: "The image shows an interview question about distributed cache consistency.",
+      };
+      return;
+    }
+    if (this.#scenario === "pinned-context") {
+      if (
+        !request.instructions.includes("Pinned Context for this Run (preferred sources, not a whitelist)") ||
+        !request.instructions.includes("notes/preferred.md:4-8") ||
+        !request.instructions.includes("notes/unread-preferred.md") ||
+        !request.instructions.includes("use vault_read before relying") ||
+        !request.tools.some((tool) => tool.name === "vault_read") ||
+        !request.tools.some((tool) => tool.name === "vault_search")
+      ) {
+        throw new ModelProviderError("provider_error", "Pinned Context instructions were invalid.");
+      }
+      const read = toolResultFor(request.input, "vault_read");
+      if (!read) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-pinned-read-${this.#toolCallSequence}`,
+          name: "vault_read",
+          arguments: {
+            path: "notes/preferred.md",
+            lineStart: 4,
+            lineEnd: 8,
+          },
+        };
+        return;
+      }
+      const search = toolResultFor(request.input, "vault_search");
+      if (!search) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-pinned-search-${this.#toolCallSequence}`,
+          name: "vault_search",
+          arguments: { query: "counterexample" },
+        };
+        return;
+      }
+      yield {
+        type: "output_text.delta",
+        delta: "Used the preferred source and found a counterexample elsewhere in the Vault.",
       };
       return;
     }

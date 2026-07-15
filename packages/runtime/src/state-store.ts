@@ -19,6 +19,7 @@ import {
   type VaultChangeTransactionState,
   type VaultToolErrorCode,
   type WebCitation,
+  type PinnedContextReference,
 } from "@offeragent/protocol";
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.js";
 import type { ModelConversationItem } from "./model-provider";
@@ -46,6 +47,7 @@ export interface RunCheckpoint {
   postResponseOutput?: string;
   runInput?: {
     attachments?: PersistedRunAttachmentMetadata[];
+    pinnedContext?: PinnedContextReference[];
     text: string;
   };
   pendingToolStep?: {
@@ -199,6 +201,13 @@ function persistedRunCheckpoint(checkpoint: RunCheckpoint): RunCheckpoint {
       ? {
           runInput: {
             text: checkpoint.runInput.text,
+            ...(checkpoint.runInput.pinnedContext?.length
+              ? {
+                  pinnedContext: checkpoint.runInput.pinnedContext.map((reference) => ({
+                    ...reference,
+                  })),
+                }
+              : {}),
             ...(checkpoint.runInput.attachments?.length
               ? {
                   attachments: (checkpoint.runInput.attachments as Array<

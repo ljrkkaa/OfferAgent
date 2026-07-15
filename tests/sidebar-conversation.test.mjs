@@ -153,9 +153,7 @@ test("the Sidebar presentation keeps activity, composer, and common settings com
     )?.message,
     "The earlier Provider request failed.",
   );
-  assert.deepEqual(presentation.composer.contextChips, [
-    { kind: "scope", label: "Vault context" },
-  ]);
+  assert.deepEqual(presentation.composer.contextChips, []);
   assert.deepEqual(presentation.composer.primaryAction, {
     agentRunId: "presentation-run",
     kind: "resume",
@@ -175,6 +173,116 @@ test("the Sidebar presentation keeps activity, composer, and common settings com
   controller.refreshPresentation();
   assert.equal(observed.at(-1).settings.fastMode.enabled, false);
   assert.equal(observed.at(-1).composer.permissionMode, "ask_every_time");
+});
+
+test("Pinned Context is inspectable, removable, and sent only with the next Agent Run", async () => {
+  const requests = [];
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async listConversations() {
+      return [{ id: "pinned-conversation", title: "Pinned", modelId: "model-a" }];
+    },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: { id: "pinned-conversation", title: "Pinned", modelId: "model-a" },
+        messages: [], agentRuns: [], toolCalls: [],
+      };
+    },
+    async *resumeAgentRun() {},
+    async *runAgent(request) {
+      requests.push(structuredClone(request));
+      yield { type: "agent_run.started", model: "model-a" };
+      yield {
+        type: "tool_call.requested",
+        toolCallId: "pinned-search",
+        tool: { kind: "local", name: "vault_search", arguments: { query: "counterexample" } },
+      };
+      yield {
+        type: "tool_call.completed",
+        toolCallId: "pinned-search",
+        tool: { kind: "local", name: "vault_search" },
+        status: "completed",
+      };
+      yield {
+        type: "tool_call.requested",
+        toolCallId: "pinned-read",
+        tool: { kind: "local", name: "vault_read", arguments: { path: "notes/current.md" } },
+      };
+      yield {
+        type: "tool_call.completed",
+        toolCallId: "pinned-read",
+        tool: { kind: "local", name: "vault_read" },
+        status: "completed",
+      };
+      yield { type: "agent_run.completed", output: { role: "assistant", text: "Done" } };
+    },
+    async start() {}, async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Pinned", modelId };
+    },
+    async updateConversation(conversationId, patch) {
+      return { id: conversationId, title: "Pinned", modelId: "model-a", ...patch };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+
+  controller.addPinnedContext({ kind: "document", path: "notes/architecture.md" });
+  controller.addPinnedContext({
+    kind: "selection",
+    path: "notes/current.md",
+    lineStart: 3,
+    lineEnd: 5,
+  });
+  controller.addPinnedContext({ kind: "document", path: "notes/architecture.md" });
+  assert.deepEqual(controller.getViewModel().presentation.composer.contextChips, [
+    { kind: "pinned", label: "notes/architecture.md", path: "notes/architecture.md" },
+    {
+      kind: "pinned",
+      label: "notes/current.md:3-5",
+      path: "notes/current.md",
+      lineStart: 3,
+      lineEnd: 5,
+    },
+  ]);
+
+  controller.removePinnedContext(0);
+  assert.deepEqual(
+    controller.getViewModel().presentation.composer.contextChips.map(({ label }) => label),
+    ["notes/current.md:3-5"],
+  );
+  controller.addPinnedContext({ kind: "document", path: "notes/architecture.md" });
+  await controller.sendMessage("Prioritize the pinned sources, but search wider if needed.");
+
+  assert.deepEqual(requests[0].pinnedContext, [
+    { kind: "selection", path: "notes/current.md", lineStart: 3, lineEnd: 5 },
+    { kind: "document", path: "notes/architecture.md" },
+  ]);
+  assert.deepEqual(controller.getViewModel().presentation.composer.contextChips, []);
+  assert.deepEqual(
+    controller.getViewModel().conversation.toolCalls.map(({ name }) => name),
+    ["vault_search", "vault_read"],
+    "search candidates and read Evidence remain activities, not composer pins",
+  );
+  assert.throws(
+    () => controller.addPinnedContext({ kind: "document", path: "../outside.md" }),
+    /inside the current Vault/,
+  );
+  assert.throws(
+    () => controller.addPinnedContext({ kind: "document", path: "agent.md" }),
+    /inside the current Vault/,
+  );
+  for (let index = 0; index < 8; index += 1) {
+    controller.addPinnedContext({ kind: "document", path: `notes/${index}.md` });
+  }
+  assert.throws(
+    () => controller.addPinnedContext({ kind: "document", path: "notes/overflow.md" }),
+    /at most 8/,
+  );
 });
 
 test("sent and restarted Conversation messages retain image previews", async () => {
@@ -491,6 +599,7 @@ test("a started image Run restores the untouched submitted draft after vision fa
   const controller = new SidebarController(runtime);
   await controller.start();
   controller.setComposerDraft("Read this interview screenshot.");
+  controller.addPinnedContext({ kind: "document", path: "notes/vision-context.md" });
   controller.attachImage({
     bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
     fileName: "interview.png",
@@ -507,6 +616,11 @@ test("a started image Run restores the untouched submitted draft after vision fa
     controller.getViewModel().presentation.composer.attachment.fileName,
     "interview.png",
   );
+  assert.deepEqual(controller.getViewModel().presentation.composer.contextChips, [{
+    kind: "pinned",
+    label: "notes/vision-context.md",
+    path: "notes/vision-context.md",
+  }]);
   assert.equal(controller.getViewModel().conversation.agentRuns[0].status, "failed");
   assert.match(controller.getViewModel().conversation.error.message, /does not support image/i);
 });

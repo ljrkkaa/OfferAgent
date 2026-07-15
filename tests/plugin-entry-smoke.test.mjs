@@ -36,6 +36,16 @@ function execute(file, args, options = {}) {
 class StubElement {
   constructor(className = "", tagName = "div") {
     this.className = className;
+    this.classList = {
+      toggle: (token, force) => {
+        const classes = new Set(this.className.split(" ").filter(Boolean));
+        const enabled = force ?? !classes.has(token);
+        if (enabled) classes.add(token);
+        else classes.delete(token);
+        this.className = [...classes].join(" ");
+        return enabled;
+      },
+    };
     this.children = [];
     this.dataset = {};
     this.disabled = false;
@@ -502,6 +512,8 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
       await activeView.onOpen();
     },
   };
+  let activeFile = { path: "notes/example.md" };
+  const openedPaths = [];
   const workspace = {
     detachLeavesOfType() {
       void activeView?.onClose();
@@ -512,6 +524,12 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     },
     getRightLeaf() {
       return leaf;
+    },
+    getActiveFile() {
+      return activeFile;
+    },
+    async openLinkText(linktext) {
+      openedPaths.push(linktext);
     },
     async revealLeaf() {},
   };
@@ -677,6 +695,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   await plugin.onload();
   assert.ok(plugin.views.has("offeragent-sidebar"));
   assert.ok(plugin.commands.has("open-offeragent-sidebar"));
+  assert.ok(plugin.commands.has("pin-selection-to-offeragent"));
   assert.equal(plugin.ribbonActions.length, 1);
   assert.equal(plugin.settingTabs.length, 1);
   plugin.settingTabs[0].display();
@@ -707,6 +726,189 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   assert.ok(settingsButton);
   settingsButton.dispatch("click");
   assert.equal(settingsOpened, 1);
+
+  let composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.value = "@example";
+  composerInput.setSelectionRange(composerInput.value.length, composerInput.value.length);
+  composerInput.dispatch("input");
+  assert.ok(
+    activeView.contentEl.findByClass("offeragent-sidebar__document-chooser"),
+    "typing @ must render bounded Vault document results immediately",
+  );
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.setSelectionRange(composerInput.value.length, composerInput.value.length);
+  composerInput.dispatch("keydown", { key: "ArrowDown", shiftKey: false, isComposing: false, keyCode: 40 });
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  const mentionEnter = composerInput.dispatch("keydown", {
+    key: "Enter", shiftKey: false, isComposing: false, keyCode: 13,
+  });
+  assert.equal(mentionEnter.defaultPrevented, true);
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__input").value, "");
+  let pinnedChip = activeView.contentEl.findByClass("offeragent-sidebar__context-chip--pinned");
+  assert.match(pinnedChip.text, /notes\/example\.md/);
+  pinnedChip.findByClass("offeragent-sidebar__context-open").dispatch("click");
+  assert.deepEqual(openedPaths, ["notes/example.md"]);
+  pinnedChip.findByClass("offeragent-sidebar__context-remove").dispatch("click");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__context-chip--pinned"), undefined);
+
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.value = "@example";
+  composerInput.setSelectionRange(composerInput.value.length, composerInput.value.length);
+  composerInput.dispatch("input");
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.value = "plain text";
+  composerInput.setSelectionRange(composerInput.value.length, composerInput.value.length);
+  composerInput.dispatch("input");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__document-chooser"),
+    undefined,
+    "leaving an @ token must remove its stale chooser",
+  );
+
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.dispatch("compositionstart");
+  composerInput.value = "@example";
+  composerInput.setSelectionRange(composerInput.value.length, composerInput.value.length);
+  composerInput.dispatch("input");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input"),
+    composerInput,
+    "IME composition must not replace its active textarea",
+  );
+  composerInput.dispatch("compositionend");
+  assert.ok(activeView.contentEl.findByClass("offeragent-sidebar__document-chooser"));
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.value = "";
+  composerInput.setSelectionRange(0, 0);
+  composerInput.dispatch("input");
+
+  activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
+  const addMenu = activeView.contentEl.findByClass("offeragent-sidebar__add-menu");
+  assert.ok(addMenu.findByClass("offeragent-sidebar__pin-current"));
+  assert.ok(addMenu.findByClass("offeragent-sidebar__choose-document"));
+  addMenu.findByClass("offeragent-sidebar__pin-current").dispatch("click");
+  assert.match(
+    activeView.contentEl.findByClass("offeragent-sidebar__context-chip--pinned").text,
+    /notes\/example\.md/,
+  );
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.value = "@example";
+  composerInput.setSelectionRange(composerInput.value.length, composerInput.value.length);
+  composerInput.dispatch("input");
+  const duplicateChoice = activeView.contentEl
+    .findAllByClass("offeragent-sidebar__document-choice")
+    .find(({ text }) => text === "notes/example.md");
+  duplicateChoice.dispatch("click");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__input").value, "");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__document-chooser"), undefined);
+  assert.equal(
+    activeView.contentEl.findAllByClass("offeragent-sidebar__context-chip--pinned").length,
+    1,
+  );
+  activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
+  activeView.contentEl.findByClass("offeragent-sidebar__choose-document").dispatch("click");
+  const chooser = activeView.contentEl.findByClass("offeragent-sidebar__document-chooser");
+  const choices = chooser.findAllByClass("offeragent-sidebar__document-choice");
+  assert.ok(choices.length > 0 && choices.length <= 8);
+  for (let index = 0; index < 12; index += 1) {
+    vaultFiles.push({
+      path: `zzz/deep-choice-${index}.md`,
+      extension: "md",
+      stat: { mtime: 2000 + index, size: 0 },
+      content: "",
+    });
+  }
+  const chooserSearch = chooser.findByClass("offeragent-sidebar__document-search");
+  chooserSearch.value = "deep-choice-11";
+  chooserSearch.dispatch("input");
+  const deepChoice = chooser.findAllByClass("offeragent-sidebar__document-choice")
+    .find(({ text }) => text === "zzz/deep-choice-11.md");
+  assert.ok(deepChoice, "the chooser must search beyond its initial bounded result page");
+  deepChoice.dispatch("click");
+  const deepChip = activeView.contentEl.findAllByClass("offeragent-sidebar__context-chip--pinned")
+    .find(({ text }) => text.includes("zzz/deep-choice-11.md"));
+  deepChip.findByClass("offeragent-sidebar__context-remove").dispatch("click");
+
+  plugin.commands.get("pin-selection-to-offeragent").editorCallback(
+    {
+      getSelection: () => "line two\n",
+      getCursor: (which) => which === "from" ? { line: 1, ch: 0 } : { line: 2, ch: 0 },
+    },
+    { file: { path: "notes/example.md" } },
+  );
+  await waitUntil(
+    () => activeView.contentEl.findAllByClass("offeragent-sidebar__context-chip--pinned").length === 2,
+    "selected editor text was not pinned with its visible source",
+  );
+  assert.ok(
+    activeView.contentEl.findAllByClass("offeragent-sidebar__context-chip--pinned")
+      .some(({ text }) => text.includes("notes/example.md:2-2")),
+  );
+  const pinsBeforeTabChange = activeView.contentEl
+    .findAllByClass("offeragent-sidebar__context-chip--pinned").map(({ text }) => text);
+  activeFile = { path: "templates/daily.md" };
+  assert.deepEqual(
+    activeView.contentEl.findAllByClass("offeragent-sidebar__context-chip--pinned").map(({ text }) => text),
+    pinsBeforeTabChange,
+  );
+  activeFile = { path: "agent.md" };
+  activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
+  assert.doesNotThrow(() => {
+    activeView.contentEl.findByClass("offeragent-sidebar__pin-current").dispatch("click");
+  });
+  assert.doesNotThrow(() => {
+    plugin.commands.get("pin-selection-to-offeragent").editorCallback(
+      {
+        getSelection: () => "control text",
+        getCursor: (which) => which === "from" ? { line: 0, ch: 0 } : { line: 0, ch: 12 },
+      },
+      { file: { path: "agent.md" } },
+    );
+  });
+  activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
+  for (let index = 0; index < 6; index += 1) {
+    plugin.commands.get("pin-selection-to-offeragent").editorCallback(
+      {
+        getSelection: () => `capacity ${index}`,
+        getCursor: (which) => which === "from" ? { line: 0, ch: 0 } : { line: 0, ch: 10 },
+      },
+      { file: { path: `notes/capacity-${index}.md` } },
+    );
+  }
+  assert.equal(
+    activeView.contentEl.findAllByClass("offeragent-sidebar__context-chip--pinned").length,
+    8,
+  );
+  activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
+  activeView.contentEl.findByClass("offeragent-sidebar__choose-document").dispatch("click");
+  let capacityChooser = activeView.contentEl.findByClass("offeragent-sidebar__document-chooser");
+  const capacitySearch = capacityChooser.findByClass("offeragent-sidebar__document-search");
+  capacitySearch.value = "deep-choice-0";
+  capacitySearch.dispatch("input");
+  const capacityChoice = capacityChooser.findAllByClass("offeragent-sidebar__document-choice")
+    .find(({ text }) => text === "zzz/deep-choice-0.md");
+  assert.doesNotThrow(() => capacityChoice.dispatch("click"));
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__document-chooser"),
+    capacityChooser,
+    "the + chooser must remain intact when the pin limit rejects a result",
+  );
+  activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
+  activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.value = "@deep-choice-1";
+  composerInput.setSelectionRange(composerInput.value.length, composerInput.value.length);
+  composerInput.dispatch("input");
+  capacityChooser = activeView.contentEl.findByClass("offeragent-sidebar__document-chooser");
+  const capacityMention = capacityChooser.findAllByClass("offeragent-sidebar__document-choice")
+    .find(({ text }) => text === "zzz/deep-choice-1.md");
+  assert.doesNotThrow(() => capacityMention.dispatch("click"));
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__input").value, "@deep-choice-1");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__document-chooser"), capacityChooser);
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.value = "";
+  composerInput.setSelectionRange(0, 0);
+  composerInput.dispatch("input");
 
   const modelSelect = await waitUntil(
     () => {
@@ -776,10 +978,9 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     activeView.contentEl.findByClass("offeragent-sidebar__file-picker")?.listeners.has("change"),
     true,
   );
-  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__attach")?.text, "添加图片");
   assert.equal(
-    activeView.contentEl.findByClass("offeragent-sidebar__attach")?.getAttribute("aria-label"),
-    "添加图片（最多 20 张）",
+    activeView.contentEl.findByClass("offeragent-sidebar__add")?.getAttribute("aria-label"),
+    "Add context or images",
   );
   assert.equal(modelSelect.getAttribute("aria-label"), "选择对话模型");
   const imagePicker = activeView.contentEl.findByClass("offeragent-sidebar__file-picker");
@@ -924,10 +1125,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     () => /^blob:/.test(activeView.contentEl.findByClass("offeragent-sidebar__message-attachment")?.src ?? ""),
     "persisted sent image did not reload after sidebar close and reopen",
   );
-  assert.equal(
-    activeView.contentEl.findByClass("offeragent-sidebar__context-chip")?.text,
-    "Vault context",
-  );
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__context-chip"), undefined);
   assert.match(
     activeView.contentEl.findByClass("offeragent-sidebar__permission")?.text ?? "",
     /Trusted Vault/,
