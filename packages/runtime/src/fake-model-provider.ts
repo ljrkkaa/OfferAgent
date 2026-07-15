@@ -125,17 +125,17 @@ export class FakeModelProvider implements ModelProvider {
       });
     }
     if (this.#scenario === "single-image" && request.imageInputs?.length) {
-      const userMessage = findLatest(
-        request.input,
-        (item): item is Extract<ModelConversationItem, { type: "user_message" }> =>
-          item.type === "user_message" && Boolean(item.attachments?.length),
+      const boundImages = request.input.flatMap((item) =>
+        item.type === "user_message" ? item.attachments ?? [] : []
       );
-      const image = request.imageInputs[0];
       if (
-        !userMessage?.attachments?.some(
-          ({ attachmentId, order }) => attachmentId === image.attachmentId && order === 0,
-        ) ||
-        !image.dataUrl.startsWith(`data:${image.mediaType};base64,`)
+        request.imageInputs.length !== boundImages.length ||
+        request.imageInputs.some((image) =>
+          !boundImages.some(
+            ({ attachmentId, order }) =>
+              attachmentId === image.attachmentId && order === image.order,
+          ) || !image.dataUrl.startsWith(`data:${image.mediaType};base64,`)
+        )
       ) {
         throw new ModelProviderError("provider_error", "The ordered image input was invalid.");
       }
@@ -150,12 +150,13 @@ export class FakeModelProvider implements ModelProvider {
         };
         return;
       }
-      const originalImageInput = findLatest(
+      const imageControlInput = findLatest(
         request.input,
         (item): item is Extract<ModelConversationItem, { type: "user_message" }> =>
-          item.type === "user_message" && Boolean(item.attachments?.length),
+          item.type === "user_message" &&
+          item.text !== "Complete the pending user request with a visible final response. Do not return an empty answer.",
       )?.text ?? userInput;
-      if (/image_empty_interrupt/u.test(originalImageInput)) {
+      if (/image_empty_interrupt/u.test(imageControlInput)) {
         const recoveryRequested = request.input.some(
           (item) =>
             item.type === "user_message" &&
@@ -163,7 +164,7 @@ export class FakeModelProvider implements ModelProvider {
         );
         if (!recoveryRequested) return;
       }
-      if (/image_(?:empty_)?interrupt/u.test(originalImageInput)) {
+      if (/image_(?:empty_)?interrupt/u.test(imageControlInput)) {
         const read = toolResultFor(request.input, "vault_read");
         if (!read) {
           this.#toolCallSequence += 1;

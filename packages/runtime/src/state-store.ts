@@ -27,6 +27,8 @@ import type { RunAttachmentMetadata as StoredRunAttachmentMetadata } from "./run
 const CURRENT_SCHEMA_VERSION = 19;
 const INVALIDATED_PROTOCOL_RESPONSE = "__offeragent_invalidated_after_resource_deletion__";
 const MAX_CONVERSATION_CONTEXT_BYTES = 64 * 1_024;
+const MAX_CONVERSATION_CONTEXT_IMAGE_BYTES = 50 * 1_024 * 1_024;
+const MAX_CONVERSATION_CONTEXT_IMAGES = 20;
 
 export interface RunCheckpoint {
   canonicalReadPaths: Array<[string, string]>;
@@ -34,6 +36,7 @@ export interface RunCheckpoint {
   fastMode?: boolean;
   hostedWebSearchProbeAttempted: boolean;
   input: ModelConversationItem[];
+  contextAttachmentBindings?: ConversationContextAttachmentBinding[];
   localSkills: string[];
   changedMemoryPaths?: string[];
   dailyPlanApplied?: boolean;
@@ -53,6 +56,17 @@ export interface RunCheckpoint {
   };
   requiredRereads: string[];
   version: 1;
+}
+
+export interface ConversationContextAttachmentBinding {
+  inputIndex: number;
+  messageId: string;
+  orders: number[];
+}
+
+export interface ConversationContextWithAttachments {
+  attachmentBindings: ConversationContextAttachmentBinding[];
+  input: ModelConversationItem[];
 }
 
 export interface ResumableRun {
@@ -172,6 +186,15 @@ function persistedRunCheckpoint(checkpoint: RunCheckpoint): RunCheckpoint {
       ? { postResponseCitations: checkpoint.postResponseCitations }
       : {}),
     ...(checkpoint.fastMode ? { fastMode: true } : {}),
+    ...(checkpoint.contextAttachmentBindings?.length
+      ? {
+          contextAttachmentBindings: checkpoint.contextAttachmentBindings.map((binding) => ({
+            inputIndex: binding.inputIndex,
+            messageId: binding.messageId,
+            orders: [...binding.orders],
+          })),
+        }
+      : {}),
     ...(checkpoint.runInput
       ? {
           runInput: {
@@ -2486,10 +2509,18 @@ export class RuntimeStateStore {
     conversationId: string,
     agentRunId: string,
   ): Promise<ModelConversationItem[]> {
+    return (await this.getConversationContextWithAttachments(conversationId, agentRunId)).input;
+  }
+
+  async getConversationContextWithAttachments(
+    conversationId: string,
+    agentRunId: string,
+  ): Promise<ConversationContextWithAttachments> {
     await this.#writeTail;
     const rows =
       this.#database.exec(
-        `SELECT messages.agent_run_id, messages.role, messages.text, messages.attachments_json
+        `SELECT messages.id, messages.agent_run_id, messages.role, messages.text,
+                messages.attachments_json
          FROM messages
          JOIN agent_runs ON agent_runs.id = messages.agent_run_id
          WHERE messages.conversation_id = ?
@@ -2497,17 +2528,35 @@ export class RuntimeStateStore {
          ORDER BY messages.sequence`,
         [conversationId, agentRunId],
       )[0]?.values ?? [];
-    const current: ModelConversationItem[] = [];
-    const completedTurns: ModelConversationItem[][] = [];
-    const turnsByRunId = new Map<string, ModelConversationItem[]>();
-    for (const [messageRunIdValue, role, textValue] of rows) {
+    type ContextEntry = {
+      attachmentBytes: number;
+      item: ModelConversationItem;
+      messageId: string;
+      orders: number[];
+    };
+    const current: ContextEntry[] = [];
+    const completedTurns: ContextEntry[][] = [];
+    const turnsByRunId = new Map<string, ContextEntry[]>();
+    for (const [messageId, messageRunIdValue, role, textValue, attachmentsJson] of rows) {
       const messageRunId = messageRunIdValue as string;
       const item: ModelConversationItem = {
         type: role === "assistant" ? "assistant_message" : "user_message",
         text: textValue as string,
       };
+      const persistedAttachments = role === "user"
+        ? JSON.parse((attachmentsJson as string | null) ?? "[]") as Array<{
+            order: number;
+            size: number;
+          }>
+        : [];
+      const entry: ContextEntry = {
+        attachmentBytes: persistedAttachments.reduce((total, { size }) => total + size, 0),
+        item,
+        messageId: messageId as string,
+        orders: persistedAttachments.map(({ order }) => order).sort((left, right) => left - right),
+      };
       if (messageRunId === agentRunId) {
-        current.push(item);
+        current.push(entry);
         continue;
       }
       let turn = turnsByRunId.get(messageRunId);
@@ -2516,22 +2565,52 @@ export class RuntimeStateStore {
         turnsByRunId.set(messageRunId, turn);
         completedTurns.push(turn);
       }
-      turn.push(item);
+      turn.push(entry);
     }
 
     let remainingBytes = Math.max(
       0,
-      MAX_CONVERSATION_CONTEXT_BYTES - contextByteLength(current),
+      MAX_CONVERSATION_CONTEXT_BYTES - contextByteLength(current.map(({ item }) => item)),
     );
-    const retainedTurns: ModelConversationItem[][] = [];
+    let remainingImageBytes = Math.max(
+      0,
+      MAX_CONVERSATION_CONTEXT_IMAGE_BYTES -
+        current.reduce((total, { attachmentBytes }) => total + attachmentBytes, 0),
+    );
+    let remainingImages = Math.max(
+      0,
+      MAX_CONVERSATION_CONTEXT_IMAGES -
+        current.reduce((total, { orders }) => total + orders.length, 0),
+    );
+    const retainedTurns: ContextEntry[][] = [];
     for (let index = completedTurns.length - 1; index >= 0; index -= 1) {
       const turn = completedTurns[index];
-      const turnBytes = contextByteLength(turn);
-      if (turnBytes > remainingBytes) break;
+      const turnBytes = contextByteLength(turn.map(({ item }) => item));
+      const turnImageBytes = turn.reduce(
+        (total, { attachmentBytes }) => total + attachmentBytes,
+        0,
+      );
+      const turnImages = turn.reduce((total, { orders }) => total + orders.length, 0);
+      if (
+        turnBytes > remainingBytes ||
+        turnImageBytes > remainingImageBytes ||
+        turnImages > remainingImages
+      ) break;
       retainedTurns.unshift(turn);
       remainingBytes -= turnBytes;
+      remainingImageBytes -= turnImageBytes;
+      remainingImages -= turnImages;
     }
-    return [...retainedTurns.flat(), ...current];
+    const retained = [...retainedTurns.flat(), ...current];
+    const historicalCount = retainedTurns.flat().length;
+    return {
+      input: retained.map(({ item }) => item),
+      attachmentBindings: retained.flatMap(({ messageId, orders }, inputIndex) =>
+        inputIndex < historicalCount && orders.length > 0
+          ? [{ inputIndex, messageId, orders }]
+          : []
+      ),
+    };
   }
 
   async listConversations(): Promise<ConversationSummary[]> {

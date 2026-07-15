@@ -332,10 +332,14 @@ test("Conversation-owned attachments survive terminal cleanup and support transa
 
 test("attachment staging is quota-bounded, deletion-safe, and namespaced by State", async (t) => {
   const {
+    DEFAULT_MAX_CONVERSATION_BYTES,
+    DEFAULT_MAX_TOTAL_BYTES,
     attachmentDirectoryForState,
     MemoryRunAttachmentMetadataStore,
     RunAttachmentModule,
   } = await import(pathToFileURL(modulePath));
+  assert.equal(DEFAULT_MAX_CONVERSATION_BYTES, 250 * 1024 * 1024);
+  assert.equal(DEFAULT_MAX_TOTAL_BYTES, 2 * 1024 * 1024 * 1024);
   assert.notEqual(
     attachmentDirectoryForState("C:/vault-a/state.db", "C:/local"),
     attachmentDirectoryForState("C:/vault-b/state.db", "C:/local"),
@@ -369,7 +373,10 @@ test("attachment staging is quota-bounded, deletion-safe, and namespaced by Stat
       conversationId: "quota-a",
       fileName: "a2.png",
     }),
-    (error) => error?.code === "capacity_exceeded" && /delete|clean/i.test(error.message),
+    (error) =>
+      error?.code === "capacity_exceeded" &&
+      /start a new Conversation/i.test(error.message) &&
+      /delete this Conversation/i.test(error.message),
   );
   await attachments.stage({
     agentRunId: "quota-b-1",

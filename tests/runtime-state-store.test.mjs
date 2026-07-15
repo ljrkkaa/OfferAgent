@@ -881,6 +881,158 @@ test("Conversation Context trims interleaved messages as complete Agent Run turn
   await store.close();
 });
 
+test("Conversation Context exposes attachment bindings only for retained user turns", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-context-attachments-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const store = await RuntimeStateStore.open(path.join(temporaryDirectory, "state.db"));
+  await store.createConversation({
+    id: "attachment-context",
+    title: "Attachment context",
+    modelId: "model",
+  });
+  const attachmentMetadata = (attachmentId, agentRunId, fileName) => ({
+    attachmentId,
+    agentRunId,
+    contentHash: `sha256:${attachmentId.padEnd(64, "0").slice(0, 64)}`,
+    conversationId: "attachment-context",
+    createdAt: "2026-07-15T00:00:00.000Z",
+    fileName,
+    mediaType: "image/png",
+    order: 0,
+    size: 32,
+  });
+  const oldAttachment = attachmentMetadata("old-attachment", "old-image-run", "old.png");
+  await store.createAttachment(oldAttachment);
+  await store.beginAgentRun(
+    "attachment-context",
+    "old-image-run",
+    "model",
+    "O".repeat(40_000),
+    undefined,
+    undefined,
+    [oldAttachment],
+  );
+  await store.completeAgentRun("old-image-run", "o".repeat(40_000));
+
+  const retainedAttachment = attachmentMetadata(
+    "retained-attachment",
+    "retained-image-run",
+    "retained.png",
+  );
+  await store.createAttachment(retainedAttachment);
+  await store.beginAgentRun(
+    "attachment-context",
+    "retained-image-run",
+    "model",
+    "Retained image question",
+    undefined,
+    undefined,
+    [retainedAttachment],
+  );
+  await store.completeAgentRun("retained-image-run", "Retained image answer");
+  await store.beginAgentRun("attachment-context", "current-image-run", "model", "Use the image above");
+
+  const context = await store.getConversationContextWithAttachments(
+    "attachment-context",
+    "current-image-run",
+  );
+  assert.deepEqual(context.input, [
+    { type: "user_message", text: "Retained image question" },
+    { type: "assistant_message", text: "Retained image answer" },
+    { type: "user_message", text: "Use the image above" },
+  ]);
+  assert.equal(context.attachmentBindings.length, 1);
+  assert.equal(context.attachmentBindings[0].inputIndex, 0);
+  assert.equal(context.attachmentBindings[0].messageId,
+    (await store.getConversation("attachment-context")).messages
+      .find(({ agentRunId }) => agentRunId === "retained-image-run").id);
+  assert.deepEqual(context.attachmentBindings[0].orders, [0]);
+  assert.equal(JSON.stringify(context).includes("retained-attachment"), false);
+  assert.equal(JSON.stringify(context).includes("old-attachment"), false);
+  await store.close();
+});
+
+test("archived Conversations retain attachment usage until deletion releases it", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-archived-usage-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const store = await RuntimeStateStore.open(path.join(temporaryDirectory, "state.db"));
+  await store.createConversation({
+    id: "archived-attachment-conversation",
+    title: "Archived attachment",
+    modelId: "model",
+  });
+  await store.createAttachment({
+    attachmentId: "archived-attachment",
+    agentRunId: "archived-attachment-run",
+    contentHash: `sha256:${"a".repeat(64)}`,
+    conversationId: "archived-attachment-conversation",
+    createdAt: "2026-07-15T00:00:00.000Z",
+    fileName: "archived.png",
+    mediaType: "image/png",
+    size: 123,
+  });
+  await store.updateConversation("archived-attachment-conversation", { archived: true });
+  assert.deepEqual(await store.getAttachmentUsage("archived-attachment-conversation"), {
+    conversationBytes: 123,
+    totalBytes: 123,
+  });
+  await store.deleteConversation("archived-attachment-conversation");
+  assert.deepEqual(await store.getAttachmentUsage("archived-attachment-conversation"), {
+    conversationBytes: 0,
+    totalBytes: 0,
+  });
+  await store.close();
+});
+
+test("Conversation Context bounds retained images by complete turns", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-context-image-budget-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const store = await RuntimeStateStore.open(path.join(temporaryDirectory, "state.db"));
+  await store.createConversation({
+    id: "bounded-image-context",
+    title: "Bounded image context",
+    modelId: "model",
+  });
+  for (const [index, name] of ["older", "newer"].entries()) {
+    const metadata = Array.from({ length: 3 }, (_, order) => ({
+      attachmentId: `${name}-large-attachment-${order}`,
+      agentRunId: `${name}-large-run`,
+      contentHash: `sha256:${String(index * 3 + order).padStart(64, "a").slice(-64)}`,
+      conversationId: "bounded-image-context",
+      createdAt: `2026-07-15T00:00:0${index}.000Z`,
+      fileName: `${name}-${order}.png`,
+      mediaType: "image/png",
+      order,
+      size: 10 * 1024 * 1024,
+    }));
+    for (const attachment of metadata) await store.createAttachment(attachment);
+    await store.beginAgentRun(
+      "bounded-image-context",
+      `${name}-large-run`,
+      "model",
+      `${name} image`,
+      undefined,
+      undefined,
+      metadata,
+    );
+    await store.completeAgentRun(`${name}-large-run`, `${name} answer`);
+  }
+  await store.beginAgentRun("bounded-image-context", "bounded-current-run", "model", "refer back");
+
+  const context = await store.getConversationContextWithAttachments(
+    "bounded-image-context",
+    "bounded-current-run",
+  );
+  assert.deepEqual(context.input, [
+    { type: "user_message", text: "newer image" },
+    { type: "assistant_message", text: "newer answer" },
+    { type: "user_message", text: "refer back" },
+  ]);
+  assert.equal(context.attachmentBindings.length, 1);
+  assert.equal(context.attachmentBindings[0].inputIndex, 0);
+  await store.close();
+});
+
 test("Conversation Context remains bounded when completed messages are empty", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-context-empty-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));

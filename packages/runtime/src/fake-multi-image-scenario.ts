@@ -13,11 +13,19 @@ export function multiImageInterviewEvent(
   request: ModelRequest,
   nextCallId: (prefix: string) => string,
 ): ModelStreamEvent {
-  const images = [...(request.imageInputs ?? [])].sort((left, right) => left.order - right.order);
   const submission = request.imageSubmission;
   const owningMessage = [...request.input].reverse().find(
-    (item) => item.type === "user_message" && item.attachments?.length === images.length,
+    (item) =>
+      item.type === "user_message" &&
+      item.attachments?.length === submission?.imageCount,
   );
+  const images = owningMessage?.type === "user_message"
+    ? [...(owningMessage.attachments ?? [])]
+        .sort((left, right) => left.order - right.order)
+        .map(({ attachmentId }) =>
+          request.imageInputs?.find((image) => image.attachmentId === attachmentId)
+        )
+    : [];
   if (
     images.length < 2 ||
     !submission ||
@@ -26,6 +34,7 @@ export function multiImageInterviewEvent(
     !owningMessage ||
     owningMessage.type !== "user_message" ||
     images.some((image, order) =>
+      !image ||
       image.order !== order ||
       owningMessage.attachments?.[order]?.order !== order ||
       owningMessage.attachments?.[order]?.attachmentId !== image.attachmentId ||

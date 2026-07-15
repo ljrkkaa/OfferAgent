@@ -184,6 +184,59 @@ test("one staged image becomes Conversation-owned without persisting bytes in St
   assert.equal(historicalImage.headers.get("content-type"), "image/png");
   assert.deepEqual(Buffer.from(await historicalImage.arrayBuffer()), PNG);
 
+  const followUp = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "single-image-follow-up-start",
+      conversationId,
+      agentRunId: "single-image-follow-up-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "继续看上面第一张图。" },
+    },
+    () => {
+      throw new Error("Unexpected non-contract tool call");
+    },
+  );
+  assert.equal(followUp.at(-1).type, "agent_run.completed");
+  assert.match(followUp.at(-1).output.text, /distributed cache consistency/);
+
+  const isolatedConversationId = "single-image-isolated-conversation";
+  const isolatedCreated = waitFor(socket, (event) =>
+    event.type === "conversation.created" && event.conversation?.id === isolatedConversationId
+  );
+  socket.send(JSON.stringify({
+    type: "conversation.create",
+    protocolVersion: 1,
+    eventId: "single-image-isolated-create",
+    conversationId: isolatedConversationId,
+    agentRunId: "conversation-management",
+    sequence: 0,
+    title: "Isolated",
+    model: "fake-interview-model",
+  }));
+  await isolatedCreated;
+  const isolatedFollowUp = await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "single-image-isolated-follow-up-start",
+      conversationId: isolatedConversationId,
+      agentRunId: "single-image-isolated-follow-up-run",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "继续看上面第一张图。" },
+    },
+    () => {
+      throw new Error("Unexpected tool call");
+    },
+  );
+  assert.equal(isolatedFollowUp.at(-1).type, "agent_run.completed");
+  assert.equal(isolatedFollowUp.at(-1).output.text, "OfferAgent received: 继续看上面第一张图。");
+
   await stopRuntime(runtime, ready.port, token);
   const { RuntimeStateStore } = await import(pathToFileURL(stateStoreModule));
   const store = await RuntimeStateStore.open(statePath);
@@ -298,6 +351,119 @@ test("unavailable vision retains the sent image and leaves later text Runs healt
   }, () => { throw new Error("Unexpected tool"); });
   assert.equal(textRun.at(-1).type, "agent_run.completed");
   assert.match(textRun.at(-1).output.text, /Text still works/);
+});
+
+test("a text-only follow-up resumes after Runtime restart with only historical image context", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-history-image-resume-"));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const attachmentsPath = path.join(temporaryDirectory, "attachments");
+  const token = "history-image-resume-token";
+  let runtime;
+  let ready;
+  let socket;
+  const launch = async () => {
+    runtime = spawn(
+      process.execPath,
+      [
+        runtimeEntry, "--port", "0", "--token", token, "--parent-pid", `${process.pid}`,
+        "--provider", "fake", "--fake-scenario", "single-image",
+        "--state-path", statePath, "--attachments-path", attachmentsPath,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
+    );
+    ready = await handshake(runtime.stdout);
+    socket = new WebSocket(`ws://127.0.0.1:${ready.port}/events`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    await once(socket, "open");
+  };
+  t.after(async () => {
+    if (socket?.readyState === WebSocket.OPEN) socket.close();
+    if (runtime?.exitCode === null) await stopRuntime(runtime, ready.port, token);
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+  await launch();
+  const conversationId = "history-image-resume-conversation";
+  const created = waitFor(socket, (event) => event.type === "conversation.created");
+  socket.send(JSON.stringify({
+    type: "conversation.create", protocolVersion: 1, eventId: "history-image-create",
+    conversationId, agentRunId: "conversation-management", sequence: 0,
+    title: "History image resume", model: "fake-interview-model",
+  }));
+  await created;
+  const upload = await fetch(`http://127.0.0.1:${ready.port}/attachments`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "image/png",
+      "x-offeragent-agent-run-id": "history-image-source-run",
+      "x-offeragent-conversation-id": conversationId,
+      "x-offeragent-file-name": "history.png",
+    },
+    body: PNG,
+  });
+  const staged = await upload.json();
+  const sourceRun = await runWithToolPeer(socket, {
+    type: "agent_run.start", protocolVersion: 1, eventId: "history-image-source-start",
+    conversationId, agentRunId: "history-image-source-run", sequence: 0,
+    model: "fake-interview-model",
+    input: {
+      role: "user", text: "Describe this retained image.",
+      attachments: [{ attachmentId: staged.attachmentId, order: 0 }],
+    },
+  }, () => { throw new Error("Unexpected non-contract tool call"); });
+  assert.equal(sourceRun.at(-1).type, "agent_run.completed");
+
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Historical image follow-up did not interrupt")), 15_000);
+    socket.on("message", function onMessage(data) {
+      const event = JSON.parse(data.toString("utf8"));
+      if (event.agentRunId !== "history-image-follow-up-run" || event.type !== "tool_call.requested") return;
+      if (event.tool.name === "agent_contract_read") {
+        socket.send(JSON.stringify({
+          type: "tool_result", protocolVersion: 1, eventId: `result-${event.toolCallId}`,
+          conversationId, agentRunId: event.agentRunId, sequence: event.sequence,
+          toolCallId: event.toolCallId,
+          result: { ok: true, value: {
+            type: "agent_contract_read", path: "agent.md", modifiedVersion: "mtime:1:size:4",
+            contentHash: "sha256:contract", content: "# Contract",
+          } },
+        }));
+      } else if (event.tool.name === "planning_memory_list") {
+        socket.send(JSON.stringify({
+          type: "tool_result", protocolVersion: 1, eventId: `result-${event.toolCallId}`,
+          conversationId, agentRunId: event.agentRunId, sequence: event.sequence,
+          toolCallId: event.toolCallId,
+          result: { ok: true, value: { type: "planning_memory_list", topics: [], truncated: false } },
+        }));
+      } else if (event.tool.name === "vault_read") {
+        clearTimeout(timeout);
+        socket.off("message", onMessage);
+        socket.close();
+        resolve();
+      }
+    });
+    socket.send(JSON.stringify({
+      type: "agent_run.start", protocolVersion: 1, eventId: "history-image-follow-up-start",
+      conversationId, agentRunId: "history-image-follow-up-run", sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "image_empty_interrupt" },
+    }));
+  });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await stopRuntime(runtime, ready.port, token);
+
+  await launch();
+  await waitFor(socket, (event) =>
+    event.type === "agent_run.interrupted" && event.agentRunId === "history-image-follow-up-run"
+  );
+  const resumed = await runWithToolPeer(socket, {
+    type: "agent_run.resume", protocolVersion: 1, eventId: "history-image-follow-up-resume",
+    conversationId, agentRunId: "history-image-follow-up-run", sequence: 0,
+  }, (event) => readResult(event.tool.arguments.path));
+  assert.equal(resumed.at(-1).type, "agent_run.completed");
+  assert.match(resumed.at(-1).output.text, /distributed cache consistency/);
+  assert.deepEqual(await readdir(attachmentsPath), [staged.attachmentId]);
 });
 
 test("a pre-Run attachment validation failure removes its staged bytes", async (t) => {

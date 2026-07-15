@@ -42,6 +42,7 @@ test("the Codex Provider sends ordered Responses image content without OCR", asy
   });
   const attachmentId = "attachment-opaque-id";
   const dataUrl = "data:image/png;base64,iVBORw0KGgo=";
+  const historicalDataUrl = "data:image/png;base64,aGlzdG9yaWNhbA==";
   const events = [];
   for await (const event of provider.stream({
     model: "vision-model",
@@ -75,7 +76,15 @@ test("the Codex Provider sends ordered Responses image content without OCR", asy
         }],
       },
     ],
-    imageInputs: [{ attachmentId, dataUrl, mediaType: "image/png", order: 0 }],
+    imageInputs: [
+      {
+        attachmentId: "historical-cleaned-attachment",
+        dataUrl: historicalDataUrl,
+        mediaType: "image/png",
+        order: 0,
+      },
+      { attachmentId, dataUrl, mediaType: "image/png", order: 0 },
+    ],
     imageSubmission: {
       imageCount: 1,
       sourceFingerprint: `sha256:${"a".repeat(64)}`,
@@ -88,7 +97,13 @@ test("the Codex Provider sends ordered Responses image content without OCR", asy
   assert.equal(requests.length, 1);
   assert.equal(requests[0].input, "https://codex.test/responses");
   assert.deepEqual(requests[0].body.input, [
-    { role: "user", content: [{ type: "input_text", text: "Earlier image question" }] },
+    {
+      role: "user",
+      content: [
+        { type: "input_text", text: "Earlier image question" },
+        { type: "input_image", image_url: historicalDataUrl },
+      ],
+    },
     { role: "assistant", content: [{ type: "output_text", text: "Earlier image answer" }] },
     {
       role: "user",

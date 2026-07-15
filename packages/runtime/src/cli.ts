@@ -43,7 +43,11 @@ import {
   type ModelConversationItem,
   type ModelProvider,
 } from "./model-provider";
-import { RuntimeStateStore, type RunCheckpoint } from "./state-store";
+import {
+  RuntimeStateStore,
+  type ConversationContextAttachmentBinding,
+  type RunCheckpoint,
+} from "./state-store";
 import { WebReader } from "./web-read";
 import {
   createFakeWebReader,
@@ -2004,11 +2008,52 @@ async function startRuntime({
           sequence += 1;
         }
         try {
-          let input: ModelConversationItem[] = checkpoint?.input ??
-            await store.getConversationContext(
-              runCommand.conversationId,
-              runCommand.agentRunId,
+          const conversationContext = checkpoint
+            ? undefined
+            : await store.getConversationContextWithAttachments(
+                runCommand.conversationId,
+                runCommand.agentRunId,
+              );
+          const contextAttachmentBindings: ConversationContextAttachmentBinding[] =
+            checkpoint?.contextAttachmentBindings ??
+            conversationContext?.attachmentBindings ??
+            [];
+          let input: ModelConversationItem[] = checkpoint?.input ?? conversationContext?.input ?? [];
+          const contextMaterializedAttachments: Array<{
+            attachments: MaterializedRunAttachment[];
+            binding: ConversationContextAttachmentBinding;
+          }> = [];
+          for (const binding of contextAttachmentBindings) {
+            const ownedAttachments: MaterializedRunAttachment[] = [];
+            for (const order of binding.orders) {
+              ownedAttachments.push(await attachments.materializeOwned({
+                conversationId: runCommand.conversationId,
+                messageId: binding.messageId,
+                order,
+              }));
+            }
+            contextMaterializedAttachments.push({ attachments: ownedAttachments, binding });
+          }
+          for (const { binding, attachments: ownedAttachments } of contextMaterializedAttachments) {
+            const owningInput = input[binding.inputIndex];
+            if (!owningInput || owningInput.type !== "user_message") {
+              throw new RunAttachmentError(
+                "attachment_missing",
+                "The retained Conversation Attachment message is missing from the Agent Run input.",
+              );
+            }
+            input = input.map((item, index) =>
+              index === binding.inputIndex && item.type === "user_message"
+                ? {
+                    ...item,
+                    attachments: ownedAttachments.map(({ bytes: _bytes, ...attachment }) => attachment),
+                  }
+                : item
             );
+          }
+          const historicalAttachments = contextMaterializedAttachments.flatMap(
+            ({ attachments: ownedAttachments }) => ownedAttachments,
+          );
           if (materializedAttachments.length > 0) {
             const owningInputIndex = input.findLastIndex(
               (item) => item.type === "user_message" && item.text === userInput,
@@ -2062,6 +2107,9 @@ async function startRuntime({
           const currentCheckpoint = (): RunCheckpoint => ({
               version: 1,
               input: checkpointInput(input),
+              ...(contextAttachmentBindings.length > 0
+                ? { contextAttachmentBindings }
+                : {}),
               runInput: {
                 text: userInput,
                 ...(materializedAttachments.length > 0
@@ -2451,15 +2499,15 @@ async function startRuntime({
               model,
               ...(fastMode ? { fastMode: true } : {}),
               input,
-              ...(materializedAttachments.length > 0
+              ...(historicalAttachments.length > 0 || materializedAttachments.length > 0
                 ? {
-                    imageInputs: materializedAttachments.map((attachment) => ({
+                    imageInputs: [...historicalAttachments, ...materializedAttachments].map((attachment) => ({
                       attachmentId: attachment.attachmentId,
                       dataUrl: `data:${attachment.mediaType};base64,${attachment.bytes.toString("base64")}`,
                       mediaType: attachment.mediaType,
                       order: attachment.order,
                     })),
-                    imageSubmission,
+                    ...(imageSubmission ? { imageSubmission } : {}),
                   }
                 : {}),
               instructions: composeInstructions(agentContract, localSkills, recalledMemory, runLocalDate),

@@ -4,8 +4,8 @@ import path from "node:path";
 
 const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MAX_SUBMISSION_BYTES = 50 * 1024 * 1024;
-const DEFAULT_MAX_CONVERSATION_BYTES = 500 * 1024 * 1024;
-const DEFAULT_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
+export const DEFAULT_MAX_CONVERSATION_BYTES = 250 * 1024 * 1024;
+export const DEFAULT_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_SUBMISSION_IMAGES = 20;
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1_000;
 
@@ -364,7 +364,7 @@ export class RunAttachmentModule {
     if (usage.conversationBytes + input.bytes.byteLength > this.#maxConversationBytes) {
       throw new RunAttachmentError(
         "capacity_exceeded",
-        "This Conversation has reached its attachment capacity. Delete old Conversations or their images before adding more.",
+        "This Conversation has reached its attachment capacity. Start a new Conversation, or delete this Conversation when you no longer need its retained images.",
       );
     }
     if (usage.totalBytes + input.bytes.byteLength > this.#maxTotalBytes) {
