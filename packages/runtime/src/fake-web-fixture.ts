@@ -1,6 +1,9 @@
 import { WebReader } from "./web-read";
 
 export const FAKE_WEB_FIXTURES = [
+  "answer-research-conflicting",
+  "answer-research-current",
+  "answer-research-missing",
   "interview-url-failure",
   "interview-url-insufficient",
   "interview-url-success",
@@ -14,6 +17,27 @@ export function isFakeWebFixture(value: string): value is FakeWebFixture {
 export function createFakeWebReader(fixture: FakeWebFixture): WebReader {
   const fakeFetch = async (input: URL | RequestInfo): Promise<Response> => {
     const url = String(input);
+    if (fixture === "answer-research-missing") {
+      return new Response("temporarily unavailable", { status: 503 });
+    }
+    if (fixture === "answer-research-conflicting") {
+      return new Response(
+        "<!doctype html><title>Conflicting cache guidance</title><main>" +
+          "Current sources contain conflicting recommendations: one requires versioned writes and post-commit invalidation, " +
+          "while another rejects invalidation and recommends unordered direct cache publication. The conflict is unresolved." +
+          "</main>",
+        { headers: { "content-type": "text/html; charset=utf-8" } },
+      );
+    }
+    if (fixture === "answer-research-current") {
+      return new Response(
+        "<!doctype html><title>Current distributed cache consistency documentation</title><main>" +
+          "Current official documentation confirms versioned writes and compare-and-set at the authoritative store. " +
+          "Invalidate stale cache entries only after the authoritative commit succeeds so publication remains ordered." +
+          "</main>",
+        { headers: { "content-type": "text/html; charset=utf-8" } },
+      );
+    }
     if (fixture === "interview-url-failure") {
       return new Response("temporarily unavailable", { status: 503 });
     }
