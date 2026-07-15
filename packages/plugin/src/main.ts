@@ -159,6 +159,11 @@ class OfferAgentSidebarView extends ItemView {
   readonly #controller: SidebarController;
   readonly #openSettings: () => void;
   readonly #previewUrls: string[] = [];
+  readonly #streamedMessageElements = new Map<string, HTMLDivElement>();
+  #composerInput?: HTMLTextAreaElement;
+  #newContentButton?: HTMLButtonElement;
+  #renderedViewModel?: SidebarViewModel;
+  #transcriptElement?: HTMLDivElement;
   #unsubscribe?: () => void;
 
   constructor(leaf: WorkspaceLeaf, controller: SidebarController, openSettings: () => void) {
@@ -195,9 +200,99 @@ class OfferAgentSidebarView extends ItemView {
     for (const url of this.#previewUrls.splice(0)) URL.revokeObjectURL(url);
   }
 
+  #transcriptItemKey(
+    item: SidebarViewModel["presentation"]["transcript"][number],
+    index: number,
+  ): string {
+    if (item.kind === "message") {
+      return `message:${item.message.agentRunId}:${item.message.role}`;
+    }
+    if (item.kind === "activity") return `activity:${item.activity.id}`;
+    if (item.kind === "vault_change") return `vault-change:${item.change.toolCallId}`;
+    return `run-status:${item.agentRunId}:${index}`;
+  }
+
+  #streamingFrameSignature(viewModel: SidebarViewModel): string {
+    return JSON.stringify({
+      conversation: {
+        ...viewModel.conversation,
+        messages: viewModel.conversation.messages.map(({ text: _text, ...message }) => message),
+      },
+      presentation: {
+        activities: viewModel.presentation.activities,
+        composer: {
+          ...viewModel.presentation.composer,
+          draftText: undefined,
+        },
+        settings: viewModel.presentation.settings,
+      },
+      runtime: viewModel.runtime,
+      title: viewModel.title,
+    });
+  }
+
+  #tryPatchStreamingUpdate(previous: SidebarViewModel, next: SidebarViewModel): boolean {
+    const transcript = this.#transcriptElement;
+    const input = this.#composerInput;
+    if (
+      !transcript ||
+      !input ||
+      previous.conversation.runState !== "streaming" ||
+      next.conversation.runState !== "streaming" ||
+      previous.conversation.activeConversationId !== next.conversation.activeConversationId ||
+      previous.presentation.transcript.length !== next.presentation.transcript.length ||
+      this.#streamingFrameSignature(previous) !== this.#streamingFrameSignature(next)
+    ) return false;
+
+    const previousScrollTop = transcript.scrollTop;
+    for (const [index, item] of next.presentation.transcript.entries()) {
+      const prior = previous.presentation.transcript[index];
+      if (!prior || this.#transcriptItemKey(prior, index) !== this.#transcriptItemKey(item, index)) {
+        return false;
+      }
+      if (item.kind !== "message" || prior.kind !== "message") continue;
+      if (item.message.text === prior.message.text) continue;
+      const element = this.#streamedMessageElements.get(this.#transcriptItemKey(item, index));
+      if (!element) return false;
+      element.setText(item.message.text);
+    }
+
+    if (input.value === previous.presentation.composer.draftText) {
+      input.value = next.presentation.composer.draftText;
+    }
+    this.#syncTranscriptScroll(next, previousScrollTop);
+    return true;
+  }
+
+  #syncTranscriptScroll(viewModel: SidebarViewModel, frozenScrollTop?: number): void {
+    const transcript = this.#transcriptElement;
+    if (!transcript) return;
+    const { hasNewContent, mode } = viewModel.presentation.transcriptScroll;
+    if (this.#newContentButton) this.#newContentButton.hidden = !hasNewContent;
+    if (mode === "following") transcript.scrollTop = transcript.scrollHeight;
+    else if (frozenScrollTop !== undefined) transcript.scrollTop = frozenScrollTop;
+  }
+
   #render(viewModel: SidebarViewModel): void {
+    const previous = this.#renderedViewModel;
+    if (previous && this.#tryPatchStreamingUpdate(previous, viewModel)) {
+      this.#renderedViewModel = viewModel;
+      return;
+    }
+    const frozenScrollTop = previous?.presentation.transcriptScroll.mode === "frozen" &&
+        viewModel.presentation.transcriptScroll.mode === "frozen"
+      ? this.#transcriptElement?.scrollTop
+      : undefined;
+    const restoreComposerFocus = typeof document !== "undefined" &&
+      this.#composerInput === document.activeElement;
+    const selectionStart = restoreComposerFocus ? this.#composerInput?.selectionStart : undefined;
+    const selectionEnd = restoreComposerFocus ? this.#composerInput?.selectionEnd : undefined;
     const container = this.contentEl;
     this.#revokePreviewUrls();
+    this.#streamedMessageElements.clear();
+    this.#composerInput = undefined;
+    this.#newContentButton = undefined;
+    this.#transcriptElement = undefined;
     container.empty();
     container.addClass("offeragent-sidebar");
 
@@ -265,6 +360,13 @@ class OfferAgentSidebarView extends ItemView {
     settings.addEventListener("click", this.#openSettings);
 
     const transcript = container.createDiv({ cls: "offeragent-sidebar__transcript" });
+    this.#transcriptElement = transcript;
+    transcript.addEventListener("scroll", () => {
+      const distanceFromBottom = transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop;
+      if (Number.isFinite(distanceFromBottom)) {
+        this.#controller.setTranscriptNearBottom(distanceFromBottom <= 32);
+      }
+    });
     if (viewModel.presentation.transcript.length === 0) {
       transcript.createDiv({
         cls: "offeragent-sidebar__empty",
@@ -283,13 +385,14 @@ class OfferAgentSidebarView extends ItemView {
       diagnostic.dataset.code = viewModel.conversation.error.code;
     }
 
-    for (const item of viewModel.presentation.transcript) {
+    for (const [index, item] of viewModel.presentation.transcript.entries()) {
       if (item.kind === "message") {
         const { message } = item;
         const messageElement = transcript.createDiv({
           cls: `offeragent-sidebar__message offeragent-sidebar__message--${message.role}`,
           text: message.text,
         });
+        this.#streamedMessageElements.set(this.#transcriptItemKey(item, index), messageElement);
         if (message.citations?.length) {
           const sources = messageElement.createDiv({ cls: "offeragent-sidebar__citations" });
           for (const [index, citation] of message.citations.entries()) {
@@ -381,6 +484,18 @@ class OfferAgentSidebarView extends ItemView {
       }
     }
 
+    const newContentButton = container.createEl("button", {
+      cls: "offeragent-sidebar__new-content",
+      text: "新内容",
+    });
+    this.#newContentButton = newContentButton;
+    newContentButton.type = "button";
+    newContentButton.setAttribute("aria-label", "查看最新内容");
+    newContentButton.addEventListener("click", () => {
+      this.#controller.resumeTranscriptFollowing();
+      transcript.scrollTop = transcript.scrollHeight;
+    });
+
     const composer = container.createEl("form", { cls: "offeragent-sidebar__composer" });
     const context = composer.createDiv({ cls: "offeragent-sidebar__context" });
     for (const chip of viewModel.presentation.composer.contextChips) {
@@ -396,10 +511,10 @@ class OfferAgentSidebarView extends ItemView {
       });
     }
     const input = composer.createEl("textarea", { cls: "offeragent-sidebar__input" });
+    this.#composerInput = input;
     input.placeholder = "Ask OfferAgent…";
     input.setAttribute("aria-label", "Message OfferAgent");
     input.value = viewModel.presentation.composer.draftText;
-    input.disabled = viewModel.presentation.composer.primaryAction.kind !== "send";
     input.addEventListener("input", () => this.#controller.setComposerDraft(input.value));
     const acceptImages = async (files: File[]): Promise<void> => {
       this.#controller.setComposerDraft(input.value);
@@ -535,6 +650,16 @@ class OfferAgentSidebarView extends ItemView {
       this.#controller.setComposerDraft(text);
       void this.#controller.sendMessage(text);
     });
+    this.#renderedViewModel = viewModel;
+    this.#syncTranscriptScroll(viewModel, frozenScrollTop);
+    if (restoreComposerFocus && typeof input.focus === "function") {
+      input.focus();
+      if (
+        selectionStart !== undefined &&
+        selectionEnd !== undefined &&
+        typeof input.setSelectionRange === "function"
+      ) input.setSelectionRange(selectionStart, selectionEnd);
+    }
   }
 }
 

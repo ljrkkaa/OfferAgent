@@ -88,6 +88,10 @@ export interface SidebarViewModel {
       providerStatus: "connected" | "unavailable";
       runtimeStatus: RuntimeViewState;
     };
+    transcriptScroll: {
+      hasNewContent: boolean;
+      mode: "following" | "frozen";
+    };
     transcript: Array<
       | {
           kind: "activity";
@@ -203,6 +207,8 @@ export class SidebarController {
   #draftRevision = 0;
   #attachmentImportPending = false;
   #sendPending = false;
+  #transcriptFollowMode: "following" | "frozen" = "following";
+  #transcriptHasNewContent = false;
   readonly #recoveredToolResults = new Map<string, {
     eventId: string;
     result: LocalToolResultPayload;
@@ -240,6 +246,25 @@ export class SidebarController {
   setComposerDraft(text: string): void {
     this.#draftText = text;
     this.#draftRevision += 1;
+  }
+
+  setTranscriptNearBottom(nearBottom: boolean): void {
+    const mode = nearBottom ? "following" : "frozen";
+    const hasNewContent = nearBottom ? false : this.#transcriptHasNewContent;
+    if (
+      mode === this.#transcriptFollowMode &&
+      hasNewContent === this.#transcriptHasNewContent
+    ) return;
+    this.#transcriptFollowMode = mode;
+    this.#transcriptHasNewContent = hasNewContent;
+    this.refreshPresentation();
+  }
+
+  resumeTranscriptFollowing(): void {
+    if (this.#transcriptFollowMode === "following" && !this.#transcriptHasNewContent) return;
+    this.#transcriptFollowMode = "following";
+    this.#transcriptHasNewContent = false;
+    this.refreshPresentation();
   }
 
   #rejectImage(message: string): never {
@@ -401,6 +426,7 @@ export class SidebarController {
       modelId,
     });
     this.#recoveredToolResults.clear();
+    this.#resetTranscriptFollowing();
     this.#updateConversation({
       ...this.#viewModel.conversation,
       activeConversationId: conversation.id,
@@ -421,6 +447,7 @@ export class SidebarController {
     }
     const snapshot = await this.#runtime.openConversation(conversationId);
     this.#recoveredToolResults.clear();
+    this.#resetTranscriptFollowing();
     await this.#rehydratePendingVaultChanges(snapshot.toolCalls ?? []);
     const toolCalls = this.#toolCallsWithRecoveredFailures(snapshot.toolCalls ?? []);
     this.#updateConversation({
@@ -614,12 +641,7 @@ export class SidebarController {
           this.#providerStatus = "connected";
           this.refreshPresentation();
         } else if (event.type === "agent_run.delta") {
-          messages[messages.length - 1] = {
-            agentRunId,
-            role: "assistant",
-            text: messages[messages.length - 1].text + event.delta,
-          };
-          this.#updateConversation({ ...this.#viewModel.conversation, messages: [...messages] });
+          this.#appendAgentDelta(messages, agentRunId, event.delta);
         } else if (event.type === "agent_run.completed") {
           messages[messages.length - 1] = { agentRunId, ...event.output };
           if (restoreAfterVaultFailure) restoreSubmittedDraft();
@@ -791,12 +813,7 @@ export class SidebarController {
           this.#providerStatus = "connected";
           this.refreshPresentation();
         } else if (event.type === "agent_run.delta") {
-          messages[messages.length - 1] = {
-            agentRunId,
-            role: "assistant",
-            text: messages[messages.length - 1].text + event.delta,
-          };
-          this.#updateConversation({ ...this.#viewModel.conversation, messages: [...messages] });
+          this.#appendAgentDelta(messages, agentRunId, event.delta);
         } else if (event.type === "agent_run.completed") {
           messages[messages.length - 1] = { agentRunId, ...event.output };
           this.#recoveredToolResults.delete(agentRunId);
@@ -1019,6 +1036,29 @@ export class SidebarController {
     for (const subscriber of this.#subscribers) subscriber(this.getViewModel());
   }
 
+  #appendAgentDelta(
+    messages: SidebarViewModel["conversation"]["messages"],
+    agentRunId: string,
+    delta: string,
+  ): void {
+    this.#markTranscriptContentAdded();
+    messages[messages.length - 1] = {
+      agentRunId,
+      role: "assistant",
+      text: messages[messages.length - 1].text + delta,
+    };
+    this.#updateConversation({ ...this.#viewModel.conversation, messages: [...messages] });
+  }
+
+  #markTranscriptContentAdded(): void {
+    if (this.#transcriptFollowMode === "frozen") this.#transcriptHasNewContent = true;
+  }
+
+  #resetTranscriptFollowing(): void {
+    this.#transcriptFollowMode = "following";
+    this.#transcriptHasNewContent = false;
+  }
+
   #presentation(): SidebarViewModel["presentation"] {
     const activities = this.#viewModel.conversation.toolCalls.flatMap((call) => {
       if (call.name === "vault_propose_changes") return [];
@@ -1162,6 +1202,10 @@ export class SidebarController {
         permissionMode,
         providerStatus: this.#providerStatus,
         runtimeStatus: this.#viewModel.runtime.state,
+      },
+      transcriptScroll: {
+        hasNewContent: this.#transcriptHasNewContent,
+        mode: this.#transcriptFollowMode,
       },
       transcript,
     };

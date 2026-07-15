@@ -71,6 +71,11 @@ class StubElement {
     this.attributes.set(name, `${value}`);
   }
 
+  setText(text) {
+    this.text = `${text}`;
+    this.children = [];
+  }
+
   getAttribute(name) {
     return this.attributes.get(name);
   }

@@ -772,6 +772,86 @@ test("the Sidebar selects a model and renders a streamed Agent Run", async () =>
   );
 });
 
+test("streaming preserves a new draft while Transcript following freezes and resumes", async () => {
+  let releaseSecondDelta;
+  let releaseCompletion;
+  const runtime = {
+    cancelAgentRun() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Conversation", modelId };
+    },
+    async createConversation(conversation) {
+      return conversation;
+    },
+    async deleteConversation() {},
+    onUnavailable() {
+      return () => {};
+    },
+    async start() {},
+    async stop() {},
+    async listModels() {
+      return [{ id: "model-a", label: "Model A" }];
+    },
+    async listConversations() {
+      return [{ id: "conversation-a", title: "Conversation", modelId: "model-a" }];
+    },
+    async openConversation() {
+      return {
+        conversation: { id: "conversation-a", title: "Conversation", modelId: "model-a" },
+        messages: [],
+        agentRuns: [],
+        toolCalls: [],
+      };
+    },
+    async *runAgent() {
+      yield { type: "agent_run.started", model: "model-a" };
+      yield { type: "agent_run.delta", delta: "First" };
+      await new Promise((resolve) => (releaseSecondDelta = resolve));
+      yield { type: "agent_run.delta", delta: " second" };
+      await new Promise((resolve) => (releaseCompletion = resolve));
+      yield {
+        type: "agent_run.completed",
+        output: { role: "assistant", text: "First second" },
+      };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+
+  const send = controller.sendMessage("Original prompt");
+  while (!releaseSecondDelta) await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(controller.getViewModel().presentation.transcriptScroll, {
+    hasNewContent: false,
+    mode: "following",
+  });
+
+  controller.setComposerDraft("Draft for the next turn");
+  controller.setTranscriptNearBottom(false);
+  releaseSecondDelta();
+  while (!releaseCompletion) await new Promise((resolve) => setImmediate(resolve));
+
+  const frozen = controller.getViewModel().presentation;
+  assert.equal(frozen.composer.draftText, "Draft for the next turn");
+  assert.deepEqual(frozen.transcriptScroll, {
+    hasNewContent: true,
+    mode: "frozen",
+  });
+
+  releaseCompletion();
+  await send;
+  assert.equal(controller.getViewModel().presentation.composer.draftText, "Draft for the next turn");
+  assert.deepEqual(controller.getViewModel().presentation.transcriptScroll, {
+    hasNewContent: true,
+    mode: "frozen",
+  });
+
+  controller.resumeTranscriptFollowing();
+  assert.deepEqual(controller.getViewModel().presentation.transcriptScroll, {
+    hasNewContent: false,
+    mode: "following",
+  });
+});
+
 test("the Sidebar preserves a typed model-catalog error", async () => {
   const runtime = {
     cancelAgentRun() {},
