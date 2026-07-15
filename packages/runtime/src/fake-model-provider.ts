@@ -114,6 +114,16 @@ export class FakeModelProvider implements ModelProvider {
       (item): item is Extract<ModelConversationItem, { type: "user_message" }> =>
         item.type === "user_message",
     )?.text ?? "";
+    if (userInput.trim() === "stop_and_revise_demo") {
+      yield { type: "output_text.delta", delta: "Partial stopped answer." };
+      await new Promise<never>((_resolve, reject) => {
+        const stop = () => reject(
+          new ModelProviderError("transport_error", "The Agent Run was stopped."),
+        );
+        if (request.signal.aborted) stop();
+        else request.signal.addEventListener("abort", stop, { once: true });
+      });
+    }
     if (this.#scenario === "single-image" && request.imageInputs?.length) {
       const userMessage = findLatest(
         request.input,

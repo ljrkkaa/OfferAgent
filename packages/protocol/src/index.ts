@@ -625,7 +625,10 @@ export type AgentRunEvent =
       searchCallId: string;
       sources: WebSearchSource[];
     })
-  | (AgentRunEventBase & { type: "agent_run.cancelled" })
+  | (AgentRunEventBase & {
+      type: "agent_run.cancelled";
+      output?: { citations?: WebCitation[]; role: "assistant"; text: string };
+    })
   | (AgentRunEventBase & { type: "agent_run.interrupted" })
   | (AgentRunEventBase & {
       type: "tool_call.requested";

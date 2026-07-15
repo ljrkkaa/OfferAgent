@@ -1794,6 +1794,7 @@ async function startRuntime({
         let checkpoint: RunCheckpoint | undefined;
         let materializedAttachments: MaterializedRunAttachment[] = [];
         let output = "";
+        let visibleOutput = "";
         const citations: WebCitation[] = [];
         const base = {
           protocolVersion: PROTOCOL_VERSION,
@@ -2399,6 +2400,7 @@ async function startRuntime({
             })) {
               if (providerEvent.type === "output_text.delta") {
                 output += providerEvent.delta;
+                visibleOutput += providerEvent.delta;
                 await store.advanceAgentRunSequence(runCommand.agentRunId, sequence);
                 publishEvent({
                   ...base,
@@ -2816,6 +2818,7 @@ async function startRuntime({
             if (changedMemoryPaths.size > 0) {
               const notice = `\n\nPlanning Memory updated: ${[...changedMemoryPaths].join(", ")}`;
               output += notice;
+              visibleOutput += notice;
               await store.advanceAgentRunSequence(runCommand.agentRunId, sequence);
               publishEvent({
                 ...base,
@@ -2850,6 +2853,7 @@ async function startRuntime({
             if (changedMemoryPaths.size > 0) {
               const notice = `\n\nPlanning Memory updated: ${[...changedMemoryPaths].join(", ")}`;
               output += notice;
+              visibleOutput += notice;
               await store.advanceAgentRunSequence(runCommand.agentRunId, sequence);
               publishEvent({
                 ...base,
@@ -2885,12 +2889,22 @@ async function startRuntime({
           const run = activeRuns.get(runCommand.agentRunId);
           if (controller.signal.aborted) {
             const cancelled = run?.cancelRequested === true;
-            const terminalEvent: AgentRunEvent = {
-              ...base,
-              type: cancelled ? "agent_run.cancelled" : "agent_run.interrupted",
-              eventId: randomUUID(),
-              sequence,
-            };
+            const terminalEvent: AgentRunEvent = cancelled
+              ? {
+                  ...base,
+                  type: "agent_run.cancelled",
+                  eventId: randomUUID(),
+                  sequence,
+                  ...(visibleOutput.length > 0
+                    ? { output: { role: "assistant", text: visibleOutput } }
+                    : {}),
+                }
+              : {
+                  ...base,
+                  type: "agent_run.interrupted",
+                  eventId: randomUUID(),
+                  sequence,
+                };
             const transitioned = cancelled
               ? await store.cancelAgentRun(runCommand.agentRunId, terminalEvent as Extract<AgentRunEvent, { type: "agent_run.cancelled" }>)
               : await store.interruptAgentRun(runCommand.agentRunId, terminalEvent as Extract<AgentRunEvent, { type: "agent_run.interrupted" }>);

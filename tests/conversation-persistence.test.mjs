@@ -709,10 +709,107 @@ test("an explicitly stopped Agent Run is durably cancelled", async (t) => {
   ]);
   assert.deepEqual(reopened.messages.map(({ role, text }) => ({ role, text })), [
     { role: "user", text: "Stop this request." },
+    { role: "assistant", text: "partial" },
   ]);
   await stopRuntime(instance, token);
+  const checkpointSQL = await initSqlJs();
+  const checkpointDatabase = new checkpointSQL.Database(await readFile(statePath));
+  assert.equal(
+    checkpointDatabase.exec(
+      "SELECT COUNT(*) FROM run_checkpoints WHERE agent_run_id = 'cancel-run'",
+    )[0].values[0][0],
+    0,
+  );
+  checkpointDatabase.close();
   const persistedBytes = await readFile(statePath);
   assert.equal(persistedBytes.includes(Buffer.from("cancel-state-token")), false);
   assert.equal(persistedBytes.includes(Buffer.from(token)), false);
   assert.equal(persistedBytes.includes(Buffer.from('"delta":"partial"')), false);
+});
+
+test("Stopped Run output survives restart and stays outside later Conversation Context", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-stopped-output-"));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const token = "stopped-output-runtime-token";
+  const conversationId = "stopped-output-conversation";
+  let instance = await startRuntime(statePath, token);
+  installContractResponder(instance.socket);
+  t.after(async () => {
+    if (instance.runtime.exitCode === null) instance.runtime.kill();
+    await rm(temporaryDirectory, { recursive: true, force: true });
+  });
+
+  const delta = waitForEvent(
+    instance.socket,
+    (event) => event.type === "agent_run.delta" && event.agentRunId === "stopped-output-run",
+  );
+  instance.socket.send(JSON.stringify({
+    type: "agent_run.start",
+    protocolVersion: 1,
+    eventId: "stopped-output-start",
+    conversationId,
+    agentRunId: "stopped-output-run",
+    sequence: 0,
+    model: "fake-interview-model",
+    input: { role: "user", text: "stop_and_revise_demo" },
+  }));
+  assert.equal((await delta).delta, "Partial stopped answer.");
+  const cancelled = waitForEvent(
+    instance.socket,
+    (event) => event.type === "agent_run.cancelled" && event.agentRunId === "stopped-output-run",
+  );
+  instance.socket.send(JSON.stringify({
+    type: "agent_run.cancel",
+    protocolVersion: 1,
+    eventId: "stopped-output-cancel",
+    conversationId,
+    agentRunId: "stopped-output-run",
+    sequence: 2,
+  }));
+  assert.deepEqual((await cancelled).output, {
+    role: "assistant",
+    text: "Partial stopped answer.",
+  });
+
+  await stopRuntime(instance, token);
+  instance = await startRuntime(statePath, token);
+  installContractResponder(instance.socket);
+  const snapshot = waitForEvent(instance.socket, (event) => event.type === "conversation.snapshot");
+  instance.socket.send(JSON.stringify({
+    type: "conversation.open",
+    protocolVersion: 1,
+    eventId: "stopped-output-open",
+    conversationId,
+    agentRunId: "conversation-management",
+    sequence: 0,
+  }));
+  const reopened = await snapshot;
+  assert.deepEqual(reopened.agentRuns.map(({ id, status }) => ({ id, status })), [
+    { id: "stopped-output-run", status: "cancelled" },
+  ]);
+  assert.deepEqual(reopened.messages.map(({ role, text }) => ({ role, text })), [
+    { role: "user", text: "stop_and_revise_demo" },
+    { role: "assistant", text: "Partial stopped answer." },
+  ]);
+
+  const inspected = await runAgent(instance.socket, {
+    agentRunId: "stopped-output-context",
+    conversationId,
+    eventId: "stopped-output-context-start",
+    text: "conversation_context",
+  });
+  assert.deepEqual(JSON.parse(inspected.output.text), [
+    { role: "user", marker: "c", length: 20 },
+  ]);
+  await stopRuntime(instance, token);
+
+  const stoppedOutputSQL = await initSqlJs();
+  const database = new stoppedOutputSQL.Database(await readFile(statePath));
+  assert.equal(
+    database.exec(
+      "SELECT COUNT(*) FROM run_checkpoints WHERE agent_run_id = 'stopped-output-run'",
+    )[0].values[0][0],
+    0,
+  );
+  database.close();
 });

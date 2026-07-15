@@ -120,6 +120,7 @@ export interface SidebarViewModel {
           agentRunId: string;
           label: string;
           message?: string;
+          revision?: { enabled: boolean; label: "放入输入框" };
           status: Exclude<AgentRunRecord["status"], "completed" | "running">;
         }
       | {
@@ -739,7 +740,11 @@ export class SidebarController {
           const vaultChanges = cancelled
             ? this.#cancelPendingVaultChanges(agentRunId)
             : this.#viewModel.conversation.vaultChanges;
-          messages.pop();
+          if (cancelled && event.output?.text.length) {
+            messages[messages.length - 1] = { agentRunId, ...event.output };
+          } else {
+            messages.pop();
+          }
           this.#updateConversation({
             ...this.#viewModel.conversation,
             messages: [...messages],
@@ -894,7 +899,11 @@ export class SidebarController {
         } else if (event.type === "agent_run.cancelled" || event.type === "agent_run.interrupted") {
           const cancelled = event.type === "agent_run.cancelled";
           if (cancelled) this.#recoveredToolResults.delete(agentRunId);
-          messages.pop();
+          if (cancelled && event.output?.text.length) {
+            messages[messages.length - 1] = { agentRunId, ...event.output };
+          } else {
+            messages.pop();
+          }
           this.#updateConversation({
             ...this.#viewModel.conversation,
             messages: [...messages],
@@ -936,6 +945,29 @@ export class SidebarController {
   stopAgentRun(): void {
     if (!this.#activeRun) return;
     this.#runtime.cancelAgentRun(this.#activeRun);
+  }
+
+  canReviseStoppedRun(agentRunId: string): boolean {
+    const run = this.#viewModel.conversation.agentRuns.find(({ id }) => id === agentRunId);
+    const prompt = this.#viewModel.conversation.messages.find(
+      (message) => message.agentRunId === agentRunId && message.role === "user",
+    )?.text;
+    if (!run || run.status !== "cancelled" || !prompt) return false;
+    if (this.#draftImages.length > 0) return false;
+    return this.#draftText.length === 0 || this.#draftText === prompt;
+  }
+
+  reviseStoppedRun(agentRunId: string): boolean {
+    if (!this.canReviseStoppedRun(agentRunId)) return false;
+    const prompt = this.#viewModel.conversation.messages.find(
+      (message) => message.agentRunId === agentRunId && message.role === "user",
+    )?.text;
+    if (!prompt) return false;
+    if (this.#draftText === prompt) return true;
+    this.#draftText = prompt;
+    this.#draftRevision += 1;
+    this.refreshPresentation();
+    return true;
   }
 
   async decideVaultChange(toolCallId: string, decision: "apply" | "reject"): Promise<void> {
@@ -1170,6 +1202,7 @@ export class SidebarController {
       const runMessages = this.#viewModel.conversation.messages.filter(
         (message) => message.agentRunId === run.id,
       );
+      const originatingPrompt = runMessages.find(({ role }) => role === "user")?.text;
       for (const message of runMessages.filter(({ role }) => role === "user")) {
         includedMessages.add(message);
         transcript.push(presentMessage(message));
@@ -1200,7 +1233,7 @@ export class SidebarController {
       }
       if (run.status !== "completed" && run.status !== "running") {
         const labels = {
-          cancelled: "Run stopped.",
+          cancelled: "已停止",
           failed: "Run failed.",
           interrupted: "Run interrupted. Resume when ready.",
         } as const;
@@ -1209,6 +1242,17 @@ export class SidebarController {
           agentRunId: run.id,
           label: labels[run.status],
           status: run.status,
+          ...(run.status === "cancelled" && originatingPrompt
+            ? {
+                revision: {
+                  enabled:
+                    this.#draftImages.length === 0 &&
+                    (this.#draftText.length === 0 ||
+                      this.#draftText === originatingPrompt),
+                  label: "放入输入框" as const,
+                },
+              }
+            : {}),
           ...(run.error?.message
             ? { message: run.error.message }
             : latestRun?.id === run.id && this.#viewModel.conversation.error

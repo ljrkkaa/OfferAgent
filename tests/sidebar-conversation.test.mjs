@@ -1487,6 +1487,7 @@ test("stopping an active Sidebar run makes it visibly cancelled", async () => {
   let releaseRun;
   const cancelled = new Promise((resolve) => (releaseRun = resolve));
   let cancelledRequest;
+  let runCount = 0;
   const runtime = {
     cancelAgentRun(request) {
       cancelledRequest = request;
@@ -1517,7 +1518,16 @@ test("stopping an active Sidebar run makes it visibly cancelled", async () => {
       };
     },
     async *runAgent(request) {
+      runCount += 1;
       yield { type: "agent_run.started", model: request.model };
+      if (runCount > 1) {
+        yield {
+          type: "agent_run.completed",
+          output: { role: "assistant", text: "Revised answer." },
+        };
+        return;
+      }
+      yield { type: "agent_run.delta", delta: "Partial stopped answer." };
       yield {
         type: "tool_call.requested",
         toolCallId: "cancelled-sidebar-tool",
@@ -1540,7 +1550,10 @@ test("stopping an active Sidebar run makes it visibly cancelled", async () => {
         },
       };
       await cancelled;
-      yield { type: "agent_run.cancelled" };
+      yield {
+        type: "agent_run.cancelled",
+        output: { role: "assistant", text: "Partial stopped answer." },
+      };
     },
     async start() {},
     async stop() {},
@@ -1569,7 +1582,90 @@ test("stopping an active Sidebar run makes it visibly cancelled", async () => {
       role: "user",
       text: "Cancel this run.",
     },
+    {
+      agentRunId: controller.getViewModel().conversation.agentRuns[0].id,
+      role: "assistant",
+      text: "Partial stopped answer.",
+    },
   ]);
+  const stoppedStatus = controller.getViewModel().presentation.transcript.find(
+    (item) => item.kind === "run_status" && item.agentRunId === cancelledRequest.agentRunId,
+  );
+  assert.equal(stoppedStatus.label, "已停止");
+  assert.deepEqual(stoppedStatus.revision, { enabled: true, label: "放入输入框" });
+
+  controller.setComposerDraft("Keep my current draft.");
+  assert.equal(controller.canReviseStoppedRun(cancelledRequest.agentRunId), false);
+  assert.equal(controller.reviseStoppedRun(cancelledRequest.agentRunId), false);
+  assert.equal(controller.getViewModel().presentation.composer.draftText, "Keep my current draft.");
+  controller.setComposerDraft("");
+  assert.equal(controller.canReviseStoppedRun(cancelledRequest.agentRunId), true);
+  assert.equal(controller.reviseStoppedRun(cancelledRequest.agentRunId), true);
+  assert.equal(controller.getViewModel().presentation.composer.draftText, "Cancel this run.");
+
+  await controller.sendMessage("Revise and try again.");
+  assert.equal(controller.getViewModel().conversation.agentRuns.length, 2);
+  assert.equal(controller.getViewModel().conversation.agentRuns[0].status, "cancelled");
+  assert.equal(controller.getViewModel().conversation.agentRuns[1].status, "completed");
+  assert.equal(
+    controller.getViewModel().conversation.messages.find(
+      ({ agentRunId, role }) => agentRunId === cancelledRequest.agentRunId && role === "assistant",
+    ).text,
+    "Partial stopped answer.",
+  );
+});
+
+test("a restored Stopped Run keeps its partial output and guarded revision action", async () => {
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async listConversations() {
+      return [{ id: "restored-stopped", title: "Stopped", modelId: "model-a" }];
+    },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: { id: "restored-stopped", title: "Stopped", modelId: "model-a" },
+        agentRuns: [{ id: "restored-stopped-run", modelId: "model-a", status: "cancelled" }],
+        messages: [
+          { id: "restored-user", agentRunId: "restored-stopped-run", role: "user", sequence: 0, text: "Original prompt" },
+          { id: "restored-assistant", agentRunId: "restored-stopped-run", role: "assistant", sequence: 1, text: "Partial output" },
+        ],
+        toolCalls: [],
+      };
+    },
+    async *resumeAgentRun() {},
+    async *runAgent() {},
+    async start() {},
+    async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Stopped", modelId };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+
+  assert.deepEqual(
+    controller.getViewModel().presentation.transcript
+      .filter(({ kind }) => kind === "message")
+      .map(({ message }) => message.text),
+    ["Original prompt", "Partial output"],
+  );
+  const status = controller.getViewModel().presentation.transcript.find(
+    ({ kind }) => kind === "run_status",
+  );
+  assert.equal(status.label, "已停止");
+  assert.deepEqual(status.revision, { enabled: true, label: "放入输入框" });
+  assert.equal(controller.reviseStoppedRun("restored-stopped-run"), true);
+  assert.equal(controller.getViewModel().presentation.composer.draftText, "Original prompt");
+  assert.deepEqual(
+    controller.getViewModel().presentation.transcript
+      .filter(({ kind }) => kind === "message")
+      .map(({ message }) => message.text),
+    ["Original prompt", "Partial output"],
+  );
 });
 
 test("a failed Agent Run remains visible with its typed error", async () => {

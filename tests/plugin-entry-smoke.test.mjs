@@ -946,6 +946,52 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   assert.deepEqual(contractReads, [migratedContract]);
   assert.equal(activeView.contentEl.findAllByClass("offeragent-sidebar__run-status").length, 0);
 
+  const stoppedComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
+  const stoppedInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  stoppedInput.value = "stop_and_revise_demo";
+  stoppedComposer.dispatch("submit");
+  const stoppedPartial = await waitUntil(
+    () => activeView.contentEl
+      .findAllByClass("offeragent-sidebar__message--assistant")
+      .find((message) => message.text.includes("Partial stopped answer.")),
+    "OfferAgent did not render the partial Stopped Run output",
+  );
+  assert.ok(stoppedPartial);
+  const stoppedDraft = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  stoppedDraft.value = "Protect this existing draft.";
+  stoppedDraft.dispatch("input");
+  activeView.contentEl.findByClass("offeragent-sidebar__stop").dispatch("click");
+  const reviseStopped = await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__revise-stopped"),
+    "OfferAgent did not expose Stop and Revise",
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__run-status")?.text.includes("已停止"),
+    true,
+  );
+  assert.equal(reviseStopped.disabled, true);
+  assert.equal(
+    reviseStopped.getAttribute("title"),
+    "请先清空当前草稿和图片，再放入原提示词",
+  );
+  const protectedDraft = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  protectedDraft.value = "";
+  protectedDraft.dispatch("input");
+  assert.equal(reviseStopped.disabled, false);
+  reviseStopped.dispatch("click");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input").value,
+    "stop_and_revise_demo",
+  );
+  const stoppedConversationId = activeView.contentEl
+    .findByClass("offeragent-sidebar__conversation-select").value;
+  activeView.contentEl.findByClass("offeragent-sidebar__new-conversation").dispatch("click");
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__conversation-select").value !==
+      stoppedConversationId,
+    "OfferAgent did not isolate later smoke checks from the Stopped Run",
+  );
+
   const nextComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const nextInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
   nextInput.value = "MARKDOWN_RENDER_FAILURE";

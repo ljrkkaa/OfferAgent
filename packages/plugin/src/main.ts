@@ -635,6 +635,7 @@ class OfferAgentSidebarView extends ItemView {
       diagnostic.dataset.code = viewModel.conversation.error.code;
     }
 
+    const stoppedRevisionButtons: Array<{ agentRunId: string; button: HTMLButtonElement }> = [];
     for (const [index, item] of viewModel.presentation.transcript.entries()) {
       let itemElement: HTMLElement;
       if (item.kind === "message") {
@@ -703,6 +704,22 @@ class OfferAgentSidebarView extends ItemView {
         });
         runStatus.dataset.agentRunId = item.agentRunId;
         runStatus.dataset.status = item.status;
+        if (item.revision) {
+          const revise = runStatus.createEl("button", {
+            cls: "offeragent-sidebar__revise-stopped",
+            text: item.revision.label,
+          });
+          revise.type = "button";
+          revise.disabled = !item.revision.enabled;
+          revise.setAttribute("aria-label", "将已停止运行的原提示词放入输入框");
+          if (!item.revision.enabled) {
+            revise.setAttribute("title", "请先清空当前草稿和图片，再放入原提示词");
+          }
+          stoppedRevisionButtons.push({ agentRunId: item.agentRunId, button: revise });
+          revise.addEventListener("click", () => {
+            this.#controller.reviseStoppedRun(item.agentRunId);
+          });
+        }
         itemElement = runStatus;
       }
       this.#transcriptItemElements.set(this.#transcriptItemKey(item, index), itemElement);
@@ -739,7 +756,16 @@ class OfferAgentSidebarView extends ItemView {
     input.placeholder = "向 OfferAgent 提问…";
     input.setAttribute("aria-label", "给 OfferAgent 的消息");
     input.value = viewModel.presentation.composer.draftText;
-    input.addEventListener("input", () => this.#controller.setComposerDraft(input.value));
+    input.addEventListener("input", () => {
+      this.#controller.setComposerDraft(input.value);
+      for (const { agentRunId, button } of stoppedRevisionButtons) {
+        button.disabled = !this.#controller.canReviseStoppedRun(agentRunId);
+        button.setAttribute(
+          "title",
+          button.disabled ? "请先清空当前草稿和图片，再放入原提示词" : "",
+        );
+      }
+    });
     let isComposing = false;
     let suppressCompositionEnter = false;
     input.addEventListener("compositionstart", () => {

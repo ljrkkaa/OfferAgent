@@ -2504,11 +2504,37 @@ export class RuntimeStateStore {
     return this.#write(() => {
       const run = this.#requiredRun(agentRunId);
       const timestamp = now();
+      const stoppedOutput = status === "cancelled" && event?.type === "agent_run.cancelled"
+        ? event.output
+        : undefined;
+      let assistantMessageId: string | undefined;
+      if (stoppedOutput?.text.length) {
+        assistantMessageId = randomUUID();
+        this.#database.run(
+          `INSERT INTO messages
+            (id, conversation_id, agent_run_id, role, text, sequence, citations_json, created_at)
+           VALUES (?, ?, ?, 'assistant', ?, ?, ?, ?)`,
+          [
+            assistantMessageId,
+            run.conversationId,
+            agentRunId,
+            stoppedOutput.text,
+            this.#nextMessageSequence(run.conversationId),
+            JSON.stringify(stoppedOutput.citations ?? []),
+            timestamp,
+          ],
+        );
+      }
       this.#database.run(
-        "UPDATE agent_runs SET status = ?, updated_at = ? WHERE id = ? AND status = 'running'",
-        [status, timestamp, agentRunId],
+        `UPDATE agent_runs
+         SET status = ?, assistant_message_id = COALESCE(?, assistant_message_id), updated_at = ?
+         WHERE id = ? AND status = 'running'`,
+        [status, assistantMessageId ?? null, timestamp, agentRunId],
       );
-      if (this.#database.getRowsModified() !== 1) return false;
+      if (this.#database.getRowsModified() !== 1) {
+        if (assistantMessageId) this.#database.run("DELETE FROM messages WHERE id = ?", [assistantMessageId]);
+        return false;
+      }
       this.#database.run(
         `UPDATE tool_calls
           SET status = 'failed', error_code = ?, error_message = ?, updated_at = ?
@@ -2524,6 +2550,7 @@ export class RuntimeStateStore {
         ],
       );
       if (status === "cancelled") {
+        this.#database.run("DELETE FROM run_checkpoints WHERE agent_run_id = ?", [agentRunId]);
         this.#database.run(
           `UPDATE vault_change_batches
             SET state = 'failed', updated_at = ?
