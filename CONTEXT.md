@@ -119,12 +119,16 @@ _Avoid_: Daily Study Plan、计划生成、推测完成
 _Avoid_: 单次请求、单次模型调用、Agent Run
 
 **Conversation Context**:
-新 Agent Run 可见的同一 Conversation 中有限、按序的用户与 Agent 消息；它不继承旧工具结果或 Evidence Snapshot，接近模型上限时从最旧的完整对话轮次开始裁剪。
+新 Agent Run 可见的同一 Conversation 中有限、按序的用户与 Agent 消息及其 Conversation Attachment；它不继承旧工具结果或 Evidence Snapshot，接近模型上限时从最旧的完整对话轮次开始裁剪。
 _Avoid_: 完整运行日志、旧证据缓存、单轮输入
 
 **Agent Run**:
 用户为一个目标明确启动、由 OfferAgent 自主选择和调度可用工具的一次执行，直到完成、失败、取消或中断；首版不在用户未启动目标时创建后台研究运行。
 _Avoid_: Conversation、模型请求、聊天消息、无人触发的后台任务、固定 Workflow 实例
+
+**Stopped Run**:
+用户在完成前主动停止的 Agent Run；已经显示的部分回答可以留在 Conversation 中供参考，但不进入 Conversation Context，也不构成可恢复进度。用户可以取回原提示词、修改后启动新的 Agent Run。
+_Avoid_: Paused Run、Interrupted Run、继续同一次运行
 
 **Interrupted Run**:
 在完成前因插件或 Runtime 断开而停止、但仍保留可恢复进度的 Agent Run。
@@ -141,6 +145,10 @@ _Avoid_: Study Evidence、Vault 内容、学习记录
 **Evidence Snapshot**:
 Agent Run 实际使用过的有限 Vault 文本片段及其来源标识；源文件发生变化后，它不能继续作为当前证据。
 _Avoid_: 完整文件副本、Vault 缓存、永久知识副本
+
+**Pinned Context**:
+用户为下一次 Agent Run 明确指定、希望 Agent 优先考虑的 Vault 文档；它不限制 Agent 搜索其他文档，也只有在实际读取后才形成 Evidence Snapshot。
+_Avoid_: 上下文白名单、仅限所选文档、Evidence Snapshot
 
 **Project Evidence**:
 Agent 从 `projects/` 中的项目文档、文本源码和配置里精确读取的有界证据，用于核对项目事实并生成特化面试回答；它不包含密钥、依赖、构建产物或版本控制内部文件，也不授权执行或修改项目代码。
@@ -178,9 +186,13 @@ _Avoid_: 伪精确总分、脱离 Project Evidence 的主观评价、只判好�
 Project Interview Training 的逐题选择规则；用户可以明确点题，否则 Agent 根据当前目标公司与岗位、最近匹配面经中的高频问题、项目关键设计与风险、既有 Training Feedback 和复训项自主选择下一题，并降低已成熟且无新证据题目的优先级。
 _Avoid_: 一次展示整套题、固定题序、忽略用户点题、无意义重复训练
 
+**Conversation Attachment**:
+用户在一条 Conversation 消息中提供的图片等非文本输入；它在 Vault 外随 Conversation 保留，可在后续 Agent Run 中再次引用，并在 Conversation 删除时一并删除。归档 Conversation 不会删除附件，容量不足时必须提示用户处理而不是静默清理。
+_Avoid_: Vault 附件、知识库原始素材、运行结束即删除的临时文件、Evidence Snapshot
+
 **Run Attachment**:
-用户为当前 Agent Run 提供的图片等非文本输入；它只在 Runtime 的临时附件区保留到运行终止、Conversation 删除或短期清理期限，以支持 Interrupted Run 恢复，不进入 Vault 或 Interview Experience 正文。
-_Avoid_: 知识库原始素材、永久附件、Evidence Snapshot、Planning Memory
+当前 Agent Run 按顺序引用的一组 Conversation Attachment；它可以来自本轮新消息或同一 Conversation 的较早消息，不复制底层附件，也不进入 Vault 或 Interview Experience 正文。
+_Avoid_: Conversation Attachment 副本、知识库原始素材、Planning Memory
 
 **Agent Sidebar**:
 Obsidian 右侧栏中承载 Conversation、Agent Run 状态和用户输入的唯一首版工作区；辅助信息只在当前操作需要时出现。

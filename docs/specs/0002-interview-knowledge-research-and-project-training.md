@@ -27,7 +27,7 @@ OfferAgent 已经能够由一个 Agent 自主调用工具来创建每日计划�
 5. 作为准备面试的用户，我想明确说明一次提交包含多份面经，以便 Agent 能按语义将它们分开处理。
 6. 作为准备面试的用户，我想在发送前查看、移除和调整图片顺序，以便输入内容准确完整。
 7. 作为准备面试的用户，我想在图片不受支持或过大时保留草稿，以便修正附件后无需重新输入消息。
-8. 作为注重隐私的用户，我希望原始图片只短暂存在于本机运行附件区，以便知识库不会积累不需要的原始材料。
+8. 作为注重隐私的用户，我希望原始图片只随所属 Conversation 保存在 Vault 外的本机附件区，以便历史中仍可查看和引用，但知识库不会积累不需要的原始材料。
 9. 作为注重隐私的用户，我希望图片、网页正文和聊天原文不会被复制进知识库，以便只保留对学习有用的结构化结果。
 10. 作为准备面试的用户，我希望 Agent 能从面经中识别公司、岗位、轮次、时间和问题，以便生成可检索的 Interview Experience。
 11. 作为准备面试的用户，我希望未知元数据保持为空而不是被猜测，以便知识库中的事实可信。
@@ -79,8 +79,8 @@ OfferAgent 已经能够由一个 Agent 自主调用工具来创建每日计划�
 - Interview Submission 由有序文本和图片内容组成。多张图片默认属于一份 Interview Experience，除非用户明确说明需要拆分。
 - 初始图片格式为 PNG、JPEG、WEBP 和非动画 GIF。单次提交最多 20 张、每张最多 10 MiB、总计最多 50 MiB；这些是产品验证限制，不是模型能力声明。
 - 插件通过带认证的本机 HTTP 端点上传二进制附件，Agent Run 命令只引用不透明 Attachment ID。Conversation、工具事件和恢复事件继续使用可重放 WebSocket 通道。
-- Run Attachment Module 负责签名和类型验证、原子暂存、所有权绑定、读取、终态清理、Conversation 清理及 TTL 清扫。原始字节只存在于本机临时附件区，不进入 Runtime State、Conversation 历史或事件日志。
-- Interrupted Run 保留附件以支持 Resume；completed、failed、cancelled、Conversation 删除和超时孤儿清理均删除原始字节。Attachment ID 不能跨 Conversation 或 Agent Run 使用。
+- Conversation Attachment Module 负责签名和类型验证、原子持久化、Conversation 所有权、Run 绑定、读取、Conversation 删除清理及孤儿 TTL 清扫。原始字节只存在于 Vault 外的本机附件区，不进入 SQLite、可重放事件或日志；Conversation 历史只保存附件元数据和引用。
+- Conversation Attachment 随 Conversation 保留，使历史消息和后续 Agent Run 可以再次引用；只有 Conversation 删除和未绑定孤儿清理才删除原始字节。Attachment ID 不能跨 Conversation 使用，Run Attachment 只按顺序绑定同一 Conversation 中的附件。
 - Multimodal Input Module 在 Provider 调用前才把有效附件物化为内存中的 Responses API 图片输入，保持文本与图片顺序。Provider 不支持图片时必须返回可操作错误，不能静默忽略或回退到 OCR。
 - Vision Capability 按 backend 和 model 保存为 unknown、available 或 unavailable。unknown 在首次图片 Run 上进行有界探测；不可用状态不能影响之后的纯文本 Run。
 - 知识库不保存原始来源，只保留最小 Source Metadata、可选规范化 URL 和单向 Source Fingerprint。未知公司、岗位、轮次或日期不得推断。
@@ -110,7 +110,7 @@ OfferAgent 已经能够由一个 Agent 自主调用工具来创建每日计划�
 
 - 测试只验证外部行为和 Module 合约，不断言内部辅助函数、搜索遍数或提示词排版。
 - 最高层主测试接缝是完整 Agent Run：给定用户输入、Agent Contract、工具结果和权限状态，验证工具选择、证据读取、单一原子提议、最终响应和可恢复状态。
-- Run Attachment Module 通过内存存储适配器测试类型验证、所有权、跨 Run 拒绝、终态清理、Conversation 清理、Interrupted Resume 和 TTL 清扫。
+- Conversation Attachment Module 通过内存存储适配器测试类型验证、Conversation 所有权、跨 Conversation 拒绝、跨 Run 重用、Conversation 清理、Interrupted Resume 和孤儿 TTL 清扫。
 - Multimodal Input Module 通过 Fake Provider 测试有序文本、多图片、图片物化时机、能力探测、unsupported 状态和纯文本兼容性。
 - Interview Catalog Module 通过内存 Vault 适配器测试精确 URL/指纹命中、转载候选、同公司不同 Experience、语义问题候选、损坏元数据、有界输出和索引版本。
 - 面经导入通过确定性 Agent Run 测试一个完整纵向路径：多图片输入、Catalog 候选、精确读取、创建 Experience、合并旧 Question、创建 needs-research Question、更新索引和原子提交。
@@ -122,8 +122,8 @@ OfferAgent 已经能够由一个 Agent 自主调用工具来创建每日计划�
 - Project Evidence Module 通过临时项目树测试 Registry 限制、秘密排除、二进制排除、超大文件限制、过期快照、只读性和无执行能力。
 - Project Interview Training 通过多轮 Conversation 测试一次一题、用户指定或 Agent 选题、证据化追问、维度反馈、无数字总分以及确认后才写入 Training Outcome。
 - 保留一个显式启用的真实 Codex 图片验收和一个安装后的真实目标 Vault 验收；它们不替代确定性测试。
-- 秘密卫生检查扩展至附件字节、图片数据 URL、浏览器 Profile 元数据、网页内容和项目文件，确保这些内容不进入持久事件、日志或知识库。
-- 恢复测试覆盖 uploaded、bound、Run started、Provider step committed、interrupted、resumed、completed、failed、cancelled、Conversation deleted 和 TTL sweep 等持久状态边界。
+- 秘密卫生检查扩展至附件字节、图片数据 URL、浏览器 Profile 元数据、网页内容和项目文件，确保这些内容不进入 SQLite、持久事件、日志或知识库；受控的 Conversation Attachment 文件区除外。
+- 恢复测试覆盖 uploaded、Conversation bound、Run referenced、Provider step committed、interrupted、resumed、completed、failed、cancelled、Conversation deleted 和 orphan TTL sweep 等持久状态边界。
 
 ## Out of Scope
 
@@ -144,6 +144,6 @@ OfferAgent 已经能够由一个 Agent 自主调用工具来创建每日计划�
 
 - 第一阶段是唯一立即实施的范围：Interview Submission 经 Vision 或文本理解，完成 Experience 去重、Question 合并和原子知识入库。
 - 后续 tickets 应采用 tracer-bullet 纵向切片，每张票在一个新上下文窗口内可独立验证；不应按协议、Runtime、UI 等横向层拆票。
-- 现有公开接口优先于新增测试接缝。新增的五个深 Module 接口分别是 Run Attachment、Multimodal Input、Interview Catalog、Research Browser 和 Project Evidence；完整 Agent Run 是它们组合后的最高验收接缝。
+- 现有公开接口优先于新增测试接缝。新增的五个深 Module 接口分别是 Conversation Attachment、Multimodal Input、Interview Catalog、Research Browser 和 Project Evidence；完整 Agent Run 是它们组合后的最高验收接缝。
 - 附件传输对既有 WebSocket ADR 是窄化修订：大体积、不可重放的二进制使用认证本机 HTTP，Conversation 与 Agent Run 事件仍由 WebSocket 承载。
 - 原始来源不是知识库资产；Source Fingerprint 仅用于去重，不能被扩展为隐式原文归档。

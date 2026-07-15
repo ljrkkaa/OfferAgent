@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0024
 ---
 
 # Store Run Attachments temporarily outside the Vault
