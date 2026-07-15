@@ -514,7 +514,25 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   };
   let activeFile = { path: "notes/example.md" };
   const openedPaths = [];
+  const openedSelections = [];
+  const scrolledSelections = [];
   const workspace = {
+    activeEditor: {
+      editor: {
+        lineCount() {
+          return 2;
+        },
+        getLine(line) {
+          return line === 0 ? "line one" : line === 1 ? "line two" : "";
+        },
+        setSelection(from, to) {
+          openedSelections.push({ from, to });
+        },
+        scrollIntoView(range, center) {
+          scrolledSelections.push({ range, center });
+        },
+      },
+    },
     detachLeavesOfType() {
       void activeView?.onClose();
       activeView = undefined;
@@ -1421,6 +1439,45 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
     "OfferAgent did not finish the Vault read Agent Run",
   );
+  const usedSource = await waitUntil(
+    () => activeView.contentEl
+      .findAllByClass("offeragent-sidebar__used-source")
+      .find((source) => source.text.includes("notes/example.md:1-2")),
+    "OfferAgent did not render the Run-owned Evidence source",
+  );
+  assert.equal(
+    usedSource.parentElement?.children[0]?.text,
+    "使用了 1 份文档",
+  );
+  assert.equal(
+    usedSource.findByClass("offeragent-sidebar__used-source-snippet")?.text,
+    "line one line two",
+  );
+  usedSource.findByClass("offeragent-sidebar__used-source-open").dispatch("click");
+  await waitUntil(
+    () => openedSelections.length > 0,
+    "Opening an Evidence source did not select its exact Vault line range",
+  );
+  assert.deepEqual(openedPaths.at(-1), "notes/example.md");
+  assert.deepEqual(openedSelections.at(-1), {
+    from: { line: 0, ch: 0 },
+    to: { line: 1, ch: 8 },
+  });
+  assert.deepEqual(scrolledSelections.at(-1), {
+    range: {
+      from: { line: 0, ch: 0 },
+      to: { line: 1, ch: 8 },
+    },
+    center: true,
+  });
+  usedSource.findByClass("offeragent-sidebar__used-source-pin").dispatch("click");
+  const usedSourcePin = await waitUntil(
+    () => activeView.contentEl
+      .findAllByClass("offeragent-sidebar__context-chip--pinned")
+      .find((chip) => chip.text.includes("notes/example.md:1-2")),
+    "OfferAgent did not pin a used source into the next Composer turn",
+  );
+  usedSourcePin.findByClass("offeragent-sidebar__context-remove").dispatch("click");
 
   const planComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const planInput = activeView.contentEl.findByClass("offeragent-sidebar__input");

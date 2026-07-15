@@ -782,6 +782,130 @@ test("Project Evidence reads become snapshots and later observations invalidate 
   database.close();
 });
 
+test("Conversation snapshots expose bounded Evidence sources by owning Agent Run across restart", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-used-sources-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  let store = await RuntimeStateStore.open(statePath);
+
+  const completeTool = async (agentRunId, id, name, arguments_, result, sequence) => {
+    await store.requestToolCall(agentRunId, {
+      type: "tool_call.requested", protocolVersion: 1, eventId: `${id}-requested`,
+      conversationId: "used-sources-conversation", agentRunId, sequence,
+      toolCallId: id, tool: { kind: "local", name, arguments: arguments_ },
+    });
+    await store.completeToolCall(agentRunId, { ok: true, value: result }, {
+      type: "tool_call.completed", protocolVersion: 1, eventId: `${id}-completed`,
+      conversationId: "used-sources-conversation", agentRunId, sequence: sequence + 1,
+      toolCallId: id, tool: { kind: "local", name }, status: "completed",
+    });
+  };
+
+  await store.beginAgentRun(
+    "used-sources-conversation",
+    "used-sources-run-one",
+    "fake-interview-model",
+    "Use exact evidence.",
+  );
+  await completeTool(
+    "used-sources-run-one",
+    "used-sources-search",
+    "vault_search",
+    { query: "candidate-only" },
+    {
+      type: "vault_search", truncated: false,
+      entries: [{
+        path: "notes/search-only.md", modifiedVersion: "mtime:1:size:10",
+        contentHash: "sha256:search-only",
+        snippets: [{ content: "SEARCH-CANDIDATE-MUST-NOT-BECOME-A-SOURCE", lineStart: 1, lineEnd: 1, truncated: false }],
+      }],
+    },
+    2,
+  );
+  const oldContent = `First observed fact ${"old bounded evidence ".repeat(30)}`;
+  await completeTool(
+    "used-sources-run-one",
+    "used-sources-read-old",
+    "vault_read",
+    { path: "notes/fact.md", lineStart: 4, lineEnd: 6 },
+    {
+      type: "vault_read", path: "notes/fact.md", lineStart: 4, lineEnd: 6,
+      modifiedVersion: "mtime:1:size:600", contentHash: "sha256:old-fact",
+      content: oldContent, truncated: false,
+    },
+    4,
+  );
+  await store.completeAgentRun("used-sources-run-one", "First answer");
+
+  await store.beginAgentRun(
+    "used-sources-conversation",
+    "used-sources-run-two",
+    "fake-interview-model",
+    "Check the source again.",
+  );
+  await completeTool(
+    "used-sources-run-two",
+    "used-sources-read-new",
+    "vault_read",
+    { path: "notes/fact.md", lineStart: 8, lineEnd: 9 },
+    {
+      type: "vault_read", path: "notes/fact.md", lineStart: 8, lineEnd: 9,
+      modifiedVersion: "mtime:2:size:20", contentHash: "sha256:new-fact",
+      content: "Fresh fact\nSecond line", truncated: false,
+    },
+    2,
+  );
+  await completeTool(
+    "used-sources-run-two",
+    "used-sources-project-read",
+    "project_read",
+    { projectId: "offeragent", path: "src/cache.ts" },
+    {
+      type: "project_read", projectId: "offeragent", path: "src/cache.ts",
+      evidencePath: "project/offeragent/src/cache.ts", lineStart: 1, lineEnd: 1,
+      modifiedVersion: "mtime:1:size:20", contentHash: "sha256:project-source",
+      content: "PROJECT-EVIDENCE-MUST-NOT-BECOME-A-VAULT-SOURCE", truncated: false,
+    },
+    4,
+  );
+  await store.completeAgentRun("used-sources-run-two", "Second answer");
+  await store.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  const snapshot = await store.getConversation("used-sources-conversation");
+  const answers = snapshot.messages.filter(({ role }) => role === "assistant");
+  assert.deepEqual(
+    answers.map(({ agentRunId, text }) => ({ agentRunId, text })),
+    [
+      { agentRunId: "used-sources-run-one", text: "First answer" },
+      { agentRunId: "used-sources-run-two", text: "Second answer" },
+    ],
+  );
+  assert.deepEqual(answers[0].evidenceSources.map(({ path, lineStart, lineEnd, stale }) => ({
+    path, lineStart, lineEnd, stale,
+  })), [{ path: "notes/fact.md", lineStart: 4, lineEnd: 6, stale: true }]);
+  assert.equal(answers[0].evidenceSources[0].snippet.startsWith("First observed fact"), true);
+  assert.equal(answers[0].evidenceSources[0].snippet.length <= 241, true);
+  assert.notEqual(answers[0].evidenceSources[0].snippet, oldContent);
+  assert.deepEqual(answers[1].evidenceSources, [{
+    path: "notes/fact.md",
+    lineStart: 8,
+    lineEnd: 9,
+    snippet: "Fresh fact Second line",
+    stale: false,
+  }]);
+  assert.equal(
+    JSON.stringify(answers).includes("SEARCH-CANDIDATE-MUST-NOT-BECOME-A-SOURCE"),
+    false,
+  );
+  assert.equal(
+    JSON.stringify(answers).includes("PROJECT-EVIDENCE-MUST-NOT-BECOME-A-VAULT-SOURCE"),
+    false,
+  );
+  assert.equal(snapshot.messages.find(({ role }) => role === "user").evidenceSources, undefined);
+  await store.close();
+});
+
 test("Runtime State rolls back a failed write and serves consistent concurrent reads", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-transactions-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));

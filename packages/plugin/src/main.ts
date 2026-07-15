@@ -48,7 +48,7 @@ interface OfferAgentPluginSettings {
 interface SidebarContextSources {
   currentDocumentPath(): string | undefined;
   listDocuments(query: string): string[];
-  openDocument(path: string): Promise<void>;
+  openDocument(path: string, lineStart?: number, lineEnd?: number): Promise<void>;
 }
 
 function mentionQuery(
@@ -465,6 +465,51 @@ class OfferAgentSidebarView extends ItemView {
         link.href = citation.url;
         link.target = "_blank";
         link.rel = "noopener noreferrer";
+      }
+    }
+    if (message.role === "assistant" && item.presentation.sourceLabel) {
+      const usedSources = messageElement.createEl("details", {
+        cls: "offeragent-sidebar__used-sources",
+      });
+      const summary = usedSources.createEl("summary", { text: item.presentation.sourceLabel });
+      summary.setAttribute("aria-label", `${item.presentation.sourceLabel}，按回车展开来源`);
+      for (const source of item.presentation.usedSources ?? []) {
+        const sourceRow = usedSources.createDiv({ cls: "offeragent-sidebar__used-source" });
+        const identity = sourceRow.createEl("button", {
+          cls: "offeragent-sidebar__used-source-open",
+          text: `${source.path}:${source.lineStart}-${source.lineEnd}`,
+        });
+        identity.type = "button";
+        identity.setAttribute(
+          "aria-label",
+          `打开来源 ${source.path} 第 ${source.lineStart} 到 ${source.lineEnd} 行`,
+        );
+        identity.addEventListener("click", () => {
+          void this.#contextSources.openDocument(source.path, source.lineStart, source.lineEnd);
+        });
+        if (source.stale) {
+          sourceRow.createEl("span", {
+            cls: "offeragent-sidebar__used-source-stale",
+            text: "来源已变化",
+          });
+        }
+        sourceRow.createDiv({
+          cls: "offeragent-sidebar__used-source-snippet",
+          text: source.snippet,
+        });
+        const pin = sourceRow.createEl("button", {
+          cls: "offeragent-sidebar__used-source-pin",
+          text: "固定到下一轮",
+        });
+        pin.type = "button";
+        pin.setAttribute("aria-label", `固定来源 ${source.path} 到下一轮`);
+        pin.addEventListener("click", () => {
+          try {
+            this.#controller.pinEvidenceSource(source);
+          } catch (error) {
+            new Notice(error instanceof Error ? error.message : String(error));
+          }
+        });
       }
     }
     return messageElement;
@@ -1522,8 +1567,17 @@ export default class OfferAgentPlugin extends Plugin {
               .sort((left, right) => left.localeCompare(right))
               .slice(0, 8);
           },
-          openDocument: async (path) => {
+          openDocument: async (path, lineStart, lineEnd) => {
             await this.app.workspace.openLinkText(path, "", false);
+            if (lineStart === undefined || lineEnd === undefined) return;
+            const editor = this.app.workspace.activeEditor?.editor;
+            if (!editor) return;
+            const lastLine = Math.max(0, editor.lineCount() - 1);
+            const from = { line: Math.min(lastLine, Math.max(0, lineStart - 1)), ch: 0 };
+            const targetLine = Math.min(lastLine, Math.max(from.line, lineEnd - 1));
+            const to = { line: targetLine, ch: editor.getLine(targetLine).length };
+            editor.setSelection(from, to);
+            editor.scrollIntoView({ from, to }, true);
           },
         },
       ),

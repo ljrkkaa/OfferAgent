@@ -186,6 +186,62 @@
   overflow-wrap: anywhere;
 }
 
+.offeragent-sidebar__used-sources {
+  margin-top: var(--size-4-2);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.offeragent-sidebar__used-sources > summary {
+  cursor: pointer;
+  width: fit-content;
+}
+
+.offeragent-sidebar__used-source {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--size-2-2) var(--size-4-2);
+  margin-top: var(--size-4-2);
+  padding: var(--size-4-2);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+}
+
+.offeragent-sidebar__used-source-open,
+.offeragent-sidebar__used-source-pin {
+  width: fit-content;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-accent);
+  font-size: inherit;
+}
+
+.offeragent-sidebar__used-source-open {
+  min-width: 0;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.offeragent-sidebar__used-source-stale {
+  color: var(--text-warning);
+  white-space: nowrap;
+}
+
+.offeragent-sidebar__used-source-snippet {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+  line-height: var(--line-height-normal);
+  overflow-wrap: anywhere;
+}
+
+.offeragent-sidebar__used-source-pin {
+  grid-column: 1 / -1;
+}
+
 .offeragent-sidebar__diagnostic {
   border: 1px solid var(--background-modifier-error-border);
   border-radius: var(--radius-s);

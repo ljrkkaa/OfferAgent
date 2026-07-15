@@ -101,10 +101,19 @@ export interface ConversationMessage {
   agentRunId: string;
   attachments?: PersistedRunAttachmentMetadata[];
   citations?: WebCitation[];
+  evidenceSources?: EvidenceSnapshotSource[];
   id: string;
   role: "assistant" | "user";
   sequence: number;
   text: string;
+}
+
+export interface EvidenceSnapshotSource {
+  lineEnd: number;
+  lineStart: number;
+  path: string;
+  snippet: string;
+  stale: boolean;
 }
 
 export type ProviderCapabilityStatus = "available" | "unavailable" | "unknown";

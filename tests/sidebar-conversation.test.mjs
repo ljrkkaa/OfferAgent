@@ -134,7 +134,10 @@ test("the Sidebar presentation keeps activity, composer, and common settings com
       })),
     [
       { role: "user", copyable: false, format: "plain_text", layout: "compact_user" },
-      { role: "assistant", copyable: false, format: "markdown", layout: "full_width_agent" },
+      {
+        role: "assistant", copyable: false, format: "markdown", layout: "full_width_agent",
+        sourceLabel: "使用了 0 份文档", usedSources: [],
+      },
     ],
   );
   const activitySummary = presentation.transcript.find(
@@ -282,6 +285,149 @@ test("Pinned Context is inspectable, removable, and sent only with the next Agen
   assert.throws(
     () => controller.addPinnedContext({ kind: "document", path: "notes/overflow.md" }),
     /at most 8/,
+  );
+});
+
+test("each Agent answer presents only its Run-owned Evidence sources and can pin one", async () => {
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async listConversations() {
+      return [{ id: "sources-conversation", title: "Sources", modelId: "model-a" }];
+    },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: { id: "sources-conversation", title: "Sources", modelId: "model-a" },
+        messages: [
+          { id: "user-one", agentRunId: "sources-run-one", role: "user", text: "First", sequence: 1 },
+          {
+            id: "answer-one", agentRunId: "sources-run-one", role: "assistant",
+            text: "First answer", sequence: 2,
+            evidenceSources: [{
+              path: "notes/a.md", lineStart: 2, lineEnd: 4,
+              snippet: "Evidence for the first answer.", stale: false,
+            }],
+          },
+          { id: "user-two", agentRunId: "sources-run-two", role: "user", text: "Second", sequence: 3 },
+          {
+            id: "answer-two", agentRunId: "sources-run-two", role: "assistant",
+            text: "Second answer", sequence: 4, evidenceSources: [],
+          },
+        ],
+        agentRuns: [
+          { id: "sources-run-one", modelId: "model-a", status: "completed" },
+          { id: "sources-run-two", modelId: "model-a", status: "completed" },
+        ],
+        toolCalls: [{
+          id: "search-only", agentRunId: "sources-run-two", name: "vault_search",
+          arguments: { query: "candidate" }, status: "completed",
+        }],
+      };
+    },
+    async *resumeAgentRun() {}, async *runAgent() {}, async start() {}, async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Sources", modelId };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+
+  const answers = controller.getViewModel().presentation.transcript
+    .filter((item) => item.kind === "message" && item.message.role === "assistant");
+  assert.deepEqual(answers.map(({ presentation }) => presentation.sourceLabel), [
+    "使用了 1 份文档",
+    "使用了 0 份文档",
+  ]);
+  assert.deepEqual(answers[0].presentation.usedSources, [{
+    path: "notes/a.md", lineStart: 2, lineEnd: 4,
+    snippet: "Evidence for the first answer.", stale: false,
+  }]);
+  assert.deepEqual(answers[1].presentation.usedSources, []);
+
+  controller.pinEvidenceSource(answers[0].presentation.usedSources[0]);
+  assert.deepEqual(controller.getViewModel().presentation.composer.contextChips, [{
+    kind: "pinned", label: "notes/a.md:2-4", path: "notes/a.md", lineStart: 2, lineEnd: 4,
+  }]);
+});
+
+test("a later Run refreshes stale source metadata on earlier answers immediately", async () => {
+  let secondRunCompleted = false;
+  let secondAgentRunId;
+  const messages = () => [
+    { id: "stale-user-one", agentRunId: "stale-run-one", role: "user", text: "First", sequence: 1 },
+    {
+      id: "stale-answer-one", agentRunId: "stale-run-one", role: "assistant",
+      text: "First answer", sequence: 2,
+      evidenceSources: [{
+        path: "notes/changing.md", lineStart: 1, lineEnd: 1,
+        snippet: "Old fact", stale: secondRunCompleted,
+      }],
+    },
+    ...(secondRunCompleted ? [
+      { id: "stale-user-two", agentRunId: secondAgentRunId, role: "user", text: "Second", sequence: 3 },
+      {
+        id: "stale-answer-two", agentRunId: secondAgentRunId, role: "assistant",
+        text: "Second answer", sequence: 4,
+        evidenceSources: [{
+          path: "notes/changing.md", lineStart: 2, lineEnd: 2,
+          snippet: "Fresh fact", stale: false,
+        }],
+      },
+    ] : []),
+  ];
+  const runtime = {
+    cancelAgentRun() {}, async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async listConversations() {
+      return [{ id: "stale-conversation", title: "Stale", modelId: "model-a" }];
+    },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      return {
+        conversation: { id: "stale-conversation", title: "Stale", modelId: "model-a" },
+        messages: messages(),
+        agentRuns: [
+          { id: "stale-run-one", modelId: "model-a", status: "completed" },
+          ...(secondRunCompleted
+            ? [{ id: secondAgentRunId, modelId: "model-a", status: "completed" }]
+            : []),
+        ],
+        toolCalls: [],
+      };
+    },
+    async *resumeAgentRun() {},
+    async *runAgent(request) {
+      yield { type: "agent_run.started", model: "model-a" };
+      secondAgentRunId = request.agentRunId;
+      secondRunCompleted = true;
+      yield { type: "agent_run.completed", output: { role: "assistant", text: "Second answer" } };
+    },
+    async start() {}, async stop() {},
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Stale", modelId };
+    },
+    async updateConversation(conversationId, patch) {
+      return { id: conversationId, title: "Stale", modelId: "model-a", ...patch };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+  await controller.sendMessage("Second");
+
+  const answers = controller.getViewModel().presentation.transcript
+    .filter((item) => item.kind === "message" && item.message.role === "assistant");
+  assert.deepEqual(
+    answers.map(({ presentation }) => presentation.usedSources?.map(({ snippet, stale }) => ({
+      snippet, stale,
+    }))),
+    [
+      [{ snippet: "Old fact", stale: true }],
+      [{ snippet: "Fresh fact", stale: false }],
+    ],
   );
 });
 

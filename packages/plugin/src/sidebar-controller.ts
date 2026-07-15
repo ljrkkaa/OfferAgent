@@ -5,6 +5,7 @@ import type {
   AgentRunRecord,
   ConversationMessage,
   ConversationSummary,
+  EvidenceSnapshotSource,
   ModelDescriptor,
   PersistedRunAttachmentMetadata,
   PinnedContextReference,
@@ -34,6 +35,7 @@ export interface SidebarViewModel {
       agentRunId: string;
       attachments?: PersistedRunAttachmentMetadata[];
       citations?: WebCitation[];
+      evidenceSources?: EvidenceSnapshotSource[];
       id?: string;
       role: "assistant" | "user";
       text: string;
@@ -125,6 +127,8 @@ export interface SidebarViewModel {
             copyable: boolean;
             format: "markdown" | "plain_text";
             layout: "compact_user" | "full_width_agent";
+            sourceLabel?: string;
+            usedSources?: EvidenceSnapshotSource[];
           };
         }
       | {
@@ -320,6 +324,15 @@ export class SidebarController {
     this.refreshPresentation();
   }
 
+  pinEvidenceSource(source: EvidenceSnapshotSource): void {
+    this.addPinnedContext({
+      kind: "selection",
+      path: source.path,
+      lineStart: source.lineStart,
+      lineEnd: source.lineEnd,
+    });
+  }
+
   refreshPresentation(): void {
     for (const subscriber of this.#subscribers) subscriber(this.getViewModel());
   }
@@ -381,14 +394,68 @@ export class SidebarController {
   #presentMessages(
     messages: ConversationMessage[],
   ): SidebarViewModel["conversation"]["messages"] {
-    return messages.map(({ id, agentRunId, role, text, citations, attachments }) => ({
+    return messages.map(({
+      id,
+      agentRunId,
+      role,
+      text,
+      citations,
+      evidenceSources,
+      attachments,
+    }) => ({
       id,
       agentRunId,
       role,
       text,
       ...(citations ? { citations } : {}),
+      ...(role === "assistant" ? { evidenceSources: evidenceSources ?? [] } : {}),
       ...(attachments?.length ? { attachments: attachments.map((attachment) => ({ ...attachment })) } : {}),
     }));
+  }
+
+  async #reconcilePersistedAssistantMessages(
+    conversationId: string,
+    messages: SidebarViewModel["conversation"]["messages"],
+  ): Promise<void> {
+    try {
+      const snapshot = await this.#runtime.openConversation(conversationId);
+      const persistedAssistants = snapshot.messages.filter(
+        (message) => message.role === "assistant",
+      );
+      const persistedById = new Map(persistedAssistants.map((message) => [message.id, message]));
+      const usedPersistedIds = new Set<string>();
+      let reconciled = false;
+      for (const [index, message] of messages.entries()) {
+        if (message.role !== "assistant") continue;
+        const persisted = message.id
+          ? persistedById.get(message.id)
+          : persistedAssistants.find(
+              (candidate) =>
+                candidate.agentRunId === message.agentRunId &&
+                candidate.text === message.text &&
+                !usedPersistedIds.has(candidate.id),
+            ) ?? persistedAssistants.find(
+              (candidate) =>
+                candidate.agentRunId === message.agentRunId &&
+                !usedPersistedIds.has(candidate.id),
+            );
+        if (!persisted) continue;
+        usedPersistedIds.add(persisted.id);
+        messages[index] = {
+          ...message,
+          id: persisted.id,
+          evidenceSources: persisted.evidenceSources ?? [],
+        };
+        reconciled = true;
+      }
+      if (!reconciled) return;
+      this.#updateConversation({
+        ...this.#viewModel.conversation,
+        messages: [...messages],
+      });
+    } catch {
+      // The completed answer remains visible; reopening the Conversation will retry source metadata.
+    }
   }
 
   async readMessageAttachment(
@@ -903,6 +970,7 @@ export class SidebarController {
           messages[messages.length - 1] = { agentRunId, ...event.output };
           if (restoreAfterVaultFailure) restoreSubmittedDraft();
           this.#setRunStatus(agentRunId, "completed");
+          await this.#reconcilePersistedAssistantMessages(conversationId, messages);
         } else if (event.type === "tool_call.requested") {
           const requestedChange = this.#requestedChange(event.toolCallId, event.tool.name, event.tool.arguments);
           this.#updateConversation({
@@ -1079,6 +1147,7 @@ export class SidebarController {
           messages[messages.length - 1] = { agentRunId, ...event.output };
           this.#recoveredToolResults.delete(agentRunId);
           this.#setRunStatus(agentRunId, "completed");
+          await this.#reconcilePersistedAssistantMessages(conversationId, messages);
         } else if (event.type === "tool_call.requested") {
           const requestedChange = this.#requestedChange(
             event.toolCallId,
@@ -1426,11 +1495,17 @@ export class SidebarController {
         kind: "message",
         message,
         presentation: message.role === "assistant"
-          ? {
+          ? (() => {
+              const usedSources = message.evidenceSources ?? [];
+              const sourceCount = new Set(usedSources.map(({ path }) => path)).size;
+              return {
               copyable: runStatusById.get(message.agentRunId) === "completed",
               format: "markdown",
               layout: "full_width_agent",
-            }
+                sourceLabel: `使用了 ${sourceCount} 份文档`,
+                usedSources,
+              } as const;
+            })()
           : { copyable: false, format: "plain_text", layout: "compact_user" },
       };
     };

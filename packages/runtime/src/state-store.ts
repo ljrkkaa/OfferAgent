@@ -1230,6 +1230,12 @@ interface ConversationSnapshot {
   toolCalls: ToolCallRecord[];
 }
 
+function evidenceSnippet(content: string): string {
+  const normalized = content.replace(/\s+/gu, " ").trim();
+  const characters = [...normalized];
+  return characters.length > 240 ? `${characters.slice(0, 240).join("")}…` : normalized;
+}
+
 type PersistStateFile = (
   statePath: string,
   temporaryPath: string,
@@ -2450,6 +2456,29 @@ export class RuntimeStateStore {
          ORDER BY tool_calls.created_at, tool_calls.id`,
         [conversationId],
       )[0]?.values ?? [];
+    const evidenceRows =
+      this.#database.exec(
+        `SELECT evidence_snapshots.agent_run_id, evidence_snapshots.path,
+                evidence_snapshots.line_start, evidence_snapshots.line_end,
+                evidence_snapshots.content, evidence_snapshots.is_stale
+         FROM evidence_snapshots
+         JOIN tool_calls ON tool_calls.id = evidence_snapshots.tool_call_id
+         WHERE evidence_snapshots.conversation_id = ? AND tool_calls.name = 'vault_read'
+         ORDER BY evidence_snapshots.created_at, evidence_snapshots.id`,
+        [conversationId],
+      )[0]?.values ?? [];
+    const evidenceByRun = new Map<string, NonNullable<ConversationMessage["evidenceSources"]>>();
+    for (const [agentRunId, path, lineStart, lineEnd, content, isStale] of evidenceRows) {
+      const sources = evidenceByRun.get(agentRunId as string) ?? [];
+      sources.push({
+        path: path as string,
+        lineStart: lineStart as number,
+        lineEnd: lineEnd as number,
+        snippet: evidenceSnippet(content as string),
+        stale: Boolean(isStale),
+      });
+      evidenceByRun.set(agentRunId as string, sources);
+    }
     return {
       conversation: {
         id: conversationRow[0] as string,
@@ -2473,6 +2502,9 @@ export class RuntimeStateStore {
         role: role as "assistant" | "user",
         text: text as string,
         sequence: sequence as number,
+        ...(role === "assistant"
+          ? { evidenceSources: evidenceByRun.get(agentRunId as string) ?? [] }
+          : {}),
         ...((JSON.parse(citationsJson as string) as unknown[]).length > 0
           ? { citations: JSON.parse(citationsJson as string) }
           : {}),
