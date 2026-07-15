@@ -119,13 +119,33 @@ test("the Sidebar presentation keeps activity, composer, and common settings com
     [
       "run_status",
       "message",
-      "activity",
-      "activity",
-      "activity",
-      "activity",
+      "activity_error",
+      "activity_summary",
       "message",
       "run_status",
     ],
+  );
+  assert.deepEqual(
+    presentation.transcript
+      .filter((item) => item.kind === "message")
+      .map(({ message, presentation: messagePresentation }) => ({
+        role: message.role,
+        ...messagePresentation,
+      })),
+    [
+      { role: "user", copyable: false, format: "plain_text", layout: "compact_user" },
+      { role: "assistant", copyable: false, format: "markdown", layout: "full_width_agent" },
+    ],
+  );
+  const activitySummary = presentation.transcript.find(
+    (item) => item.kind === "activity_summary",
+  );
+  assert.equal(activitySummary.agentRunId, "presentation-run");
+  assert.equal(activitySummary.activities.length, 3);
+  assert.match(activitySummary.label, /3/);
+  assert.equal(
+    presentation.transcript.find((item) => item.kind === "activity_error")?.activity.id,
+    "presentation-tool",
   );
   assert.equal(
     presentation.transcript.find(
@@ -923,7 +943,16 @@ test("the Sidebar resumes one restored Interrupted Run only after an explicit us
     async openConversation() {
       return {
         conversation: { id: "resume-conversation", title: "Resume", modelId: "model-a" },
-        messages: [{ id: "user-one", agentRunId: "resume-run", role: "user", text: "continue", sequence: 1 }],
+        messages: [
+          { id: "user-one", agentRunId: "resume-run", role: "user", text: "continue", sequence: 1 },
+          {
+            id: "partial-assistant",
+            agentRunId: "resume-run",
+            role: "assistant",
+            text: "partial before interruption",
+            sequence: 2,
+          },
+        ],
         agentRuns: [{ id: "resume-run", modelId: "model-a", status: "interrupted" }],
         toolCalls: [],
       };
@@ -950,6 +979,15 @@ test("the Sidebar resumes one restored Interrupted Run only after an explicit us
   });
   assert.equal(controller.getViewModel().conversation.agentRuns[0].status, "completed");
   assert.equal(controller.getViewModel().conversation.messages.at(-1).text, "continued");
+  const resumedMessages = controller.getViewModel().presentation.transcript.filter(
+    (item) => item.kind === "message" && item.message.role === "assistant",
+  );
+  assert.deepEqual(resumedMessages.map(({ message }) => message.text), [
+    "partial before interruption",
+    "continued",
+  ]);
+  assert.equal(new Set(resumedMessages.map(({ key }) => key)).size, 2);
+  assert.equal(resumedMessages[0].key, "persisted:partial-assistant");
 });
 
 test("a proposal lost before plugin persistence fails only on explicit Resume", async () => {
@@ -1365,7 +1403,12 @@ test("the Sidebar creates, switches, and deletes Conversations", async () => {
 
   await controller.openConversation("conversation-b");
   assert.deepEqual(controller.getViewModel().conversation.messages, [
-    { agentRunId: "run-conversation-b", role: "user", text: "history conversation-b" },
+    {
+      id: "message-conversation-b",
+      agentRunId: "run-conversation-b",
+      role: "user",
+      text: "history conversation-b",
+    },
   ]);
 
   await controller.createConversation("Fresh Conversation");

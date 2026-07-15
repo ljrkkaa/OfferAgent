@@ -28,6 +28,7 @@ export interface SidebarViewModel {
     messages: Array<{
       agentRunId: string;
       citations?: WebCitation[];
+      id?: string;
       role: "assistant" | "user";
       text: string;
     }>;
@@ -94,12 +95,24 @@ export interface SidebarViewModel {
     };
     transcript: Array<
       | {
-          kind: "activity";
+          kind: "activity_error";
           activity: SidebarViewModel["presentation"]["activities"][number];
         }
       | {
+          activities: SidebarViewModel["presentation"]["activities"];
+          agentRunId: string;
+          kind: "activity_summary";
+          label: string;
+        }
+      | {
+          key: string;
           kind: "message";
           message: SidebarViewModel["conversation"]["messages"][number];
+          presentation: {
+            copyable: boolean;
+            format: "markdown" | "plain_text";
+            layout: "compact_user" | "full_width_agent";
+          };
         }
       | {
           kind: "run_status";
@@ -385,7 +398,8 @@ export class SidebarController {
           activeConversationId: snapshot?.conversation.id,
           selectedModelId: snapshot?.conversation.modelId ?? models[0]?.id,
           messages:
-            snapshot?.messages.map(({ agentRunId, role, text, citations }) => ({
+            snapshot?.messages.map(({ id, agentRunId, role, text, citations }) => ({
+              id,
               agentRunId,
               role,
               text,
@@ -454,7 +468,8 @@ export class SidebarController {
       ...this.#viewModel.conversation,
       activeConversationId: snapshot.conversation.id,
       agentRuns: snapshot.agentRuns,
-      messages: snapshot.messages.map(({ agentRunId, role, text, citations }) => ({
+      messages: snapshot.messages.map(({ id, agentRunId, role, text, citations }) => ({
+        id,
         agentRunId,
         role,
         text,
@@ -1111,6 +1126,41 @@ export class SidebarController {
       this.#viewModel.conversation.vaultChanges.map((change) => [change.toolCallId, change]),
     );
     const transcript: SidebarViewModel["presentation"]["transcript"] = [];
+    const runStatusById = new Map(
+      this.#viewModel.conversation.agentRuns.map((run) => [run.id, run.status]),
+    );
+    const messageKeys = new Map<
+      SidebarViewModel["conversation"]["messages"][number],
+      string
+    >();
+    const messageOccurrences = new Map<string, number>();
+    for (const message of this.#viewModel.conversation.messages) {
+      const group = `${message.agentRunId}:${message.role}`;
+      const occurrence = messageOccurrences.get(group) ?? 0;
+      messageOccurrences.set(group, occurrence + 1);
+      messageKeys.set(
+        message,
+        message.id ? `persisted:${message.id}` : `ephemeral:${group}:${occurrence}`,
+      );
+    }
+    const presentMessage = (
+      message: SidebarViewModel["conversation"]["messages"][number],
+    ): Extract<SidebarViewModel["presentation"]["transcript"][number], { kind: "message" }> => {
+      const key = messageKeys.get(message);
+      if (!key) throw new Error("Sidebar message presentation requires a stable key.");
+      return {
+        key,
+        kind: "message",
+        message,
+        presentation: message.role === "assistant"
+          ? {
+              copyable: runStatusById.get(message.agentRunId) === "completed",
+              format: "markdown",
+              layout: "full_width_agent",
+            }
+          : { copyable: false, format: "plain_text", layout: "compact_user" },
+      };
+    };
     const includedMessages = new Set<SidebarViewModel["conversation"]["messages"][number]>();
     const includedCalls = new Set<string>();
     const latestRun = this.#viewModel.conversation.agentRuns.at(-1);
@@ -1120,8 +1170,9 @@ export class SidebarController {
       );
       for (const message of runMessages.filter(({ role }) => role === "user")) {
         includedMessages.add(message);
-        transcript.push({ kind: "message", message });
+        transcript.push(presentMessage(message));
       }
+      const summarizedActivities: SidebarViewModel["presentation"]["activities"] = [];
       for (const call of this.#viewModel.conversation.toolCalls.filter(
         (candidate) => candidate.agentRunId === run.id,
       )) {
@@ -1129,11 +1180,21 @@ export class SidebarController {
         const change = changeByToolCallId.get(call.id);
         const activity = activityById.get(call.id);
         if (change) transcript.push({ kind: "vault_change", change });
-        else if (activity) transcript.push({ kind: "activity", activity });
+        else if (activity?.status === "failed") {
+          transcript.push({ kind: "activity_error", activity });
+        } else if (activity) summarizedActivities.push(activity);
+      }
+      if (summarizedActivities.length > 0) {
+        transcript.push({
+          activities: summarizedActivities,
+          agentRunId: run.id,
+          kind: "activity_summary",
+          label: `${summarizedActivities.length} 个工具活动`,
+        });
       }
       for (const message of runMessages.filter(({ role }) => role === "assistant")) {
         includedMessages.add(message);
-        transcript.push({ kind: "message", message });
+        transcript.push(presentMessage(message));
       }
       if (run.status !== "completed" && run.status !== "running") {
         const labels = {
@@ -1155,14 +1216,29 @@ export class SidebarController {
       }
     }
     for (const message of this.#viewModel.conversation.messages) {
-      if (!includedMessages.has(message)) transcript.push({ kind: "message", message });
+      if (!includedMessages.has(message)) transcript.push(presentMessage(message));
     }
+    const unmatchedActivities = new Map<string, SidebarViewModel["presentation"]["activities"]>();
     for (const call of this.#viewModel.conversation.toolCalls) {
       if (includedCalls.has(call.id)) continue;
       const change = changeByToolCallId.get(call.id);
       const activity = activityById.get(call.id);
       if (change) transcript.push({ kind: "vault_change", change });
-      else if (activity) transcript.push({ kind: "activity", activity });
+      else if (activity?.status === "failed") {
+        transcript.push({ kind: "activity_error", activity });
+      } else if (activity) {
+        const group = unmatchedActivities.get(call.agentRunId) ?? [];
+        group.push(activity);
+        unmatchedActivities.set(call.agentRunId, group);
+      }
+    }
+    for (const [agentRunId, groupedActivities] of unmatchedActivities) {
+      transcript.push({
+        activities: groupedActivities,
+        agentRunId,
+        kind: "activity_summary",
+        label: `${groupedActivities.length} 个工具活动`,
+      });
     }
     return {
       activities,

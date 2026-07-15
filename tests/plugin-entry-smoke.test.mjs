@@ -42,13 +42,58 @@ class StubElement {
     this.attributes = new Map();
     this.listeners = new Map();
     this.open = false;
+    this.parentElement = undefined;
     this.tagName = tagName;
-    this.text = "";
+    this._text = "";
     this.value = "";
   }
 
   empty() {
+    for (const child of this.children) child.parentElement = undefined;
     this.children = [];
+  }
+
+  get text() {
+    return `${this._text}${this.children.map(({ text }) => text).join("")}`;
+  }
+
+  set text(value) {
+    this._text = `${value}`;
+  }
+
+  get childNodes() {
+    return this.children;
+  }
+
+  get textContent() {
+    return this.text;
+  }
+
+  appendChild(child) {
+    child.remove();
+    child.parentElement = this;
+    this.children.push(child);
+    return child;
+  }
+
+  cloneNode(deep = false) {
+    const clone = new StubElement(this.className, this.tagName);
+    clone._text = this._text;
+    if (deep) clone.replaceChildren(...this.children.map((child) => child.cloneNode(true)));
+    return clone;
+  }
+
+  remove() {
+    if (!this.parentElement) return;
+    const index = this.parentElement.children.indexOf(this);
+    if (index >= 0) this.parentElement.children.splice(index, 1);
+    this.parentElement = undefined;
+  }
+
+  replaceChildren(...children) {
+    for (const child of this.children) child.parentElement = undefined;
+    this.children = [];
+    for (const child of children) this.appendChild(child);
   }
 
   addClass(className) {
@@ -82,6 +127,7 @@ class StubElement {
 
   dispatch(type) {
     this.listeners.get(type)?.({ preventDefault() {} });
+    this[`on${type}`]?.({ preventDefault() {} });
   }
 
   findByClass(className) {
@@ -99,11 +145,34 @@ class StubElement {
     return matches;
   }
 
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] ?? undefined;
+  }
+
+  querySelectorAll(selector) {
+    const descendants = this.children.flatMap(function collect(element) {
+      return [element, ...element.children.flatMap(collect)];
+    });
+    if (selector === "pre > code") {
+      return descendants.filter(
+        (element) => element.tagName === "code" && element.parentElement?.tagName === "pre",
+      );
+    }
+    if (selector === 'a[href^="http://"], a[href^="https://"]') {
+      return descendants.filter((element) => {
+        const href = element.getAttribute("href") ?? "";
+        return element.tagName === "a" && /^https?:\/\//.test(href);
+      });
+    }
+    if (selector.startsWith(".")) return this.findAllByClass(selector.slice(1));
+    return [];
+  }
+
   #createChild(options, tagName = "div") {
     const child = new StubElement(options.cls ?? "", tagName);
     child.text = options.text ?? "";
     child.value = options.value ?? "";
-    this.children.push(child);
+    this.appendChild(child);
     return child;
   }
 }
@@ -220,6 +289,8 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
 
   let activeView;
   let plugin;
+  let releaseStaleMarkdownRender;
+  let deferredStreamingMarkdown = false;
   let persistedPluginData;
 
   class FileSystemAdapter {
@@ -250,6 +321,11 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
       this.leaf = leaf;
       this.contentEl = new StubElement();
     }
+  }
+
+  class Component {
+    load() {}
+    unload() {}
   }
 
   class Plugin {
@@ -398,8 +474,35 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     async revealLeaf() {},
   };
   const obsidianStub = {
+    Component,
     FileSystemAdapter,
     ItemView,
+    MarkdownRenderer: {
+      async render(_app, markdown, element) {
+        if (
+          markdown === "OfferAgent received: Practice my introduction." &&
+          !deferredStreamingMarkdown
+        ) {
+          deferredStreamingMarkdown = true;
+          await new Promise((resolve) => {
+            releaseStaleMarkdownRender = resolve;
+          });
+        }
+        if (markdown.includes("MARKDOWN_RENDER_FAILURE")) {
+          throw new Error("synthetic Markdown renderer failure");
+        }
+        element.createDiv({ text: markdown });
+        if (markdown.includes("Practice my introduction.")) {
+          const link = element.createEl("a", { text: "External source" });
+          link.setAttribute("href", "https://example.com/source");
+          const nativePre = element.createEl("pre");
+          nativePre.createEl("code", { text: "const answer = 42;" });
+          nativePre.createEl("button", { cls: "copy-code-button" });
+          const fallbackPre = element.createEl("pre");
+          fallbackPre.createEl("code", { text: "const fallback = 7;" });
+        }
+      },
+    },
     Notice,
     Platform: { isDesktopApp: true },
     Plugin,
@@ -671,26 +774,63 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__send")?.text, "Send");
   input.value = "Practice my introduction.";
   composer.dispatch("submit");
-
-  const assistantMessage = await waitUntil(
-    () => {
-      const message = activeView.contentEl.findByClass("offeragent-sidebar__message--assistant");
-      return message?.text === "OfferAgent received: Practice my introduction." ? message : undefined;
-    },
-    "OfferAgent did not stream the fake Provider response into the Sidebar",
+  await waitUntil(
+    () => releaseStaleMarkdownRender,
+    "OfferAgent did not start the deferred Markdown render",
   );
-  assert.equal(assistantMessage.text, "OfferAgent received: Practice my introduction.");
   await waitUntil(
     () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
     "OfferAgent did not finish the first Agent Run",
   );
+  await plugin.setFastMode(true);
+  const assistantMessage = await waitUntil(
+    () => {
+      const message = activeView.contentEl.findByClass("offeragent-sidebar__message--assistant");
+      return message?.findByClass("offeragent-sidebar__message-body")?.text.startsWith(
+          "OfferAgent received: Practice my introduction.",
+        )
+        ? message
+        : undefined;
+    },
+    "OfferAgent did not stream the fake Provider response into the Sidebar",
+  );
+  assert.equal(
+    assistantMessage.findByClass("offeragent-sidebar__message-body")?.text,
+    "OfferAgent received: Practice my introduction.External sourceconst answer = 42;const fallback = 7;复制代码",
+  );
+  const externalLink = assistantMessage
+    .findByClass("offeragent-sidebar__message-body")
+    ?.querySelectorAll('a[href^="http://"], a[href^="https://"]')[0];
+  assert.equal(externalLink?.target, "_blank");
+  assert.equal(externalLink?.rel, "noopener noreferrer");
+  assert.equal(
+    assistantMessage.findByClass("offeragent-sidebar__code-copy")?.getAttribute("aria-label"),
+    "复制代码块",
+  );
+  assert.equal(assistantMessage.findAllByClass("copy-code-button").length, 1);
+  assert.equal(assistantMessage.findAllByClass("offeragent-sidebar__code-copy").length, 1);
+  assert.equal(
+    assistantMessage.findByClass("offeragent-sidebar__message-copy")?.getAttribute("aria-label"),
+    "复制完整回答",
+  );
+  releaseStaleMarkdownRender();
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal(
+    activeView.contentEl
+      .findByClass("offeragent-sidebar__message--assistant")
+      ?.findByClass("offeragent-sidebar__message-body")?.text,
+    "OfferAgent received: Practice my introduction.External sourceconst answer = 42;const fallback = 7;复制代码",
+    "A stale Markdown render replaced the latest completed response",
+  );
+  await plugin.setFastMode(false);
   assert.ok(
     activeView.contentEl
       .findAllByClass("offeragent-sidebar__tool-activity")
       .some(
         (activity) =>
-          activity.dataset.status === "completed" &&
-          activity.children[0]?.text.includes("Read contract agent.md"),
+          activity
+            .findAllByClass("offeragent-sidebar__tool-activity-label")
+            .some((label) => label.text.includes("Read contract agent.md")),
       ),
     "The installed Runtime did not read the migrated Agent Contract",
   );
@@ -699,11 +839,21 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
 
   const nextComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const nextInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
-  nextInput.value = "Practice a second answer.";
+  nextInput.value = "MARKDOWN_RENDER_FAILURE";
   nextComposer.dispatch("submit");
   await waitUntil(
     () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
     "OfferAgent did not finish the second Agent Run",
+  );
+  assert.ok(
+    activeView.contentEl
+      .findAllByClass("offeragent-sidebar__message-body")
+      .some(
+        (body) =>
+          body.dataset.renderStatus === "plain-text-fallback" &&
+          body.text.includes("MARKDOWN_RENDER_FAILURE"),
+      ),
+    "A Markdown renderer failure did not retain the complete plain-text answer",
   );
   assert.equal(activeView.contentEl.findAllByClass("offeragent-sidebar__run-status").length, 0);
 
@@ -711,18 +861,50 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   const toolInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
   toolInput.value = "vault_read notes/example.md 1-2";
   toolComposer.dispatch("submit");
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__stop"),
+    "OfferAgent did not enter the active Tool Run",
+  );
+  const stableToolRunElements = {
+    composer: activeView.contentEl.findByClass("offeragent-sidebar__composer"),
+    header: activeView.contentEl.findByClass("offeragent-sidebar__header"),
+    input: activeView.contentEl.findByClass("offeragent-sidebar__input"),
+    transcript: activeView.contentEl.findByClass("offeragent-sidebar__transcript"),
+  };
   const completedTool = await waitUntil(
     () => {
       const activities = activeView.contentEl.findAllByClass("offeragent-sidebar__tool-activity");
       return activities.find(
         (activity) =>
           activity.dataset.status === "completed" &&
-          activity.children[0]?.text.includes("Read notes/example.md"),
+          activity
+            .findAllByClass("offeragent-sidebar__tool-activity-label")
+            .some((label) => label.text.includes("Read notes/example.md")),
       );
     },
     "OfferAgent did not execute and render the Vault tool activity",
   );
-  assert.match(completedTool.children[0].text, /Read notes\/example\.md · completed/);
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__header"),
+    stableToolRunElements.header,
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__transcript"),
+    stableToolRunElements.transcript,
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__composer"),
+    stableToolRunElements.composer,
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input"),
+    stableToolRunElements.input,
+  );
+  assert.ok(
+    completedTool
+      .findAllByClass("offeragent-sidebar__tool-activity-label")
+      .some((label) => /Read notes\/example\.md · completed/.test(label.text)),
+  );
   assert.equal(completedTool.children[0].getAttribute("aria-expanded"), "false");
   completedTool.open = true;
   completedTool.dispatch("toggle");
@@ -1339,7 +1521,11 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   );
   const readActivityCount = activeView.contentEl
     .findAllByClass("offeragent-sidebar__tool-activity")
-    .filter((activity) => activity.children[0]?.text.includes("Read notes/example.md")).length;
+    .filter((activity) =>
+      activity
+        .findAllByClass("offeragent-sidebar__tool-activity-label")
+        .some((label) => label.text.includes("Read notes/example.md"))
+    ).length;
   const readOnlyComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const readOnlyInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
   readOnlyInput.value = "vault_read notes/example.md 1-2";
@@ -1351,7 +1537,9 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
         .filter(
           (activity) =>
             activity.dataset.status === "completed" &&
-            activity.children[0]?.text.includes("Read notes/example.md"),
+            activity
+              .findAllByClass("offeragent-sidebar__tool-activity-label")
+              .some((label) => label.text.includes("Read notes/example.md")),
         ).length === readActivityCount + 1,
     "Read Only blocked a permitted Vault read",
   );

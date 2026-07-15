@@ -110,22 +110,67 @@
 .offeragent-sidebar__message {
   min-width: 0;
   overflow-wrap: anywhere;
-  white-space: pre-wrap;
+}
+
+.offeragent-sidebar__message-body {
+  min-width: 0;
+}
+
+.offeragent-sidebar__message--compact_user {
+  align-self: flex-end;
+  max-width: 82%;
+  padding: var(--size-4-2) var(--size-4-3);
 }
 
 .offeragent-sidebar__message--user {
-  align-self: flex-end;
-  max-width: 82%;
   border: 1px solid var(--background-modifier-border);
   border-radius: var(--radius-m) var(--radius-m) var(--radius-s) var(--radius-m);
-  padding: var(--size-4-2) var(--size-4-3);
   background: var(--background-secondary-alt);
 }
 
-.offeragent-sidebar__message--assistant {
+.offeragent-sidebar__message--user .offeragent-sidebar__message-body {
+  white-space: pre-wrap;
+}
+
+.offeragent-sidebar__message--full_width_agent {
   align-self: stretch;
   width: 100%;
   padding: var(--size-4-1) 0;
+}
+
+.offeragent-sidebar__message--assistant .offeragent-sidebar__message-body > :first-child {
+  margin-top: 0;
+}
+
+.offeragent-sidebar__message--assistant .offeragent-sidebar__message-body > :last-child {
+  margin-bottom: 0;
+}
+
+.offeragent-sidebar__message-body pre,
+.offeragent-sidebar__message-body table {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.offeragent-sidebar__message-body table {
+  display: block;
+}
+
+.offeragent-sidebar__message-copy,
+.offeragent-sidebar__code-copy {
+  margin-top: var(--size-4-1);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.offeragent-sidebar__message-body pre {
+  position: relative;
+}
+
+.offeragent-sidebar__code-copy {
+  position: sticky;
+  right: var(--size-4-1);
+  float: right;
 }
 
 .offeragent-sidebar__citations {
@@ -180,14 +225,36 @@
   outline-offset: 2px;
 }
 
-.offeragent-sidebar__tool-activity > pre {
+.offeragent-sidebar__tool-activity-row {
+  min-width: 0;
+  padding: 0 var(--size-4-1) var(--size-4-2);
+}
+
+.offeragent-sidebar__tool-activity-label {
+  color: var(--text-normal);
+  overflow-wrap: anywhere;
+}
+
+.offeragent-sidebar__tool-activity-row > pre,
+.offeragent-sidebar__activity-error > pre {
   max-height: 14rem;
-  margin: 0 0 var(--size-4-2);
+  margin: var(--size-4-1) 0 0;
   overflow: auto;
   padding: var(--size-4-2);
   background: var(--background-secondary);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+}
+
+.offeragent-sidebar__activity-error {
+  min-width: 0;
+  border: 1px solid var(--background-modifier-error-border);
+  border-radius: var(--radius-s);
+  padding: var(--size-4-2);
+  color: var(--text-error);
+  background: var(--background-modifier-error);
+  font-size: var(--font-ui-smaller);
+  overflow-wrap: anywhere;
 }
 
 .offeragent-sidebar__run-status {
@@ -389,7 +456,7 @@
     flex-basis: 100%;
   }
 
-  .offeragent-sidebar__message--user {
+  .offeragent-sidebar__message--compact_user {
     max-width: 92%;
   }
 

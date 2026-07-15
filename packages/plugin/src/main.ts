@@ -1,8 +1,10 @@
 import path from "node:path";
 import {
+  Component,
   type App,
   FileSystemAdapter,
   ItemView,
+  MarkdownRenderer,
   Notice,
   Platform,
   Plugin,
@@ -158,8 +160,13 @@ class OfferAgentSettingTab extends PluginSettingTab {
 class OfferAgentSidebarView extends ItemView {
   readonly #controller: SidebarController;
   readonly #openSettings: () => void;
+  readonly #markdownRenders = new Map<string, {
+    owner?: Component;
+    timer?: ReturnType<typeof setTimeout>;
+  }>();
   readonly #previewUrls: string[] = [];
   readonly #streamedMessageElements = new Map<string, HTMLDivElement>();
+  readonly #transcriptItemElements = new Map<string, HTMLElement>();
   #composerInput?: HTMLTextAreaElement;
   #newContentButton?: HTMLButtonElement;
   #renderedViewModel?: SidebarViewModel;
@@ -193,6 +200,7 @@ class OfferAgentSidebarView extends ItemView {
   async onClose(): Promise<void> {
     this.#unsubscribe?.();
     this.#unsubscribe = undefined;
+    this.#disposeMarkdownRenders();
     this.#revokePreviewUrls();
   }
 
@@ -205,21 +213,25 @@ class OfferAgentSidebarView extends ItemView {
     index: number,
   ): string {
     if (item.kind === "message") {
-      return `message:${item.message.agentRunId}:${item.message.role}`;
+      return `message:${item.key}`;
     }
-    if (item.kind === "activity") return `activity:${item.activity.id}`;
+    if (item.kind === "activity_error") return `activity-error:${item.activity.id}`;
+    if (item.kind === "activity_summary") return `activity-summary:${item.agentRunId}`;
     if (item.kind === "vault_change") return `vault-change:${item.change.toolCallId}`;
     return `run-status:${item.agentRunId}:${index}`;
   }
 
   #streamingFrameSignature(viewModel: SidebarViewModel): string {
+    const {
+      agentRuns: _agentRuns,
+      messages: _messages,
+      toolCalls: _toolCalls,
+      vaultChanges: _vaultChanges,
+      ...conversation
+    } = viewModel.conversation;
     return JSON.stringify({
-      conversation: {
-        ...viewModel.conversation,
-        messages: viewModel.conversation.messages.map(({ text: _text, ...message }) => message),
-      },
+      conversation,
       presentation: {
-        activities: viewModel.presentation.activities,
         composer: {
           ...viewModel.presentation.composer,
           draftText: undefined,
@@ -231,6 +243,95 @@ class OfferAgentSidebarView extends ItemView {
     });
   }
 
+  #appendMessage(
+    transcript: HTMLDivElement,
+    item: Extract<SidebarViewModel["presentation"]["transcript"][number], { kind: "message" }>,
+    index: number,
+  ): HTMLDivElement {
+    const { message } = item;
+    const messageElement = transcript.createDiv({
+      cls: `offeragent-sidebar__message offeragent-sidebar__message--${message.role} offeragent-sidebar__message--${item.presentation.layout}`,
+    });
+    const messageBody = messageElement.createDiv({ cls: "offeragent-sidebar__message-body" });
+    const key = this.#transcriptItemKey(item, index);
+    this.#streamedMessageElements.set(key, messageBody);
+    if (item.presentation.format === "markdown") {
+      messageBody.addClass("markdown-rendered");
+      this.#scheduleMarkdownRender(key, messageBody, message.text, 0);
+    } else messageBody.setText(message.text);
+    if (item.presentation.copyable && message.text) {
+      const copy = messageElement.createEl("button", {
+        cls: "offeragent-sidebar__message-copy",
+        text: "复制回答",
+      });
+      copy.type = "button";
+      copy.setAttribute("aria-label", "复制完整回答");
+      copy.addEventListener("click", () => this.#copyText(message.text));
+    }
+    if (message.citations?.length) {
+      const sources = messageElement.createDiv({ cls: "offeragent-sidebar__citations" });
+      for (const [citationIndex, citation] of message.citations.entries()) {
+        const link = sources.createEl("a", {
+          cls: "offeragent-sidebar__citation",
+          text: `[${citationIndex + 1}] ${citation.title}`,
+        });
+        link.href = citation.url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+      }
+    }
+    return messageElement;
+  }
+
+  #populateActivitySummary(
+    activity: HTMLDetailsElement,
+    item: Extract<SidebarViewModel["presentation"]["transcript"][number], {
+      kind: "activity_summary";
+    }>,
+  ): void {
+    const wasOpen = activity.open;
+    activity.empty();
+    activity.open = wasOpen;
+    activity.dataset.status = item.activities.every(({ status }) => status === "completed")
+      ? "completed"
+      : "requested";
+    const summary = activity.createEl("summary", { text: item.label });
+    summary.setAttribute("aria-expanded", wasOpen ? "true" : "false");
+    summary.setAttribute("aria-label", `${item.label}，按回车展开详情`);
+    activity.ontoggle = () => {
+      summary.setAttribute("aria-expanded", activity.open ? "true" : "false");
+    };
+    for (const presented of item.activities) {
+      const row = activity.createDiv({ cls: "offeragent-sidebar__tool-activity-row" });
+      row.createDiv({ cls: "offeragent-sidebar__tool-activity-label", text: presented.label });
+      row.createEl("pre", { text: presented.details });
+    }
+  }
+
+  #appendActivitySummary(
+    transcript: HTMLDivElement,
+    item: Extract<SidebarViewModel["presentation"]["transcript"][number], {
+      kind: "activity_summary";
+    }>,
+  ): HTMLDetailsElement {
+    const activity = transcript.createEl("details", { cls: "offeragent-sidebar__tool-activity" });
+    this.#populateActivitySummary(activity, item);
+    return activity;
+  }
+
+  #appendActivityError(
+    transcript: HTMLDivElement,
+    item: Extract<SidebarViewModel["presentation"]["transcript"][number], {
+      kind: "activity_error";
+    }>,
+  ): HTMLDivElement {
+    const error = transcript.createDiv({ cls: "offeragent-sidebar__activity-error" });
+    error.dataset.status = item.activity.status;
+    error.createDiv({ text: item.activity.label });
+    error.createEl("pre", { text: item.activity.details });
+    return error;
+  }
+
   #tryPatchStreamingUpdate(previous: SidebarViewModel, next: SidebarViewModel): boolean {
     const transcript = this.#transcriptElement;
     const input = this.#composerInput;
@@ -240,21 +341,59 @@ class OfferAgentSidebarView extends ItemView {
       previous.conversation.runState !== "streaming" ||
       next.conversation.runState !== "streaming" ||
       previous.conversation.activeConversationId !== next.conversation.activeConversationId ||
-      previous.presentation.transcript.length !== next.presentation.transcript.length ||
       this.#streamingFrameSignature(previous) !== this.#streamingFrameSignature(next)
     ) return false;
 
     const previousScrollTop = transcript.scrollTop;
+    const previousItems = new Map(previous.presentation.transcript.map((item, index) => [
+      this.#transcriptItemKey(item, index),
+      item,
+    ]));
+    const nextKeys = new Set<string>();
     for (const [index, item] of next.presentation.transcript.entries()) {
-      const prior = previous.presentation.transcript[index];
-      if (!prior || this.#transcriptItemKey(prior, index) !== this.#transcriptItemKey(item, index)) {
-        return false;
+      const key = this.#transcriptItemKey(item, index);
+      nextKeys.add(key);
+      const prior = previousItems.get(key);
+      let itemElement = this.#transcriptItemElements.get(key);
+      if (!itemElement) {
+        if (item.kind === "message") itemElement = this.#appendMessage(transcript, item, index);
+        else if (item.kind === "activity_summary") {
+          itemElement = this.#appendActivitySummary(transcript, item);
+        } else if (item.kind === "activity_error") {
+          itemElement = this.#appendActivityError(transcript, item);
+        } else return false;
+        this.#transcriptItemElements.set(key, itemElement);
       }
-      if (item.kind !== "message" || prior.kind !== "message") continue;
-      if (item.message.text === prior.message.text) continue;
-      const element = this.#streamedMessageElements.get(this.#transcriptItemKey(item, index));
+      if (!prior || JSON.stringify(prior) === JSON.stringify(item)) continue;
+      if (item.kind === "message" && prior.kind === "message") {
+        const element = this.#streamedMessageElements.get(key);
+        if (!element) return false;
+        if (item.presentation.format === "markdown") {
+          this.#scheduleMarkdownRender(key, element, item.message.text);
+        } else element.setText(item.message.text);
+      } else if (item.kind === "activity_summary" && prior.kind === "activity_summary") {
+        this.#populateActivitySummary(itemElement as HTMLDetailsElement, item);
+      } else if (item.kind === "activity_error" && prior.kind === "activity_error") {
+        itemElement.empty();
+        itemElement.dataset.status = item.activity.status;
+        itemElement.createDiv({ text: item.activity.label });
+        itemElement.createEl("pre", { text: item.activity.details });
+      } else return false;
+    }
+    for (const [key, element] of this.#transcriptItemElements) {
+      if (nextKeys.has(key)) continue;
+      element.remove();
+      this.#transcriptItemElements.delete(key);
+      this.#streamedMessageElements.delete(key);
+      const render = this.#markdownRenders.get(key);
+      if (render?.timer) clearTimeout(render.timer);
+      if (render) this.#unloadMarkdownOwner(render);
+      this.#markdownRenders.delete(key);
+    }
+    for (const [index, item] of next.presentation.transcript.entries()) {
+      const element = this.#transcriptItemElements.get(this.#transcriptItemKey(item, index));
       if (!element) return false;
-      element.setText(item.message.text);
+      transcript.appendChild(element);
     }
 
     if (input.value === previous.presentation.composer.draftText) {
@@ -262,6 +401,109 @@ class OfferAgentSidebarView extends ItemView {
     }
     this.#syncTranscriptScroll(next, previousScrollTop);
     return true;
+  }
+
+  #copyText(text: string): void {
+    void navigator.clipboard.writeText(text).catch(() => {
+      new Notice("无法复制到剪贴板。");
+    });
+  }
+
+  #disposeMarkdownRenders(): void {
+    for (const render of this.#markdownRenders.values()) {
+      if (render.timer) clearTimeout(render.timer);
+      this.#unloadMarkdownOwner(render);
+    }
+    this.#markdownRenders.clear();
+  }
+
+  #unloadMarkdownOwner(render: { owner?: Component }): void {
+    const owner = render.owner;
+    render.owner = undefined;
+    owner?.unload();
+  }
+
+  #postprocessMarkdown(element: HTMLDivElement): void {
+    if (typeof element.querySelectorAll !== "function") return;
+    for (const link of element.querySelectorAll<HTMLAnchorElement>(
+      'a[href^="http://"], a[href^="https://"]',
+    )) {
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+    }
+    for (const code of element.querySelectorAll<HTMLElement>("pre > code")) {
+      const pre = code.parentElement;
+      if (
+        !pre ||
+        pre.querySelector(".copy-code-button") ||
+        pre.querySelector(".offeragent-sidebar__code-copy")
+      ) continue;
+      const copy = pre.createEl("button", {
+        cls: "offeragent-sidebar__code-copy",
+        text: "复制代码",
+      });
+      copy.type = "button";
+      copy.setAttribute("aria-label", "复制代码块");
+      copy.addEventListener("click", () => this.#copyText(code.textContent ?? ""));
+    }
+  }
+
+  #scheduleMarkdownRender(
+    key: string,
+    element: HTMLDivElement,
+    markdown: string,
+    delayMs = 50,
+  ): void {
+    const previous = this.#markdownRenders.get(key);
+    if (previous?.timer) clearTimeout(previous.timer);
+    if (previous) this.#unloadMarkdownOwner(previous);
+    const render: {
+      owner?: Component;
+      timer?: ReturnType<typeof setTimeout>;
+    } = {};
+    const start = async () => {
+      render.timer = undefined;
+      if (this.#markdownRenders.get(key) !== render) return;
+      const owner = new Component();
+      owner.load();
+      render.owner = owner;
+      const staging = element.cloneNode(false) as HTMLDivElement;
+      try {
+        await MarkdownRenderer.render(this.app, markdown, staging, "", owner);
+        if (
+          this.#markdownRenders.get(key) !== render ||
+          this.#streamedMessageElements.get(key) !== element
+        ) {
+          this.#unloadMarkdownOwner(render);
+          return;
+        }
+        this.#postprocessMarkdown(staging);
+        const transcript = this.#transcriptElement;
+        const frozenScrollTop = transcript?.scrollTop;
+        element.replaceChildren(...Array.from(staging.childNodes));
+        element.dataset.renderStatus = "rendered";
+        if (transcript && this.#renderedViewModel) {
+          this.#syncTranscriptScroll(this.#renderedViewModel, frozenScrollTop);
+        }
+      } catch {
+        this.#unloadMarkdownOwner(render);
+        if (
+          this.#markdownRenders.get(key) !== render ||
+          this.#streamedMessageElements.get(key) !== element
+        ) return;
+        const transcript = this.#transcriptElement;
+        const frozenScrollTop = transcript?.scrollTop;
+        element.setText(markdown);
+        element.dataset.renderStatus = "plain-text-fallback";
+        new Notice("Markdown 渲染失败，已显示纯文本回答。");
+        if (transcript && this.#renderedViewModel) {
+          this.#syncTranscriptScroll(this.#renderedViewModel, frozenScrollTop);
+        }
+      }
+    };
+    this.#markdownRenders.set(key, render);
+    if (delayMs <= 0) void start();
+    else render.timer = setTimeout(() => void start(), delayMs);
   }
 
   #syncTranscriptScroll(viewModel: SidebarViewModel, frozenScrollTop?: number): void {
@@ -289,7 +531,9 @@ class OfferAgentSidebarView extends ItemView {
     const selectionEnd = restoreComposerFocus ? this.#composerInput?.selectionEnd : undefined;
     const container = this.contentEl;
     this.#revokePreviewUrls();
+    this.#disposeMarkdownRenders();
     this.#streamedMessageElements.clear();
+    this.#transcriptItemElements.clear();
     this.#composerInput = undefined;
     this.#newContentButton = undefined;
     this.#transcriptElement = undefined;
@@ -386,28 +630,13 @@ class OfferAgentSidebarView extends ItemView {
     }
 
     for (const [index, item] of viewModel.presentation.transcript.entries()) {
+      let itemElement: HTMLElement;
       if (item.kind === "message") {
-        const { message } = item;
-        const messageElement = transcript.createDiv({
-          cls: `offeragent-sidebar__message offeragent-sidebar__message--${message.role}`,
-          text: message.text,
-        });
-        this.#streamedMessageElements.set(this.#transcriptItemKey(item, index), messageElement);
-        if (message.citations?.length) {
-          const sources = messageElement.createDiv({ cls: "offeragent-sidebar__citations" });
-          for (const [index, citation] of message.citations.entries()) {
-            const link = sources.createEl("a", {
-              cls: "offeragent-sidebar__citation",
-              text: `[${index + 1}] ${citation.title}`,
-            });
-            link.href = citation.url;
-            link.target = "_blank";
-            link.rel = "noopener noreferrer";
-          }
-        }
+        itemElement = this.#appendMessage(transcript, item, index);
       } else if (item.kind === "vault_change") {
         const { change: batch } = item;
         const card = transcript.createDiv({ cls: "offeragent-sidebar__change-batch" });
+        itemElement = card;
         card.dataset.status = batch.status;
         card.createEl("h3", { text: batch.task });
         card.createDiv({
@@ -457,23 +686,10 @@ class OfferAgentSidebarView extends ItemView {
             void this.#controller.undoVaultChange(batch.batchId);
           });
         }
-      } else if (item.kind === "activity") {
-        const presented = item.activity;
-        const activity = transcript.createEl("details", {
-          cls: "offeragent-sidebar__tool-activity",
-        });
-        activity.dataset.status = presented.status;
-        const summary = activity.createEl("summary", {
-          text: presented.label,
-        });
-        summary.setAttribute("aria-expanded", "false");
-        summary.setAttribute("aria-label", `${presented.label}. Press Enter to show details.`);
-        activity.addEventListener("toggle", () => {
-          summary.setAttribute("aria-expanded", activity.open ? "true" : "false");
-        });
-        activity.createEl("pre", {
-          text: presented.details,
-        });
+      } else if (item.kind === "activity_error") {
+        itemElement = this.#appendActivityError(transcript, item);
+      } else if (item.kind === "activity_summary") {
+        itemElement = this.#appendActivitySummary(transcript, item);
       } else {
         const runStatus = transcript.createDiv({
           cls: "offeragent-sidebar__run-status",
@@ -481,7 +697,9 @@ class OfferAgentSidebarView extends ItemView {
         });
         runStatus.dataset.agentRunId = item.agentRunId;
         runStatus.dataset.status = item.status;
+        itemElement = runStatus;
       }
+      this.#transcriptItemElements.set(this.#transcriptItemKey(item, index), itemElement);
     }
 
     const newContentButton = container.createEl("button", {
