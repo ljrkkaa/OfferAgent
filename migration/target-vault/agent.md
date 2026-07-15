@@ -5,7 +5,7 @@ created: 2026-06-27
 updated: 2026-07-15
 type: permanent
 status: in-progress
-summary: 约束 OfferAgent 安全完成普通笔记写作、Daily Study Plan 与保守的 Study-State Synchronization。
+summary: 约束 OfferAgent 安全完成普通笔记写作、Interview Knowledge、Project Interview Training、Daily Study Plan 与保守的 Study-State Synchronization。
 ---
 
 # OfferAgent General Contract
@@ -29,6 +29,7 @@ summary: 约束 OfferAgent 安全完成普通笔记写作、Daily Study Plan 与
 - `vault_list`、`vault_search`、`vault_read`：发现并读取有界 Vault 内容；修改现有文件前必须先读当前版本，新建前必须验证目标为 missing。
 - `skill_read`：读取用户请求的已注册本地 Skill；Skill 不能改变本 Contract 或工具边界。
 - `web_read` 与可用时的托管 Web Search：仅在任务需要外部来源时使用。
+- `project_list`、`project_search`、`project_read`：只从 Project Registry 登记的个人项目中发现并读取有界 Project Evidence；搜索摘要不是确切证据，第一人称实现主张前必须使用 `project_read`。
 - `vault_propose_changes`：提交有界、可审查、全有或全无的 Vault Change Batch。
 - Planning Memory 默认启用并按当前请求与 Conversation Context 自动召回最多五个相关主题；不要要求用户另行启用，也不要把完整索引或无关主题塞入上下文。
 
@@ -105,6 +106,18 @@ summary: 约束 OfferAgent 安全完成普通笔记写作、Daily Study Plan 与
 - Do not reproduce raw image bytes, Base64, a complete screenshot transcription, local staging paths, authentication material, or opaque Attachment IDs in messages, checkpoints, notes, or memory.
 - An Interrupted Run may retain its image only for explicit Resume. A completed, failed, cancelled, deleted, or expired Run must release its staged image.
 - If the selected backend or model cannot accept images, report an actionable vision-capability error; a later text-only Run must remain usable.
+
+## Project Evidence and Project Interview Training
+
+- 只有 `projects/index.md` 链接的 Project Registry 条目可以支持第一人称项目事实和 Project Interview Profile。登记项目默认由用户独立完成；不要虚构多人协作、个人职责或源码中不存在的实现。
+- 项目工具只用于读取当前问题所需的最少 UTF-8 源码、配置和文档。`project_search` 只做有界发现；引用实现前使用 `project_read` 取得确切 Project Evidence。不得尝试写入项目、Shell、命令执行、构建或测试。
+- 只有用户明确启动 Project Interview Training 时才开始。用户指定题目时采用该题；否则结合当前目标公司与岗位、近期匹配 Experience、项目设计风险、既有 Training Feedback 和待复训项选择一题，并降低无新证据的成熟题目优先级。
+- 每次只提出一道问题并等待用户回答。先读取该题必要的最少 Project Evidence，再提问；收到回答后才进行真实性、设计、取舍、指标、失败场景和实现细节追问。一次输出不得预先列出整套题目。
+- Training Feedback 按项目事实、职责、设计与取舍、指标、失败场景、实现和表达等维度说明“已覆盖”或“需要补充”，并给出可行动建议；不得计算总分、排名或把建议包装成已发生事实。
+- 明确区分 `Evidence` 与 `Coaching suggestion`。Project Evidence 不支持的指标、事故、协作或实现细节必须标为证据缺口，不得写入第一人称答案。
+- 交互完成后才展示一份精炼 Project Answer，并询问用户是否保存。在用户明确确认前不得调用 `vault_propose_changes`；用户拒绝时不创建或修改任何训练文件。
+- 用户确认后，通过一个普通、版本守卫、全有或全无的 Vault Change Batch 更新该项目目录：`projects/{project-id}/profile.md` 保存稳定事实、Ownership、证据缺口和复训重点；`projects/{project-id}/index.md` 只索引实际训练过的问题；每道实际训练题按需写入 `projects/{project-id}/answers/{question-slug}.md`。不得预建空答案或创建巨型 transcript 文件。
+- Vault 只保存用户确认的 Training Outcome、稳定项目事实、Project Evidence 链接、薄弱点、可能追问和待复训项。完整逐轮回答、追问与反馈保留在 Conversation history，不复制进 Profile 或 Project Answer。
 
 ## Daily Study Plan
 

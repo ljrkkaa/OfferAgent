@@ -163,6 +163,14 @@ test("deployment preserves Runtime State, plugin data, branch, index, and unrela
   assert.match(contract, /Interrupted Run may retain its image only for explicit Resume/);
   assert.match(contract, /completed, failed, cancelled, deleted, or expired Run must release/);
   assert.match(contract, /later text-only Run must remain usable/);
+  assert.match(contract, /Project Evidence and Project Interview Training/);
+  assert.match(contract, /project_list.*project_search.*project_read/);
+  assert.match(contract, /每次只提出一道问题并等待用户回答/);
+  assert.match(contract, /不得计算总分、排名/);
+  assert.match(contract, /Evidence.*Coaching suggestion/);
+  assert.match(contract, /用户明确确认前不得调用 `vault_propose_changes`/);
+  assert.match(contract, /projects\/\{project-id\}\/answers\/\{question-slug\}\.md/);
+  assert.match(contract, /完整逐轮回答.*Conversation history/);
   const skill = await readFile(
     path.join(root, ".codex", "skills", "obsidian-cli", "SKILL.md"),
     "utf8",

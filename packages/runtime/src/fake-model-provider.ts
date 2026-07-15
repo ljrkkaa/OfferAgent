@@ -19,12 +19,14 @@ import { dynamicInterviewResearchEvent } from "./fake-dynamic-interview-research
 import { interviewAnswerResearchEvent } from "./fake-answer-research-scenario";
 import { interviewKnowledgePlanningEvent } from "./fake-interview-knowledge-planning-scenario";
 import { projectEvidenceQuestionEvent } from "./fake-project-evidence-scenario";
+import { projectInterviewTrainingEvent } from "./fake-project-interview-training-scenario";
 import { toolResultFor, toolResultForAfter } from "./fake-provider-conversation";
 
 export const FAKE_SCENARIOS = [
   "interview-answer-research",
   "interview-knowledge-planning",
   "project-question-answer",
+  "project-interview-training",
   "dynamic-interview-research",
   "interview-deduplication",
   "multi-image-interview-ingestion",
@@ -248,6 +250,13 @@ export class FakeModelProvider implements ModelProvider {
     }
     if (this.#scenario === "project-question-answer") {
       yield projectEvidenceQuestionEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
+      return;
+    }
+    if (this.#scenario === "project-interview-training") {
+      yield projectInterviewTrainingEvent(request, (prefix) => {
         this.#toolCallSequence += 1;
         return `${prefix}-${this.#toolCallSequence}`;
       });

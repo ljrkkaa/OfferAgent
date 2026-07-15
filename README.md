@@ -93,6 +93,29 @@ secret paths, unsupported or binary files, and files larger than 1 MiB. Exact re
 200 lines and 32 KiB and participate in the same Evidence Snapshot and stale-read rules as Vault
 evidence. Registration does not grant project writes, Shell, build, test, or command execution.
 
+Project Interview Training remains inside the existing multi-Run Conversation and asks one question
+at a time. A user may select the question; otherwise the Agent selects from the target role, recent
+Interview Experiences, project risks, prior feedback, and retraining needs. Follow-ups cite exact
+Project Evidence, feedback is dimension-based without a numeric total, and unsupported metrics or
+implementation claims remain explicit gaps.
+
+Only a user-confirmed Training Outcome is proposed through the ordinary atomic Vault Change Batch.
+For a registered `offeragent` project, the first confirmed outcome creates or updates this bounded
+profile layout:
+
+```text
+projects/offeragent/
+├── profile.md
+├── index.md
+└── answers/
+    └── cache-invalidation.md
+```
+
+The profile stores stable facts, ownership, evidence gaps, and retraining direction; the index links
+only questions that were actually trained; each answer stores the refined outcome and Project
+Evidence links. Full training transcripts remain in Conversation history, and declining the proposed
+outcome performs no Vault write.
+
 The production plugin package is emitted to `packages/plugin/dist/` and contains:
 
 - `manifest.json`
