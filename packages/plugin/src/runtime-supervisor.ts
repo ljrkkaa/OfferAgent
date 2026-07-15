@@ -49,6 +49,7 @@ function unrefTimer(timer: unknown): void {
 }
 
 export interface RuntimeSupervisorOptions {
+  loadUserProxyEnvironment?: () => Promise<NodeJS.ProcessEnv>;
   nodeCandidates?: string[];
   parentPid?: number;
   provider?: "codex" | "fake";
@@ -337,6 +338,37 @@ function defaultNodeCandidates(environment: NodeJS.ProcessEnv): string[] {
   return [...new Set(candidates.filter((candidate): candidate is string => Boolean(candidate)))];
 }
 
+const PROXY_ENVIRONMENT_NAMES = new Set([
+  "ALL_PROXY",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+]);
+
+async function loadWindowsUserProxyEnvironment(): Promise<NodeJS.ProcessEnv> {
+  if (process.platform !== "win32") return {};
+  return new Promise((resolve) => {
+    execFile(
+      "reg.exe",
+      ["query", "HKCU\\Environment"],
+      { encoding: "utf8", timeout: 3_000, windowsHide: true },
+      (error, stdout) => {
+        if (error) {
+          resolve({});
+          return;
+        }
+        const environment: NodeJS.ProcessEnv = {};
+        for (const line of stdout.split(/\r?\n/u)) {
+          const match = /^\s*([^\s]+)\s+REG_(?:EXPAND_)?SZ\s+(.+?)\s*$/u.exec(line);
+          const name = match?.[1]?.toUpperCase();
+          if (name && PROXY_ENVIRONMENT_NAMES.has(name)) environment[name] = match?.[2];
+        }
+        resolve(environment);
+      },
+    );
+  });
+}
+
 async function findNodeExecutable(candidates: string[]): Promise<string> {
   for (const candidate of candidates) {
     try {
@@ -491,7 +523,10 @@ function callRuntime<T>(
 
 export class RuntimeSupervisor implements RuntimeClient {
   readonly #options: Required<
-    Pick<RuntimeSupervisorOptions, "parentPid" | "provider" | "runtimePath" | "startupTimeoutMs">
+    Pick<
+      RuntimeSupervisorOptions,
+      "loadUserProxyEnvironment" | "parentPid" | "provider" | "runtimePath" | "startupTimeoutMs"
+    >
   > & { nodeCandidates: string[]; statePath?: string };
   readonly #toolExecutor?: LocalToolExecutor;
   readonly #onCancelAgentRun?: (agentRunId: string) => void;
@@ -513,6 +548,8 @@ export class RuntimeSupervisor implements RuntimeClient {
 
   constructor(options: RuntimeSupervisorOptions) {
     this.#options = {
+      loadUserProxyEnvironment:
+        options.loadUserProxyEnvironment ?? loadWindowsUserProxyEnvironment,
       nodeCandidates: options.nodeCandidates ?? defaultNodeCandidates(process.env),
       parentPid: options.parentPid ?? process.pid,
       provider:
@@ -551,10 +588,12 @@ export class RuntimeSupervisor implements RuntimeClient {
       this.#options.provider,
     ];
     if (this.#options.statePath) arguments_.push("--state-path", this.#options.statePath);
+    const userProxyEnvironment = await this.#options.loadUserProxyEnvironment();
     const child = spawn(
       executable,
       arguments_,
       {
+        env: { ...userProxyEnvironment, ...process.env },
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
       },
