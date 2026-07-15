@@ -479,9 +479,11 @@ test("the Sidebar serializes sends while an image upload is pending", async () =
 
   const firstSend = controller.sendMessage();
   await started;
+  assert.equal(controller.getViewModel().presentation.composer.isSending, true);
   await assert.rejects(controller.sendMessage(), /Wait for the current Agent Run/);
   failUpload(new Error("Upload stopped for test."));
   await assert.rejects(firstSend, /Upload stopped/);
+  assert.equal(controller.getViewModel().presentation.composer.isSending, false);
   assert.equal(controller.getViewModel().presentation.composer.draftText, "Only once.");
 });
 

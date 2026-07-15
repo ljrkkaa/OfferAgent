@@ -56,6 +56,12 @@ const PERMISSION_LABELS: Record<VaultPermissionMode, string> = {
   trusted_vault: "Trusted Vault",
 };
 
+const PERMISSION_ACCESSIBLE_LABELS: Record<VaultPermissionMode, string> = {
+  ask_every_time: "Vault 权限模式：每次询问",
+  read_only: "Vault 权限模式：只读",
+  trusted_vault: "Vault 权限模式：信任 Vault",
+};
+
 class OfferAgentSettingTab extends PluginSettingTab {
   readonly #owner: OfferAgentPlugin;
 
@@ -730,10 +736,23 @@ class OfferAgentSidebarView extends ItemView {
     }
     const input = composer.createEl("textarea", { cls: "offeragent-sidebar__input" });
     this.#composerInput = input;
-    input.placeholder = "Ask OfferAgent…";
-    input.setAttribute("aria-label", "Message OfferAgent");
+    input.placeholder = "向 OfferAgent 提问…";
+    input.setAttribute("aria-label", "给 OfferAgent 的消息");
     input.value = viewModel.presentation.composer.draftText;
     input.addEventListener("input", () => this.#controller.setComposerDraft(input.value));
+    let isComposing = false;
+    let suppressCompositionEnter = false;
+    input.addEventListener("compositionstart", () => {
+      isComposing = true;
+      suppressCompositionEnter = false;
+    });
+    input.addEventListener("compositionend", () => {
+      isComposing = false;
+      suppressCompositionEnter = true;
+      setTimeout(() => {
+        suppressCompositionEnter = false;
+      }, 0);
+    });
     const acceptImages = async (files: File[]): Promise<void> => {
       this.#controller.setComposerDraft(input.value);
       let finishImport: (() => void) | undefined;
@@ -809,7 +828,7 @@ class OfferAgentSidebarView extends ItemView {
     filePicker.type = "file";
     filePicker.multiple = true;
     filePicker.accept = "image/png,image/jpeg,image/webp,image/gif";
-    filePicker.setAttribute("aria-label", "Choose up to 20 images");
+    filePicker.setAttribute("aria-label", "添加图片（最多 20 张）");
     filePicker.disabled = viewModel.presentation.composer.isPreparingAttachments;
     filePicker.addEventListener("change", () => {
       const files = [...(filePicker.files ?? [])];
@@ -817,16 +836,17 @@ class OfferAgentSidebarView extends ItemView {
     });
     const attachButton = controls.createEl("button", {
       cls: "offeragent-sidebar__attach",
-      text: "Attach images",
+      text: "添加图片",
     });
     attachButton.type = "button";
+    attachButton.setAttribute("aria-label", "添加图片（最多 20 张）");
     attachButton.disabled = viewModel.presentation.composer.primaryAction.kind !== "send" ||
       viewModel.presentation.composer.isPreparingAttachments;
     attachButton.addEventListener("click", () => filePicker.click());
     const modelSelect = controls.createEl("select", {
       cls: "offeragent-sidebar__model-select",
     });
-    modelSelect.setAttribute("aria-label", "Conversation model");
+    modelSelect.setAttribute("aria-label", "选择对话模型");
     for (const model of viewModel.conversation.models) {
       const option = modelSelect.createEl("option", { text: model.label });
       option.value = model.id;
@@ -838,21 +858,38 @@ class OfferAgentSidebarView extends ItemView {
     modelSelect.addEventListener("change", () => {
       void this.#controller.selectModel(modelSelect.value);
     });
-    controls.createDiv({
+    const permission = controls.createDiv({
       cls: "offeragent-sidebar__permission",
       text: PERMISSION_LABELS[viewModel.presentation.composer.permissionMode],
     });
+    permission.setAttribute(
+      "aria-label",
+      PERMISSION_ACCESSIBLE_LABELS[viewModel.presentation.composer.permissionMode],
+    );
+    permission.setAttribute("role", "status");
     const primary = viewModel.presentation.composer.primaryAction;
     const primaryButton = controls.createEl("button", {
       cls: `offeragent-sidebar__primary offeragent-sidebar__${primary.kind}`,
       text: primary.label,
     });
     primaryButton.type = primary.kind === "send" ? "submit" : "button";
+    primaryButton.setAttribute(
+      "aria-label",
+      primary.kind === "send"
+        ? "发送消息"
+        : primary.kind === "stop"
+          ? "停止当前运行"
+          : "继续中断的运行",
+    );
+    const canSend =
+      primary.kind === "send" &&
+      viewModel.runtime.state === "connected" &&
+      Boolean(viewModel.conversation.selectedModelId) &&
+      !viewModel.presentation.composer.isPreparingAttachments &&
+      !viewModel.presentation.composer.isSending;
     primaryButton.disabled =
       viewModel.runtime.state !== "connected" ||
-      (primary.kind === "send" &&
-        (!viewModel.conversation.selectedModelId ||
-          viewModel.presentation.composer.isPreparingAttachments));
+      (primary.kind === "send" && !canSend);
     if (primary.kind === "stop") {
       primaryButton.addEventListener("click", () => this.#controller.stopAgentRun());
     } else if (primary.kind === "resume" && primary.agentRunId) {
@@ -860,13 +897,28 @@ class OfferAgentSidebarView extends ItemView {
         void this.#controller.resumeAgentRun(primary.agentRunId!);
       });
     }
-    composer.addEventListener("submit", (event) => {
-      event.preventDefault();
-      if (primary.kind !== "send") return;
+    const submitDraft = () => {
+      if (!canSend) return;
       const text = input.value;
       if (!text.trim() && viewModel.presentation.composer.attachments.length === 0) return;
       this.#controller.setComposerDraft(text);
-      void this.#controller.sendMessage(text);
+      void this.#controller.sendMessage(text).catch(() => undefined);
+    };
+    input.addEventListener("keydown", (event) => {
+      if (
+        event.key !== "Enter" ||
+        event.shiftKey ||
+        event.isComposing ||
+        event.keyCode === 229 ||
+        isComposing ||
+        suppressCompositionEnter
+      ) return;
+      event.preventDefault();
+      submitDraft();
+    });
+    composer.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submitDraft();
     });
     this.#renderedViewModel = viewModel;
     this.#syncTranscriptScroll(viewModel, frozenScrollTop);

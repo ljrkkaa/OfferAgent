@@ -70,6 +70,7 @@ export interface SidebarViewModel {
       contextChips: Array<{ kind: "scope"; label: string }>;
       draftText: string;
       isPreparingAttachments: boolean;
+      isSending: boolean;
       permissionMode: VaultPermissionMode;
       primaryAction: {
         agentRunId?: string;
@@ -561,6 +562,7 @@ export class SidebarController {
       throw new Error("Wait for the current Agent Run to finish.");
     }
     this.#sendPending = true;
+    this.refreshPresentation();
     const agentRunId = randomUUID();
     const submittedDraft = {
       images: this.#draftImages.map((image) => ({
@@ -624,6 +626,7 @@ export class SidebarController {
       { id: agentRunId, modelId: selectedModelId, status: "running" as const },
     ];
     this.#activeRun = { agentRunId, conversationId };
+    this.#sendPending = false;
     this.#updateConversation({
       ...this.#viewModel.conversation,
       agentRuns,
@@ -631,7 +634,6 @@ export class SidebarController {
       runState: "streaming",
       error: undefined,
     });
-    this.#sendPending = false;
 
     try {
       for await (const event of this.#runtime.runAgent({
@@ -1261,6 +1263,7 @@ export class SidebarController {
         contextChips: [{ kind: "scope", label: "Vault context" }],
         draftText: this.#draftText,
         isPreparingAttachments: this.#attachmentImportPending,
+        isSending: this.#sendPending,
         permissionMode,
         primaryAction,
       },

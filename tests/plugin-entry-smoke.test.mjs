@@ -125,9 +125,17 @@ class StubElement {
     return this.attributes.get(name);
   }
 
-  dispatch(type) {
-    this.listeners.get(type)?.({ preventDefault() {} });
-    this[`on${type}`]?.({ preventDefault() {} });
+  dispatch(type, event = {}) {
+    const dispatched = {
+      defaultPrevented: false,
+      preventDefault() {
+        this.defaultPrevented = true;
+      },
+      ...event,
+    };
+    this.listeners.get(type)?.(dispatched);
+    this[`on${type}`]?.(dispatched);
+    return dispatched;
   }
 
   findByClass(className) {
@@ -681,7 +689,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   );
   assert.equal(
     activeView.contentEl.findByClass("offeragent-sidebar__input").getAttribute("aria-label"),
-    "Message OfferAgent",
+    "给 OfferAgent 的消息",
   );
   plugin.settingTabs[0].display();
   assert.ok(
@@ -718,14 +726,23 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     activeView.contentEl.findByClass("offeragent-sidebar__file-picker")?.listeners.has("change"),
     true,
   );
-  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__attach")?.text, "Attach images");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__attach")?.text, "添加图片");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__attach")?.getAttribute("aria-label"),
+    "添加图片（最多 20 张）",
+  );
+  assert.equal(modelSelect.getAttribute("aria-label"), "选择对话模型");
   const imagePicker = activeView.contentEl.findByClass("offeragent-sidebar__file-picker");
+  let releaseFirstImageImport;
+  const firstImageImport = new Promise((resolve) => {
+    releaseFirstImageImport = () => resolve(new Uint8Array([1, 2, 3]).buffer);
+  });
   imagePicker.files = [
     {
       name: "first-preview.png",
       size: 3,
       type: "image/png",
-      async arrayBuffer() { return new Uint8Array([1, 2, 3]).buffer; },
+      async arrayBuffer() { return firstImageImport; },
     },
     {
       name: "second-preview.png",
@@ -735,6 +752,24 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     },
   ];
   imagePicker.dispatch("change");
+  const pendingImportInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  pendingImportInput.value = "Do not send while images are preparing.";
+  pendingImportInput.dispatch("input");
+  const messagesBeforePendingImportEnter = activeView.contentEl
+    .findAllByClass("offeragent-sidebar__message").length;
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled, true);
+  const pendingImportEnter = pendingImportInput.dispatch("keydown", {
+    isComposing: false,
+    key: "Enter",
+    keyCode: 13,
+    shiftKey: false,
+  });
+  assert.equal(pendingImportEnter.defaultPrevented, true);
+  assert.equal(
+    activeView.contentEl.findAllByClass("offeragent-sidebar__message").length,
+    messagesBeforePendingImportEnter,
+  );
+  releaseFirstImageImport();
   const imagePreviews = await waitUntil(
     () => {
       const previews = activeView.contentEl.findAllByClass("offeragent-sidebar__attachment-preview");
@@ -772,8 +807,78 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   );
   await plugin.setVaultPermissionMode("trusted_vault");
   assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__send")?.text, "Send");
-  input.value = "Practice my introduction.";
-  composer.dispatch("submit");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__permission")?.getAttribute("aria-label"),
+    "Vault 权限模式：信任 Vault",
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__permission")?.getAttribute("role"),
+    "status",
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__send")?.getAttribute("aria-label"),
+    "发送消息",
+  );
+  const keyboardInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  const messageCountBeforeKeyboard = activeView.contentEl
+    .findAllByClass("offeragent-sidebar__message").length;
+  keyboardInput.value = "中文输入法确认不应发送";
+  keyboardInput.dispatch("compositionstart");
+  const composingEnter = keyboardInput.dispatch("keydown", {
+    isComposing: true,
+    key: "Enter",
+    keyCode: 229,
+    shiftKey: false,
+  });
+  keyboardInput.dispatch("compositionend");
+  const postCompositionEnter = keyboardInput.dispatch("keydown", {
+    isComposing: false,
+    key: "Enter",
+    keyCode: 13,
+    shiftKey: false,
+  });
+  assert.equal(composingEnter.defaultPrevented, false);
+  assert.equal(postCompositionEnter.defaultPrevented, false);
+  assert.equal(
+    activeView.contentEl.findAllByClass("offeragent-sidebar__message").length,
+    messageCountBeforeKeyboard,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const shiftedEnter = keyboardInput.dispatch("keydown", {
+    isComposing: false,
+    key: "Enter",
+    keyCode: 13,
+    shiftKey: true,
+  });
+  assert.equal(shiftedEnter.defaultPrevented, false);
+  assert.equal(
+    activeView.contentEl.findAllByClass("offeragent-sidebar__message").length,
+    messageCountBeforeKeyboard,
+  );
+  keyboardInput.value = "Practice my introduction.";
+  keyboardInput.dispatch("input");
+  const sendEnter = keyboardInput.dispatch("keydown", {
+    isComposing: false,
+    key: "Enter",
+    keyCode: 13,
+    shiftKey: false,
+  });
+  assert.equal(sendEnter.defaultPrevented, true);
+  const activeInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  assert.equal(activeInput.disabled, false);
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__stop")?.getAttribute("aria-label"),
+    "停止当前运行",
+  );
+  activeInput.value = "Draft retained during the active Run";
+  activeInput.dispatch("input");
+  const blockedSecondEnter = activeInput.dispatch("keydown", {
+    isComposing: false,
+    key: "Enter",
+    keyCode: 13,
+    shiftKey: false,
+  });
+  assert.equal(blockedSecondEnter.defaultPrevented, true);
   await waitUntil(
     () => releaseStaleMarkdownRender,
     "OfferAgent did not start the deferred Markdown render",
@@ -781,6 +886,10 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   await waitUntil(
     () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
     "OfferAgent did not finish the first Agent Run",
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input").value,
+    "Draft retained during the active Run",
   );
   await plugin.setFastMode(true);
   const assistantMessage = await waitUntil(
