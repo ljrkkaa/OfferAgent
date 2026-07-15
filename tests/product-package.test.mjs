@@ -41,7 +41,7 @@ test("the packaged Sidebar stays theme-neutral, keyboard-visible, and narrow-saf
   assert.match(styles, /:focus-visible/);
   assert.match(styles, /overflow-wrap:\s*anywhere/);
   assert.match(styles, /@media\s*\(max-width:\s*360px\)/);
-  assert.match(styles, /offeragent-sidebar__message--user[^}]*max-width:\s*82%/s);
-  assert.match(styles, /offeragent-sidebar__message--assistant[^}]*width:\s*100%/s);
+  assert.match(styles, /offeragent-sidebar__message--compact_user[^}]*max-width:\s*82%/s);
+  assert.match(styles, /offeragent-sidebar__message--full_width_agent[^}]*width:\s*100%/s);
   assert.doesNotMatch(styles, /#[0-9a-f]{3,8}\b|rgba?\(|hsla?\(/i);
 });

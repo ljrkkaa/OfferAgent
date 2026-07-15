@@ -27,11 +27,17 @@ test("web_read extracts bounded page content and source metadata", async () => {
   assert.equal(result.value.url, "https://example.com/docs");
   assert.equal(result.value.finalUrl, "https://example.com/docs");
   assert.equal(result.value.sourceTitle, "Example & Docs");
+  assert.match(result.value.sourceFingerprint, /^sha256:[a-f0-9]{64}$/);
   assert.equal(result.value.contentType, "text/html");
   assert.equal(Buffer.byteLength(result.value.content, "utf8") <= 24, true);
   assert.equal(result.value.truncated, true);
   assert.doesNotMatch(result.value.content, /hidden|ignored/);
   assert.deepEqual(requests, [{ url: "https://example.com/docs", redirect: "manual" }]);
+
+  const complete = await reader.execute({ url: "https://example.com/docs", maxBytes: 1_024 });
+  assert.equal(complete.ok, true);
+  assert.equal(complete.value.truncated, false);
+  assert.equal(complete.value.sourceFingerprint, result.value.sourceFingerprint);
 });
 
 test("web_read rejects unsafe URLs, redirect abuse, oversized, and unreadable responses", async (t) => {

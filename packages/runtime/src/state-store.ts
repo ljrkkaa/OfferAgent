@@ -2,14 +2,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
+  generateConversationTitle,
   PROTOCOL_VERSION,
   type AgentRunEvent,
   type AgentRunRecord,
   type AgentRunStatus,
   type ConversationMessage,
   type ConversationSummary,
-  type HostedWebSearchCapability,
+  type ProviderCapabilityStatus,
   type LocalToolResultPayload,
+  type PersistedRunAttachmentMetadata,
   type ProviderErrorCode,
   type ToolCallRecord,
   type VaultChangeJournalRecord,
@@ -17,12 +19,17 @@ import {
   type VaultChangeTransactionState,
   type VaultToolErrorCode,
   type WebCitation,
+  type PinnedContextReference,
 } from "@offeragent/protocol";
 import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.js";
 import type { ModelConversationItem } from "./model-provider";
+import type { RunAttachmentMetadata as StoredRunAttachmentMetadata } from "./run-attachments";
 
-const CURRENT_SCHEMA_VERSION = 12;
+const CURRENT_SCHEMA_VERSION = 19;
+const INVALIDATED_PROTOCOL_RESPONSE = "__offeragent_invalidated_after_resource_deletion__";
 const MAX_CONVERSATION_CONTEXT_BYTES = 64 * 1_024;
+const MAX_CONVERSATION_CONTEXT_IMAGE_BYTES = 50 * 1_024 * 1_024;
+const MAX_CONVERSATION_CONTEXT_IMAGES = 20;
 
 export interface RunCheckpoint {
   canonicalReadPaths: Array<[string, string]>;
@@ -30,6 +37,7 @@ export interface RunCheckpoint {
   fastMode?: boolean;
   hostedWebSearchProbeAttempted: boolean;
   input: ModelConversationItem[];
+  contextAttachmentBindings?: ConversationContextAttachmentBinding[];
   localSkills: string[];
   changedMemoryPaths?: string[];
   dailyPlanApplied?: boolean;
@@ -37,6 +45,11 @@ export interface RunCheckpoint {
   resolvedDailyNotePaths?: string[];
   postResponseCitations?: WebCitation[];
   postResponseOutput?: string;
+  runInput?: {
+    attachments?: PersistedRunAttachmentMetadata[];
+    pinnedContext?: PinnedContextReference[];
+    text: string;
+  };
   pendingToolStep?: {
     completedSteps: number;
     name: ToolCallRecord["name"];
@@ -47,13 +60,31 @@ export interface RunCheckpoint {
   version: 1;
 }
 
+export interface ConversationContextAttachmentBinding {
+  inputIndex: number;
+  messageId: string;
+  orders: number[];
+}
+
+export interface ConversationContextWithAttachments {
+  attachmentBindings: ConversationContextAttachmentBinding[];
+  input: ModelConversationItem[];
+}
+
 export interface ResumableRun {
   checkpoint: RunCheckpoint;
   model: string;
   nextSequence: number;
 }
 
+const RESEARCH_BROWSER_FAILURE_MESSAGE = "The Research Browser action failed.";
+
 function persistedToolArguments(name: ToolCallRecord["name"], arguments_: unknown): unknown {
+  if (name === "research_browser") {
+    if (!arguments_ || typeof arguments_ !== "object" || Array.isArray(arguments_)) return {};
+    const action = (arguments_ as { action?: unknown }).action;
+    return typeof action === "string" ? { action } : {};
+  }
   if (name !== "vault_propose_changes" || !arguments_ || typeof arguments_ !== "object") {
     return arguments_;
   }
@@ -84,20 +115,49 @@ function persistedToolArguments(name: ToolCallRecord["name"], arguments_: unknow
 }
 
 function persistedRunCheckpoint(checkpoint: RunCheckpoint): RunCheckpoint {
-  const skillCallIds = new Set(
+  const ephemeralCallIds = new Set(
     checkpoint.input
       .filter(
         (item): item is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
-          item.type === "local_tool_call" && item.name === "skill_read",
+          item.type === "local_tool_call" &&
+          (item.name === "skill_read" || item.name === "research_browser"),
+      )
+      .map((item) => item.callId),
+  );
+  const projectSearchCallIds = new Set(
+    checkpoint.input
+      .filter(
+        (item): item is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
+          item.type === "local_tool_call" && item.name === "project_search",
+      )
+      .map((item) => item.callId),
+  );
+  const projectReadCallIds = new Set(
+    checkpoint.input
+      .filter(
+        (item): item is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
+          item.type === "local_tool_call" && item.name === "project_read",
       )
       .map((item) => item.callId),
   );
   const input = checkpoint.input.flatMap((item) => {
     if (
       (item.type === "local_tool_call" || item.type === "local_tool_result") &&
-      skillCallIds.has(item.callId)
+      ephemeralCallIds.has(item.callId)
     ) {
       return [];
+    }
+    if (
+      (item.type === "local_tool_call" || item.type === "local_tool_result") &&
+      projectSearchCallIds.has(item.callId)
+    ) {
+      return [];
+    }
+    if (item.type === "local_tool_result" && projectReadCallIds.has(item.callId)) {
+      return [];
+    }
+    if (item.type === "user_message" && item.attachments?.length) {
+      return [{ type: "user_message" as const, text: item.text }];
     }
     return item.type === "local_tool_call" && item.name === "vault_propose_changes"
       ? [{ ...item, arguments: persistedToolArguments(item.name, item.arguments) }]
@@ -128,11 +188,52 @@ function persistedRunCheckpoint(checkpoint: RunCheckpoint): RunCheckpoint {
       ? { postResponseCitations: checkpoint.postResponseCitations }
       : {}),
     ...(checkpoint.fastMode ? { fastMode: true } : {}),
-    ...(checkpoint.pendingToolStep ? { pendingToolStep: checkpoint.pendingToolStep } : {}),
+    ...(checkpoint.contextAttachmentBindings?.length
+      ? {
+          contextAttachmentBindings: checkpoint.contextAttachmentBindings.map((binding) => ({
+            inputIndex: binding.inputIndex,
+            messageId: binding.messageId,
+            orders: [...binding.orders],
+          })),
+        }
+      : {}),
+    ...(checkpoint.runInput
+      ? {
+          runInput: {
+            text: checkpoint.runInput.text,
+            ...(checkpoint.runInput.pinnedContext?.length
+              ? {
+                  pinnedContext: checkpoint.runInput.pinnedContext.map((reference) => ({
+                    ...reference,
+                  })),
+                }
+              : {}),
+            ...(checkpoint.runInput.attachments?.length
+              ? {
+                  attachments: (checkpoint.runInput.attachments as Array<
+                    PersistedRunAttachmentMetadata & { attachmentId?: string }
+                  >).map(({ attachmentId: _attachmentId, ...metadata }) => metadata),
+                }
+              : {}),
+          },
+        }
+      : {}),
+    ...(checkpoint.pendingToolStep && checkpoint.pendingToolStep.name !== "research_browser"
+      ? { pendingToolStep: checkpoint.pendingToolStep }
+      : {}),
   };
 }
 
-function persistedToolResult(result: LocalToolResultPayload): unknown {
+function persistedToolResult(
+  result: LocalToolResultPayload,
+  name?: ToolCallRecord["name"],
+): unknown {
+  if (!result.ok && name === "research_browser") {
+    return {
+      ok: false,
+      error: { code: result.error.code, message: RESEARCH_BROWSER_FAILURE_MESSAGE },
+    };
+  }
   if (
     result.ok &&
     (result.value.type === "agent_contract_read" || result.value.type === "skill_read")
@@ -140,12 +241,38 @@ function persistedToolResult(result: LocalToolResultPayload): unknown {
     const { content: _content, ...metadata } = result.value;
     return { ok: true, value: metadata };
   }
+  if (result.ok && result.value.type === "research_browser") {
+    const { content: _content, entries: _entries, ...metadata } = result.value;
+    return {
+      ok: true,
+      value: {
+        ...metadata,
+        message: "Rendered page data is ephemeral; use research_browser again to reread it.",
+      },
+    };
+  }
   if (result.ok && result.value.type === "planning_memory_read") {
     return {
       ok: true,
       value: {
         type: "planning_memory_read",
         topics: result.value.topics.map(({ content: _content, ...metadata }) => metadata),
+      },
+    };
+  }
+  if (result.ok && result.value.type === "project_read") {
+    const { content: _content, ...metadata } = result.value;
+    return { ok: true, value: metadata };
+  }
+  if (result.ok && result.value.type === "project_search") {
+    return {
+      ok: true,
+      value: {
+        ...result.value,
+        entries: result.value.entries.map((entry) => ({
+          ...entry,
+          snippets: entry.snippets.map(({ content: _content, ...metadata }) => metadata),
+        })),
       },
     };
   }
@@ -778,6 +905,322 @@ const MIGRATIONS = [
       CREATE INDEX vault_change_batches_by_state ON vault_change_batches(state, updated_at);
     `,
   },
+  {
+    version: 13,
+    sql: `
+      CREATE TABLE tool_calls_v13 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        name TEXT NOT NULL CHECK (name IN (
+          'agent_contract_read', 'daily_note_context', 'hosted_web_search_probe',
+          'interview_catalog', 'planning_memory_list', 'planning_memory_read',
+          'skill_read', 'vault_list', 'vault_propose_changes', 'vault_read',
+          'vault_search', 'web_read'
+        )),
+        arguments_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('requested', 'completed', 'failed')),
+        error_code TEXT,
+        error_message TEXT,
+        result_json TEXT,
+        result_event_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO tool_calls_v13
+        (id, conversation_id, agent_run_id, name, arguments_json, status,
+         error_code, error_message, result_json, result_event_id, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, name, arguments_json, status,
+             error_code, error_message, result_json, result_event_id, created_at, updated_at
+      FROM tool_calls;
+      CREATE TABLE evidence_snapshots_v13 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v13(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        line_start INTEGER NOT NULL,
+        line_end INTEGER NOT NULL,
+        modified_version TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        is_stale INTEGER NOT NULL DEFAULT 0 CHECK (is_stale IN (0, 1)),
+        stale_detected_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO evidence_snapshots_v13
+        (id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+         modified_version, content_hash, content, is_stale, stale_detected_at, created_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+             modified_version, content_hash, content, is_stale, stale_detected_at, created_at
+      FROM evidence_snapshots;
+      CREATE TABLE vault_change_batches_v13 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v13(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        task TEXT NOT NULL,
+        target_paths_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+          'pending', 'applying', 'applied', 'rejected', 'failed', 'rolled_back',
+          'recovery_failed', 'undone', 'expired'
+        )),
+        checkpoint_ref TEXT,
+        before_hashes_json TEXT,
+        after_hashes_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO vault_change_batches_v13
+        (id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+         target_paths_json, state, checkpoint_ref, before_hashes_json,
+         after_hashes_json, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+             target_paths_json, state, checkpoint_ref, before_hashes_json,
+             after_hashes_json, created_at, updated_at
+      FROM vault_change_batches;
+      DROP TABLE evidence_snapshots;
+      DROP TABLE vault_change_batches;
+      DROP TABLE tool_calls;
+      ALTER TABLE tool_calls_v13 RENAME TO tool_calls;
+      ALTER TABLE evidence_snapshots_v13 RENAME TO evidence_snapshots;
+      ALTER TABLE vault_change_batches_v13 RENAME TO vault_change_batches;
+      CREATE INDEX tool_calls_by_run ON tool_calls(agent_run_id, created_at);
+      CREATE INDEX evidence_by_run ON evidence_snapshots(agent_run_id, created_at);
+      CREATE INDEX evidence_by_source ON evidence_snapshots(path, content_hash, is_stale);
+      CREATE INDEX vault_change_batches_by_run ON vault_change_batches(agent_run_id, created_at);
+      CREATE INDEX vault_change_batches_by_state ON vault_change_batches(state, updated_at);
+    `,
+  },
+  {
+    version: 14,
+    sql: `
+      CREATE TABLE provider_capabilities_v14 (
+        backend_id TEXT NOT NULL,
+        model_id TEXT NOT NULL,
+        capability TEXT NOT NULL CHECK (capability IN ('hosted_web_search', 'vision')),
+        status TEXT NOT NULL CHECK (status IN ('unknown', 'available', 'unavailable')),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (backend_id, model_id, capability)
+      );
+      INSERT INTO provider_capabilities_v14
+        (backend_id, model_id, capability, status, updated_at)
+      SELECT backend_id, model_id, capability, status, updated_at
+      FROM provider_capabilities;
+      DROP TABLE provider_capabilities;
+      ALTER TABLE provider_capabilities_v14 RENAME TO provider_capabilities;
+      CREATE TABLE IF NOT EXISTS run_attachments (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        media_type TEXT NOT NULL CHECK (media_type IN (
+          'image/gif', 'image/jpeg', 'image/png', 'image/webp'
+        )),
+        size INTEGER NOT NULL CHECK (size > 0 AND size <= 10485760),
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS run_attachments_by_run ON run_attachments(agent_run_id, created_at);
+      CREATE INDEX IF NOT EXISTS run_attachments_by_conversation
+        ON run_attachments(conversation_id, created_at);
+      CREATE INDEX IF NOT EXISTS run_attachments_by_created ON run_attachments(created_at);
+    `,
+  },
+  {
+    version: 15,
+    sql: `SELECT 1;`,
+  },
+  {
+    version: 16,
+    sql: `
+      CREATE TABLE tool_calls_v16 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        name TEXT NOT NULL CHECK (name IN (
+          'agent_contract_read', 'daily_note_context', 'hosted_web_search_probe',
+          'interview_catalog', 'planning_memory_list', 'planning_memory_read',
+          'research_browser', 'skill_read', 'vault_list', 'vault_propose_changes',
+          'vault_read', 'vault_search', 'web_read'
+        )),
+        arguments_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('requested', 'completed', 'failed')),
+        error_code TEXT,
+        error_message TEXT,
+        result_json TEXT,
+        result_event_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO tool_calls_v16
+        (id, conversation_id, agent_run_id, name, arguments_json, status,
+         error_code, error_message, result_json, result_event_id, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, name, arguments_json, status,
+             error_code, error_message, result_json, result_event_id, created_at, updated_at
+      FROM tool_calls;
+      CREATE TABLE evidence_snapshots_v16 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v16(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        line_start INTEGER NOT NULL,
+        line_end INTEGER NOT NULL,
+        modified_version TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        is_stale INTEGER NOT NULL DEFAULT 0 CHECK (is_stale IN (0, 1)),
+        stale_detected_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO evidence_snapshots_v16
+        (id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+         modified_version, content_hash, content, is_stale, stale_detected_at, created_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+             modified_version, content_hash, content, is_stale, stale_detected_at, created_at
+      FROM evidence_snapshots;
+      CREATE TABLE vault_change_batches_v16 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v16(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        task TEXT NOT NULL,
+        target_paths_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+          'pending', 'applying', 'applied', 'rejected', 'failed', 'rolled_back',
+          'recovery_failed', 'undone', 'expired'
+        )),
+        checkpoint_ref TEXT,
+        before_hashes_json TEXT,
+        after_hashes_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO vault_change_batches_v16
+        (id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+         target_paths_json, state, checkpoint_ref, before_hashes_json,
+         after_hashes_json, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+             target_paths_json, state, checkpoint_ref, before_hashes_json,
+             after_hashes_json, created_at, updated_at
+      FROM vault_change_batches;
+      DROP TABLE evidence_snapshots;
+      DROP TABLE vault_change_batches;
+      DROP TABLE tool_calls;
+      ALTER TABLE tool_calls_v16 RENAME TO tool_calls;
+      ALTER TABLE evidence_snapshots_v16 RENAME TO evidence_snapshots;
+      ALTER TABLE vault_change_batches_v16 RENAME TO vault_change_batches;
+      CREATE INDEX tool_calls_by_run ON tool_calls(agent_run_id, created_at);
+      CREATE INDEX evidence_by_run ON evidence_snapshots(agent_run_id, created_at);
+      CREATE INDEX evidence_by_source ON evidence_snapshots(path, content_hash, is_stale);
+      CREATE INDEX vault_change_batches_by_run ON vault_change_batches(agent_run_id, created_at);
+      CREATE INDEX vault_change_batches_by_state ON vault_change_batches(state, updated_at);
+    `,
+  },
+  {
+    version: 17,
+    sql: `
+      CREATE TABLE tool_calls_v17 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        name TEXT NOT NULL CHECK (name IN (
+          'agent_contract_read', 'daily_note_context', 'hosted_web_search_probe',
+          'interview_catalog', 'planning_memory_list', 'planning_memory_read',
+          'project_list', 'project_read', 'project_search', 'research_browser',
+          'skill_read', 'vault_list',
+          'vault_propose_changes', 'vault_read', 'vault_search', 'web_read'
+        )),
+        arguments_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('requested', 'completed', 'failed')),
+        error_code TEXT,
+        error_message TEXT,
+        result_json TEXT,
+        result_event_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO tool_calls_v17
+        (id, conversation_id, agent_run_id, name, arguments_json, status,
+         error_code, error_message, result_json, result_event_id, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, name, arguments_json, status,
+             error_code, error_message, result_json, result_event_id, created_at, updated_at
+      FROM tool_calls;
+      CREATE TABLE evidence_snapshots_v17 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v17(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        line_start INTEGER NOT NULL,
+        line_end INTEGER NOT NULL,
+        modified_version TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        is_stale INTEGER NOT NULL DEFAULT 0 CHECK (is_stale IN (0, 1)),
+        stale_detected_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO evidence_snapshots_v17
+        (id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+         modified_version, content_hash, content, is_stale, stale_detected_at, created_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+             modified_version, content_hash, content, is_stale, stale_detected_at, created_at
+      FROM evidence_snapshots;
+      CREATE TABLE vault_change_batches_v17 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v17(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        task TEXT NOT NULL,
+        target_paths_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+          'pending', 'applying', 'applied', 'rejected', 'failed', 'rolled_back',
+          'recovery_failed', 'undone', 'expired'
+        )),
+        checkpoint_ref TEXT,
+        before_hashes_json TEXT,
+        after_hashes_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO vault_change_batches_v17
+        (id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+         target_paths_json, state, checkpoint_ref, before_hashes_json,
+         after_hashes_json, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+             target_paths_json, state, checkpoint_ref, before_hashes_json,
+             after_hashes_json, created_at, updated_at
+      FROM vault_change_batches;
+      DROP TABLE evidence_snapshots;
+      DROP TABLE vault_change_batches;
+      DROP TABLE tool_calls;
+      ALTER TABLE tool_calls_v17 RENAME TO tool_calls;
+      ALTER TABLE evidence_snapshots_v17 RENAME TO evidence_snapshots;
+      ALTER TABLE vault_change_batches_v17 RENAME TO vault_change_batches;
+      CREATE INDEX tool_calls_by_run ON tool_calls(agent_run_id, created_at);
+      CREATE INDEX evidence_by_run ON evidence_snapshots(agent_run_id, created_at);
+      CREATE INDEX evidence_by_source ON evidence_snapshots(path, content_hash, is_stale);
+      CREATE INDEX vault_change_batches_by_run ON vault_change_batches(agent_run_id, created_at);
+      CREATE INDEX vault_change_batches_by_state ON vault_change_batches(state, updated_at);
+    `,
+  },
+  {
+    version: 18,
+    sql: `
+      UPDATE conversations SET title_origin = 'placeholder' WHERE title = 'New Conversation';
+      CREATE INDEX IF NOT EXISTS conversations_by_archive_activity
+        ON conversations(archived, updated_at DESC, id);
+    `,
+  },
+  {
+    version: 19,
+    sql: `SELECT 1;`,
+  },
 ] as const;
 
 interface ConversationSnapshot {
@@ -785,6 +1228,12 @@ interface ConversationSnapshot {
   conversation: ConversationSummary;
   messages: ConversationMessage[];
   toolCalls: ToolCallRecord[];
+}
+
+function evidenceSnippet(content: string): string {
+  const normalized = content.replace(/\s+/gu, " ").trim();
+  const characters = [...normalized];
+  return characters.length > 240 ? `${characters.slice(0, 240).join("")}…` : normalized;
 }
 
 type PersistStateFile = (
@@ -859,6 +1308,7 @@ export class RuntimeStateStore {
     store.#database.run("PRAGMA foreign_keys = ON");
     await store.#migrate();
     await store.interruptActiveRuns();
+    await store.#backfillLegacyConversationTitles();
     return store;
   }
 
@@ -866,32 +1316,65 @@ export class RuntimeStateStore {
     conversation: ConversationSummary,
   ): Promise<ConversationSummary> {
     return this.#write(() => {
+      const titleOrigin = conversation.titleOrigin ??
+        (conversation.title === "New Conversation" || conversation.title === "新对话"
+          ? "placeholder"
+          : "manual");
+      const archived = conversation.archived ?? false;
       const existing = firstRow(
         this.#database,
-        "SELECT title, model_id FROM conversations WHERE id = ?",
+        "SELECT title, model_id, title_origin, archived, updated_at FROM conversations WHERE id = ?",
         [conversation.id],
       );
       if (existing) {
-        if (existing[0] === conversation.title && existing[1] === conversation.modelId) {
-          return conversation;
+        if (
+          existing[0] === conversation.title &&
+          existing[1] === conversation.modelId &&
+          existing[2] === titleOrigin &&
+          Boolean(existing[3]) === archived
+        ) {
+          return {
+            ...conversation,
+            titleOrigin,
+            archived,
+            updatedAt: existing[4] as string,
+          };
         }
       }
       const timestamp = now();
       this.#database.run(
-        `INSERT INTO conversations (id, title, model_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)`,
-        [conversation.id, conversation.title, conversation.modelId, timestamp, timestamp],
+        `INSERT INTO conversations
+          (id, title, model_id, title_origin, archived, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          conversation.id,
+          conversation.title,
+          conversation.modelId,
+          titleOrigin,
+          archived ? 1 : 0,
+          timestamp,
+          timestamp,
+        ],
       );
-      return conversation;
+      return { ...conversation, titleOrigin, archived, updatedAt: timestamp };
     });
+  }
+
+  async conversationExists(conversationId: string): Promise<boolean> {
+    return Boolean(firstRow(
+      this.#database,
+      "SELECT 1 FROM conversations WHERE id = ?",
+      [conversationId],
+    ));
   }
 
   async ensureConversation(conversationId: string, modelId: string): Promise<void> {
     await this.#write(() => {
       const timestamp = now();
       this.#database.run(
-        `INSERT OR IGNORE INTO conversations (id, title, model_id, created_at, updated_at)
-         VALUES (?, 'New Conversation', ?, ?, ?)`,
+        `INSERT OR IGNORE INTO conversations
+          (id, title, model_id, title_origin, archived, created_at, updated_at)
+         VALUES (?, '新对话', ?, 'placeholder', 0, ?, ?)`,
         [conversationId, modelId, timestamp, timestamp],
       );
     });
@@ -902,11 +1385,16 @@ export class RuntimeStateStore {
     return valueAt(this.#database, "SELECT 1 FROM conversations WHERE id = ?", [conversationId]) === 1;
   }
 
+  async hasAgentRun(agentRunId: string): Promise<boolean> {
+    await this.#writeTail;
+    return valueAt(this.#database, "SELECT 1 FROM agent_runs WHERE id = ?", [agentRunId]) === 1;
+  }
+
   async getProviderCapability(
     backendId: string,
     modelId: string,
-    capability: "hosted_web_search",
-  ): Promise<HostedWebSearchCapability> {
+    capability: "hosted_web_search" | "vision",
+  ): Promise<ProviderCapabilityStatus> {
     await this.#writeTail;
     const status = valueAt(
       this.#database,
@@ -920,8 +1408,8 @@ export class RuntimeStateStore {
   async setProviderCapability(
     backendId: string,
     modelId: string,
-    capability: "hosted_web_search",
-    status: HostedWebSearchCapability,
+    capability: "hosted_web_search" | "vision",
+    status: ProviderCapabilityStatus,
   ): Promise<void> {
     await this.#write(() => {
       this.#database.run(
@@ -938,7 +1426,7 @@ export class RuntimeStateStore {
   async resetProviderCapability(
     backendId: string,
     modelId: string,
-    capability: "hosted_web_search",
+    capability: "hosted_web_search" | "vision",
   ): Promise<void> {
     await this.#write(() => {
       this.#database.run(
@@ -947,6 +1435,138 @@ export class RuntimeStateStore {
         [backendId, modelId, capability],
       );
     });
+  }
+
+  async createAttachment(metadata: StoredRunAttachmentMetadata): Promise<void> {
+    await this.#write(() => {
+      if (
+        valueAt(this.#database, "SELECT 1 FROM conversations WHERE id = ?", [metadata.conversationId]) !== 1
+      ) {
+        throw new Error(`Conversation '${metadata.conversationId}' does not exist.`);
+      }
+      this.#database.run(
+        `INSERT INTO run_attachments
+          (id, conversation_id, agent_run_id, content_hash, file_name, media_type, size, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          metadata.attachmentId,
+          metadata.conversationId,
+          metadata.agentRunId,
+          metadata.contentHash,
+          metadata.fileName,
+          metadata.mediaType,
+          metadata.size,
+          metadata.createdAt,
+        ],
+      );
+    });
+  }
+
+  async claimAttachments(input: {
+    agentRunId: string;
+    attachments: Array<{ attachmentId: string; order: number }>;
+    conversationId: string;
+    messageId: string;
+    ownedAt: string;
+  }): Promise<void> {
+    await this.#write(() => this.#claimAttachments(input));
+  }
+
+  #claimAttachments(input: {
+    agentRunId: string;
+    attachments: Array<{ attachmentId: string; order: number }>;
+    conversationId: string;
+    messageId: string;
+    ownedAt: string;
+  }): void {
+    for (const { attachmentId, order } of input.attachments) {
+      this.#database.run(
+        `UPDATE run_attachments
+         SET message_id = ?, message_order = ?, owned_at = ?
+         WHERE id = ? AND conversation_id = ? AND agent_run_id = ? AND message_id IS NULL`,
+        [
+          input.messageId,
+          order,
+          input.ownedAt,
+          attachmentId,
+          input.conversationId,
+          input.agentRunId,
+        ],
+      );
+      if (this.#database.getRowsModified() !== 1) {
+        throw new Error(`Run Attachment '${attachmentId}' could not be promoted to its message.`);
+      }
+    }
+  }
+
+  async deleteAttachment(attachmentId: string): Promise<void> {
+    await this.#write(() => {
+      this.#database.run("DELETE FROM run_attachments WHERE id = ?", [attachmentId]);
+    });
+  }
+
+  async getAttachment(attachmentId: string): Promise<StoredRunAttachmentMetadata | undefined> {
+    await this.#writeTail;
+    const row = firstRow(
+      this.#database,
+      `SELECT id, conversation_id, agent_run_id, content_hash, file_name, media_type, size, created_at,
+              message_id, message_order, owned_at
+       FROM run_attachments WHERE id = ?`,
+      [attachmentId],
+    );
+    return row ? this.#attachmentMetadata(row) : undefined;
+  }
+
+  async getAttachmentUsage(conversationId: string): Promise<{
+    conversationBytes: number;
+    totalBytes: number;
+  }> {
+    await this.#writeTail;
+    return {
+      conversationBytes: Number(valueAt(
+        this.#database,
+        "SELECT COALESCE(SUM(size), 0) FROM run_attachments WHERE conversation_id = ?",
+        [conversationId],
+      )),
+      totalBytes: Number(valueAt(
+        this.#database,
+        "SELECT COALESCE(SUM(size), 0) FROM run_attachments",
+      )),
+    };
+  }
+
+  async getAttachmentByMessage(
+    messageId: string,
+    order: number,
+  ): Promise<StoredRunAttachmentMetadata | undefined> {
+    await this.#writeTail;
+    const row = firstRow(
+      this.#database,
+      `SELECT id, conversation_id, agent_run_id, content_hash, file_name, media_type, size, created_at,
+              message_id, message_order, owned_at
+       FROM run_attachments WHERE message_id = ? AND message_order = ?`,
+      [messageId, order],
+    );
+    return row ? this.#attachmentMetadata(row) : undefined;
+  }
+
+  async listAttachmentsByConversation(
+    conversationId: string,
+  ): Promise<StoredRunAttachmentMetadata[]> {
+    await this.#writeTail;
+    return this.#attachmentRows("conversation_id = ?", [conversationId]);
+  }
+
+  async listAttachmentsByRun(agentRunId: string): Promise<StoredRunAttachmentMetadata[]> {
+    await this.#writeTail;
+    return this.#attachmentRows("agent_run_id = ?", [agentRunId]);
+  }
+
+  async listAttachmentsCreatedBefore(
+    isoTimestamp: string,
+  ): Promise<StoredRunAttachmentMetadata[]> {
+    await this.#writeTail;
+    return this.#attachmentRows("created_at < ?", [isoTimestamp]);
   }
 
   async getProtocolResponse(
@@ -972,7 +1592,7 @@ export class RuntimeStateStore {
     ) {
       throw new Error(`Protocol event '${requestEventId}' was reused with conflicting identity.`);
     }
-    if (row[4] === null) {
+    if (row[4] === null || row[4] === INVALIDATED_PROTOCOL_RESPONSE) {
       throw new Error(`Protocol event '${requestEventId}' was invalidated after resource deletion.`);
     }
     return JSON.parse(row[4] as string) as unknown;
@@ -1003,7 +1623,7 @@ export class RuntimeStateStore {
         ) {
           throw new Error(`Protocol event '${requestEventId}' was reused with conflicting identity.`);
         }
-        if (existing[4] === null) {
+        if (existing[4] === null || existing[4] === INVALIDATED_PROTOCOL_RESPONSE) {
           throw new Error(`Protocol event '${requestEventId}' was invalidated after resource deletion.`);
         }
         return JSON.parse(existing[4] as string) as unknown;
@@ -1035,13 +1655,17 @@ export class RuntimeStateStore {
     input: string,
     startedEvent?: Extract<AgentRunEvent, { type: "agent_run.started" }>,
     startEventId?: string,
+    attachments: Array<PersistedRunAttachmentMetadata & { attachmentId?: string }> = [],
   ): Promise<boolean> {
     return this.#write(() => {
+      const persistedAttachments = (attachments as Array<
+        PersistedRunAttachmentMetadata & { attachmentId?: string }
+      >).map(({ attachmentId: _attachmentId, ...metadata }) => metadata);
       const timestamp = now();
       const existing = firstRow(
         this.#database,
         `SELECT agent_runs.conversation_id, agent_runs.model_id, agent_runs.start_event_id,
-                messages.text
+                messages.text, messages.attachments_json
          FROM agent_runs
          LEFT JOIN messages ON messages.id = agent_runs.user_message_id
          WHERE agent_runs.id = ?`,
@@ -1053,7 +1677,8 @@ export class RuntimeStateStore {
           existing[0] === conversationId &&
           existing[1] === modelId &&
           existing[2] === startEventId &&
-          existing[3] === input
+          existing[3] === input &&
+          existing[4] === JSON.stringify(persistedAttachments)
         ) {
           return false;
         }
@@ -1071,8 +1696,9 @@ export class RuntimeStateStore {
       }
       const messageId = randomUUID();
       this.#database.run(
-        `INSERT OR IGNORE INTO conversations (id, title, model_id, created_at, updated_at)
-         VALUES (?, 'New Conversation', ?, ?, ?)`,
+        `INSERT OR IGNORE INTO conversations
+          (id, title, model_id, title_origin, archived, created_at, updated_at)
+         VALUES (?, '新对话', ?, 'placeholder', 0, ?, ?)`,
         [conversationId, modelId, timestamp, timestamp],
       );
       const sequence = this.#nextMessageSequence(conversationId);
@@ -1084,14 +1710,37 @@ export class RuntimeStateStore {
       );
       this.#database.run(
         `INSERT INTO messages
-          (id, conversation_id, agent_run_id, role, text, sequence, created_at)
-         VALUES (?, ?, ?, 'user', ?, ?, ?)`,
-        [messageId, conversationId, agentRunId, input, sequence, timestamp],
+          (id, conversation_id, agent_run_id, role, text, sequence, attachments_json, created_at)
+         VALUES (?, ?, ?, 'user', ?, ?, ?, ?)`,
+        [
+          messageId,
+          conversationId,
+          agentRunId,
+          input,
+          sequence,
+          JSON.stringify(persistedAttachments),
+          timestamp,
+        ],
       );
       this.#database.run("UPDATE agent_runs SET user_message_id = ? WHERE id = ?", [
         messageId,
         agentRunId,
       ]);
+      const ownedAttachments = attachments.flatMap(({ attachmentId, order }) =>
+        attachmentId ? [{ attachmentId, order }] : []
+      );
+      if (ownedAttachments.length !== attachments.length) {
+        throw new Error("Every Conversation Attachment must retain its storage identity during promotion.");
+      }
+      if (ownedAttachments.length > 0) {
+        this.#claimAttachments({
+          agentRunId,
+          attachments: ownedAttachments,
+          conversationId,
+          messageId,
+          ownedAt: timestamp,
+        });
+      }
       this.#recordEvent(
         startedEvent ?? {
           type: "agent_run.started",
@@ -1223,31 +1872,8 @@ export class RuntimeStateStore {
     recoveredToolResult?: { result: LocalToolResultPayload; toolCallId: string },
   ): Promise<ResumableRun> {
     return this.#write(() => {
-      const run = firstRow(
-        this.#database,
-        `SELECT conversation_id, model_id, status, last_sequence
-         FROM agent_runs WHERE id = ?`,
-        [agentRunId],
-      );
-      if (!run || run[0] !== conversationId) {
-        throw new Error(`Agent Run '${agentRunId}' does not belong to Conversation '${conversationId}'.`);
-      }
-      if (run[2] !== "interrupted") {
-        throw new Error(`Agent Run '${agentRunId}' cannot be resumed from '${run[2]}'.`);
-      }
-      const checkpointJson = valueAt(
-        this.#database,
-        `SELECT checkpoint_json FROM run_checkpoints
-         WHERE agent_run_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
-        [agentRunId],
-      );
-      if (typeof checkpointJson !== "string") {
-        throw new Error(`Agent Run '${agentRunId}' has no durable Run Checkpoint.`);
-      }
-      const checkpoint = JSON.parse(checkpointJson) as RunCheckpoint;
-      if (checkpoint.version !== 1) {
-        throw new Error(`Agent Run '${agentRunId}' has an unsupported Run Checkpoint.`);
-      }
+      const resumable = this.#resumableRun(conversationId, agentRunId);
+      const { checkpoint } = resumable;
       if (checkpoint.pendingToolStep?.name === "vault_propose_changes") {
         const pendingStatus = valueAt(
           this.#database,
@@ -1285,20 +1911,31 @@ export class RuntimeStateStore {
       }
       return {
         checkpoint,
-        model: run[1] as string,
-        nextSequence: Number(run[3]) + 1,
+        model: resumable.model,
+        nextSequence: resumable.nextSequence,
       };
     });
+  }
+
+  async inspectResumableAgentRun(
+    conversationId: string,
+    agentRunId: string,
+  ): Promise<ResumableRun> {
+    await this.#writeTail;
+    return this.#resumableRun(conversationId, agentRunId);
   }
 
   async getToolCallResult(toolCallId: string, agentRunId: string): Promise<LocalToolResultPayload | undefined> {
     await this.#writeTail;
     const row = firstRow(
       this.#database,
-      `SELECT status, result_json FROM tool_calls WHERE id = ? AND agent_run_id = ?`,
+      `SELECT status, result_json, name FROM tool_calls WHERE id = ? AND agent_run_id = ?`,
       [toolCallId, agentRunId],
     );
     if (!row || (row[0] !== "completed" && row[0] !== "failed") || typeof row[1] !== "string") {
+      return undefined;
+    }
+    if (row[2] === "project_list" || row[2] === "project_search" || row[2] === "project_read") {
       return undefined;
     }
     return JSON.parse(row[1]) as LocalToolResultPayload;
@@ -1455,7 +2092,7 @@ export class RuntimeStateStore {
         );
       }
       this.#recordEvent(
-        event.tool.name === "vault_propose_changes"
+        event.tool.name === "vault_propose_changes" || event.tool.name === "research_browser"
           ? {
               ...event,
               tool: {
@@ -1621,7 +2258,8 @@ export class RuntimeStateStore {
   ): Promise<string[]> {
     return this.#write(() => {
       const run = this.#requiredRun(agentRunId);
-      this.#assertToolResultMatches(event.toolCallId, agentRunId, result);
+      const toolName = this.#assertToolResultMatches(event.toolCallId, agentRunId, result);
+      const persistedResult = persistedToolResult(result, toolName);
       const timestamp = now();
       const stalePaths: string[] = [];
       this.#database.run(
@@ -1632,9 +2270,13 @@ export class RuntimeStateStore {
         [
           result.ok ? "completed" : "failed",
           result.ok ? null : result.error.code,
-          result.ok ? null : result.error.message,
+          result.ok
+            ? null
+            : toolName === "research_browser"
+              ? RESEARCH_BROWSER_FAILURE_MESSAGE
+              : result.error.message,
           resultEventId ?? null,
-          JSON.stringify(persistedToolResult(result)),
+          JSON.stringify(persistedResult),
           timestamp,
           event.toolCallId,
           agentRunId,
@@ -1672,6 +2314,16 @@ export class RuntimeStateStore {
         const sources =
           result.value.type === "vault_read"
             ? [{ path: result.value.path, contentHash: result.value.contentHash }]
+            : result.value.type === "project_read"
+              ? [{ path: result.value.evidencePath, contentHash: result.value.contentHash }]
+            : result.value.type === "project_list" || result.value.type === "project_search"
+              ? (() => {
+                  const projectEvidence = result.value;
+                  return projectEvidence.entries.map(({ path, contentHash }) => ({
+                    path: `project/${projectEvidence.projectId}/${path}`,
+                    contentHash,
+                  }));
+                })()
             : result.value.type === "vault_propose_changes" &&
                 result.value.decision === "applied"
               ? result.value.targets.map(({ path, afterHash }) => ({
@@ -1691,8 +2343,12 @@ export class RuntimeStateStore {
           if (this.#database.getRowsModified() > 0) stalePaths.push(source.path);
         }
       }
-      if (result.ok && result.value.type === "vault_read") {
+      if (
+        result.ok &&
+        (result.value.type === "vault_read" || result.value.type === "project_read")
+      ) {
         const evidence = result.value;
+        const evidencePath = evidence.type === "vault_read" ? evidence.path : evidence.evidencePath;
         this.#database.run(
           `INSERT INTO evidence_snapshots
             (id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
@@ -1703,7 +2359,7 @@ export class RuntimeStateStore {
             run.conversationId,
             agentRunId,
             event.toolCallId,
-            evidence.path,
+            evidencePath,
             evidence.lineStart,
             evidence.lineEnd,
             evidence.modifiedVersion,
@@ -1713,7 +2369,14 @@ export class RuntimeStateStore {
           ],
         );
       }
-      this.#recordEvent(event);
+      this.#recordEvent(
+        toolName === "research_browser" && event.error
+          ? {
+              ...event,
+              error: { ...event.error, message: RESEARCH_BROWSER_FAILURE_MESSAGE },
+            }
+          : event,
+      );
       this.#touchConversation(run.conversationId, timestamp);
       return stalePaths;
     });
@@ -1723,19 +2386,19 @@ export class RuntimeStateStore {
     toolCallId: string,
     agentRunId: string,
     result: LocalToolResultPayload,
-  ): void {
+  ): ToolCallRecord["name"] {
     const row = firstRow(
       this.#database,
       "SELECT name FROM tool_calls WHERE id = ? AND agent_run_id = ?",
       [toolCallId, agentRunId],
     );
     if (!row) throw new Error(`Tool Call '${toolCallId}' does not belong to Agent Run '${agentRunId}'.`);
-    if (!result.ok) return;
     const name = row[0] as ToolCallRecord["name"];
+    if (!result.ok) return name;
     if (result.value.type !== name) {
       throw new Error(`Tool Call '${toolCallId}' returned '${result.value.type}' for '${name}'.`);
     }
-    if (name !== "vault_propose_changes" || result.value.type !== "vault_propose_changes") return;
+    if (name !== "vault_propose_changes" || result.value.type !== "vault_propose_changes") return name;
     const batch = firstRow(
       this.#database,
       "SELECT id, target_paths_json FROM vault_change_batches WHERE tool_call_id = ? AND agent_run_id = ?",
@@ -1747,6 +2410,7 @@ export class RuntimeStateStore {
     if (result.value.batchId !== batch[0] || JSON.stringify(resultPaths) !== JSON.stringify(expectedPaths)) {
       throw new Error(`Vault Change Tool Call '${toolCallId}' returned a mismatched batch result.`);
     }
+    return name;
   }
 
   async isDuplicateToolResult(
@@ -1757,13 +2421,13 @@ export class RuntimeStateStore {
     await this.#writeTail;
     const row = firstRow(
       this.#database,
-      `SELECT result_event_id, result_json, status FROM tool_calls WHERE id = ?`,
+      `SELECT result_event_id, result_json, status, name FROM tool_calls WHERE id = ?`,
       [toolCallId],
     );
     return Boolean(
       row &&
       row[0] === eventId &&
-      row[1] === JSON.stringify(persistedToolResult(result)) &&
+      row[1] === JSON.stringify(persistedToolResult(result, row[3] as ToolCallRecord["name"])) &&
       (row[2] === "completed" || row[2] === "failed"),
     );
   }
@@ -1772,13 +2436,14 @@ export class RuntimeStateStore {
     await this.#writeTail;
     const conversationRow = firstRow(
       this.#database,
-      "SELECT id, title, model_id FROM conversations WHERE id = ?",
+      `SELECT id, title, model_id, title_origin, archived, updated_at
+       FROM conversations WHERE id = ?`,
       [conversationId],
     );
     if (!conversationRow) throw new Error(`Conversation '${conversationId}' does not exist.`);
     const messageRows =
       this.#database.exec(
-        `SELECT id, agent_run_id, role, text, sequence, citations_json
+        `SELECT id, agent_run_id, role, text, sequence, citations_json, attachments_json
          FROM messages WHERE conversation_id = ? ORDER BY sequence`,
         [conversationId],
       )[0]?.values ?? [];
@@ -1799,20 +2464,60 @@ export class RuntimeStateStore {
          ORDER BY tool_calls.created_at, tool_calls.id`,
         [conversationId],
       )[0]?.values ?? [];
+    const evidenceRows =
+      this.#database.exec(
+        `SELECT evidence_snapshots.agent_run_id, evidence_snapshots.path,
+                evidence_snapshots.line_start, evidence_snapshots.line_end,
+                evidence_snapshots.content, evidence_snapshots.is_stale
+         FROM evidence_snapshots
+         JOIN tool_calls ON tool_calls.id = evidence_snapshots.tool_call_id
+         WHERE evidence_snapshots.conversation_id = ? AND tool_calls.name = 'vault_read'
+         ORDER BY evidence_snapshots.created_at, evidence_snapshots.id`,
+        [conversationId],
+      )[0]?.values ?? [];
+    const evidenceByRun = new Map<string, NonNullable<ConversationMessage["evidenceSources"]>>();
+    for (const [agentRunId, path, lineStart, lineEnd, content, isStale] of evidenceRows) {
+      const sources = evidenceByRun.get(agentRunId as string) ?? [];
+      sources.push({
+        path: path as string,
+        lineStart: lineStart as number,
+        lineEnd: lineEnd as number,
+        snippet: evidenceSnippet(content as string),
+        stale: Boolean(isStale),
+      });
+      evidenceByRun.set(agentRunId as string, sources);
+    }
     return {
       conversation: {
         id: conversationRow[0] as string,
         title: conversationRow[1] as string,
         modelId: conversationRow[2] as string,
+        titleOrigin: conversationRow[3] as ConversationSummary["titleOrigin"],
+        archived: Boolean(conversationRow[4]),
+        updatedAt: conversationRow[5] as string,
       },
-      messages: messageRows.map(([id, agentRunId, role, text, sequence, citationsJson]) => ({
+      messages: messageRows.map(([
+        id,
+        agentRunId,
+        role,
+        text,
+        sequence,
+        citationsJson,
+        attachmentsJson,
+      ]) => ({
         id: id as string,
         agentRunId: agentRunId as string,
         role: role as "assistant" | "user",
         text: text as string,
         sequence: sequence as number,
+        ...(role === "assistant"
+          ? { evidenceSources: evidenceByRun.get(agentRunId as string) ?? [] }
+          : {}),
         ...((JSON.parse(citationsJson as string) as unknown[]).length > 0
           ? { citations: JSON.parse(citationsJson as string) }
+          : {}),
+        ...((JSON.parse(attachmentsJson as string) as unknown[]).length > 0
+          ? { attachments: JSON.parse(attachmentsJson as string) }
           : {}),
       })),
       agentRuns: runRows.map(([id, modelId, status, errorCode, errorMessage]) => ({
@@ -1853,10 +2558,18 @@ export class RuntimeStateStore {
     conversationId: string,
     agentRunId: string,
   ): Promise<ModelConversationItem[]> {
+    return (await this.getConversationContextWithAttachments(conversationId, agentRunId)).input;
+  }
+
+  async getConversationContextWithAttachments(
+    conversationId: string,
+    agentRunId: string,
+  ): Promise<ConversationContextWithAttachments> {
     await this.#writeTail;
     const rows =
       this.#database.exec(
-        `SELECT messages.agent_run_id, messages.role, messages.text
+        `SELECT messages.id, messages.agent_run_id, messages.role, messages.text,
+                messages.attachments_json
          FROM messages
          JOIN agent_runs ON agent_runs.id = messages.agent_run_id
          WHERE messages.conversation_id = ?
@@ -1864,17 +2577,35 @@ export class RuntimeStateStore {
          ORDER BY messages.sequence`,
         [conversationId, agentRunId],
       )[0]?.values ?? [];
-    const current: ModelConversationItem[] = [];
-    const completedTurns: ModelConversationItem[][] = [];
-    const turnsByRunId = new Map<string, ModelConversationItem[]>();
-    for (const [messageRunIdValue, role, textValue] of rows) {
+    type ContextEntry = {
+      attachmentBytes: number;
+      item: ModelConversationItem;
+      messageId: string;
+      orders: number[];
+    };
+    const current: ContextEntry[] = [];
+    const completedTurns: ContextEntry[][] = [];
+    const turnsByRunId = new Map<string, ContextEntry[]>();
+    for (const [messageId, messageRunIdValue, role, textValue, attachmentsJson] of rows) {
       const messageRunId = messageRunIdValue as string;
       const item: ModelConversationItem = {
         type: role === "assistant" ? "assistant_message" : "user_message",
         text: textValue as string,
       };
+      const persistedAttachments = role === "user"
+        ? JSON.parse((attachmentsJson as string | null) ?? "[]") as Array<{
+            order: number;
+            size: number;
+          }>
+        : [];
+      const entry: ContextEntry = {
+        attachmentBytes: persistedAttachments.reduce((total, { size }) => total + size, 0),
+        item,
+        messageId: messageId as string,
+        orders: persistedAttachments.map(({ order }) => order).sort((left, right) => left - right),
+      };
       if (messageRunId === agentRunId) {
-        current.push(item);
+        current.push(entry);
         continue;
       }
       let turn = turnsByRunId.get(messageRunId);
@@ -1883,59 +2614,128 @@ export class RuntimeStateStore {
         turnsByRunId.set(messageRunId, turn);
         completedTurns.push(turn);
       }
-      turn.push(item);
+      turn.push(entry);
     }
 
     let remainingBytes = Math.max(
       0,
-      MAX_CONVERSATION_CONTEXT_BYTES - contextByteLength(current),
+      MAX_CONVERSATION_CONTEXT_BYTES - contextByteLength(current.map(({ item }) => item)),
     );
-    const retainedTurns: ModelConversationItem[][] = [];
+    let remainingImageBytes = Math.max(
+      0,
+      MAX_CONVERSATION_CONTEXT_IMAGE_BYTES -
+        current.reduce((total, { attachmentBytes }) => total + attachmentBytes, 0),
+    );
+    let remainingImages = Math.max(
+      0,
+      MAX_CONVERSATION_CONTEXT_IMAGES -
+        current.reduce((total, { orders }) => total + orders.length, 0),
+    );
+    const retainedTurns: ContextEntry[][] = [];
     for (let index = completedTurns.length - 1; index >= 0; index -= 1) {
       const turn = completedTurns[index];
-      const turnBytes = contextByteLength(turn);
-      if (turnBytes > remainingBytes) break;
+      const turnBytes = contextByteLength(turn.map(({ item }) => item));
+      const turnImageBytes = turn.reduce(
+        (total, { attachmentBytes }) => total + attachmentBytes,
+        0,
+      );
+      const turnImages = turn.reduce((total, { orders }) => total + orders.length, 0);
+      if (
+        turnBytes > remainingBytes ||
+        turnImageBytes > remainingImageBytes ||
+        turnImages > remainingImages
+      ) break;
       retainedTurns.unshift(turn);
       remainingBytes -= turnBytes;
+      remainingImageBytes -= turnImageBytes;
+      remainingImages -= turnImages;
     }
-    return [...retainedTurns.flat(), ...current];
+    const retained = [...retainedTurns.flat(), ...current];
+    const historicalCount = retainedTurns.flat().length;
+    return {
+      input: retained.map(({ item }) => item),
+      attachmentBindings: retained.flatMap(({ messageId, orders }, inputIndex) =>
+        inputIndex < historicalCount && orders.length > 0
+          ? [{ inputIndex, messageId, orders }]
+          : []
+      ),
+    };
   }
 
   async listConversations(): Promise<ConversationSummary[]> {
     await this.#writeTail;
     const rows =
       this.#database.exec(
-        "SELECT id, title, model_id FROM conversations ORDER BY updated_at DESC, id",
+        `SELECT id, title, model_id, title_origin, archived, updated_at
+         FROM conversations ORDER BY updated_at DESC, id`,
       )[0]?.values ?? [];
-    return rows.map(([id, title, modelId]) => ({
+    return rows.map(([id, title, modelId, titleOrigin, archived, updatedAt]) => ({
       id: id as string,
       title: title as string,
       modelId: modelId as string,
+      titleOrigin: titleOrigin as ConversationSummary["titleOrigin"],
+      archived: Boolean(archived),
+      updatedAt: updatedAt as string,
     }));
+  }
+
+  async updateConversation(
+    conversationId: string,
+    patch: Partial<Pick<ConversationSummary, "archived" | "modelId" | "title" | "titleOrigin">>,
+  ): Promise<ConversationSummary> {
+    return this.#write(() => {
+      const row = firstRow(
+        this.#database,
+        `SELECT id, title, model_id, title_origin, archived, updated_at
+         FROM conversations WHERE id = ?`,
+        [conversationId],
+      );
+      if (!row) throw new Error(`Conversation '${conversationId}' does not exist.`);
+      const current: ConversationSummary = {
+        id: row[0] as string,
+        title: row[1] as string,
+        modelId: row[2] as string,
+        titleOrigin: row[3] as ConversationSummary["titleOrigin"],
+        archived: Boolean(row[4]),
+        updatedAt: row[5] as string,
+      };
+      const next = { ...current, ...patch, updatedAt: now() };
+      if (!next.title.trim() || next.title.length > 512) {
+        throw new Error("Conversation titles must contain between 1 and 512 characters.");
+      }
+      this.#database.run(
+        `UPDATE conversations
+         SET title = ?, model_id = ?, title_origin = ?, archived = ?, updated_at = ?
+         WHERE id = ?`,
+        [
+          next.title,
+          next.modelId,
+          next.titleOrigin,
+          next.archived ? 1 : 0,
+          next.updatedAt,
+          conversationId,
+        ],
+      );
+      if (this.#database.getRowsModified() !== 1) {
+        throw new Error(`Conversation '${conversationId}' does not exist.`);
+      }
+      return next;
+    });
   }
 
   async updateConversationModel(
     conversationId: string,
     modelId: string,
   ): Promise<ConversationSummary> {
-    await this.#write(() => {
-      this.#database.run(
-        "UPDATE conversations SET model_id = ?, updated_at = ? WHERE id = ?",
-        [modelId, now(), conversationId],
-      );
-      if (this.#database.getRowsModified() !== 1) {
-        throw new Error(`Conversation '${conversationId}' does not exist.`);
-      }
-    });
-    return (await this.getConversation(conversationId)).conversation;
+    return this.updateConversation(conversationId, { modelId });
   }
 
   async deleteConversation(conversationId: string): Promise<void> {
     await this.#write(() => {
       this.#database.run(
-        `UPDATE protocol_responses SET response_json = NULL
+        `UPDATE protocol_responses SET response_json = ?
          WHERE conversation_id = ? OR owner_conversation_id = ?`,
-        [conversationId, conversationId],
+        [INVALIDATED_PROTOCOL_RESPONSE, conversationId, conversationId],
       );
       this.#database.run("DELETE FROM conversations WHERE id = ?", [conversationId]);
     });
@@ -2002,11 +2802,37 @@ export class RuntimeStateStore {
     return this.#write(() => {
       const run = this.#requiredRun(agentRunId);
       const timestamp = now();
+      const stoppedOutput = status === "cancelled" && event?.type === "agent_run.cancelled"
+        ? event.output
+        : undefined;
+      let assistantMessageId: string | undefined;
+      if (stoppedOutput?.text.length) {
+        assistantMessageId = randomUUID();
+        this.#database.run(
+          `INSERT INTO messages
+            (id, conversation_id, agent_run_id, role, text, sequence, citations_json, created_at)
+           VALUES (?, ?, ?, 'assistant', ?, ?, ?, ?)`,
+          [
+            assistantMessageId,
+            run.conversationId,
+            agentRunId,
+            stoppedOutput.text,
+            this.#nextMessageSequence(run.conversationId),
+            JSON.stringify(stoppedOutput.citations ?? []),
+            timestamp,
+          ],
+        );
+      }
       this.#database.run(
-        "UPDATE agent_runs SET status = ?, updated_at = ? WHERE id = ? AND status = 'running'",
-        [status, timestamp, agentRunId],
+        `UPDATE agent_runs
+         SET status = ?, assistant_message_id = COALESCE(?, assistant_message_id), updated_at = ?
+         WHERE id = ? AND status = 'running'`,
+        [status, assistantMessageId ?? null, timestamp, agentRunId],
       );
-      if (this.#database.getRowsModified() !== 1) return false;
+      if (this.#database.getRowsModified() !== 1) {
+        if (assistantMessageId) this.#database.run("DELETE FROM messages WHERE id = ?", [assistantMessageId]);
+        return false;
+      }
       this.#database.run(
         `UPDATE tool_calls
           SET status = 'failed', error_code = ?, error_message = ?, updated_at = ?
@@ -2022,6 +2848,7 @@ export class RuntimeStateStore {
         ],
       );
       if (status === "cancelled") {
+        this.#database.run("DELETE FROM run_checkpoints WHERE agent_run_id = ?", [agentRunId]);
         this.#database.run(
           `UPDATE vault_change_batches
             SET state = 'failed', updated_at = ?
@@ -2052,6 +2879,65 @@ export class RuntimeStateStore {
     );
     if (!row) throw new Error(`Agent Run '${agentRunId}' does not exist.`);
     return { conversationId: row[0] as string };
+  }
+
+  #resumableRun(conversationId: string, agentRunId: string): ResumableRun {
+    const run = firstRow(
+      this.#database,
+      `SELECT conversation_id, model_id, status, last_sequence
+       FROM agent_runs WHERE id = ?`,
+      [agentRunId],
+    );
+    if (!run || run[0] !== conversationId) {
+      throw new Error(`Agent Run '${agentRunId}' does not belong to Conversation '${conversationId}'.`);
+    }
+    if (run[2] !== "interrupted") {
+      throw new Error(`Agent Run '${agentRunId}' cannot be resumed from '${run[2]}'.`);
+    }
+    const checkpointJson = valueAt(
+      this.#database,
+      `SELECT checkpoint_json FROM run_checkpoints
+       WHERE agent_run_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      [agentRunId],
+    );
+    if (typeof checkpointJson !== "string") {
+      throw new Error(`Agent Run '${agentRunId}' has no durable Run Checkpoint.`);
+    }
+    const checkpoint = JSON.parse(checkpointJson) as RunCheckpoint;
+    if (checkpoint.version !== 1) {
+      throw new Error(`Agent Run '${agentRunId}' has an unsupported Run Checkpoint.`);
+    }
+    return {
+      checkpoint,
+      model: run[1] as string,
+      nextSequence: Number(run[3]) + 1,
+    };
+  }
+
+  #attachmentRows(where: string, parameters: unknown[]): StoredRunAttachmentMetadata[] {
+    const rows = this.#database.exec(
+      `SELECT id, conversation_id, agent_run_id, content_hash, file_name, media_type, size, created_at,
+              message_id, message_order, owned_at
+       FROM run_attachments WHERE ${where} ORDER BY created_at, id`,
+      parameters as (string | number | null | Uint8Array)[],
+    )[0]?.values ?? [];
+    return rows.map((row) => this.#attachmentMetadata(row));
+  }
+
+  #attachmentMetadata(row: unknown[]): StoredRunAttachmentMetadata {
+    return {
+      attachmentId: row[0] as string,
+      conversationId: row[1] as string,
+      agentRunId: row[2] as string,
+      contentHash: row[3] as string,
+      fileName: row[4] as string,
+      mediaType: row[5] as StoredRunAttachmentMetadata["mediaType"],
+      size: row[6] as number,
+      createdAt: row[7] as string,
+      ...(row[8] ? { messageId: row[8] as string } : {}),
+      ...(row[9] !== null && row[9] !== undefined ? { messageOrder: row[9] as number } : {}),
+      ...(row[10] ? { ownedAt: row[10] as string } : {}),
+    };
   }
 
   #nextMessageSequence(conversationId: string): number {
@@ -2112,9 +2998,13 @@ export class RuntimeStateStore {
       this.#database.run("BEGIN IMMEDIATE");
       try {
         if (migration.version === 9) this.#ensureProtocolColumns();
+        if (migration.version === 18) this.#ensureConversationMetadataColumns();
+        if (migration.version === 19) this.#ensureAttachmentStorageColumns();
         this.#database.run(migration.sql);
         if (migration.version === 7) this.#scrubPersistedVaultChangeArguments();
         if (migration.version === 8) this.#ensureCitationsColumn();
+        if (migration.version === 14) this.#ensureAttachmentsColumn();
+        if (migration.version === 15) this.#scrubOpaqueAttachmentIds();
         if (migration.version === 10) this.#scrubResumableStateBodies();
         const timestamp = now();
         this.#database.run(
@@ -2137,8 +3027,45 @@ export class RuntimeStateStore {
     // Early v9/v10 builds could persist the current version before these additive
     // protocol columns existed. Keep the repair idempotent for already-versioned State.
     this.#ensureProtocolColumns();
+    this.#ensureAttachmentStorageColumns();
+    this.#linkLegacyConversationAttachments();
+    this.#ensureConversationMetadataColumns();
     if (version < 10) this.#database.run("VACUUM");
     await this.#persist();
+  }
+
+  async #backfillLegacyConversationTitles(): Promise<void> {
+    await this.#write(() => {
+      const rows = this.#database.exec(
+        `SELECT conversations.id, messages.text, messages.attachments_json
+         FROM conversations
+         JOIN messages ON messages.conversation_id = conversations.id
+         WHERE conversations.title = 'New Conversation'
+           AND conversations.title_origin = 'placeholder'
+           AND messages.role = 'user'
+           AND messages.sequence = (
+             SELECT MIN(first_message.sequence)
+             FROM messages AS first_message
+             WHERE first_message.conversation_id = conversations.id
+               AND first_message.role = 'user'
+           )
+         ORDER BY conversations.id`,
+      )[0]?.values ?? [];
+      for (const [conversationId, text, attachmentsJson] of rows) {
+        const attachments = JSON.parse((attachmentsJson as string | null) ?? "[]") as Array<{
+          fileName?: string;
+        }>;
+        const message = text as string;
+        const imageFileName = attachments.find(({ fileName }) => Boolean(fileName?.trim()))?.fileName;
+        if (!message.trim() && !imageFileName) continue;
+        this.#database.run(
+          `UPDATE conversations
+           SET title = ?, title_origin = 'automatic'
+           WHERE id = ? AND title = 'New Conversation' AND title_origin = 'placeholder'`,
+          [generateConversationTitle({ text: message, imageFileName }), conversationId],
+        );
+      }
+    });
   }
 
   #scrubPersistedVaultChangeArguments(): void {
@@ -2220,6 +3147,9 @@ export class RuntimeStateStore {
           requiredRereads: Array.isArray(legacy.requiredRereads) ? legacy.requiredRereads : [],
           hostedWebSearchProbeAttempted: legacy.hostedWebSearchProbeAttempted === true,
           completedSteps: Number.isInteger(legacy.completedSteps) ? legacy.completedSteps as number : 0,
+          ...(legacy.runInput && typeof legacy.runInput.text === "string"
+            ? { runInput: legacy.runInput }
+            : {}),
           ...(legacy.pendingToolStep
             ? { pendingToolStep: legacy.pendingToolStep }
             : (legacy as { pendingConfirmation?: Omit<NonNullable<RunCheckpoint["pendingToolStep"]>, "name"> }).pendingConfirmation
@@ -2255,6 +3185,32 @@ export class RuntimeStateStore {
         this.#database.run("UPDATE tool_calls SET result_json = NULL WHERE id = ?", [id]);
       }
     }
+  }
+
+  #ensureConversationMetadataColumns(): void {
+    const columns = new Set(
+      (this.#database.exec("PRAGMA table_info(conversations)")[0]?.values ?? [])
+        .map((column) => column[1]),
+    );
+    if (!columns.has("title_origin")) {
+      this.#database.run(
+        `ALTER TABLE conversations ADD COLUMN title_origin TEXT NOT NULL DEFAULT 'manual'
+         CHECK (title_origin IN ('placeholder', 'automatic', 'manual'))`,
+      );
+      this.#database.run(
+        "UPDATE conversations SET title_origin = 'placeholder' WHERE title = 'New Conversation'",
+      );
+    }
+    if (!columns.has("archived")) {
+      this.#database.run(
+        `ALTER TABLE conversations ADD COLUMN archived INTEGER NOT NULL DEFAULT 0
+         CHECK (archived IN (0, 1))`,
+      );
+    }
+    this.#database.run(
+      `CREATE INDEX IF NOT EXISTS conversations_by_archive_activity
+       ON conversations(archived, updated_at DESC, id)`,
+    );
   }
 
   #ensureProtocolColumns(): void {
@@ -2307,6 +3263,128 @@ export class RuntimeStateStore {
     const columns = this.#database.exec("PRAGMA table_info(messages)")[0]?.values ?? [];
     if (!columns.some((column) => column[1] === "citations_json")) {
       this.#database.run("ALTER TABLE messages ADD COLUMN citations_json TEXT NOT NULL DEFAULT '[]'");
+    }
+  }
+
+  #ensureAttachmentsColumn(): void {
+    const columns = this.#database.exec("PRAGMA table_info(messages)")[0]?.values ?? [];
+    if (!columns.some((column) => column[1] === "attachments_json")) {
+      this.#database.run(
+        "ALTER TABLE messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'",
+      );
+    }
+  }
+
+  #ensureAttachmentStorageColumns(): void {
+    const table = this.#database.exec(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'run_attachments'",
+    )[0]?.values ?? [];
+    if (table.length === 0) return;
+    const columns = this.#database.exec("PRAGMA table_info(run_attachments)")[0]?.values ?? [];
+    if (!columns.some((column) => column[1] === "content_hash")) {
+      this.#database.run(
+        "ALTER TABLE run_attachments ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+      );
+    }
+    if (!columns.some((column) => column[1] === "message_id")) {
+      this.#database.run("ALTER TABLE run_attachments ADD COLUMN message_id TEXT");
+    }
+    if (!columns.some((column) => column[1] === "message_order")) {
+      this.#database.run("ALTER TABLE run_attachments ADD COLUMN message_order INTEGER");
+    }
+    if (!columns.some((column) => column[1] === "owned_at")) {
+      this.#database.run("ALTER TABLE run_attachments ADD COLUMN owned_at TEXT");
+    }
+    this.#database.run(
+      `CREATE UNIQUE INDEX IF NOT EXISTS run_attachments_by_message_order
+       ON run_attachments(message_id, message_order) WHERE message_id IS NOT NULL`,
+    );
+  }
+
+  #linkLegacyConversationAttachments(): void {
+    const messages = this.#database.exec(
+      `SELECT id, conversation_id, agent_run_id, attachments_json, created_at
+       FROM messages
+       WHERE role = 'user' AND attachments_json <> '[]'
+       ORDER BY created_at, id`,
+    )[0]?.values ?? [];
+    for (const [messageId, conversationId, agentRunId, attachmentsJson, createdAt] of messages) {
+      let persisted: PersistedRunAttachmentMetadata[];
+      try {
+        persisted = JSON.parse(attachmentsJson as string) as PersistedRunAttachmentMetadata[];
+      } catch {
+        continue;
+      }
+      const candidates = this.#attachmentRows(
+        "conversation_id = ? AND agent_run_id = ? AND message_id IS NULL",
+        [conversationId, agentRunId],
+      );
+      const occupiedOrders = new Set(
+        this.#attachmentRows("message_id = ?", [messageId])
+          .flatMap(({ messageOrder }) => messageOrder === undefined ? [] : [messageOrder]),
+      );
+      const used = new Set<string>();
+      for (const attachment of [...persisted].sort((left, right) => left.order - right.order)) {
+        if (occupiedOrders.has(attachment.order)) continue;
+        const match = candidates.find((candidate) =>
+          !used.has(candidate.attachmentId) &&
+          candidate.contentHash === attachment.contentHash &&
+          candidate.fileName === attachment.fileName &&
+          candidate.mediaType === attachment.mediaType &&
+          candidate.size === attachment.size
+        );
+        if (!match) continue;
+        used.add(match.attachmentId);
+        this.#database.run(
+          `UPDATE run_attachments
+           SET message_id = ?, message_order = ?, owned_at = ?
+           WHERE id = ? AND message_id IS NULL`,
+          [messageId, attachment.order, createdAt, match.attachmentId],
+        );
+      }
+    }
+  }
+
+  #scrubOpaqueAttachmentIds(): void {
+    const messages = this.#database.exec(
+      "SELECT id, attachments_json FROM messages WHERE attachments_json <> '[]'",
+    )[0]?.values ?? [];
+    for (const [id, attachmentsJson] of messages) {
+      try {
+        const attachments = JSON.parse(attachmentsJson as string) as Array<Record<string, unknown>>;
+        this.#database.run(
+          "UPDATE messages SET attachments_json = ? WHERE id = ?",
+          [JSON.stringify(attachments.map(({ attachmentId: _id, ...metadata }) => metadata)), id],
+        );
+      } catch {
+        this.#database.run("UPDATE messages SET attachments_json = '[]' WHERE id = ?", [id]);
+      }
+    }
+    const checkpoints = this.#database.exec(
+      "SELECT id, checkpoint_json FROM run_checkpoints",
+    )[0]?.values ?? [];
+    for (const [id, checkpointJson] of checkpoints) {
+      try {
+        const checkpoint = JSON.parse(checkpointJson as string) as RunCheckpoint;
+        if (checkpoint.runInput?.attachments) {
+          checkpoint.runInput.attachments = (checkpoint.runInput.attachments as Array<
+            PersistedRunAttachmentMetadata & { attachmentId?: string }
+          >).map(
+            ({ attachmentId: _id, ...metadata }) => metadata,
+          );
+        }
+        checkpoint.input = checkpoint.input.map((item) =>
+          item.type === "user_message" && item.attachments?.length
+            ? { type: "user_message" as const, text: item.text }
+            : item,
+        );
+        this.#database.run(
+          "UPDATE run_checkpoints SET checkpoint_json = ? WHERE id = ?",
+          [JSON.stringify(checkpoint), id],
+        );
+      } catch {
+        this.#database.run("DELETE FROM run_checkpoints WHERE id = ?", [id]);
+      }
     }
   }
 

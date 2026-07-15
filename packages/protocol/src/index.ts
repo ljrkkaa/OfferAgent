@@ -23,6 +23,28 @@ export interface ModelDescriptor {
   supportsFastMode?: boolean;
 }
 
+export interface RunAttachmentReference {
+  attachmentId: string;
+  order: number;
+}
+
+export interface RunAttachmentMetadata extends RunAttachmentReference {
+  contentHash: string;
+  fileName: string;
+  mediaType: "image/gif" | "image/jpeg" | "image/png" | "image/webp";
+  size: number;
+}
+
+export type PersistedRunAttachmentMetadata = Omit<RunAttachmentMetadata, "attachmentId">;
+
+export interface StagedRunAttachment {
+  attachmentId: string;
+  contentHash: string;
+  fileName: string;
+  mediaType: RunAttachmentMetadata["mediaType"];
+  size: number;
+}
+
 export type AgentRunStatus =
   | "cancelled"
   | "completed"
@@ -31,21 +53,76 @@ export type AgentRunStatus =
   | "running";
 
 export interface ConversationSummary {
+  archived: boolean;
   id: string;
   modelId: string;
   title: string;
+  titleOrigin: "automatic" | "manual" | "placeholder";
+  updatedAt: string;
+}
+
+export function generateConversationTitle(input: {
+  date?: Date;
+  imageFileName?: string;
+  text: string;
+}): string {
+  const cleanedLines = input.text
+    .replace(/```[^\n]*\n?/g, "\n")
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/^(?:#{1,6}|[-*>])\s*/, ""))
+    .filter((line) => line.length > 0);
+  let candidate = cleanedLines.find((line) => !/^https?:\/\/\S+$/i.test(line)) ??
+    cleanedLines[0] ?? "";
+  const originalCandidate = candidate;
+  const usesStandaloneUrl = /^https?:\/\/\S+$/i.test(candidate);
+  if (!usesStandaloneUrl) {
+    candidate = candidate
+      .replace(/^(?:请|麻烦)?(?:帮我|帮忙)?(?:分析一下|分析|解释一下|解释|看看|说明一下)?[：:，,\s]*/u, "")
+      .replace(/^(?:please\s+)?(?:help\s+me\s+)?(?:to\s+)?/i, "")
+      .trim();
+    candidate = candidate.split(/[。！？?!：:；;.]/u)[0]?.trim() ?? "";
+  }
+  let usesImageFileName = false;
+  if (!candidate && input.imageFileName) {
+    candidate = input.imageFileName.replace(/\.[^.]+$/, "").trim();
+    usesImageFileName = true;
+  }
+  if (!candidate && originalCandidate) {
+    candidate = originalCandidate.split(/[。！？?!：:；;.]/u)[0]?.trim() ?? originalCandidate;
+  }
+  if (!candidate) {
+    const date = input.date ?? new Date();
+    return `图片分析 · ${date.getMonth() + 1}月${date.getDate()}日`;
+  }
+  if (!usesImageFileName && !usesStandaloneUrl && /^[a-z]/.test(candidate)) {
+    candidate = `${candidate[0]?.toUpperCase()}${candidate.slice(1)}`;
+  }
+  const maximum = /[\u3400-\u9fff]/u.test(candidate) ? 28 : 56;
+  return [...candidate].slice(0, maximum).join("").trim();
 }
 
 export interface ConversationMessage {
   agentRunId: string;
+  attachments?: PersistedRunAttachmentMetadata[];
   citations?: WebCitation[];
+  evidenceSources?: EvidenceSnapshotSource[];
   id: string;
   role: "assistant" | "user";
   sequence: number;
   text: string;
 }
 
-export type HostedWebSearchCapability = "available" | "unavailable" | "unknown";
+export interface EvidenceSnapshotSource {
+  lineEnd: number;
+  lineStart: number;
+  path: string;
+  snippet: string;
+  stale: boolean;
+}
+
+export type ProviderCapabilityStatus = "available" | "unavailable" | "unknown";
+export type HostedWebSearchCapability = ProviderCapabilityStatus;
+export type VisionCapability = ProviderCapabilityStatus;
 
 export interface WebCitation {
   endIndex: number;
@@ -70,8 +147,13 @@ export type LocalToolName =
   | "agent_contract_read"
   | "daily_note_context"
   | "hosted_web_search_probe"
+  | "interview_catalog"
   | "planning_memory_list"
   | "planning_memory_read"
+  | "project_list"
+  | "project_read"
+  | "project_search"
+  | "research_browser"
   | "skill_read"
   | "vault_list"
   | "vault_propose_changes"
@@ -116,6 +198,46 @@ export interface VaultReadResult {
   type: "vault_read";
 }
 
+export interface ProjectEvidenceEntry {
+  contentHash: string;
+  modifiedVersion: string;
+  path: string;
+}
+
+export interface ProjectListResult {
+  entries: ProjectEvidenceEntry[];
+  projectId: string;
+  truncated: boolean;
+  type: "project_list";
+}
+
+export interface ProjectSearchResult {
+  entries: Array<ProjectEvidenceEntry & {
+    snippets: Array<{
+      content: string;
+      lineEnd: number;
+      lineStart: number;
+      truncated: boolean;
+    }>;
+  }>;
+  projectId: string;
+  truncated: boolean;
+  type: "project_search";
+}
+
+export interface ProjectReadResult {
+  content: string;
+  contentHash: string;
+  evidencePath: string;
+  lineEnd: number;
+  lineStart: number;
+  modifiedVersion: string;
+  path: string;
+  projectId: string;
+  truncated: boolean;
+  type: "project_read";
+}
+
 export interface VaultSearchResult {
   entries: Array<{
     contentHash: string;
@@ -137,6 +259,7 @@ export interface WebReadResult {
   content: string;
   contentType: string;
   finalUrl: string;
+  sourceFingerprint: string;
   sourceTitle?: string;
   truncated: boolean;
   type: "web_read";
@@ -146,6 +269,32 @@ export interface WebReadResult {
 export interface HostedWebSearchProbeResult {
   status: HostedWebSearchCapability;
   type: "hosted_web_search_probe";
+}
+
+export type ResearchBrowserAction =
+  | "back"
+  | "enumerate"
+  | "follow"
+  | "open"
+  | "paginate"
+  | "read";
+
+export interface ResearchBrowserResult {
+  action: ResearchBrowserAction;
+  content?: string;
+  entries?: Array<{
+    id: string;
+    title: string;
+    url: string;
+  }>;
+  message?: string;
+  sourceFingerprint?: string;
+  status: "login_required" | "ready";
+  title: string;
+  truncated?: boolean;
+  type: "research_browser";
+  untrusted: true;
+  url: string;
 }
 
 export interface AgentContractResult {
@@ -166,6 +315,37 @@ export interface DailyNoteContextResult {
   templatePath: string | null;
   templateVersion: string | null;
   type: "daily_note_context";
+}
+
+export interface InterviewCatalogResult {
+  experienceCandidates: Array<{
+    company?: string;
+    contentHash: string;
+    date?: string;
+    matchKinds: Array<"canonical-url" | "repost-candidate" | "source-fingerprint">;
+    modifiedVersion: string;
+    path: string;
+    position?: string;
+    round?: string;
+    title: string;
+  }>;
+  indexes: Array<{
+    contentHash?: string;
+    exists: boolean;
+    kind: "experience" | "question";
+    modifiedVersion: string;
+    path: string;
+  }>;
+  questionCandidates: Array<{
+    answerState?: "draft" | "needs-research" | "verified";
+    contentHash: string;
+    matchKinds: Array<"semantic-candidate">;
+    modifiedVersion: string;
+    path: string;
+    title: string;
+  }>;
+  truncated: boolean;
+  type: "interview_catalog";
 }
 
 export type MemoryTopicType = "feedback" | "project" | "study" | "user";
@@ -335,8 +515,13 @@ export type LocalToolResultPayload =
         | AgentContractResult
         | DailyNoteContextResult
         | HostedWebSearchProbeResult
+        | InterviewCatalogResult
         | PlanningMemoryListResult
         | PlanningMemoryReadResult
+        | ProjectListResult
+        | ProjectReadResult
+        | ProjectSearchResult
+        | ResearchBrowserResult
         | SkillReadResult
         | VaultListResult
         | VaultChangeResult
@@ -365,11 +550,18 @@ export type ConversationCommand =
       type: "conversation.create";
       model: string;
       title: string;
+      titleOrigin?: ConversationSummary["titleOrigin"];
     })
   | (ConversationCommandBase & { type: "conversation.delete" })
   | (ConversationCommandBase & { type: "conversation.list" })
   | (ConversationCommandBase & { type: "conversation.open" })
-  | (ConversationCommandBase & { type: "conversation.update"; model: string });
+  | (ConversationCommandBase & {
+      type: "conversation.update";
+      archived?: boolean;
+      model?: string;
+      title?: string;
+      titleOrigin?: ConversationSummary["titleOrigin"];
+    });
 
 export type ConversationEvent =
   | (ConversationCommandBase & {
@@ -406,6 +598,11 @@ export interface RuntimeHostedWebSearchCapability {
   status: HostedWebSearchCapability;
 }
 
+export interface RuntimeVisionCapability {
+  modelId: string;
+  status: VisionCapability;
+}
+
 export type ProviderErrorCode =
   | "auth_required"
   | "instruction_error"
@@ -419,12 +616,26 @@ export interface AgentRunStart {
   conversationId: string;
   eventId: string;
   fastMode?: boolean;
-  input: { role: "user"; text: string };
+  input: {
+    attachments?: RunAttachmentReference[];
+    pinnedContext?: PinnedContextReference[];
+    role: "user";
+    text: string;
+  };
   model: string;
   protocolVersion: typeof PROTOCOL_VERSION;
   sequence: 0;
   type: "agent_run.start";
 }
+
+export type PinnedContextReference =
+  | { kind: "document"; path: string }
+  | {
+      kind: "selection";
+      lineEnd: number;
+      lineStart: number;
+      path: string;
+    };
 
 export interface AgentRunCancel {
   agentRunId: string;
@@ -487,7 +698,10 @@ export type AgentRunEvent =
       searchCallId: string;
       sources: WebSearchSource[];
     })
-  | (AgentRunEventBase & { type: "agent_run.cancelled" })
+  | (AgentRunEventBase & {
+      type: "agent_run.cancelled";
+      output?: { citations?: WebCitation[]; role: "assistant"; text: string };
+    })
   | (AgentRunEventBase & { type: "agent_run.interrupted" })
   | (AgentRunEventBase & {
       type: "tool_call.requested";

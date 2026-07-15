@@ -202,6 +202,22 @@ test("RuntimeSupervisor keeps one WebSocket across sequential Agent Runs", async
   assert.equal(connectionCount, 1);
 });
 
+test("RuntimeSupervisor cancellation stops an active host capability even before socket delivery", () => {
+  const cancelled = [];
+  const supervisor = new RuntimeSupervisor({
+    nodeCandidates: [process.execPath],
+    parentPid: process.pid,
+    provider: "fake",
+    runtimePath: runtimeEntry,
+    onCancelAgentRun: (agentRunId) => cancelled.push(agentRunId),
+  });
+  supervisor.cancelAgentRun({
+    conversationId: "research-conversation",
+    agentRunId: "research-run",
+  });
+  assert.deepEqual(cancelled, ["research-run"]);
+});
+
 test("RuntimeSupervisor reconnects and delivers the durable interruption after a socket drop", async (t) => {
   connectionCount = 0;
   trackedSockets.length = 0;

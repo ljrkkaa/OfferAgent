@@ -36,19 +36,76 @@ function execute(file, args, options = {}) {
 class StubElement {
   constructor(className = "", tagName = "div") {
     this.className = className;
+    this.classList = {
+      toggle: (token, force) => {
+        const classes = new Set(this.className.split(" ").filter(Boolean));
+        const enabled = force ?? !classes.has(token);
+        if (enabled) classes.add(token);
+        else classes.delete(token);
+        this.className = [...classes].join(" ");
+        return enabled;
+      },
+    };
     this.children = [];
     this.dataset = {};
     this.disabled = false;
     this.attributes = new Map();
     this.listeners = new Map();
     this.open = false;
+    this.parentElement = undefined;
     this.tagName = tagName;
-    this.text = "";
+    this._text = "";
     this.value = "";
+    this.selectionStart = 0;
+    this.selectionEnd = 0;
   }
 
   empty() {
+    for (const child of this.children) child.parentElement = undefined;
     this.children = [];
+  }
+
+  get text() {
+    return `${this._text}${this.children.map(({ text }) => text).join("")}`;
+  }
+
+  set text(value) {
+    this._text = `${value}`;
+  }
+
+  get childNodes() {
+    return this.children;
+  }
+
+  get textContent() {
+    return this.text;
+  }
+
+  appendChild(child) {
+    child.remove();
+    child.parentElement = this;
+    this.children.push(child);
+    return child;
+  }
+
+  cloneNode(deep = false) {
+    const clone = new StubElement(this.className, this.tagName);
+    clone._text = this._text;
+    if (deep) clone.replaceChildren(...this.children.map((child) => child.cloneNode(true)));
+    return clone;
+  }
+
+  remove() {
+    if (!this.parentElement) return;
+    const index = this.parentElement.children.indexOf(this);
+    if (index >= 0) this.parentElement.children.splice(index, 1);
+    this.parentElement = undefined;
+  }
+
+  replaceChildren(...children) {
+    for (const child of this.children) child.parentElement = undefined;
+    this.children = [];
+    for (const child of children) this.appendChild(child);
   }
 
   addClass(className) {
@@ -71,12 +128,35 @@ class StubElement {
     this.attributes.set(name, `${value}`);
   }
 
+  setText(text) {
+    this.text = `${text}`;
+    this.children = [];
+  }
+
   getAttribute(name) {
     return this.attributes.get(name);
   }
 
-  dispatch(type) {
-    this.listeners.get(type)?.({ preventDefault() {} });
+  focus() {
+    this.focused = true;
+  }
+
+  setSelectionRange(start, end) {
+    this.selectionStart = start;
+    this.selectionEnd = end;
+  }
+
+  dispatch(type, event = {}) {
+    const dispatched = {
+      defaultPrevented: false,
+      preventDefault() {
+        this.defaultPrevented = true;
+      },
+      ...event,
+    };
+    this.listeners.get(type)?.(dispatched);
+    this[`on${type}`]?.(dispatched);
+    return dispatched;
   }
 
   findByClass(className) {
@@ -94,11 +174,34 @@ class StubElement {
     return matches;
   }
 
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] ?? undefined;
+  }
+
+  querySelectorAll(selector) {
+    const descendants = this.children.flatMap(function collect(element) {
+      return [element, ...element.children.flatMap(collect)];
+    });
+    if (selector === "pre > code") {
+      return descendants.filter(
+        (element) => element.tagName === "code" && element.parentElement?.tagName === "pre",
+      );
+    }
+    if (selector === 'a[href^="http://"], a[href^="https://"]') {
+      return descendants.filter((element) => {
+        const href = element.getAttribute("href") ?? "";
+        return element.tagName === "a" && /^https?:\/\//.test(href);
+      });
+    }
+    if (selector.startsWith(".")) return this.findAllByClass(selector.slice(1));
+    return [];
+  }
+
   #createChild(options, tagName = "div") {
     const child = new StubElement(options.cls ?? "", tagName);
     child.text = options.text ?? "";
     child.value = options.value ?? "";
-    this.children.push(child);
+    this.appendChild(child);
     return child;
   }
 }
@@ -122,6 +225,28 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   const previousSetTimeout = globalThis.setTimeout;
   const previousClearTimeout = globalThis.clearTimeout;
   const previousDate = globalThis.Date;
+  const previousIntersectionObserver = globalThis.IntersectionObserver;
+  const attachmentObservers = [];
+  globalThis.IntersectionObserver = class {
+    constructor(callback) {
+      this.callback = callback;
+      this.disconnected = false;
+      attachmentObservers.push(this);
+    }
+
+    disconnect() {
+      this.disconnected = true;
+    }
+
+    observe(element) {
+      this.element = element;
+      this.emit(true);
+    }
+
+    emit(isIntersecting) {
+      if (!this.disconnected) this.callback([{ isIntersecting, target: this.element }]);
+    }
+  };
   globalThis.Date = class extends previousDate {
     constructor(...args) {
       super(...(args.length > 0 ? args : ["2026-07-14T12:00:00"]));
@@ -171,6 +296,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     globalThis.setTimeout = previousSetTimeout;
     globalThis.clearTimeout = previousClearTimeout;
     globalThis.Date = previousDate;
+    globalThis.IntersectionObserver = previousIntersectionObserver;
   });
   process.env.OFFERAGENT_RUNTIME_PROVIDER = "fake";
   const temporaryVault = await mkdtemp(path.join(os.tmpdir(), "offeragent-vault-"));
@@ -215,6 +341,8 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
 
   let activeView;
   let plugin;
+  let releaseStaleMarkdownRender;
+  let deferredStreamingMarkdown = false;
   let persistedPluginData;
 
   class FileSystemAdapter {
@@ -245,6 +373,11 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
       this.leaf = leaf;
       this.contentEl = new StubElement();
     }
+  }
+
+  class Component {
+    load() {}
+    unload() {}
   }
 
   class Plugin {
@@ -367,9 +500,11 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     }
   }
 
+  const notices = [];
   class Notice {
     constructor(message) {
       this.message = message;
+      notices.push(message);
     }
   }
 
@@ -379,7 +514,27 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
       await activeView.onOpen();
     },
   };
+  let activeFile = { path: "notes/example.md" };
+  const openedPaths = [];
+  const openedSelections = [];
+  const scrolledSelections = [];
   const workspace = {
+    activeEditor: {
+      editor: {
+        lineCount() {
+          return 2;
+        },
+        getLine(line) {
+          return line === 0 ? "line one" : line === 1 ? "line two" : "";
+        },
+        setSelection(from, to) {
+          openedSelections.push({ from, to });
+        },
+        scrollIntoView(range, center) {
+          scrolledSelections.push({ range, center });
+        },
+      },
+    },
     detachLeavesOfType() {
       void activeView?.onClose();
       activeView = undefined;
@@ -390,11 +545,44 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     getRightLeaf() {
       return leaf;
     },
+    getActiveFile() {
+      return activeFile;
+    },
+    async openLinkText(linktext) {
+      openedPaths.push(linktext);
+    },
     async revealLeaf() {},
   };
   const obsidianStub = {
+    Component,
     FileSystemAdapter,
     ItemView,
+    MarkdownRenderer: {
+      async render(_app, markdown, element) {
+        if (
+          markdown === "OfferAgent received: Practice my introduction." &&
+          !deferredStreamingMarkdown
+        ) {
+          deferredStreamingMarkdown = true;
+          await new Promise((resolve) => {
+            releaseStaleMarkdownRender = resolve;
+          });
+        }
+        if (markdown.includes("MARKDOWN_RENDER_FAILURE")) {
+          throw new Error("synthetic Markdown renderer failure");
+        }
+        element.createDiv({ text: markdown });
+        if (markdown.includes("Practice my introduction.")) {
+          const link = element.createEl("a", { text: "External source" });
+          link.setAttribute("href", "https://example.com/source");
+          const nativePre = element.createEl("pre");
+          nativePre.createEl("code", { text: "const answer = 42;" });
+          nativePre.createEl("button", { cls: "copy-code-button" });
+          const fallbackPre = element.createEl("pre");
+          fallbackPre.createEl("code", { text: "const fallback = 7;" });
+        }
+      },
+    },
     Notice,
     Platform: { isDesktopApp: true },
     Plugin,
@@ -512,6 +700,14 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   };
   const OfferAgentPlugin = loaded.default ?? loaded;
   plugin = new OfferAgentPlugin(app, manifest);
+  await assert.rejects(
+    plugin.getHostedWebSearchCapability(),
+    /检查 Hosted Web Search 前请选择模型/,
+  );
+  await assert.rejects(
+    plugin.reprobeHostedWebSearch(),
+    /重新探测 Hosted Web Search 前请选择模型/,
+  );
   t.after(async () => {
     await plugin?.onunload();
     if (previousProvider === undefined) delete process.env.OFFERAGENT_RUNTIME_PROVIDER;
@@ -527,6 +723,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   await plugin.onload();
   assert.ok(plugin.views.has("offeragent-sidebar"));
   assert.ok(plugin.commands.has("open-offeragent-sidebar"));
+  assert.ok(plugin.commands.has("pin-selection-to-offeragent"));
   assert.equal(plugin.ribbonActions.length, 1);
   assert.equal(plugin.settingTabs.length, 1);
   plugin.settingTabs[0].display();
@@ -537,26 +734,239 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   const commonSettingNames = plugin.settingTabs[0].containerEl
     .findAllByClass("setting-item-name")
     .map(({ text }) => text);
-  assert.ok(commonSettingNames.includes("Runtime status"));
-  assert.ok(commonSettingNames.includes("Provider status"));
-  assert.ok(commonSettingNames.includes("Model"));
-  assert.ok(commonSettingNames.includes("Vault Permission Mode"));
+  assert.ok(commonSettingNames.includes("Runtime 状态"));
+  assert.ok(commonSettingNames.includes("Provider 状态"));
+  assert.ok(commonSettingNames.includes("模型"));
+  assert.ok(commonSettingNames.includes("Vault 权限模式"));
   assert.ok(plugin.settingTabs[0].containerEl.findByClass("offeragent-settings__advanced"));
 
+  assert.equal(plugin.commands.get("open-offeragent-sidebar")?.name, "打开 OfferAgent 侧栏");
+  assert.equal(plugin.commands.get("pin-selection-to-offeragent")?.name, "将选区固定到 OfferAgent");
   plugin.commands.get("open-offeragent-sidebar").callback();
   await waitUntil(() => activeView, "OfferAgent did not open its sidebar");
-  const connectedStatus = await waitUntil(
+  await waitUntil(
     () => {
       const status = activeView.contentEl.findByClass("offeragent-sidebar__status");
-      return status?.dataset.state === "connected" ? status : undefined;
+      return status === undefined && activeView.contentEl.findByClass("offeragent-sidebar__empty")
+        ? true
+        : undefined;
     },
-    "OfferAgent sidebar did not report a connected Runtime",
+    "OfferAgent sidebar did not become quietly connected",
   );
-  assert.equal(connectedStatus.text, "connected");
-  const settingsButton = activeView.contentEl.findByClass("offeragent-sidebar__settings");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__status"), undefined);
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__empty")?.text,
+    "准备好开始新对话了。",
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__permission")?.text,
+    "信任 Vault",
+  );
+  const headerOverflow = activeView.contentEl.findByClass("offeragent-sidebar__header-overflow");
+  assert.ok(headerOverflow);
+  assert.equal(
+    headerOverflow.findByClass("offeragent-sidebar__header-overflow-toggle")?.getAttribute("aria-label"),
+    "打开侧栏菜单",
+  );
+  const settingsButton = headerOverflow.findByClass("offeragent-sidebar__settings");
   assert.ok(settingsButton);
   settingsButton.dispatch("click");
   assert.equal(settingsOpened, 1);
+
+  let composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.value = "@example";
+  composerInput.setSelectionRange(composerInput.value.length, composerInput.value.length);
+  composerInput.dispatch("input");
+  assert.ok(
+    activeView.contentEl.findByClass("offeragent-sidebar__document-chooser"),
+    "typing @ must render bounded Vault document results immediately",
+  );
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.setSelectionRange(composerInput.value.length, composerInput.value.length);
+  composerInput.dispatch("keydown", { key: "ArrowDown", shiftKey: false, isComposing: false, keyCode: 40 });
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  const mentionEnter = composerInput.dispatch("keydown", {
+    key: "Enter", shiftKey: false, isComposing: false, keyCode: 13,
+  });
+  assert.equal(mentionEnter.defaultPrevented, true);
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__input").value, "");
+  let pinnedChip = activeView.contentEl.findByClass("offeragent-sidebar__context-chip--pinned");
+  assert.match(pinnedChip.text, /notes\/example\.md/);
+  assert.equal(
+    pinnedChip.findByClass("offeragent-sidebar__context-open").getAttribute("aria-label"),
+    "打开已固定来源 notes/example.md",
+  );
+  assert.equal(
+    pinnedChip.findByClass("offeragent-sidebar__context-remove").getAttribute("aria-label"),
+    "移除已固定来源 notes/example.md",
+  );
+  pinnedChip.findByClass("offeragent-sidebar__context-open").dispatch("click");
+  assert.deepEqual(openedPaths, ["notes/example.md"]);
+  pinnedChip.findByClass("offeragent-sidebar__context-remove").dispatch("click");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__context-chip--pinned"), undefined);
+
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.value = "@example";
+  composerInput.setSelectionRange(composerInput.value.length, composerInput.value.length);
+  composerInput.dispatch("input");
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.value = "plain text";
+  composerInput.setSelectionRange(composerInput.value.length, composerInput.value.length);
+  composerInput.dispatch("input");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__document-chooser"),
+    undefined,
+    "leaving an @ token must remove its stale chooser",
+  );
+
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.dispatch("compositionstart");
+  composerInput.value = "@example";
+  composerInput.setSelectionRange(composerInput.value.length, composerInput.value.length);
+  composerInput.dispatch("input");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input"),
+    composerInput,
+    "IME composition must not replace its active textarea",
+  );
+  composerInput.dispatch("compositionend");
+  assert.ok(activeView.contentEl.findByClass("offeragent-sidebar__document-chooser"));
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.value = "";
+  composerInput.setSelectionRange(0, 0);
+  composerInput.dispatch("input");
+
+  activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
+  const addMenu = activeView.contentEl.findByClass("offeragent-sidebar__add-menu");
+  assert.equal(addMenu.findByClass("offeragent-sidebar__pin-current")?.text, "固定当前笔记");
+  assert.equal(addMenu.findByClass("offeragent-sidebar__choose-document")?.text, "选择 Vault 文档");
+  assert.equal(addMenu.findByClass("offeragent-sidebar__attach")?.text, "添加图片");
+  addMenu.findByClass("offeragent-sidebar__pin-current").dispatch("click");
+  assert.match(
+    activeView.contentEl.findByClass("offeragent-sidebar__context-chip--pinned").text,
+    /notes\/example\.md/,
+  );
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.value = "@example";
+  composerInput.setSelectionRange(composerInput.value.length, composerInput.value.length);
+  composerInput.dispatch("input");
+  const duplicateChoice = activeView.contentEl
+    .findAllByClass("offeragent-sidebar__document-choice")
+    .find(({ text }) => text === "notes/example.md");
+  duplicateChoice.dispatch("click");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__input").value, "");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__document-chooser"), undefined);
+  assert.equal(
+    activeView.contentEl.findAllByClass("offeragent-sidebar__context-chip--pinned").length,
+    1,
+  );
+  activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
+  activeView.contentEl.findByClass("offeragent-sidebar__choose-document").dispatch("click");
+  const chooser = activeView.contentEl.findByClass("offeragent-sidebar__document-chooser");
+  const choices = chooser.findAllByClass("offeragent-sidebar__document-choice");
+  assert.ok(choices.length > 0 && choices.length <= 8);
+  for (let index = 0; index < 12; index += 1) {
+    vaultFiles.push({
+      path: `zzz/deep-choice-${index}.md`,
+      extension: "md",
+      stat: { mtime: 2000 + index, size: 0 },
+      content: "",
+    });
+  }
+  const chooserSearch = chooser.findByClass("offeragent-sidebar__document-search");
+  assert.equal(chooserSearch.placeholder, "搜索 Vault 文档");
+  assert.equal(chooserSearch.getAttribute("aria-label"), "搜索要固定的 Vault 文档");
+  chooserSearch.value = "deep-choice-11";
+  chooserSearch.dispatch("input");
+  const deepChoice = chooser.findAllByClass("offeragent-sidebar__document-choice")
+    .find(({ text }) => text === "zzz/deep-choice-11.md");
+  assert.ok(deepChoice, "the chooser must search beyond its initial bounded result page");
+  deepChoice.dispatch("click");
+  const deepChip = activeView.contentEl.findAllByClass("offeragent-sidebar__context-chip--pinned")
+    .find(({ text }) => text.includes("zzz/deep-choice-11.md"));
+  deepChip.findByClass("offeragent-sidebar__context-remove").dispatch("click");
+
+  plugin.commands.get("pin-selection-to-offeragent").editorCallback(
+    {
+      getSelection: () => "line two\n",
+      getCursor: (which) => which === "from" ? { line: 1, ch: 0 } : { line: 2, ch: 0 },
+    },
+    { file: { path: "notes/example.md" } },
+  );
+  await waitUntil(
+    () => activeView.contentEl.findAllByClass("offeragent-sidebar__context-chip--pinned").length === 2,
+    "selected editor text was not pinned with its visible source",
+  );
+  assert.ok(
+    activeView.contentEl.findAllByClass("offeragent-sidebar__context-chip--pinned")
+      .some(({ text }) => text.includes("notes/example.md:2-2")),
+  );
+  const pinsBeforeTabChange = activeView.contentEl
+    .findAllByClass("offeragent-sidebar__context-chip--pinned").map(({ text }) => text);
+  activeFile = { path: "templates/daily.md" };
+  assert.deepEqual(
+    activeView.contentEl.findAllByClass("offeragent-sidebar__context-chip--pinned").map(({ text }) => text),
+    pinsBeforeTabChange,
+  );
+  activeFile = { path: "agent.md" };
+  activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
+  assert.doesNotThrow(() => {
+    activeView.contentEl.findByClass("offeragent-sidebar__pin-current").dispatch("click");
+  });
+  assert.doesNotThrow(() => {
+    plugin.commands.get("pin-selection-to-offeragent").editorCallback(
+      {
+        getSelection: () => "control text",
+        getCursor: (which) => which === "from" ? { line: 0, ch: 0 } : { line: 0, ch: 12 },
+      },
+      { file: { path: "agent.md" } },
+    );
+  });
+  activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
+  for (let index = 0; index < 6; index += 1) {
+    plugin.commands.get("pin-selection-to-offeragent").editorCallback(
+      {
+        getSelection: () => `capacity ${index}`,
+        getCursor: (which) => which === "from" ? { line: 0, ch: 0 } : { line: 0, ch: 10 },
+      },
+      { file: { path: `notes/capacity-${index}.md` } },
+    );
+  }
+  assert.equal(
+    activeView.contentEl.findAllByClass("offeragent-sidebar__context-chip--pinned").length,
+    8,
+  );
+  activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
+  activeView.contentEl.findByClass("offeragent-sidebar__choose-document").dispatch("click");
+  let capacityChooser = activeView.contentEl.findByClass("offeragent-sidebar__document-chooser");
+  const capacitySearch = capacityChooser.findByClass("offeragent-sidebar__document-search");
+  capacitySearch.value = "deep-choice-0";
+  capacitySearch.dispatch("input");
+  const capacityChoice = capacityChooser.findAllByClass("offeragent-sidebar__document-choice")
+    .find(({ text }) => text === "zzz/deep-choice-0.md");
+  assert.doesNotThrow(() => capacityChoice.dispatch("click"));
+  assert.equal(notices.at(-1), "每次运行最多固定 8 份 Vault 来源。");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__document-chooser"),
+    capacityChooser,
+    "the + chooser must remain intact when the pin limit rejects a result",
+  );
+  activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
+  activeView.contentEl.findByClass("offeragent-sidebar__add").dispatch("click");
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.value = "@deep-choice-1";
+  composerInput.setSelectionRange(composerInput.value.length, composerInput.value.length);
+  composerInput.dispatch("input");
+  capacityChooser = activeView.contentEl.findByClass("offeragent-sidebar__document-chooser");
+  const capacityMention = capacityChooser.findAllByClass("offeragent-sidebar__document-choice")
+    .find(({ text }) => text === "zzz/deep-choice-1.md");
+  assert.doesNotThrow(() => capacityMention.dispatch("click"));
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__input").value, "@deep-choice-1");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__document-chooser"), capacityChooser);
+  composerInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  composerInput.value = "";
+  composerInput.setSelectionRange(0, 0);
+  composerInput.dispatch("input");
 
   const modelSelect = await waitUntil(
     () => {
@@ -566,99 +976,519 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "OfferAgent did not render its model selector",
   );
   assert.equal(modelSelect.value, "fake-interview-model");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__status"), undefined);
   assert.equal(
-    activeView.contentEl.findByClass("offeragent-sidebar__conversation-select")
-      .getAttribute("aria-label"),
-    "Conversation history",
+    activeView.contentEl.findByClass("offeragent-sidebar__settings")?.text,
+    "设置",
   );
   assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__settings")?.getAttribute("aria-label"),
+    "打开 OfferAgent 设置",
+  );
+  const historyButton = activeView.contentEl.findByClass("offeragent-sidebar__history");
+  assert.ok(historyButton);
+  assert.equal(historyButton.getAttribute("aria-expanded"), "false");
+  assert.ok(historyButton.getAttribute("aria-label"));
+  historyButton.dispatch("click");
+  const historyDrawer = activeView.contentEl.findByClass("offeragent-sidebar__history-drawer");
+  const historySearch = historyDrawer?.findByClass("offeragent-sidebar__history-search");
+  const historyItem = historyDrawer?.findByClass("offeragent-sidebar__history-item");
+  assert.ok(historySearch);
+  assert.ok(historyItem);
+  assert.equal(historySearch.focused, true);
+  assert.ok(historyItem.findByClass("offeragent-sidebar__history-updated"));
+  historySearch.value = "title-that-does-not-exist";
+  historySearch.dispatch("input");
+  assert.equal(historyItem.hidden, true);
+  historyDrawer.findByClass("offeragent-sidebar__history-select").dispatch("click");
+  await waitUntil(
+    () => !activeView.contentEl.findByClass("offeragent-sidebar__history-drawer"),
+    "Conversation history did not close after selection",
+  );
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__history").focused, true);
+  assert.equal(
     activeView.contentEl.findByClass("offeragent-sidebar__input").getAttribute("aria-label"),
-    "Message OfferAgent",
+    "给 OfferAgent 的消息",
   );
   plugin.settingTabs[0].display();
   assert.ok(
     plugin.settingTabs[0].containerEl
       .findAllByClass("setting-item-name")
-      .some(({ text }) => text === "Fast Mode"),
+      .some(({ text }) => text === "快速模式"),
   );
   const capabilityStatus = await waitUntil(
     () => plugin.settingTabs[0].containerEl
       .findAllByClass("setting-item-description")
-      .find((description) => description.text.includes("fake-interview-model: unknown")),
+      .find((description) =>
+        description.text.includes("fake-interview-model") && description.text.includes("未知")
+      ),
     "OfferAgent settings did not show the unknown Hosted Web Search capability",
   );
-  assert.match(capabilityStatus.text, /unknown/);
+  assert.match(capabilityStatus.text, /未知/);
   const reprobe = plugin.settingTabs[0].containerEl
     .findAllByClass("setting-item-button")
-    .find((button) => button.text === "Reprobe");
+    .find((button) => button.text === "重新探测");
   assert.ok(reprobe);
   reprobe.dispatch("click");
   await waitUntil(
     () => reprobe.disabled === false && plugin.settingTabs[0].containerEl
       .findAllByClass("setting-item-description")
-      .some((description) => description.text.includes("fake-interview-model: available")),
+      .some((description) =>
+        description.text.includes("fake-interview-model") && description.text.includes("可用")
+      ),
     "OfferAgent settings did not complete a Hosted Web Search reprobe",
   );
   const composer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const input = activeView.contentEl.findByClass("offeragent-sidebar__input");
   assert.ok(composer);
   assert.ok(input);
+  assert.equal(input.listeners.has("paste"), true);
+  assert.equal(composer.listeners.has("dragover"), true);
+  assert.equal(composer.listeners.has("drop"), true);
   assert.equal(
-    activeView.contentEl.findByClass("offeragent-sidebar__context-chip")?.text,
-    "Vault context",
+    activeView.contentEl.findByClass("offeragent-sidebar__file-picker")?.listeners.has("change"),
+    true,
   );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__add")?.getAttribute("aria-label"),
+    "添加上下文或图片",
+  );
+  assert.equal(modelSelect.getAttribute("aria-label"), "选择对话模型");
+  const imagePicker = activeView.contentEl.findByClass("offeragent-sidebar__file-picker");
+  assert.equal(imagePicker.tabIndex, -1);
+  let releaseFirstImageImport;
+  const firstImageImport = new Promise((resolve) => {
+    releaseFirstImageImport = () => resolve(new Uint8Array([1, 2, 3]).buffer);
+  });
+  imagePicker.files = [
+    {
+      name: "first-preview.png",
+      size: 3,
+      type: "image/png",
+      async arrayBuffer() { return firstImageImport; },
+    },
+    {
+      name: "second-preview.png",
+      size: 3,
+      type: "image/png",
+      async arrayBuffer() { return new Uint8Array([4, 5, 6]).buffer; },
+    },
+  ];
+  imagePicker.dispatch("change");
+  const pendingImportInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  pendingImportInput.value = "Do not send while images are preparing.";
+  pendingImportInput.dispatch("input");
+  const messagesBeforePendingImportEnter = activeView.contentEl
+    .findAllByClass("offeragent-sidebar__message").length;
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled, true);
+  const pendingImportEnter = pendingImportInput.dispatch("keydown", {
+    isComposing: false,
+    key: "Enter",
+    keyCode: 13,
+    shiftKey: false,
+  });
+  assert.equal(pendingImportEnter.defaultPrevented, true);
+  assert.equal(
+    activeView.contentEl.findAllByClass("offeragent-sidebar__message").length,
+    messagesBeforePendingImportEnter,
+  );
+  releaseFirstImageImport();
+  const imagePreviews = await waitUntil(
+    () => {
+      const previews = activeView.contentEl.findAllByClass("offeragent-sidebar__attachment-preview");
+      return previews.length === 2 ? previews : undefined;
+    },
+    "OfferAgent did not render ordered image thumbnails",
+  );
+  assert.deepEqual(imagePreviews.map(({ tagName }) => tagName), ["img", "img"]);
+  assert.deepEqual(
+    imagePreviews.map((preview) => preview.getAttribute("alt")),
+    ["图片预览 1：first-preview.png", "图片预览 2：second-preview.png"],
+  );
+  assert.ok(imagePreviews.every(({ src }) => /^blob:/.test(src)));
+  const attachmentStrip = activeView.contentEl.findByClass("offeragent-sidebar__attachment-strip");
+  assert.ok(attachmentStrip, "draft images must render in one horizontal thumbnail strip");
+  assert.equal(
+    attachmentStrip.findAllByClass("offeragent-sidebar__attachment").length,
+    2,
+  );
+  const draftCards = activeView.contentEl.findAllByClass("offeragent-sidebar__attachment");
+  assert.ok(draftCards.every(({ draggable }) => draggable === true));
+  assert.equal(
+    draftCards[0].findByClass("offeragent-sidebar__attachment-move-up")?.getAttribute("aria-label"),
+    "将 first-preview.png 前移",
+  );
+  assert.equal(
+    draftCards[0].findByClass("offeragent-sidebar__attachment-move-down")?.getAttribute("aria-label"),
+    "将 first-preview.png 后移",
+  );
+  assert.equal(
+    draftCards[0].findByClass("offeragent-sidebar__attachment-remove")?.getAttribute("aria-label"),
+    "移除 first-preview.png",
+  );
+  draftCards[1].dispatch("drop", {
+    dataTransfer: {
+      files: [{ name: "external.png", type: "image/png" }],
+      types: ["Files"],
+      getData() { return ""; },
+    },
+  });
+  assert.deepEqual(
+    activeView.contentEl
+      .findAllByClass("offeragent-sidebar__attachment-preview")
+      .map((preview) => preview.getAttribute("alt")),
+    ["图片预览 1：first-preview.png", "图片预览 2：second-preview.png"],
+    "an external file drop on a thumbnail must not reorder the first draft image",
+  );
+  let draggedIndex = "";
+  const draftTransfer = {
+    files: [],
+    types: ["application/x-offeragent-attachment-index"],
+    setData(_type, value) { draggedIndex = value; },
+    getData() { return draggedIndex; },
+  };
+  draftCards[0].dispatch("dragstart", { dataTransfer: draftTransfer });
+  draftCards[1].dispatch("drop", { dataTransfer: draftTransfer });
+  assert.deepEqual(
+    activeView.contentEl
+      .findAllByClass("offeragent-sidebar__attachment-preview")
+      .map((preview) => preview.getAttribute("alt")),
+    ["图片预览 1：second-preview.png", "图片预览 2：first-preview.png"],
+  );
+  activeView.contentEl.findByClass("offeragent-sidebar__attachment-remove").dispatch("click");
+  activeView.contentEl.findByClass("offeragent-sidebar__attachment-remove").dispatch("click");
+  assert.equal(activeView.contentEl.findAllByClass("offeragent-sidebar__attachment-preview").length, 0);
+  const mixedPasteInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  mixedPasteInput.value = "Prefix ";
+  mixedPasteInput.setSelectionRange(mixedPasteInput.value.length, mixedPasteInput.value.length);
+  const mixedPaste = mixedPasteInput.dispatch("paste", {
+    clipboardData: {
+      files: [{
+        name: "clipboard.png",
+        size: 8,
+        type: "image/png",
+        async arrayBuffer() {
+          return new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).buffer;
+        },
+      }],
+      getData(type) { return type === "text/plain" ? "mixed text" : ""; },
+    },
+  });
+  assert.equal(mixedPaste.defaultPrevented, true);
+  await waitUntil(
+    () => activeView.contentEl.findAllByClass("offeragent-sidebar__attachment-preview").length === 1,
+    "Mixed clipboard image did not use the atomic attachment import path",
+  );
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__input").value, "Prefix mixed text");
+  const mixedSend = activeView.contentEl.findByClass("offeragent-sidebar__input").dispatch("keydown", {
+    isComposing: false,
+    key: "Enter",
+    keyCode: 13,
+    shiftKey: false,
+  });
+  assert.equal(mixedSend.defaultPrevented, true);
+  const sentAttachment = await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__message-attachment"),
+    "Sent user message did not render its image immediately",
+  );
+  assert.equal(sentAttachment.getAttribute("alt"), "附件 1：clipboard.png");
+  assert.match(sentAttachment.src, /^blob:/);
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.text === "发送",
+    "Image message Agent Run did not return to idle",
+  );
+  const visibleAttachment = activeView.contentEl.findByClass("offeragent-sidebar__message-attachment");
+  const visibleAttachmentObserver = [...attachmentObservers].reverse().find(
+    (observer) => !observer.disconnected && observer.element === visibleAttachment,
+  );
+  assert.ok(visibleAttachmentObserver, "sent message image was not visibility-observed");
+  visibleAttachmentObserver.emit(false);
+  assert.equal(visibleAttachment.src, "", "offscreen message bytes must release their Blob URL");
+  visibleAttachmentObserver.emit(true);
+  await waitUntil(
+    () => /^blob:/.test(visibleAttachment.src),
+    "visible message image did not reload after offscreen release",
+  );
+  await activeView.onClose();
+  await activeView.onOpen();
+  await waitUntil(
+    () => /^blob:/.test(activeView.contentEl.findByClass("offeragent-sidebar__message-attachment")?.src ?? ""),
+    "persisted sent image did not reload after sidebar close and reopen",
+  );
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__context-chip"), undefined);
   assert.match(
     activeView.contentEl.findByClass("offeragent-sidebar__permission")?.text ?? "",
-    /Trusted Vault/,
+    /信任 Vault/,
   );
   await plugin.setFastMode(true);
   await waitUntil(
-    () => activeView.contentEl.findByClass("offeragent-sidebar__context-chip--fast"),
+    () => activeView.contentEl.findByClass("offeragent-sidebar__context-chip--fast")?.text === "快速模式",
     "Fast Mode setting did not refresh the idle Sidebar presentation",
   );
   await plugin.setFastMode(false);
   await plugin.setVaultPermissionMode("read_only");
   await waitUntil(
-    () => activeView.contentEl.findByClass("offeragent-sidebar__permission")?.text === "Read Only",
+    () => activeView.contentEl.findByClass("offeragent-sidebar__permission")?.text === "只读",
     "Vault Permission setting did not refresh the idle Sidebar presentation",
   );
   await plugin.setVaultPermissionMode("trusted_vault");
-  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__send")?.text, "Send");
-  input.value = "Practice my introduction.";
-  composer.dispatch("submit");
-
-  const assistantMessage = await waitUntil(
-    () => {
-      const message = activeView.contentEl.findByClass("offeragent-sidebar__message--assistant");
-      return message?.text === "OfferAgent received: Practice my introduction." ? message : undefined;
-    },
-    "OfferAgent did not stream the fake Provider response into the Sidebar",
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__send")?.text, "发送");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__permission")?.getAttribute("aria-label"),
+    "Vault 权限模式：信任 Vault",
   );
-  assert.equal(assistantMessage.text, "OfferAgent received: Practice my introduction.");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__permission")?.getAttribute("role"),
+    "status",
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__send")?.getAttribute("aria-label"),
+    "发送消息",
+  );
+  const keyboardInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  const messageCountBeforeKeyboard = activeView.contentEl
+    .findAllByClass("offeragent-sidebar__message").length;
+  keyboardInput.value = "中文输入法确认不应发送";
+  keyboardInput.dispatch("compositionstart");
+  const composingEnter = keyboardInput.dispatch("keydown", {
+    isComposing: true,
+    key: "Enter",
+    keyCode: 229,
+    shiftKey: false,
+  });
+  keyboardInput.dispatch("compositionend");
+  const postCompositionEnter = keyboardInput.dispatch("keydown", {
+    isComposing: false,
+    key: "Enter",
+    keyCode: 13,
+    shiftKey: false,
+  });
+  assert.equal(composingEnter.defaultPrevented, false);
+  assert.equal(postCompositionEnter.defaultPrevented, false);
+  assert.equal(
+    activeView.contentEl.findAllByClass("offeragent-sidebar__message").length,
+    messageCountBeforeKeyboard,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const shiftedEnter = keyboardInput.dispatch("keydown", {
+    isComposing: false,
+    key: "Enter",
+    keyCode: 13,
+    shiftKey: true,
+  });
+  assert.equal(shiftedEnter.defaultPrevented, false);
+  assert.equal(
+    activeView.contentEl.findAllByClass("offeragent-sidebar__message").length,
+    messageCountBeforeKeyboard,
+  );
+  activeView.contentEl.findByClass("offeragent-sidebar__history").dispatch("click");
+  assert.ok(activeView.contentEl.findByClass("offeragent-sidebar__history-drawer"));
+  const historyOpenInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  historyOpenInput.value = "Practice my introduction.";
+  historyOpenInput.dispatch("input");
+  const sendEnter = historyOpenInput.dispatch("keydown", {
+    isComposing: false,
+    key: "Enter",
+    keyCode: 13,
+    shiftKey: false,
+  });
+  assert.equal(sendEnter.defaultPrevented, true);
+  const stopButton = await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__stop"),
+    "OfferAgent did not begin the keyboard-submitted Run",
+  );
+  const activeInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  assert.equal(activeInput.disabled, false);
+  assert.equal(
+    stopButton.getAttribute("aria-label"),
+    "停止当前运行",
+  );
+  const streamingDrawer = activeView.contentEl.findByClass("offeragent-sidebar__history-drawer");
+  assert.ok(streamingDrawer.findByClass("offeragent-sidebar__history-overflow"));
+  for (const className of [
+    "offeragent-sidebar__history-select",
+    "offeragent-sidebar__history-rename",
+    "offeragent-sidebar__history-archive",
+    "offeragent-sidebar__history-delete",
+  ]) {
+    assert.equal(streamingDrawer.findByClass(className).disabled, true);
+  }
+  activeInput.value = "Draft retained during the active Run";
+  activeInput.dispatch("input");
+  const blockedSecondEnter = activeInput.dispatch("keydown", {
+    isComposing: false,
+    key: "Enter",
+    keyCode: 13,
+    shiftKey: false,
+  });
+  assert.equal(blockedSecondEnter.defaultPrevented, true);
+  await waitUntil(
+    () => releaseStaleMarkdownRender,
+    "OfferAgent did not start the deferred Markdown render",
+  );
   await waitUntil(
     () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
     "OfferAgent did not finish the first Agent Run",
   );
+  activeView.contentEl.findByClass("offeragent-sidebar__history").dispatch("click");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__history-drawer"), undefined);
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input").value,
+    "Draft retained during the active Run",
+  );
+  await plugin.setFastMode(true);
+  const assistantMessage = await waitUntil(
+    () => {
+      return activeView.contentEl
+        .findAllByClass("offeragent-sidebar__message--assistant")
+        .find((message) => message.findByClass("offeragent-sidebar__message-body")?.text.startsWith(
+          "OfferAgent received: Practice my introduction.",
+        ));
+    },
+    "OfferAgent did not stream the fake Provider response into the Sidebar",
+  );
+  assert.equal(
+    assistantMessage.findByClass("offeragent-sidebar__message-body")?.text,
+    "OfferAgent received: Practice my introduction.External sourceconst answer = 42;const fallback = 7;复制代码",
+  );
+  const externalLink = assistantMessage
+    .findByClass("offeragent-sidebar__message-body")
+    ?.querySelectorAll('a[href^="http://"], a[href^="https://"]')[0];
+  assert.equal(externalLink?.target, "_blank");
+  assert.equal(externalLink?.rel, "noopener noreferrer");
+  assert.equal(
+    assistantMessage.findByClass("offeragent-sidebar__code-copy")?.getAttribute("aria-label"),
+    "复制代码块",
+  );
+  assert.equal(assistantMessage.findAllByClass("copy-code-button").length, 1);
+  assert.equal(assistantMessage.findAllByClass("offeragent-sidebar__code-copy").length, 1);
+  assert.equal(
+    assistantMessage.findByClass("offeragent-sidebar__message-copy")?.getAttribute("aria-label"),
+    "复制完整回答",
+  );
+  releaseStaleMarkdownRender();
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal(
+    assistantMessage.findByClass("offeragent-sidebar__message-body")?.text,
+    "OfferAgent received: Practice my introduction.External sourceconst answer = 42;const fallback = 7;复制代码",
+    "A stale Markdown render replaced the latest completed response",
+  );
+  await plugin.setFastMode(false);
   assert.ok(
     activeView.contentEl
       .findAllByClass("offeragent-sidebar__tool-activity")
       .some(
         (activity) =>
-          activity.dataset.status === "completed" &&
-          activity.children[0]?.text.includes("Read contract agent.md"),
+          activity
+            .findAllByClass("offeragent-sidebar__tool-activity-label")
+            .some((label) => label.text.includes("读取约定 agent.md")),
       ),
     "The installed Runtime did not read the migrated Agent Contract",
   );
-  assert.deepEqual(contractReads, [migratedContract]);
+  assert.equal(contractReads.length, 2);
+  assert.ok(contractReads.every((content) => content === migratedContract));
   assert.equal(activeView.contentEl.findAllByClass("offeragent-sidebar__run-status").length, 0);
+
+  const reviseRecent = activeView.contentEl.findByClass("offeragent-sidebar__message-revise");
+  assert.ok(reviseRecent, "The latest user message did not expose Put in Composer");
+  assert.equal(reviseRecent.text, "放入输入框");
+  assert.equal(reviseRecent.getAttribute("aria-label"), "将最近一条用户消息放入输入框");
+  const recentDraft = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  recentDraft.value = "Protect this recent draft.";
+  recentDraft.dispatch("input");
+  const previousRecentWindow = globalThis.window;
+  globalThis.window = { confirm: () => false };
+  reviseRecent.dispatch("click");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input").value,
+    "Protect this recent draft.",
+  );
+  globalThis.window.confirm = () => true;
+  reviseRecent.dispatch("click");
+  globalThis.window = previousRecentWindow;
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input").value,
+    "Practice my introduction.",
+  );
+
+  const stoppedComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
+  const stoppedInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  stoppedInput.value = "stop_and_revise_demo";
+  stoppedComposer.dispatch("submit");
+  const stoppedPartial = await waitUntil(
+    () => activeView.contentEl
+      .findAllByClass("offeragent-sidebar__message--assistant")
+      .find((message) => message.text.includes("Partial stopped answer.")),
+    "OfferAgent did not render the partial Stopped Run output",
+  );
+  assert.ok(stoppedPartial);
+  const stoppedDraft = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  stoppedDraft.value = "Protect this existing draft.";
+  stoppedDraft.dispatch("input");
+  activeView.contentEl.findByClass("offeragent-sidebar__stop").dispatch("click");
+  const reviseStopped = await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__revise-stopped"),
+    "OfferAgent did not expose Stop and Revise",
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__run-status")?.text.includes("已停止"),
+    true,
+  );
+  assert.equal(reviseStopped.disabled, false);
+  assert.equal(
+    reviseStopped.getAttribute("title"),
+    "当前草稿或图片会在确认后被原提示词替换",
+  );
+  const previousWindow = globalThis.window;
+  globalThis.window = { confirm: () => false };
+  reviseStopped.dispatch("click");
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input").value,
+    "Protect this existing draft.",
+  );
+  const dynamicDraft = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  dynamicDraft.value = "";
+  dynamicDraft.dispatch("input");
+  assert.equal(reviseStopped.getAttribute("title"), "");
+  dynamicDraft.value = "Protect this newer draft.";
+  dynamicDraft.dispatch("input");
+  assert.equal(
+    reviseStopped.getAttribute("title"),
+    "当前草稿或图片会在确认后被原提示词替换",
+  );
+  globalThis.window.confirm = () => true;
+  reviseStopped.dispatch("click");
+  globalThis.window = previousWindow;
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input").value,
+    "stop_and_revise_demo",
+  );
+  const stoppedConversationTitle = activeView.contentEl
+    .findByClass("offeragent-sidebar__history").text;
+  activeView.contentEl.findByClass("offeragent-sidebar__new-conversation").dispatch("click");
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__history").text !==
+      stoppedConversationTitle,
+    "OfferAgent did not isolate later smoke checks from the Stopped Run",
+  );
 
   const nextComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const nextInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
-  nextInput.value = "Practice a second answer.";
+  nextInput.value = "MARKDOWN_RENDER_FAILURE";
   nextComposer.dispatch("submit");
   await waitUntil(
     () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
     "OfferAgent did not finish the second Agent Run",
+  );
+  assert.ok(
+    activeView.contentEl
+      .findAllByClass("offeragent-sidebar__message-body")
+      .some(
+        (body) =>
+          body.dataset.renderStatus === "plain-text-fallback" &&
+          body.text.includes("MARKDOWN_RENDER_FAILURE"),
+      ),
+    "A Markdown renderer failure did not retain the complete plain-text answer",
   );
   assert.equal(activeView.contentEl.findAllByClass("offeragent-sidebar__run-status").length, 0);
 
@@ -666,18 +1496,50 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   const toolInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
   toolInput.value = "vault_read notes/example.md 1-2";
   toolComposer.dispatch("submit");
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__stop"),
+    "OfferAgent did not enter the active Tool Run",
+  );
+  const stableToolRunElements = {
+    composer: activeView.contentEl.findByClass("offeragent-sidebar__composer"),
+    header: activeView.contentEl.findByClass("offeragent-sidebar__header"),
+    input: activeView.contentEl.findByClass("offeragent-sidebar__input"),
+    transcript: activeView.contentEl.findByClass("offeragent-sidebar__transcript"),
+  };
   const completedTool = await waitUntil(
     () => {
       const activities = activeView.contentEl.findAllByClass("offeragent-sidebar__tool-activity");
       return activities.find(
         (activity) =>
           activity.dataset.status === "completed" &&
-          activity.children[0]?.text.includes("Read notes/example.md"),
+          activity
+            .findAllByClass("offeragent-sidebar__tool-activity-label")
+            .some((label) => label.text.includes("读取 notes/example.md")),
       );
     },
     "OfferAgent did not execute and render the Vault tool activity",
   );
-  assert.match(completedTool.children[0].text, /Read notes\/example\.md · completed/);
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__header"),
+    stableToolRunElements.header,
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__transcript"),
+    stableToolRunElements.transcript,
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__composer"),
+    stableToolRunElements.composer,
+  );
+  assert.equal(
+    activeView.contentEl.findByClass("offeragent-sidebar__input"),
+    stableToolRunElements.input,
+  );
+  assert.ok(
+    completedTool
+      .findAllByClass("offeragent-sidebar__tool-activity-label")
+      .some((label) => /读取 notes\/example\.md · 完成/.test(label.text)),
+  );
   assert.equal(completedTool.children[0].getAttribute("aria-expanded"), "false");
   completedTool.open = true;
   completedTool.dispatch("toggle");
@@ -687,6 +1549,45 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
     "OfferAgent did not finish the Vault read Agent Run",
   );
+  const usedSource = await waitUntil(
+    () => activeView.contentEl
+      .findAllByClass("offeragent-sidebar__used-source")
+      .find((source) => source.text.includes("notes/example.md:1-2")),
+    "OfferAgent did not render the Run-owned Evidence source",
+  );
+  assert.equal(
+    usedSource.parentElement?.children[0]?.text,
+    "使用了 1 份文档",
+  );
+  assert.equal(
+    usedSource.findByClass("offeragent-sidebar__used-source-snippet")?.text,
+    "line one line two",
+  );
+  usedSource.findByClass("offeragent-sidebar__used-source-open").dispatch("click");
+  await waitUntil(
+    () => openedSelections.length > 0,
+    "Opening an Evidence source did not select its exact Vault line range",
+  );
+  assert.deepEqual(openedPaths.at(-1), "notes/example.md");
+  assert.deepEqual(openedSelections.at(-1), {
+    from: { line: 0, ch: 0 },
+    to: { line: 1, ch: 8 },
+  });
+  assert.deepEqual(scrolledSelections.at(-1), {
+    range: {
+      from: { line: 0, ch: 0 },
+      to: { line: 1, ch: 8 },
+    },
+    center: true,
+  });
+  usedSource.findByClass("offeragent-sidebar__used-source-pin").dispatch("click");
+  const usedSourcePin = await waitUntil(
+    () => activeView.contentEl
+      .findAllByClass("offeragent-sidebar__context-chip--pinned")
+      .find((chip) => chip.text.includes("notes/example.md:1-2")),
+    "OfferAgent did not pin a used source into the next Composer turn",
+  );
+  usedSourcePin.findByClass("offeragent-sidebar__context-remove").dispatch("click");
 
   const planComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const planInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
@@ -1168,10 +2069,18 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "OfferAgent did not render the pending whole-batch confirmation card",
   );
   assert.match(pendingBatch.children[0].text, /Append one smoke-test line/);
+  assert.equal(
+    pendingBatch.findByClass("offeragent-sidebar__change-batch-status")?.text,
+    "Vault 变更：等待确认",
+  );
+  assert.match(
+    pendingBatch.findByClass("offeragent-sidebar__change-actions")?.text ?? "",
+    /追加：notes\/example\.md/,
+  );
   const applyAll = activeView.contentEl.findByClass("offeragent-sidebar__change-apply");
   const rejectAll = activeView.contentEl.findByClass("offeragent-sidebar__change-reject");
-  assert.equal(applyAll.text, "Apply all");
-  assert.equal(rejectAll.text, "Reject all");
+  assert.equal(applyAll.text, "全部应用");
+  assert.equal(rejectAll.text, "全部拒绝");
   rejectAll.dispatch("click");
   const rejectedBatch = await waitUntil(
     () =>
@@ -1294,7 +2203,11 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   );
   const readActivityCount = activeView.contentEl
     .findAllByClass("offeragent-sidebar__tool-activity")
-    .filter((activity) => activity.children[0]?.text.includes("Read notes/example.md")).length;
+    .filter((activity) =>
+      activity
+        .findAllByClass("offeragent-sidebar__tool-activity-label")
+        .some((label) => label.text.includes("读取 notes/example.md"))
+    ).length;
   const readOnlyComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");
   const readOnlyInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
   readOnlyInput.value = "vault_read notes/example.md 1-2";
@@ -1306,7 +2219,9 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
         .filter(
           (activity) =>
             activity.dataset.status === "completed" &&
-            activity.children[0]?.text.includes("Read notes/example.md"),
+            activity
+              .findAllByClass("offeragent-sidebar__tool-activity-label")
+              .some((label) => label.text.includes("读取 notes/example.md")),
         ).length === readActivityCount + 1,
     "Read Only blocked a permitted Vault read",
   );
@@ -1383,6 +2298,12 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   );
 
   await plugin.onunload();
+  const getRightLeaf = workspace.getRightLeaf;
+  workspace.getRightLeaf = () => undefined;
+  plugin.commands.get("open-offeragent-sidebar").callback();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(notices.at(-1), "OfferAgent 无法打开右侧栏。");
+  workspace.getRightLeaf = getRightLeaf;
   plugin = undefined;
   assert.equal(activeView, undefined);
 });

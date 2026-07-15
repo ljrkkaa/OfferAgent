@@ -16,6 +16,7 @@ The current implementation includes the product shell, durable Conversations, an
 - persisted Run-boundary events with stable identities, client acknowledgements, and reconnect replay;
 - Conversation create/switch/reopen/delete controls plus visible Run status and cancellation.
 - local `vault_list`, `vault_search`, and `vault_read` Function Tools executed only by the Obsidian plugin;
+- plugin-owned `project_list`, `project_search`, and `project_read` Function Tools for bounded read-only Project Evidence from explicitly registered personal projects;
 - on-demand keyword and exact-phrase search with path-first ranking and bounded candidate snippets;
 - a mandatory root `agent.md` contract gate before each Agent Run's first Provider step, with Contract > requested Local Skill > model-default precedence;
 - bounded `skill_read` access to registered `.codex/skills/*/SKILL.md` instructions and only their directly referenced in-skill resources;
@@ -65,6 +66,55 @@ answer streaming and a local Function Tool round trip using the existing local C
 ```powershell
 npm.cmd run test:live-codex
 ```
+
+## Project Registry
+
+First-person project claims are authorized only by links in the Vault's `projects/index.md`. Each
+linked descriptor supplies a stable project ID and an absolute local source root. For example,
+`projects/index.md` can contain:
+
+```markdown
+- [[projects/offeragent|OfferAgent]]
+```
+
+and `projects/offeragent.md` can contain:
+
+```yaml
+---
+project-id: offeragent
+project-root: 'C:\Users\me\source\OfferAgent'
+---
+```
+
+The plugin resolves and contains every read beneath that registered root. Project tool results
+return only project-relative paths and never include the absolute root. Project tools
+exclude VCS internals, dependencies, virtual environments, generated/build/cache output, hidden and
+secret paths, unsupported or binary files, and files larger than 1 MiB. Exact reads are capped at
+200 lines and 32 KiB and participate in the same Evidence Snapshot and stale-read rules as Vault
+evidence. Registration does not grant project writes, Shell, build, test, or command execution.
+
+Project Interview Training remains inside the existing multi-Run Conversation and asks one question
+at a time. A user may select the question; otherwise the Agent selects from the target role, recent
+Interview Experiences, project risks, prior feedback, and retraining needs. Follow-ups cite exact
+Project Evidence, feedback is dimension-based without a numeric total, and unsupported metrics or
+implementation claims remain explicit gaps.
+
+Only a user-confirmed Training Outcome is proposed through the ordinary atomic Vault Change Batch.
+For a registered `offeragent` project, the first confirmed outcome creates or updates this bounded
+profile layout:
+
+```text
+projects/offeragent/
+├── profile.md
+├── index.md
+└── answers/
+    └── cache-invalidation.md
+```
+
+The profile stores stable facts, ownership, evidence gaps, and retraining direction; the index links
+only questions that were actually trained; each answer stores the refined outcome and Project
+Evidence links. Full training transcripts remain in Conversation history, and declining the proposed
+outcome performs no Vault write.
 
 The production plugin package is emitted to `packages/plugin/dist/` and contains:
 

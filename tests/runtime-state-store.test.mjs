@@ -13,6 +13,269 @@ const { CURRENT_SCHEMA_VERSION, RuntimeStateStore } = require(
   path.join(repositoryRoot, "packages", "runtime", "dist", "state-store.js"),
 );
 
+test("Conversation metadata persists and legacy placeholders backfill idempotently", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-conversation-metadata-"));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  let store = await RuntimeStateStore.open(statePath);
+  await store.createConversation({
+    id: "legacy-titled",
+    title: "New Conversation",
+    titleOrigin: "placeholder",
+    modelId: "fake-interview-model",
+    archived: false,
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.beginAgentRun(
+    "legacy-titled",
+    "legacy-title-run",
+    "fake-interview-model",
+    "Please help me explain event loop behavior.",
+  );
+  await store.cancelAgentRun("legacy-title-run");
+  await store.createConversation({
+    id: "legacy-empty",
+    title: "New Conversation",
+    titleOrigin: "placeholder",
+    modelId: "fake-interview-model",
+    archived: false,
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.createConversation({
+    id: "custom-title",
+    title: "Keep me",
+    titleOrigin: "manual",
+    modelId: "fake-interview-model",
+    archived: false,
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.createConversation({
+    id: "manual-exact-title",
+    title: "New Conversation",
+    titleOrigin: "manual",
+    modelId: "fake-interview-model",
+    archived: false,
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.beginAgentRun(
+    "manual-exact-title",
+    "manual-exact-title-run",
+    "fake-interview-model",
+    "This message must not replace a manual title.",
+  );
+  await store.cancelAgentRun("manual-exact-title-run");
+  await store.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  let conversations = await store.listConversations();
+  assert.equal(conversations.find(({ id }) => id === "legacy-titled").title, "Explain event loop behavior");
+  assert.equal(conversations.find(({ id }) => id === "legacy-titled").titleOrigin, "automatic");
+  assert.equal(conversations.find(({ id }) => id === "legacy-empty").title, "New Conversation");
+  assert.equal(conversations.find(({ id }) => id === "custom-title").title, "Keep me");
+  assert.equal(conversations.find(({ id }) => id === "manual-exact-title").title, "New Conversation");
+  assert.equal(conversations.find(({ id }) => id === "manual-exact-title").titleOrigin, "manual");
+  const renamed = await store.updateConversation("legacy-titled", {
+    title: "Manual title",
+    titleOrigin: "manual",
+  });
+  assert.equal(renamed.title, "Manual title");
+  assert.equal(renamed.titleOrigin, "manual");
+  await Promise.all([
+    store.updateConversation("legacy-titled", {
+      title: "Concurrent title",
+      titleOrigin: "manual",
+    }),
+    store.updateConversation("legacy-titled", { archived: true }),
+  ]);
+  const concurrentlyUpdated = (await store.getConversation("legacy-titled")).conversation;
+  assert.equal(concurrentlyUpdated.title, "Concurrent title");
+  assert.equal(concurrentlyUpdated.titleOrigin, "manual");
+  assert.equal(concurrentlyUpdated.archived, true);
+  await store.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  conversations = await store.listConversations();
+  assert.equal(conversations.find(({ id }) => id === "legacy-titled").title, "Concurrent title");
+  assert.equal(conversations.find(({ id }) => id === "legacy-titled").archived, true);
+  await store.updateConversation("legacy-titled", { archived: false });
+  await store.createConversation({
+    id: "deleted-conversation",
+    title: "Delete me",
+    titleOrigin: "manual",
+    modelId: "fake-interview-model",
+    archived: false,
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.deleteConversation("deleted-conversation");
+  await store.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  conversations = await store.listConversations();
+  assert.equal(conversations.find(({ id }) => id === "legacy-titled").archived, false);
+  assert.equal(conversations.some(({ id }) => id === "deleted-conversation"), false);
+  await store.close();
+});
+
+test("message ownership keeps attachment metadata addressable across restart", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-owned-attachment-state-"));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  let store = await RuntimeStateStore.open(statePath);
+  await store.createConversation({
+    id: "attachment-conversation",
+    title: "Attachment history",
+    titleOrigin: "manual",
+    modelId: "fake-interview-model",
+    archived: false,
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.createAttachment({
+    attachmentId: "attachment-owned-a",
+    agentRunId: "attachment-run",
+    contentHash: `sha256:${"a".repeat(64)}`,
+    conversationId: "attachment-conversation",
+    createdAt: "2026-07-15T00:00:00.000Z",
+    fileName: "history.png",
+    mediaType: "image/png",
+    size: 128,
+  });
+  await store.beginAgentRun(
+    "attachment-conversation",
+    "attachment-run",
+    "fake-interview-model",
+    "Remember this image",
+    undefined,
+    undefined,
+    [{
+      attachmentId: "attachment-owned-a",
+      contentHash: `sha256:${"a".repeat(64)}`,
+      fileName: "history.png",
+      mediaType: "image/png",
+      order: 0,
+      size: 128,
+    }],
+  );
+  const snapshot = await store.getConversation("attachment-conversation");
+  const message = snapshot.messages.find(({ role }) => role === "user");
+  assert.ok(message);
+  assert.deepEqual(
+    await store.getAttachmentByMessage(message.id, 0),
+    {
+      attachmentId: "attachment-owned-a",
+      agentRunId: "attachment-run",
+      contentHash: `sha256:${"a".repeat(64)}`,
+      conversationId: "attachment-conversation",
+      createdAt: "2026-07-15T00:00:00.000Z",
+      fileName: "history.png",
+      mediaType: "image/png",
+      messageId: message.id,
+      messageOrder: 0,
+      ownedAt: message ? (await store.getAttachmentByMessage(message.id, 0)).ownedAt : undefined,
+      size: 128,
+    },
+  );
+  await store.close();
+
+  const SQL = await initSqlJs();
+  const legacy = new SQL.Database(await readFile(statePath));
+  legacy.run("DROP INDEX run_attachments_by_message_order");
+  legacy.run("ALTER TABLE run_attachments DROP COLUMN owned_at");
+  legacy.run("ALTER TABLE run_attachments DROP COLUMN message_order");
+  legacy.run("ALTER TABLE run_attachments DROP COLUMN message_id");
+  legacy.run("DELETE FROM schema_migrations WHERE version = 19");
+  legacy.run("UPDATE settings_metadata SET value = '18' WHERE key = 'schema_version'");
+  legacy.run("PRAGMA user_version = 18");
+  await writeFile(statePath, legacy.export());
+  legacy.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  assert.equal((await store.getAttachmentByMessage(message.id, 0)).attachmentId, "attachment-owned-a");
+  assert.equal(CURRENT_SCHEMA_VERSION, 19);
+  await store.close();
+});
+
+test("Conversation deletion invalidates cached responses in legacy NOT NULL State", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-legacy-delete-"));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const request = {
+    type: "conversation.open",
+    eventId: "legacy-delete-open",
+    conversationId: "legacy-delete-conversation",
+  };
+  let store = await RuntimeStateStore.open(statePath);
+  await store.createConversation({
+    id: "legacy-delete-conversation",
+    title: "Delete me",
+    titleOrigin: "manual",
+    modelId: "fake-interview-model",
+    archived: false,
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.storeProtocolResponse(
+    "legacy-delete-open",
+    "conversation.open",
+    "legacy-delete-conversation",
+    "legacy-delete-request",
+    request,
+    { type: "conversation.snapshot" },
+    "legacy-delete-conversation",
+  );
+  await store.close();
+
+  const SQL = await initSqlJs();
+  const legacy = new SQL.Database(await readFile(statePath));
+  legacy.run("DROP INDEX protocol_responses_by_conversation");
+  legacy.run("DROP INDEX protocol_responses_by_owner");
+  legacy.run("ALTER TABLE protocol_responses RENAME TO protocol_responses_legacy");
+  legacy.run(`
+    CREATE TABLE protocol_responses (
+      request_event_id TEXT PRIMARY KEY,
+      request_type TEXT NOT NULL,
+      conversation_id TEXT NOT NULL,
+      agent_run_id TEXT NOT NULL,
+      owner_conversation_id TEXT,
+      request_hash TEXT NOT NULL,
+      response_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    INSERT INTO protocol_responses SELECT * FROM protocol_responses_legacy;
+    DROP TABLE protocol_responses_legacy;
+    CREATE INDEX protocol_responses_by_conversation ON protocol_responses(conversation_id);
+    CREATE INDEX protocol_responses_by_owner ON protocol_responses(owner_conversation_id);
+  `);
+  await writeFile(statePath, legacy.export());
+  legacy.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  await store.deleteConversation("legacy-delete-conversation");
+  await assert.rejects(
+    store.getProtocolResponse(
+      "legacy-delete-open",
+      "conversation.open",
+      "legacy-delete-conversation",
+      "legacy-delete-request",
+      request,
+    ),
+    /invalidated after resource deletion/,
+  );
+  assert.equal(await store.hasConversation("legacy-delete-conversation"), false);
+  await store.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  await assert.rejects(
+    store.getProtocolResponse(
+      "legacy-delete-open",
+      "conversation.open",
+      "legacy-delete-conversation",
+      "legacy-delete-request",
+      request,
+    ),
+    /invalidated after resource deletion/,
+  );
+  await store.close();
+});
+
 test("Runtime State applies explicit schema migrations and rejects newer schemas", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-migrations-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
@@ -31,6 +294,42 @@ test("Runtime State applies explicit schema migrations and rejects newer schemas
     migrated.exec("SELECT value FROM settings_metadata WHERE key = 'schema_version'")[0].values[0][0],
     `${CURRENT_SCHEMA_VERSION}`,
   );
+
+  const upgradeFromV17Path = path.join(temporaryDirectory, "upgrade-from-v17.db");
+  const pre18 = new SQL.Database(migrated.export());
+  pre18.run("DROP INDEX conversations_by_archive_activity");
+  pre18.run("ALTER TABLE conversations DROP COLUMN title_origin");
+  pre18.run("ALTER TABLE conversations DROP COLUMN archived");
+  pre18.run(
+    `INSERT INTO conversations (id, title, model_id, created_at, updated_at)
+     VALUES ('pre-v18-conversation', 'New Conversation', 'fake-interview-model', ?, ?)`,
+    [new Date().toISOString(), new Date().toISOString()],
+  );
+  pre18.run("DELETE FROM schema_migrations WHERE version >= 18");
+  pre18.run("UPDATE settings_metadata SET value = '17' WHERE key = 'schema_version'");
+  pre18.run("PRAGMA user_version = 17");
+  await writeFile(upgradeFromV17Path, pre18.export());
+  pre18.close();
+  const upgradedFromV17 = await RuntimeStateStore.open(upgradeFromV17Path);
+  await upgradedFromV17.close();
+  const verifiedV18 = new SQL.Database(await readFile(upgradeFromV17Path));
+  const conversationColumns = verifiedV18.exec("PRAGMA table_info(conversations)")[0].values
+    .map((column) => column[1]);
+  assert.ok(conversationColumns.includes("title_origin"));
+  assert.ok(conversationColumns.includes("archived"));
+  assert.deepEqual(
+    verifiedV18.exec(
+      "SELECT title_origin, archived FROM conversations WHERE id = 'pre-v18-conversation'",
+    )[0].values,
+    [["placeholder", 0]],
+  );
+  assert.deepEqual(
+    verifiedV18.exec(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'conversations_by_archive_activity'",
+    )[0].values,
+    [["conversations_by_archive_activity"]],
+  );
+  verifiedV18.close();
 
   const upgradePath = path.join(temporaryDirectory, "upgrade-from-v1.db");
   const timestamp = new Date().toISOString();
@@ -411,6 +710,202 @@ test("hosted Web Search capability is persisted per backend and model", async (t
   await store.close();
 });
 
+test("Project Evidence reads become snapshots and later observations invalidate stale versions", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-project-state-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const store = await RuntimeStateStore.open(statePath);
+  await store.beginAgentRun("project-conversation", "project-run", "fake-interview-model", "Explain cache invalidation");
+  const readMarker = "PROJECT-READ-BODY-MUST-ONLY-BE-EVIDENCE";
+  const searchMarker = "PROJECT-SEARCH-SNIPPET-MUST-NOT-PERSIST";
+
+  const request = async (id, name, arguments_, result, sequence) => {
+    await store.requestToolCall("project-run", {
+      type: "tool_call.requested", protocolVersion: 1, eventId: `${id}-requested`,
+      conversationId: "project-conversation", agentRunId: "project-run", sequence,
+      toolCallId: id, tool: { kind: "local", name, arguments: arguments_ },
+    });
+    return store.completeToolCall("project-run", { ok: true, value: result }, {
+      type: "tool_call.completed", protocolVersion: 1, eventId: `${id}-completed`,
+      conversationId: "project-conversation", agentRunId: "project-run", sequence: sequence + 1,
+      toolCallId: id, tool: { kind: "local", name }, status: "completed",
+    });
+  };
+
+  const readResult = {
+    type: "project_read", projectId: "offeragent", path: "src/cache.ts",
+    evidencePath: "project/offeragent/src/cache.ts", lineStart: 1, lineEnd: 1,
+    modifiedVersion: "mtime:1:size:3", contentHash: "sha256:old", content: readMarker, truncated: false,
+  };
+  const searchResult = {
+    type: "project_search", projectId: "offeragent", truncated: false,
+    entries: [{
+      path: "src/cache.ts", modifiedVersion: "mtime:2:size:3", contentHash: "sha256:new",
+      snippets: [{ content: searchMarker, lineStart: 1, lineEnd: 1, truncated: false }],
+    }],
+  };
+  assert.deepEqual(await request("project-read-old", "project_read", {
+    projectId: "offeragent", path: "src/cache.ts",
+  }, readResult, 2), []);
+  assert.deepEqual(await request("project-search-new", "project_search", {
+    projectId: "offeragent", query: "new",
+  }, searchResult, 4), ["project/offeragent/src/cache.ts"]);
+
+  await store.saveRunCheckpoint("project-run", {
+    version: 1,
+    input: [
+      { type: "user_message", text: "Explain cache invalidation" },
+      { type: "local_tool_call", callId: "provider-search", name: "project_search", arguments: { projectId: "offeragent", query: "new" } },
+      { type: "local_tool_result", callId: "provider-search", result: { ok: true, value: searchResult } },
+      { type: "local_tool_call", callId: "provider-read", name: "project_read", arguments: { projectId: "offeragent", path: "src/cache.ts" } },
+      { type: "local_tool_result", callId: "provider-read", result: { ok: true, value: readResult } },
+    ],
+    localSkills: [], canonicalReadPaths: [["provider-read", "project/offeragent/src/cache.ts"]],
+    requiredRereads: [], hostedWebSearchProbeAttempted: false, completedSteps: 2,
+  });
+
+  await store.close();
+  const SQL = await initSqlJs();
+  const database = new SQL.Database(await readFile(statePath));
+  assert.deepEqual(database.exec(
+    "SELECT path, content_hash, content, is_stale FROM evidence_snapshots",
+  )[0].values, [["project/offeragent/src/cache.ts", "sha256:old", readMarker, 1]]);
+  const toolResults = database.exec("SELECT result_json FROM tool_calls ORDER BY created_at")[0].values.flat().join("\n");
+  const checkpoint = database.exec("SELECT checkpoint_json FROM run_checkpoints")[0].values[0][0];
+  assert.equal(toolResults.includes(readMarker), false);
+  assert.equal(toolResults.includes(searchMarker), false);
+  assert.equal(checkpoint.includes(readMarker), false);
+  assert.equal(checkpoint.includes(searchMarker), false);
+  const serialized = Buffer.from(await readFile(statePath)).toString("utf8");
+  assert.equal(serialized.includes(temporaryDirectory), false);
+  assert.equal(serialized.includes(searchMarker), false);
+  database.close();
+});
+
+test("Conversation snapshots expose bounded Evidence sources by owning Agent Run across restart", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-used-sources-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  let store = await RuntimeStateStore.open(statePath);
+
+  const completeTool = async (agentRunId, id, name, arguments_, result, sequence) => {
+    await store.requestToolCall(agentRunId, {
+      type: "tool_call.requested", protocolVersion: 1, eventId: `${id}-requested`,
+      conversationId: "used-sources-conversation", agentRunId, sequence,
+      toolCallId: id, tool: { kind: "local", name, arguments: arguments_ },
+    });
+    await store.completeToolCall(agentRunId, { ok: true, value: result }, {
+      type: "tool_call.completed", protocolVersion: 1, eventId: `${id}-completed`,
+      conversationId: "used-sources-conversation", agentRunId, sequence: sequence + 1,
+      toolCallId: id, tool: { kind: "local", name }, status: "completed",
+    });
+  };
+
+  await store.beginAgentRun(
+    "used-sources-conversation",
+    "used-sources-run-one",
+    "fake-interview-model",
+    "Use exact evidence.",
+  );
+  await completeTool(
+    "used-sources-run-one",
+    "used-sources-search",
+    "vault_search",
+    { query: "candidate-only" },
+    {
+      type: "vault_search", truncated: false,
+      entries: [{
+        path: "notes/search-only.md", modifiedVersion: "mtime:1:size:10",
+        contentHash: "sha256:search-only",
+        snippets: [{ content: "SEARCH-CANDIDATE-MUST-NOT-BECOME-A-SOURCE", lineStart: 1, lineEnd: 1, truncated: false }],
+      }],
+    },
+    2,
+  );
+  const oldContent = `First observed fact ${"old bounded evidence ".repeat(30)}`;
+  await completeTool(
+    "used-sources-run-one",
+    "used-sources-read-old",
+    "vault_read",
+    { path: "notes/fact.md", lineStart: 4, lineEnd: 6 },
+    {
+      type: "vault_read", path: "notes/fact.md", lineStart: 4, lineEnd: 6,
+      modifiedVersion: "mtime:1:size:600", contentHash: "sha256:old-fact",
+      content: oldContent, truncated: false,
+    },
+    4,
+  );
+  await store.completeAgentRun("used-sources-run-one", "First answer");
+
+  await store.beginAgentRun(
+    "used-sources-conversation",
+    "used-sources-run-two",
+    "fake-interview-model",
+    "Check the source again.",
+  );
+  await completeTool(
+    "used-sources-run-two",
+    "used-sources-read-new",
+    "vault_read",
+    { path: "notes/fact.md", lineStart: 8, lineEnd: 9 },
+    {
+      type: "vault_read", path: "notes/fact.md", lineStart: 8, lineEnd: 9,
+      modifiedVersion: "mtime:2:size:20", contentHash: "sha256:new-fact",
+      content: "Fresh fact\nSecond line", truncated: false,
+    },
+    2,
+  );
+  await completeTool(
+    "used-sources-run-two",
+    "used-sources-project-read",
+    "project_read",
+    { projectId: "offeragent", path: "src/cache.ts" },
+    {
+      type: "project_read", projectId: "offeragent", path: "src/cache.ts",
+      evidencePath: "project/offeragent/src/cache.ts", lineStart: 1, lineEnd: 1,
+      modifiedVersion: "mtime:1:size:20", contentHash: "sha256:project-source",
+      content: "PROJECT-EVIDENCE-MUST-NOT-BECOME-A-VAULT-SOURCE", truncated: false,
+    },
+    4,
+  );
+  await store.completeAgentRun("used-sources-run-two", "Second answer");
+  await store.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  const snapshot = await store.getConversation("used-sources-conversation");
+  const answers = snapshot.messages.filter(({ role }) => role === "assistant");
+  assert.deepEqual(
+    answers.map(({ agentRunId, text }) => ({ agentRunId, text })),
+    [
+      { agentRunId: "used-sources-run-one", text: "First answer" },
+      { agentRunId: "used-sources-run-two", text: "Second answer" },
+    ],
+  );
+  assert.deepEqual(answers[0].evidenceSources.map(({ path, lineStart, lineEnd, stale }) => ({
+    path, lineStart, lineEnd, stale,
+  })), [{ path: "notes/fact.md", lineStart: 4, lineEnd: 6, stale: true }]);
+  assert.equal(answers[0].evidenceSources[0].snippet.startsWith("First observed fact"), true);
+  assert.equal(answers[0].evidenceSources[0].snippet.length <= 241, true);
+  assert.notEqual(answers[0].evidenceSources[0].snippet, oldContent);
+  assert.deepEqual(answers[1].evidenceSources, [{
+    path: "notes/fact.md",
+    lineStart: 8,
+    lineEnd: 9,
+    snippet: "Fresh fact Second line",
+    stale: false,
+  }]);
+  assert.equal(
+    JSON.stringify(answers).includes("SEARCH-CANDIDATE-MUST-NOT-BECOME-A-SOURCE"),
+    false,
+  );
+  assert.equal(
+    JSON.stringify(answers).includes("PROJECT-EVIDENCE-MUST-NOT-BECOME-A-VAULT-SOURCE"),
+    false,
+  );
+  assert.equal(snapshot.messages.find(({ role }) => role === "user").evidenceSources, undefined);
+  await store.close();
+});
+
 test("Runtime State rolls back a failed write and serves consistent concurrent reads", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-transactions-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
@@ -507,6 +1002,158 @@ test("Conversation Context trims interleaved messages as complete Agent Run turn
       { type: "user_message", text: "current" },
     ],
   );
+  await store.close();
+});
+
+test("Conversation Context exposes attachment bindings only for retained user turns", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-context-attachments-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const store = await RuntimeStateStore.open(path.join(temporaryDirectory, "state.db"));
+  await store.createConversation({
+    id: "attachment-context",
+    title: "Attachment context",
+    modelId: "model",
+  });
+  const attachmentMetadata = (attachmentId, agentRunId, fileName) => ({
+    attachmentId,
+    agentRunId,
+    contentHash: `sha256:${attachmentId.padEnd(64, "0").slice(0, 64)}`,
+    conversationId: "attachment-context",
+    createdAt: "2026-07-15T00:00:00.000Z",
+    fileName,
+    mediaType: "image/png",
+    order: 0,
+    size: 32,
+  });
+  const oldAttachment = attachmentMetadata("old-attachment", "old-image-run", "old.png");
+  await store.createAttachment(oldAttachment);
+  await store.beginAgentRun(
+    "attachment-context",
+    "old-image-run",
+    "model",
+    "O".repeat(40_000),
+    undefined,
+    undefined,
+    [oldAttachment],
+  );
+  await store.completeAgentRun("old-image-run", "o".repeat(40_000));
+
+  const retainedAttachment = attachmentMetadata(
+    "retained-attachment",
+    "retained-image-run",
+    "retained.png",
+  );
+  await store.createAttachment(retainedAttachment);
+  await store.beginAgentRun(
+    "attachment-context",
+    "retained-image-run",
+    "model",
+    "Retained image question",
+    undefined,
+    undefined,
+    [retainedAttachment],
+  );
+  await store.completeAgentRun("retained-image-run", "Retained image answer");
+  await store.beginAgentRun("attachment-context", "current-image-run", "model", "Use the image above");
+
+  const context = await store.getConversationContextWithAttachments(
+    "attachment-context",
+    "current-image-run",
+  );
+  assert.deepEqual(context.input, [
+    { type: "user_message", text: "Retained image question" },
+    { type: "assistant_message", text: "Retained image answer" },
+    { type: "user_message", text: "Use the image above" },
+  ]);
+  assert.equal(context.attachmentBindings.length, 1);
+  assert.equal(context.attachmentBindings[0].inputIndex, 0);
+  assert.equal(context.attachmentBindings[0].messageId,
+    (await store.getConversation("attachment-context")).messages
+      .find(({ agentRunId }) => agentRunId === "retained-image-run").id);
+  assert.deepEqual(context.attachmentBindings[0].orders, [0]);
+  assert.equal(JSON.stringify(context).includes("retained-attachment"), false);
+  assert.equal(JSON.stringify(context).includes("old-attachment"), false);
+  await store.close();
+});
+
+test("archived Conversations retain attachment usage until deletion releases it", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-archived-usage-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const store = await RuntimeStateStore.open(path.join(temporaryDirectory, "state.db"));
+  await store.createConversation({
+    id: "archived-attachment-conversation",
+    title: "Archived attachment",
+    modelId: "model",
+  });
+  await store.createAttachment({
+    attachmentId: "archived-attachment",
+    agentRunId: "archived-attachment-run",
+    contentHash: `sha256:${"a".repeat(64)}`,
+    conversationId: "archived-attachment-conversation",
+    createdAt: "2026-07-15T00:00:00.000Z",
+    fileName: "archived.png",
+    mediaType: "image/png",
+    size: 123,
+  });
+  await store.updateConversation("archived-attachment-conversation", { archived: true });
+  assert.deepEqual(await store.getAttachmentUsage("archived-attachment-conversation"), {
+    conversationBytes: 123,
+    totalBytes: 123,
+  });
+  await store.deleteConversation("archived-attachment-conversation");
+  assert.deepEqual(await store.getAttachmentUsage("archived-attachment-conversation"), {
+    conversationBytes: 0,
+    totalBytes: 0,
+  });
+  await store.close();
+});
+
+test("Conversation Context bounds retained images by complete turns", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-context-image-budget-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const store = await RuntimeStateStore.open(path.join(temporaryDirectory, "state.db"));
+  await store.createConversation({
+    id: "bounded-image-context",
+    title: "Bounded image context",
+    modelId: "model",
+  });
+  for (const [index, name] of ["older", "newer"].entries()) {
+    const metadata = Array.from({ length: 3 }, (_, order) => ({
+      attachmentId: `${name}-large-attachment-${order}`,
+      agentRunId: `${name}-large-run`,
+      contentHash: `sha256:${String(index * 3 + order).padStart(64, "a").slice(-64)}`,
+      conversationId: "bounded-image-context",
+      createdAt: `2026-07-15T00:00:0${index}.000Z`,
+      fileName: `${name}-${order}.png`,
+      mediaType: "image/png",
+      order,
+      size: 10 * 1024 * 1024,
+    }));
+    for (const attachment of metadata) await store.createAttachment(attachment);
+    await store.beginAgentRun(
+      "bounded-image-context",
+      `${name}-large-run`,
+      "model",
+      `${name} image`,
+      undefined,
+      undefined,
+      metadata,
+    );
+    await store.completeAgentRun(`${name}-large-run`, `${name} answer`);
+  }
+  await store.beginAgentRun("bounded-image-context", "bounded-current-run", "model", "refer back");
+
+  const context = await store.getConversationContextWithAttachments(
+    "bounded-image-context",
+    "bounded-current-run",
+  );
+  assert.deepEqual(context.input, [
+    { type: "user_message", text: "newer image" },
+    { type: "assistant_message", text: "newer answer" },
+    { type: "user_message", text: "refer back" },
+  ]);
+  assert.equal(context.attachmentBindings.length, 1);
+  assert.equal(context.attachmentBindings[0].inputIndex, 0);
   await store.close();
 });
 
@@ -734,6 +1381,10 @@ test("Run Checkpoints resume only Interrupted Runs from the latest committed ste
     requiredRereads: [],
     hostedWebSearchProbeAttempted: false,
     completedSteps: 0,
+    runInput: {
+      text: "resume me",
+      pinnedContext: [{ kind: "document", path: "notes/resume-source.md" }],
+    },
   };
   await store.saveRunCheckpoint("checkpoint-run", first);
   const latest = { ...first, completedSteps: 1 };
@@ -764,10 +1415,22 @@ test("Run Checkpoints do not persist Agent Contract, Local Skill, or pending pro
   await store.beginAgentRun("body-conversation", "body-run", "fake-interview-model", "change it");
   const proposalMarker = "PENDING-PROPOSAL-BODY-MUST-NOT-PERSIST";
   const instructionMarker = "CONTROL-INSTRUCTION-BODY-MUST-NOT-PERSIST";
+  const attachmentIdMarker = "OPAQUE-ATTACHMENT-ID-MUST-NOT-PERSIST";
   await store.saveRunCheckpoint("body-run", {
     version: 1,
     input: [
-      { type: "user_message", text: "change it" },
+      {
+        type: "user_message",
+        text: "change it",
+        attachments: [{
+          attachmentId: attachmentIdMarker,
+          contentHash: `sha256:${"a".repeat(64)}`,
+          fileName: "interview.png",
+          mediaType: "image/png",
+          order: 0,
+          size: 12,
+        }],
+      },
       {
         type: "local_tool_call",
         callId: "skill-provider-call",
@@ -815,11 +1478,199 @@ test("Run Checkpoints do not persist Agent Contract, Local Skill, or pending pro
     requiredRereads: [],
     hostedWebSearchProbeAttempted: false,
     completedSteps: 1,
+    runInput: {
+      text: "change it",
+      attachments: [{
+        attachmentId: attachmentIdMarker,
+        contentHash: `sha256:${"a".repeat(64)}`,
+        fileName: "interview.png",
+        mediaType: "image/png",
+        order: 0,
+        size: 12,
+      }],
+    },
   });
   await store.close();
   const databaseText = (await readFile(statePath)).toString("utf8");
   assert.equal(databaseText.includes(proposalMarker), false);
   assert.equal(databaseText.includes(instructionMarker), false);
+  assert.equal(databaseText.includes(attachmentIdMarker), false);
+});
+
+test("Research Browser rendered content and enumerated links are ephemeral", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-research-ephemeral-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const store = await RuntimeStateStore.open(statePath);
+  const contentMarker = "HOSTILE-RENDERED-PAGE-MUST-NOT-PERSIST";
+  const linkMarker = "https://dynamic.example/private-result-marker";
+  const credentialMarker = "OAUTH-CODE-MUST-NOT-PERSIST";
+  const sessionMarker = "OAUTH-STATE-MUST-NOT-PERSIST";
+  const failureMarker = "ELECTRON-FAILURE-URL-MUST-NOT-PERSIST";
+  await store.beginAgentRun("research-conversation", "research-run", "fake-interview-model", "research it");
+  const callEvent = {
+    type: "tool_call.requested",
+    protocolVersion: 1,
+    eventId: "research-request-event",
+    conversationId: "research-conversation",
+    agentRunId: "research-run",
+    sequence: 2,
+    toolCallId: "research-tool-call",
+    tool: {
+      kind: "local",
+      name: "research_browser",
+      arguments: {
+        action: "open",
+        url: `https://dynamic.example/signin-oidc?code=${credentialMarker}&state=${sessionMarker}&view=interview`,
+      },
+    },
+  };
+  await store.requestToolCall("research-run", callEvent);
+  const result = {
+    ok: true,
+    value: {
+      type: "research_browser",
+      action: "read",
+      status: "ready",
+      title: "Dynamic interview",
+      url: "https://dynamic.example/interview/42",
+      content: `${contentMarker}\n${linkMarker}`,
+      sourceFingerprint: `sha256:${"a".repeat(64)}`,
+      truncated: false,
+      untrusted: true,
+    },
+  };
+  await store.completeToolCall("research-run", result, {
+    type: "tool_call.completed",
+    protocolVersion: 1,
+    eventId: "research-completed-event",
+    conversationId: "research-conversation",
+    agentRunId: "research-run",
+    sequence: 3,
+    toolCallId: "research-tool-call",
+    tool: { kind: "local", name: "research_browser" },
+    status: "completed",
+  });
+  await store.requestToolCall("research-run", {
+    ...callEvent,
+    eventId: "research-enumerate-request-event",
+    sequence: 4,
+    toolCallId: "research-enumerate-tool-call",
+    tool: { kind: "local", name: "research_browser", arguments: { action: "enumerate", limit: 10 } },
+  });
+  await store.completeToolCall("research-run", {
+    ok: true,
+    value: {
+      type: "research_browser",
+      action: "enumerate",
+      status: "ready",
+      title: "Dynamic interview search",
+      url: "https://dynamic.example/search",
+      entries: [{ id: "result-1", title: "Private marker", url: linkMarker }],
+      truncated: false,
+      untrusted: true,
+    },
+  }, {
+    type: "tool_call.completed",
+    protocolVersion: 1,
+    eventId: "research-enumerate-completed-event",
+    conversationId: "research-conversation",
+    agentRunId: "research-run",
+    sequence: 5,
+    toolCallId: "research-enumerate-tool-call",
+    tool: { kind: "local", name: "research_browser" },
+    status: "completed",
+  });
+  await store.requestToolCall("research-run", {
+    ...callEvent,
+    eventId: "research-failed-request-event",
+    sequence: 6,
+    toolCallId: "research-failed-tool-call",
+    tool: {
+      kind: "local",
+      name: "research_browser",
+      arguments: { action: "open", url: `https://dynamic.example/cb?code=${failureMarker}` },
+    },
+  });
+  await store.completeToolCall("research-run", {
+    ok: false,
+    error: {
+      code: "tool_error",
+      message: `ERR_FAILED loading https://dynamic.example/cb?code=${failureMarker}`,
+    },
+  }, {
+    type: "tool_call.completed",
+    protocolVersion: 1,
+    eventId: "research-failed-completed-event",
+    conversationId: "research-conversation",
+    agentRunId: "research-run",
+    sequence: 7,
+    toolCallId: "research-failed-tool-call",
+    tool: { kind: "local", name: "research_browser" },
+    status: "failed",
+    error: {
+      code: "tool_error",
+      message: `ERR_FAILED loading https://dynamic.example/cb?code=${failureMarker}`,
+    },
+  });
+  await store.saveRunCheckpoint("research-run", {
+    version: 1,
+    input: [
+      { type: "user_message", text: "research it" },
+      { type: "local_tool_call", callId: "research-provider-call", name: "research_browser", arguments: { action: "read" } },
+      { type: "local_tool_result", callId: "research-provider-call", result },
+    ],
+    localSkills: [],
+    canonicalReadPaths: [],
+    requiredRereads: [],
+    hostedWebSearchProbeAttempted: false,
+    completedSteps: 1,
+    pendingToolStep: {
+      completedSteps: 1,
+      name: "research_browser",
+      providerCallId: "research-provider-call",
+      toolCallId: "research-tool-call",
+    },
+  });
+  await store.interruptAgentRun("research-run");
+  const resumed = await store.resumeAgentRun("research-conversation", "research-run");
+  assert.deepEqual(resumed.checkpoint.input, [{ type: "user_message", text: "research it" }]);
+  assert.equal(resumed.checkpoint.pendingToolStep, undefined);
+  const stored = await store.getToolCallResult("research-tool-call", "research-run");
+  assert.equal(stored.value.content, undefined);
+  const storedEnumeration = await store.getToolCallResult("research-enumerate-tool-call", "research-run");
+  assert.equal(storedEnumeration.value.entries, undefined);
+  await store.close();
+  const stateBytes = await readFile(statePath);
+  const SQL = await initSqlJs();
+  const database = new SQL.Database(stateBytes);
+  const storedArguments = JSON.parse(database.exec(
+    "SELECT arguments_json FROM tool_calls WHERE id = 'research-tool-call'",
+  )[0].values[0][0]);
+  assert.deepEqual(storedArguments, { action: "open" });
+  const storedRequestEvent = JSON.parse(database.exec(
+    "SELECT payload_json FROM durable_events WHERE id = 'research-request-event'",
+  )[0].values[0][0]);
+  assert.deepEqual(storedRequestEvent.tool.arguments, { action: "open" });
+  const [storedFailureMessage, storedFailureResult] = database.exec(
+    "SELECT error_message, result_json FROM tool_calls WHERE id = 'research-failed-tool-call'",
+  )[0].values[0];
+  assert.equal(storedFailureMessage, "The Research Browser action failed.");
+  assert.equal(
+    JSON.parse(storedFailureResult).error.message,
+    "The Research Browser action failed.",
+  );
+  const storedFailureEvent = database.exec(
+    "SELECT payload_json FROM durable_events WHERE id = 'research-failed-completed-event'",
+  )[0].values[0][0];
+  assert.equal(storedFailureEvent.includes(failureMarker), false);
+  database.close();
+  const databaseText = stateBytes.toString("utf8");
+  assert.equal(databaseText.includes(contentMarker), false);
+  assert.equal(databaseText.includes(linkMarker), false);
+  assert.equal(databaseText.includes(credentialMarker), false);
+  assert.equal(databaseText.includes(sessionMarker), false);
+  assert.equal(databaseText.includes(failureMarker), false);
 });
 
 test("post-response fallback phase survives interruption for direct finalization", async (t) => {

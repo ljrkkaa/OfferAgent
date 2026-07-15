@@ -11,6 +11,37 @@ import {
   MEMORY_SELECTOR_INSTRUCTIONS,
   type MemorySelectionInput,
 } from "./planning-memory";
+import { interviewDeduplicationEvent } from "./fake-interview-deduplication-scenario";
+import { interviewUrlIngestionEvent } from "./fake-interview-url-scenario";
+import { multiImageInterviewEvent } from "./fake-multi-image-scenario";
+import { publicInterviewResearchEvents } from "./fake-public-interview-research-scenario";
+import { dynamicInterviewResearchEvent } from "./fake-dynamic-interview-research-scenario";
+import { interviewAnswerResearchEvent } from "./fake-answer-research-scenario";
+import { interviewKnowledgePlanningEvent } from "./fake-interview-knowledge-planning-scenario";
+import { projectEvidenceQuestionEvent } from "./fake-project-evidence-scenario";
+import { projectInterviewTrainingEvent } from "./fake-project-interview-training-scenario";
+import { toolResultFor, toolResultForAfter } from "./fake-provider-conversation";
+
+export const FAKE_SCENARIOS = [
+  "interview-answer-research",
+  "interview-knowledge-planning",
+  "project-question-answer",
+  "project-interview-training",
+  "dynamic-interview-research",
+  "interview-deduplication",
+  "multi-image-interview-ingestion",
+  "public-interview-research",
+  "text-interview-ingestion",
+  "url-interview-ingestion",
+  "single-image",
+  "vision-unavailable",
+  "pinned-context",
+] as const;
+export type FakeScenario = (typeof FAKE_SCENARIOS)[number];
+
+export function isFakeScenario(value: string): value is FakeScenario {
+  return (FAKE_SCENARIOS as readonly string[]).includes(value);
+}
 
 function findLatest<T extends ModelConversationItem>(
   input: ModelConversationItem[],
@@ -43,7 +74,12 @@ const MODEL: ModelDescriptor = {
 
 export class FakeModelProvider implements ModelProvider {
   readonly backendId = "fake";
+  readonly #scenario?: FakeScenario;
   #toolCallSequence = 0;
+
+  constructor(options: { scenario?: FakeScenario } = {}) {
+    this.#scenario = options.scenario;
+  }
 
   async listModels(): Promise<ModelDescriptor[]> {
     return [MODEL];
@@ -59,11 +95,138 @@ export class FakeModelProvider implements ModelProvider {
         `The selected model '${request.model}' is not available.`,
       );
     }
+    if (this.#scenario === "vision-unavailable" && request.imageInputs?.length) {
+      throw new ModelProviderError(
+        "unsupported_capability",
+        "input_image is unsupported",
+        { capability: "vision" },
+      );
+    }
+    if (request.instructions === "This is a minimal Vision Capability probe. Reply only OK.") {
+      yield { type: "output_text.delta", delta: "OK" };
+      return;
+    }
+    if (request.instructions === "This is a minimal capability probe. Reply only OK and do not search.") {
+      yield { type: "output_text.delta", delta: "OK" };
+      return;
+    }
     const userInput = findLatest(
       request.input,
       (item): item is Extract<ModelConversationItem, { type: "user_message" }> =>
         item.type === "user_message",
     )?.text ?? "";
+    if (userInput.trim() === "stop_and_revise_demo") {
+      yield { type: "output_text.delta", delta: "Partial stopped answer." };
+      await new Promise<never>((_resolve, reject) => {
+        const stop = () => reject(
+          new ModelProviderError("transport_error", "The Agent Run was stopped."),
+        );
+        if (request.signal.aborted) stop();
+        else request.signal.addEventListener("abort", stop, { once: true });
+      });
+    }
+    if (this.#scenario === "single-image" && request.imageInputs?.length) {
+      const boundImages = request.input.flatMap((item) =>
+        item.type === "user_message" ? item.attachments ?? [] : []
+      );
+      if (
+        request.imageInputs.length !== boundImages.length ||
+        request.imageInputs.some((image) =>
+          !boundImages.some(
+            ({ attachmentId, order }) =>
+              attachmentId === image.attachmentId && order === image.order,
+          ) || !image.dataUrl.startsWith(`data:${image.mediaType};base64,`)
+        )
+      ) {
+        throw new ModelProviderError("provider_error", "The ordered image input was invalid.");
+      }
+      const contract = toolResultFor(request.input, "agent_contract_read");
+      if (!contract) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-image-contract-${this.#toolCallSequence}`,
+          name: "agent_contract_read",
+          arguments: {},
+        };
+        return;
+      }
+      const imageControlInput = findLatest(
+        request.input,
+        (item): item is Extract<ModelConversationItem, { type: "user_message" }> =>
+          item.type === "user_message" &&
+          item.text !== "Complete the pending user request with a visible final response. Do not return an empty answer.",
+      )?.text ?? userInput;
+      if (/image_empty_interrupt/u.test(imageControlInput)) {
+        const recoveryRequested = request.input.some(
+          (item) =>
+            item.type === "user_message" &&
+            item.text === "Complete the pending user request with a visible final response. Do not return an empty answer.",
+        );
+        if (!recoveryRequested) return;
+      }
+      if (/image_(?:empty_)?interrupt/u.test(imageControlInput)) {
+        const read = toolResultFor(request.input, "vault_read");
+        if (!read) {
+          this.#toolCallSequence += 1;
+          yield {
+            type: "local_tool_call",
+            callId: `fake-image-read-${this.#toolCallSequence}`,
+            name: "vault_read",
+            arguments: { path: "notes/image-context.md" },
+          };
+          return;
+        }
+      }
+      yield {
+        type: "output_text.delta",
+        delta: "The image shows an interview question about distributed cache consistency.",
+      };
+      return;
+    }
+    if (this.#scenario === "pinned-context") {
+      if (
+        !request.instructions.includes("Pinned Context for this Run (preferred sources, not a whitelist)") ||
+        !request.instructions.includes("notes/preferred.md:4-8") ||
+        !request.instructions.includes("notes/unread-preferred.md") ||
+        !request.instructions.includes("use vault_read before relying") ||
+        !request.tools.some((tool) => tool.name === "vault_read") ||
+        !request.tools.some((tool) => tool.name === "vault_search")
+      ) {
+        throw new ModelProviderError("provider_error", "Pinned Context instructions were invalid.");
+      }
+      const read = toolResultFor(request.input, "vault_read");
+      if (!read) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-pinned-read-${this.#toolCallSequence}`,
+          name: "vault_read",
+          arguments: {
+            path: "notes/preferred.md",
+            lineStart: 4,
+            lineEnd: 8,
+          },
+        };
+        return;
+      }
+      const search = toolResultFor(request.input, "vault_search");
+      if (!search) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-pinned-search-${this.#toolCallSequence}`,
+          name: "vault_search",
+          arguments: { query: "counterexample" },
+        };
+        return;
+      }
+      yield {
+        type: "output_text.delta",
+        delta: "Used the preferred source and found a counterexample elsewhere in the Vault.",
+      };
+      return;
+    }
     if (request.instructions === MEMORY_CAPTURE_INSTRUCTIONS) {
       let durable = false;
       try {
@@ -116,6 +279,275 @@ export class FakeModelProvider implements ModelProvider {
         selected = [];
       }
       yield { type: "output_text.delta", delta: JSON.stringify(selected) };
+      return;
+    }
+    if (this.#scenario === "interview-deduplication") {
+      yield interviewDeduplicationEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
+      return;
+    }
+    if (this.#scenario === "interview-answer-research") {
+      yield interviewAnswerResearchEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
+      return;
+    }
+    if (this.#scenario === "interview-knowledge-planning") {
+      const events = interviewKnowledgePlanningEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
+      for (const event of Array.isArray(events) ? events : [events]) yield event;
+      return;
+    }
+    if (this.#scenario === "project-question-answer") {
+      yield projectEvidenceQuestionEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
+      return;
+    }
+    if (this.#scenario === "project-interview-training") {
+      yield projectInterviewTrainingEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
+      return;
+    }
+    if (this.#scenario === "dynamic-interview-research") {
+      yield dynamicInterviewResearchEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
+      return;
+    }
+    if (this.#scenario === "multi-image-interview-ingestion") {
+      yield multiImageInterviewEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
+      return;
+    }
+    if (this.#scenario === "url-interview-ingestion") {
+      yield interviewUrlIngestionEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
+      return;
+    }
+    if (this.#scenario === "public-interview-research") {
+      for (const event of publicInterviewResearchEvents(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      })) {
+        yield event;
+      }
+      return;
+    }
+    if (this.#scenario === "text-interview-ingestion") {
+      const catalog = toolResultFor(request.input, "interview_catalog");
+      if (!catalog) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-interview-catalog-${this.#toolCallSequence}`,
+          name: "interview_catalog",
+          arguments: {
+            query: "后端工程师 Node.js 事件循环 消息处理幂等",
+            limit: 10,
+          },
+        };
+        return;
+      }
+      if (!catalog.result.ok || catalog.result.value.type !== "interview_catalog") {
+        yield {
+          type: "output_text.delta",
+          delta: catalog.result.ok
+            ? "The Interview Catalog returned an invalid result."
+            : `Interview Catalog failed: ${catalog.result.error.message}`,
+        };
+        return;
+      }
+      const candidatePaths = [
+        catalog.result.value.experienceCandidates[0]?.path,
+        catalog.result.value.questionCandidates[0]?.path,
+      ].filter((candidate): candidate is string => typeof candidate === "string");
+      for (const candidatePath of candidatePaths) {
+        const candidateRead = toolResultFor(
+          request.input,
+          "vault_read",
+          (call) => (call.arguments as { path?: unknown }).path === candidatePath,
+        );
+        if (!candidateRead) {
+          this.#toolCallSequence += 1;
+          yield {
+            type: "local_tool_call",
+            callId: `fake-interview-candidate-${this.#toolCallSequence}`,
+            name: "vault_read",
+            arguments: { path: candidatePath },
+          };
+          return;
+        }
+        if (!candidateRead.result.ok || candidateRead.result.value.type !== "vault_read") {
+          yield {
+            type: "output_text.delta",
+            delta: candidateRead.result.ok
+              ? "Candidate evidence returned an invalid result."
+              : `Candidate evidence failed: ${candidateRead.result.error.message}`,
+          };
+          return;
+        }
+      }
+      const experienceIndexDescriptor = catalog.result.value.indexes.find(
+        ({ kind }) => kind === "experience",
+      );
+      const questionIndexDescriptor = catalog.result.value.indexes.find(
+        ({ kind }) => kind === "question",
+      );
+      if (!experienceIndexDescriptor || !questionIndexDescriptor) {
+        yield { type: "output_text.delta", delta: "The Interview Catalog omitted an index." };
+        return;
+      }
+      const applied = toolResultFor(request.input, "vault_propose_changes");
+      const experienceIndex = experienceIndexDescriptor.exists && !applied
+        ? toolResultFor(
+            request.input,
+            "vault_read",
+            (call) => (call.arguments as { path?: unknown }).path === "experiences/index.md",
+          )
+        : undefined;
+      if (experienceIndexDescriptor.exists && !applied && !experienceIndex) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-experience-index-${this.#toolCallSequence}`,
+          name: "vault_read",
+          arguments: { path: "experiences/index.md" },
+        };
+        return;
+      }
+      const questionIndex = questionIndexDescriptor.exists && !applied
+        ? toolResultFor(
+            request.input,
+            "vault_read",
+            (call) => (call.arguments as { path?: unknown }).path === "interview/index.md",
+          )
+        : undefined;
+      if (questionIndexDescriptor.exists && !applied && !questionIndex) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-question-index-${this.#toolCallSequence}`,
+          name: "vault_read",
+          arguments: { path: "interview/index.md" },
+        };
+        return;
+      }
+      if (!applied) {
+        const experienceIndexValue = experienceIndex?.result.ok &&
+          experienceIndex.result.value.type === "vault_read"
+          ? experienceIndex.result.value
+          : undefined;
+        const questionIndexValue = questionIndex?.result.ok &&
+          questionIndex.result.value.type === "vault_read"
+          ? questionIndex.result.value
+          : undefined;
+        if (
+          (experienceIndexDescriptor.exists && !experienceIndexValue) ||
+          (questionIndexDescriptor.exists && !questionIndexValue)
+        ) {
+          yield { type: "output_text.delta", delta: "The interview indexes could not be read." };
+          return;
+        }
+        this.#toolCallSequence += 1;
+        const batchId = `text-interview-batch-${this.#toolCallSequence}`;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-interview-proposal-${this.#toolCallSequence}`,
+          name: "vault_propose_changes",
+          arguments: {
+            batchId,
+            idempotencyKey: batchId,
+            task: "Ingest one backend Interview Experience and its Interview Questions",
+            actions: [
+              {
+                actionId: "create-backend-experience",
+                idempotencyKey: "create-backend-experience",
+                operation: "create",
+                path: "experiences/backend-engineer-interview.md",
+                expectedVersion: "missing",
+                content: "---\ntitle: Backend engineer interview\ntype: interview-experience\nsource-type: user-text\nposition: Backend Engineer\n---\n\n# Backend engineer interview\n\n## Summary\n\nA backend candidate discussed Node.js scheduling and reliable message consumption.\n\n## Questions\n\n- [[interview/nodejs-event-loop]]\n- [[interview/message-processing-idempotency]]\n",
+              },
+              {
+                actionId: "create-event-loop-question",
+                idempotencyKey: "create-event-loop-question",
+                operation: "create",
+                path: "interview/nodejs-event-loop.md",
+                expectedVersion: "missing",
+                content: "---\ntitle: Explain the Node.js event loop\ntype: interview-question\nanswer-state: needs-research\nfrequency: 1\n---\n\n# Explain the Node.js event loop\n\nSeen in [[experiences/backend-engineer-interview]].\n",
+              },
+              {
+                actionId: "create-message-idempotency-question",
+                idempotencyKey: "create-message-idempotency-question",
+                operation: "create",
+                path: "interview/message-processing-idempotency.md",
+                expectedVersion: "missing",
+                content: "---\ntitle: Guarantee idempotent message processing\ntype: interview-question\nanswer-state: needs-research\nfrequency: 1\n---\n\n# Guarantee idempotent message processing\n\nSeen in [[experiences/backend-engineer-interview]].\n",
+              },
+              experienceIndexDescriptor.exists
+                ? {
+                    actionId: "update-experience-index",
+                    idempotencyKey: "update-experience-index",
+                    operation: "exact_replace",
+                    path: "experiences/index.md",
+                    expectedVersion: experienceIndexValue!.modifiedVersion,
+                    expectedContent: experienceIndexValue!.content,
+                    replacement: `${experienceIndexValue!.content}\n\n- [[backend-engineer-interview]]\n`,
+                  }
+                : {
+                    actionId: "create-experience-index",
+                    idempotencyKey: "create-experience-index",
+                    operation: "create",
+                    path: "experiences/index.md",
+                    expectedVersion: "missing",
+                    content: "# Interview Experiences\n\n- [[backend-engineer-interview]]\n",
+                  },
+              questionIndexDescriptor.exists
+                ? {
+                    actionId: "update-question-index",
+                    idempotencyKey: "update-question-index",
+                    operation: "exact_replace",
+                    path: "interview/index.md",
+                    expectedVersion: questionIndexValue!.modifiedVersion,
+                    expectedContent: questionIndexValue!.content,
+                    replacement: `${questionIndexValue!.content}\n\n- [[nodejs-event-loop]]\n- [[message-processing-idempotency]]\n`,
+                  }
+                : {
+                    actionId: "create-question-index",
+                    idempotencyKey: "create-question-index",
+                    operation: "create",
+                    path: "interview/index.md",
+                    expectedVersion: "missing",
+                    content: "# Interview Questions\n\n- [[nodejs-event-loop]]\n- [[message-processing-idempotency]]\n",
+                  },
+            ],
+          },
+        };
+        return;
+      }
+      if (applied.result.ok && applied.result.value.type === "vault_propose_changes") {
+        yield {
+          type: "output_text.delta",
+          delta: applied.result.value.decision === "applied"
+            ? `5 Vault changes applied with ${applied.result.value.checkpointRef}.`
+            : "The interview ingestion batch was rejected.",
+        };
+        return;
+      }
+      yield { type: "output_text.delta", delta: "The interview ingestion batch failed." };
       return;
     }
     if (userInput.trim() === "planning_memory_acceptance") {
@@ -792,6 +1224,43 @@ export class FakeModelProvider implements ModelProvider {
       yield { type: "output_text.delta", delta: "Final answer without a citation" };
       return;
     }
+    const projectStaleFlow = /^project_stale_evidence_flow\s+([a-z0-9][a-z0-9_-]{0,63})\s+([^\s]+)$/i.exec(userInput.trim());
+    if (projectStaleFlow) {
+      const calls = request.input.filter((item) => item.type === "local_tool_call");
+      const results = request.input.filter((item) => item.type === "local_tool_result");
+      const successfulRead = results.find(
+        (item) => item.result.ok && item.result.value.type === "project_read",
+      );
+      const hasSearchCall = calls.some((item) => item.name === "project_search");
+      if (!successfulRead) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-project-stale-read-${this.#toolCallSequence}`,
+          name: "project_read",
+          arguments: {
+            projectId: projectStaleFlow[1], path: projectStaleFlow[2], lineStart: 1, lineEnd: 1,
+          },
+        };
+        return;
+      }
+      if (!hasSearchCall) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-project-stale-search-${this.#toolCallSequence}`,
+          name: "project_search",
+          arguments: { projectId: projectStaleFlow[1], query: "content", limit: 5 },
+        };
+        return;
+      }
+      const contents = results.flatMap((item) =>
+        item.result.ok && item.result.value.type === "project_read"
+          ? [item.result.value.content]
+          : []);
+      yield { type: "output_text.delta", delta: `OfferAgent received fresh Project Evidence: ${JSON.stringify(contents)}` };
+      return;
+    }
     const staleFlow = /^stale_evidence_flow\s+([^\s]+)$/i.exec(userInput.trim());
     if (staleFlow) {
       const calls = request.input.filter((item) => item.type === "local_tool_call");
@@ -940,46 +1409,6 @@ function replaceMemoryIndexEntry(
     return `- [${name}](${relativePath}) - ${description}`;
   });
   return replaced ? lines.join("\n") : undefined;
-}
-
-function toolResultFor(
-  input: ModelConversationItem[],
-  name: LocalToolName,
-  predicate: (call: Extract<ModelConversationItem, { type: "local_tool_call" }>) => boolean = () => true,
-): Extract<ModelConversationItem, { type: "local_tool_result" }> | undefined {
-  for (let index = input.length - 1; index >= 0; index -= 1) {
-    const result = input[index];
-    if (result.type !== "local_tool_result") continue;
-    const call = input.find(
-      (candidate): candidate is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
-        candidate.type === "local_tool_call" &&
-        candidate.callId === result.callId &&
-        candidate.name === name,
-    );
-    if (call && predicate(call)) return result;
-  }
-  return undefined;
-}
-
-function toolResultForAfter(
-  input: ModelConversationItem[],
-  name: LocalToolName,
-  afterIndex: number,
-  predicate: (call: Extract<ModelConversationItem, { type: "local_tool_call" }>) => boolean,
-): Extract<ModelConversationItem, { type: "local_tool_result" }> | undefined {
-  for (let index = input.length - 1; index > afterIndex; index -= 1) {
-    const result = input[index];
-    if (result.type !== "local_tool_result") continue;
-    const call = input.find(
-      (candidate, callIndex): candidate is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
-        callIndex > afterIndex &&
-        candidate.type === "local_tool_call" &&
-        candidate.callId === result.callId &&
-        candidate.name === name,
-    );
-    if (call && predicate(call)) return result;
-  }
-  return undefined;
 }
 
 function dailyPlanAction(

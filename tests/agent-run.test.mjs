@@ -486,6 +486,71 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
           );
           return;
         }
+        if (responseMode === "interview-catalog") {
+          const hasCatalogOutput = requestPayload.input.some(
+            (item) => item.type === "function_call_output" && item.call_id === "codex-interview-catalog-call",
+          );
+          const hasProposalOutput = requestPayload.input.some(
+            (item) => item.type === "function_call_output" && item.call_id === "codex-large-proposal-call",
+          );
+          const hasIndexReadOutput = requestPayload.input.some(
+            (item) => item.type === "function_call_output" && item.call_id === "codex-index-read-call",
+          );
+          response.end(
+            (hasProposalOutput
+              ? 'data: {"type":"response.output_text.delta","delta":"Catalog inspected"}\r\n\r\n'
+              : hasIndexReadOutput
+                ? `data: ${JSON.stringify({
+                    type: "response.output_item.done",
+                    output_index: 0,
+                    item: {
+                      type: "function_call",
+                      id: "item-large-proposal",
+                      call_id: "codex-large-proposal-call",
+                      name: "vault_propose_changes",
+                      status: "completed",
+                      arguments: JSON.stringify({
+                        batchId: "large-interview-batch",
+                        idempotencyKey: "large-interview-batch",
+                        task: "Create an atomic multi-note interview batch",
+                        actions: [{
+                          operation: "exact_replace",
+                          path: "experiences/index.md",
+                          oldText: "old",
+                          newText: "x".repeat(9_000),
+                        }],
+                      }),
+                    },
+                  })}\r\n\r\n`
+                : hasCatalogOutput
+                  ? `data: ${JSON.stringify({
+                      type: "response.output_item.done",
+                      output_index: 0,
+                      item: {
+                        type: "function_call",
+                        id: "item-index-read",
+                        call_id: "codex-index-read-call",
+                        name: "vault_read",
+                        status: "completed",
+                        arguments: JSON.stringify({ path: "experiences/index.md" }),
+                      },
+                    })}\r\n\r\n`
+              : `data: ${JSON.stringify({
+                  type: "response.output_item.done",
+                  output_index: 0,
+                  item: {
+                    type: "function_call",
+                    id: "item-interview-catalog",
+                    call_id: "codex-interview-catalog-call",
+                    name: "interview_catalog",
+                    status: "completed",
+                    arguments: JSON.stringify({ sourceFingerprint: "sha256:fixture" }),
+                  },
+                })}\r\n\r\n`) +
+            'data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\ndata: [DONE]\r\n\r\n',
+          );
+          return;
+        }
         if (responseMode === "empty-then-message") {
           emptyResponseCount += 1;
           response.end(
@@ -598,7 +663,12 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
   assert.match(responseRequest.instructions, /non-empty visible final response/i);
   assert.deepEqual(responseRequest.tools.filter((tool) => tool.type === "function").map((tool) => tool.name), [
     "daily_note_context",
+    "interview_catalog",
     "web_read",
+    "research_browser",
+    "project_list",
+    "project_search",
+    "project_read",
     "vault_list",
     "vault_search",
     "skill_read",
@@ -622,6 +692,99 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
     input: { role: "user", text: "Recover the completed message item." },
   }));
   assert.equal((await messageOnlyRun).at(-1).output.text, "Recovered full response");
+  responseMode = "complete";
+
+  responseMode = "interview-catalog";
+  const interviewCatalogStart = upstreamRequests.length;
+  const interviewCatalogRun = collectRunEvents(socket, "agent-run-codex-interview-catalog");
+  function respondToInterviewCatalog(data) {
+    const event = JSON.parse(data.toString("utf8"));
+    if (
+      event.agentRunId !== "agent-run-codex-interview-catalog" ||
+      event.type !== "tool_call.requested" ||
+      !["interview_catalog", "vault_propose_changes", "vault_read"].includes(event.tool.name)
+    ) return;
+    socket.send(JSON.stringify({
+      type: "tool_result",
+      protocolVersion: 1,
+      eventId: `interview-catalog-result-${event.toolCallId}`,
+      conversationId: event.conversationId,
+      agentRunId: event.agentRunId,
+      sequence: event.sequence,
+      toolCallId: event.toolCallId,
+      result: event.tool.name === "vault_propose_changes" ? {
+        ok: true,
+        value: {
+          type: "vault_propose_changes",
+          batchId: "large-interview-batch",
+          decision: "applied",
+          checkpointRef: "refs/offeragent/checkpoints/large-interview-batch",
+          targets: [{
+            beforeHash: "sha256:old-index",
+            afterHash: "sha256:new-index",
+            path: "experiences/index.md",
+          }],
+        },
+      } : event.tool.name === "vault_read" ? {
+        ok: true,
+        value: {
+          type: "vault_read",
+          path: "experiences/index.md",
+          lineStart: 1,
+          lineEnd: 1,
+          modifiedVersion: "mtime:1:size:3",
+          contentHash: "sha256:old-index",
+          content: "old",
+          truncated: false,
+        },
+      } : {
+        ok: true,
+        value: {
+          type: "interview_catalog",
+          experienceCandidates: [],
+          questionCandidates: [],
+          indexes: [
+            { kind: "experience", path: "experiences/index.md", exists: false, modifiedVersion: "missing" },
+            { kind: "question", path: "interview/index.md", exists: false, modifiedVersion: "missing" },
+          ],
+          truncated: false,
+        },
+      },
+    }));
+  }
+  socket.on("message", respondToInterviewCatalog);
+  socket.send(JSON.stringify({
+    type: "agent_run.start",
+    protocolVersion: 1,
+    eventId: "client-codex-interview-catalog",
+    conversationId: "conversation-codex-interview-catalog",
+    agentRunId: "agent-run-codex-interview-catalog",
+    sequence: 0,
+    model: "gpt-5.4",
+    input: { role: "user", text: "Inspect the Interview Catalog." },
+  }));
+  const interviewCatalogEvents = await interviewCatalogRun;
+  assert.equal(
+    interviewCatalogEvents.find(
+      (event) => event.type === "tool_call.requested" && event.tool.name === "interview_catalog",
+    )?.tool.arguments.sourceFingerprint,
+    "sha256:fixture",
+  );
+  assert.equal(
+    interviewCatalogEvents.find(
+      (event) => event.type === "tool_call.requested" && event.tool.name === "vault_propose_changes",
+    )?.tool.arguments.actions[0].newText.length,
+    9_000,
+  );
+  assert.equal(interviewCatalogEvents.at(-1).output.text, "Catalog inspected");
+  const interviewCatalogRequests = mainResponseRequestsSince(interviewCatalogStart);
+  assert.equal(
+    JSON.parse(interviewCatalogRequests.at(-1).body).input.some(
+      (item) => item.type === "function_call" && item.id === "item-index-read",
+    ),
+    false,
+  );
+  socket.off("message", respondToInterviewCatalog);
   responseMode = "complete";
 
   const emptyResponseStart = upstreamRequests.length;
@@ -1081,7 +1244,12 @@ test("the Codex Provider uses the existing OAuth cache without exposing auth mat
       .map((tool) => tool.name),
     [
       "daily_note_context",
+      "interview_catalog",
       "web_read",
+      "research_browser",
+      "project_list",
+      "project_search",
+      "project_read",
       "vault_list",
       "vault_search",
       "skill_read",

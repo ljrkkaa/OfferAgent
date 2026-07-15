@@ -1,4 +1,5 @@
 import { lookup as dnsLookup } from "node:dns/promises";
+import { createHash } from "node:crypto";
 import { isIP, type LookupFunction } from "node:net";
 import type { LocalToolResultPayload, VaultToolErrorCode } from "@offeragent/protocol";
 import { Agent, fetch as undiciFetch } from "undici";
@@ -389,6 +390,7 @@ export class WebReader {
           finalUrl: current.href,
           contentType,
           ...(extracted.title ? { sourceTitle: truncateUtf8(extracted.title, 512).content } : {}),
+          sourceFingerprint: `sha256:${createHash("sha256").update(extracted.content, "utf8").digest("hex")}`,
           content: bounded.content,
           truncated: bounded.truncated,
         },

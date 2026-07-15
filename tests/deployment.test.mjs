@@ -131,12 +131,47 @@ test("deployment preserves Runtime State, plugin data, branch, index, and unrela
   const contract = await readFile(path.join(root, "agent.md"), "utf8");
   assert.match(contract, /OfferAgent General Contract/);
   assert.match(contract, /Daily Study Plan/);
+  assert.match(contract, /explicit company, position, interview date, and current study goal take priority/);
+  assert.match(contract, /without a numeric score or fixed schedule/);
+  assert.match(contract, /Registered-project relevance and resume deep-dive risk/);
+  assert.match(contract, /reduce low-value repetition/);
+  assert.match(contract, /Planning never advances Answer State or Learning State/);
   assert.match(contract, /普通笔记写作/);
   assert.match(contract, /Study-State Synchronization 是独立/);
   assert.match(contract, /vault_read/);
+  assert.match(contract, /interview_catalog/);
+  assert.match(contract, /Interview Submission/);
+  assert.match(contract, /Source Fingerprint/);
+  assert.match(contract, /duplicate Interview Experience/);
+  assert.match(contract, /recurring Interview Question/);
+  assert.match(contract, /user-supplied Interview Submission URL/);
+  assert.match(contract, /final canonical URL and bounded Source Fingerprint/);
+  assert.match(contract, /page is inaccessible or does not contain enough interview evidence/);
+  assert.match(contract, /needs-research/);
+  assert.match(contract, /Interview Question Answer Research/);
+  assert.match(contract, /needs-research -> draft -> verified/);
+  assert.match(contract, /Never perform background Answer research/);
+  assert.match(contract, /Answer State is independent from Learning State/);
+  assert.match(contract, /Missing, unreadable, insufficient, stale, or conflicting evidence leaves Answer State unchanged/);
+  assert.match(contract, /原始.*(?:全文|文本).*不.*(?:复制|写入).*Vault/);
   assert.match(contract, /vault_propose_changes/);
   assert.match(contract, /Trusted Vault/);
   assert.match(contract, /explicit Resume/i);
+  assert.match(contract, /Run Attachments and Vision/);
+  assert.match(contract, /local evidence for its owning Agent Run/);
+  assert.match(contract, /Do not invoke OCR/);
+  assert.match(contract, /sent image belongs to its Conversation message and remains available across restart/);
+  assert.match(contract, /Deleting a Conversation removes only that Conversation's attachment bytes/);
+  assert.match(contract, /terminal Runs do not discard images from sent message history/);
+  assert.match(contract, /later text-only Run must remain usable/);
+  assert.match(contract, /Project Evidence and Project Interview Training/);
+  assert.match(contract, /project_list.*project_search.*project_read/);
+  assert.match(contract, /每次只提出一道问题并等待用户回答/);
+  assert.match(contract, /不得计算总分、排名/);
+  assert.match(contract, /Evidence.*Coaching suggestion/);
+  assert.match(contract, /用户明确确认前不得调用 `vault_propose_changes`/);
+  assert.match(contract, /projects\/\{project-id\}\/answers\/\{question-slug\}\.md/);
+  assert.match(contract, /完整逐轮回答.*Conversation history/);
   const skill = await readFile(
     path.join(root, ".codex", "skills", "obsidian-cli", "SKILL.md"),
     "utf8",

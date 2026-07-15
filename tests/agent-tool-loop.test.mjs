@@ -9,103 +9,10 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import initSqlJs from "sql.js/dist/sql-asm.js";
 import WebSocket from "ws";
+import { handshake, runWithToolPeer, stopRuntime } from "./runtime-tool-peer.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const runtimeEntry = path.join(repositoryRoot, "packages", "runtime", "dist", "cli.js");
-
-function handshake(stream) {
-  return new Promise((resolve, reject) => {
-    let buffer = "";
-    const timeout = setTimeout(() => reject(new Error("Runtime handshake timed out")), 5_000);
-    stream.on("data", function onData(chunk) {
-      buffer += chunk.toString("utf8");
-      const newline = buffer.indexOf("\n");
-      if (newline < 0) return;
-      clearTimeout(timeout);
-      stream.off("data", onData);
-      resolve(JSON.parse(buffer.slice(0, newline)));
-    });
-  });
-}
-
-async function stopRuntime(runtime, port, token) {
-  const exited = once(runtime, "exit");
-  await new Promise((resolve, reject) => {
-    const outgoing = request(
-      {
-        host: "127.0.0.1",
-        port,
-        path: "/shutdown",
-        method: "POST",
-        headers: { authorization: `Bearer ${token}` },
-      },
-      (response) => {
-        response.resume();
-        response.on("end", resolve);
-      },
-    );
-    outgoing.once("error", reject);
-    outgoing.end();
-  });
-  await exited;
-}
-
-function runWithToolPeer(
-  socket,
-  requestPayload,
-  resultForCall,
-  memoryTopics = [],
-  contractContent = "# Test Agent Contract",
-  memoryTruncated = false,
-) {
-  return new Promise((resolve, reject) => {
-    const events = [];
-    const timeout = setTimeout(
-      () => reject(new Error(`Agent tool loop timed out: ${JSON.stringify(events.slice(-8))}`)),
-      20_000,
-    );
-    socket.on("message", function onMessage(data) {
-      const event = JSON.parse(data.toString("utf8"));
-      if (event.agentRunId !== requestPayload.agentRunId) return;
-      events.push(event);
-      if (event.type === "tool_call.requested" && event.tool.kind === "local") {
-        const result =
-          event.tool.name === "agent_contract_read"
-            ? {
-                ok: true,
-                value: {
-                  type: "agent_contract_read",
-                  path: "agent.md",
-                  modifiedVersion: "mtime:1:size:24",
-                  contentHash: "sha256:test-contract",
-                  content: contractContent,
-                },
-              }
-            : event.tool.name === "planning_memory_list"
-              ? { ok: true, value: { type: "planning_memory_list", topics: memoryTopics, truncated: memoryTruncated } }
-              : resultForCall(event);
-        socket.send(
-          JSON.stringify({
-            type: "tool_result",
-            protocolVersion: 1,
-            eventId: `result-${event.toolCallId}`,
-            conversationId: event.conversationId,
-            agentRunId: event.agentRunId,
-            sequence: event.sequence,
-            toolCallId: event.toolCallId,
-            result,
-          }),
-        );
-      }
-      if (event.type === "agent_run.completed" || event.type === "agent_run.failed") {
-        clearTimeout(timeout);
-        socket.off("message", onMessage);
-        resolve(events);
-      }
-    });
-    socket.send(JSON.stringify(requestPayload));
-  });
-}
 
 function runtimeHealth(port, token) {
   return new Promise((resolve, reject) => {
@@ -198,6 +105,34 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
   assert.equal(successfulEvents[5].tool.name, "vault_read");
   assert.equal(successfulEvents[6].status, "completed");
   assert.match(successfulEvents.at(-1).output.text, /second\\nthird/);
+
+  const refreshedContent = `Fresh observed fact ${"bounded protocol evidence ".repeat(30)}`;
+  await runWithToolPeer(
+    socket,
+    {
+      type: "agent_run.start",
+      protocolVersion: 1,
+      eventId: "tool-run-refresh-start",
+      conversationId: "tool-conversation",
+      agentRunId: "tool-run-refresh",
+      sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: "vault_read notes/interview.md 4-4" },
+    },
+    () => ({
+      ok: true,
+      value: {
+        type: "vault_read",
+        path: "notes/interview.md",
+        lineStart: 4,
+        lineEnd: 4,
+        modifiedVersion: "mtime:5678:size:700",
+        contentHash: "sha256:refreshed-source-hash",
+        content: refreshedContent,
+        truncated: false,
+      },
+    }),
+  );
 
   const failedToolEvents = await runWithToolPeer(
     socket,
@@ -969,11 +904,13 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
       sequence: 0,
     }),
   );
+  const openedSnapshot = await snapshot;
   assert.deepEqual(
-    (await snapshot).toolCalls
+    openedSnapshot.toolCalls
       .filter(({ name }) => name !== "agent_contract_read" && name !== "planning_memory_list")
       .map(({ name, status }) => ({ name, status })),
     [
+      { name: "vault_read", status: "completed" },
       { name: "vault_read", status: "completed" },
       { name: "vault_read", status: "failed" },
       { name: "web_read", status: "failed" },
@@ -985,6 +922,31 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
       { name: "vault_propose_changes", status: "completed" },
     ],
   );
+  const successfulAnswer = openedSnapshot.messages.find(
+    ({ agentRunId, role }) => agentRunId === "tool-run-success" && role === "assistant",
+  );
+  assert.deepEqual(successfulAnswer.evidenceSources, [{
+    path: "notes/interview.md",
+    lineStart: 2,
+    lineEnd: 3,
+    snippet: "second third",
+    stale: true,
+  }]);
+  const refreshedAnswer = openedSnapshot.messages.find(
+    ({ agentRunId, role }) => agentRunId === "tool-run-refresh" && role === "assistant",
+  );
+  assert.equal(refreshedAnswer.evidenceSources[0].path, "notes/interview.md");
+  assert.equal(refreshedAnswer.evidenceSources[0].lineStart, 4);
+  assert.equal(refreshedAnswer.evidenceSources[0].lineEnd, 4);
+  assert.equal(refreshedAnswer.evidenceSources[0].stale, false);
+  assert.equal(refreshedAnswer.evidenceSources[0].snippet.length <= 241, true);
+  assert.notEqual(refreshedAnswer.evidenceSources[0].snippet, refreshedContent);
+  assert.equal(
+    openedSnapshot.messages.find(
+      ({ agentRunId, role }) => agentRunId === "tool-run-error" && role === "assistant",
+    ).evidenceSources.length,
+    0,
+  );
 
   await stopRuntime(runtime, ready.port, token);
   const SQL = await initSqlJs();
@@ -993,7 +955,7 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
     database.exec(
       "SELECT status FROM tool_calls WHERE conversation_id = 'tool-conversation' AND name IN ('vault_read', 'vault_search') ORDER BY agent_run_id",
     )[0].values,
-    [["completed"], ["failed"], ["completed"], ["completed"]],
+    [["completed"], ["failed"], ["completed"], ["completed"], ["completed"]],
   );
   assert.equal(
     database.exec("SELECT COUNT(*) FROM tool_calls WHERE name = 'skill_read' AND status = 'completed'")[0]
@@ -1021,14 +983,15 @@ test("the real Runtime executes local Vault tools through a simulated plugin pee
     database.exec(
       `SELECT path, line_start, line_end, modified_version, content_hash, content,
               is_stale, stale_detected_at IS NOT NULL
-       FROM evidence_snapshots ORDER BY path`,
+       FROM evidence_snapshots ORDER BY path, line_start`,
     )[0].values,
     [
       ["notes/citation.md", 1, 1, "mtime:2:size:4", "sha256:citation-evidence", "fact", 0, 0],
-      ["notes/interview.md", 2, 3, "mtime:1234:size:25", "sha256:source-hash", "second\nthird", 0, 0],
+      ["notes/interview.md", 2, 3, "mtime:1234:size:25", "sha256:source-hash", "second\nthird", 1, 1],
+      ["notes/interview.md", 4, 4, "mtime:5678:size:700", "sha256:refreshed-source-hash", refreshedContent, 0, 0],
     ],
   );
-  assert.equal(database.exec("SELECT COUNT(*) FROM evidence_snapshots")[0].values[0][0], 2);
+  assert.equal(database.exec("SELECT COUNT(*) FROM evidence_snapshots")[0].values[0][0], 3);
   assert.equal(
     (await readFile(statePath)).includes(Buffer.from("first\nsecond\nthird\nfourth")),
     false,

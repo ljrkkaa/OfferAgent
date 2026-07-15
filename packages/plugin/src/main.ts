@@ -1,8 +1,15 @@
 import path from "node:path";
+import type {
+  ConversationSummary,
+  PinnedContextReference,
+  ProviderCapabilityStatus,
+} from "@offeragent/protocol";
 import {
+  Component,
   type App,
   FileSystemAdapter,
   ItemView,
+  MarkdownRenderer,
   Notice,
   Platform,
   Plugin,
@@ -14,9 +21,11 @@ import {
 import {
   RuntimeSupervisor,
   SidebarController,
+  type RuntimeViewState,
   type SidebarViewModel,
 } from "./sidebar-controller";
 import { ObsidianVaultToolAdapter } from "./vault-tool-adapter";
+import { ProjectEvidenceAdapter } from "./project-evidence-adapter";
 import {
   GitCheckpointStore,
   ObsidianVaultChangeFileApi,
@@ -24,6 +33,7 @@ import {
   type VaultPermissionMode,
 } from "./vault-change-coordinator";
 import { resolveLocalToday } from "./daily-note-context";
+import { createHostResearchBrowser, type ResearchBrowser } from "./research-browser";
 
 const SIDEBAR_VIEW_TYPE = "offeragent-sidebar";
 const localMoment = moment as unknown as {
@@ -40,6 +50,22 @@ interface OfferAgentPluginSettings {
   vaultPermissionMode: VaultPermissionMode;
 }
 
+interface SidebarContextSources {
+  currentDocumentPath(): string | undefined;
+  listDocuments(query: string): string[];
+  openDocument(path: string, lineStart?: number, lineEnd?: number): Promise<void>;
+}
+
+function mentionQuery(
+  text: string,
+  cursor: number,
+): { end: number; query: string; start: number } | undefined {
+  const prefix = text.slice(0, cursor);
+  const match = /(?:^|\s)@([^\s@]*)$/u.exec(prefix);
+  if (!match) return undefined;
+  return { end: cursor, query: match[1] ?? "", start: prefix.lastIndexOf("@") };
+}
+
 function permissionMode(value: unknown): VaultPermissionMode {
   return value === "ask_every_time" || value === "read_only" || value === "trusted_vault"
     ? value
@@ -47,9 +73,51 @@ function permissionMode(value: unknown): VaultPermissionMode {
 }
 
 const PERMISSION_LABELS: Record<VaultPermissionMode, string> = {
-  ask_every_time: "Ask Every Time",
-  read_only: "Read Only",
-  trusted_vault: "Trusted Vault",
+  ask_every_time: "每次询问",
+  read_only: "只读",
+  trusted_vault: "信任 Vault",
+};
+
+const PERMISSION_ACCESSIBLE_LABELS: Record<VaultPermissionMode, string> = {
+  ask_every_time: "Vault 权限模式：每次询问",
+  read_only: "Vault 权限模式：只读",
+  trusted_vault: "Vault 权限模式：信任 Vault",
+};
+
+const RUNTIME_STATE_LABELS: Record<RuntimeViewState, string> = {
+  connected: "已连接",
+  idle: "未启动",
+  starting: "正在启动",
+  unavailable: "不可用",
+};
+
+const CAPABILITY_STATUS_LABELS: Record<ProviderCapabilityStatus, string> = {
+  available: "可用",
+  unavailable: "不可用",
+  unknown: "未知",
+};
+
+const VAULT_CHANGE_STATUS_LABELS: Record<
+  SidebarViewModel["conversation"]["vaultChanges"][number]["status"],
+  string
+> = {
+  applied: "已应用",
+  applying: "正在应用",
+  conflicted: "存在冲突",
+  expired: "已过期",
+  failed: "失败",
+  pending: "等待确认",
+  rejected: "已拒绝",
+  rejecting: "正在拒绝",
+  undone: "已撤销",
+};
+
+const VAULT_ACTION_LABELS: Record<string, string> = {
+  append: "追加",
+  create: "创建",
+  delete: "删除",
+  replace: "替换",
+  update: "更新",
 };
 
 class OfferAgentSettingTab extends PluginSettingTab {
@@ -66,22 +134,22 @@ class OfferAgentSettingTab extends PluginSettingTab {
     const presentation = viewModel.presentation.settings;
     this.containerEl.createEl("h2", { text: "OfferAgent" });
     new Setting(this.containerEl)
-      .setName("Runtime status")
+      .setName("Runtime 状态")
       .setDesc(
         presentation.runtimeStatus === "connected"
-          ? "Connected to the local OfferAgent Runtime."
+          ? "已连接本地 OfferAgent Runtime。"
           : presentation.advanced.diagnostics,
       );
     new Setting(this.containerEl)
-      .setName("Provider status")
+      .setName("Provider 状态")
       .setDesc(
         presentation.providerStatus === "connected"
-          ? "Codex subscription Provider is available."
-          : "Provider is unavailable; check authentication and Runtime diagnostics.",
+          ? "Codex 订阅 Provider 可用。"
+          : "Provider 不可用；请检查登录状态和 Runtime 诊断信息。",
       );
     new Setting(this.containerEl)
-      .setName("Model")
-      .setDesc("Model used for this Conversation.")
+      .setName("模型")
+      .setDesc("当前对话使用的模型。")
       .addDropdown((dropdown) => {
         for (const model of viewModel.conversation.models) {
           dropdown.addOption(model.id, model.label);
@@ -92,8 +160,8 @@ class OfferAgentSettingTab extends PluginSettingTab {
       });
     if (presentation.fastMode) {
       new Setting(this.containerEl)
-        .setName("Fast Mode")
-        .setDesc("Uses the Provider's faster priority processing and may consume more credits.")
+        .setName("快速模式")
+        .setDesc("使用 Provider 的优先加速处理，可能消耗更多额度。")
         .addToggle((toggle) =>
           toggle
             .setValue(presentation.fastMode!.enabled)
@@ -101,13 +169,13 @@ class OfferAgentSettingTab extends PluginSettingTab {
         );
     }
     new Setting(this.containerEl)
-      .setName("Vault Permission Mode")
-      .setDesc("Controls Agent-requested writes for this Vault. Control files always require confirmation.")
+      .setName("Vault 权限模式")
+      .setDesc("控制 Agent 对此 Vault 发起的写入；控制文件始终需要确认。")
       .addDropdown((dropdown) =>
         dropdown
-          .addOption("trusted_vault", "Trusted Vault")
-          .addOption("ask_every_time", "Ask Every Time")
-          .addOption("read_only", "Read Only")
+          .addOption("trusted_vault", "信任 Vault")
+          .addOption("ask_every_time", "每次询问")
+          .addOption("read_only", "只读")
           .setValue(this.#owner.getVaultPermissionMode())
           .onChange(async (value) => {
             await this.#owner.setVaultPermissionMode(permissionMode(value));
@@ -116,27 +184,29 @@ class OfferAgentSettingTab extends PluginSettingTab {
     const advanced = this.containerEl.createEl("details", {
       cls: "offeragent-settings__advanced",
     });
-    advanced.createEl("summary", { text: "Advanced" });
+    advanced.createEl("summary", { text: "高级设置" });
     const advancedContent = advanced.createDiv({ cls: "offeragent-settings__advanced-content" });
     new Setting(advancedContent)
-      .setName("Git Checkpoint retention")
+      .setName("Git Checkpoint 保留策略")
       .setDesc(presentation.advanced.gitRetention);
     new Setting(advancedContent)
-      .setName("Diagnostics")
+      .setName("诊断")
       .setDesc(presentation.advanced.diagnostics);
     const hostedSearch = new Setting(advancedContent)
       .setName("Hosted Web Search")
-      .setDesc("Capability status: unknown. Status is discovered from the active backend and model.")
+      .setDesc("能力状态：未知。状态根据当前后端和模型探测。")
       .addButton((button) =>
-        button.setButtonText("Reprobe").onClick(async () => {
+        button.setButtonText("重新探测").onClick(async () => {
           button.setDisabled(true);
-          hostedSearch.setDesc("Capability status: probing…");
+          hostedSearch.setDesc("能力状态：正在探测…");
           try {
             const result = await this.#owner.reprobeHostedWebSearch();
-            hostedSearch.setDesc(`Capability status for ${result.modelId}: ${result.status}.`);
+            hostedSearch.setDesc(
+              `模型 ${result.modelId} 的能力状态：${CAPABILITY_STATUS_LABELS[result.status]}。`,
+            );
           } catch (error) {
             hostedSearch.setDesc(
-              `Capability probe failed: ${error instanceof Error ? error.message : String(error)}`,
+              `能力探测失败：${error instanceof Error ? error.message : String(error)}`,
             );
           } finally {
             button.setDisabled(false);
@@ -144,10 +214,12 @@ class OfferAgentSettingTab extends PluginSettingTab {
         }),
       );
     void this.#owner.getHostedWebSearchCapability().then((result) => {
-      hostedSearch.setDesc(`Capability status for ${result.modelId}: ${result.status}.`);
+      hostedSearch.setDesc(
+        `模型 ${result.modelId} 的能力状态：${CAPABILITY_STATUS_LABELS[result.status]}。`,
+      );
     }).catch((error: unknown) => {
       hostedSearch.setDesc(
-        `Capability status unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        `无法获取能力状态：${error instanceof Error ? error.message : String(error)}`,
       );
     });
   }
@@ -155,13 +227,48 @@ class OfferAgentSettingTab extends PluginSettingTab {
 
 class OfferAgentSidebarView extends ItemView {
   readonly #controller: SidebarController;
+  readonly #contextSources: SidebarContextSources;
   readonly #openSettings: () => void;
+  readonly #markdownRenders = new Map<string, {
+    owner?: Component;
+    timer?: ReturnType<typeof setTimeout>;
+  }>();
+  readonly #draftPreviewUrls: string[] = [];
+  readonly #messagePreviewUrls = new Map<string, string>();
+  readonly #messagePreviewElements = new Map<string, HTMLImageElement>();
+  readonly #loadingMessagePreviews = new Set<string>();
+  readonly #attachmentObservers = new Set<IntersectionObserver>();
+  #attachmentLoadGeneration = 0;
+  #attachmentLoadQueue: Array<() => Promise<void>> = [];
+  #activeAttachmentLoads = 0;
+  readonly #streamedMessageElements = new Map<string, HTMLDivElement>();
+  readonly #transcriptItemElements = new Map<string, HTMLElement>();
+  #composerInput?: HTMLTextAreaElement;
+  #focusHistorySearch = false;
+  #historyOpen = false;
+  #addMenuOpen = false;
+  #documentChooserOpen = false;
+  #documentChooserQuery = "";
+  #mentionDismissed = false;
+  #mentionVisible = false;
+  #mentionIndex = 0;
+  #restoreHistoryFocus = false;
+  #showArchived = false;
+  #newContentButton?: HTMLButtonElement;
+  #renderedViewModel?: SidebarViewModel;
+  #transcriptElement?: HTMLDivElement;
   #unsubscribe?: () => void;
 
-  constructor(leaf: WorkspaceLeaf, controller: SidebarController, openSettings: () => void) {
+  constructor(
+    leaf: WorkspaceLeaf,
+    controller: SidebarController,
+    openSettings: () => void,
+    contextSources: SidebarContextSources,
+  ) {
     super(leaf);
     this.#controller = controller;
     this.#openSettings = openSettings;
+    this.#contextSources = contextSources;
   }
 
   getViewType(): string {
@@ -176,6 +283,16 @@ class OfferAgentSidebarView extends ItemView {
     return "sparkles";
   }
 
+  #tryAddPinnedContext(reference: PinnedContextReference): boolean {
+    try {
+      this.#controller.addPinnedContext(reference);
+      return true;
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : String(error));
+      return false;
+    }
+  }
+
   async onOpen(): Promise<void> {
     this.#unsubscribe = this.#controller.subscribe((viewModel) => {
       this.#render(viewModel);
@@ -185,10 +302,539 @@ class OfferAgentSidebarView extends ItemView {
   async onClose(): Promise<void> {
     this.#unsubscribe?.();
     this.#unsubscribe = undefined;
+    this.#disposeMarkdownRenders();
+    this.#resetAttachmentLoads();
+    this.#revokeDraftPreviewUrls();
+    for (const url of this.#messagePreviewUrls.values()) URL.revokeObjectURL(url);
+    this.#messagePreviewUrls.clear();
+  }
+
+  #revokeDraftPreviewUrls(): void {
+    for (const url of this.#draftPreviewUrls.splice(0)) URL.revokeObjectURL(url);
+  }
+
+  #messageAttachmentKey(
+    message: SidebarViewModel["conversation"]["messages"][number],
+    attachment: NonNullable<SidebarViewModel["conversation"]["messages"][number]["attachments"]>[number],
+  ): string {
+    return `${message.id ?? message.agentRunId}:${attachment.order}:${attachment.contentHash}`;
+  }
+
+  #resetAttachmentLoads(): void {
+    this.#attachmentLoadGeneration += 1;
+    this.#attachmentLoadQueue = [];
+    for (const observer of this.#attachmentObservers) observer.disconnect();
+    this.#attachmentObservers.clear();
+    this.#messagePreviewElements.clear();
+    this.#loadingMessagePreviews.clear();
+  }
+
+  #pruneMessagePreviewUrls(viewModel: SidebarViewModel): void {
+    const retained = new Set<string>();
+    for (const message of viewModel.conversation.messages) {
+      for (const attachment of message.attachments ?? []) {
+        retained.add(this.#messageAttachmentKey(message, attachment));
+      }
+    }
+    for (const [key, url] of this.#messagePreviewUrls) {
+      if (retained.has(key)) continue;
+      URL.revokeObjectURL(url);
+      this.#messagePreviewUrls.delete(key);
+      this.#messagePreviewElements.delete(key);
+    }
+  }
+
+  #releaseMessagePreview(key: string): void {
+    const url = this.#messagePreviewUrls.get(key);
+    if (!url) return;
+    URL.revokeObjectURL(url);
+    this.#messagePreviewUrls.delete(key);
+    const element = this.#messagePreviewElements.get(key);
+    if (element?.src === url) element.src = "";
+  }
+
+  #cacheMessagePreview(key: string, url: string): void {
+    this.#releaseMessagePreview(key);
+    this.#messagePreviewUrls.set(key, url);
+  }
+
+  #enqueueAttachmentLoad(load: () => Promise<void>): void {
+    this.#attachmentLoadQueue.push(load);
+    this.#drainAttachmentLoads();
+  }
+
+  #drainAttachmentLoads(): void {
+    while (this.#activeAttachmentLoads < 4) {
+      const load = this.#attachmentLoadQueue.shift();
+      if (!load) return;
+      this.#activeAttachmentLoads += 1;
+      void load().finally(() => {
+        this.#activeAttachmentLoads -= 1;
+        this.#drainAttachmentLoads();
+      });
+    }
+  }
+
+  #observeAttachment(load: () => void, unload: () => void, element: HTMLImageElement): void {
+    if (typeof IntersectionObserver === "undefined") {
+      load();
+      return;
+    }
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some(({ isIntersecting }) => isIntersecting)) load();
+      else unload();
+    }, { root: this.#transcriptElement, rootMargin: "200px" });
+    this.#attachmentObservers.add(observer);
+    observer.observe(element);
+  }
+
+  #transcriptItemKey(
+    item: SidebarViewModel["presentation"]["transcript"][number],
+    index: number,
+  ): string {
+    if (item.kind === "message") {
+      return `message:${item.key}`;
+    }
+    if (item.kind === "activity_error") return `activity-error:${item.activity.id}`;
+    if (item.kind === "activity_summary") return `activity-summary:${item.agentRunId}`;
+    if (item.kind === "vault_change") return `vault-change:${item.change.toolCallId}`;
+    return `run-status:${item.agentRunId}:${index}`;
+  }
+
+  #streamingFrameSignature(viewModel: SidebarViewModel): string {
+    const {
+      agentRuns: _agentRuns,
+      messages: _messages,
+      toolCalls: _toolCalls,
+      vaultChanges: _vaultChanges,
+      ...conversation
+    } = viewModel.conversation;
+    return JSON.stringify({
+      conversation,
+      presentation: {
+        composer: {
+          ...viewModel.presentation.composer,
+          draftText: undefined,
+        },
+        settings: viewModel.presentation.settings,
+      },
+      runtime: viewModel.runtime,
+      title: viewModel.title,
+    });
+  }
+
+  #appendMessage(
+    transcript: HTMLDivElement,
+    item: Extract<SidebarViewModel["presentation"]["transcript"][number], { kind: "message" }>,
+    index: number,
+  ): HTMLDivElement {
+    const { message } = item;
+    const messageElement = transcript.createDiv({
+      cls: `offeragent-sidebar__message offeragent-sidebar__message--${message.role} offeragent-sidebar__message--${item.presentation.layout}`,
+    });
+    if (message.attachments?.length) {
+      const gallery = messageElement.createDiv({ cls: "offeragent-sidebar__message-attachments" });
+      for (const [attachmentIndex, attachment] of message.attachments.entries()) {
+        const preview = gallery.createEl("img", {
+          cls: "offeragent-sidebar__message-attachment",
+        });
+        preview.loading = "lazy";
+        preview.setAttribute(
+          "alt",
+          `附件 ${attachmentIndex + 1}：${attachment.fileName}`,
+        );
+        const previewKey = this.#messageAttachmentKey(message, attachment);
+        this.#messagePreviewElements.set(previewKey, preview);
+        const generation = this.#attachmentLoadGeneration;
+        let visible = false;
+        const load = (): void => {
+          visible = true;
+          const cachedUrl = this.#messagePreviewUrls.get(previewKey);
+          if (cachedUrl) {
+            this.#messagePreviewUrls.delete(previewKey);
+            this.#messagePreviewUrls.set(previewKey, cachedUrl);
+            preview.src = cachedUrl;
+            return;
+          }
+          if (this.#loadingMessagePreviews.has(previewKey)) return;
+          this.#loadingMessagePreviews.add(previewKey);
+          this.#enqueueAttachmentLoad(async () => {
+            try {
+              const bytes = await this.#controller.readMessageAttachment(message, attachment.order);
+              if (generation !== this.#attachmentLoadGeneration || !visible) return;
+              const previewBytes = Uint8Array.from(bytes);
+              const previewUrl = URL.createObjectURL(new Blob([previewBytes.buffer], {
+                type: attachment.mediaType,
+              }));
+              this.#cacheMessagePreview(previewKey, previewUrl);
+              preview.src = previewUrl;
+              if (message.id) {
+                this.#controller.releaseOptimisticAttachmentPreview(message.agentRunId, attachment.order);
+              }
+            } catch {
+              preview.addClass("offeragent-sidebar__message-attachment--unavailable");
+            } finally {
+              this.#loadingMessagePreviews.delete(previewKey);
+            }
+          });
+        };
+        this.#observeAttachment(load, () => {
+          visible = false;
+          this.#releaseMessagePreview(previewKey);
+        }, preview);
+      }
+    }
+    const messageBody = messageElement.createDiv({ cls: "offeragent-sidebar__message-body" });
+    const key = this.#transcriptItemKey(item, index);
+    this.#streamedMessageElements.set(key, messageBody);
+    if (item.presentation.format === "markdown") {
+      messageBody.addClass("markdown-rendered");
+      this.#scheduleMarkdownRender(key, messageBody, message.text, 0);
+    } else messageBody.setText(message.text);
+    if (item.presentation.revision?.enabled) {
+      const revise = messageElement.createEl("button", {
+        cls: "offeragent-sidebar__message-revise",
+        text: item.presentation.revision.label,
+      });
+      revise.type = "button";
+      revise.setAttribute("aria-label", "将最近一条用户消息放入输入框");
+      revise.addEventListener("click", () => {
+        const requiresConfirmation =
+          this.#controller.userMessageRevisionRequiresConfirmation(message.agentRunId);
+        if (
+          requiresConfirmation &&
+          !window.confirm("当前草稿和图片会被最近一条用户消息替换。继续吗？")
+        ) return;
+        if (this.#controller.reviseUserMessage(message.agentRunId, requiresConfirmation)) {
+          this.#composerInput?.focus();
+        }
+      });
+    }
+    if (item.presentation.copyable && message.text) {
+      const copy = messageElement.createEl("button", {
+        cls: "offeragent-sidebar__message-copy",
+        text: "复制回答",
+      });
+      copy.type = "button";
+      copy.setAttribute("aria-label", "复制完整回答");
+      copy.addEventListener("click", () => this.#copyText(message.text));
+    }
+    if (message.citations?.length) {
+      const sources = messageElement.createDiv({ cls: "offeragent-sidebar__citations" });
+      for (const [citationIndex, citation] of message.citations.entries()) {
+        const link = sources.createEl("a", {
+          cls: "offeragent-sidebar__citation",
+          text: `[${citationIndex + 1}] ${citation.title}`,
+        });
+        link.href = citation.url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+      }
+    }
+    if (message.role === "assistant" && item.presentation.sourceLabel) {
+      const usedSources = messageElement.createEl("details", {
+        cls: "offeragent-sidebar__used-sources",
+      });
+      const summary = usedSources.createEl("summary", { text: item.presentation.sourceLabel });
+      summary.setAttribute("aria-label", `${item.presentation.sourceLabel}，按回车展开来源`);
+      for (const source of item.presentation.usedSources ?? []) {
+        const sourceRow = usedSources.createDiv({ cls: "offeragent-sidebar__used-source" });
+        const identity = sourceRow.createEl("button", {
+          cls: "offeragent-sidebar__used-source-open",
+          text: `${source.path}:${source.lineStart}-${source.lineEnd}`,
+        });
+        identity.type = "button";
+        identity.setAttribute(
+          "aria-label",
+          `打开来源 ${source.path} 第 ${source.lineStart} 到 ${source.lineEnd} 行`,
+        );
+        identity.addEventListener("click", () => {
+          void this.#contextSources.openDocument(source.path, source.lineStart, source.lineEnd);
+        });
+        if (source.stale) {
+          sourceRow.createEl("span", {
+            cls: "offeragent-sidebar__used-source-stale",
+            text: "来源已变化",
+          });
+        }
+        sourceRow.createDiv({
+          cls: "offeragent-sidebar__used-source-snippet",
+          text: source.snippet,
+        });
+        const pin = sourceRow.createEl("button", {
+          cls: "offeragent-sidebar__used-source-pin",
+          text: "固定到下一轮",
+        });
+        pin.type = "button";
+        pin.setAttribute("aria-label", `固定来源 ${source.path} 到下一轮`);
+        pin.addEventListener("click", () => {
+          try {
+            this.#controller.pinEvidenceSource(source);
+          } catch (error) {
+            new Notice(error instanceof Error ? error.message : String(error));
+          }
+        });
+      }
+    }
+    return messageElement;
+  }
+
+  #populateActivitySummary(
+    activity: HTMLDetailsElement,
+    item: Extract<SidebarViewModel["presentation"]["transcript"][number], {
+      kind: "activity_summary";
+    }>,
+  ): void {
+    const wasOpen = activity.open;
+    activity.empty();
+    activity.open = wasOpen;
+    activity.dataset.status = item.activities.every(({ status }) => status === "completed")
+      ? "completed"
+      : "requested";
+    const summary = activity.createEl("summary", { text: item.label });
+    summary.setAttribute("aria-expanded", wasOpen ? "true" : "false");
+    summary.setAttribute("aria-label", `${item.label}，按回车展开详情`);
+    activity.ontoggle = () => {
+      summary.setAttribute("aria-expanded", activity.open ? "true" : "false");
+    };
+    for (const presented of item.activities) {
+      const row = activity.createDiv({ cls: "offeragent-sidebar__tool-activity-row" });
+      row.createDiv({ cls: "offeragent-sidebar__tool-activity-label", text: presented.label });
+      row.createEl("pre", { text: presented.details });
+    }
+  }
+
+  #appendActivitySummary(
+    transcript: HTMLDivElement,
+    item: Extract<SidebarViewModel["presentation"]["transcript"][number], {
+      kind: "activity_summary";
+    }>,
+  ): HTMLDetailsElement {
+    const activity = transcript.createEl("details", { cls: "offeragent-sidebar__tool-activity" });
+    this.#populateActivitySummary(activity, item);
+    return activity;
+  }
+
+  #appendActivityError(
+    transcript: HTMLDivElement,
+    item: Extract<SidebarViewModel["presentation"]["transcript"][number], {
+      kind: "activity_error";
+    }>,
+  ): HTMLDivElement {
+    const error = transcript.createDiv({ cls: "offeragent-sidebar__activity-error" });
+    error.dataset.status = item.activity.status;
+    error.createDiv({ text: item.activity.label });
+    error.createEl("pre", { text: item.activity.details });
+    return error;
+  }
+
+  #tryPatchStreamingUpdate(previous: SidebarViewModel, next: SidebarViewModel): boolean {
+    const transcript = this.#transcriptElement;
+    const input = this.#composerInput;
+    if (
+      !transcript ||
+      !input ||
+      previous.conversation.runState !== "streaming" ||
+      next.conversation.runState !== "streaming" ||
+      previous.conversation.activeConversationId !== next.conversation.activeConversationId ||
+      this.#streamingFrameSignature(previous) !== this.#streamingFrameSignature(next)
+    ) return false;
+
+    const previousScrollTop = transcript.scrollTop;
+    const previousItems = new Map(previous.presentation.transcript.map((item, index) => [
+      this.#transcriptItemKey(item, index),
+      item,
+    ]));
+    const nextKeys = new Set<string>();
+    for (const [index, item] of next.presentation.transcript.entries()) {
+      const key = this.#transcriptItemKey(item, index);
+      nextKeys.add(key);
+      const prior = previousItems.get(key);
+      let itemElement = this.#transcriptItemElements.get(key);
+      if (!itemElement) {
+        if (item.kind === "message") itemElement = this.#appendMessage(transcript, item, index);
+        else if (item.kind === "activity_summary") {
+          itemElement = this.#appendActivitySummary(transcript, item);
+        } else if (item.kind === "activity_error") {
+          itemElement = this.#appendActivityError(transcript, item);
+        } else return false;
+        this.#transcriptItemElements.set(key, itemElement);
+      }
+      if (!prior || JSON.stringify(prior) === JSON.stringify(item)) continue;
+      if (item.kind === "message" && prior.kind === "message") {
+        const element = this.#streamedMessageElements.get(key);
+        if (!element) return false;
+        if (item.presentation.format === "markdown") {
+          this.#scheduleMarkdownRender(key, element, item.message.text);
+        } else element.setText(item.message.text);
+      } else if (item.kind === "activity_summary" && prior.kind === "activity_summary") {
+        this.#populateActivitySummary(itemElement as HTMLDetailsElement, item);
+      } else if (item.kind === "activity_error" && prior.kind === "activity_error") {
+        itemElement.empty();
+        itemElement.dataset.status = item.activity.status;
+        itemElement.createDiv({ text: item.activity.label });
+        itemElement.createEl("pre", { text: item.activity.details });
+      } else return false;
+    }
+    for (const [key, element] of this.#transcriptItemElements) {
+      if (nextKeys.has(key)) continue;
+      element.remove();
+      this.#transcriptItemElements.delete(key);
+      this.#streamedMessageElements.delete(key);
+      const render = this.#markdownRenders.get(key);
+      if (render?.timer) clearTimeout(render.timer);
+      if (render) this.#unloadMarkdownOwner(render);
+      this.#markdownRenders.delete(key);
+    }
+    for (const [index, item] of next.presentation.transcript.entries()) {
+      const element = this.#transcriptItemElements.get(this.#transcriptItemKey(item, index));
+      if (!element) return false;
+      transcript.appendChild(element);
+    }
+
+    if (input.value === previous.presentation.composer.draftText) {
+      input.value = next.presentation.composer.draftText;
+    }
+    this.#syncTranscriptScroll(next, previousScrollTop);
+    return true;
+  }
+
+  #copyText(text: string): void {
+    void navigator.clipboard.writeText(text).catch(() => {
+      new Notice("无法复制到剪贴板。");
+    });
+  }
+
+  #disposeMarkdownRenders(): void {
+    for (const render of this.#markdownRenders.values()) {
+      if (render.timer) clearTimeout(render.timer);
+      this.#unloadMarkdownOwner(render);
+    }
+    this.#markdownRenders.clear();
+  }
+
+  #unloadMarkdownOwner(render: { owner?: Component }): void {
+    const owner = render.owner;
+    render.owner = undefined;
+    owner?.unload();
+  }
+
+  #postprocessMarkdown(element: HTMLDivElement): void {
+    if (typeof element.querySelectorAll !== "function") return;
+    for (const link of element.querySelectorAll<HTMLAnchorElement>(
+      'a[href^="http://"], a[href^="https://"]',
+    )) {
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+    }
+    for (const code of element.querySelectorAll<HTMLElement>("pre > code")) {
+      const pre = code.parentElement;
+      if (
+        !pre ||
+        pre.querySelector(".copy-code-button") ||
+        pre.querySelector(".offeragent-sidebar__code-copy")
+      ) continue;
+      const copy = pre.createEl("button", {
+        cls: "offeragent-sidebar__code-copy",
+        text: "复制代码",
+      });
+      copy.type = "button";
+      copy.setAttribute("aria-label", "复制代码块");
+      copy.addEventListener("click", () => this.#copyText(code.textContent ?? ""));
+    }
+  }
+
+  #scheduleMarkdownRender(
+    key: string,
+    element: HTMLDivElement,
+    markdown: string,
+    delayMs = 50,
+  ): void {
+    const previous = this.#markdownRenders.get(key);
+    if (previous?.timer) clearTimeout(previous.timer);
+    if (previous) this.#unloadMarkdownOwner(previous);
+    const render: {
+      owner?: Component;
+      timer?: ReturnType<typeof setTimeout>;
+    } = {};
+    const start = async () => {
+      render.timer = undefined;
+      if (this.#markdownRenders.get(key) !== render) return;
+      const owner = new Component();
+      owner.load();
+      render.owner = owner;
+      const staging = element.cloneNode(false) as HTMLDivElement;
+      try {
+        await MarkdownRenderer.render(this.app, markdown, staging, "", owner);
+        if (
+          this.#markdownRenders.get(key) !== render ||
+          this.#streamedMessageElements.get(key) !== element
+        ) {
+          this.#unloadMarkdownOwner(render);
+          return;
+        }
+        this.#postprocessMarkdown(staging);
+        const transcript = this.#transcriptElement;
+        const frozenScrollTop = transcript?.scrollTop;
+        element.replaceChildren(...Array.from(staging.childNodes));
+        element.dataset.renderStatus = "rendered";
+        if (transcript && this.#renderedViewModel) {
+          this.#syncTranscriptScroll(this.#renderedViewModel, frozenScrollTop);
+        }
+      } catch {
+        this.#unloadMarkdownOwner(render);
+        if (
+          this.#markdownRenders.get(key) !== render ||
+          this.#streamedMessageElements.get(key) !== element
+        ) return;
+        const transcript = this.#transcriptElement;
+        const frozenScrollTop = transcript?.scrollTop;
+        element.setText(markdown);
+        element.dataset.renderStatus = "plain-text-fallback";
+        new Notice("Markdown 渲染失败，已显示纯文本回答。");
+        if (transcript && this.#renderedViewModel) {
+          this.#syncTranscriptScroll(this.#renderedViewModel, frozenScrollTop);
+        }
+      }
+    };
+    this.#markdownRenders.set(key, render);
+    if (delayMs <= 0) void start();
+    else render.timer = setTimeout(() => void start(), delayMs);
+  }
+
+  #syncTranscriptScroll(viewModel: SidebarViewModel, frozenScrollTop?: number): void {
+    const transcript = this.#transcriptElement;
+    if (!transcript) return;
+    const { hasNewContent, mode } = viewModel.presentation.transcriptScroll;
+    if (this.#newContentButton) this.#newContentButton.hidden = !hasNewContent;
+    if (mode === "following") transcript.scrollTop = transcript.scrollHeight;
+    else if (frozenScrollTop !== undefined) transcript.scrollTop = frozenScrollTop;
   }
 
   #render(viewModel: SidebarViewModel): void {
+    const previous = this.#renderedViewModel;
+    if (previous && this.#tryPatchStreamingUpdate(previous, viewModel)) {
+      this.#renderedViewModel = viewModel;
+      return;
+    }
+    const frozenScrollTop = previous?.presentation.transcriptScroll.mode === "frozen" &&
+        viewModel.presentation.transcriptScroll.mode === "frozen"
+      ? this.#transcriptElement?.scrollTop
+      : undefined;
+    const restoreComposerFocus = typeof document !== "undefined" &&
+      this.#composerInput === document.activeElement;
+    const selectionStart = restoreComposerFocus ? this.#composerInput?.selectionStart : undefined;
+    const selectionEnd = restoreComposerFocus ? this.#composerInput?.selectionEnd : undefined;
     const container = this.contentEl;
+    this.#resetAttachmentLoads();
+    this.#revokeDraftPreviewUrls();
+    this.#pruneMessagePreviewUrls(viewModel);
+    this.#disposeMarkdownRenders();
+    this.#streamedMessageElements.clear();
+    this.#transcriptItemElements.clear();
+    this.#composerInput = undefined;
+    this.#newContentButton = undefined;
+    this.#transcriptElement = undefined;
     container.empty();
     container.addClass("offeragent-sidebar");
 
@@ -198,11 +844,13 @@ class OfferAgentSidebarView extends ItemView {
       cls: "offeragent-sidebar__title",
       text: viewModel.title,
     });
-    const status = brand.createDiv({
-      cls: "offeragent-sidebar__status",
-      text: viewModel.runtime.state,
-    });
-    status.dataset.state = viewModel.runtime.state;
+    if (viewModel.runtime.state !== "connected") {
+      const status = brand.createDiv({
+        cls: "offeragent-sidebar__status",
+        text: RUNTIME_STATE_LABELS[viewModel.runtime.state],
+      });
+      status.dataset.state = viewModel.runtime.state;
+    }
 
     if (viewModel.runtime.message) {
       container.createDiv({
@@ -212,54 +860,193 @@ class OfferAgentSidebarView extends ItemView {
     }
 
     const conversationRow = header.createDiv({ cls: "offeragent-sidebar__conversations" });
-    const conversationSelect = conversationRow.createEl("select", {
-      cls: "offeragent-sidebar__conversation-select",
+    const activeConversation = viewModel.conversation.conversations.find(
+      ({ id }) => id === viewModel.conversation.activeConversationId,
+    );
+    const history = conversationRow.createEl("button", {
+      cls: "offeragent-sidebar__history",
+      text: activeConversation?.title ?? "对话历史",
     });
-    for (const conversation of viewModel.conversation.conversations) {
-      const option = conversationSelect.createEl("option", { text: conversation.title });
-      option.value = conversation.id;
+    history.type = "button";
+    history.setAttribute("aria-label", "打开对话历史");
+    history.setAttribute("aria-expanded", `${this.#historyOpen}`);
+    const conversationActionsDisabled = viewModel.conversation.runState === "streaming" ||
+      viewModel.presentation.composer.isPreparingAttachments ||
+      viewModel.presentation.composer.isSending;
+    history.disabled = conversationActionsDisabled;
+    history.addEventListener("click", () => {
+      this.#historyOpen = !this.#historyOpen;
+      this.#focusHistorySearch = this.#historyOpen;
+      this.#restoreHistoryFocus = !this.#historyOpen;
+      this.#render(viewModel);
+    });
+    if (this.#restoreHistoryFocus && !this.#historyOpen) {
+      this.#restoreHistoryFocus = false;
+      history.focus();
     }
-    conversationSelect.value = viewModel.conversation.activeConversationId ?? "";
-    conversationSelect.setAttribute("aria-label", "Conversation history");
-    conversationSelect.disabled = viewModel.conversation.runState === "streaming";
-    conversationSelect.addEventListener("change", () => {
-      void this.#controller.openConversation(conversationSelect.value);
-    });
     const newConversation = conversationRow.createEl("button", {
       cls: "offeragent-sidebar__new-conversation",
-      text: "New",
+      text: "新建",
     });
     newConversation.type = "button";
-    newConversation.setAttribute("aria-label", "New Conversation");
-    newConversation.disabled = viewModel.conversation.runState === "streaming";
+    newConversation.setAttribute("aria-label", "新建对话");
+    newConversation.disabled = conversationActionsDisabled;
     newConversation.addEventListener("click", () => {
       void this.#controller.createConversation();
     });
-    const deleteConversation = conversationRow.createEl("button", {
-      cls: "offeragent-sidebar__delete-conversation",
-      text: "Delete",
+    const headerOverflow = conversationRow.createEl("details", {
+      cls: "offeragent-sidebar__header-overflow",
     });
-    deleteConversation.type = "button";
-    deleteConversation.setAttribute("aria-label", "Delete Conversation");
-    deleteConversation.disabled =
-      !viewModel.conversation.activeConversationId ||
-      viewModel.conversation.runState === "streaming";
-    deleteConversation.addEventListener("click", () => {
-      void this.#controller.deleteCurrentConversation();
+    const headerOverflowToggle = headerOverflow.createEl("summary", {
+      cls: "offeragent-sidebar__header-overflow-toggle",
+      text: "⋯",
     });
-    const settings = conversationRow.createEl("button", {
+    headerOverflowToggle.setAttribute("aria-label", "打开侧栏菜单");
+    const headerOverflowMenu = headerOverflow.createDiv({
+      cls: "offeragent-sidebar__header-overflow-menu",
+    });
+    const settings = headerOverflowMenu.createEl("button", {
       cls: "offeragent-sidebar__settings",
-      text: "Settings",
+      text: "设置",
     });
     settings.type = "button";
-    settings.setAttribute("aria-label", "Open OfferAgent settings");
+    settings.setAttribute("aria-label", "打开 OfferAgent 设置");
     settings.addEventListener("click", this.#openSettings);
 
+    if (this.#historyOpen) {
+      const drawer = header.createDiv({ cls: "offeragent-sidebar__history-drawer" });
+      const search = drawer.createEl("input", { cls: "offeragent-sidebar__history-search" });
+      search.type = "search";
+      search.placeholder = "搜索对话";
+      search.setAttribute("aria-label", "搜索对话标题");
+      if (this.#focusHistorySearch) {
+        this.#focusHistorySearch = false;
+        search.focus();
+      }
+      const archiveToggle = drawer.createEl("button", {
+        cls: "offeragent-sidebar__history-archive-toggle",
+        text: this.#showArchived ? "显示当前对话" : "显示已归档",
+      });
+      archiveToggle.type = "button";
+      archiveToggle.addEventListener("click", () => {
+        this.#showArchived = !this.#showArchived;
+        this.#render(viewModel);
+      });
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+      const yesterday = today - 86_400_000;
+      const grouped = new Map<string, ConversationSummary[]>();
+      for (const conversation of viewModel.conversation.conversations.filter(
+        ({ archived }) => archived === this.#showArchived,
+      )) {
+        const updated = new Date(conversation.updatedAt).getTime();
+        const label = updated >= today ? "今天" : updated >= yesterday ? "昨天" : "更早";
+        const entries = grouped.get(label) ?? [];
+        entries.push(conversation);
+        grouped.set(label, entries);
+      }
+      const searchable: Array<{ element: HTMLElement; title: string }> = [];
+      for (const label of ["今天", "昨天", "更早"]) {
+        const entries = grouped.get(label);
+        if (!entries?.length) continue;
+        const group = drawer.createDiv({ cls: "offeragent-sidebar__history-group" });
+        group.createDiv({ cls: "offeragent-sidebar__history-group-label", text: label });
+        for (const conversation of entries) {
+          const item = group.createDiv({ cls: "offeragent-sidebar__history-item" });
+          const select = item.createEl("button", {
+            cls: "offeragent-sidebar__history-select",
+            text: conversation.title,
+          });
+          select.type = "button";
+          select.dataset.titleOrigin = conversation.titleOrigin;
+          select.disabled = conversationActionsDisabled;
+          select.addEventListener("click", () => {
+            void this.#controller.openConversation(conversation.id).then(() => {
+              this.#historyOpen = false;
+              this.#restoreHistoryFocus = true;
+              this.#render(this.#controller.getViewModel());
+            }).catch((error) => {
+              new Notice(`打开对话失败：${error instanceof Error ? error.message : String(error)}`);
+            });
+          });
+          const updated = item.createEl("time", {
+            cls: "offeragent-sidebar__history-updated",
+            text: new Intl.DateTimeFormat("zh-CN", {
+              hour: "2-digit",
+              minute: "2-digit",
+              month: "numeric",
+              day: "numeric",
+            }).format(new Date(conversation.updatedAt)),
+          });
+          updated.dateTime = conversation.updatedAt;
+          const itemOverflow = item.createEl("details", {
+            cls: "offeragent-sidebar__history-overflow",
+          });
+          const itemOverflowToggle = itemOverflow.createEl("summary", {
+            cls: "offeragent-sidebar__history-overflow-toggle",
+            text: "⋯",
+          });
+          itemOverflowToggle.setAttribute("aria-label", `打开 ${conversation.title} 的操作菜单`);
+          const itemOverflowMenu = itemOverflow.createDiv({
+            cls: "offeragent-sidebar__history-overflow-menu",
+          });
+          const rename = itemOverflowMenu.createEl("button", { cls: "offeragent-sidebar__history-rename", text: "重命名" });
+          rename.type = "button";
+          rename.disabled = conversationActionsDisabled;
+          rename.addEventListener("click", () => {
+            const title = window.prompt("重命名对话", conversation.title);
+            if (title !== null) {
+              void this.#controller.renameConversation(conversation.id, title).catch((error) => {
+                new Notice(`重命名对话失败：${error instanceof Error ? error.message : String(error)}`);
+              });
+            }
+          });
+          const archive = itemOverflowMenu.createEl("button", {
+            cls: "offeragent-sidebar__history-archive",
+            text: conversation.archived ? "恢复" : "归档",
+          });
+          archive.type = "button";
+          archive.disabled = conversationActionsDisabled;
+          archive.addEventListener("click", () => {
+            void this.#controller.setConversationArchived(
+              conversation.id,
+              !conversation.archived,
+            ).catch((error) => {
+              new Notice(`${conversation.archived ? "恢复" : "归档"}对话失败：${
+                error instanceof Error ? error.message : String(error)
+              }`);
+            });
+          });
+          const remove = itemOverflowMenu.createEl("button", { cls: "offeragent-sidebar__history-delete", text: "删除" });
+          remove.type = "button";
+          remove.disabled = conversationActionsDisabled;
+          remove.addEventListener("click", () => {
+            if (!window.confirm(`确定永久删除“${conversation.title}”吗？`)) return;
+            void this.#controller.deleteConversation(conversation.id).catch((error) => {
+              new Notice(`删除对话失败：${error instanceof Error ? error.message : String(error)}`);
+            });
+          });
+          searchable.push({ element: item, title: conversation.title.toLocaleLowerCase() });
+        }
+      }
+      search.addEventListener("input", () => {
+        const query = search.value.trim().toLocaleLowerCase();
+        for (const entry of searchable) entry.element.hidden = !entry.title.includes(query);
+      });
+    }
+
     const transcript = container.createDiv({ cls: "offeragent-sidebar__transcript" });
+    this.#transcriptElement = transcript;
+    transcript.addEventListener("scroll", () => {
+      const distanceFromBottom = transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop;
+      if (Number.isFinite(distanceFromBottom)) {
+        this.#controller.setTranscriptNearBottom(distanceFromBottom <= 32);
+      }
+    });
     if (viewModel.presentation.transcript.length === 0) {
       transcript.createDiv({
         cls: "offeragent-sidebar__empty",
-        text: "OfferAgent is ready for a conversation.",
+        text: "准备好开始新对话了。",
       });
     }
 
@@ -274,33 +1061,20 @@ class OfferAgentSidebarView extends ItemView {
       diagnostic.dataset.code = viewModel.conversation.error.code;
     }
 
-    for (const item of viewModel.presentation.transcript) {
+    const stoppedRevisionButtons: Array<{ agentRunId: string; button: HTMLButtonElement }> = [];
+    for (const [index, item] of viewModel.presentation.transcript.entries()) {
+      let itemElement: HTMLElement;
       if (item.kind === "message") {
-        const { message } = item;
-        const messageElement = transcript.createDiv({
-          cls: `offeragent-sidebar__message offeragent-sidebar__message--${message.role}`,
-          text: message.text,
-        });
-        if (message.citations?.length) {
-          const sources = messageElement.createDiv({ cls: "offeragent-sidebar__citations" });
-          for (const [index, citation] of message.citations.entries()) {
-            const link = sources.createEl("a", {
-              cls: "offeragent-sidebar__citation",
-              text: `[${index + 1}] ${citation.title}`,
-            });
-            link.href = citation.url;
-            link.target = "_blank";
-            link.rel = "noopener noreferrer";
-          }
-        }
+        itemElement = this.#appendMessage(transcript, item, index);
       } else if (item.kind === "vault_change") {
         const { change: batch } = item;
         const card = transcript.createDiv({ cls: "offeragent-sidebar__change-batch" });
+        itemElement = card;
         card.dataset.status = batch.status;
         card.createEl("h3", { text: batch.task });
         card.createDiv({
           cls: "offeragent-sidebar__change-batch-status",
-          text: `Vault Change Batch: ${batch.status}`,
+          text: `Vault 变更：${VAULT_CHANGE_STATUS_LABELS[batch.status]}`,
         });
         if (batch.message) {
           card.createDiv({
@@ -310,7 +1084,9 @@ class OfferAgentSidebarView extends ItemView {
         }
         const actions = card.createEl("ul", { cls: "offeragent-sidebar__change-actions" });
         for (const action of batch.actions) {
-          actions.createEl("li", { text: `${action.operation}: ${action.path}` });
+          actions.createEl("li", {
+            text: `${VAULT_ACTION_LABELS[action.operation] ?? action.operation}：${action.path}`,
+          });
         }
         for (const conflict of batch.conflicts ?? []) {
           card.createEl("pre", {
@@ -321,7 +1097,7 @@ class OfferAgentSidebarView extends ItemView {
         if (batch.status === "pending") {
           const apply = card.createEl("button", {
             cls: "offeragent-sidebar__change-apply",
-            text: "Apply all",
+            text: "全部应用",
           });
           apply.type = "button";
           apply.addEventListener("click", () => {
@@ -329,7 +1105,7 @@ class OfferAgentSidebarView extends ItemView {
           });
           const reject = card.createEl("button", {
             cls: "offeragent-sidebar__change-reject",
-            text: "Reject all",
+            text: "全部拒绝",
           });
           reject.type = "button";
           reject.addEventListener("click", () => {
@@ -338,30 +1114,17 @@ class OfferAgentSidebarView extends ItemView {
         } else if (batch.status === "applied") {
           const undo = card.createEl("button", {
             cls: "offeragent-sidebar__change-undo",
-            text: "Undo",
+            text: "撤销",
           });
           undo.type = "button";
           undo.addEventListener("click", () => {
             void this.#controller.undoVaultChange(batch.batchId);
           });
         }
-      } else if (item.kind === "activity") {
-        const presented = item.activity;
-        const activity = transcript.createEl("details", {
-          cls: "offeragent-sidebar__tool-activity",
-        });
-        activity.dataset.status = presented.status;
-        const summary = activity.createEl("summary", {
-          text: presented.label,
-        });
-        summary.setAttribute("aria-expanded", "false");
-        summary.setAttribute("aria-label", `${presented.label}. Press Enter to show details.`);
-        activity.addEventListener("toggle", () => {
-          summary.setAttribute("aria-expanded", activity.open ? "true" : "false");
-        });
-        activity.createEl("pre", {
-          text: presented.details,
-        });
+      } else if (item.kind === "activity_error") {
+        itemElement = this.#appendActivityError(transcript, item);
+      } else if (item.kind === "activity_summary") {
+        itemElement = this.#appendActivitySummary(transcript, item);
       } else {
         const runStatus = transcript.createDiv({
           cls: "offeragent-sidebar__run-status",
@@ -369,32 +1132,351 @@ class OfferAgentSidebarView extends ItemView {
         });
         runStatus.dataset.agentRunId = item.agentRunId;
         runStatus.dataset.status = item.status;
+        if (item.revision) {
+          const revise = runStatus.createEl("button", {
+            cls: "offeragent-sidebar__revise-stopped",
+            text: item.revision.label,
+          });
+          revise.type = "button";
+          revise.disabled = !item.revision.enabled;
+          revise.setAttribute("aria-label", "将已停止运行的原提示词放入输入框");
+          if (item.revision.requiresConfirmation) {
+            revise.setAttribute("title", "当前草稿或图片会在确认后被原提示词替换");
+          }
+          stoppedRevisionButtons.push({ agentRunId: item.agentRunId, button: revise });
+          revise.addEventListener("click", () => {
+            const requiresConfirmation =
+              this.#controller.stoppedRunRevisionRequiresConfirmation(item.agentRunId);
+            if (
+              requiresConfirmation &&
+              !window.confirm("当前草稿和图片会被已停止运行的原提示词替换。继续吗？")
+            ) return;
+            this.#controller.reviseStoppedRun(
+              item.agentRunId,
+              requiresConfirmation,
+            );
+          });
+        }
+        itemElement = runStatus;
       }
+      this.#transcriptItemElements.set(this.#transcriptItemKey(item, index), itemElement);
     }
+
+    const newContentButton = container.createEl("button", {
+      cls: "offeragent-sidebar__new-content",
+      text: "新内容",
+    });
+    this.#newContentButton = newContentButton;
+    newContentButton.type = "button";
+    newContentButton.setAttribute("aria-label", "查看最新内容");
+    newContentButton.addEventListener("click", () => {
+      this.#controller.resumeTranscriptFollowing();
+      transcript.scrollTop = transcript.scrollHeight;
+    });
 
     const composer = container.createEl("form", { cls: "offeragent-sidebar__composer" });
     const context = composer.createDiv({ cls: "offeragent-sidebar__context" });
-    for (const chip of viewModel.presentation.composer.contextChips) {
-      context.createDiv({
-        cls: "offeragent-sidebar__context-chip",
+    for (const [index, chip] of viewModel.presentation.composer.contextChips.entries()) {
+      const chipElement = context.createDiv({
+        cls: "offeragent-sidebar__context-chip offeragent-sidebar__context-chip--pinned",
+      });
+      const open = chipElement.createEl("button", {
+        cls: "offeragent-sidebar__context-open",
         text: chip.label,
       });
+      open.type = "button";
+      open.setAttribute("aria-label", `打开已固定来源 ${chip.label}`);
+      open.addEventListener("click", () => void this.#contextSources.openDocument(chip.path));
+      const remove = chipElement.createEl("button", {
+        cls: "offeragent-sidebar__context-remove",
+        text: "×",
+      });
+      remove.type = "button";
+      remove.setAttribute("aria-label", `移除已固定来源 ${chip.label}`);
+      remove.addEventListener("click", () => this.#controller.removePinnedContext(index));
     }
     if (viewModel.presentation.settings.fastMode?.enabled) {
       context.createDiv({
         cls: "offeragent-sidebar__context-chip offeragent-sidebar__context-chip--fast",
-        text: "Fast Mode",
+        text: "快速模式",
       });
     }
     const input = composer.createEl("textarea", { cls: "offeragent-sidebar__input" });
-    input.placeholder = "Ask OfferAgent…";
-    input.setAttribute("aria-label", "Message OfferAgent");
-    input.disabled = viewModel.presentation.composer.primaryAction.kind !== "send";
+    this.#composerInput = input;
+    input.placeholder = "向 OfferAgent 提问…";
+    input.setAttribute("aria-label", "给 OfferAgent 的消息");
+    input.value = viewModel.presentation.composer.draftText;
+    let isComposing = false;
+    let mentionRenderPending = false;
+    input.addEventListener("input", () => {
+      this.#mentionDismissed = false;
+      this.#mentionIndex = 0;
+      this.#controller.setComposerDraft(input.value);
+      for (const { agentRunId, button } of stoppedRevisionButtons) {
+        button.disabled = !this.#controller.canReviseStoppedRun(agentRunId);
+        const requiresConfirmation =
+          this.#controller.stoppedRunRevisionRequiresConfirmation(agentRunId);
+        button.setAttribute(
+          "title",
+          requiresConfirmation ? "当前草稿或图片会在确认后被原提示词替换" : "",
+        );
+      }
+      const activeMention = mentionQuery(input.value, input.selectionStart ?? input.value.length);
+      const shouldReconcileMention = Boolean(activeMention) || this.#mentionVisible;
+      this.#mentionVisible = Boolean(activeMention);
+      if (isComposing) {
+        mentionRenderPending ||= shouldReconcileMention;
+      } else if (shouldReconcileMention) {
+        this.#render(this.#controller.getViewModel());
+      }
+    });
+    let suppressCompositionEnter = false;
+    input.addEventListener("compositionstart", () => {
+      isComposing = true;
+      suppressCompositionEnter = false;
+    });
+    input.addEventListener("compositionend", () => {
+      isComposing = false;
+      suppressCompositionEnter = true;
+      if (mentionRenderPending) {
+        mentionRenderPending = false;
+        this.#render(this.#controller.getViewModel());
+      }
+      setTimeout(() => {
+        suppressCompositionEnter = false;
+      }, 0);
+    });
+    const acceptImages = async (files: File[]): Promise<void> => {
+      this.#controller.setComposerDraft(input.value);
+      let finishImport: (() => void) | undefined;
+      try {
+        finishImport = this.#controller.beginAttachmentImport(files.map((file) => ({
+          mediaType: file.type,
+          size: file.size,
+        })));
+        const images = await Promise.all(files.map(async (file) => ({
+          bytes: new Uint8Array(await file.arrayBuffer()),
+          fileName: file.name,
+          mediaType: file.type,
+        })));
+        this.#controller.attachImages(images);
+      } catch {
+        // The controller preserves the prior complete draft and publishes validation errors.
+      } finally {
+        finishImport?.();
+      }
+    };
+    input.addEventListener("paste", (event) => {
+      const files = [...(event.clipboardData?.files ?? [])];
+      if (files.length === 0) return;
+      event.preventDefault();
+      const clipboardText = event.clipboardData?.getData("text/plain") ?? "";
+      if (clipboardText) {
+        const start = input.selectionStart ?? input.value.length;
+        const end = input.selectionEnd ?? start;
+        input.value = `${input.value.slice(0, start)}${clipboardText}${input.value.slice(end)}`;
+        const cursor = start + clipboardText.length;
+        input.setSelectionRange(cursor, cursor);
+        this.#controller.setComposerDraft(input.value);
+      }
+      void acceptImages(files);
+    });
+    composer.addEventListener("dragover", (event) => {
+      if (event.dataTransfer?.files.length) event.preventDefault();
+    });
+    composer.addEventListener("drop", (event) => {
+      const files = [...(event.dataTransfer?.files ?? [])];
+      if (files.length === 0) return;
+      event.preventDefault();
+      void acceptImages(files);
+    });
+    const attachmentStrip = viewModel.presentation.composer.attachments.length > 0
+      ? composer.createDiv({ cls: "offeragent-sidebar__attachment-strip" })
+      : undefined;
+    for (const [index, presented] of viewModel.presentation.composer.attachments.entries()) {
+      const attachment = attachmentStrip!.createDiv({ cls: "offeragent-sidebar__attachment" });
+      attachment.draggable = !viewModel.presentation.composer.isPreparingAttachments;
+      attachment.addEventListener("dragstart", (event) => {
+        event.dataTransfer?.setData("application/x-offeragent-attachment-index", `${index}`);
+      });
+      attachment.addEventListener("dragover", (event) => {
+        if (event.dataTransfer?.types.includes("application/x-offeragent-attachment-index")) {
+          event.preventDefault();
+        }
+      });
+      attachment.addEventListener("drop", (event) => {
+        const transferType = "application/x-offeragent-attachment-index";
+        if (!event.dataTransfer?.types.includes(transferType)) return;
+        const payload = event.dataTransfer.getData(transferType);
+        if (!/^\d+$/.test(payload)) return;
+        const source = Number(payload);
+        if (!Number.isSafeInteger(source)) return;
+        event.preventDefault();
+        this.#controller.reorderDraftImage(source, index);
+      });
+      const previewBytes = Uint8Array.from(presented.previewBytes);
+      const previewUrl = URL.createObjectURL(new Blob([previewBytes.buffer], {
+        type: presented.mediaType,
+      }));
+      this.#draftPreviewUrls.push(previewUrl);
+      const preview = attachment.createEl("img", {
+        cls: "offeragent-sidebar__attachment-preview",
+      });
+      preview.src = previewUrl;
+      preview.setAttribute("alt", `图片预览 ${index + 1}：${presented.fileName}`);
+      attachment.createEl("span", {
+        text: `${index + 1}. ${presented.fileName} (${Math.ceil(presented.size / 1024)} KiB)`,
+      });
+      const moveUp = attachment.createEl("button", {
+        cls: "offeragent-sidebar__attachment-move-up",
+        text: "↑",
+      });
+      moveUp.type = "button";
+      moveUp.disabled = viewModel.presentation.composer.isPreparingAttachments || index === 0;
+      moveUp.setAttribute("aria-label", `将 ${presented.fileName} 前移`);
+      moveUp.addEventListener("click", () => this.#controller.moveDraftImage(index, -1));
+      const moveDown = attachment.createEl("button", {
+        cls: "offeragent-sidebar__attachment-move-down",
+        text: "↓",
+      });
+      moveDown.type = "button";
+      moveDown.disabled = viewModel.presentation.composer.isPreparingAttachments ||
+        index === viewModel.presentation.composer.attachments.length - 1;
+      moveDown.setAttribute("aria-label", `将 ${presented.fileName} 后移`);
+      moveDown.addEventListener("click", () => this.#controller.moveDraftImage(index, 1));
+      const removeAttachment = attachment.createEl("button", {
+        cls: "offeragent-sidebar__attachment-remove",
+        text: "×",
+      });
+      removeAttachment.type = "button";
+      removeAttachment.disabled = viewModel.presentation.composer.isPreparingAttachments;
+      removeAttachment.setAttribute("aria-label", `移除 ${presented.fileName}`);
+      removeAttachment.addEventListener("click", () => this.#controller.removeDraftImage(index));
+    }
     const controls = composer.createDiv({ cls: "offeragent-sidebar__composer-controls" });
+    const filePicker = controls.createEl("input", { cls: "offeragent-sidebar__file-picker" });
+    filePicker.type = "file";
+    filePicker.tabIndex = -1;
+    filePicker.multiple = true;
+    filePicker.accept = "image/png,image/jpeg,image/webp,image/gif";
+    filePicker.setAttribute("aria-label", "添加图片（最多 20 张）");
+    filePicker.disabled = viewModel.presentation.composer.isPreparingAttachments;
+    filePicker.addEventListener("change", () => {
+      const files = [...(filePicker.files ?? [])];
+      if (files.length > 0) void acceptImages(files);
+    });
+    const addButton = controls.createEl("button", {
+      cls: "offeragent-sidebar__add",
+      text: "+",
+    });
+    addButton.type = "button";
+    addButton.setAttribute("aria-label", "添加上下文或图片");
+    addButton.disabled = viewModel.presentation.composer.primaryAction.kind !== "send" ||
+      viewModel.presentation.composer.isPreparingAttachments;
+    addButton.addEventListener("click", () => {
+      this.#addMenuOpen = !this.#addMenuOpen;
+      this.#documentChooserOpen = false;
+      this.#render(this.#controller.getViewModel());
+    });
+    if (this.#addMenuOpen) {
+      const addMenu = composer.createDiv({ cls: "offeragent-sidebar__add-menu" });
+      const pinCurrent = addMenu.createEl("button", {
+        cls: "offeragent-sidebar__pin-current",
+        text: "固定当前笔记",
+      });
+      pinCurrent.type = "button";
+      pinCurrent.addEventListener("click", () => {
+        const path = this.#contextSources.currentDocumentPath();
+        if (path) {
+          if (this.#tryAddPinnedContext({ kind: "document", path })) {
+            this.#addMenuOpen = false;
+            this.#render(this.#controller.getViewModel());
+          }
+        }
+        else new Notice("请先打开一篇 Vault 笔记，再固定当前笔记。");
+      });
+      const chooseDocument = addMenu.createEl("button", {
+        cls: "offeragent-sidebar__choose-document",
+        text: "选择 Vault 文档",
+      });
+      chooseDocument.type = "button";
+      chooseDocument.addEventListener("click", () => {
+        this.#addMenuOpen = false;
+        this.#documentChooserOpen = true;
+        this.#documentChooserQuery = "";
+        this.#render(this.#controller.getViewModel());
+      });
+      const addImages = addMenu.createEl("button", {
+        cls: "offeragent-sidebar__attach",
+        text: "添加图片",
+      });
+      addImages.type = "button";
+      addImages.addEventListener("click", () => filePicker.click());
+    }
+    const mention = !this.#mentionDismissed
+      ? mentionQuery(
+          input.value,
+          restoreComposerFocus ? selectionStart ?? input.value.length : input.value.length,
+        )
+      : undefined;
+    this.#mentionVisible = Boolean(mention);
+    if (this.#documentChooserOpen) {
+      const chooser = composer.createDiv({ cls: "offeragent-sidebar__document-chooser" });
+      chooser.setAttribute("role", "listbox");
+      const search = chooser.createEl("input", {
+        cls: "offeragent-sidebar__document-search",
+      });
+      search.type = "search";
+      search.value = this.#documentChooserQuery;
+      search.placeholder = "搜索 Vault 文档";
+      search.setAttribute("aria-label", "搜索要固定的 Vault 文档");
+      const results = chooser.createDiv({ cls: "offeragent-sidebar__document-results" });
+      const renderResults = (): void => {
+        results.empty();
+        for (const path of this.#contextSources.listDocuments(search.value)) {
+          const choice = results.createEl("button", {
+            cls: "offeragent-sidebar__document-choice",
+            text: path,
+          });
+          choice.type = "button";
+          choice.addEventListener("click", () => {
+            if (!this.#tryAddPinnedContext({ kind: "document", path })) return;
+            this.#documentChooserOpen = false;
+            this.#documentChooserQuery = "";
+            this.#render(this.#controller.getViewModel());
+          });
+        }
+      };
+      search.addEventListener("input", () => {
+        this.#documentChooserQuery = search.value;
+        renderResults();
+      });
+      renderResults();
+    } else if (mention) {
+      const chooser = composer.createDiv({ cls: "offeragent-sidebar__document-chooser" });
+      chooser.setAttribute("role", "listbox");
+      for (const [index, path] of this.#contextSources.listDocuments(mention.query).entries()) {
+        const choice = chooser.createEl("button", {
+          cls: index === this.#mentionIndex
+            ? "offeragent-sidebar__document-choice is-selected"
+            : "offeragent-sidebar__document-choice",
+          text: path,
+        });
+        choice.type = "button";
+        choice.addEventListener("click", () => {
+          if (!this.#tryAddPinnedContext({ kind: "document", path })) return;
+          const next = `${input.value.slice(0, mention.start)}${input.value.slice(mention.end)}`;
+          this.#mentionDismissed = true;
+          this.#mentionVisible = false;
+          this.#controller.setComposerDraft(next);
+          this.#render(this.#controller.getViewModel());
+        });
+      }
+    }
     const modelSelect = controls.createEl("select", {
       cls: "offeragent-sidebar__model-select",
     });
-    modelSelect.setAttribute("aria-label", "Conversation model");
+    modelSelect.setAttribute("aria-label", "选择对话模型");
     for (const model of viewModel.conversation.models) {
       const option = modelSelect.createEl("option", { text: model.label });
       option.value = model.id;
@@ -406,19 +1488,38 @@ class OfferAgentSidebarView extends ItemView {
     modelSelect.addEventListener("change", () => {
       void this.#controller.selectModel(modelSelect.value);
     });
-    controls.createDiv({
+    const permission = controls.createDiv({
       cls: "offeragent-sidebar__permission",
       text: PERMISSION_LABELS[viewModel.presentation.composer.permissionMode],
     });
+    permission.setAttribute(
+      "aria-label",
+      PERMISSION_ACCESSIBLE_LABELS[viewModel.presentation.composer.permissionMode],
+    );
+    permission.setAttribute("role", "status");
     const primary = viewModel.presentation.composer.primaryAction;
     const primaryButton = controls.createEl("button", {
       cls: `offeragent-sidebar__primary offeragent-sidebar__${primary.kind}`,
       text: primary.label,
     });
     primaryButton.type = primary.kind === "send" ? "submit" : "button";
+    primaryButton.setAttribute(
+      "aria-label",
+      primary.kind === "send"
+        ? "发送消息"
+        : primary.kind === "stop"
+          ? "停止当前运行"
+          : "继续中断的运行",
+    );
+    const canSend =
+      primary.kind === "send" &&
+      viewModel.runtime.state === "connected" &&
+      Boolean(viewModel.conversation.selectedModelId) &&
+      !viewModel.presentation.composer.isPreparingAttachments &&
+      !viewModel.presentation.composer.isSending;
     primaryButton.disabled =
       viewModel.runtime.state !== "connected" ||
-      (primary.kind === "send" && !viewModel.conversation.selectedModelId);
+      (primary.kind === "send" && !canSend);
     if (primary.kind === "stop") {
       primaryButton.addEventListener("click", () => this.#controller.stopAgentRun());
     } else if (primary.kind === "resume" && primary.agentRunId) {
@@ -426,19 +1527,81 @@ class OfferAgentSidebarView extends ItemView {
         void this.#controller.resumeAgentRun(primary.agentRunId!);
       });
     }
+    const submitDraft = () => {
+      if (!canSend) return;
+      const text = input.value;
+      if (!text.trim() && viewModel.presentation.composer.attachments.length === 0) return;
+      this.#controller.setComposerDraft(text);
+      void this.#controller.sendMessage(text).catch(() => undefined);
+    };
+    input.addEventListener("keydown", (event) => {
+      const activeMention = !this.#mentionDismissed
+        ? mentionQuery(input.value, input.selectionStart ?? input.value.length)
+        : undefined;
+      const matches = activeMention
+        ? this.#contextSources.listDocuments(activeMention.query)
+        : [];
+      if (activeMention && matches.length > 0 && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        this.#mentionIndex = (this.#mentionIndex + direction + matches.length) % matches.length;
+        for (const [index, choice] of Array.from(
+          composer.querySelectorAll<HTMLButtonElement>(".offeragent-sidebar__document-choice"),
+        ).entries()) {
+          choice.classList.toggle("is-selected", index === this.#mentionIndex);
+        }
+        return;
+      }
+      if (activeMention && matches.length > 0 && event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        const selectedPath = matches[Math.min(this.#mentionIndex, matches.length - 1)]!;
+        if (!this.#tryAddPinnedContext({ kind: "document", path: selectedPath })) return;
+        const cursor = input.selectionStart ?? input.value.length;
+        const next = `${input.value.slice(0, activeMention.start)}${input.value.slice(cursor)}`;
+        this.#mentionDismissed = true;
+        this.#mentionVisible = false;
+        this.#controller.setComposerDraft(next);
+        this.#render(this.#controller.getViewModel());
+        return;
+      }
+      if (activeMention && event.key === "Escape") {
+        event.preventDefault();
+        this.#mentionDismissed = true;
+        this.#mentionVisible = false;
+        this.#render(this.#controller.getViewModel());
+        return;
+      }
+      if (
+        event.key !== "Enter" ||
+        event.shiftKey ||
+        event.isComposing ||
+        event.keyCode === 229 ||
+        isComposing ||
+        suppressCompositionEnter
+      ) return;
+      event.preventDefault();
+      submitDraft();
+    });
     composer.addEventListener("submit", (event) => {
       event.preventDefault();
-      if (primary.kind !== "send") return;
-      const text = input.value;
-      if (!text.trim()) return;
-      input.value = "";
-      void this.#controller.sendMessage(text);
+      submitDraft();
     });
+    this.#renderedViewModel = viewModel;
+    this.#syncTranscriptScroll(viewModel, frozenScrollTop);
+    if (restoreComposerFocus && typeof input.focus === "function") {
+      input.focus();
+      if (
+        selectionStart !== undefined &&
+        selectionEnd !== undefined &&
+        typeof input.setSelectionRange === "function"
+      ) input.setSelectionRange(selectionStart, selectionEnd);
+    }
   }
 }
 
 export default class OfferAgentPlugin extends Plugin {
   #controller?: SidebarController;
+  #researchBrowser?: ResearchBrowser;
   #runtime?: RuntimeSupervisor;
   #settings: OfferAgentPluginSettings = { ...DEFAULT_SETTINGS };
 
@@ -469,6 +1632,9 @@ export default class OfferAgentPlugin extends Plugin {
         formatDate: (date, format) => localMoment(date, "YYYY-MM-DD", true).format(format),
       },
     );
+    const projectEvidence = new ProjectEvidenceAdapter(this.app.vault);
+    const researchBrowser = createHostResearchBrowser();
+    this.#researchBrowser = researchBrowser;
     let runtime!: RuntimeSupervisor;
     const checkpointStore = new GitCheckpointStore(vaultRoot);
     const changeCoordinator = new VaultChangeCoordinator(
@@ -487,10 +1653,17 @@ export default class OfferAgentPlugin extends Plugin {
     runtime = new RuntimeSupervisor({
       runtimePath,
       statePath: process.env.OFFERAGENT_RUNTIME_STATE_PATH,
+      onCancelAgentRun: (agentRunId) => researchBrowser.cancelRun(agentRunId),
       toolExecutor: {
         execute: (event) =>
           event.tool.name === "vault_propose_changes"
             ? changeCoordinator.execute(event)
+            : event.tool.name === "research_browser"
+              ? researchBrowser.execute(event)
+            : event.tool.name === "project_list" ||
+                event.tool.name === "project_search" ||
+                event.tool.name === "project_read"
+              ? projectEvidence.execute(event)
             : readTools.execute(event),
       },
     });
@@ -506,15 +1679,66 @@ export default class OfferAgentPlugin extends Plugin {
         leaf,
         this.#requiredController(),
         () => this.#openSettings(),
+        {
+          currentDocumentPath: () => this.app.workspace.getActiveFile()?.path,
+          listDocuments: (query) => {
+            const normalized = query.trim().toLocaleLowerCase();
+            return this.app.vault.getFiles()
+              .filter((file) => file.extension === "md" && file.path.toLocaleLowerCase() !== "agent.md")
+              .map((file) => file.path)
+              .filter((path) => !normalized || path.toLocaleLowerCase().includes(normalized))
+              .sort((left, right) => left.localeCompare(right))
+              .slice(0, 8);
+          },
+          openDocument: async (path, lineStart, lineEnd) => {
+            await this.app.workspace.openLinkText(path, "", false);
+            if (lineStart === undefined || lineEnd === undefined) return;
+            const editor = this.app.workspace.activeEditor?.editor;
+            if (!editor) return;
+            const lastLine = Math.max(0, editor.lineCount() - 1);
+            const from = { line: Math.min(lastLine, Math.max(0, lineStart - 1)), ch: 0 };
+            const targetLine = Math.min(lastLine, Math.max(from.line, lineEnd - 1));
+            const to = { line: targetLine, ch: editor.getLine(targetLine).length };
+            editor.setSelection(from, to);
+            editor.scrollIntoView({ from, to }, true);
+          },
+        },
       ),
     );
-    this.addRibbonIcon("sparkles", "Open OfferAgent", () => {
+    this.addRibbonIcon("sparkles", "打开 OfferAgent", () => {
       void this.#openSidebar();
     });
     this.addCommand({
       id: "open-offeragent-sidebar",
-      name: "Open OfferAgent sidebar",
+      name: "打开 OfferAgent 侧栏",
       callback: () => {
+        void this.#openSidebar();
+      },
+    });
+    this.addCommand({
+      id: "pin-selection-to-offeragent",
+      name: "将选区固定到 OfferAgent",
+      editorCallback: (editor, view) => {
+        const path = view.file?.path;
+        const selectedText = editor.getSelection();
+        if (!path || !selectedText.trim()) {
+          new Notice("请先在 Vault 笔记中选择文本，再固定到 OfferAgent。");
+          return;
+        }
+        const from = editor.getCursor("from");
+        const to = editor.getCursor("to");
+        const inclusiveEndLine = to.ch === 0 && to.line > from.line ? to.line : to.line + 1;
+        try {
+          this.#requiredController().addPinnedContext({
+            kind: "selection",
+            path,
+            lineStart: from.line + 1,
+            lineEnd: inclusiveEndLine,
+          });
+        } catch (error) {
+          new Notice(error instanceof Error ? error.message : String(error));
+          return;
+        }
         void this.#openSidebar();
       },
     });
@@ -531,6 +1755,7 @@ export default class OfferAgentPlugin extends Plugin {
 
   async onunload(): Promise<void> {
     await this.#controller?.stop();
+    await this.#researchBrowser?.close();
     this.app.workspace.detachLeavesOfType(SIDEBAR_VIEW_TYPE);
   }
 
@@ -554,15 +1779,15 @@ export default class OfferAgentPlugin extends Plugin {
 
   async getHostedWebSearchCapability() {
     const modelId = this.#controller?.getViewModel().conversation.selectedModelId;
-    if (!modelId) throw new Error("Select a model before checking Hosted Web Search.");
-    if (!this.#runtime) throw new Error("OfferAgent Runtime is not connected.");
+    if (!modelId) throw new Error("检查 Hosted Web Search 前请选择模型。");
+    if (!this.#runtime) throw new Error("OfferAgent Runtime 尚未连接。");
     return this.#runtime.getHostedWebSearchCapability(modelId);
   }
 
   async reprobeHostedWebSearch() {
     const modelId = this.#controller?.getViewModel().conversation.selectedModelId;
-    if (!modelId) throw new Error("Select a model before probing Hosted Web Search.");
-    if (!this.#runtime) throw new Error("OfferAgent Runtime is not connected.");
+    if (!modelId) throw new Error("重新探测 Hosted Web Search 前请选择模型。");
+    if (!this.#runtime) throw new Error("OfferAgent Runtime 尚未连接。");
     return this.#runtime.reprobeHostedWebSearch(modelId);
   }
 
@@ -589,7 +1814,7 @@ export default class OfferAgentPlugin extends Plugin {
 
     const leaf = this.app.workspace.getRightLeaf(false);
     if (!leaf) {
-      new Notice("OfferAgent could not open the right sidebar.");
+      new Notice("OfferAgent 无法打开右侧栏。");
       return;
     }
     await leaf.setViewState({ type: SIDEBAR_VIEW_TYPE, active: true });
@@ -597,7 +1822,7 @@ export default class OfferAgentPlugin extends Plugin {
   }
 
   #requiredController(): SidebarController {
-    if (!this.#controller) throw new Error("OfferAgent controller is not initialized.");
+    if (!this.#controller) throw new Error("OfferAgent 控制器尚未初始化。");
     return this.#controller;
   }
 

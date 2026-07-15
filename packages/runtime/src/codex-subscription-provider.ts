@@ -7,6 +7,7 @@ import { EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
 import {
   MAX_LOCAL_TOOL_ARGUMENT_BYTES,
   MAX_PROVIDER_REASONING_BYTES,
+  MAX_VAULT_PROPOSAL_ARGUMENT_BYTES,
   ModelProviderError,
   type ModelConversationItem,
   type ModelProvider,
@@ -14,11 +15,14 @@ import {
   type ModelStreamEvent,
 } from "./model-provider";
 
-function boundedToolArguments(encoded: string): string {
-  if (Buffer.byteLength(encoded, "utf8") > MAX_LOCAL_TOOL_ARGUMENT_BYTES) {
+function boundedToolArguments(
+  encoded: string,
+  maximumBytes = MAX_LOCAL_TOOL_ARGUMENT_BYTES,
+): string {
+  if (Buffer.byteLength(encoded, "utf8") > maximumBytes) {
     throw new ModelProviderError(
       "provider_error",
-      `Codex local tool arguments exceed ${MAX_LOCAL_TOOL_ARGUMENT_BYTES} UTF-8 bytes.`,
+      `Codex local tool arguments exceed ${maximumBytes} UTF-8 bytes.`,
     );
   }
   return encoded;
@@ -32,6 +36,23 @@ function isHttpUrl(value: unknown): value is string {
   } catch {
     return false;
   }
+}
+
+function providerInstructions(request: ModelRequest): string {
+  if (!request.imageSubmission) return request.instructions;
+  return `${request.instructions}\n\nRuntime-verified Interview Submission metadata:\n` +
+    `- ordered image count: ${request.imageSubmission.imageCount}\n` +
+    `- source fingerprint: ${request.imageSubmission.sourceFingerprint}\n` +
+    "When cataloging this image submission, pass this exact fingerprint to interview_catalog " +
+    "before proposing any Vault changes. Treat this metadata as authoritative and do not derive " +
+    "a replacement fingerprint from image text.";
+}
+
+function isUnsupportedVisionDetail(detail: string): boolean {
+  if (!/(input_image|image input|vision)/i.test(detail)) return false;
+  return /(unsupported|not supported|does not support|not allowed|unavailable)/i.test(detail) ||
+    /(?:unknown|unrecognized|invalid)\s+(?:parameter|field)[^\n]*(?:input_image|image input|vision)/i.test(detail) ||
+    /(?:input_image|image input|vision)[^\n]*(?:unknown|unrecognized|invalid)\s+(?:parameter|field)/i.test(detail);
 }
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -188,8 +209,8 @@ export class CodexSubscriptionProvider implements ModelProvider {
         body: JSON.stringify({
           model: request.model,
           ...(request.fastMode ? { service_tier: "priority" } : {}),
-          instructions: request.instructions,
-          input: request.input.map(encodeConversationItem),
+          instructions: providerInstructions(request),
+          input: request.input.map((item) => encodeConversationItem(item, request.imageInputs)),
           tools: request.tools.map((tool) =>
             tool.kind === "hosted"
               ? { type: "web_search" }
@@ -264,7 +285,10 @@ export class CodexSubscriptionProvider implements ModelProvider {
             ) {
               functionArguments.set(
                 event.item_id,
-                boundedToolArguments(`${functionArguments.get(event.item_id) ?? ""}${event.delta}`),
+                boundedToolArguments(
+                  `${functionArguments.get(event.item_id) ?? ""}${event.delta}`,
+                  MAX_VAULT_PROPOSAL_ARGUMENT_BYTES,
+                ),
               );
             } else if (event.type === "response.output_item.done") {
               const item = event.item;
@@ -366,6 +390,9 @@ export class CodexSubscriptionProvider implements ModelProvider {
                       : typeof call.id === "string"
                         ? functionArguments.get(call.id) ?? "{}"
                         : "{}",
+                    call.name === "vault_propose_changes"
+                      ? MAX_VAULT_PROPOSAL_ARGUMENT_BYTES
+                      : MAX_LOCAL_TOOL_ARGUMENT_BYTES,
                   );
                   let arguments_: unknown;
                   try {
@@ -418,10 +445,19 @@ export class CodexSubscriptionProvider implements ModelProvider {
               event.type === "response.failed" ||
               event.type === "error"
             ) {
-              if (/web_search/i.test(JSON.stringify(event)) && /(unsupported|unknown|invalid|parameter|tool)/i.test(JSON.stringify(event))) {
+              const detail = JSON.stringify(event);
+              if (/web_search/i.test(detail) && /(unsupported|unknown|invalid|parameter|tool)/i.test(detail)) {
                 throw new ModelProviderError(
                   "unsupported_capability",
                   "This Codex backend does not support hosted Web Search.",
+                  { capability: "hosted_web_search" },
+                );
+              }
+              if (isUnsupportedVisionDetail(detail)) {
+                throw new ModelProviderError(
+                  "unsupported_capability",
+                  "This Codex backend or model does not support image input.",
+                  { capability: "vision" },
                 );
               }
               throw new ModelProviderError(
@@ -547,6 +583,18 @@ export class CodexSubscriptionProvider implements ModelProvider {
       throw new ModelProviderError(
         "unsupported_capability",
         "This Codex backend does not support hosted Web Search.",
+        { capability: "hosted_web_search" },
+      );
+    }
+    if (
+      context === "agent_run" &&
+      (response.status === 400 || response.status === 404) &&
+      isUnsupportedVisionDetail(detail)
+    ) {
+      throw new ModelProviderError(
+        "unsupported_capability",
+        "This Codex backend or model does not support image input.",
+        { capability: "vision" },
       );
     }
     if (
@@ -570,6 +618,10 @@ export class CodexSubscriptionProvider implements ModelProvider {
 function isLocalToolName(value: unknown): value is LocalToolName {
   return (
     value === "daily_note_context" ||
+    value === "interview_catalog" ||
+    value === "project_list" ||
+    value === "project_read" ||
+    value === "project_search" ||
     value === "skill_read" ||
     value === "hosted_web_search_probe" ||
     value === "vault_list" ||
@@ -580,11 +632,22 @@ function isLocalToolName(value: unknown): value is LocalToolName {
   );
 }
 
-function encodeConversationItem(item: ModelConversationItem): Record<string, unknown> {
+function encodeConversationItem(
+  item: ModelConversationItem,
+  imageInputs: ModelRequest["imageInputs"],
+): Record<string, unknown> {
   if (item.type === "user_message") {
+    const images = [...(item.attachments ?? [])]
+      .sort((left, right) => left.order - right.order)
+      .flatMap((attachment) => {
+        const image = imageInputs?.find(
+          ({ attachmentId }) => attachmentId === attachment.attachmentId,
+        );
+        return image ? [{ type: "input_image", image_url: image.dataUrl }] : [];
+      });
     return {
       role: "user",
-      content: [{ type: "input_text", text: item.text }],
+      content: [{ type: "input_text", text: item.text }, ...images],
     };
   }
   if (item.type === "assistant_message") {

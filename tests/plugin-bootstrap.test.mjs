@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import os from "node:os";
 import path from "node:path";
@@ -71,6 +72,76 @@ test("the sidebar controller starts and stops the bundled Runtime", async (t) =>
 
   await controller.stop();
   assert.equal(controller.getViewModel().runtime.state, "idle");
+});
+
+test("the bundled Runtime uses the persisted user proxy when Obsidian has stale environment", async (t) => {
+  const { RuntimeSupervisor } = await loadControllerModule();
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-user-proxy-"));
+  const authPath = path.join(temporaryDirectory, "auth.json");
+  await writeFile(authPath, JSON.stringify({ tokens: { access_token: "user-proxy-token" } }), "utf8");
+
+  const proxy = createServer();
+  proxy.on("connect", (request, socket) => {
+    if (request.url !== "offeragent.invalid:80") {
+      socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      return;
+    }
+    socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    socket.once("data", () => {
+      const body = JSON.stringify({
+        models: [{ slug: "proxy-model", display_name: "Proxy Model" }],
+      });
+      socket.end(
+        `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
+      );
+    });
+  });
+  await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+  const proxyUrl = `http://127.0.0.1:${proxy.address().port}`;
+
+  const previousEnvironment = Object.fromEntries(
+    [
+      "ALL_PROXY",
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "NO_PROXY",
+      "OFFERAGENT_CODEX_AUTH_FILE",
+      "OFFERAGENT_CODEX_BASE_URL",
+    ].map((name) => [name, process.env[name]]),
+  );
+  for (const name of ["ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]) {
+    delete process.env[name];
+  }
+  process.env.OFFERAGENT_CODEX_AUTH_FILE = authPath;
+  process.env.OFFERAGENT_CODEX_BASE_URL = "http://offeragent.invalid";
+
+  const supervisor = new RuntimeSupervisor({
+    loadUserProxyEnvironment: async () => ({
+      ALL_PROXY: proxyUrl,
+      HTTP_PROXY: proxyUrl,
+      HTTPS_PROXY: proxyUrl,
+      NO_PROXY: "localhost,127.0.0.1",
+    }),
+    nodeCandidates: [process.execPath],
+    parentPid: process.pid,
+    provider: "codex",
+    runtimePath: runtimeEntry,
+    statePath: path.join(temporaryDirectory, "state.db"),
+  });
+  t.after(async () => {
+    await supervisor.stop();
+    await new Promise((resolve) => proxy.close(resolve));
+    await rm(temporaryDirectory, { recursive: true, force: true });
+    for (const [name, value] of Object.entries(previousEnvironment)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+
+  await supervisor.start();
+  assert.deepEqual(await supervisor.listModels(), [
+    { id: "proxy-model", label: "Proxy Model" },
+  ]);
 });
 
 test("the sidebar explains how to repair a missing Node.js installation", async () => {

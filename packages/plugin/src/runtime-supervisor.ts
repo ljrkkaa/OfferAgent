@@ -21,13 +21,16 @@ import {
   type DurableEventAck,
   type LocalToolResultPayload,
   type ModelDescriptor,
+  type PinnedContextReference,
   type ProviderErrorCode,
+  type RunAttachmentReference,
   type RuntimeError,
   type RuntimeHandshake,
   type RuntimeHealth,
   type RuntimeHostedWebSearchCapability,
   type RuntimeModels,
   type RuntimeShutdown,
+  type StagedRunAttachment,
   type ToolCallRecord,
   type ToolResultCommand,
   type VaultChangeApplyingRequest,
@@ -47,6 +50,7 @@ function unrefTimer(timer: unknown): void {
 }
 
 export interface RuntimeSupervisorOptions {
+  loadUserProxyEnvironment?: () => Promise<NodeJS.ProcessEnv>;
   nodeCandidates?: string[];
   parentPid?: number;
   provider?: "codex" | "fake";
@@ -54,6 +58,7 @@ export interface RuntimeSupervisorOptions {
   statePath?: string;
   startupTimeoutMs?: number;
   toolExecutor?: LocalToolExecutor;
+  onCancelAgentRun?: (agentRunId: string) => void;
 }
 
 export interface LocalToolExecutor {
@@ -64,10 +69,12 @@ export interface LocalToolExecutor {
 
 export interface AgentRunRequest {
   agentRunId: string;
+  attachments?: RunAttachmentReference[];
   conversationId: string;
   fastMode?: boolean;
   input: string;
   model: string;
+  pinnedContext?: PinnedContextReference[];
 }
 
 export interface AgentRunResumeRequest extends Pick<AgentRunRequest, "agentRunId" | "conversationId"> {
@@ -85,17 +92,38 @@ export interface RuntimeClient {
   cancelAgentRun(request: Pick<AgentRunRequest, "agentRunId" | "conversationId">): void;
   createConversation(conversation: ConversationSummary): Promise<ConversationSummary>;
   deleteConversation(conversationId: string): Promise<void>;
+  discardAttachment(request: {
+    agentRunId: string;
+    attachmentId: string;
+    conversationId: string;
+  }): Promise<void>;
   listModels(): Promise<ModelDescriptor[]>;
   listConversations(): Promise<ConversationSummary[]>;
   onUnavailable(subscriber: UnavailableSubscriber): () => void;
   openConversation(conversationId: string): Promise<ConversationSnapshot>;
+  readConversationAttachment(request: {
+    conversationId: string;
+    messageId: string;
+    order: number;
+  }): Promise<Uint8Array>;
   resumeAgentRun(
     request: AgentRunResumeRequest,
   ): AsyncIterable<AgentRunEvent>;
   runAgent(request: AgentRunRequest): AsyncIterable<AgentRunEvent>;
   start(): Promise<RuntimeHandshake>;
+  stageAttachment(request: {
+    agentRunId: string;
+    bytes: Uint8Array;
+    conversationId: string;
+    fileName: string;
+    mediaType: string;
+  }): Promise<StagedRunAttachment>;
   stop(): Promise<void>;
   updateConversationModel(conversationId: string, modelId: string): Promise<ConversationSummary>;
+  updateConversation(
+    conversationId: string,
+    patch: Partial<Pick<ConversationSummary, "archived" | "modelId" | "title" | "titleOrigin">>,
+  ): Promise<ConversationSummary>;
 }
 
 type UnavailableSubscriber = (message: string) => void;
@@ -321,6 +349,37 @@ function defaultNodeCandidates(environment: NodeJS.ProcessEnv): string[] {
   return [...new Set(candidates.filter((candidate): candidate is string => Boolean(candidate)))];
 }
 
+const PROXY_ENVIRONMENT_NAMES = new Set([
+  "ALL_PROXY",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+]);
+
+async function loadWindowsUserProxyEnvironment(): Promise<NodeJS.ProcessEnv> {
+  if (process.platform !== "win32") return {};
+  return new Promise((resolve) => {
+    execFile(
+      "reg.exe",
+      ["query", "HKCU\\Environment"],
+      { encoding: "utf8", timeout: 3_000, windowsHide: true },
+      (error, stdout) => {
+        if (error) {
+          resolve({});
+          return;
+        }
+        const environment: NodeJS.ProcessEnv = {};
+        for (const line of stdout.split(/\r?\n/u)) {
+          const match = /^\s*([^\s]+)\s+REG_(?:EXPAND_)?SZ\s+(.+?)\s*$/u.exec(line);
+          const name = match?.[1]?.toUpperCase();
+          if (name && PROXY_ENVIRONMENT_NAMES.has(name)) environment[name] = match?.[2];
+        }
+        resolve(environment);
+      },
+    );
+  });
+}
+
 async function findNodeExecutable(candidates: string[]): Promise<string> {
   for (const candidate of candidates) {
     try {
@@ -475,9 +534,13 @@ function callRuntime<T>(
 
 export class RuntimeSupervisor implements RuntimeClient {
   readonly #options: Required<
-    Pick<RuntimeSupervisorOptions, "parentPid" | "provider" | "runtimePath" | "startupTimeoutMs">
+    Pick<
+      RuntimeSupervisorOptions,
+      "loadUserProxyEnvironment" | "parentPid" | "provider" | "runtimePath" | "startupTimeoutMs"
+    >
   > & { nodeCandidates: string[]; statePath?: string };
   readonly #toolExecutor?: LocalToolExecutor;
+  readonly #onCancelAgentRun?: (agentRunId: string) => void;
   readonly #unavailableSubscribers = new Set<UnavailableSubscriber>();
   #child?: RuntimeChild;
   #connection?: RuntimeConnection;
@@ -496,6 +559,8 @@ export class RuntimeSupervisor implements RuntimeClient {
 
   constructor(options: RuntimeSupervisorOptions) {
     this.#options = {
+      loadUserProxyEnvironment:
+        options.loadUserProxyEnvironment ?? loadWindowsUserProxyEnvironment,
       nodeCandidates: options.nodeCandidates ?? defaultNodeCandidates(process.env),
       parentPid: options.parentPid ?? process.pid,
       provider:
@@ -506,6 +571,7 @@ export class RuntimeSupervisor implements RuntimeClient {
       startupTimeoutMs: options.startupTimeoutMs ?? 10_000,
     };
     this.#toolExecutor = options.toolExecutor;
+    this.#onCancelAgentRun = options.onCancelAgentRun;
   }
 
   onUnavailable(subscriber: UnavailableSubscriber): () => void {
@@ -533,10 +599,12 @@ export class RuntimeSupervisor implements RuntimeClient {
       this.#options.provider,
     ];
     if (this.#options.statePath) arguments_.push("--state-path", this.#options.statePath);
+    const userProxyEnvironment = await this.#options.loadUserProxyEnvironment();
     const child = spawn(
       executable,
       arguments_,
       {
+        env: { ...userProxyEnvironment, ...process.env },
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
       },
@@ -619,6 +687,154 @@ export class RuntimeSupervisor implements RuntimeClient {
     return response.models;
   }
 
+  async stageAttachment(input: {
+    agentRunId: string;
+    bytes: Uint8Array;
+    conversationId: string;
+    fileName: string;
+    mediaType: string;
+  }): Promise<StagedRunAttachment> {
+    const connection = this.#requiredConnection();
+    return new Promise((resolve, reject) => {
+      const bytes = Buffer.from(input.bytes);
+      const outgoing = request(
+        {
+          host: "127.0.0.1",
+          port: connection.port,
+          method: "POST",
+          path: "/attachments",
+          headers: {
+            authorization: `Bearer ${connection.token}`,
+            "content-length": bytes.byteLength,
+            "content-type": input.mediaType,
+            "x-offeragent-agent-run-id": input.agentRunId,
+            "x-offeragent-conversation-id": input.conversationId,
+            "x-offeragent-file-name": encodeURIComponent(input.fileName),
+          },
+        },
+        (response) => {
+          let body = "";
+          response.setEncoding("utf8");
+          response.on("data", (chunk) => {
+            body += chunk;
+          });
+          response.on("end", () => {
+            if (!response.statusCode || response.statusCode >= 400) {
+              try {
+                const error = JSON.parse(body) as RuntimeError;
+                reject(new Error(error.message));
+              } catch {
+                reject(new Error(`Run Attachment upload failed with status ${response.statusCode}.`));
+              }
+              return;
+            }
+            try {
+              resolve(JSON.parse(body) as StagedRunAttachment);
+            } catch (error) {
+              reject(error);
+            }
+          });
+        },
+      );
+      outgoing.once("error", reject);
+      outgoing.setTimeout(5_000, () => {
+        outgoing.destroy(new Error("Run Attachment upload timed out."));
+      });
+      outgoing.end(bytes);
+    });
+  }
+
+  async discardAttachment(input: {
+    agentRunId: string;
+    attachmentId: string;
+    conversationId: string;
+  }): Promise<void> {
+    const connection = this.#requiredConnection();
+    return new Promise((resolve, reject) => {
+      const outgoing = request(
+        {
+          host: "127.0.0.1",
+          port: connection.port,
+          method: "DELETE",
+          path: `/attachments/${encodeURIComponent(input.attachmentId)}`,
+          headers: {
+            authorization: `Bearer ${connection.token}`,
+            "x-offeragent-agent-run-id": input.agentRunId,
+            "x-offeragent-conversation-id": input.conversationId,
+          },
+        },
+        (response) => {
+          let body = "";
+          response.setEncoding("utf8");
+          response.on("data", (chunk) => {
+            body += chunk;
+          });
+          response.on("end", () => {
+            if (!response.statusCode || response.statusCode >= 400) {
+              try {
+                reject(new Error((JSON.parse(body) as RuntimeError).message));
+              } catch {
+                reject(new Error(`Run Attachment discard failed with status ${response.statusCode}.`));
+              }
+              return;
+            }
+            resolve();
+          });
+        },
+      );
+      outgoing.once("error", reject);
+      outgoing.setTimeout(5_000, () => {
+        outgoing.destroy(new Error("Run Attachment discard timed out."));
+      });
+      outgoing.end();
+    });
+  }
+
+  async readConversationAttachment(input: {
+    conversationId: string;
+    messageId: string;
+    order: number;
+  }): Promise<Uint8Array> {
+    const connection = this.#requiredConnection();
+    return new Promise((resolve, reject) => {
+      const outgoing = request(
+        {
+          host: "127.0.0.1",
+          port: connection.port,
+          method: "GET",
+          path: `/conversation-attachments/${encodeURIComponent(input.messageId)}/${input.order}`,
+          headers: {
+            authorization: `Bearer ${connection.token}`,
+            "x-offeragent-conversation-id": input.conversationId,
+          },
+        },
+        (response) => {
+          const chunks: Buffer[] = [];
+          response.on("data", (chunk: Buffer | string) => {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          });
+          response.on("end", () => {
+            const body = Buffer.concat(chunks);
+            if (!response.statusCode || response.statusCode >= 400) {
+              try {
+                reject(new Error((JSON.parse(body.toString("utf8")) as RuntimeError).message));
+              } catch {
+                reject(new Error(`Conversation Attachment read failed with status ${response.statusCode}.`));
+              }
+              return;
+            }
+            resolve(new Uint8Array(body));
+          });
+        },
+      );
+      outgoing.once("error", reject);
+      outgoing.setTimeout(5_000, () => {
+        outgoing.destroy(new Error("Conversation Attachment read timed out."));
+      });
+      outgoing.end();
+    });
+  }
+
   async getHostedWebSearchCapability(modelId: string): Promise<RuntimeHostedWebSearchCapability> {
     return callRuntime<RuntimeHostedWebSearchCapability>(
       this.#requiredConnection(),
@@ -680,6 +896,7 @@ export class RuntimeSupervisor implements RuntimeClient {
       type: "conversation.create",
       conversationId: conversation.id,
       title: conversation.title,
+      titleOrigin: conversation.titleOrigin,
       model: conversation.modelId,
     });
     if (event.type !== "conversation.created") throw new Error("Unexpected Conversation response.");
@@ -708,16 +925,27 @@ export class RuntimeSupervisor implements RuntimeClient {
     conversationId: string,
     modelId: string,
   ): Promise<ConversationSummary> {
+    return this.updateConversation(conversationId, { modelId });
+  }
+
+  async updateConversation(
+    conversationId: string,
+    patch: Partial<Pick<ConversationSummary, "archived" | "modelId" | "title" | "titleOrigin">>,
+  ): Promise<ConversationSummary> {
     const event = await this.#requestConversation({
       type: "conversation.update",
       conversationId,
-      model: modelId,
+      ...(patch.modelId !== undefined ? { model: patch.modelId } : {}),
+      ...(patch.title !== undefined ? { title: patch.title } : {}),
+      ...(patch.titleOrigin !== undefined ? { titleOrigin: patch.titleOrigin } : {}),
+      ...(patch.archived !== undefined ? { archived: patch.archived } : {}),
     });
     if (event.type !== "conversation.updated") throw new Error("Unexpected Conversation response.");
     return event.conversation;
   }
 
   cancelAgentRun(request: Pick<AgentRunRequest, "agentRunId" | "conversationId">): void {
+    this.#onCancelAgentRun?.(request.agentRunId);
     const socket = this.#eventSocket;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     const cancel: AgentRunCancel = {
@@ -741,7 +969,12 @@ export class RuntimeSupervisor implements RuntimeClient {
       sequence: 0,
       model: request.model,
       ...(request.fastMode ? { fastMode: true } : {}),
-      input: { role: "user", text: request.input },
+      input: {
+        role: "user",
+        text: request.input,
+        ...(request.attachments?.length ? { attachments: request.attachments } : {}),
+        ...(request.pinnedContext?.length ? { pinnedContext: request.pinnedContext } : {}),
+      },
     };
     yield* this.#runAgentCommand(request, command);
   }
@@ -1245,8 +1478,21 @@ export class RuntimeSupervisor implements RuntimeClient {
 
   #requestConversation(
     input:
-      | { type: "conversation.create"; conversationId: string; title: string; model: string }
-      | { type: "conversation.update"; conversationId: string; model: string }
+      | {
+          type: "conversation.create";
+          conversationId: string;
+          title: string;
+          titleOrigin: ConversationSummary["titleOrigin"];
+          model: string;
+        }
+      | {
+          type: "conversation.update";
+          conversationId: string;
+          archived?: boolean;
+          model?: string;
+          title?: string;
+          titleOrigin?: ConversationSummary["titleOrigin"];
+        }
       | { type: "conversation.delete" | "conversation.list" | "conversation.open"; conversationId: string },
   ): Promise<ConversationEvent> {
     const socket = this.#eventSocket;

@@ -3,11 +3,13 @@ import type {
   LocalToolResultPayload,
   ModelDescriptor,
   ProviderErrorCode,
+  RunAttachmentMetadata,
   WebCitation,
   WebSearchSource,
 } from "@offeragent/protocol";
 
 export const MAX_LOCAL_TOOL_ARGUMENT_BYTES = 8_192;
+export const MAX_VAULT_PROPOSAL_ARGUMENT_BYTES = 131_072;
 export const MAX_PROVIDER_REASONING_BYTES = 256 * 1_024;
 
 export interface ProviderReasoningItem {
@@ -19,7 +21,7 @@ export interface ProviderReasoningItem {
 }
 
 export type ModelConversationItem =
-  | { type: "user_message"; text: string }
+  | { attachments?: RunAttachmentMetadata[]; type: "user_message"; text: string }
   | { type: "assistant_message"; text: string }
   | { type: "provider_reasoning"; item: ProviderReasoningItem }
   | {
@@ -62,11 +64,25 @@ export type ModelToolDefinition = HostedToolDefinition | LocalToolDefinition;
 
 export interface ModelRequest {
   fastMode?: boolean;
+  imageInputs?: ModelImageInput[];
+  imageSubmission?: ModelImageSubmission;
   input: ModelConversationItem[];
   instructions: string;
   model: string;
   signal: AbortSignal;
   tools: ModelToolDefinition[];
+}
+
+export interface ModelImageSubmission {
+  imageCount: number;
+  sourceFingerprint: string;
+}
+
+export interface ModelImageInput {
+  attachmentId: string;
+  dataUrl: string;
+  mediaType: RunAttachmentMetadata["mediaType"];
+  order: number;
 }
 
 export interface ModelProvider {
@@ -76,12 +92,18 @@ export interface ModelProvider {
 }
 
 export class ModelProviderError extends Error {
+  readonly capability?: "hosted_web_search" | "vision";
   readonly code: ProviderErrorCode;
 
-  constructor(code: ProviderErrorCode, message: string, options?: ErrorOptions) {
+  constructor(
+    code: ProviderErrorCode,
+    message: string,
+    options?: ErrorOptions & { capability?: "hosted_web_search" | "vision" },
+  ) {
     super(message, options);
     this.name = "ModelProviderError";
     this.code = code;
+    this.capability = options?.capability;
   }
 }
 

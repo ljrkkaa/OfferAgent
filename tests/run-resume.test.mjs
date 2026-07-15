@@ -626,6 +626,124 @@ test("Resume revalidates committed Evidence and replans before using a changed s
   resumedSocket.close();
 });
 
+test("Resume revalidates committed Project Evidence before continuing the interrupted Run", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "offeragent-project-stale-resume-"));
+  const instance = await startRuntime(path.join(directory, "state.db"), "project-stale-resume-token");
+  t.after(async () => {
+    await stopRuntime(instance);
+    await rm(directory, { recursive: true, force: true });
+  });
+  const projectId = "offeragent";
+  const projectPath = "src/cache.ts";
+  const evidencePath = `project/${projectId}/${projectPath}`;
+  const firstSocket = await connect(instance);
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Initial Project Evidence flow did not reach search")), 5_000);
+    firstSocket.on("message", function onMessage(data) {
+      const event = JSON.parse(data.toString("utf8"));
+      if (event.agentRunId !== "project-stale-resume-run" || event.type !== "tool_call.requested") return;
+      if (respondPlanningMemoryList(firstSocket, event)) return;
+      if (event.tool.name === "agent_contract_read") {
+        firstSocket.send(JSON.stringify(toolResult(event, {
+          ok: true,
+          value: {
+            type: "agent_contract_read", path: "agent.md", modifiedVersion: "mtime:1:size:8",
+            contentHash: "sha256:contract", content: "# Agent",
+          },
+        })));
+      } else if (event.tool.name === "project_read") {
+        firstSocket.send(JSON.stringify(toolResult(event, {
+          ok: true,
+          value: {
+            type: "project_read", projectId, path: projectPath, evidencePath,
+            lineStart: 1, lineEnd: 1, modifiedVersion: "mtime:1:size:3",
+            contentHash: `sha256:${"a".repeat(64)}`, content: "old", truncated: false,
+          },
+        })));
+      } else if (event.tool.name === "project_search") {
+        clearTimeout(timeout);
+        firstSocket.terminate();
+        resolve();
+      }
+    });
+    firstSocket.send(JSON.stringify({
+      type: "agent_run.start", protocolVersion: 1, eventId: "project-stale-resume-start",
+      conversationId: "project-stale-resume-conversation", agentRunId: "project-stale-resume-run", sequence: 0,
+      model: "fake-interview-model",
+      input: { role: "user", text: `project_stale_evidence_flow ${projectId} ${projectPath}` },
+    }));
+  });
+  await once(firstSocket, "close");
+
+  const resumedSocket = await connect(instance);
+  const resumedTools = [];
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Interrupted Project Evidence Run was not replayed")), 5_000);
+    resumedSocket.on("message", function onInterrupted(data) {
+      const event = JSON.parse(data.toString("utf8"));
+      if (event.agentRunId !== "project-stale-resume-run" || event.type !== "agent_run.interrupted") return;
+      clearTimeout(timeout);
+      resumedSocket.off("message", onInterrupted);
+      resolve();
+    });
+  });
+  let completedOutput = "";
+  const completed = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("Project Evidence Run did not complete after Resume")), 5_000);
+    resumedSocket.on("message", function onMessage(data) {
+      const event = JSON.parse(data.toString("utf8"));
+      if (event.agentRunId !== "project-stale-resume-run") return;
+      if (event.type === "tool_call.requested") {
+        resumedTools.push(event.tool.name);
+        if (respondPlanningMemoryList(resumedSocket, event)) return;
+        if (event.tool.name === "agent_contract_read") {
+          resumedSocket.send(JSON.stringify(toolResult(event, {
+            ok: true,
+            value: {
+              type: "agent_contract_read", path: "agent.md", modifiedVersion: "mtime:1:size:8",
+              contentHash: "sha256:contract", content: "# Agent",
+            },
+          })));
+        } else if (event.tool.name === "project_read") {
+          resumedSocket.send(JSON.stringify(toolResult(event, {
+            ok: true,
+            value: {
+              type: "project_read", projectId, path: projectPath, evidencePath,
+              lineStart: 1, lineEnd: 1, modifiedVersion: "mtime:2:size:3",
+              contentHash: `sha256:${"b".repeat(64)}`, content: "new", truncated: false,
+            },
+          })));
+        } else if (event.tool.name === "project_search") {
+          resumedSocket.send(JSON.stringify(toolResult(event, {
+            ok: true,
+            value: {
+              type: "project_search", projectId, entries: [{
+                path: projectPath, modifiedVersion: "mtime:2:size:3",
+                contentHash: `sha256:${"b".repeat(64)}`, snippets: [],
+              }], truncated: false,
+            },
+          })));
+        }
+      } else if (event.type === "agent_run.completed") {
+        completedOutput = event.output.text;
+        clearTimeout(timeout);
+        resumedSocket.off("message", onMessage);
+        resolve();
+      }
+    });
+  });
+  resumedSocket.send(JSON.stringify({
+    type: "agent_run.resume", protocolVersion: 1, eventId: "project-stale-explicit-resume",
+    conversationId: "project-stale-resume-conversation", agentRunId: "project-stale-resume-run", sequence: 0,
+  }));
+  await completed;
+  assert.deepEqual(resumedTools.slice(0, 3), ["agent_contract_read", "planning_memory_list", "project_read"]);
+  assert.ok(resumedTools.includes("project_search"));
+  assert.match(completedOutput, /fresh Project Evidence.*new/i);
+  assert.doesNotMatch(completedOutput, /old/);
+  resumedSocket.close();
+});
+
 test("an Interrupted Run resumes after the Runtime process itself restarts", async (t) => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "offeragent-process-resume-"));
   const statePath = path.join(directory, "state.db");
