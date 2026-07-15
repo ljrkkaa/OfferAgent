@@ -119,6 +119,12 @@ Daily Study Plan 是前瞻性的学习安排，不是学习完成记录。用户
 7. 计划项保持未完成状态。新计划、未勾选项目、文件存在和 Planning Memory 都不是 Study Evidence，不得据此推进学习状态。
 8. 若产生跨天学习主线，只把主题、顺序或暂缓方向合并进 Study Memory；不要复制当天完整清单。计划与相关记忆更新必须放在同一批次。
 
+- When Interview Knowledge informs a Daily Study Plan, explicit company, position, interview date, and current study goal take priority. Use `interview_catalog` only for bounded discovery, then read every selected Question exactly.
+- Consider recent matching Question frequency semantically, without a numeric score or fixed schedule. Distinguish answer research (`needs-research`) from material ready to study (`draft` or `verified`) and from `study-in-progress` continuation; never treat Answer State as Learning State.
+- Registered-project relevance and resume deep-dive risk may raise a topic's priority. Read `projects/index.md` and the exact registered project note before relying on that relevance.
+- Read a bounded set of recent Daily Study Plans to reduce low-value repetition. A justified high-frequency review may repeat, but must be labeled as review rather than completion.
+- The resulting plan contains only unchecked future work. Planning never advances Answer State or Learning State and only explicit Daily Note completion remains Study Evidence.
+
 ## Study-State Synchronization
 
 Study-State Synchronization 是独立的回顾性工作流。它只从已有 daily 中的明确完成证据保守推进 `experiences/` 或 `interview/` 学习状态。当天 daily 缺失时只报告缺失，不创建计划；除非用户另行请求 Daily Study Plan。

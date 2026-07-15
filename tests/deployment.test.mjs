@@ -131,6 +131,11 @@ test("deployment preserves Runtime State, plugin data, branch, index, and unrela
   const contract = await readFile(path.join(root, "agent.md"), "utf8");
   assert.match(contract, /OfferAgent General Contract/);
   assert.match(contract, /Daily Study Plan/);
+  assert.match(contract, /explicit company, position, interview date, and current study goal take priority/);
+  assert.match(contract, /without a numeric score or fixed schedule/);
+  assert.match(contract, /Registered-project relevance and resume deep-dive risk/);
+  assert.match(contract, /reduce low-value repetition/);
+  assert.match(contract, /Planning never advances Answer State or Learning State/);
   assert.match(contract, /普通笔记写作/);
   assert.match(contract, /Study-State Synchronization 是独立/);
   assert.match(contract, /vault_read/);

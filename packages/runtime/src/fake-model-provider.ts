@@ -17,10 +17,12 @@ import { multiImageInterviewEvent } from "./fake-multi-image-scenario";
 import { publicInterviewResearchEvents } from "./fake-public-interview-research-scenario";
 import { dynamicInterviewResearchEvent } from "./fake-dynamic-interview-research-scenario";
 import { interviewAnswerResearchEvent } from "./fake-answer-research-scenario";
+import { interviewKnowledgePlanningEvent } from "./fake-interview-knowledge-planning-scenario";
 import { toolResultFor, toolResultForAfter } from "./fake-provider-conversation";
 
 export const FAKE_SCENARIOS = [
   "interview-answer-research",
+  "interview-knowledge-planning",
   "dynamic-interview-research",
   "interview-deduplication",
   "multi-image-interview-ingestion",
@@ -232,6 +234,14 @@ export class FakeModelProvider implements ModelProvider {
         this.#toolCallSequence += 1;
         return `${prefix}-${this.#toolCallSequence}`;
       });
+      return;
+    }
+    if (this.#scenario === "interview-knowledge-planning") {
+      const events = interviewKnowledgePlanningEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
+      for (const event of Array.isArray(events) ? events : [events]) yield event;
       return;
     }
     if (this.#scenario === "dynamic-interview-research") {
