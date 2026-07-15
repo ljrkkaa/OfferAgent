@@ -246,7 +246,7 @@ test(
       }));
     });
     assert.match(imageOutput, /magenta/i);
-    assert.deepEqual(await readdir(attachmentsPath), []);
+    assert.deepEqual(await readdir(attachmentsPath), [stagedImage.attachmentId]);
 
     let requestedVaultRead = false;
     const toolOutput = await new Promise((resolve, reject) => {

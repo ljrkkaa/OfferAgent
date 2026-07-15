@@ -24,7 +24,7 @@ import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.
 import type { ModelConversationItem } from "./model-provider";
 import type { RunAttachmentMetadata as StoredRunAttachmentMetadata } from "./run-attachments";
 
-const CURRENT_SCHEMA_VERSION = 18;
+const CURRENT_SCHEMA_VERSION = 19;
 const INVALIDATED_PROTOCOL_RESPONSE = "__offeragent_invalidated_after_resource_deletion__";
 const MAX_CONVERSATION_CONTEXT_BYTES = 64 * 1_024;
 
@@ -1185,6 +1185,10 @@ const MIGRATIONS = [
         ON conversations(archived, updated_at DESC, id);
     `,
   },
+  {
+    version: 19,
+    sql: `SELECT 1;`,
+  },
 ] as const;
 
 interface ConversationSnapshot {
@@ -1412,6 +1416,43 @@ export class RuntimeStateStore {
     });
   }
 
+  async claimAttachments(input: {
+    agentRunId: string;
+    attachments: Array<{ attachmentId: string; order: number }>;
+    conversationId: string;
+    messageId: string;
+    ownedAt: string;
+  }): Promise<void> {
+    await this.#write(() => this.#claimAttachments(input));
+  }
+
+  #claimAttachments(input: {
+    agentRunId: string;
+    attachments: Array<{ attachmentId: string; order: number }>;
+    conversationId: string;
+    messageId: string;
+    ownedAt: string;
+  }): void {
+    for (const { attachmentId, order } of input.attachments) {
+      this.#database.run(
+        `UPDATE run_attachments
+         SET message_id = ?, message_order = ?, owned_at = ?
+         WHERE id = ? AND conversation_id = ? AND agent_run_id = ? AND message_id IS NULL`,
+        [
+          input.messageId,
+          order,
+          input.ownedAt,
+          attachmentId,
+          input.conversationId,
+          input.agentRunId,
+        ],
+      );
+      if (this.#database.getRowsModified() !== 1) {
+        throw new Error(`Run Attachment '${attachmentId}' could not be promoted to its message.`);
+      }
+    }
+  }
+
   async deleteAttachment(attachmentId: string): Promise<void> {
     await this.#write(() => {
       this.#database.run("DELETE FROM run_attachments WHERE id = ?", [attachmentId]);
@@ -1422,9 +1463,43 @@ export class RuntimeStateStore {
     await this.#writeTail;
     const row = firstRow(
       this.#database,
-      `SELECT id, conversation_id, agent_run_id, content_hash, file_name, media_type, size, created_at
+      `SELECT id, conversation_id, agent_run_id, content_hash, file_name, media_type, size, created_at,
+              message_id, message_order, owned_at
        FROM run_attachments WHERE id = ?`,
       [attachmentId],
+    );
+    return row ? this.#attachmentMetadata(row) : undefined;
+  }
+
+  async getAttachmentUsage(conversationId: string): Promise<{
+    conversationBytes: number;
+    totalBytes: number;
+  }> {
+    await this.#writeTail;
+    return {
+      conversationBytes: Number(valueAt(
+        this.#database,
+        "SELECT COALESCE(SUM(size), 0) FROM run_attachments WHERE conversation_id = ?",
+        [conversationId],
+      )),
+      totalBytes: Number(valueAt(
+        this.#database,
+        "SELECT COALESCE(SUM(size), 0) FROM run_attachments",
+      )),
+    };
+  }
+
+  async getAttachmentByMessage(
+    messageId: string,
+    order: number,
+  ): Promise<StoredRunAttachmentMetadata | undefined> {
+    await this.#writeTail;
+    const row = firstRow(
+      this.#database,
+      `SELECT id, conversation_id, agent_run_id, content_hash, file_name, media_type, size, created_at,
+              message_id, message_order, owned_at
+       FROM run_attachments WHERE message_id = ? AND message_order = ?`,
+      [messageId, order],
     );
     return row ? this.#attachmentMetadata(row) : undefined;
   }
@@ -1534,7 +1609,7 @@ export class RuntimeStateStore {
     input: string,
     startedEvent?: Extract<AgentRunEvent, { type: "agent_run.started" }>,
     startEventId?: string,
-    attachments: PersistedRunAttachmentMetadata[] = [],
+    attachments: Array<PersistedRunAttachmentMetadata & { attachmentId?: string }> = [],
   ): Promise<boolean> {
     return this.#write(() => {
       const persistedAttachments = (attachments as Array<
@@ -1605,6 +1680,21 @@ export class RuntimeStateStore {
         messageId,
         agentRunId,
       ]);
+      const ownedAttachments = attachments.flatMap(({ attachmentId, order }) =>
+        attachmentId ? [{ attachmentId, order }] : []
+      );
+      if (ownedAttachments.length !== attachments.length) {
+        throw new Error("Every Conversation Attachment must retain its storage identity during promotion.");
+      }
+      if (ownedAttachments.length > 0) {
+        this.#claimAttachments({
+          agentRunId,
+          attachments: ownedAttachments,
+          conversationId,
+          messageId,
+          ownedAt: timestamp,
+        });
+      }
       this.#recordEvent(
         startedEvent ?? {
           type: "agent_run.started",
@@ -2698,7 +2788,8 @@ export class RuntimeStateStore {
 
   #attachmentRows(where: string, parameters: unknown[]): StoredRunAttachmentMetadata[] {
     const rows = this.#database.exec(
-      `SELECT id, conversation_id, agent_run_id, content_hash, file_name, media_type, size, created_at
+      `SELECT id, conversation_id, agent_run_id, content_hash, file_name, media_type, size, created_at,
+              message_id, message_order, owned_at
        FROM run_attachments WHERE ${where} ORDER BY created_at, id`,
       parameters as (string | number | null | Uint8Array)[],
     )[0]?.values ?? [];
@@ -2715,6 +2806,9 @@ export class RuntimeStateStore {
       mediaType: row[5] as StoredRunAttachmentMetadata["mediaType"],
       size: row[6] as number,
       createdAt: row[7] as string,
+      ...(row[8] ? { messageId: row[8] as string } : {}),
+      ...(row[9] !== null && row[9] !== undefined ? { messageOrder: row[9] as number } : {}),
+      ...(row[10] ? { ownedAt: row[10] as string } : {}),
     };
   }
 
@@ -2777,6 +2871,7 @@ export class RuntimeStateStore {
       try {
         if (migration.version === 9) this.#ensureProtocolColumns();
         if (migration.version === 18) this.#ensureConversationMetadataColumns();
+        if (migration.version === 19) this.#ensureAttachmentStorageColumns();
         this.#database.run(migration.sql);
         if (migration.version === 7) this.#scrubPersistedVaultChangeArguments();
         if (migration.version === 8) this.#ensureCitationsColumn();
@@ -2805,6 +2900,7 @@ export class RuntimeStateStore {
     // protocol columns existed. Keep the repair idempotent for already-versioned State.
     this.#ensureProtocolColumns();
     this.#ensureAttachmentStorageColumns();
+    this.#linkLegacyConversationAttachments();
     this.#ensureConversationMetadataColumns();
     if (version < 10) this.#database.run("VACUUM");
     await this.#persist();
@@ -3061,6 +3157,63 @@ export class RuntimeStateStore {
       this.#database.run(
         "ALTER TABLE run_attachments ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
       );
+    }
+    if (!columns.some((column) => column[1] === "message_id")) {
+      this.#database.run("ALTER TABLE run_attachments ADD COLUMN message_id TEXT");
+    }
+    if (!columns.some((column) => column[1] === "message_order")) {
+      this.#database.run("ALTER TABLE run_attachments ADD COLUMN message_order INTEGER");
+    }
+    if (!columns.some((column) => column[1] === "owned_at")) {
+      this.#database.run("ALTER TABLE run_attachments ADD COLUMN owned_at TEXT");
+    }
+    this.#database.run(
+      `CREATE UNIQUE INDEX IF NOT EXISTS run_attachments_by_message_order
+       ON run_attachments(message_id, message_order) WHERE message_id IS NOT NULL`,
+    );
+  }
+
+  #linkLegacyConversationAttachments(): void {
+    const messages = this.#database.exec(
+      `SELECT id, conversation_id, agent_run_id, attachments_json, created_at
+       FROM messages
+       WHERE role = 'user' AND attachments_json <> '[]'
+       ORDER BY created_at, id`,
+    )[0]?.values ?? [];
+    for (const [messageId, conversationId, agentRunId, attachmentsJson, createdAt] of messages) {
+      let persisted: PersistedRunAttachmentMetadata[];
+      try {
+        persisted = JSON.parse(attachmentsJson as string) as PersistedRunAttachmentMetadata[];
+      } catch {
+        continue;
+      }
+      const candidates = this.#attachmentRows(
+        "conversation_id = ? AND agent_run_id = ? AND message_id IS NULL",
+        [conversationId, agentRunId],
+      );
+      const occupiedOrders = new Set(
+        this.#attachmentRows("message_id = ?", [messageId])
+          .flatMap(({ messageOrder }) => messageOrder === undefined ? [] : [messageOrder]),
+      );
+      const used = new Set<string>();
+      for (const attachment of [...persisted].sort((left, right) => left.order - right.order)) {
+        if (occupiedOrders.has(attachment.order)) continue;
+        const match = candidates.find((candidate) =>
+          !used.has(candidate.attachmentId) &&
+          candidate.contentHash === attachment.contentHash &&
+          candidate.fileName === attachment.fileName &&
+          candidate.mediaType === attachment.mediaType &&
+          candidate.size === attachment.size
+        );
+        if (!match) continue;
+        used.add(match.attachmentId);
+        this.#database.run(
+          `UPDATE run_attachments
+           SET message_id = ?, message_order = ?, owned_at = ?
+           WHERE id = ? AND message_id IS NULL`,
+          [messageId, attachment.order, createdAt, match.attachmentId],
+        );
+      }
     }
   }
 

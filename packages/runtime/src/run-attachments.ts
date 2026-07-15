@@ -4,6 +4,8 @@ import path from "node:path";
 
 const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MAX_SUBMISSION_BYTES = 50 * 1024 * 1024;
+const DEFAULT_MAX_CONVERSATION_BYTES = 500 * 1024 * 1024;
+const DEFAULT_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_SUBMISSION_IMAGES = 20;
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1_000;
 
@@ -11,6 +13,7 @@ export type SupportedImageMediaType = "image/gif" | "image/jpeg" | "image/png" |
 export type RunAttachmentErrorCode =
   | "attachment_missing"
   | "attachment_too_large"
+  | "capacity_exceeded"
   | "invalid_image"
   | "ownership_mismatch";
 
@@ -22,13 +25,28 @@ export interface RunAttachmentMetadata {
   createdAt: string;
   fileName: string;
   mediaType: SupportedImageMediaType;
+  messageId?: string;
+  messageOrder?: number;
+  ownedAt?: string;
   size: number;
 }
 
 export interface RunAttachmentMetadataStore {
+  claimAttachments(input: {
+    agentRunId: string;
+    attachments: Array<{ attachmentId: string; order: number }>;
+    conversationId: string;
+    messageId: string;
+    ownedAt: string;
+  }): Promise<void>;
   createAttachment(metadata: RunAttachmentMetadata): Promise<void>;
   deleteAttachment(attachmentId: string): Promise<void>;
   getAttachment(attachmentId: string): Promise<RunAttachmentMetadata | undefined>;
+  getAttachmentUsage(conversationId: string): Promise<{
+    conversationBytes: number;
+    totalBytes: number;
+  }>;
+  getAttachmentByMessage(messageId: string, order: number): Promise<RunAttachmentMetadata | undefined>;
   listAttachmentsByConversation(conversationId: string): Promise<RunAttachmentMetadata[]>;
   listAttachmentsByRun(agentRunId: string): Promise<RunAttachmentMetadata[]>;
   listAttachmentsCreatedBefore(isoTimestamp: string): Promise<RunAttachmentMetadata[]>;
@@ -54,12 +72,65 @@ export class MemoryRunAttachmentMetadataStore implements RunAttachmentMetadataSt
     this.#items.set(metadata.attachmentId, { ...metadata });
   }
 
+  async claimAttachments(input: {
+    agentRunId: string;
+    attachments: Array<{ attachmentId: string; order: number }>;
+    conversationId: string;
+    messageId: string;
+    ownedAt: string;
+  }): Promise<void> {
+    const claimed = input.attachments.map(({ attachmentId, order }) => {
+      const metadata = this.#items.get(attachmentId);
+      if (
+        !metadata || metadata.agentRunId !== input.agentRunId ||
+        metadata.conversationId !== input.conversationId || metadata.messageId
+      ) {
+        throw new RunAttachmentError(
+          "ownership_mismatch",
+          "The Run Attachment cannot be promoted to this Conversation message.",
+        );
+      }
+      return { metadata, order };
+    });
+    for (const { metadata, order } of claimed) {
+      this.#items.set(metadata.attachmentId, {
+        ...metadata,
+        messageId: input.messageId,
+        messageOrder: order,
+        ownedAt: input.ownedAt,
+      });
+    }
+  }
+
   async deleteAttachment(attachmentId: string): Promise<void> {
     this.#items.delete(attachmentId);
   }
 
   async getAttachment(attachmentId: string): Promise<RunAttachmentMetadata | undefined> {
     const metadata = this.#items.get(attachmentId);
+    return metadata ? { ...metadata } : undefined;
+  }
+
+  async getAttachmentUsage(conversationId: string): Promise<{
+    conversationBytes: number;
+    totalBytes: number;
+  }> {
+    let conversationBytes = 0;
+    let totalBytes = 0;
+    for (const item of this.#items.values()) {
+      totalBytes += item.size;
+      if (item.conversationId === conversationId) conversationBytes += item.size;
+    }
+    return { conversationBytes, totalBytes };
+  }
+
+  async getAttachmentByMessage(
+    messageId: string,
+    order: number,
+  ): Promise<RunAttachmentMetadata | undefined> {
+    const metadata = [...this.#items.values()].find(
+      (item) => item.messageId === messageId && item.messageOrder === order,
+    );
     return metadata ? { ...metadata } : undefined;
   }
 
@@ -92,6 +163,46 @@ export interface MaterializedRunAttachment extends StagedRunAttachment {
 export interface ImageSubmissionMetadata {
   imageCount: number;
   sourceFingerprint: string;
+}
+
+export function attachmentDirectoryForState(statePath: string, dataRoot: string): string {
+  const resolvedStatePath = path.resolve(statePath);
+  const normalizedStatePath = process.platform === "win32"
+    ? resolvedStatePath.toLowerCase()
+    : resolvedStatePath;
+  const namespace = createHash("sha256").update(normalizedStatePath, "utf8").digest("hex").slice(0, 24);
+  return path.join(path.resolve(dataRoot), "OfferAgent", "attachments", namespace);
+}
+
+export async function migrateLegacyAttachmentDirectory(input: {
+  directory: string;
+  legacyDirectory: string;
+  metadata: RunAttachmentMetadataStore;
+}): Promise<string[]> {
+  const directory = path.resolve(input.directory);
+  const legacyDirectory = path.resolve(input.legacyDirectory);
+  if (directory === legacyDirectory) return [];
+  const entries = await readdir(legacyDirectory, { withFileTypes: true }).catch(
+    (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? [] : Promise.reject(error),
+  );
+  const moved: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || entry.name.endsWith(".tmp")) continue;
+    const deleting = entry.name.endsWith(".deleting");
+    const attachmentId = deleting ? entry.name.slice(0, -".deleting".length) : entry.name;
+    if (!attachmentId || !await input.metadata.getAttachment(attachmentId)) continue;
+    await mkdir(directory, { recursive: true });
+    const target = path.join(directory, entry.name);
+    const targetExists = await stat(target).then(() => true, () => false);
+    if (targetExists) continue;
+    try {
+      await rename(path.join(legacyDirectory, entry.name), target);
+      moved.push(entry.name);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  return moved;
 }
 
 export function orderedImageSubmissionMetadata(
@@ -173,23 +284,31 @@ function contentHash(bytes: Uint8Array): string {
 
 export class RunAttachmentModule {
   readonly #directory: string;
+  readonly #deletingConversations = new Set<string>();
+  readonly #maxConversationBytes: number;
   readonly #maxImageBytes: number;
   readonly #maxSubmissionBytes: number;
+  readonly #maxTotalBytes: number;
   readonly #metadata: RunAttachmentMetadataStore;
+  #mutationTail: Promise<void> = Promise.resolve();
   readonly #now: () => Date;
   readonly #ttlMs: number;
 
   constructor(options: {
     directory: string;
+    maxConversationBytes?: number;
     maxImageBytes?: number;
     maxSubmissionBytes?: number;
+    maxTotalBytes?: number;
     metadata: RunAttachmentMetadataStore;
     now?: () => Date;
     ttlMs?: number;
   }) {
     this.#directory = path.resolve(options.directory);
+    this.#maxConversationBytes = options.maxConversationBytes ?? DEFAULT_MAX_CONVERSATION_BYTES;
     this.#maxImageBytes = options.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES;
     this.#maxSubmissionBytes = options.maxSubmissionBytes ?? DEFAULT_MAX_SUBMISSION_BYTES;
+    this.#maxTotalBytes = options.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
     this.#metadata = options.metadata;
     this.#now = options.now ?? (() => new Date());
     this.#ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
@@ -202,6 +321,22 @@ export class RunAttachmentModule {
     conversationId: string;
     fileName: string;
   }): Promise<StagedRunAttachment> {
+    return this.#withMutation(() => this.#stage(input));
+  }
+
+  async #stage(input: {
+    agentRunId: string;
+    bytes: Uint8Array;
+    claimedMediaType?: string;
+    conversationId: string;
+    fileName: string;
+  }): Promise<StagedRunAttachment> {
+    if (this.#deletingConversations.has(input.conversationId)) {
+      throw new RunAttachmentError(
+        "ownership_mismatch",
+        "The Conversation is being deleted; wait or choose another Conversation before attaching images.",
+      );
+    }
     if (input.bytes.byteLength > this.#maxImageBytes) {
       throw new RunAttachmentError(
         "attachment_too_large",
@@ -224,6 +359,19 @@ export class RunAttachmentModule {
     const fileName = path.basename(input.fileName).slice(0, 255);
     if (!fileName) {
       throw new RunAttachmentError("invalid_image", "The image file name is missing.");
+    }
+    const usage = await this.#metadata.getAttachmentUsage(input.conversationId);
+    if (usage.conversationBytes + input.bytes.byteLength > this.#maxConversationBytes) {
+      throw new RunAttachmentError(
+        "capacity_exceeded",
+        "This Conversation has reached its attachment capacity. Delete old Conversations or their images before adding more.",
+      );
+    }
+    if (usage.totalBytes + input.bytes.byteLength > this.#maxTotalBytes) {
+      throw new RunAttachmentError(
+        "capacity_exceeded",
+        "OfferAgent has reached its total attachment capacity. Delete old Conversations to clean up space.",
+      );
     }
     await mkdir(this.#directory, { recursive: true });
     const attachmentId = randomUUID();
@@ -275,10 +423,52 @@ export class RunAttachmentModule {
         "The Run Attachment does not belong to this Conversation and Agent Run.",
       );
     }
+    const bytes = await this.#readValidated(metadata);
+    const {
+      agentRunId: _run,
+      conversationId: _conversation,
+      createdAt: _created,
+      messageId: _message,
+      messageOrder: _messageOrder,
+      ownedAt: _ownedAt,
+      ...staged
+    } = metadata;
+    return { ...staged, bytes, order: input.order };
+  }
+
+  async materializeOwned(input: {
+    conversationId: string;
+    messageId: string;
+    order: number;
+  }): Promise<MaterializedRunAttachment> {
+    const metadata = await this.#metadata.getAttachmentByMessage(input.messageId, input.order);
+    if (!metadata) {
+      throw new RunAttachmentError("attachment_missing", "The Conversation Attachment is missing.");
+    }
+    if (metadata.conversationId !== input.conversationId) {
+      throw new RunAttachmentError(
+        "ownership_mismatch",
+        "The Conversation Attachment does not belong to this Conversation.",
+      );
+    }
+    const bytes = await this.#readValidated(metadata);
+    const {
+      agentRunId: _run,
+      conversationId: _conversation,
+      createdAt: _created,
+      messageId: _message,
+      messageOrder: _messageOrder,
+      ownedAt: _ownedAt,
+      ...staged
+    } = metadata;
+    return { ...staged, bytes, order: input.order };
+  }
+
+  async #readValidated(metadata: RunAttachmentMetadata): Promise<Buffer> {
     const bytes = await readFile(this.#pathFor(metadata.attachmentId)).catch((error: unknown) => {
       throw new RunAttachmentError(
         "attachment_missing",
-        "The Run Attachment bytes are missing or expired.",
+        "The Attachment bytes are missing or expired.",
         { cause: error },
       );
     });
@@ -287,10 +477,9 @@ export class RunAttachmentModule {
       detectedMediaType(bytes) !== metadata.mediaType ||
       contentHash(bytes) !== metadata.contentHash
     ) {
-      throw new RunAttachmentError("invalid_image", "The staged Run Attachment failed validation.");
+      throw new RunAttachmentError("invalid_image", "The stored Attachment failed validation.");
     }
-    const { agentRunId: _run, conversationId: _conversation, createdAt: _created, ...staged } = metadata;
-    return { ...staged, bytes, order: input.order };
+    return bytes;
   }
 
   async materializeSubmission(input: {
@@ -355,7 +544,9 @@ export class RunAttachmentModule {
   }
 
   async deleteRun(agentRunId: string): Promise<void> {
-    await this.#delete(await this.#metadata.listAttachmentsByRun(agentRunId));
+    await this.#delete(
+      (await this.#metadata.listAttachmentsByRun(agentRunId)).filter(({ messageId }) => !messageId),
+    );
   }
 
   async discard(input: {
@@ -367,23 +558,114 @@ export class RunAttachmentModule {
     if (!metadata) return;
     if (
       metadata.agentRunId !== input.agentRunId ||
-      metadata.conversationId !== input.conversationId
+      metadata.conversationId !== input.conversationId ||
+      metadata.messageId
     ) {
       throw new RunAttachmentError(
         "ownership_mismatch",
-        "The Run Attachment does not belong to this Conversation and Agent Run.",
+        "The Run Attachment does not belong to this draft or is already owned by a message.",
       );
     }
     await this.#delete([metadata]);
   }
 
   async deleteConversation(conversationId: string): Promise<void> {
-    await this.#delete(await this.#metadata.listAttachmentsByConversation(conversationId));
+    const deletion = await this.prepareConversationDeletion(conversationId);
+    await deletion.commit();
+  }
+
+  async prepareConversationDeletion(conversationId: string): Promise<{
+    commit(): Promise<void>;
+    rollback(): Promise<void>;
+  }> {
+    return this.#withMutation(async () => {
+      if (this.#deletingConversations.has(conversationId)) {
+        throw new RunAttachmentError("ownership_mismatch", "The Conversation is already being deleted.");
+      }
+      this.#deletingConversations.add(conversationId);
+      try {
+        return await this.#prepareConversationDeletion(conversationId);
+      } catch (error) {
+        this.#deletingConversations.delete(conversationId);
+        throw error;
+      }
+    });
+  }
+
+  async #prepareConversationDeletion(conversationId: string): Promise<{
+    commit(): Promise<void>;
+    rollback(): Promise<void>;
+  }> {
+    const items = await this.#metadata.listAttachmentsByConversation(conversationId);
+    const moved: RunAttachmentMetadata[] = [];
+    try {
+      for (const item of items) {
+        try {
+          await rename(this.#pathFor(item.attachmentId), this.#pathFor(`${item.attachmentId}.deleting`));
+          moved.push(item);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
+    } catch (error) {
+      await Promise.all(moved.map((item) =>
+        rename(this.#pathFor(`${item.attachmentId}.deleting`), this.#pathFor(item.attachmentId))
+          .catch(() => undefined)
+      ));
+      throw error;
+    }
+    let settled = false;
+    return {
+      commit: async () => {
+        await this.#withMutation(async () => {
+          if (settled) return;
+          for (const item of moved) {
+            await unlink(this.#pathFor(`${item.attachmentId}.deleting`)).catch(() => undefined);
+          }
+          for (const item of items) {
+            await this.#metadata.deleteAttachment(item.attachmentId).catch(() => undefined);
+          }
+          settled = true;
+          this.#deletingConversations.delete(conversationId);
+        });
+      },
+      rollback: async () => {
+        await this.#withMutation(async () => {
+          if (settled) return;
+          settled = true;
+          await Promise.all(moved.map((item) =>
+            rename(this.#pathFor(`${item.attachmentId}.deleting`), this.#pathFor(item.attachmentId))
+          ));
+          this.#deletingConversations.delete(conversationId);
+        });
+      },
+    };
+  }
+
+  async recoverPendingDeletions(): Promise<void> {
+    const entries = await readdir(this.#directory, { withFileTypes: true }).catch(
+      (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? [] : Promise.reject(error),
+    );
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".deleting")) continue;
+      const attachmentId = entry.name.slice(0, -".deleting".length);
+      const tombstonePath = this.#pathFor(entry.name);
+      const metadata = await this.#metadata.getAttachment(attachmentId);
+      if (!metadata) {
+        await unlink(tombstonePath).catch(() => undefined);
+        continue;
+      }
+      const finalPath = this.#pathFor(attachmentId);
+      const finalExists = await stat(finalPath).then(() => true, () => false);
+      if (finalExists) await unlink(tombstonePath).catch(() => undefined);
+      else await rename(tombstonePath, finalPath);
+    }
   }
 
   async sweepExpired(): Promise<string[]> {
     const cutoff = new Date(this.#now().getTime() - this.#ttlMs).toISOString();
-    const expired = await this.#metadata.listAttachmentsCreatedBefore(cutoff);
+    const expired = (await this.#metadata.listAttachmentsCreatedBefore(cutoff))
+      .filter(({ messageId }) => !messageId);
     await this.#delete(expired);
     const removed = expired.map(({ attachmentId }) => attachmentId);
     const entries = await readdir(this.#directory, { withFileTypes: true }).catch(
@@ -416,6 +698,20 @@ export class RunAttachmentModule {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
       await this.#metadata.deleteAttachment(item.attachmentId);
+    }
+  }
+
+  async #withMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.#mutationTail;
+    let release!: () => void;
+    this.#mutationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
     }
   }
 }

@@ -99,6 +99,11 @@ export interface RuntimeClient {
   listConversations(): Promise<ConversationSummary[]>;
   onUnavailable(subscriber: UnavailableSubscriber): () => void;
   openConversation(conversationId: string): Promise<ConversationSnapshot>;
+  readConversationAttachment(request: {
+    conversationId: string;
+    messageId: string;
+    order: number;
+  }): Promise<Uint8Array>;
   resumeAgentRun(
     request: AgentRunResumeRequest,
   ): AsyncIterable<AgentRunEvent>;
@@ -778,6 +783,51 @@ export class RuntimeSupervisor implements RuntimeClient {
       outgoing.once("error", reject);
       outgoing.setTimeout(5_000, () => {
         outgoing.destroy(new Error("Run Attachment discard timed out."));
+      });
+      outgoing.end();
+    });
+  }
+
+  async readConversationAttachment(input: {
+    conversationId: string;
+    messageId: string;
+    order: number;
+  }): Promise<Uint8Array> {
+    const connection = this.#requiredConnection();
+    return new Promise((resolve, reject) => {
+      const outgoing = request(
+        {
+          host: "127.0.0.1",
+          port: connection.port,
+          method: "GET",
+          path: `/conversation-attachments/${encodeURIComponent(input.messageId)}/${input.order}`,
+          headers: {
+            authorization: `Bearer ${connection.token}`,
+            "x-offeragent-conversation-id": input.conversationId,
+          },
+        },
+        (response) => {
+          const chunks: Buffer[] = [];
+          response.on("data", (chunk: Buffer | string) => {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          });
+          response.on("end", () => {
+            const body = Buffer.concat(chunks);
+            if (!response.statusCode || response.statusCode >= 400) {
+              try {
+                reject(new Error((JSON.parse(body.toString("utf8")) as RuntimeError).message));
+              } catch {
+                reject(new Error(`Conversation Attachment read failed with status ${response.statusCode}.`));
+              }
+              return;
+            }
+            resolve(new Uint8Array(body));
+          });
+        },
+      );
+      outgoing.once("error", reject);
+      outgoing.setTimeout(5_000, () => {
+        outgoing.destroy(new Error("Conversation Attachment read timed out."));
       });
       outgoing.end();
     });

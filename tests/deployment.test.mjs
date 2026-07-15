@@ -158,10 +158,11 @@ test("deployment preserves Runtime State, plugin data, branch, index, and unrela
   assert.match(contract, /Trusted Vault/);
   assert.match(contract, /explicit Resume/i);
   assert.match(contract, /Run Attachments and Vision/);
-  assert.match(contract, /temporary evidence for its owning Agent Run/);
+  assert.match(contract, /local evidence for its owning Agent Run/);
   assert.match(contract, /Do not invoke OCR/);
-  assert.match(contract, /Interrupted Run may retain its image only for explicit Resume/);
-  assert.match(contract, /completed, failed, cancelled, deleted, or expired Run must release/);
+  assert.match(contract, /sent image belongs to its Conversation message and remains available across restart/);
+  assert.match(contract, /Deleting a Conversation removes only that Conversation's attachment bytes/);
+  assert.match(contract, /terminal Runs do not discard images from sent message history/);
   assert.match(contract, /later text-only Run must remain usable/);
   assert.match(contract, /Project Evidence and Project Interview Training/);
   assert.match(contract, /project_list.*project_search.*project_read/);

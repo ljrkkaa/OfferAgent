@@ -52,6 +52,8 @@ import {
 } from "./fake-web-fixture";
 import { CapabilityGatedModelProvider } from "./capability-gated-provider";
 import {
+  attachmentDirectoryForState,
+  migrateLegacyAttachmentDirectory,
   orderedImageSubmissionMetadata,
   RunAttachmentError,
   RunAttachmentModule,
@@ -1225,8 +1227,14 @@ async function handleConversationCommand(
     });
     event = { ...base, type: "conversation.updated", conversation };
   } else {
-    await attachments.deleteConversation(command.conversationId);
-    await store.deleteConversation(command.conversationId);
+    const deletion = await attachments.prepareConversationDeletion(command.conversationId);
+    try {
+      await store.deleteConversation(command.conversationId);
+      await deletion.commit();
+    } catch (error) {
+      await deletion.rollback();
+      throw error;
+    }
     event = { ...base, type: "conversation.deleted" };
   }
   if (cacheable) {
@@ -1318,16 +1326,24 @@ async function startRuntime({
 }: RuntimeOptions): Promise<void> {
   const instanceId = randomUUID();
   const store = await RuntimeStateStore.open(statePath);
+  const dataRoot = process.env.LOCALAPPDATA || path.join(homedir(), ".local", "share");
+  const effectiveStatePath = statePath ?? path.join(dataRoot, "OfferAgent", "state.db");
+  const legacyAttachmentDirectory = path.join(dataRoot, "OfferAgent", "attachments");
+  const defaultAttachmentDirectory = attachmentDirectoryForState(effectiveStatePath, dataRoot);
+  if (!attachmentsPath) {
+    await migrateLegacyAttachmentDirectory({
+      directory: defaultAttachmentDirectory,
+      legacyDirectory: legacyAttachmentDirectory,
+      metadata: store,
+    });
+  }
   const attachments = new RunAttachmentModule({
     directory:
       attachmentsPath ??
-      path.join(
-        process.env.LOCALAPPDATA || path.join(homedir(), ".local", "share"),
-        "OfferAgent",
-        "attachments",
-      ),
+      defaultAttachmentDirectory,
     metadata: store,
   });
+  await attachments.recoverPendingDeletions();
   await attachments.sweepExpired();
   const deleteTerminalAttachments = async (agentRunId: string): Promise<void> => {
     try {
@@ -1442,6 +1458,42 @@ async function startRuntime({
           message: attachmentError?.message ?? "The Run Attachment could not be staged.",
         });
       });
+      return;
+    }
+
+    if (request.method === "GET" && requestUrl.pathname.startsWith("/conversation-attachments/")) {
+      const segments = requestUrl.pathname.slice("/conversation-attachments/".length).split("/");
+      const messageId = segments[0] ?? "";
+      const order = Number(segments[1]);
+      const conversationId = request.headers["x-offeragent-conversation-id"];
+      if (
+        segments.length !== 2 || !isProtocolIdentifier(messageId) ||
+        !Number.isSafeInteger(order) || order < 0 ||
+        typeof conversationId !== "string" || !isProtocolIdentifier(conversationId)
+      ) {
+        sendJson(response, 400, {
+          code: "invalid_attachment",
+          message: "The Conversation Attachment address is invalid.",
+        });
+        return;
+      }
+      void attachments.materializeOwned({ conversationId, messageId, order }).then(
+        (attachment) => {
+          response.writeHead(200, {
+            "cache-control": "private, no-store",
+            "content-length": attachment.bytes.byteLength,
+            "content-type": attachment.mediaType,
+          });
+          response.end(attachment.bytes);
+        },
+        (error: unknown) => {
+          const attachmentError = error instanceof RunAttachmentError ? error : undefined;
+          sendJson(response, attachmentError?.code === "attachment_missing" ? 404 : 403, {
+            code: attachmentError?.code ?? "storage_error",
+            message: attachmentError?.message ?? "The Conversation Attachment could not be read.",
+          });
+        },
+      );
       return;
     }
 
@@ -1921,9 +1973,7 @@ async function startRuntime({
               userInput,
               startedEvent,
               startCommand.eventId,
-              materializedAttachments.map(
-                ({ bytes: _bytes, attachmentId: _attachmentId, ...metadata }) => metadata,
-              ),
+              materializedAttachments.map(({ bytes: _bytes, ...metadata }) => metadata),
             );
             if (!began) {
               for (const event of await store.listUnacknowledgedEvents(startCommand.agentRunId)) {

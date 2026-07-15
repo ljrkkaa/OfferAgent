@@ -46,6 +46,8 @@ class StubElement {
     this.tagName = tagName;
     this._text = "";
     this.value = "";
+    this.selectionStart = 0;
+    this.selectionEnd = 0;
   }
 
   empty() {
@@ -129,6 +131,11 @@ class StubElement {
     this.focused = true;
   }
 
+  setSelectionRange(start, end) {
+    this.selectionStart = start;
+    this.selectionEnd = end;
+  }
+
   dispatch(type, event = {}) {
     const dispatched = {
       defaultPrevented: false,
@@ -208,6 +215,28 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   const previousSetTimeout = globalThis.setTimeout;
   const previousClearTimeout = globalThis.clearTimeout;
   const previousDate = globalThis.Date;
+  const previousIntersectionObserver = globalThis.IntersectionObserver;
+  const attachmentObservers = [];
+  globalThis.IntersectionObserver = class {
+    constructor(callback) {
+      this.callback = callback;
+      this.disconnected = false;
+      attachmentObservers.push(this);
+    }
+
+    disconnect() {
+      this.disconnected = true;
+    }
+
+    observe(element) {
+      this.element = element;
+      this.emit(true);
+    }
+
+    emit(isIntersecting) {
+      if (!this.disconnected) this.callback([{ isIntersecting, target: this.element }]);
+    }
+  };
   globalThis.Date = class extends previousDate {
     constructor(...args) {
       super(...(args.length > 0 ? args : ["2026-07-14T12:00:00"]));
@@ -257,6 +286,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     globalThis.setTimeout = previousSetTimeout;
     globalThis.clearTimeout = previousClearTimeout;
     globalThis.Date = previousDate;
+    globalThis.IntersectionObserver = previousIntersectionObserver;
   });
   process.env.OFFERAGENT_RUNTIME_PROVIDER = "fake";
   const temporaryVault = await mkdtemp(path.join(os.tmpdir(), "offeragent-vault-"));
@@ -803,9 +833,97 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     ["Preview 1: first-preview.png", "Preview 2: second-preview.png"],
   );
   assert.ok(imagePreviews.every(({ src }) => /^blob:/.test(src)));
+  const draftCards = activeView.contentEl.findAllByClass("offeragent-sidebar__attachment");
+  assert.ok(draftCards.every(({ draggable }) => draggable === true));
+  draftCards[1].dispatch("drop", {
+    dataTransfer: {
+      files: [{ name: "external.png", type: "image/png" }],
+      types: ["Files"],
+      getData() { return ""; },
+    },
+  });
+  assert.deepEqual(
+    activeView.contentEl
+      .findAllByClass("offeragent-sidebar__attachment-preview")
+      .map((preview) => preview.getAttribute("alt")),
+    ["Preview 1: first-preview.png", "Preview 2: second-preview.png"],
+    "an external file drop on a thumbnail must not reorder the first draft image",
+  );
+  let draggedIndex = "";
+  const draftTransfer = {
+    files: [],
+    types: ["application/x-offeragent-attachment-index"],
+    setData(_type, value) { draggedIndex = value; },
+    getData() { return draggedIndex; },
+  };
+  draftCards[0].dispatch("dragstart", { dataTransfer: draftTransfer });
+  draftCards[1].dispatch("drop", { dataTransfer: draftTransfer });
+  assert.deepEqual(
+    activeView.contentEl
+      .findAllByClass("offeragent-sidebar__attachment-preview")
+      .map((preview) => preview.getAttribute("alt")),
+    ["Preview 1: second-preview.png", "Preview 2: first-preview.png"],
+  );
   activeView.contentEl.findByClass("offeragent-sidebar__attachment-remove").dispatch("click");
   activeView.contentEl.findByClass("offeragent-sidebar__attachment-remove").dispatch("click");
   assert.equal(activeView.contentEl.findAllByClass("offeragent-sidebar__attachment-preview").length, 0);
+  const mixedPasteInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  mixedPasteInput.value = "Prefix ";
+  mixedPasteInput.setSelectionRange(mixedPasteInput.value.length, mixedPasteInput.value.length);
+  const mixedPaste = mixedPasteInput.dispatch("paste", {
+    clipboardData: {
+      files: [{
+        name: "clipboard.png",
+        size: 8,
+        type: "image/png",
+        async arrayBuffer() {
+          return new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).buffer;
+        },
+      }],
+      getData(type) { return type === "text/plain" ? "mixed text" : ""; },
+    },
+  });
+  assert.equal(mixedPaste.defaultPrevented, true);
+  await waitUntil(
+    () => activeView.contentEl.findAllByClass("offeragent-sidebar__attachment-preview").length === 1,
+    "Mixed clipboard image did not use the atomic attachment import path",
+  );
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__input").value, "Prefix mixed text");
+  const mixedSend = activeView.contentEl.findByClass("offeragent-sidebar__input").dispatch("keydown", {
+    isComposing: false,
+    key: "Enter",
+    keyCode: 13,
+    shiftKey: false,
+  });
+  assert.equal(mixedSend.defaultPrevented, true);
+  const sentAttachment = await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__message-attachment"),
+    "Sent user message did not render its image immediately",
+  );
+  assert.equal(sentAttachment.getAttribute("alt"), "Attachment 1: clipboard.png");
+  assert.match(sentAttachment.src, /^blob:/);
+  await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.text === "Send",
+    "Image message Agent Run did not return to idle",
+  );
+  const visibleAttachment = activeView.contentEl.findByClass("offeragent-sidebar__message-attachment");
+  const visibleAttachmentObserver = [...attachmentObservers].reverse().find(
+    (observer) => !observer.disconnected && observer.element === visibleAttachment,
+  );
+  assert.ok(visibleAttachmentObserver, "sent message image was not visibility-observed");
+  visibleAttachmentObserver.emit(false);
+  assert.equal(visibleAttachment.src, "", "offscreen message bytes must release their Blob URL");
+  visibleAttachmentObserver.emit(true);
+  await waitUntil(
+    () => /^blob:/.test(visibleAttachment.src),
+    "visible message image did not reload after offscreen release",
+  );
+  await activeView.onClose();
+  await activeView.onOpen();
+  await waitUntil(
+    () => /^blob:/.test(activeView.contentEl.findByClass("offeragent-sidebar__message-attachment")?.src ?? ""),
+    "persisted sent image did not reload after sidebar close and reopen",
+  );
   assert.equal(
     activeView.contentEl.findByClass("offeragent-sidebar__context-chip")?.text,
     "Vault context",
@@ -932,12 +1050,11 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   await plugin.setFastMode(true);
   const assistantMessage = await waitUntil(
     () => {
-      const message = activeView.contentEl.findByClass("offeragent-sidebar__message--assistant");
-      return message?.findByClass("offeragent-sidebar__message-body")?.text.startsWith(
+      return activeView.contentEl
+        .findAllByClass("offeragent-sidebar__message--assistant")
+        .find((message) => message.findByClass("offeragent-sidebar__message-body")?.text.startsWith(
           "OfferAgent received: Practice my introduction.",
-        )
-        ? message
-        : undefined;
+        ));
     },
     "OfferAgent did not stream the fake Provider response into the Sidebar",
   );
@@ -963,9 +1080,7 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
   releaseStaleMarkdownRender();
   await new Promise((resolve) => setTimeout(resolve, 75));
   assert.equal(
-    activeView.contentEl
-      .findByClass("offeragent-sidebar__message--assistant")
-      ?.findByClass("offeragent-sidebar__message-body")?.text,
+    assistantMessage.findByClass("offeragent-sidebar__message-body")?.text,
     "OfferAgent received: Practice my introduction.External sourceconst answer = 42;const fallback = 7;复制代码",
     "A stale Markdown render replaced the latest completed response",
   );
@@ -981,7 +1096,8 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
       ),
     "The installed Runtime did not read the migrated Agent Contract",
   );
-  assert.deepEqual(contractReads, [migratedContract]);
+  assert.equal(contractReads.length, 2);
+  assert.ok(contractReads.every((content) => content === migratedContract));
   assert.equal(activeView.contentEl.findAllByClass("offeragent-sidebar__run-status").length, 0);
 
   const stoppedComposer = activeView.contentEl.findByClass("offeragent-sidebar__composer");

@@ -171,7 +171,14 @@ class OfferAgentSidebarView extends ItemView {
     owner?: Component;
     timer?: ReturnType<typeof setTimeout>;
   }>();
-  readonly #previewUrls: string[] = [];
+  readonly #draftPreviewUrls: string[] = [];
+  readonly #messagePreviewUrls = new Map<string, string>();
+  readonly #messagePreviewElements = new Map<string, HTMLImageElement>();
+  readonly #loadingMessagePreviews = new Set<string>();
+  readonly #attachmentObservers = new Set<IntersectionObserver>();
+  #attachmentLoadGeneration = 0;
+  #attachmentLoadQueue: Array<() => Promise<void>> = [];
+  #activeAttachmentLoads = 0;
   readonly #streamedMessageElements = new Map<string, HTMLDivElement>();
   readonly #transcriptItemElements = new Map<string, HTMLElement>();
   #composerInput?: HTMLTextAreaElement;
@@ -212,11 +219,89 @@ class OfferAgentSidebarView extends ItemView {
     this.#unsubscribe?.();
     this.#unsubscribe = undefined;
     this.#disposeMarkdownRenders();
-    this.#revokePreviewUrls();
+    this.#resetAttachmentLoads();
+    this.#revokeDraftPreviewUrls();
+    for (const url of this.#messagePreviewUrls.values()) URL.revokeObjectURL(url);
+    this.#messagePreviewUrls.clear();
   }
 
-  #revokePreviewUrls(): void {
-    for (const url of this.#previewUrls.splice(0)) URL.revokeObjectURL(url);
+  #revokeDraftPreviewUrls(): void {
+    for (const url of this.#draftPreviewUrls.splice(0)) URL.revokeObjectURL(url);
+  }
+
+  #messageAttachmentKey(
+    message: SidebarViewModel["conversation"]["messages"][number],
+    attachment: NonNullable<SidebarViewModel["conversation"]["messages"][number]["attachments"]>[number],
+  ): string {
+    return `${message.id ?? message.agentRunId}:${attachment.order}:${attachment.contentHash}`;
+  }
+
+  #resetAttachmentLoads(): void {
+    this.#attachmentLoadGeneration += 1;
+    this.#attachmentLoadQueue = [];
+    for (const observer of this.#attachmentObservers) observer.disconnect();
+    this.#attachmentObservers.clear();
+    this.#messagePreviewElements.clear();
+    this.#loadingMessagePreviews.clear();
+  }
+
+  #pruneMessagePreviewUrls(viewModel: SidebarViewModel): void {
+    const retained = new Set<string>();
+    for (const message of viewModel.conversation.messages) {
+      for (const attachment of message.attachments ?? []) {
+        retained.add(this.#messageAttachmentKey(message, attachment));
+      }
+    }
+    for (const [key, url] of this.#messagePreviewUrls) {
+      if (retained.has(key)) continue;
+      URL.revokeObjectURL(url);
+      this.#messagePreviewUrls.delete(key);
+      this.#messagePreviewElements.delete(key);
+    }
+  }
+
+  #releaseMessagePreview(key: string): void {
+    const url = this.#messagePreviewUrls.get(key);
+    if (!url) return;
+    URL.revokeObjectURL(url);
+    this.#messagePreviewUrls.delete(key);
+    const element = this.#messagePreviewElements.get(key);
+    if (element?.src === url) element.src = "";
+  }
+
+  #cacheMessagePreview(key: string, url: string): void {
+    this.#releaseMessagePreview(key);
+    this.#messagePreviewUrls.set(key, url);
+  }
+
+  #enqueueAttachmentLoad(load: () => Promise<void>): void {
+    this.#attachmentLoadQueue.push(load);
+    this.#drainAttachmentLoads();
+  }
+
+  #drainAttachmentLoads(): void {
+    while (this.#activeAttachmentLoads < 4) {
+      const load = this.#attachmentLoadQueue.shift();
+      if (!load) return;
+      this.#activeAttachmentLoads += 1;
+      void load().finally(() => {
+        this.#activeAttachmentLoads -= 1;
+        this.#drainAttachmentLoads();
+      });
+    }
+  }
+
+  #observeAttachment(load: () => void, unload: () => void, element: HTMLImageElement): void {
+    if (typeof IntersectionObserver === "undefined") {
+      load();
+      return;
+    }
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some(({ isIntersecting }) => isIntersecting)) load();
+      else unload();
+    }, { root: this.#transcriptElement, rootMargin: "200px" });
+    this.#attachmentObservers.add(observer);
+    observer.observe(element);
   }
 
   #transcriptItemKey(
@@ -263,6 +348,58 @@ class OfferAgentSidebarView extends ItemView {
     const messageElement = transcript.createDiv({
       cls: `offeragent-sidebar__message offeragent-sidebar__message--${message.role} offeragent-sidebar__message--${item.presentation.layout}`,
     });
+    if (message.attachments?.length) {
+      const gallery = messageElement.createDiv({ cls: "offeragent-sidebar__message-attachments" });
+      for (const [attachmentIndex, attachment] of message.attachments.entries()) {
+        const preview = gallery.createEl("img", {
+          cls: "offeragent-sidebar__message-attachment",
+        });
+        preview.loading = "lazy";
+        preview.setAttribute(
+          "alt",
+          `Attachment ${attachmentIndex + 1}: ${attachment.fileName}`,
+        );
+        const previewKey = this.#messageAttachmentKey(message, attachment);
+        this.#messagePreviewElements.set(previewKey, preview);
+        const generation = this.#attachmentLoadGeneration;
+        let visible = false;
+        const load = (): void => {
+          visible = true;
+          const cachedUrl = this.#messagePreviewUrls.get(previewKey);
+          if (cachedUrl) {
+            this.#messagePreviewUrls.delete(previewKey);
+            this.#messagePreviewUrls.set(previewKey, cachedUrl);
+            preview.src = cachedUrl;
+            return;
+          }
+          if (this.#loadingMessagePreviews.has(previewKey)) return;
+          this.#loadingMessagePreviews.add(previewKey);
+          this.#enqueueAttachmentLoad(async () => {
+            try {
+              const bytes = await this.#controller.readMessageAttachment(message, attachment.order);
+              if (generation !== this.#attachmentLoadGeneration || !visible) return;
+              const previewBytes = Uint8Array.from(bytes);
+              const previewUrl = URL.createObjectURL(new Blob([previewBytes.buffer], {
+                type: attachment.mediaType,
+              }));
+              this.#cacheMessagePreview(previewKey, previewUrl);
+              preview.src = previewUrl;
+              if (message.id) {
+                this.#controller.releaseOptimisticAttachmentPreview(message.agentRunId, attachment.order);
+              }
+            } catch {
+              preview.addClass("offeragent-sidebar__message-attachment--unavailable");
+            } finally {
+              this.#loadingMessagePreviews.delete(previewKey);
+            }
+          });
+        };
+        this.#observeAttachment(load, () => {
+          visible = false;
+          this.#releaseMessagePreview(previewKey);
+        }, preview);
+      }
+    }
     const messageBody = messageElement.createDiv({ cls: "offeragent-sidebar__message-body" });
     const key = this.#transcriptItemKey(item, index);
     this.#streamedMessageElements.set(key, messageBody);
@@ -541,7 +678,9 @@ class OfferAgentSidebarView extends ItemView {
     const selectionStart = restoreComposerFocus ? this.#composerInput?.selectionStart : undefined;
     const selectionEnd = restoreComposerFocus ? this.#composerInput?.selectionEnd : undefined;
     const container = this.contentEl;
-    this.#revokePreviewUrls();
+    this.#resetAttachmentLoads();
+    this.#revokeDraftPreviewUrls();
+    this.#pruneMessagePreviewUrls(viewModel);
     this.#disposeMarkdownRenders();
     this.#streamedMessageElements.clear();
     this.#transcriptItemElements.clear();
@@ -581,7 +720,10 @@ class OfferAgentSidebarView extends ItemView {
     history.type = "button";
     history.setAttribute("aria-label", "打开对话历史");
     history.setAttribute("aria-expanded", `${this.#historyOpen}`);
-    history.disabled = viewModel.conversation.runState === "streaming";
+    const conversationActionsDisabled = viewModel.conversation.runState === "streaming" ||
+      viewModel.presentation.composer.isPreparingAttachments ||
+      viewModel.presentation.composer.isSending;
+    history.disabled = conversationActionsDisabled;
     history.addEventListener("click", () => {
       this.#historyOpen = !this.#historyOpen;
       this.#focusHistorySearch = this.#historyOpen;
@@ -598,7 +740,7 @@ class OfferAgentSidebarView extends ItemView {
     });
     newConversation.type = "button";
     newConversation.setAttribute("aria-label", "新建对话");
-    newConversation.disabled = viewModel.conversation.runState === "streaming";
+    newConversation.disabled = conversationActionsDisabled;
     newConversation.addEventListener("click", () => {
       void this.#controller.createConversation();
     });
@@ -656,7 +798,7 @@ class OfferAgentSidebarView extends ItemView {
           });
           select.type = "button";
           select.dataset.titleOrigin = conversation.titleOrigin;
-          select.disabled = viewModel.conversation.runState === "streaming";
+          select.disabled = conversationActionsDisabled;
           select.addEventListener("click", () => {
             this.#historyOpen = false;
             this.#restoreHistoryFocus = true;
@@ -674,7 +816,7 @@ class OfferAgentSidebarView extends ItemView {
           updated.dateTime = conversation.updatedAt;
           const rename = item.createEl("button", { cls: "offeragent-sidebar__history-rename", text: "重命名" });
           rename.type = "button";
-          rename.disabled = viewModel.conversation.runState === "streaming";
+          rename.disabled = conversationActionsDisabled;
           rename.addEventListener("click", () => {
             const title = window.prompt("重命名对话", conversation.title);
             if (title !== null) void this.#controller.renameConversation(conversation.id, title);
@@ -684,13 +826,13 @@ class OfferAgentSidebarView extends ItemView {
             text: conversation.archived ? "恢复" : "归档",
           });
           archive.type = "button";
-          archive.disabled = viewModel.conversation.runState === "streaming";
+          archive.disabled = conversationActionsDisabled;
           archive.addEventListener("click", () => {
             void this.#controller.setConversationArchived(conversation.id, !conversation.archived);
           });
           const remove = item.createEl("button", { cls: "offeragent-sidebar__history-delete", text: "删除" });
           remove.type = "button";
-          remove.disabled = viewModel.conversation.runState === "streaming";
+          remove.disabled = conversationActionsDisabled;
           remove.addEventListener("click", () => {
             if (!window.confirm(`确定永久删除“${conversation.title}”吗？`)) return;
             if (conversation.id === viewModel.conversation.activeConversationId) {
@@ -903,6 +1045,15 @@ class OfferAgentSidebarView extends ItemView {
       const files = [...(event.clipboardData?.files ?? [])];
       if (files.length === 0) return;
       event.preventDefault();
+      const clipboardText = event.clipboardData?.getData("text/plain") ?? "";
+      if (clipboardText) {
+        const start = input.selectionStart ?? input.value.length;
+        const end = input.selectionEnd ?? start;
+        input.value = `${input.value.slice(0, start)}${clipboardText}${input.value.slice(end)}`;
+        const cursor = start + clipboardText.length;
+        input.setSelectionRange(cursor, cursor);
+        this.#controller.setComposerDraft(input.value);
+      }
       void acceptImages(files);
     });
     composer.addEventListener("dragover", (event) => {
@@ -916,11 +1067,30 @@ class OfferAgentSidebarView extends ItemView {
     });
     for (const [index, presented] of viewModel.presentation.composer.attachments.entries()) {
       const attachment = composer.createDiv({ cls: "offeragent-sidebar__attachment" });
+      attachment.draggable = !viewModel.presentation.composer.isPreparingAttachments;
+      attachment.addEventListener("dragstart", (event) => {
+        event.dataTransfer?.setData("application/x-offeragent-attachment-index", `${index}`);
+      });
+      attachment.addEventListener("dragover", (event) => {
+        if (event.dataTransfer?.types.includes("application/x-offeragent-attachment-index")) {
+          event.preventDefault();
+        }
+      });
+      attachment.addEventListener("drop", (event) => {
+        const transferType = "application/x-offeragent-attachment-index";
+        if (!event.dataTransfer?.types.includes(transferType)) return;
+        const payload = event.dataTransfer.getData(transferType);
+        if (!/^\d+$/.test(payload)) return;
+        const source = Number(payload);
+        if (!Number.isSafeInteger(source)) return;
+        event.preventDefault();
+        this.#controller.reorderDraftImage(source, index);
+      });
       const previewBytes = Uint8Array.from(presented.previewBytes);
       const previewUrl = URL.createObjectURL(new Blob([previewBytes.buffer], {
         type: presented.mediaType,
       }));
-      this.#previewUrls.push(previewUrl);
+      this.#draftPreviewUrls.push(previewUrl);
       const preview = attachment.createEl("img", {
         cls: "offeragent-sidebar__attachment-preview",
       });

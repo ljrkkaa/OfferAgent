@@ -158,7 +158,10 @@ test("an ordered multi-image Interview Submission ingests once as one atomic Exp
   assert.equal(/SCREENSHOT-[ABC]-SECRET|data:image|base64/i.test(JSON.stringify(proposal)), false);
   assert.equal(events.findIndex((event) => event.type === "tool_call.requested" && event.tool.name === "interview_catalog") <
     events.findIndex((event) => event.type === "tool_call.requested" && event.tool.name === "vault_propose_changes"), true);
-  assert.deepEqual(await readdir(attachmentsPath), []);
+  assert.deepEqual(
+    new Set(await readdir(attachmentsPath)),
+    new Set(staged.map(({ attachmentId }) => attachmentId)),
+  );
 
   const repeated = await stageImages("multi-image-duplicate-run");
   let duplicateProposals = 0;
@@ -195,7 +198,10 @@ test("an ordered multi-image Interview Submission ingests once as one atomic Exp
   assert.equal(duplicateEvents.at(-1).type, "agent_run.completed");
   assert.equal(duplicateProposals, 0);
   assert.match(duplicateEvents.at(-1).output.text, /duplicate/i);
-  assert.deepEqual(await readdir(attachmentsPath), []);
+  assert.deepEqual(
+    new Set(await readdir(attachmentsPath)),
+    new Set([...staged, ...repeated].map(({ attachmentId }) => attachmentId)),
+  );
 
   await stopRuntime(runtime, ready.port, token);
   const { RuntimeStateStore } = await import(pathToFileURL(stateStoreModule));

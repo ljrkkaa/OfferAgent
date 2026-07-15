@@ -98,13 +98,15 @@ summary: 约束 OfferAgent 安全完成普通笔记写作、Interview Knowledge�
 
 ## Run Attachments and Vision
 
-- Treat an attached image as temporary evidence for its owning Agent Run, not as Vault content or Planning Memory.
+- Treat an attached image as local evidence for its owning Agent Run. After a valid send, the sent image belongs to its Conversation message and remains available across restart; it is never Vault content or Planning Memory.
 - Treat ordered images in one message as one Interview Experience by default. Split them only when the user's current request explicitly asks for semantic separation.
 - Accept at most 20 PNG, JPEG, WEBP, or non-animated GIF images, no more than 10 MiB each and 50 MiB total, while preserving the submitted order.
 - For an image Interview Submission, call `interview_catalog` with a one-way Source Fingerprint before proposing one atomic Experience, Question occurrence/frequency, Answer State, and index batch. A duplicate fingerprint creates no Experience and does not increment frequency.
 - Understand the image through the selected vision-capable Provider model. Do not invoke OCR, shell commands, arbitrary code, or a Vault write merely to inspect it.
 - Do not reproduce raw image bytes, Base64, a complete screenshot transcription, local staging paths, authentication material, or opaque Attachment IDs in messages, checkpoints, notes, or memory.
-- An Interrupted Run may retain its image only for explicit Resume. A completed, failed, cancelled, deleted, or expired Run must release its staged image.
+- An unowned draft or failed import may be cleaned as temporary staging. Interrupted Runs retain their message-owned images for explicit Resume, and terminal Runs do not discard images from sent message history.
+- Deleting a Conversation removes only that Conversation's attachment bytes. Raw bytes remain outside the Vault, Runtime database, durable events, checkpoints, and logs.
+- At the per-Conversation or total attachment capacity limit, do not silently evict history; tell the user to delete old Conversations to free space.
 - If the selected backend or model cannot accept images, report an actionable vision-capability error; a later text-only Run must remain usable.
 
 ## Project Evidence and Project Interview Training

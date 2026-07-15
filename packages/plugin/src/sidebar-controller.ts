@@ -3,8 +3,11 @@ export { RuntimeSupervisor } from "./runtime-supervisor";
 import { randomUUID } from "node:crypto";
 import type {
   AgentRunRecord,
+  ConversationMessage,
   ConversationSummary,
   ModelDescriptor,
+  PersistedRunAttachmentMetadata,
+  StagedRunAttachment,
   ProviderErrorCode,
   ToolCallRecord,
   VaultChangeBatchProposal,
@@ -28,6 +31,7 @@ export interface SidebarViewModel {
     error?: { code: ProviderErrorCode | VaultToolErrorCode; message: string };
     messages: Array<{
       agentRunId: string;
+      attachments?: PersistedRunAttachmentMetadata[];
       citations?: WebCitation[];
       id?: string;
       role: "assistant" | "user";
@@ -223,6 +227,7 @@ export class SidebarController {
   #draftRevision = 0;
   #attachmentImportPending = false;
   #sendPending = false;
+  readonly #optimisticAttachmentPreviews = new Map<string, Map<number, Uint8Array>>();
   #transcriptFollowMode: "following" | "frozen" = "following";
   #transcriptHasNewContent = false;
   readonly #recoveredToolResults = new Map<string, {
@@ -313,6 +318,61 @@ export class SidebarController {
     }
   }
 
+  #presentMessages(
+    messages: ConversationMessage[],
+  ): SidebarViewModel["conversation"]["messages"] {
+    return messages.map(({ id, agentRunId, role, text, citations, attachments }) => ({
+      id,
+      agentRunId,
+      role,
+      text,
+      ...(citations ? { citations } : {}),
+      ...(attachments?.length ? { attachments: attachments.map((attachment) => ({ ...attachment })) } : {}),
+    }));
+  }
+
+  async readMessageAttachment(
+    message: { agentRunId: string; id?: string },
+    order: number,
+  ): Promise<Uint8Array> {
+    if (message.id) {
+      const conversationId = this.#viewModel.conversation.activeConversationId;
+      if (!conversationId) throw new Error("Choose a Conversation before loading its image.");
+      return this.#runtime.readConversationAttachment({ conversationId, messageId: message.id, order });
+    }
+    const bytes = this.#optimisticAttachmentPreviews.get(message.agentRunId)?.get(order);
+    if (!bytes) throw new Error("The message image is not available yet.");
+    return new Uint8Array(bytes);
+  }
+
+  releaseOptimisticAttachmentPreview(agentRunId: string, order: number): void {
+    const previews = this.#optimisticAttachmentPreviews.get(agentRunId);
+    if (!previews) return;
+    previews.delete(order);
+    if (previews.size === 0) this.#optimisticAttachmentPreviews.delete(agentRunId);
+  }
+
+  async #reconcilePersistedUserMessage(conversationId: string, agentRunId: string): Promise<void> {
+    try {
+      const snapshot = await this.#runtime.openConversation(conversationId);
+      const persisted = snapshot.messages.find(
+        (message) => message.agentRunId === agentRunId && message.role === "user",
+      );
+      if (!persisted) return;
+      const local = this.#viewModel.conversation.messages.find(
+        (message) => message.agentRunId === agentRunId && message.role === "user",
+      );
+      if (!local) return;
+      local.id = persisted.id;
+      if (persisted.attachments?.length) {
+        local.attachments = persisted.attachments.map((attachment) => ({ ...attachment }));
+      }
+      this.refreshPresentation();
+    } catch {
+      // Keep the optimistic bytes until a later Conversation snapshot can supply the durable ID.
+    }
+  }
+
   beginAttachmentImport(
     files: Array<{ mediaType: string; size: number }> = [],
   ): () => void {
@@ -362,7 +422,14 @@ export class SidebarController {
 
   moveDraftImage(index: number, offset: -1 | 1): void {
     const target = index + offset;
-    if (index < 0 || index >= this.#draftImages.length || target < 0 || target >= this.#draftImages.length) {
+    this.reorderDraftImage(index, target);
+  }
+
+  reorderDraftImage(index: number, target: number): void {
+    if (
+      index < 0 || index >= this.#draftImages.length ||
+      target < 0 || target >= this.#draftImages.length || index === target
+    ) {
       return;
     }
     const [image] = this.#draftImages.splice(index, 1);
@@ -372,6 +439,7 @@ export class SidebarController {
   }
 
   async start(): Promise<void> {
+    this.#optimisticAttachmentPreviews.clear();
     this.#update({ state: "starting" });
     try {
       await this.#runtime.start();
@@ -395,6 +463,7 @@ export class SidebarController {
         }
         const active = conversations.find(({ archived }) => !archived);
         const snapshot = active ? await this.#runtime.openConversation(active.id) : undefined;
+        const messages = snapshot ? this.#presentMessages(snapshot.messages) : [];
         this.#recoveredToolResults.clear();
         if (snapshot) await this.#rehydratePendingVaultChanges(snapshot.toolCalls ?? []);
         const toolCalls = this.#toolCallsWithRecoveredFailures(snapshot?.toolCalls ?? []);
@@ -404,14 +473,7 @@ export class SidebarController {
           conversations,
           activeConversationId: snapshot?.conversation.id,
           selectedModelId: snapshot?.conversation.modelId ?? models[0]?.id,
-          messages:
-            snapshot?.messages.map(({ id, agentRunId, role, text, citations }) => ({
-              id,
-              agentRunId,
-              role,
-              text,
-              ...(citations ? { citations } : {}),
-            })) ?? [],
+          messages,
           agentRuns: snapshot?.agentRuns ?? [],
           toolCalls,
           vaultChanges: this.#changesFromToolCalls(toolCalls),
@@ -439,6 +501,9 @@ export class SidebarController {
   }
 
   async createConversation(title = "新对话"): Promise<void> {
+    if (this.#attachmentImportPending || this.#sendPending) {
+      throw new Error("Wait for attachment import or sending to finish before creating a Conversation.");
+    }
     const modelId = this.#viewModel.conversation.selectedModelId;
     if (!modelId) throw new Error("Choose an available model before creating a Conversation.");
     const conversation = await this.#runtime.createConversation({
@@ -449,6 +514,7 @@ export class SidebarController {
       archived: false,
       updatedAt: new Date().toISOString(),
     });
+    this.#optimisticAttachmentPreviews.clear();
     this.#recoveredToolResults.clear();
     this.#resetTranscriptFollowing();
     this.#updateConversation({
@@ -469,7 +535,12 @@ export class SidebarController {
     if (this.#viewModel.conversation.runState === "streaming") {
       throw new Error("Stop the current Agent Run before switching Conversations.");
     }
+    if (this.#attachmentImportPending || this.#sendPending) {
+      throw new Error("Wait for attachment import or sending to finish before switching Conversations.");
+    }
     const snapshot = await this.#runtime.openConversation(conversationId);
+    this.#optimisticAttachmentPreviews.clear();
+    const messages = this.#presentMessages(snapshot.messages);
     this.#recoveredToolResults.clear();
     this.#resetTranscriptFollowing();
     await this.#rehydratePendingVaultChanges(snapshot.toolCalls ?? []);
@@ -481,13 +552,7 @@ export class SidebarController {
         conversation.id === snapshot.conversation.id ? snapshot.conversation : conversation
       ),
       agentRuns: snapshot.agentRuns,
-      messages: snapshot.messages.map(({ id, agentRunId, role, text, citations }) => ({
-        id,
-        agentRunId,
-        role,
-        text,
-        ...(citations ? { citations } : {}),
-      })),
+      messages,
       runState: "idle",
       selectedModelId: snapshot.conversation.modelId,
       toolCalls,
@@ -502,6 +567,9 @@ export class SidebarController {
     if (this.#viewModel.conversation.runState === "streaming") {
       throw new Error("Stop the current Agent Run before deleting its Conversation.");
     }
+    if (this.#attachmentImportPending || this.#sendPending) {
+      throw new Error("Wait for attachment import or sending to finish before deleting this Conversation.");
+    }
     const proposalCalls = this.#viewModel.conversation.toolCalls.filter(
       (call) => call.name === "vault_propose_changes",
     );
@@ -511,6 +579,7 @@ export class SidebarController {
       await this.#vaultChanges?.acknowledge?.(call.id);
     }
     await this.#runtime.deleteConversation(conversationId);
+    this.#optimisticAttachmentPreviews.clear();
     this.#recoveredToolResults.clear();
     const conversations = this.#viewModel.conversation.conversations.filter(
       (conversation) => conversation.id !== conversationId,
@@ -640,6 +709,7 @@ export class SidebarController {
       this.#draftRevision += 1;
     };
     let attachments: Array<{ attachmentId: string; order: number }> | undefined;
+    const stagedAttachments: Array<StagedRunAttachment & { order: number }> = [];
     let runStarted = false;
     const discardUnstartedAttachments = async (): Promise<void> => {
       if (runStarted || !attachments) return;
@@ -660,6 +730,7 @@ export class SidebarController {
             fileName: image.fileName,
             mediaType: image.mediaType,
           });
+          stagedAttachments.push({ ...staged, order });
           attachments.push({ attachmentId: staged.attachmentId, order });
         }
       } catch (error) {
@@ -677,9 +748,25 @@ export class SidebarController {
     }
     const messages = [
       ...this.#viewModel.conversation.messages,
-      { agentRunId, role: "user" as const, text },
+      {
+        agentRunId,
+        role: "user" as const,
+        text,
+        ...(stagedAttachments.length > 0
+          ? {
+              attachments: stagedAttachments.map(({ attachmentId: _attachmentId, ...metadata }) => ({
+                ...metadata,
+              })),
+            }
+          : {}),
+      },
       { agentRunId, role: "assistant" as const, text: "" },
     ];
+    if (submittedDraft.images.length > 0) {
+      this.#optimisticAttachmentPreviews.set(agentRunId, new Map(
+        submittedDraft.images.map((image, order) => [order, new Uint8Array(image.bytes)]),
+      ));
+    }
     const agentRuns = [
       ...this.#viewModel.conversation.agentRuns,
       { id: agentRunId, modelId: selectedModelId, status: "running" as const },
@@ -714,6 +801,9 @@ export class SidebarController {
       })) {
         if (event.type === "agent_run.started") {
           runStarted = true;
+          if (stagedAttachments.length > 0) {
+            await this.#reconcilePersistedUserMessage(conversationId, agentRunId);
+          }
           if (automaticTitle) {
             try {
               const updated = await this.#runtime.updateConversation(conversationId, {

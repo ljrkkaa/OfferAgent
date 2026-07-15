@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -241,5 +241,228 @@ test("one ordered image submission enforces count, order, and total-byte limits"
       conversationId: "ordered-conversation",
     }),
     (error) => error instanceof RunAttachmentError && /20 images/i.test(error.message),
+  );
+});
+
+test("Conversation-owned attachments survive terminal cleanup and support transactional deletion", async (t) => {
+  const {
+    MemoryRunAttachmentMetadataStore,
+    RunAttachmentModule,
+  } = await import(pathToFileURL(modulePath));
+  const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-conversation-attachments-"));
+  const metadata = new MemoryRunAttachmentMetadataStore();
+  let now = new Date("2026-07-15T00:00:00.000Z");
+  const attachments = new RunAttachmentModule({
+    directory: root,
+    metadata,
+    now: () => now,
+    ttlMs: 60_000,
+  });
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const staged = await attachments.stage({
+    agentRunId: "owned-run",
+    bytes: PNG,
+    claimedMediaType: "image/png",
+    conversationId: "owned-conversation",
+    fileName: "owned.png",
+  });
+  await metadata.claimAttachments({
+    agentRunId: "owned-run",
+    attachments: [{ attachmentId: staged.attachmentId, order: 0 }],
+    conversationId: "owned-conversation",
+    messageId: "owned-message",
+    ownedAt: now.toISOString(),
+  });
+
+  await attachments.deleteRun("owned-run");
+  now = new Date("2026-07-15T00:02:00.000Z");
+  assert.deepEqual(await attachments.sweepExpired(), []);
+  assert.deepEqual(await readdir(root), [staged.attachmentId]);
+  const historical = await attachments.materializeOwned({
+    conversationId: "owned-conversation",
+    messageId: "owned-message",
+    order: 0,
+  });
+  assert.deepEqual(historical.bytes, PNG);
+  assert.equal(historical.fileName, "owned.png");
+  await assert.rejects(
+    attachments.discard({
+      agentRunId: "owned-run",
+      attachmentId: staged.attachmentId,
+      conversationId: "owned-conversation",
+    }),
+    (error) => error?.code === "ownership_mismatch",
+  );
+  const other = await attachments.stage({
+    agentRunId: "other-run",
+    bytes: PNG,
+    claimedMediaType: "image/png",
+    conversationId: "other-conversation",
+    fileName: "other.png",
+  });
+  await metadata.claimAttachments({
+    agentRunId: "other-run",
+    attachments: [{ attachmentId: other.attachmentId, order: 0 }],
+    conversationId: "other-conversation",
+    messageId: "other-message",
+    ownedAt: now.toISOString(),
+  });
+
+  const deletion = await attachments.prepareConversationDeletion("owned-conversation");
+  assert.deepEqual(
+    new Set(await readdir(root)),
+    new Set([`${staged.attachmentId}.deleting`, other.attachmentId]),
+  );
+  const restartedAttachments = new RunAttachmentModule({ directory: root, metadata });
+  await restartedAttachments.recoverPendingDeletions();
+  assert.deepEqual(
+    new Set(await readdir(root)),
+    new Set([staged.attachmentId, other.attachmentId]),
+  );
+
+  const committedDeletion = await restartedAttachments.prepareConversationDeletion("owned-conversation");
+  await committedDeletion.commit();
+  assert.deepEqual(await readdir(root), [other.attachmentId]);
+  assert.equal(await metadata.getAttachment(staged.attachmentId), undefined);
+  assert.equal((await metadata.getAttachment(other.attachmentId)).conversationId, "other-conversation");
+  await restartedAttachments.deleteConversation("other-conversation");
+  assert.deepEqual(await readdir(root), []);
+});
+
+test("attachment staging is quota-bounded, deletion-safe, and namespaced by State", async (t) => {
+  const {
+    attachmentDirectoryForState,
+    MemoryRunAttachmentMetadataStore,
+    RunAttachmentModule,
+  } = await import(pathToFileURL(modulePath));
+  assert.notEqual(
+    attachmentDirectoryForState("C:/vault-a/state.db", "C:/local"),
+    attachmentDirectoryForState("C:/vault-b/state.db", "C:/local"),
+  );
+  assert.equal(
+    attachmentDirectoryForState("C:/vault-a/state.db", "C:/local"),
+    attachmentDirectoryForState("C:/vault-a/state.db", "C:/local"),
+  );
+
+  const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-attachment-capacity-"));
+  const metadata = new MemoryRunAttachmentMetadataStore();
+  const attachments = new RunAttachmentModule({
+    directory: root,
+    maxConversationBytes: PNG.length,
+    maxTotalBytes: PNG.length * 2,
+    metadata,
+  });
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await attachments.stage({
+    agentRunId: "quota-a-1",
+    bytes: PNG,
+    claimedMediaType: "image/png",
+    conversationId: "quota-a",
+    fileName: "a.png",
+  });
+  await assert.rejects(
+    attachments.stage({
+      agentRunId: "quota-a-2",
+      bytes: PNG,
+      claimedMediaType: "image/png",
+      conversationId: "quota-a",
+      fileName: "a2.png",
+    }),
+    (error) => error?.code === "capacity_exceeded" && /delete|clean/i.test(error.message),
+  );
+  await attachments.stage({
+    agentRunId: "quota-b-1",
+    bytes: PNG,
+    claimedMediaType: "image/png",
+    conversationId: "quota-b",
+    fileName: "b.png",
+  });
+  await assert.rejects(
+    attachments.stage({
+      agentRunId: "quota-c-1",
+      bytes: PNG,
+      claimedMediaType: "image/png",
+      conversationId: "quota-c",
+      fileName: "c.png",
+    }),
+    (error) => error?.code === "capacity_exceeded" && /delete|clean/i.test(error.message),
+  );
+  assert.equal((await readdir(root)).length, 2);
+  await attachments.deleteRun("quota-a-1");
+  await attachments.deleteRun("quota-b-1");
+
+  const deletion = await attachments.prepareConversationDeletion("deleting-conversation");
+  await assert.rejects(
+    attachments.stage({
+      agentRunId: "late-stage",
+      bytes: PNG,
+      claimedMediaType: "image/png",
+      conversationId: "deleting-conversation",
+      fileName: "late.png",
+    }),
+    (error) => error?.code === "ownership_mismatch" && /delet/i.test(error.message),
+  );
+  await deletion.rollback();
+  const afterRollback = await attachments.stage({
+    agentRunId: "after-rollback",
+    bytes: PNG,
+    claimedMediaType: "image/png",
+    conversationId: "deleting-conversation",
+    fileName: "after.png",
+  });
+  assert.ok(afterRollback.attachmentId);
+});
+
+test("legacy default attachment bytes migrate only when owned by the current State", async (t) => {
+  const {
+    MemoryRunAttachmentMetadataStore,
+    RunAttachmentModule,
+    migrateLegacyAttachmentDirectory,
+  } = await import(pathToFileURL(modulePath));
+  const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-legacy-attachments-"));
+  const legacyDirectory = path.join(root, "OfferAgent", "attachments");
+  const directory = path.join(legacyDirectory, "state-namespace");
+  const metadata = new MemoryRunAttachmentMetadataStore();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(legacyDirectory, { recursive: true });
+
+  const ownedId = "11111111-1111-4111-8111-111111111111";
+  const deletingId = "22222222-2222-4222-8222-222222222222";
+  const foreignId = "33333333-3333-4333-8333-333333333333";
+  for (const [attachmentId, conversationId] of [[ownedId, "owned"], [deletingId, "deleting"]]) {
+    await metadata.createAttachment({
+      agentRunId: `${conversationId}-run`,
+      attachmentId,
+      contentHash: `sha256:${createHash("sha256").update(PNG).digest("hex")}`,
+      conversationId,
+      createdAt: "2026-07-15T00:00:00.000Z",
+      fileName: `${conversationId}.png`,
+      mediaType: "image/png",
+      size: PNG.byteLength,
+    });
+  }
+  await writeFile(path.join(legacyDirectory, ownedId), PNG);
+  await writeFile(path.join(legacyDirectory, `${deletingId}.deleting`), PNG);
+  await writeFile(path.join(legacyDirectory, foreignId), PNG);
+
+  assert.deepEqual(
+    new Set(await migrateLegacyAttachmentDirectory({ directory, legacyDirectory, metadata })),
+    new Set([ownedId, `${deletingId}.deleting`]),
+  );
+  assert.deepEqual(await readdir(legacyDirectory), [foreignId, "state-namespace"]);
+  assert.deepEqual(new Set(await readdir(directory)), new Set([ownedId, `${deletingId}.deleting`]));
+
+  const attachments = new RunAttachmentModule({ directory, metadata });
+  await attachments.recoverPendingDeletions();
+  assert.deepEqual(new Set(await readdir(directory)), new Set([ownedId, deletingId]));
+  assert.deepEqual(
+    (await attachments.materialize({
+      agentRunId: "owned-run",
+      attachmentId: ownedId,
+      conversationId: "owned",
+      order: 0,
+    })).bytes,
+    PNG,
   );
 });

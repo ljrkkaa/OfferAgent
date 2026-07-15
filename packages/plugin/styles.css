@@ -444,6 +444,20 @@
   object-fit: cover;
 }
 
+.offeragent-sidebar__message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-4-1);
+  margin-bottom: var(--size-4-1);
+}
+
+.offeragent-sidebar__message-attachment {
+  width: 5rem;
+  height: 5rem;
+  border-radius: var(--radius-s);
+  object-fit: cover;
+}
+
 .offeragent-sidebar__attachment > span {
   overflow: hidden;
   text-overflow: ellipsis;

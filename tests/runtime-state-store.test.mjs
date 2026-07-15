@@ -116,6 +116,84 @@ test("Conversation metadata persists and legacy placeholders backfill idempotent
   await store.close();
 });
 
+test("message ownership keeps attachment metadata addressable across restart", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-owned-attachment-state-"));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  let store = await RuntimeStateStore.open(statePath);
+  await store.createConversation({
+    id: "attachment-conversation",
+    title: "Attachment history",
+    titleOrigin: "manual",
+    modelId: "fake-interview-model",
+    archived: false,
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.createAttachment({
+    attachmentId: "attachment-owned-a",
+    agentRunId: "attachment-run",
+    contentHash: `sha256:${"a".repeat(64)}`,
+    conversationId: "attachment-conversation",
+    createdAt: "2026-07-15T00:00:00.000Z",
+    fileName: "history.png",
+    mediaType: "image/png",
+    size: 128,
+  });
+  await store.beginAgentRun(
+    "attachment-conversation",
+    "attachment-run",
+    "fake-interview-model",
+    "Remember this image",
+    undefined,
+    undefined,
+    [{
+      attachmentId: "attachment-owned-a",
+      contentHash: `sha256:${"a".repeat(64)}`,
+      fileName: "history.png",
+      mediaType: "image/png",
+      order: 0,
+      size: 128,
+    }],
+  );
+  const snapshot = await store.getConversation("attachment-conversation");
+  const message = snapshot.messages.find(({ role }) => role === "user");
+  assert.ok(message);
+  assert.deepEqual(
+    await store.getAttachmentByMessage(message.id, 0),
+    {
+      attachmentId: "attachment-owned-a",
+      agentRunId: "attachment-run",
+      contentHash: `sha256:${"a".repeat(64)}`,
+      conversationId: "attachment-conversation",
+      createdAt: "2026-07-15T00:00:00.000Z",
+      fileName: "history.png",
+      mediaType: "image/png",
+      messageId: message.id,
+      messageOrder: 0,
+      ownedAt: message ? (await store.getAttachmentByMessage(message.id, 0)).ownedAt : undefined,
+      size: 128,
+    },
+  );
+  await store.close();
+
+  const SQL = await initSqlJs();
+  const legacy = new SQL.Database(await readFile(statePath));
+  legacy.run("DROP INDEX run_attachments_by_message_order");
+  legacy.run("ALTER TABLE run_attachments DROP COLUMN owned_at");
+  legacy.run("ALTER TABLE run_attachments DROP COLUMN message_order");
+  legacy.run("ALTER TABLE run_attachments DROP COLUMN message_id");
+  legacy.run("DELETE FROM schema_migrations WHERE version = 19");
+  legacy.run("UPDATE settings_metadata SET value = '18' WHERE key = 'schema_version'");
+  legacy.run("PRAGMA user_version = 18");
+  await writeFile(statePath, legacy.export());
+  legacy.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  assert.equal((await store.getAttachmentByMessage(message.id, 0)).attachmentId, "attachment-owned-a");
+  assert.equal(CURRENT_SCHEMA_VERSION, 19);
+  await store.close();
+});
+
 test("Conversation deletion invalidates cached responses in legacy NOT NULL State", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-legacy-delete-"));
   const statePath = path.join(temporaryDirectory, "state.db");
@@ -227,7 +305,7 @@ test("Runtime State applies explicit schema migrations and rejects newer schemas
      VALUES ('pre-v18-conversation', 'New Conversation', 'fake-interview-model', ?, ?)`,
     [new Date().toISOString(), new Date().toISOString()],
   );
-  pre18.run("DELETE FROM schema_migrations WHERE version = 18");
+  pre18.run("DELETE FROM schema_migrations WHERE version >= 18");
   pre18.run("UPDATE settings_metadata SET value = '17' WHERE key = 'schema_version'");
   pre18.run("PRAGMA user_version = 17");
   await writeFile(upgradeFromV17Path, pre18.export());

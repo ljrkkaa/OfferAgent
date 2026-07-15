@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -36,7 +37,7 @@ function waitFor(socket, predicate) {
   });
 }
 
-test("one staged image reaches a fake vision Provider without persistent bytes", async (t) => {
+test("one staged image becomes Conversation-owned without persisting bytes in State", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-single-image-"));
   const statePath = path.join(temporaryDirectory, "state.db");
   const attachmentsPath = path.join(temporaryDirectory, "attachments");
@@ -159,7 +160,29 @@ test("one staged image reaches a fake vision Provider without persistent bytes",
   );
   assert.equal(events.at(-1).type, "agent_run.completed");
   assert.match(events.at(-1).output.text, /distributed cache consistency/);
-  assert.deepEqual(await readdir(attachmentsPath), []);
+  assert.deepEqual(await readdir(attachmentsPath), [staged.attachmentId]);
+  const opened = waitFor(socket, (event) => event.type === "conversation.snapshot");
+  socket.send(JSON.stringify({
+    type: "conversation.open",
+    protocolVersion: 1,
+    eventId: "single-image-conversation-open",
+    conversationId,
+    agentRunId: "conversation-management",
+    sequence: 0,
+  }));
+  const liveSnapshot = await opened;
+  const historicalImage = await fetch(
+    `http://127.0.0.1:${ready.port}/conversation-attachments/${liveSnapshot.messages[0].id}/0`,
+    {
+      headers: {
+        authorization: `Bearer ${token}`,
+        "x-offeragent-conversation-id": conversationId,
+      },
+    },
+  );
+  assert.equal(historicalImage.status, 200);
+  assert.equal(historicalImage.headers.get("content-type"), "image/png");
+  assert.deepEqual(Buffer.from(await historicalImage.arrayBuffer()), PNG);
 
   await stopRuntime(runtime, ready.port, token);
   const { RuntimeStateStore } = await import(pathToFileURL(stateStoreModule));
@@ -174,12 +197,43 @@ test("one staged image reaches a fake vision Provider without persistent bytes",
     size: PNG.length,
   }]);
   assert.equal(JSON.stringify(snapshot.messages).includes(staged.attachmentId), false);
+  assert.deepEqual(await readdir(attachmentsPath), [staged.attachmentId]);
+  const restarted = spawn(
+    process.execPath,
+    [
+      runtimeEntry,
+      "--port", "0",
+      "--token", token,
+      "--parent-pid", `${process.pid}`,
+      "--provider", "fake",
+      "--fake-scenario", "single-image",
+      "--state-path", statePath,
+      "--attachments-path", attachmentsPath,
+    ],
+    { stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
+  );
+  const restartedReady = await handshake(restarted.stdout);
+  try {
+    const restartedImage = await fetch(
+      `http://127.0.0.1:${restartedReady.port}/conversation-attachments/${snapshot.messages[0].id}/0`,
+      {
+        headers: {
+          authorization: `Bearer ${token}`,
+          "x-offeragent-conversation-id": conversationId,
+        },
+      },
+    );
+    assert.equal(restartedImage.status, 200);
+    assert.deepEqual(Buffer.from(await restartedImage.arrayBuffer()), PNG);
+  } finally {
+    await stopRuntime(restarted, restartedReady.port, token);
+  }
   const persisted = await readFile(statePath);
   assert.equal(persisted.includes(Buffer.from("RUN-ATTACHMENT-SECRET-BYTES-31")), false);
   assert.equal(persisted.includes(Buffer.from(PNG.toString("base64"))), false);
 });
 
-test("unavailable vision cleans the image and leaves later text Runs healthy", async (t) => {
+test("unavailable vision retains the sent image and leaves later text Runs healthy", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-no-vision-"));
   const attachmentsPath = path.join(temporaryDirectory, "attachments");
   const token = "no-vision-token";
@@ -234,7 +288,7 @@ test("unavailable vision cleans the image and leaves later text Runs healthy", a
   }, () => { throw new Error("Unexpected tool"); });
   assert.equal(failed.at(-1).type, "agent_run.failed");
   assert.match(failed.at(-1).error.message, /vision-capable model|provide text/i);
-  assert.deepEqual(await readdir(attachmentsPath), []);
+  assert.deepEqual(await readdir(attachmentsPath), [staged.attachmentId]);
 
   const textRun = await runWithToolPeer(socket, {
     type: "agent_run.start", protocolVersion: 1, eventId: "after-no-vision-start",
@@ -307,7 +361,95 @@ test("a pre-Run attachment validation failure removes its staged bytes", async (
   assert.deepEqual(await readdir(attachmentsPath), []);
 });
 
-test("Interrupted image Runs retain bytes for Resume and cancelled Runs remove them", async (t) => {
+test("an upgraded default Runtime adopts legacy bytes for an Interrupted Conversation message", async (t) => {
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), "offeragent-legacy-default-runtime-"));
+  const statePath = path.join(dataRoot, "OfferAgent", "state.db");
+  const legacyDirectory = path.join(dataRoot, "OfferAgent", "attachments");
+  const attachmentId = "44444444-4444-4444-8444-444444444444";
+  const conversationId = "legacy-default-conversation";
+  const agentRunId = "legacy-default-interrupted-run";
+  await mkdir(legacyDirectory, { recursive: true });
+  const { RuntimeStateStore } = await import(pathToFileURL(stateStoreModule));
+  const store = await RuntimeStateStore.open(statePath);
+  await store.createConversation({
+    archived: false,
+    id: conversationId,
+    modelId: "fake-interview-model",
+    title: "Legacy attachment",
+    titleOrigin: "manual",
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  const metadata = {
+    attachmentId,
+    contentHash: `sha256:${createHash("sha256").update(PNG).digest("hex")}`,
+    fileName: "legacy.png",
+    mediaType: "image/png",
+    order: 0,
+    size: PNG.byteLength,
+  };
+  await store.createAttachment({
+    ...metadata,
+    agentRunId,
+    conversationId,
+    createdAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.beginAgentRun(
+    conversationId,
+    agentRunId,
+    "fake-interview-model",
+    "Resume my legacy image.",
+    undefined,
+    "legacy-default-start",
+    [metadata],
+  );
+  await store.interruptAgentRun(agentRunId);
+  const snapshot = await store.getConversation(conversationId);
+  const messageId = snapshot.messages.find(({ role }) => role === "user").id;
+  await store.close();
+  await writeFile(path.join(legacyDirectory, attachmentId), PNG);
+
+  const token = "legacy-default-token";
+  const runtime = spawn(
+    process.execPath,
+    [
+      runtimeEntry, "--port", "0", "--token", token, "--parent-pid", `${process.pid}`,
+      "--provider", "fake", "--fake-scenario", "single-image", "--state-path", statePath,
+    ],
+    {
+      env: { ...process.env, LOCALAPPDATA: dataRoot },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    },
+  );
+  const ready = await handshake(runtime.stdout);
+  t.after(async () => {
+    if (runtime.exitCode === null) await stopRuntime(runtime, ready.port, token);
+    await rm(dataRoot, { recursive: true, force: true });
+  });
+  const response = await fetch(
+    `http://127.0.0.1:${ready.port}/conversation-attachments/${messageId}/0`,
+    {
+      headers: {
+        authorization: `Bearer ${token}`,
+        "x-offeragent-conversation-id": conversationId,
+      },
+    },
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), PNG);
+  assert.deepEqual(
+    (await readdir(legacyDirectory, { withFileTypes: true }))
+      .filter((entry) => entry.isFile())
+      .map(({ name }) => name),
+    [],
+  );
+  const namespaces = (await readdir(legacyDirectory, { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory());
+  assert.equal(namespaces.length, 1);
+  assert.deepEqual(await readdir(path.join(legacyDirectory, namespaces[0].name)), [attachmentId]);
+});
+
+test("Interrupted, resumed, and cancelled image messages retain bytes until Conversation deletion", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-image-resume-"));
   const attachmentsPath = path.join(temporaryDirectory, "attachments");
   const token = "image-resume-token";
@@ -364,7 +506,7 @@ test("Interrupted image Runs retain bytes for Resume and cancelled Runs remove t
     },
   }, () => { throw new Error("Unexpected non-contract tool call"); });
   assert.equal(prior.at(-1).type, "agent_run.completed");
-  assert.deepEqual(await readdir(attachmentsPath), []);
+  assert.deepEqual(await readdir(attachmentsPath), [priorAttachment.attachmentId]);
 
   const staged = await uploadFor("image-interrupted-run");
   const interrupted = new Promise((resolve, reject) => {
@@ -425,7 +567,7 @@ test("Interrupted image Runs retain bytes for Resume and cancelled Runs remove t
   });
   await interrupted;
   await new Promise((resolve) => setTimeout(resolve, 100));
-  assert.equal((await readdir(attachmentsPath)).length, 1);
+  assert.equal((await readdir(attachmentsPath)).length, 2);
 
   socket = new WebSocket(`ws://127.0.0.1:${ready.port}/events`, {
     headers: { authorization: `Bearer ${token}` },
@@ -446,7 +588,7 @@ test("Interrupted image Runs retain bytes for Resume and cancelled Runs remove t
     },
   );
   assert.equal(protectedDiscard.status, 409);
-  assert.equal((await readdir(attachmentsPath)).length, 1);
+  assert.equal((await readdir(attachmentsPath)).length, 2);
 
   const retainedPath = path.join(attachmentsPath, staged.attachmentId);
   const heldPath = path.join(temporaryDirectory, "held-interrupted-image");
@@ -472,7 +614,10 @@ test("Interrupted image Runs retain bytes for Resume and cancelled Runs remove t
     conversationId, agentRunId: "image-interrupted-run", sequence: 0,
   }, (event) => readResult(event.tool.arguments.path));
   assert.equal(resumed.at(-1).type, "agent_run.completed");
-  assert.deepEqual(await readdir(attachmentsPath), []);
+  assert.deepEqual(
+    new Set(await readdir(attachmentsPath)),
+    new Set([priorAttachment.attachmentId, staged.attachmentId]),
+  );
 
   const cancelAttachment = await uploadFor("image-cancelled-run");
   const cancelled = new Promise((resolve, reject) => {
@@ -521,10 +666,13 @@ test("Interrupted image Runs retain bytes for Resume and cancelled Runs remove t
     }));
   });
   await cancelled;
-  assert.deepEqual(await readdir(attachmentsPath), []);
+  assert.deepEqual(
+    new Set(await readdir(attachmentsPath)),
+    new Set([priorAttachment.attachmentId, staged.attachmentId, cancelAttachment.attachmentId]),
+  );
 
   await uploadFor("image-unstarted-run");
-  assert.equal((await readdir(attachmentsPath)).length, 1);
+  assert.equal((await readdir(attachmentsPath)).length, 4);
   const deleted = waitFor(socket, (event) => event.type === "conversation.deleted");
   socket.send(JSON.stringify({
     type: "conversation.delete", protocolVersion: 1, eventId: "image-conversation-delete",

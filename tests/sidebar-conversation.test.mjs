@@ -177,6 +177,122 @@ test("the Sidebar presentation keeps activity, composer, and common settings com
   assert.equal(observed.at(-1).composer.permissionMode, "ask_every_time");
 });
 
+test("sent and restarted Conversation messages retain image previews", async () => {
+  let opened = 0;
+  let attachmentReads = 0;
+  let latestAgentRunId;
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]);
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) { return conversation; },
+    async deleteConversation() {},
+    async discardAttachment() {},
+    async listConversations() {
+      return [{
+        id: "attachment-history",
+        title: "Attachment history",
+        titleOrigin: "manual",
+        modelId: "model-a",
+        archived: false,
+        updatedAt: "2026-07-15T00:00:00.000Z",
+      }];
+    },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation() {
+      opened += 1;
+      return {
+        conversation: {
+          id: "attachment-history",
+          title: "Attachment history",
+          titleOrigin: "manual",
+          modelId: "model-a",
+          archived: false,
+          updatedAt: "2026-07-15T00:00:00.000Z",
+        },
+        messages: opened === 1 ? [{
+          id: "historical-message",
+          agentRunId: "historical-run",
+          role: "user",
+          text: "Earlier image",
+          sequence: 0,
+          attachments: [{
+            contentHash: `sha256:${"b".repeat(64)}`,
+            fileName: "earlier.png",
+            mediaType: "image/png",
+            order: 0,
+            size: png.byteLength,
+          }],
+        }] : [{
+          id: "new-persisted-message",
+          agentRunId: latestAgentRunId,
+          role: "user",
+          text: "New image",
+          sequence: 0,
+          attachments: [{
+            contentHash: `sha256:${"c".repeat(64)}`,
+            fileName: "new.png",
+            mediaType: "image/png",
+            order: 0,
+            size: png.byteLength,
+          }],
+        }],
+        agentRuns: [],
+        toolCalls: [],
+      };
+    },
+    async readConversationAttachment(request) {
+      attachmentReads += 1;
+      assert.equal(request.conversationId, "attachment-history");
+      assert.equal(request.order, 0);
+      assert.ok(["historical-message", "new-persisted-message"].includes(request.messageId));
+      return png;
+    },
+    async *resumeAgentRun() {},
+    async *runAgent(request) {
+      latestAgentRunId = request.agentRunId;
+      yield { type: "agent_run.started", model: "model-a" };
+      yield { type: "agent_run.completed", output: { role: "assistant", text: "Done" } };
+    },
+    async stageAttachment() {
+      return {
+        attachmentId: "new-owned-attachment",
+        contentHash: `sha256:${"c".repeat(64)}`,
+        fileName: "new.png",
+        mediaType: "image/png",
+        size: png.byteLength,
+      };
+    },
+    async start() {},
+    async stop() {},
+    async updateConversation(conversationId, patch) {
+      return { id: conversationId, title: "Attachment history", titleOrigin: "manual", modelId: "model-a", archived: false, updatedAt: new Date().toISOString(), ...patch };
+    },
+    async updateConversationModel(conversationId, modelId) {
+      return { id: conversationId, title: "Attachment history", titleOrigin: "manual", modelId, archived: false, updatedAt: new Date().toISOString() };
+    },
+  };
+  const controller = new SidebarController(runtime);
+  await controller.start();
+  const historical = controller.getViewModel().conversation.messages[0];
+  assert.equal(attachmentReads, 0, "history startup must not eagerly download image bytes");
+  assert.equal("previewBytes" in historical.attachments[0], false);
+  assert.deepEqual(await controller.readMessageAttachment(historical, 0), png);
+  assert.equal(attachmentReads, 1);
+
+  controller.attachImage({ bytes: png, fileName: "new.png", mediaType: "image/png" });
+  await controller.sendMessage("New image");
+  const sent = controller.getViewModel().conversation.messages.find(
+    ({ role, text }) => role === "user" && text === "New image",
+  );
+  assert.equal(sent.attachments[0].fileName, "new.png");
+  assert.equal(sent.id, "new-persisted-message");
+  assert.equal("previewBytes" in sent.attachments[0], false);
+  assert.deepEqual(await controller.readMessageAttachment(sent, 0), png);
+  controller.releaseOptimisticAttachmentPreview(sent.agentRunId, 0);
+  assert.deepEqual(await controller.readMessageAttachment(sent, 0), png);
+});
+
 test("one image draft survives staging failure and sends only an opaque Attachment ID", async () => {
   let rejectUpload = true;
   let runRequest;
@@ -672,9 +788,10 @@ test("the Sidebar rejects more than 20 images or more than 50 MiB without losing
 });
 
 test("one attachment import is atomic and blocks Send until every image is decoded", async () => {
+  let deleteCalls = 0;
   const runtime = {
     cancelAgentRun() {}, async createConversation(value) { return value; },
-    async deleteConversation() {}, async discardAttachment() {},
+    async deleteConversation() { deleteCalls += 1; }, async discardAttachment() {},
     async listConversations() {
       return [{ id: "atomic-import", title: "Images", modelId: "model-a" }];
     },
@@ -698,6 +815,8 @@ test("one attachment import is atomic and blocks Send until every image is decod
 
   assert.equal(controller.getViewModel().presentation.composer.isPreparingAttachments, true);
   await assert.rejects(controller.sendMessage("Do not send a partial selection."), /images are ready/i);
+  await assert.rejects(controller.deleteCurrentConversation(), /attachment import or sending/i);
+  assert.equal(deleteCalls, 0);
   assert.throws(
     () => controller.attachImages([
       { bytes: new Uint8Array(8), fileName: "valid.png", mediaType: "image/png" },
