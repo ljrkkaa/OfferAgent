@@ -21,26 +21,6 @@ function loadModule() {
     return compiled.exports;
 }
 
-function headlessStatus(overrides = {}) {
-    return {
-        state: "pipe_client_tool",
-        pipeConnectionCount: 1,
-        baselineReliable: true,
-        workspaceRevision: 9,
-        approvalId: null,
-        operationId: null,
-        argsHash: null,
-        revision: 0,
-        expiresAt: null,
-        reasonCode: "pipe_client_tool_authoritative",
-        userMessage: "Obsidian 已连接；Vault 写入只会经过唯一 Named Pipe Client Tool。",
-        canRequest: false,
-        canActivate: false,
-        canRevoke: false,
-        ...overrides,
-    };
-}
-
 test("obsolete settings schemas fail closed instead of being migrated", () => {
     const { DEFAULT_LOCAL_SETTINGS, parseLocalSettings } = loadModule();
     const settings = parseLocalSettings({
@@ -62,7 +42,6 @@ test("invalid enum/list values fail closed to safe defaults", () => {
         schemaVersion: 2,
         provider: "remote-agent",
         permissionMode: "skip-approval",
-        enabledSkills: ["a", "a"],
     });
     assert.equal(settings.schemaVersion, 2);
     assert.equal(settings.provider, "deepseek");
@@ -71,7 +50,6 @@ test("invalid enum/list values fail closed to safe defaults", () => {
     assert.equal(settings.reasoningEffort, "medium");
     assert.equal(settings.permissionMode, "normal");
     assert.equal(settings.workspaceTrusted, false);
-    assert.deepEqual(settings.enabledSkills, []);
 });
 
 test("current provider settings retain their explicit credential identity", () => {
@@ -94,15 +72,14 @@ test("current provider settings retain their explicit credential identity", () =
     assert.equal(modelCredentialProviderId(configured), "codex");
 });
 
-test("Run config is copied and cannot mutate saved settings through aliases", () => {
+test("Run config has no per-Skill selection state", () => {
     const { parseLocalSettings, runConfig, snapshotLocalSettings } = loadModule();
-    const settings = parseLocalSettings({ schemaVersion: 2, enabledSkills: ["review"] });
+    const settings = parseLocalSettings({ schemaVersion: 2 });
     const config = runConfig(settings);
-    config.enabledSkills.push("mutated");
-    assert.deepEqual(settings.enabledSkills, ["review"]);
+    assert.equal("enabledSkills" in config, false);
     const snapshot = snapshotLocalSettings(settings);
     assert.equal(Object.isFrozen(snapshot), true);
-    assert.equal(Object.isFrozen(snapshot.enabledSkills), true);
+    assert.equal("enabledSkills" in snapshot, false);
 });
 
 test("non-canonical local enum spellings fail closed", () => {
@@ -133,6 +110,15 @@ test("Workspace trust is independent, explicit, and fail-closed for effective pe
     assert.equal(missingExplicitTrust.workspaceTrusted, false);
     assert.equal(missingExplicitTrust.permissionMode, "normal");
     assert.equal(effectivePermissionMode(missingExplicitTrust), "read-only");
+
+    const bypass = parseLocalSettings({ schemaVersion: 2, permissionMode: "bypass", workspaceTrusted: true });
+    assert.equal(bypass.permissionMode, "bypass");
+    assert.equal(effectivePermissionMode(bypass), "bypass");
+    assert.equal(vaultWriteAvailable(bypass), true);
+
+    const bypassWithoutTrust = parseLocalSettings({ schemaVersion: 2, permissionMode: "bypass" });
+    assert.equal(bypassWithoutTrust.permissionMode, "normal");
+    assert.equal(effectivePermissionMode(bypassWithoutTrust), "read-only");
 
     const plan = parseLocalSettings({ schemaVersion: 2, permissionMode: "plan", workspaceTrusted: false });
     assert.equal(effectivePermissionMode(plan), "plan");
@@ -414,51 +400,4 @@ test("trusted Workspace can explicitly disable only Vault write prompts", () => 
     assert.match(settingsSource, /Vault 写入无需逐次审批/);
     assert.match(settingsSource, /Shell 与网络权限不会因此开放/);
     assert.match(mainSource, /approve_vault_writes: !settings\.autoApproveVaultWrites/);
-});
-
-test("headless Vault status parser preserves the closed wire proof and renders Pipe authority", () => {
-    const { headlessVaultWriteDescription, parseHeadlessVaultWriteStatus } = loadModule();
-    const status = parseHeadlessVaultWriteStatus(headlessStatus());
-
-    assert.equal(status.state, "pipe_client_tool");
-    assert.equal(status.pipeConnectionCount, 1);
-    assert.match(headlessVaultWriteDescription(status), /Pipe\/Client Tool 权威/);
-    assert.match(headlessVaultWriteDescription(status), /Web 授权已动态撤销/);
-    assert.match(headlessVaultWriteDescription(status), /Workspace revision 9/);
-});
-
-test("headless Vault status parser accepts a complete revocable authorization identity", () => {
-    const { parseHeadlessVaultWriteStatus } = loadModule();
-    const status = parseHeadlessVaultWriteStatus(headlessStatus({
-        state: "active",
-        pipeConnectionCount: 0,
-        approvalId: "apr_headless_1",
-        operationId: `op_headless_${"a".repeat(32)}`,
-        argsHash: `sha256:${"b".repeat(64)}`,
-        revision: 3,
-        expiresAt: "2026-07-13T12:00:00+08:00",
-        reasonCode: "authorization_active",
-        userMessage: "授权已激活。",
-        canRevoke: true,
-    }));
-
-    assert.equal(status.canRevoke, true);
-    assert.equal(status.revision, 3);
-    assert.equal(status.approvalId, "apr_headless_1");
-});
-
-test("headless Vault status parser rejects partial or incoherent authorization proofs", () => {
-    const { parseHeadlessVaultWriteStatus } = loadModule();
-    assert.throws(() => parseHeadlessVaultWriteStatus(headlessStatus({
-        approvalId: "apr_headless_1",
-    })), /身份字段不完整/);
-    assert.throws(() => parseHeadlessVaultWriteStatus(headlessStatus({
-        canActivate: true,
-    })), /只有已批准/);
-    assert.throws(() => parseHeadlessVaultWriteStatus(headlessStatus({
-        canRevoke: true,
-    })), /缺少审批身份/);
-    assert.throws(() => parseHeadlessVaultWriteStatus(headlessStatus({
-        pipeConnectionCount: 17,
-    })), /Pipe 连接数.*无效/);
 });

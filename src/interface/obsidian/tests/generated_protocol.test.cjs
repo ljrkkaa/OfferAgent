@@ -26,7 +26,8 @@ test("generated TypeScript protocol has the exact schema identity and method cat
 
     assert.equal(generated.PROTOCOL_TYPES_SCHEMA_HASH, manifest.schemaHash);
     assert.deepEqual(generated.PROTOCOL_COMMAND_METHODS, Object.keys(schema.commands).sort());
-    assert.deepEqual(generated.PROTOCOL_REVERSE_REQUEST_METHODS, Object.keys(schema.reverseRequests).sort());
+    assert.equal("reverseRequests" in schema, false);
+    assert.equal("PROTOCOL_REVERSE_REQUEST_METHODS" in generated, false);
     assert.deepEqual(generated.PROTOCOL_EVENT_TYPES, Object.keys(schema.events).sort());
     assert.deepEqual(generated.PROTOCOL_ERROR_CODES, schema.$defs.ErrorCode.enum);
     assert.deepEqual(generated.PROTOCOL_JSON_RPC_ERROR_CODES, schema.$defs.JsonRpcErrorCode.enum);

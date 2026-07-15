@@ -17,7 +17,7 @@ from offeragent_harness.protocol.jsonrpc import (
     validate_request,
     validate_response,
 )
-from offeragent_harness.protocol.messages import ALL_METHOD_REGISTRY, COMMAND_REGISTRY, REVERSE_REQUEST_REGISTRY
+from offeragent_harness.protocol.messages import ALL_METHOD_REGISTRY, COMMAND_REGISTRY
 from offeragent_harness.protocol.schemas import (
     BUNDLE_FILENAME,
     DEFAULT_SCHEMA_DIR,
@@ -91,10 +91,9 @@ def test_manifest_hashes_exact_generated_bytes() -> None:
 def test_bundle_registries_are_complete_and_use_refs_to_closed_models() -> None:
     bundle = build_schema_bundle()
     commands = _object(bundle["commands"])
-    reverse_requests = _object(bundle["reverseRequests"])
     events = _object(bundle["events"])
     assert set(commands) == set(COMMAND_REGISTRY)
-    assert set(reverse_requests) == set(REVERSE_REQUEST_REGISTRY)
+    assert "reverseRequests" not in bundle
     assert set(events) == {event.value for event in EVENT_REGISTRY}
 
     definitions = _object(bundle["$defs"])
@@ -126,7 +125,6 @@ def test_all_committed_examples_validate_against_dto_and_json_schema() -> None:
     bundle = build_schema_bundle()
     definitions = _object(bundle["$defs"])
     commands = _object(bundle["commands"])
-    reverse_requests = _object(bundle["reverseRequests"])
     envelopes = _object(bundle["envelopes"])
     examples = build_examples()
     assert set(examples) == set(EXAMPLE_METHODS)
@@ -137,16 +135,14 @@ def test_all_committed_examples_validate_against_dto_and_json_schema() -> None:
         if kind == "request":
             assert isinstance(message, JsonRpcRequest)
             validated = validate_request(message)
-            registry = commands if method in COMMAND_REGISTRY else reverse_requests
-            method_schema = _object(registry[method])
+            method_schema = _object(commands[method])
             params_schema = _object(method_schema["params"])
             schema_ref = params_schema["$ref"]
             instance = validated.params.to_wire()
         elif kind == "response":
             assert isinstance(message, JsonRpcSuccessResponse)
             validated_response = validate_response(method, message)
-            registry = commands if method in COMMAND_REGISTRY else reverse_requests
-            method_schema = _object(registry[method])
+            method_schema = _object(commands[method])
             result_schema = _object(method_schema["result"])
             schema_ref = result_schema["$ref"]
             instance = validated_response.result.to_wire()

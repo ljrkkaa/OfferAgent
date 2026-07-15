@@ -15,8 +15,7 @@ import secrets
 import sys
 import time
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -80,7 +79,6 @@ from offeragent_harness.ports import (
     UnitOfWorkFactory,
 )
 from offeragent_harness.ports.processes import ProcessSupervisor
-from offeragent_harness.ports.skills import SkillTrustVerifier
 from offeragent_harness.ports.subagents import (
     ChildRunExecution,
     ParentRunAuthority,
@@ -115,8 +113,6 @@ from offeragent_harness.runtime.application_handlers import (
 from offeragent_harness.runtime.approval_manager import ApprovalManager
 from offeragent_harness.runtime.backpressure import BufferedEventSink
 from offeragent_harness.runtime.cancellation import CancellationScope
-from offeragent_harness.runtime.client_tool_bridge import NamedPipeClientToolPort, ReverseRequestChannel
-from offeragent_harness.runtime.client_vault_preflight import ClientBoundVaultTransaction
 from offeragent_harness.runtime.codex_credentials import CodexFileCredentialSource
 from offeragent_harness.runtime.config_service import ConfigService, ConfigUpdateCommand, WorkerConfigActivation
 from offeragent_harness.runtime.conversation_controls import (
@@ -138,11 +134,6 @@ from offeragent_harness.runtime.harness_service import (
     RunHookBinding,
     StartTurnCommand,
 )
-from offeragent_harness.runtime.headless_vault_write import (
-    HeadlessAuthorizedVaultTransaction,
-    HeadlessVaultWriteAuthority,
-    headless_vault_write_handlers,
-)
 from offeragent_harness.runtime.host_supervisor import SupervisedWorkspaceIdentity
 from offeragent_harness.runtime.loopback_gateway import LoopbackGatewayConfig, LoopbackWebGateway
 from offeragent_harness.runtime.loopback_server import AsyncioLoopbackServer
@@ -152,6 +143,7 @@ from offeragent_harness.runtime.named_pipe import (
     DiscoveryMaterialStore,
     DuplexJsonRpcConnection,
     HandshakeReplayGuard,
+    PipeByteStream,
     authenticate_server_stream,
 )
 from offeragent_harness.runtime.network_audit import EntityNetworkAuditSink
@@ -178,7 +170,6 @@ from offeragent_harness.runtime.production_shell import (
 from offeragent_harness.runtime.production_skills import (
     PreparedSkillBundle,
     ProductionSkillBundleFactory,
-    ReleaseManifestSkillTrustVerifier,
 )
 from offeragent_harness.runtime.recovery import RecoveryCoordinator
 from offeragent_harness.runtime.recovery_apply import RecoveryPlanApplier
@@ -248,9 +239,6 @@ from offeragent_harness.tools.scheduler import FairEffectGate, ToolScheduler
 from offeragent_harness.vault import (
     VaultCasBarrier,
     VaultTransactionCoordinator,
-    client_vault_transaction_definition,
-    legacy_public_vault_transaction_definition,
-    legacy_vault_transaction_definition,
     vault_transaction_definition,
 )
 from offeragent_harness.workspace import (
@@ -331,7 +319,6 @@ class ProductionWorkerOverrides:
     start_native_transports: bool = True
     host_pid: int | None = None
     runtime_config: HarnessConfig | None = None
-    skill_trust_verifier: SkillTrustVerifier | None = None
     skill_runtime_root: Path | None = None
     ripgrep_path: Path | None = None
     powershell_path: Path | None = None
@@ -380,224 +367,16 @@ class _EventHub(EventSink):
             self._connections.discard(connection)
 
 
-@dataclass(slots=True)
-class _ReverseChannelEntry:
-    channel: ReverseRequestChannel
-    lease_count: int = 0
-    retiring: bool = False
-    drained: asyncio.Event = field(default_factory=asyncio.Event)
-    retirement: asyncio.Task[None] | None = None
-
-    def __post_init__(self) -> None:
-        self.drained.set()
-
-
-class _ReverseChannels:
-    def __init__(self, workspace_id: str) -> None:
-        self._workspace_id = workspace_id
-        self._channels: dict[str, _ReverseChannelEntry] = {}
-        self._retiring: dict[str, _ReverseChannelEntry] = {}
-        self._membership_lock = asyncio.Lock()
-        self._retirement_tasks: set[asyncio.Task[None]] = set()
-        self._headless_authority: HeadlessVaultWriteAuthority | None = None
-
-    def bind_headless_authority(self, authority: HeadlessVaultWriteAuthority) -> None:
-        if self._headless_authority is not None:
-            raise RuntimeError("headless Vault authority is already bound")
-        if authority.workspace_id != self._workspace_id:
-            raise ValueError("headless Vault authority belongs to another Workspace")
-        self._headless_authority = authority
-
-    def channel(self, workspace_id: str) -> ReverseRequestChannel:
-        if workspace_id != self._workspace_id or len(self._channels) != 1:
-            raise RuntimeError("Client Tool channel requires an explicit owning connection")
-        return next(iter(self._channels.values())).channel
-
-    def channel_for(self, workspace_id: str, client_connection_id: str) -> ReverseRequestChannel:
-        if workspace_id != self._workspace_id:
-            raise RuntimeError("Client Tool channel belongs to a different Workspace")
-        entry = self._channels.get(client_connection_id)
-        if entry is None:
-            raise RuntimeError("authenticated Obsidian Client Tool channel is unavailable")
-        return entry.channel
-
-    def binding_snapshot(self, client_connection_id: str) -> _ReverseChannelEntry | None:
-        """Freeze the current connection generation, including its absence.
-
-        A run whose authenticated connection disappeared before its Tool Kernel
-        was built may still execute unrelated local tools.  Freezing ``None``
-        makes every later Client Tool request fail closed and, importantly,
-        prevents a new connection reusing the same public id from acquiring the
-        abandoned run's authority.
-        """
-
-        return self._channels.get(client_connection_id)
-
-    def channel_for_binding(
-        self,
-        workspace_id: str,
-        client_connection_id: str,
-        binding: _ReverseChannelEntry,
-    ) -> ReverseRequestChannel:
-        if workspace_id != self._workspace_id:
-            raise RuntimeError("Client Tool channel belongs to a different Workspace")
-        entry = self._channels.get(client_connection_id)
-        if entry is not binding:
-            raise RuntimeError("authenticated Obsidian Client Tool channel binding is unavailable")
-        return entry.channel
-
-    @asynccontextmanager
-    async def connection_lease_for(
-        self,
-        workspace_id: str,
-        client_connection_id: str,
-        binding: _ReverseChannelEntry,
-    ) -> AsyncIterator[ReverseRequestChannel]:
-        """Linearize a commit lease against disconnect and connection reuse.
-
-        Disconnect retirement removes an entry from all new routing before it
-        waits for existing leases.  Therefore either disconnect wins and this
-        acquisition fails without a write, or this lease wins and preserves the
-        exact authenticated channel authority through commit/rollback/cleanup.
-        """
-
-        if workspace_id != self._workspace_id:
-            raise RuntimeError("Client Tool channel belongs to a different Workspace")
-        async with self._membership_lock:
-            entry = self._channels.get(client_connection_id)
-            if entry is not binding or entry.retiring:
-                raise RuntimeError("authenticated Obsidian Client Tool connection lease is unavailable")
-            entry.lease_count += 1
-            entry.drained.clear()
-        try:
-            yield entry.channel
-        finally:
-            # No await here: lease release remains cancellation-safe and is
-            # atomic with the retirement task on this event loop.
-            entry.lease_count -= 1
-            if entry.lease_count < 0:
-                raise AssertionError("Client Tool connection lease count underflow")
-            if entry.lease_count == 0:
-                entry.drained.set()
-
-    def contains(self, client_connection_id: str) -> bool:
-        return client_connection_id in self._channels
-
-    def sole_connection_id(self) -> str | None:
-        if len(self._channels) != 1:
-            return None
-        return next(iter(self._channels))
-
-    async def add(self, client_connection_id: str, value: ReverseRequestChannel) -> None:
-        authority = self._headless_authority
-        if authority is None:
-            raise RuntimeError("headless Vault authority is not bound")
-        async with authority.pipe_registration():
-            async with self._membership_lock:
-                if client_connection_id in self._channels or client_connection_id in self._retiring:
-                    raise RuntimeError("authenticated client connection identity is duplicated or retiring")
-                if len(self._channels) >= 16:
-                    raise RuntimeError("authenticated Pipe connection limit exceeded")
-                self._channels[client_connection_id] = _ReverseChannelEntry(value)
-
-    async def remove(self, client_connection_id: str, value: ReverseRequestChannel) -> None:
-        retirement: asyncio.Task[None] | None
-        async with self._membership_lock:
-            entry = self._channels.get(client_connection_id)
-            if entry is not None and entry.channel is value:
-                # Removal linearizes here.  No new route or lease can observe
-                # this authority, while an already-acquired lease retains the
-                # exact entry until its critical section finishes.
-                del self._channels[client_connection_id]
-                entry.retiring = True
-                self._retiring[client_connection_id] = entry
-                retirement = asyncio.create_task(
-                    self._finish_retirement(client_connection_id, entry),
-                    name=f"client-channel-retire-{client_connection_id}",
-                )
-                entry.retirement = retirement
-                self._retirement_tasks.add(retirement)
-                retirement.add_done_callback(self._retirement_tasks.discard)
-            else:
-                entry = self._retiring.get(client_connection_id)
-                if entry is None or entry.channel is not value:
-                    return
-                retirement = entry.retirement
-        if retirement is not None:
-            await asyncio.shield(retirement)
-
-    async def _finish_retirement(self, client_connection_id: str, entry: _ReverseChannelEntry) -> None:
-        await entry.drained.wait()
-        async with self._membership_lock:
-            if self._retiring.get(client_connection_id) is entry:
-                del self._retiring[client_connection_id]
-            entry.retirement = None
-
-    @property
-    def active(self) -> bool:
-        return bool(self._channels)
-
-    @property
-    def count(self) -> int:
-        return len(self._channels)
-
-
 class _ProductionApplicationTransportPolicy(ApplicationTransportPolicy):
-    """Select one authenticated Pipe or one explicit headless authorization."""
-
-    def __init__(self, channels: _ReverseChannels, headless: HeadlessVaultWriteAuthority) -> None:
-        self._channels = channels
-        self._headless = headless
+    """Accept the permission already reduced by durable Workspace policy."""
 
     async def resolve_run_route(
         self,
         context: ApplicationCommandContext,
         requested_permission: WirePermissionMode,
-        *,
-        request_hash: str,
-        headless_eligible: bool,
     ) -> RunTransportRoute:
-        if requested_permission in {WirePermissionMode.READ_ONLY, WirePermissionMode.PLAN}:
-            return RunTransportRoute(requested_permission)
-        if context.transport == "windows-named-pipe":
-            if self._channels.count != 1 or self._channels.sole_connection_id() != context.client_id:
-                return RunTransportRoute(WirePermissionMode.READ_ONLY)
-            return RunTransportRoute(requested_permission, client_connection_id=context.client_id)
-        if context.transport in {"loopback-http", "loopback-websocket"}:
-            client_connection_id = self._channels.sole_connection_id()
-            if client_connection_id is not None:
-                return RunTransportRoute(
-                    requested_permission,
-                    client_connection_id=client_connection_id,
-                )
-            if self._channels.count == 0 and headless_eligible:
-                grant_id = await self._headless.claim_for_turn(context.client_id, request_hash)
-                if grant_id is not None:
-                    return RunTransportRoute(
-                        requested_permission,
-                        local_vault_write_grant_id=grant_id,
-                    )
-        return RunTransportRoute(WirePermissionMode.READ_ONLY)
-
-
-class _BoundReverseChannels:
-    def __init__(self, channels: _ReverseChannels, client_connection_id: str) -> None:
-        self._channels = channels
-        self._client_connection_id = client_connection_id
-        self._binding = channels.binding_snapshot(client_connection_id)
-
-    def channel(self, workspace_id: str) -> ReverseRequestChannel:
-        if self._binding is None:
-            raise RuntimeError("authenticated Obsidian Client Tool channel binding is unavailable")
-        return self._channels.channel_for_binding(workspace_id, self._client_connection_id, self._binding)
-
-    def connection_lease(
-        self,
-        workspace_id: str,
-    ) -> AbstractAsyncContextManager[ReverseRequestChannel]:
-        if self._binding is None:
-            raise RuntimeError("authenticated Obsidian Client Tool channel binding is unavailable")
-        return self._channels.connection_lease_for(workspace_id, self._client_connection_id, self._binding)
+        del context
+        return RunTransportRoute(requested_permission)
 
 
 class _CompositeExecutor(ToolExecutor):
@@ -643,8 +422,6 @@ class _PreparedProductionCapabilities:
     config: WireRunConfigSnapshot
     inputs: ContextInputs
     effective_config: HarnessConfig
-    client_connection_id: str | None
-    local_vault_write_grant_id: str | None
     budget: RunBudget
     permission: PermissionMode
     scope: CapabilityScope
@@ -679,8 +456,6 @@ class ProductionRunComponentsFactory(
         artifacts: LocalArtifactStore,
         local_read: CodeToolExecutor,
         local_transaction: VaultTransactionCoordinator,
-        headless_vault_write: HeadlessVaultWriteAuthority,
-        channels: _ReverseChannels,
         parent_authorities: ParentRunAuthorityProvider,
         optional_definitions: Sequence[ToolDefinition] = (),
         optional_local_executors: Sequence[tuple[Sequence[ToolDefinition], ToolExecutor]] = (),
@@ -706,8 +481,6 @@ class ProductionRunComponentsFactory(
         self._artifacts = artifacts
         self._local_read = local_read
         self._local_transaction = local_transaction
-        self._headless_vault_write = headless_vault_write
-        self._channels = channels
         self._parent_authorities = parent_authorities
         self._optional_definitions = tuple(optional_definitions)
         self._optional_local_executors = tuple(optional_local_executors)
@@ -729,8 +502,6 @@ class ProductionRunComponentsFactory(
         self._recent_registries: OrderedDict[str, ToolRegistry] = OrderedDict()
         self._root_ledgers: dict[str, BudgetLedger] = {}
         self._effective_configs: dict[str, HarnessConfig] = {}
-        self._client_connections: dict[str, str] = {}
-        self._headless_grants: dict[str, str] = {}
         self._prepared_runs: dict[str, _PreparedProductionCapabilities] = {}
         self._bound_hook_bundles: dict[str, ProductionHookBundle] = {}
         self._effect_gate = FairEffectGate(default_config.budgets.max_parallel_reads)
@@ -780,8 +551,6 @@ class ProductionRunComponentsFactory(
         base_definitions = self._base_definitions(
             config,
             effective_config,
-            client_connection_id=command.client_connection_id,
-            local_vault_write_grant_id=command.local_vault_write_grant_id,
             permission=permission,
         )
         shell: PreparedShellBundle | None = None
@@ -803,10 +572,9 @@ class ProductionRunComponentsFactory(
         skills: PreparedSkillBundle | None = None
         skill_definitions: tuple[ToolDefinition, ...] = ()
         if self._skills is not None:
-            authority = _skill_authority(candidate_definitions, candidate_scope, config, effective_config)
+            authority = _skill_authority(candidate_definitions, candidate_scope, effective_config)
             skills = await self._skills.prepare(
                 effective_config,
-                config.enabled_skills,
                 cancellation,
                 authority_ceiling=authority,
             )
@@ -823,8 +591,6 @@ class ProductionRunComponentsFactory(
             config=config,
             inputs=_with_skill_prompt_context(_context_inputs(command.input_blocks), skills),
             effective_config=effective_config,
-            client_connection_id=command.client_connection_id,
-            local_vault_write_grant_id=command.local_vault_write_grant_id,
             budget=_run_budget(
                 config,
                 effective_config,
@@ -856,8 +622,6 @@ class ProductionRunComponentsFactory(
             state,
             token.inputs,
             effective_config=token.effective_config,
-            client_connection_id=token.client_connection_id,
-            local_vault_write_grant_id=token.local_vault_write_grant_id,
             definitions_override=token.definitions,
             budget_override=token.budget,
             scope_override=token.scope,
@@ -925,10 +689,10 @@ class ProductionRunComponentsFactory(
                 or len(declared_skills) != len(set(declared_skills))
             ):
                 raise ValueError("child context contains an invalid declared Skill set")
-            authority = _skill_authority(selected, scope, config, effective_config)
+            authority = _skill_authority(selected, scope, effective_config)
             skills = self._skills.narrow_prepared(
                 root.skills,
-                tuple(name for name in config.enabled_skills if name in set(declared_skills)),
+                tuple(declared_skills),
                 authority_ceiling=authority,
             )
             if skills.active_skill_names:
@@ -954,18 +718,11 @@ class ProductionRunComponentsFactory(
             for item in selected
             if item in base_definitions or item in skill_definitions or item in shell_definitions
         )
-        transaction_selected = any(item.name == "vault.transaction" for item in definitions)
-        client_connection_id = root.client_connection_id if transaction_selected else None
-        local_vault_write_grant_id = root.local_vault_write_grant_id if transaction_selected else None
-        if transaction_selected and (client_connection_id is None) == (local_vault_write_grant_id is None):
-            raise ValueError("child Run Vault scope must inherit exactly one root write authority")
         prepared = _PreparedProductionCapabilities(
             run_id=state.run_id,
             config=config,
             inputs=_with_skill_prompt_context(_child_context_inputs(execution), skills),
             effective_config=effective_config,
-            client_connection_id=client_connection_id,
-            local_vault_write_grant_id=local_vault_write_grant_id,
             budget=_child_run_budget(
                 execution,
                 parent_max_parallel_reads=parent_parallel_reads,
@@ -996,8 +753,6 @@ class ProductionRunComponentsFactory(
             state,
             token.inputs,
             effective_config=token.effective_config,
-            client_connection_id=token.client_connection_id,
-            local_vault_write_grant_id=token.local_vault_write_grant_id,
             definitions_override=token.definitions,
             budget_override=token.budget,
             scope_override=token.scope,
@@ -1017,31 +772,8 @@ class ProductionRunComponentsFactory(
         self._root_ledgers.pop(run_id, None)
         self._run_budgets.pop(run_id, None)
         self._effective_configs.pop(run_id, None)
-        self._client_connections.pop(run_id, None)
-        headless_grant_id = self._headless_grants.pop(run_id, None)
         self._bound_hook_bundles.pop(run_id, None)
-        if headless_grant_id is None:
-            return None
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            asyncio.run(self._release_run_resources(headless_grant_id, run_id))
-            return None
-        return loop.create_task(
-            self._release_run_resources(headless_grant_id, run_id),
-            name=f"release-run-capabilities:{run_id}",
-        )
-
-    async def _release_run_resources(
-        self,
-        headless_grant_id: str | None,
-        run_id: str,
-    ) -> None:
-        if headless_grant_id is not None:
-            await self._headless_vault_write.release_claim(
-                headless_grant_id,
-                reason=f"turn_finished:{run_id}",
-            )
+        return None
 
     def active_hook_bundle(self, run_id: str) -> ProductionHookBundle | None:
         return self._bound_hook_bundles.get(run_id)
@@ -1173,10 +905,6 @@ class ProductionRunComponentsFactory(
             raise ValueError("per-Run production capability snapshot changed after preparation")
         self._prepared_runs[state.run_id] = prepared
         self._effective_configs[state.run_id] = prepared.effective_config
-        if prepared.client_connection_id is not None:
-            self._client_connections[state.run_id] = prepared.client_connection_id
-        if prepared.local_vault_write_grant_id is not None and prepared.parent_snapshot_fingerprint is None:
-            self._headless_grants[state.run_id] = prepared.local_vault_write_grant_id
 
     async def _principal_id(self, session_id: str) -> str:
         unit_of_work = self._hook_unit_of_work
@@ -1206,19 +934,12 @@ class ProductionRunComponentsFactory(
         config: WireRunConfigSnapshot,
         effective_config: HarnessConfig,
         *,
-        client_connection_id: str | None,
-        local_vault_write_grant_id: str | None,
         permission: PermissionMode,
     ) -> tuple[ToolDefinition, ...]:
+        del config
         write_allowed = permission not in {PermissionMode.READ_ONLY, PermissionMode.PLAN}
         transaction_definitions: tuple[ToolDefinition, ...] = ()
         if write_allowed:
-            authorities = int(client_connection_id is not None) + int(local_vault_write_grant_id is not None)
-            if authorities != 1:
-                raise ValueError("write-capable production Run requires exactly one Vault authority")
-            # The public transaction is always a Worker-local Tool.  An exact
-            # Obsidian connection contributes live-editor proof, but never owns
-            # the durable filesystem mutation.
             transaction_definitions = (vault_transaction_definition(executor_location=ExecutorLocation.LOCAL),)
         optional_definitions = tuple(
             item
@@ -1238,17 +959,11 @@ class ProductionRunComponentsFactory(
         effective_config = command.effective_config or self._default_config
         self._ensure_worker_read_limit(effective_config)
         self._effective_configs[state.run_id] = effective_config
-        if command.client_connection_id is not None:
-            self._client_connections[state.run_id] = command.client_connection_id
-        if command.local_vault_write_grant_id is not None:
-            self._headless_grants[state.run_id] = command.local_vault_write_grant_id
         return self._build(
             config,
             state,
             inputs,
             effective_config=effective_config,
-            client_connection_id=command.client_connection_id,
-            local_vault_write_grant_id=command.local_vault_write_grant_id,
         )
 
     def build_child(self, execution: Any, state: RunState) -> RunComponents:
@@ -1275,18 +990,11 @@ class ProductionRunComponentsFactory(
             effective_config = self._effective_configs[root_run_id]
         except KeyError as error:
             raise ValueError("child Run effective root configuration is unavailable") from error
-        transaction_selected = any(item.name == "vault.transaction" for item in definitions)
-        client_connection_id = self._client_connections.get(root_run_id) if transaction_selected else None
-        local_vault_write_grant_id = self._headless_grants.get(root_run_id) if transaction_selected else None
-        if transaction_selected and (client_connection_id is None) == (local_vault_write_grant_id is None):
-            raise ValueError("child Run Vault scope must inherit exactly one root write authority")
         return self._build(
             config,
             state,
             inputs,
             effective_config=effective_config,
-            client_connection_id=client_connection_id,
-            local_vault_write_grant_id=local_vault_write_grant_id,
             definitions_override=definitions,
             budget_override=_child_run_budget(
                 execution,
@@ -1351,8 +1059,6 @@ class ProductionRunComponentsFactory(
         inputs: ContextInputs,
         *,
         effective_config: HarnessConfig,
-        client_connection_id: str | None,
-        local_vault_write_grant_id: str | None,
         definitions_override: Sequence[ToolDefinition] | None = None,
         budget_override: RunBudget | None = None,
         scope_override: CapabilityScope | None = None,
@@ -1416,10 +1122,6 @@ class ProductionRunComponentsFactory(
             visibility=visibility,
             budget=ContextBudget.generous_default(),
         )
-        client_route = client_connection_id is not None
-        local_route = local_vault_write_grant_id is not None
-        if client_route and local_route:
-            raise ValueError("Run cannot retain both CLIENT and LOCAL Vault authorities")
         permission = permission_override or _effective_permission(config, effective_config)
         workspace_trusted = effective_config.policy.workspace_trusted
         write_allowed = permission not in {PermissionMode.READ_ONLY, PermissionMode.PLAN}
@@ -1437,8 +1139,6 @@ class ProductionRunComponentsFactory(
                 definitions = self._base_definitions(
                     config,
                     effective_config,
-                    client_connection_id=client_connection_id,
-                    local_vault_write_grant_id=local_vault_write_grant_id,
                     permission=permission,
                 )
             else:
@@ -1467,8 +1167,6 @@ class ProductionRunComponentsFactory(
             for item in base_definitions
             if item.name == "vault.transaction" and item.executor_location is ExecutorLocation.LOCAL
         )
-        if local_transactions and (client_connection_id is None) == (local_vault_write_grant_id is None):
-            raise ValueError("LOCAL vault.transaction requires exactly one client-bound or headless authority")
         for route_definitions, executor in self._optional_local_executors:
             narrowed = tuple(
                 item for item in route_definitions if (item.name, item.version, item.fingerprint) in base_selected
@@ -1571,28 +1269,8 @@ class ProductionRunComponentsFactory(
             preflight_providers: list[Any] = []
             active_local_routes = list(local_routes)
             if local_transactions:
-                if client_route:
-                    assert client_connection_id is not None
-                    client_preview = NamedPipeClientToolPort(
-                        workspace_id=self.workspace_id,
-                        channels=_BoundReverseChannels(self._channels, client_connection_id),
-                        clock=self._clock,
-                    )
-                    authorized_transaction: ToolExecutor = ClientBoundVaultTransaction(
-                        workspace_id=self.workspace_id,
-                        client=client_preview,
-                        transaction=self._local_transaction,
-                        clock=self._clock,
-                    )
-                else:
-                    assert local_vault_write_grant_id is not None
-                    authorized_transaction = HeadlessAuthorizedVaultTransaction(
-                        authority=self._headless_vault_write,
-                        grant_id=local_vault_write_grant_id,
-                        transaction=self._local_transaction,
-                    )
-                preflight_providers.append(authorized_transaction)
-                active_local_routes.append((local_transactions, authorized_transaction))
+                preflight_providers.append(self._local_transaction)
+                active_local_routes.append((local_transactions, self._local_transaction))
             artifacts = ToolArtifactManager(self._artifacts, self._clock, self._ids, budget)
             if prepared_capabilities is not None and prepared_capabilities.skill_definitions:
                 if self._skills is None or prepared_capabilities.skills is None:
@@ -1635,9 +1313,7 @@ class ProductionRunComponentsFactory(
                 raise RuntimeError("per-Run Tool Registry changed after active ledger binding")
             self._registries[state.run_id] = registry
             dispatcher = ToolDispatcher(
-                clock=self._clock,
                 local=_CompositeExecutor(active_local_routes),
-                client=None,
                 subagent=self._subagent_executor,
             )
             bound_ledger = budget
@@ -1712,9 +1388,7 @@ def _prepared_capability_snapshot(prepared: _PreparedProductionCapabilities) -> 
         status = prepared.skills.catalog_status
         authority = prepared.skills.authority
         skills = {
-            "enabled": prepared.skills.skills_enabled,
             "workspaceTrusted": prepared.skills.workspace_trusted,
-            "enabledNames": sorted(prepared.skills.enabled_skill_names),
             "activeNames": sorted(prepared.skills.active_skill_names),
             "catalogRevision": prepared.skills.catalog_revision,
             "catalogSnapshotHash": prepared.skills.catalog_snapshot_hash,
@@ -1741,18 +1415,6 @@ def _prepared_capability_snapshot(prepared: _PreparedProductionCapabilities) -> 
                 "enabledSkills": None if authority.enabled_skills is None else sorted(authority.enabled_skills),
                 "workspaceTrusted": authority.workspace_trusted,
             },
-            "trustEvidence": [
-                {
-                    "rootId": item.root_id,
-                    "packagePath": item.package_path,
-                    "name": item.name,
-                    "layer": item.layer.value,
-                    "metadataHash": item.metadata_hash,
-                    "trustState": item.trust_state,
-                    "trustTokenHash": item.trust_token_hash,
-                }
-                for item in prepared.skills.trust_evidence
-            ],
             "promptDescriptors": [
                 {
                     "rootId": item.root_id,
@@ -1789,7 +1451,6 @@ def _prepared_capability_snapshot(prepared: _PreparedProductionCapabilities) -> 
     return {
         "schemaVersion": 1,
         "runId": prepared.run_id,
-        "localVaultWriteGrantId": prepared.local_vault_write_grant_id,
         "effectiveConfigFingerprint": canonical_json_sha256(prepared.effective_config.model_dump(mode="json")),
         "runConfigFingerprint": canonical_json_sha256(prepared.config.to_wire()),
         "permissionMode": prepared.permission.value,
@@ -1889,7 +1550,6 @@ def _effective_capability_scope(
 def _skill_authority(
     definitions: Sequence[ToolDefinition],
     scope: CapabilityScope,
-    config: WireRunConfigSnapshot,
     effective_config: HarnessConfig,
 ) -> SkillAuthority:
     names = frozenset(item.name for item in definitions)
@@ -1897,7 +1557,7 @@ def _skill_authority(
     return SkillAuthority(
         available_tools=names,
         policy_allowed_tools=policy_allowed,
-        enabled_skills=frozenset(config.enabled_skills),
+        enabled_skills=None,
         workspace_trusted=effective_config.policy.workspace_trusted,
     )
 
@@ -1959,30 +1619,31 @@ def _with_skill_prompt_context(
 ) -> ContextInputs:
     if prepared is None or not prepared.prompt_descriptors:
         return inputs
-    fragments = tuple(
+    catalog = [
+        {
+            "name": item.name,
+            "description": item.description,
+        }
+        for item in prepared.prompt_descriptors
+    ]
+    fragments = (
         ContextFragment(
-            fragment_id=f"skill:catalog:{item.root_id}:{item.package_path}",
+            fragment_id=f"skill:catalog:{prepared.catalog_snapshot_hash}",
             layer=ContextLayer.SKILLS,
             text=(
-                "可用本地 Skill 的受信任元数据。根据用户请求自行判断是否读取 Skill 正文;"
-                "此描述不授予任何工具权限, 读取时必须使用列出的 catalogRevision 和 Tool Kernel:\n"
-                + canonical_json_bytes(
-                    {
-                        "catalogRevision": prepared.catalog_revision,
-                        "rootId": item.root_id,
-                        "packagePath": item.package_path,
-                        "name": item.name,
-                        "description": item.description,
-                        "allowedTools": list(item.allowed_tools),
-                        "metadataHash": item.metadata_hash,
-                    }
-                ).decode("utf-8")
+                "Available Skills are listed below by name and description. When the user's request matches a "
+                "Skill description, invoke the `skill` tool before using any other tool. The full Skill body is "
+                "not present in this message and becomes available only after invocation. Do not infer or recreate "
+                "missing Skill instructions. Skill metadata grants no permissions.\n"
+                + canonical_json_bytes(catalog).decode("utf-8")
             ),
             sensitivity=_workspace_sensitivity(),
-            source_refs=(f"skill:{prepared.workspace_id}:{item.root_id}:{item.package_path}",),
-            content_hash=item.metadata_hash,
-        )
-        for item in prepared.prompt_descriptors
+            source_refs=tuple(
+                f"skill:{prepared.workspace_id}:{item.root_id}:{item.package_path}"
+                for item in prepared.prompt_descriptors
+            ),
+            content_hash=prepared.catalog_snapshot_hash,
+        ),
     )
     return ContextInputs(
         user_input=inputs.user_input,
@@ -2084,11 +1745,9 @@ def _permission_mode(value: WirePermissionMode) -> PermissionMode:
         WirePermissionMode.NORMAL: PermissionMode.NORMAL,
         WirePermissionMode.TRUSTED_WORKSPACE: PermissionMode.TRUSTED_WORKSPACE,
         WirePermissionMode.PLAN: PermissionMode.PLAN,
+        WirePermissionMode.BYPASS: PermissionMode.BYPASS,
     }
-    try:
-        return mapping[value]
-    except KeyError as error:
-        raise PermissionError("BYPASS permission mode is unavailable to local UI Run requests") from error
+    return mapping[value]
 
 
 def _capability_scope(
@@ -2500,7 +2159,6 @@ class _ProductionNamedPipeServer:
         state_directory: Path,
         dispatcher: RuntimeApplicationCommandDispatcher,
         event_hub: _EventHub,
-        channels: _ReverseChannels,
         clock: Clock,
         response_flushed: Callable[[str], None] | None = None,
         request_finalized: Callable[[str], None] | None = None,
@@ -2511,7 +2169,6 @@ class _ProductionNamedPipeServer:
         )
         self._dispatcher = dispatcher
         self._event_hub = event_hub
-        self._channels = channels
         self._clock = clock
         self._response_flushed = response_flushed
         self._request_finalized = request_finalized
@@ -2608,19 +2265,19 @@ class _ProductionNamedPipeServer:
                 stream,
                 role=ConnectionRole.SERVER,
                 dispatcher=self._dispatcher,
+                command_transport="windows-named-pipe",
+                command_peer="current-windows-sid",
                 response_flushed=self._response_flushed,
                 request_finalized=self._request_finalized,
             )
             self._connections.add(connection)
             await connection.start()
             await connection.wait_ready()
-            await self._channels.add(connection.connection_id, connection)
             await self._event_hub.add(connection)
             await connection.wait_closed()
         finally:
             if connection is not None:
                 self._connections.discard(connection)
-                await self._channels.remove(connection.connection_id, connection)
                 await self._event_hub.remove(connection)
             else:
                 await stream.close()
@@ -2652,7 +2309,6 @@ class _WorkerControl(WorkerControlHandler):
         if valid_db != self._application.database_identity:
             return ResumeValidation(False, False, False, False, False)
         active_runs: list[Run] = []
-        bindings: dict[str, str] = {}
         approval_records: list[ApprovalRecord] = []
         async with self._application.unit_of_work.begin() as uow:
             after_id: str | None = None
@@ -2664,10 +2320,6 @@ class _WorkerControl(WorkerControlHandler):
                     if isinstance(record.value, Run) and not record.value.status.is_terminal:
                         active_runs.append(record.value)
                 after_id = page[-1].entity_id
-            for run in active_runs:
-                binding = await uow.entities.get("run_client_bindings", run.run_id)
-                if isinstance(binding, Mapping) and isinstance(binding.get("clientConnectionId"), str):
-                    bindings[run.run_id] = cast(str, binding["clientConnectionId"])
             after_id = None
             while True:
                 page = await uow.entities.list("approvals", after_id=after_id, limit=100)
@@ -2677,7 +2329,6 @@ class _WorkerControl(WorkerControlHandler):
                 after_id = page[-1].entity_id
         now = self._application.clock.utcnow()
         deadlines_valid = all(run.deadline_at is not None and now < run.deadline_at for run in active_runs)
-        pipe_valid = all(self._application.channels.contains(client_id) for client_id in bindings.values())
         approvals_valid = True
         for run in active_runs:
             if run.status.value != "awaiting_approval":
@@ -2695,7 +2346,7 @@ class _WorkerControl(WorkerControlHandler):
         return ResumeValidation(
             deadlines_valid=deadlines_valid,
             vault_hash_valid=valid_root == self._application.canonical_root_identity,
-            named_pipe_client_valid=pipe_valid,
+            named_pipe_client_valid=True,
             # No provider adapter currently exposes a resumable connection
             # health proof.  Active model work therefore fails closed.
             model_connection_valid=not active_runs,
@@ -2738,9 +2389,7 @@ class ProductionWorkerApplication(WorkerApplication):
     dispatcher: RuntimeApplicationCommandDispatcher
     gateway: LoopbackWebGateway | None
     loopback: AsyncioLoopbackServer | None
-    channels: _ReverseChannels
     local_vault_transaction: VaultTransactionCoordinator
-    headless_vault_write: HeadlessVaultWriteAuthority
     event_hub: _EventHub
     unit_of_work: SqliteUnitOfWorkFactory
     subagents: SubagentService
@@ -2999,7 +2648,6 @@ class ProductionWorkerApplication(WorkerApplication):
                 blockedPathCount=len(vault_recovery.manual_review_paths),
             )
             raise ProductionWorkerError("Worker readiness is blocked by unresolved durable Vault transaction manifests")
-        await self.headless_vault_write.recover_after_restart()
         layer = await self.config_service.layer(ConfigScope.WORKSPACE, self.workspace_id)
         if layer.revision == 0:
             await self.config_service.update(
@@ -3029,7 +2677,6 @@ class ProductionWorkerApplication(WorkerApplication):
                 state_directory=self.state_directory,
                 dispatcher=self.dispatcher,
                 event_hub=self.event_hub,
-                channels=self.channels,
                 clock=SystemClock(),
                 request_finalized=self._application_request_finalized,
             )
@@ -3521,21 +3168,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             ids=ids,
         )
         config_activation = WorkerConfigActivation()
-        channels = _ReverseChannels(workspace_id)
-        headless_vault_write = HeadlessVaultWriteAuthority(
-            workspace_id=workspace_id,
-            workspace_instance_id=bootstrap.workspace_instance_id,
-            root_identity=self._canonical_root_identity,
-            database_identity=self._database_identity,
-            unit_of_work=uow,
-            clock=clock,
-            identity_probe=lambda: (
-                identify_workspace_root(bootstrap.canonical_root).identity_hash,
-                workspace_database_identity(bootstrap.workspace_instance_id),
-            ),
-            pipe_connection_count=lambda: channels.count,
-        )
-        channels.bind_headless_authority(headless_vault_write)
         from offeragent_harness.subagents.tools import subagent_tool_definitions
 
         subagent_definitions = subagent_tool_definitions()
@@ -3543,18 +3175,11 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
         late_parent_authorities = _LateParentRunAuthorityProvider()
         configured_user_home = self._overrides.skill_user_home or Path.home()
         skill_runtime_root = self._overrides.skill_runtime_root or Path(sys.executable).resolve().parent
-        skill_trust_verifier = self._overrides.skill_trust_verifier or ReleaseManifestSkillTrustVerifier(
-            skill_runtime_root
-        )
         skill_factory = ProductionSkillBundleFactory(
             workspace_id=workspace_id,
             workspace_root=bootstrap.canonical_root,
             runtime_root=skill_runtime_root,
             user_home=configured_user_home,
-            unit_of_work=uow,
-            trust_verifier=skill_trust_verifier,
-            clock=clock,
-            ids=ids,
         )
         managed_hook_layer = self._overrides.managed_hook_layer or HookLayer(
             HookScope.MANAGED,
@@ -3596,8 +3221,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             artifacts=artifacts,
             local_read=read_executor,
             local_transaction=local_transaction,
-            headless_vault_write=headless_vault_write,
-            channels=channels,
             parent_authorities=late_parent_authorities,
             optional_definitions=(*powershell_executor.definitions, *subagent_definitions),
             optional_local_executors=((powershell_executor.definitions, powershell_executor),),
@@ -3723,15 +3346,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             recovery=RecoveryCoordinator(
                 unit_of_work=uow,
                 registry=recovery_registry,
-                definition_resolver=_FingerprintDefinitionResolver(
-                    (
-                        *base_definitions,
-                        client_vault_transaction_definition(),
-                        legacy_public_vault_transaction_definition(),
-                        legacy_vault_transaction_definition(),
-                        legacy_vault_transaction_definition(executor_location=ExecutorLocation.CLIENT),
-                    )
-                ),
+                definition_resolver=_FingerprintDefinitionResolver(base_definitions),
                 clock=clock,
             ),
             applier=RecoveryPlanApplier(unit_of_work=uow, clock=clock, ids=ids),
@@ -3773,7 +3388,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             ids=ids,
         )
         application_holder: dict[str, ProductionWorkerApplication] = {}
-        transport_policy = _ProductionApplicationTransportPolicy(channels, headless_vault_write)
+        transport_policy = _ProductionApplicationTransportPolicy()
 
         async def runtime_status(
             raw: Any,
@@ -3812,8 +3427,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                 diagnostics_owner_runs=_DiagnosticsOwnerAuthorizer(workspace_id, uow),
                 gateway_provider=lambda: application_holder["application"].gateway,
                 transport_policy=transport_policy,
-                administrative_approvals=headless_vault_write,
-                headless_vault_write_handlers=headless_vault_write_handlers(headless_vault_write),
                 extension_management_handlers=extension_management_command_handlers(
                     workspace_id=workspace_id,
                     profile_id=_LOCAL_PROFILE_ID,
@@ -3909,9 +3522,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             dispatcher=dispatcher,
             gateway=None,
             loopback=None,
-            channels=channels,
             local_vault_transaction=local_transaction,
-            headless_vault_write=headless_vault_write,
             event_hub=event_hub,
             unit_of_work=uow,
             subagents=subagents,
@@ -3966,18 +3577,15 @@ async def _runtime_status(
 
 def _protocol_capabilities() -> CapabilitySet:
     return CapabilitySet(
-        client_tools=True,
         event_replay=True,
         multi_session=True,
         approvals=True,
         skills=True,
         shell=True,
         hooks=True,
-        headless_vault_write=True,
         subagents=True,
         artifacts=True,
         loopback_web=True,
-        reverse_requests=True,
         content_blocks=True,
         cancellation=True,
         diagnostics=True,
@@ -4014,12 +3622,42 @@ class WorkerCommandLine:
     canonical_root_identity: str
     database_identity: str
     runtime_version: str
+    stdio: bool = False
 
 
 def parse_worker_arguments(arguments: Sequence[str]) -> WorkerCommandLine:
     values = list(arguments)
+    if (
+        len(values) == 5
+        and values[:1] == ["stdio"]
+        and values[1] == "--vault-root"
+        and values[3] == "--runtime-version"
+    ):
+        try:
+            root = Path(values[2]).expanduser().resolve(strict=True)
+            if not root.is_dir():
+                raise ValueError("Vault root is not a directory")
+            portable = read_portable_workspace_config(root)
+            local_app_data = os.environ.get("LOCALAPPDATA")
+            if not local_app_data:
+                raise ValueError("LOCALAPPDATA is unavailable")
+            record = WorkspaceRegistry(Path(local_app_data) / "OfferAgent" / "workspace-registry.json").register(
+                root,
+                portable_workspace_id=portable.portable_workspace_id,
+            )
+        except (OSError, ValueError) as error:
+            raise ProductionWorkerError("Worker stdio Vault bootstrap is invalid") from error
+        runtime_version = values[4]
+        _semantic_version(runtime_version)
+        return WorkerCommandLine(
+            record.workspace_instance_id,
+            record.root_identity.identity_hash,
+            workspace_database_identity(record.workspace_instance_id),
+            runtime_version,
+            stdio=True,
+        )
     if len(values) != 12 or values[:5] != list(_WORKER_ARGUMENTS):
-        raise ProductionWorkerError("Worker arguments do not match the fixed Host contract")
+        raise ProductionWorkerError("Worker arguments do not match the direct stdio contract")
     expected_flags = (
         "--canonical-root-identity",
         "--database-identity",
@@ -4040,6 +3678,61 @@ def parse_worker_arguments(arguments: Sequence[str]) -> WorkerCommandLine:
         raise ProductionWorkerError("Worker Host identity digests are invalid")
     _semantic_version(runtime_version)
     return WorkerCommandLine(instance_id, root_identity, database_identity, runtime_version)
+
+
+class _StdioWorkerStream(PipeByteStream):
+    """The Worker has exactly one parent: the Obsidian plugin that spawned it.
+
+    Standard input/output are inherited private handles, so no discoverable
+    listener or second process is required.  The JSON-RPC framing remains the
+    protocol boundary and all operations stay inside the Worker.
+    """
+
+    def __init__(self) -> None:
+        self._closed = False
+        self._write_lock = asyncio.Lock()
+
+    async def read(self, max_bytes: int) -> bytes:
+        if self._closed:
+            return b""
+        return await asyncio.to_thread(os.read, 0, max_bytes)
+
+    async def write(self, data: bytes) -> None:
+        if self._closed:
+            raise BrokenPipeError("Worker stdio transport is closed")
+        async with self._write_lock:
+            view = memoryview(data)
+            while view:
+                written = await asyncio.to_thread(os.write, 1, view)
+                view = view[written:]
+
+    def cancel_pending_io(self) -> None:
+        # The parent owns the inherited handles. Closing the child process is
+        # the only safe cancellation operation for a blocked standard read.
+        return None
+
+    async def close(self) -> None:
+        self._closed = True
+
+
+async def _serve_stdio_connection(application: ProductionWorkerApplication) -> None:
+    stream = _StdioWorkerStream()
+    connection = DuplexJsonRpcConnection(
+        stream,
+        role=ConnectionRole.SERVER,
+        dispatcher=application.dispatcher,
+        command_transport="stdio-dev",
+        command_peer="parent-process",
+        request_finalized=application._application_request_finalized,
+    )
+    try:
+        await connection.start()
+        await connection.wait_ready()
+        await application.event_hub.add(connection)
+        await connection.wait_closed()
+    finally:
+        await application.event_hub.remove(connection)
+        await connection.close()
 
 
 def _resolve_worker_bootstrap(command: WorkerCommandLine) -> WorkerBootstrap:
@@ -4191,16 +3884,11 @@ async def _run_worker(
     if development_trust is None:
         release = _installed_release_trust()
         catalog = load_production_process_catalog(release.version_directory, manifest_trust=release)
-        skill_trust_verifier: SkillTrustVerifier | None = None
     else:
         from offeragent_harness.runtime.production_process_catalog import load_development_process_catalog
 
         release = development_trust
         catalog = load_development_process_catalog(
-            release.version_directory,
-            manifest_trust=development_trust,
-        )
-        skill_trust_verifier = ReleaseManifestSkillTrustVerifier(
             release.version_directory,
             manifest_trust=development_trust,
         )
@@ -4252,17 +3940,22 @@ async def _run_worker(
             process_registration_service=process_registrations,
             signed_shell_profiles=catalog.signed_shell_profiles,
             skill_runtime_root=release.version_directory,
-            skill_trust_verifier=skill_trust_verifier,
             ripgrep_path=ripgrep_path,
             powershell_path=powershell_path,
+            start_native_transports=False,
         ),
     )
-    from offeragent_harness.runtime.worker_entrypoint import WorkerEntrypoint
+    from offeragent_harness.runtime.worker_entrypoint import WorkerEntrypoint, WorkerTransportMode
 
     entrypoint = WorkerEntrypoint(root)
-    application = cast(ProductionWorkerApplication, await entrypoint.start(bootstrap))
+    application = cast(
+        ProductionWorkerApplication,
+        await entrypoint.start(bootstrap, transport=WorkerTransportMode.STDIO),
+    )
     try:
-        await application.wait_stopped()
+        if not command.stdio:
+            raise ProductionWorkerError("Worker requires the direct stdio transport")
+        await _serve_stdio_connection(application)
     finally:
         await entrypoint.shutdown()
 

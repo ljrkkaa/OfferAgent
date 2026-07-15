@@ -54,12 +54,9 @@ from offeragent_harness.protocol.messages import (
     ShellSetEnabledParams,
     SkillCatalogStatusSnapshot,
     SkillDiagnosticSnapshot,
-    SkillsConfirmTrustParams,
     SkillsListParams,
     SkillsListResult,
-    SkillsMutationResult,
     SkillSnapshot,
-    SkillsRescanParams,
     SkillsStatusParams,
     SkillsStatusResult,
 )
@@ -70,7 +67,7 @@ from offeragent_harness.shell.state import (
     ShellProfileSource,
     ShellProfileTrust,
 )
-from offeragent_harness.skills import SkillCatalog, SkillDescriptor, SkillDiagnostic, SkillTrustState
+from offeragent_harness.skills import SkillCatalog, SkillDescriptor, SkillDiagnostic
 from offeragent_harness.tools import SideEffectClass, canonical_json_sha256
 
 from .application_dispatcher import ApplicationCommandHandler
@@ -85,8 +82,6 @@ from .session_service import SessionGetCommand
 _RECEIPT_COLLECTION = "extension_management_receipts"
 _MUTATING_METHODS = frozenset(
     {
-        "skills/rescan",
-        "skills/confirm-trust",
         "shell/install",
         "shell/confirm",
         "shell/set-enabled",
@@ -257,15 +252,6 @@ def _skill_handlers(
     skills: ProductionSkillBundleFactory,
     receipts: ExtensionManagementReceiptJournal,
 ) -> Mapping[str, ApplicationCommandHandler]:
-    async def require_mutation(context: ApplicationCommandContext) -> None:
-        await _require_mutation_authority(
-            context,
-            config=config,
-            workspace_id=workspace_id,
-            profile_id=profile_id,
-            managed_owner_id=managed_owner_id,
-        )
-
     async def catalog(cancellation: CancellationToken) -> SkillCatalog:
         snapshot = await _effective_config(
             config,
@@ -299,90 +285,9 @@ def _skill_handlers(
         current = await catalog(cancellation)
         return SkillsStatusResult(status=_skill_status(current))
 
-    async def rescan(raw: WireModel, cancellation: CancellationToken, context: ApplicationCommandContext) -> WireModel:
-        params = cast(SkillsRescanParams, raw)
-        await require_mutation(context)
-
-        async def apply(recovering: bool) -> WireModel:
-            await require_mutation(context)
-            current = await catalog(cancellation)
-            if recovering and current.snapshot.revision == params.expected_revision + 1:
-                return SkillsMutationResult(
-                    client_request_id=params.client_request_id,
-                    applied=True,
-                    status=_skill_status(current),
-                )
-            result = await current.rescan(
-                expected_revision=params.expected_revision,
-                cancellation=cancellation,
-            )
-            return SkillsMutationResult(
-                client_request_id=params.client_request_id,
-                applied=result.applied,
-                status=_skill_status(current),
-            )
-
-        return await receipts.execute(
-            method="skills/rescan",
-            params=params,
-            client_request_id=params.client_request_id,
-            result_type=SkillsMutationResult,
-            operation=apply,
-        )
-
-    async def confirm(raw: WireModel, cancellation: CancellationToken, context: ApplicationCommandContext) -> WireModel:
-        params = cast(SkillsConfirmTrustParams, raw)
-        await require_mutation(context)
-
-        async def apply(recovering: bool) -> WireModel:
-            await require_mutation(context)
-            current = await catalog(cancellation)
-            expected_state = SkillTrustState.CONFIRMED if params.confirmed else SkillTrustState.CONFIRMATION_REQUIRED
-            if recovering and current.snapshot.revision == params.expected_revision + 1:
-                recovered = next(
-                    (
-                        item
-                        for item in current.snapshot.descriptors
-                        if item.root_id == params.root_id
-                        and item.package_path == params.package_path
-                        and item.content_hash == params.expected_metadata_hash
-                        and item.trust_state is expected_state
-                    ),
-                    None,
-                )
-                if recovered is not None:
-                    return SkillsMutationResult(
-                        client_request_id=params.client_request_id,
-                        applied=True,
-                        status=_skill_status(current),
-                    )
-            result = await current.confirm_trust(
-                root_id=params.root_id,
-                package_path=params.package_path,
-                expected_metadata_hash=params.expected_metadata_hash,
-                expected_revision=params.expected_revision,
-                confirmed=params.confirmed,
-                cancellation=cancellation,
-            )
-            return SkillsMutationResult(
-                client_request_id=params.client_request_id,
-                applied=result.applied,
-                status=_skill_status(current),
-            )
-
-        return await receipts.execute(
-            method="skills/confirm-trust",
-            params=params,
-            client_request_id=params.client_request_id,
-            result_type=SkillsMutationResult,
-            operation=apply,
-        )
-
     return {
         "skills/list": list_skills,
         "skills/status": status,
-        "skills/rescan": rescan,
-        "skills/confirm-trust": confirm,
     }
 
 
@@ -762,8 +667,6 @@ def _skill_snapshot(value: SkillDescriptor) -> SkillSnapshot:
         name=value.name,
         description=value.description,
         metadata_hash=value.content_hash,
-        trust_state=value.trust_state.value,
-        enabled=value.trust_state.enabled,
         allowed_tools=sorted(value.allowed_tools),
     )
 

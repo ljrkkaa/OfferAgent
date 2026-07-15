@@ -20,7 +20,6 @@ from .common import (
     ApprovalDescriptor,
     ApprovalScope,
     BudgetSnapshot,
-    ClientContextSnapshot,
     RunConfigSnapshot,
     RunPhase,
     RunStatus,
@@ -59,9 +58,7 @@ class EventType(str, Enum):
     REASONING_SUMMARY = "reasoning.summary"
     ASSISTANT_DELTA = "assistant.delta"
     ASSISTANT_COMPLETED = "assistant.completed"
-    TOOL_QUEUED = "tool.queued"
     TOOL_STARTED = "tool.started"
-    TOOL_PROGRESS = "tool.progress"
     TOOL_COMPLETED = "tool.completed"
     TOOL_FAILED = "tool.failed"
     APPROVAL_REQUIRED = "approval.required"
@@ -72,8 +69,6 @@ class EventType(str, Enum):
     USAGE_UPDATED = "usage.updated"
     CONTEXT_COMPACTED = "context.compacted"
     SESSION_UPDATED = "session.updated"
-    SKILL_CATALOG_UPDATED = "skill.catalog_updated"
-    SKILL_TRUST_CHANGED = "skill.trust_changed"
     SUBAGENT_QUEUED = "subagent.queued"
     SUBAGENT_STARTED = "subagent.started"
     SUBAGENT_PROGRESS = "subagent.progress"
@@ -105,7 +100,6 @@ class EventType(str, Enum):
 class TurnStartedPayload(WireModel):
     input: list[ContentBlock] = Field(min_length=1, max_length=256)
     run_config: RunConfigSnapshot
-    client_context: ClientContextSnapshot | None = None
     attempt: int = Field(default=1, ge=1, le=10_000)
 
 
@@ -131,34 +125,9 @@ class AssistantCompletedPayload(WireModel):
     finish_reason: Literal["stop", "length", "cancelled", "interrupted"]
 
 
-class ToolQueuedPayload(WireModel):
-    call: ToolCallDescriptor
-    ordinal: int = Field(ge=0)
-
-
 class ToolStartedPayload(WireModel):
     call: ToolCallDescriptor
     attempt: int = Field(default=1, ge=1, le=100)
-
-
-class ToolProgressPayload(WireModel):
-    tool_call_id: ToolCallId
-    message: str = Field(min_length=1, max_length=4096)
-    completed_units: int | None = Field(default=None, ge=0)
-    total_units: int | None = Field(default=None, ge=1)
-    artifact: ArtifactRef | None = None
-
-    @model_validator(mode="after")
-    def _progress_is_bounded(self) -> ToolProgressPayload:
-        if self.completed_units is not None and self.total_units is None:
-            raise ValueError("completedUnits requires totalUnits")
-        if (
-            self.completed_units is not None
-            and self.total_units is not None
-            and self.completed_units > self.total_units
-        ):
-            raise ValueError("completedUnits cannot exceed totalUnits")
-        return self
 
 
 class TurnSteeredPayload(WireModel):
@@ -557,39 +526,13 @@ class RuntimeWarningPayload(WireModel):
     disabled_capabilities: list[CapabilityName] = Field(default_factory=list, max_length=32)
 
 
-class SkillCatalogUpdatedPayload(WireModel):
-    revision: int = Field(ge=1)
-    snapshot_hash: Sha256Digest
-    record_revision: int = Field(ge=1)
-    discovered_count: int = Field(ge=0, le=100_000)
-    enabled_count: int = Field(ge=0, le=100_000)
-    partial: bool
-
-    @model_validator(mode="after")
-    def _enabled_is_discovered(self) -> SkillCatalogUpdatedPayload:
-        if self.enabled_count > self.discovered_count:
-            raise ValueError("enabledCount cannot exceed discoveredCount")
-        return self
-
-
-class SkillTrustChangedPayload(WireModel):
-    root_id: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_-]*$")
-    package_path: str = Field(min_length=1, max_length=2048)
-    name: str = Field(min_length=1, max_length=128, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-    metadata_hash: Sha256Digest
-    confirmed: bool
-    record_revision: int = Field(ge=1)
-
-
 _EventPayloadUnion = (
     TurnStartedPayload
     | PhaseChangedPayload
     | ReasoningSummaryPayload
     | AssistantDeltaPayload
     | AssistantCompletedPayload
-    | ToolQueuedPayload
     | ToolStartedPayload
-    | ToolProgressPayload
     | ToolCompletedPayload
     | ToolFailedPayload
     | ApprovalRequiredPayload
@@ -618,8 +561,6 @@ _EventPayloadUnion = (
     | TurnFailedPayload
     | TurnInterruptedPayload
     | RuntimeWarningPayload
-    | SkillCatalogUpdatedPayload
-    | SkillTrustChangedPayload
     | ModelAttemptPayload
     | ModelCompositionStartedPayload
     | ToolCallsAcceptedPayload
@@ -637,9 +578,7 @@ _EVENT_REGISTRY: dict[EventType, type[WireModel]] = {
     EventType.REASONING_SUMMARY: ReasoningSummaryPayload,
     EventType.ASSISTANT_DELTA: AssistantDeltaPayload,
     EventType.ASSISTANT_COMPLETED: AssistantCompletedPayload,
-    EventType.TOOL_QUEUED: ToolQueuedPayload,
     EventType.TOOL_STARTED: ToolStartedPayload,
-    EventType.TOOL_PROGRESS: ToolProgressPayload,
     EventType.TOOL_COMPLETED: ToolCompletedPayload,
     EventType.TOOL_FAILED: ToolFailedPayload,
     EventType.APPROVAL_REQUIRED: ApprovalRequiredPayload,
@@ -667,8 +606,6 @@ _EVENT_REGISTRY: dict[EventType, type[WireModel]] = {
     EventType.TURN_CANCELLED: TurnCancelledPayload,
     EventType.TURN_FAILED: TurnFailedPayload,
     EventType.RUNTIME_WARNING: RuntimeWarningPayload,
-    EventType.SKILL_CATALOG_UPDATED: SkillCatalogUpdatedPayload,
-    EventType.SKILL_TRUST_CHANGED: SkillTrustChangedPayload,
     EventType.MODEL_ATTEMPT: ModelAttemptPayload,
     EventType.MODEL_COMPOSITION_STARTED: ModelCompositionStartedPayload,
     EventType.TOOL_CALLS_ACCEPTED: ToolCallsAcceptedPayload,

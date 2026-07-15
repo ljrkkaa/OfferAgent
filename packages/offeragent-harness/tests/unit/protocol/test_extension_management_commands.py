@@ -9,8 +9,6 @@ from offeragent_harness.protocol.messages import COMMAND_REGISTRY, validate_comm
 EXTENSION_METHODS = {
     "skills/list": CapabilityName.SKILLS,
     "skills/status": CapabilityName.SKILLS,
-    "skills/rescan": CapabilityName.SKILLS,
-    "skills/confirm-trust": CapabilityName.SKILLS,
     "shell/list": CapabilityName.SHELL,
     "shell/install": CapabilityName.SHELL,
     "shell/confirm": CapabilityName.SHELL,

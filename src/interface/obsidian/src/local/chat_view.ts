@@ -2,10 +2,16 @@ import { ItemView, Menu, Notice, WorkspaceLeaf, setIcon } from "obsidian";
 
 import { BootstrapSnapshot } from "../runtime/bootstrap";
 import { ChatStore, ChatStoreSnapshot } from "../runtime/chat_store";
-import type { ClientContextSnapshot } from "../runtime/generated_protocol";
+import type {
+    ApprovalTimelineItem,
+    RunViewState,
+    SubagentTimelineItem,
+    TimelineItem,
+    ToolCallTimelineItem,
+} from "../runtime/event_reducer";
 import { JsonObject } from "../runtime/json_rpc";
 import { sourceReferenceLabel, vaultReferenceTarget } from "../runtime/source_references";
-import { LocalOfferAgentSettings, effectivePermissionMode, runConfig, vaultWriteAvailable } from "./settings";
+import { LocalOfferAgentSettings, effectivePermissionMode, runConfig } from "./settings";
 
 export const LOCAL_CHAT_VIEW = "offeragent-local-chat";
 
@@ -14,7 +20,6 @@ export interface LocalChatHost {
     runtimeSnapshot(): BootstrapSnapshot;
     subscribeRuntime(listener: (snapshot: BootstrapSnapshot) => void): () => void;
     ensureChatStore(): Promise<ChatStore>;
-    captureClientContext(): Promise<ClientContextSnapshot>;
     readArtifactText(artifactId: string): Promise<string>;
     listSessions(): Promise<readonly { sessionId: string; title: string }[]>;
     openDiagnostics(): Promise<void>;
@@ -35,8 +40,6 @@ export class LocalChatView extends ItemView {
     private composing = false;
     private sendPending = false;
     private clearComposerTabId: string | null = null;
-    private writeRequired = false;
-    private writeTargetPaths = "";
 
     constructor(leaf: WorkspaceLeaf, host: LocalChatHost) {
         super(leaf);
@@ -202,38 +205,45 @@ export class LocalChatView extends ItemView {
     private renderTimeline(root: HTMLElement, snapshot: ChatStoreSnapshot): void {
         const timeline = root.createDiv({ cls: "offeragent-timeline" });
         const tab = snapshot.tabs.find((candidate) => candidate.tabId === snapshot.activeTabId);
-        if (!tab?.sessionId) {
+        if (!tab) return;
+        const pending = snapshot.pendingSubmissions.filter((submission) => submission.tabId === tab.tabId);
+        if (!tab.sessionId && pending.length === 0) {
             const empty = timeline.createDiv({ cls: "offeragent-empty" });
             empty.createEl("h3", { text: "从本地知识库开始" });
             empty.createEl("p", { text: "可以引用活动笔记、选区和 Vault 内容；写入会显示 Diff 并等待相应审批。" });
             return;
         }
-        const runs = [...snapshot.projection.runs.values()].filter((run) => run.sessionId === tab.sessionId);
-        if (runs.length === 0) timeline.createEl("p", { text: "此会话尚无消息。", cls: "offeragent-empty" });
+        const runs = tab.sessionId === null
+            ? []
+            : [...snapshot.projection.runs.values()].filter(
+                (run) => run.sessionId === tab.sessionId && run.parentRunId === null,
+            );
+        if (runs.length === 0 && pending.length === 0) {
+            timeline.createEl("p", { text: "此会话尚无消息。", cls: "offeragent-empty" });
+        }
         for (const run of runs) this.renderRun(timeline, run);
+        for (const submission of pending) this.renderPendingSubmission(timeline, submission);
         timeline.scrollTop = timeline.scrollHeight;
     }
 
-    private renderRun(container: HTMLElement, run: ChatStoreSnapshot["projection"]["runs"] extends Map<string, infer R> ? R : never): void {
+    private renderPendingSubmission(
+        container: HTMLElement,
+        submission: ChatStoreSnapshot["pendingSubmissions"][number],
+    ): void {
+        const article = container.createEl("article", {
+            cls: "offeragent-run offeragent-run-pending",
+            attr: { "data-turn-id": submission.turnId },
+        });
+        const user = article.createDiv({ cls: "offeragent-message offeragent-user" });
+        user.createDiv({ cls: "offeragent-message-label", text: "你" });
+        user.createDiv({ cls: "offeragent-message-body", text: submission.text });
+        article.createDiv({ cls: "offeragent-thinking", text: "正在提交给 OfferAgent…" });
+    }
+
+    private renderRun(container: HTMLElement, run: RunViewState): void {
         const article = container.createEl("article", { cls: "offeragent-run", attr: { "data-run-id": run.runId } });
-        if (run.userBlocks.length > 0) {
-            const user = article.createDiv({ cls: "offeragent-message offeragent-user" });
-            user.createDiv({ cls: "offeragent-message-label", text: "你" });
-            for (const block of run.userBlocks) user.createDiv({ cls: "offeragent-message-body", text: block });
-        }
-        const assistant = article.createDiv({ cls: "offeragent-message offeragent-assistant" });
-        assistant.createDiv({ cls: "offeragent-message-label", text: run.parentRunId ? "子任务" : "OfferAgent" });
-        if (run.reasoningSummary) {
-            const reasoning = assistant.createEl("details", { cls: "offeragent-reasoning" });
-            reasoning.createEl("summary", { text: "推理摘要" });
-            reasoning.createEl("p", { text: run.reasoningSummary });
-        }
-        for (const block of run.assistantBlocks) assistant.createDiv({ cls: "offeragent-message-body", text: block });
-        if (run.assistantBlocks.length === 0 && !isTerminal(run.status)) {
-            assistant.createDiv({ cls: "offeragent-thinking", text: phaseLabel(run.phase) });
-        }
-        for (const tool of run.tools.values()) this.renderToolCard(article, tool);
-        for (const approval of run.approvals.values()) this.renderApproval(article, approval);
+        for (const item of run.timeline) this.renderTimelineItem(article, item, run.parentRunId !== null);
+        if (!isTerminal(run.status)) article.createDiv({ cls: "offeragent-thinking", text: phaseLabel(run.phase) });
         if (run.references.length > 0) {
             const references = article.createEl("details", { cls: "offeragent-references" });
             references.createEl("summary", { text: `引用 ${run.references.length}` });
@@ -250,6 +260,7 @@ export class LocalChatView extends ItemView {
             }
         }
         const footer = article.createDiv({ cls: "offeragent-run-footer" });
+        if (!isTerminal(run.status)) footer.createSpan({ text: phaseLabel(run.phase) });
         footer.createSpan({ text: statusLabel(run.status) });
         if (run.usage) footer.createSpan({ text: usageLabel(run.usage) });
         if (isTerminal(run.status)) {
@@ -267,29 +278,54 @@ export class LocalChatView extends ItemView {
         }
     }
 
-    private renderToolCard(container: HTMLElement, tool: {
-        name: string; status: string; arguments: JsonObject; progressMessage: string | null;
-        completedUnits: number | null; totalUnits: number | null; artifactIds: string[]; result: JsonObject | null;
-    }): void {
+    private renderTimelineItem(container: HTMLElement, item: TimelineItem, childRun: boolean): void {
+        switch (item.kind) {
+            case "user_message": {
+                const user = container.createDiv({ cls: "offeragent-message offeragent-user" });
+                user.createDiv({ cls: "offeragent-message-label", text: item.source === "steer" ? "你（追加）" : "你" });
+                for (const block of item.blocks) user.createDiv({ cls: "offeragent-message-body", text: block });
+                return;
+            }
+            case "reasoning": {
+                const reasoning = container.createEl("details", { cls: "offeragent-reasoning" });
+                reasoning.createEl("summary", { text: item.partial ? "推理摘要（生成中）" : "推理摘要" });
+                reasoning.createEl("p", { text: item.summary });
+                return;
+            }
+            case "assistant_message": {
+                const assistant = container.createDiv({ cls: "offeragent-message offeragent-assistant" });
+                assistant.createDiv({ cls: "offeragent-message-label", text: childRun ? "子任务" : "OfferAgent" });
+                for (const block of item.blocks) assistant.createDiv({ cls: "offeragent-message-body", text: block });
+                if (!item.completed) assistant.createDiv({ cls: "offeragent-thinking", text: "正在生成回答…" });
+                return;
+            }
+            case "tool_call":
+                this.renderToolCard(container, item);
+                return;
+            case "approval":
+                this.renderApproval(container, item);
+                return;
+            case "subagent":
+                this.renderSubagent(container, item);
+                return;
+        }
+    }
+
+    private renderToolCard(container: HTMLElement, tool: ToolCallTimelineItem): void {
         const card = container.createDiv({ cls: `offeragent-tool-card status-${cssToken(tool.status)}` });
         const header = card.createDiv({ cls: "offeragent-tool-header" });
         header.createSpan({ text: tool.name });
         header.createSpan({ text: statusLabel(tool.status), cls: "offeragent-tool-status" });
         const details = card.createEl("details");
-        details.createEl("summary", { text: tool.progressMessage ?? "参数与结果" });
+        details.createEl("summary", { text: "参数与结果" });
         details.createEl("pre", { text: safeJson(tool.arguments) });
         if (tool.result) details.createEl("pre", { text: safeJson(tool.result) });
-        if (tool.completedUnits !== null && tool.totalUnits !== null) {
-            const progress = card.createEl("progress");
-            progress.max = tool.totalUnits;
-            progress.value = tool.completedUnits;
-        }
+        if (tool.error) details.createEl("pre", { text: safeJson(tool.error) });
+        if (tool.sideEffects.length > 0) details.createEl("pre", { text: safeJson({ sideEffects: tool.sideEffects }) });
         if (tool.artifactIds.length > 0) card.createDiv({ text: `Artifact: ${tool.artifactIds.join(", ")}` });
     }
 
-    private renderApproval(container: HTMLElement, approval: {
-        approvalId: string; status: string; explanation: string; expectedArgsHash: string | null; diffArtifactIds: string[];
-    }): void {
+    private renderApproval(container: HTMLElement, approval: ApprovalTimelineItem): void {
         const card = container.createDiv({ cls: `offeragent-approval status-${cssToken(approval.status)}` });
         card.createEl("strong", { text: approval.status === "pending" ? "需要审批" : `审批：${approval.status}` });
         card.createEl("p", { text: approval.explanation });
@@ -320,6 +356,14 @@ export class LocalChatView extends ItemView {
         this.approvalButton(actions, "本会话允许", approval, "allow_session", "session");
     }
 
+    private renderSubagent(container: HTMLElement, subagent: SubagentTimelineItem): void {
+        const card = container.createEl("details", { cls: `offeragent-subagent status-${cssToken(subagent.status)}` });
+        card.createEl("summary", { text: `子 Agent · ${subagent.agentName} · ${statusLabel(subagent.status)}` });
+        card.createEl("p", { text: subagent.task });
+        if (subagent.message) card.createEl("p", { text: subagent.message });
+        if (subagent.summary) card.createEl("pre", { text: subagent.summary });
+    }
+
     private approvalButton(
         container: HTMLElement,
         label: string,
@@ -346,11 +390,6 @@ export class LocalChatView extends ItemView {
         const activeRun = activeRunForTab(snapshot, tab.sessionId, tab.selectedRunId);
         const hasActiveRun = activeRun !== undefined;
         const effectiveMode = effectivePermissionMode(this.host.settings);
-        const writeAvailable = vaultWriteAvailable(this.host.settings);
-        if (!writeAvailable) {
-            this.writeRequired = false;
-            this.writeTargetPaths = "";
-        }
         const composer = root.createDiv({ cls: "offeragent-composer" });
         if (!this.host.settings.workspaceTrusted &&
             !["read-only", "plan"].includes(this.host.settings.permissionMode)) {
@@ -387,37 +426,11 @@ export class LocalChatView extends ItemView {
             if (!this.composing) this.scheduleDraftSave(tab.tabId, input.value);
         };
         input.onkeydown = (event) => {
-            const blocked = snapshot.busy || this.sendPending || hasActiveRun ||
-                (this.writeRequired && !this.writeTargetPaths.trim());
+            const blocked = snapshot.busy || this.sendPending || hasActiveRun;
             if (shouldSendComposerInput(event, this.composing, blocked)) {
                 event.preventDefault();
                 void this.send(input.value);
             }
-        };
-        const writeIntent = composer.createDiv({ cls: "offeragent-write-intent" });
-        const writeToggle = writeIntent.createEl("label", { cls: "offeragent-write-intent-toggle" });
-        const writeCheckbox = writeToggle.createEl("input", { type: "checkbox" });
-        writeCheckbox.checked = this.writeRequired;
-        writeCheckbox.disabled = snapshot.busy || !writeAvailable;
-        writeToggle.createSpan({ text: "本轮必须产生目标 Vault 写结果" });
-        const writeTargets = writeIntent.createEl("textarea", {
-            cls: "offeragent-write-intent-targets",
-            attr: {
-                placeholder: "目标 Vault 路径（每行一个，例如 notes/offer.md）",
-                rows: "2",
-                "aria-label": "本轮必须写入的 Vault 目标路径",
-            },
-        });
-        writeTargets.value = this.writeTargetPaths;
-        writeTargets.hidden = !this.writeRequired;
-        writeTargets.disabled = snapshot.busy || !writeAvailable;
-        writeCheckbox.onchange = () => {
-            this.writeRequired = writeCheckbox.checked;
-            writeTargets.hidden = !this.writeRequired;
-            this.scheduleRender();
-        };
-        writeTargets.oninput = () => {
-            this.writeTargetPaths = writeTargets.value;
         };
         const controls = composer.createDiv({ cls: "offeragent-composer-controls" });
         if (activeRun) {
@@ -432,8 +445,7 @@ export class LocalChatView extends ItemView {
             };
         }
         const send = controls.createEl("button", { text: "发送", cls: "mod-cta" });
-        send.disabled = snapshot.busy || this.sendPending || hasActiveRun ||
-            (this.writeRequired && !this.writeTargetPaths.trim());
+        send.disabled = snapshot.busy || this.sendPending || hasActiveRun;
         send.onclick = () => void this.send(input.value);
     }
 
@@ -443,8 +455,7 @@ export class LocalChatView extends ItemView {
         const snapshot = this.snapshot;
         const tab = snapshot?.tabs.find((candidate) => candidate.tabId === snapshot.activeTabId);
         if (!message || !store || !snapshot || !tab || this.sendPending || snapshot.busy ||
-            activeRunForTab(snapshot, tab.sessionId, tab.selectedRunId) !== undefined ||
-            (this.writeRequired && !this.writeTargetPaths.trim())) return;
+            activeRunForTab(snapshot, tab.sessionId, tab.selectedRunId) !== undefined) return;
         // Set this before the first await so Enter and click in the same frame
         // cannot start two Turns.
         this.sendPending = true;
@@ -452,21 +463,10 @@ export class LocalChatView extends ItemView {
         this.draftTimer = null;
         this.scheduleRender();
         try {
-            await store.updateDraft(tab.tabId, text);
-            const context = await this.host.captureClientContext();
             await store.send(message, {
-                context,
                 runConfig: runConfig(this.host.settings),
-                writeIntent: this.writeRequired
-                    ? {
-                        kind: "vault_write_required",
-                        targetPaths: this.writeTargetPaths.split(/\r?\n/u),
-                    }
-                    : { kind: "none" },
             });
             this.clearComposerTabId = tab.tabId;
-            this.writeRequired = false;
-            this.writeTargetPaths = "";
         } catch (error) {
             new Notice(actionableMessage(error));
         } finally {
@@ -521,6 +521,7 @@ function permissionModeLabel(mode: LocalOfferAgentSettings["permissionMode"]): s
     if (mode === "read-only") return "只读";
     if (mode === "normal") return "标准（写操作逐次审批）";
     if (mode === "trusted-workspace") return "受信任工作区";
+    if (mode === "bypass") return "免审批执行";
     return "仅规划";
 }
 

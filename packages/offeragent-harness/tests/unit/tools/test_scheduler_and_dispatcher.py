@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pytest
 
 from offeragent_harness.permissions import RiskClass
-from offeragent_harness.ports import CancellationToken, ClientToolInvocation
+from offeragent_harness.ports import CancellationToken
 from offeragent_harness.sessions import AgentLineage
 from offeragent_harness.testing import ControlledBarrier, FakeRunCancelled, ManualCancellationToken, ManualClock
 from offeragent_harness.tools import (
@@ -138,6 +138,44 @@ def scheduled(
         return result
 
     return ScheduledInvocation(tool_call, tool, guard, prepare, execute, finalize)
+
+
+@pytest.mark.asyncio
+async def test_started_callback_runs_only_after_preparation_and_before_the_first_executor_attempt() -> None:
+    tool = definition("workspace.read")
+    tool_call = call(tool, 1)
+    scheduler = ToolScheduler(clock=ManualClock(NOW), max_parallel_reads=1)
+    lifecycle: list[str] = []
+
+    async def prepare() -> ToolResult | None:
+        lifecycle.append("prepared")
+        return None
+
+    async def execute(_: CancellationToken) -> ToolResult:
+        lifecycle.append("executed")
+        return success(tool_call.tool_call_id, 1)
+
+    async def finalize(result: ToolResult) -> ToolResult:
+        lifecycle.append("finalized")
+        return result
+
+    async def started(invocation: ScheduledInvocation) -> None:
+        assert invocation.call is tool_call
+        lifecycle.append("started")
+
+    invocation = ScheduledInvocation(
+        tool_call,
+        tool,
+        guard,
+        prepare,
+        execute,
+        finalize,
+        on_started=started,
+    )
+    result = await scheduler.execute_batch((invocation,), ManualCancellationToken())
+
+    assert result[0].status is ToolResultStatus.SUCCEEDED
+    assert lifecycle == ["prepared", "started", "executed", "finalized"]
 
 
 @pytest.mark.asyncio
@@ -789,33 +827,14 @@ class RecordingExecutor:
         return success(tool_call.tool_call_id, 1)
 
 
-class RecordingClient:
-    def __init__(self) -> None:
-        self.invocations: list[ClientToolInvocation] = []
-
-    async def invoke(self, invocation: ClientToolInvocation, cancellation: CancellationToken) -> ToolResult:
-        cancellation.checkpoint()
-        self.invocations.append(invocation)
-        return success(invocation.call.tool_call_id, 1)
-
-    async def cancel(self, invocation_id: str, reason: str) -> None:
-        del invocation_id, reason
-
-    async def lookup_result(self, invocation_id: str, *, run_id: str | None = None) -> ToolResult | None:
-        del invocation_id, run_id
-        return None
-
-
 @pytest.mark.asyncio
-async def test_dispatcher_routes_all_locations_and_client_invocation_identity_is_stable() -> None:
+async def test_dispatcher_routes_local_and_subagent_executors() -> None:
     local = RecordingExecutor()
     subagent = RecordingExecutor()
-    client = RecordingClient()
-    dispatcher = ToolDispatcher(clock=ManualClock(NOW), local=local, client=client, subagent=subagent)
+    dispatcher = ToolDispatcher(local=local, subagent=subagent)
     token = ManualCancellationToken()
     definitions = (
         definition("local.read", location=ExecutorLocation.LOCAL),
-        definition("client.read", location=ExecutorLocation.CLIENT),
         definition("agent.read", location=ExecutorLocation.SUBAGENT),
     )
     calls = tuple(call(tool, index) for index, tool in enumerate(definitions, start=1))
@@ -823,14 +842,12 @@ async def test_dispatcher_routes_all_locations_and_client_invocation_identity_is
         assert (await dispatcher.execute(tool, tool_call, token)).status is ToolResultStatus.SUCCEEDED
 
     assert local.calls == [calls[0]]
-    assert subagent.calls == [calls[2]]
-    assert client.invocations[0].invocation_id == dispatcher.client_invocation_id(calls[1])
-    assert client.invocations[0].deadline == NOW + timedelta(seconds=1)
+    assert subagent.calls == [calls[1]]
 
 
 @pytest.mark.asyncio
 async def test_dispatcher_missing_route_fails_before_side_effect() -> None:
     tool = definition("workspace.read")
     with pytest.raises(DispatcherUnavailable) as error:
-        await ToolDispatcher(clock=ManualClock(NOW)).execute(tool, call(tool, 1), ManualCancellationToken())
+        await ToolDispatcher().execute(tool, call(tool, 1), ManualCancellationToken())
     assert error.value.side_effect_possible is False

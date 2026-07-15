@@ -119,9 +119,10 @@ def worker_main(arguments: Sequence[str] | None = None) -> int:
                 "development Worker differs from its pinned manifest identity",
             )
         asyncio.run(_run_worker(command, development_trust=trust))
-    except BaseException:
+    except BaseException as error:
         try:
-            os.write(2, b"offeragent-worker: local development startup failed\n")
+            code = getattr(error, "code", type(error).__name__)
+            os.write(2, f"offeragent-worker: local development startup failed ({code})\n".encode())
         except OSError:
             pass
         return 2

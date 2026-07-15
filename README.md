@@ -23,9 +23,8 @@ src/interface/obsidian/            Obsidian 本地客户端源码
 docs/architecture/                 新 Runtime 的架构与发行说明
 ```
 
-主分支不保存旧 Khoj Server、服务端 Web UI 或第二套 Agent Loop。旧实现只通过 Git
-对照分支 `archive/khoj-server-baseline-20260713` 和外层只读 snapshot 追溯；一次性数据导出使用独立的
-`packages/offeragent-harness/scripts/legacy_exporter`，它不 import 或启动旧服务器。
+主分支不保存旧 Khoj Server、服务端 Web UI、迁移导出器或第二套 Agent Loop。历史实现只在 Git
+对照分支 `archive/khoj-server-baseline-20260713` 与外层只读 snapshot 中追溯。
 
 真实开发与测试边界不在本仓库目录内混用：
 

@@ -87,7 +87,7 @@ def test_web_javascript_command_contract() -> None:
         timeout=10,
     )
     assert completed.returncode == 0, completed.stderr
-    assert "local web JS command contract passed" in completed.stdout
+    assert "local web single Worker tool authority contract passed" in completed.stdout
 
 
 def test_web_client_drives_conversation_controls_through_real_commands() -> None:
@@ -131,14 +131,15 @@ def test_web_client_reads_artifacts_in_bounded_text_only_pages() -> None:
         assert unsafe_sink not in source
 
 
-def test_web_client_renders_diff_session_approval_and_subagent_lineage() -> None:
+def test_web_client_renders_diff_session_approval_and_subagent_timeline_items() -> None:
     source = (WEB / "app.js").read_text(encoding="utf-8")
     assert '["本会话允许", "allow_session", "session", ""]' in source
     assert 'renderArtifactLinks(approval.diffs, "查看 Diff 内容")' in source
-    assert "container.dataset.parentRunId = run.parentRunId" in source
     assert "usageText(run.usage, run.startedAt, run.completedAt)" in source
     assert "renderReferences(run.references)" in source
-    assert "run.parentRunId && runIds.has(run.parentRunId)" in source
+    assert "for (const item of run.timeline)" in source
+    assert 'item.kind === "subagent"' in source
+    assert "appendTimelineItem(run, {" in source
 
 
 def test_web_citations_come_from_terminal_tool_facts_not_model_content() -> None:
@@ -167,8 +168,6 @@ def test_web_client_reads_real_extension_management_state_without_loopback_mutat
     for command in ("skills/list", "skills/status", "shell/list", "hooks/list"):
         assert f'command("{command}"' in source
     for command in (
-        "skills/rescan",
-        "skills/confirm-trust",
         "shell/install",
         "shell/confirm",
         "shell/set-enabled",
@@ -177,32 +176,20 @@ def test_web_client_reads_real_extension_management_state_without_loopback_mutat
         "hooks/confirm-workspace-command",
     ):
         assert f'command("{command}"' not in source
-    assert "信任、安装、启停等持久管理变更必须回到认证 Obsidian Named Pipe" in source
-    assert "enabledSkills: [...state.selectedSkills].sort()" in source
+    assert "所有工具执行都由 Worker 的统一权限与审计链负责" in source
+    assert "enabledSkills: [...state.selectedSkills].sort()" not in source
     assert "管理命令未暴露" not in source
 
 
-def test_web_headless_vault_write_requires_two_confirmations_and_never_applies_directly() -> None:
+def test_web_has_no_plugin_owned_or_headless_vault_execution_path() -> None:
     source = (WEB / "app.js").read_text(encoding="utf-8")
-    for command in (
-        "vault/headless/status",
-        "vault/headless/request",
-        "approval/resolve",
-        "vault/headless/activate",
-        "vault/headless/revoke",
-    ):
-        assert f'command("{command}"' in source
-    assert "第一次确认" in source and "Obsidian 已完全关闭" in source
-    assert "第二次确认" in source and "核对以下 argsHash" in source
-    assert 'confirmation: "obsidian_closed_disk_authoritative"' in source
-    assert "expectedBaselineFingerprint: baseline.baselineFingerprint" in source
-    assert 'decision: "allow_once"' in source
-    assert 'scope: "once"' in source
-    assert "resolved.runId != null" in source
-    assert "vault/headless/apply" not in source
+    assert "vault/headless" not in source
+    assert "headlessVaultWrite" not in source
+    assert "clientTools" not in source
+    assert "reverseRequests" not in source
 
 
-def test_web_client_uses_memory_admin_cas_confirmations_and_stable_export() -> None:
+def test_web_has_no_separate_memory_admin_protocol() -> None:
     source = (WEB / "app.js").read_text(encoding="utf-8")
     for command in (
         "memory/settings",
@@ -214,19 +201,9 @@ def test_web_client_uses_memory_admin_cas_confirmations_and_stable_export() -> N
         "memory/delete",
         "memory/export",
     ):
-        assert f'command("{command}"' in source
-    assert "expectedConfigRevision: settings.configLayerRevision" in source
-    assert "expectedRevision: memory.revision" in source
-    for field in (
-        "allowSensitive",
-        "allowProfileSharing",
-        "allowExternalSource",
-        "allowConflictResolution",
-    ):
-        assert field in source
-    assert "snapshotAt: view.snapshotAt" in source
-    assert "expectedContentHash: view.contentHash" in source
-    assert "result.nextOffset !== requestedOffset + contentBytes" in source
+        assert f'command("{command}"' not in source
+    assert "memory: true" not in source
+    assert "正在读取固定 Vault Memory 文件" in source
 
 
 def test_web_root_exposes_complete_local_controls() -> None:
@@ -241,6 +218,6 @@ def test_web_root_exposes_complete_local_controls() -> None:
         "steer",
         "cancel",
         "capabilities",
-        "memory",
     ):
         assert f'id="{control_id}"' in index
+    assert 'id="memory"' not in index

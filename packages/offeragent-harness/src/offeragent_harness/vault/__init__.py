@@ -15,9 +15,6 @@ from .schema import (
     VAULT_TRANSACTION_OUTPUT_SCHEMA,
     VAULT_TRANSACTION_PREFLIGHT_PROVIDER,
     VAULT_TRANSACTION_SCHEMA,
-    client_vault_transaction_definition,
-    legacy_public_vault_transaction_definition,
-    legacy_vault_transaction_definition,
     vault_transaction_definition,
 )
 
@@ -34,9 +31,6 @@ __all__ = [
     "VaultTransactionCoordinator",
     "VaultTransactionError",
     "VaultTransactionRecoveryReport",
-    "client_vault_transaction_definition",
     "content_hash",
-    "legacy_public_vault_transaction_definition",
-    "legacy_vault_transaction_definition",
     "vault_transaction_definition",
 ]

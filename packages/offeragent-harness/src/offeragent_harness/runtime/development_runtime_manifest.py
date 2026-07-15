@@ -33,9 +33,7 @@ DEVELOPMENT_MANIFEST_NAME = "development-runtime-manifest.json"
 DEVELOPMENT_SIGNING_KEY_ID = "local-development-hash-pin"
 REQUIRED_DEVELOPMENT_EXECUTABLES = frozenset(
     {
-        "offeragent-host.exe",
         "offeragent-process-host.exe",
-        "offeragent-self-test.exe",
         "offeragent-worker.exe",
     }
 )

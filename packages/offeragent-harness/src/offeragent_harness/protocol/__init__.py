@@ -77,7 +77,7 @@ from .jsonrpc import (
     validate_response,
 )
 from .messages import *
-from .messages import ALL_METHOD_REGISTRY, COMMAND_REGISTRY, REVERSE_REQUEST_REGISTRY
+from .messages import ALL_METHOD_REGISTRY, COMMAND_REGISTRY
 
 _PUBLIC_NAMES = [
     "ALL_METHOD_REGISTRY",
@@ -85,7 +85,6 @@ _PUBLIC_NAMES = [
     "DEFAULT_MAX_MESSAGE_BYTES",
     "EVENT_REGISTRY",
     "LENGTH_PREFIX_BYTES",
-    "REVERSE_REQUEST_REGISTRY",
     "ArtifactContentBlock",
     "ArtifactRef",
     "ArtifactSensitivity",

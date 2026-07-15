@@ -34,11 +34,9 @@ for (const name of definitionNames) {
     lines.push(`export type ${name} = ${renderSchema(definitions[name], 0)};`, "");
 }
 emitMethodMap(lines, "ProtocolCommandMap", schema.commands, true);
-emitMethodMap(lines, "ProtocolReverseRequestMap", schema.reverseRequests, true);
 emitMethodMap(lines, "ProtocolEventMap", schema.events, false);
 emitEnvelopeMap(lines, schema.envelopes);
 emitStringTuple(lines, "PROTOCOL_COMMAND_METHODS", Object.keys(schema.commands).sort());
-emitStringTuple(lines, "PROTOCOL_REVERSE_REQUEST_METHODS", Object.keys(schema.reverseRequests).sort());
 emitStringTuple(lines, "PROTOCOL_EVENT_TYPES", Object.keys(schema.events).sort());
 emitDefinitionEnumTuple(lines, "PROTOCOL_ERROR_CODES", definitions.ErrorCode, "string");
 emitDefinitionEnumTuple(lines, "PROTOCOL_JSON_RPC_ERROR_CODES", definitions.JsonRpcErrorCode, "integer");
@@ -48,9 +46,6 @@ lines.push(
     "export type ProtocolCommandMethod = keyof ProtocolCommandMap;",
     "export type ProtocolCommandParams<Method extends ProtocolCommandMethod> = ProtocolCommandMap[Method][\"params\"];",
     "export type ProtocolCommandResult<Method extends ProtocolCommandMethod> = ProtocolCommandMap[Method][\"result\"];",
-    "export type ProtocolReverseRequestMethod = keyof ProtocolReverseRequestMap;",
-    "export type ProtocolReverseRequestParams<Method extends ProtocolReverseRequestMethod> = ProtocolReverseRequestMap[Method][\"params\"];",
-    "export type ProtocolReverseRequestResult<Method extends ProtocolReverseRequestMethod> = ProtocolReverseRequestMap[Method][\"result\"];",
     "export type ProtocolEventType = keyof ProtocolEventMap;",
     "export type ProtocolEventPayload<Type extends ProtocolEventType> = ProtocolEventMap[Type][\"payload\"];",
     "",

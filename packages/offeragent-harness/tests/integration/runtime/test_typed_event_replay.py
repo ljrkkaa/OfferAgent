@@ -9,8 +9,9 @@ import pytest
 from offeragent_harness.agent import RunBudget
 from offeragent_harness.agent.composer import CompositionEvent
 from offeragent_harness.agent.loop import ToolExecution, ToolKernel
-from offeragent_harness.agent.planner import Planner, PlanningStep
+from offeragent_harness.agent.planner import Planner, PlanningAttempt, PlanningAttemptOutcome, PlanningStep
 from offeragent_harness.agent.state import RunState
+from offeragent_harness.models import ModelUsage
 from offeragent_harness.permissions import (
     ApprovalBinding,
     ApprovalRequest,
@@ -59,9 +60,8 @@ NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 class _StopPlanner:
     async def plan(self, state: RunState, cancellation: CancellationToken) -> PlanningStep:
-        del state
         cancellation.checkpoint()
-        return PlanningStep((), False, "done")
+        return _audited_step(state, (), False, "done")
 
 
 class _WaitingPlanner:
@@ -78,12 +78,32 @@ class _ToolPlanner:
         self._planned = False
 
     async def plan(self, state: RunState, cancellation: CancellationToken) -> PlanningStep:
-        del state
         cancellation.checkpoint()
         if not self._planned:
             self._planned = True
-            return PlanningStep((self._call,), True, None)
-        return PlanningStep((), True, "tool outcome recorded")
+            return _audited_step(state, (self._call,), True, None)
+        return _audited_step(state, (), True, "tool outcome recorded")
+
+
+def _audited_step(
+    state: RunState,
+    calls: tuple[ToolCall, ...],
+    requires_write_outcome: bool,
+    stop_reason: str | None,
+) -> PlanningStep:
+    return PlanningStep(
+        calls,
+        requires_write_outcome,
+        stop_reason,
+        attempts=(
+            PlanningAttempt(
+                request_id=f"test-replay-{state.model_rounds + 1}",
+                repair_index=0,
+                outcome=PlanningAttemptOutcome.SUCCEEDED,
+                usage=ModelUsage(0, 0, 0, 0),
+            ),
+        ),
+    )
 
 
 class _Composer:
@@ -159,7 +179,10 @@ class _ResultKernel:
                     include_descendants=False,
                 ),
             )
-        await observer.execution_started()
+        await observer.execution_started(
+            self._execution.call,
+            self._execution.definition,
+        )
         await observer.result_available(
             self._execution.call,
             self._execution.definition,

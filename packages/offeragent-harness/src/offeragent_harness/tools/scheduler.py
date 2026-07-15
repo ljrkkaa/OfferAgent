@@ -28,6 +28,7 @@ FinalizeInvocation = Callable[[ToolResult], Awaitable[ToolResult]]
 AbortInvocation = Callable[[], Awaitable[None]]
 GuardFactory = Callable[[CancellationToken], AbstractAsyncContextManager[None]]
 RetrySleep = Callable[[float, CancellationToken], Awaitable[None]]
+StartCallback = Callable[["ScheduledInvocation"], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ class ScheduledInvocation:
     finalize: FinalizeInvocation | None
     precomputed_result: ToolResult | None = None
     abort: AbortInvocation | None = None
+    on_started: StartCallback | None = None
 
     def __post_init__(self) -> None:
         executable_fields = (self.guard, self.prepare, self.execute_attempt, self.finalize)
@@ -69,8 +71,8 @@ class ScheduledInvocation:
             raise ValueError("executable scheduled invocation requires guard/prepare/attempt/finalize")
         if self.precomputed_result is not None and any(field is not None for field in executable_fields):
             raise ValueError("precomputed invocation cannot also be executable")
-        if self.precomputed_result is not None and self.abort is not None:
-            raise ValueError("precomputed invocation cannot retain abort cleanup")
+        if self.precomputed_result is not None and (self.abort is not None or self.on_started is not None):
+            raise ValueError("precomputed invocation cannot retain execution callbacks")
         if self.precomputed_result is not None and self.precomputed_result.tool_call_id != self.call.tool_call_id:
             raise ValueError("precomputed result must match its ToolCall")
 
@@ -393,6 +395,8 @@ class ToolScheduler:
                 replay = await invocation.prepare()
                 if replay is not None:
                     return replay
+                if invocation.on_started is not None:
+                    await invocation.on_started(invocation)
                 final_result: ToolResult | None = None
                 for attempt in range(1, self._retry_policy.max_attempts + 1):
                     cancellation.checkpoint()

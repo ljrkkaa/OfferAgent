@@ -57,7 +57,6 @@ except ModuleNotFoundError:
 
 try:
     from scripts.build_windows_release import (
-        REQUIRED_EXES,
         add_release_assets,
         build_one_onedir,
         merge_identical_tree,
@@ -65,7 +64,6 @@ try:
     )
 except ModuleNotFoundError:
     from build_windows_release import (  # type: ignore[import-not-found,no-redef]
-        REQUIRED_EXES,
         add_release_assets,
         build_one_onedir,
         merge_identical_tree,
@@ -108,6 +106,10 @@ DEVELOPMENT_EXCLUDED_MODULES = (
     "offeragent_harness.testing",
     "psycopg",
     "pytest",
+)
+LOCAL_RUNTIME_EXES = (
+    "offeragent-process-host.exe",
+    "offeragent-worker.exe",
 )
 _FORBIDDEN_FROZEN_PROJECT_PREFIXES = (
     "project:src/offeragent_harness/testing/",
@@ -248,9 +250,7 @@ def run_static_gates() -> None:
 
 def build_development_runtime(destination: Path) -> Path:
     specifications = (
-        (DEVELOPMENT_ENTRYPOINTS / "offeragent_host.py", "offeragent-host", destination / "host"),
         (DEVELOPMENT_ENTRYPOINTS / "offeragent_worker.py", "offeragent-worker", destination / "worker"),
-        (DEVELOPMENT_ENTRYPOINTS / "offeragent_self_test.py", "offeragent-self-test", destination / "self-test"),
         (
             DEVELOPMENT_ENTRYPOINTS / "offeragent_process_host.py",
             "offeragent-process-host",
@@ -289,7 +289,7 @@ def build_development_runtime(destination: Path) -> Path:
     audit_development_frozen_evidence(evidence)
     audit_development_pyinstaller_archives(merged)
     actual = {path.name for path in merged.glob("*.exe")}
-    if not set(REQUIRED_EXES) <= actual:
+    if not set(LOCAL_RUNTIME_EXES) <= actual:
         raise RuntimeError("development PyInstaller output is missing a required executable")
     expected_machine = windows_pe_machine_for_architecture("x64")
     for executable in sorted(merged.glob("*.exe")):
@@ -341,7 +341,7 @@ def audit_development_pyinstaller_archives(runtime: Path) -> None:
         "psycopg",
         "pytest",
     )
-    for executable_name in REQUIRED_EXES:
+    for executable_name in LOCAL_RUNTIME_EXES:
         executable = runtime / executable_name
         archive = CArchiveReader(str(executable))
         pyz_names = [name for name in archive.toc if name.casefold().endswith(".pyz")]

@@ -73,7 +73,7 @@ def definition(
             "required": ["ok"],
             "additionalProperties": False,
         },
-        executor_location=ExecutorLocation.CLIENT,
+        executor_location=ExecutorLocation.LOCAL,
         risk=RiskClass.WRITE,
         side_effect_class=side_effect_class,
         required_capabilities=required_capabilities,

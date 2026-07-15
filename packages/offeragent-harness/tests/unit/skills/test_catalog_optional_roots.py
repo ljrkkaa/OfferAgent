@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from offeragent_harness.ports.skills import SkillTrustVerificationRequest, SkillTrustVerificationResult
-from offeragent_harness.skills import InMemorySkillStateStore, SkillCatalog, SkillLayer, SkillRoot
+from offeragent_harness.skills import SkillCatalog, SkillLayer, SkillRoot
 from offeragent_harness.skills.catalog import _is_missing_path_error
 from offeragent_harness.testing import ManualCancellationToken
 
@@ -17,12 +15,6 @@ class _WindowsPathNotFound(OSError):
 
 def test_optional_skill_root_accepts_windows_path_not_found() -> None:
     assert _is_missing_path_error(_WindowsPathNotFound(3, "The system cannot find the path specified"))
-
-
-@dataclass(frozen=True, slots=True)
-class _Verifier:
-    async def verify(self, request: SkillTrustVerificationRequest) -> SkillTrustVerificationResult:
-        return SkillTrustVerificationResult(True, "test", f"verified:{request.metadata_hash}", None)
 
 
 @pytest.mark.asyncio
@@ -54,11 +46,10 @@ async def test_absent_builtin_root_does_not_hide_discovered_workspace_skills(tmp
                 workspace_trusted=True,
             ),
         ),
-        trust_verifier=_Verifier(),
-        state_store=InMemorySkillStateStore(),
     )
 
     result = await catalog.initialize(ManualCancellationToken())
 
     assert not result.partial
     assert [item.name for item in result.snapshot.descriptors] == ["daily-study-workflow"]
+    assert [item.name for item in result.snapshot.effective_descriptors] == ["daily-study-workflow"]

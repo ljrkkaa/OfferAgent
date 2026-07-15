@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
 
 import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
-import type { ButtonComponent, ToggleComponent } from "obsidian";
+import type { ToggleComponent } from "obsidian";
 
 import { TurnRunConfig } from "../runtime/chat_store";
-import { JsonObject, JsonValue, requireJsonObject } from "../runtime/json_rpc";
+import { JsonObject } from "../runtime/json_rpc";
 import { ExtensionSettingsPanel, ExtensionSettingsPanelHost } from "./extension_settings_panel";
 
 export interface LocalOfferAgentSettings {
@@ -16,10 +16,9 @@ export interface LocalOfferAgentSettings {
     approvedRemoteHttpsEndpoint: string | null;
     model: string;
     reasoningEffort: "minimal" | "low" | "medium" | "high" | "max";
-    permissionMode: "read-only" | "normal" | "trusted-workspace" | "plan";
+    permissionMode: "read-only" | "normal" | "trusted-workspace" | "plan" | "bypass";
     workspaceTrusted: boolean;
     autoApproveVaultWrites: boolean;
-    enabledSkills: string[];
     shellEnabled: boolean;
     subagentsEnabled: boolean;
     hooksEnabled: boolean;
@@ -39,7 +38,6 @@ export const DEFAULT_LOCAL_SETTINGS: LocalOfferAgentSettings = {
     permissionMode: "normal",
     workspaceTrusted: false,
     autoApproveVaultWrites: false,
-    enabledSkills: [],
     shellEnabled: false,
     subagentsEnabled: false,
     hooksEnabled: false,
@@ -54,40 +52,6 @@ export const CODEX_SUBSCRIPTION_PROVIDER = "codex-subscription-experimental" as 
 export const DEEPSEEK_PROVIDER = "deepseek" as const;
 export const DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash" as const;
 
-const HEADLESS_VAULT_WRITE_STATES = [
-    "read_only",
-    "pipe_client_tool",
-    "ambiguous_pipe",
-    "baseline_unreliable",
-    "pending_approval",
-    "approved",
-    "active",
-    "claimed",
-    "denied",
-    "expired",
-    "revoked",
-    "consumed",
-] as const;
-
-export type HeadlessVaultWriteState = typeof HEADLESS_VAULT_WRITE_STATES[number];
-
-export interface HeadlessVaultWriteStatusView {
-    readonly state: HeadlessVaultWriteState;
-    readonly pipeConnectionCount: number;
-    readonly baselineReliable: boolean;
-    readonly workspaceRevision: number;
-    readonly approvalId: string | null;
-    readonly operationId: string | null;
-    readonly argsHash: string | null;
-    readonly revision: number;
-    readonly expiresAt: string | null;
-    readonly reasonCode: string;
-    readonly userMessage: string;
-    readonly canRequest: boolean;
-    readonly canActivate: boolean;
-    readonly canRevoke: boolean;
-}
-
 export interface SettingsHost extends ExtensionSettingsPanelHost {
     settings: LocalOfferAgentSettings;
     saveLocalSettings(): Promise<void>;
@@ -96,16 +60,10 @@ export interface SettingsHost extends ExtensionSettingsPanelHost {
     saveProviderCredential(secret: string): Promise<void>;
     deleteProviderCredential(): Promise<void>;
     checkModelHealth(): Promise<string>;
-    loadHeadlessVaultWriteStatus(signal?: AbortSignal): Promise<HeadlessVaultWriteStatusView>;
-    revokeHeadlessVaultWrite(
-        status: HeadlessVaultWriteStatusView,
-        signal?: AbortSignal,
-    ): Promise<HeadlessVaultWriteStatusView>;
 }
 
 export class LocalOfferAgentSettingTab extends PluginSettingTab {
     private extensionPanel: ExtensionSettingsPanel | null = null;
-    private headlessRequest: AbortController | null = null;
 
     constructor(app: App, private readonly host: SettingsHost & Plugin) {
         super(app, host);
@@ -113,7 +71,6 @@ export class LocalOfferAgentSettingTab extends PluginSettingTab {
 
     display(): void {
         const { containerEl } = this;
-        this.cancelHeadlessRequest();
         this.extensionPanel?.dispose();
         containerEl.empty();
         containerEl.createEl("h2", { text: "OfferAgent 本地 Runtime" });
@@ -339,7 +296,6 @@ export class LocalOfferAgentSettingTab extends PluginSettingTab {
                 }));
         this.extensionPanel = new ExtensionSettingsPanel(this.host);
         this.extensionPanel.mount(containerEl);
-        this.mountHeadlessVaultWriteStatus(containerEl);
         new Setting(containerEl)
             .setName("信任当前 Workspace")
             .setDesc(this.host.settings.workspaceTrusted
@@ -357,7 +313,7 @@ export class LocalOfferAgentSettingTab extends PluginSettingTab {
                         return;
                     }
                     this.host.settings.workspaceTrusted = value;
-                    if (!value && this.host.settings.permissionMode === "trusted-workspace") {
+                    if (!value && ["trusted-workspace", "bypass"].includes(this.host.settings.permissionMode)) {
                         this.host.settings.permissionMode = "normal";
                     }
                     if (!value) this.host.settings.autoApproveVaultWrites = false;
@@ -394,7 +350,9 @@ export class LocalOfferAgentSettingTab extends PluginSettingTab {
                 }));
         new Setting(containerEl)
             .setName("权限模式")
-            .setDesc(this.host.settings.workspaceTrusted
+            .setDesc(this.host.settings.permissionMode === "bypass"
+                ? "当前受信任 Workspace 跳过逐工具审批；工具范围、参数校验、预算、审计和原子写入保护仍然有效。"
+                : this.host.settings.workspaceTrusted
                 ? "所有模式仍经过 Tool Schema、Policy、预算与审计；受信任工作区不会绕过高风险审批。"
                 : "Workspace 尚未信任；选择“标准”时有效权限仍为只读，“受信任工作区”不可用。")
             .addDropdown((dropdown) => dropdown
@@ -402,9 +360,10 @@ export class LocalOfferAgentSettingTab extends PluginSettingTab {
                 .addOption("normal", "标准")
                 .addOption("trusted-workspace", "受信任工作区")
                 .addOption("plan", "仅规划")
+                .addOption("bypass", "免审批执行")
                 .setValue(this.host.settings.permissionMode)
                 .onChange(async (value) => {
-                    if (value === "trusted-workspace" && !this.host.settings.workspaceTrusted) {
+                    if (["trusted-workspace", "bypass"].includes(value) && !this.host.settings.workspaceTrusted) {
                         dropdown.setValue(this.host.settings.permissionMode);
                         new Notice("请先显式信任当前 Workspace");
                         return;
@@ -446,170 +405,10 @@ export class LocalOfferAgentSettingTab extends PluginSettingTab {
     }
 
     hide(): void {
-        this.cancelHeadlessRequest();
         this.extensionPanel?.dispose();
         this.extensionPanel = null;
     }
 
-    private mountHeadlessVaultWriteStatus(containerEl: HTMLElement): void {
-        let status: HeadlessVaultWriteStatusView | null = null;
-        let refreshButton: ButtonComponent | null = null;
-        let revokeButton: ButtonComponent | null = null;
-        const setting = new Setting(containerEl)
-            .setName("Vault 写入权威")
-            .setDesc("正在通过当前 Vault 的认证 Named Pipe 读取写入权威状态……");
-
-        const setBusy = (busy: boolean): void => {
-            refreshButton?.setDisabled(busy);
-            revokeButton?.setDisabled(busy || status?.canRevoke !== true);
-        };
-        const render = (next: HeadlessVaultWriteStatusView): void => {
-            status = next;
-            setting.setDesc(headlessVaultWriteDescription(next));
-            setBusy(false);
-        };
-        const load = async (): Promise<void> => {
-            const controller = this.beginHeadlessRequest();
-            setBusy(true);
-            try {
-                const next = await this.host.loadHeadlessVaultWriteStatus(controller.signal);
-                if (this.headlessRequest === controller && !controller.signal.aborted) render(next);
-            } catch (error) {
-                if (this.headlessRequest === controller && !controller.signal.aborted) {
-                    status = null;
-                    setting.setDesc(`无法读取 Vault 写入权威状态：${errorMessage(error)}`);
-                }
-            } finally {
-                if (this.headlessRequest === controller) {
-                    this.headlessRequest = null;
-                    setBusy(false);
-                }
-            }
-        };
-        const revoke = async (): Promise<void> => {
-            if (!status?.canRevoke) return;
-            const target = status;
-            const controller = this.beginHeadlessRequest();
-            setBusy(true);
-            try {
-                const next = await this.host.revokeHeadlessVaultWrite(target, controller.signal);
-                if (this.headlessRequest === controller && !controller.signal.aborted) {
-                    render(next);
-                    new Notice("Web headless Vault 写入授权已撤销");
-                }
-            } catch (error) {
-                if (this.headlessRequest === controller && !controller.signal.aborted) {
-                    status = null;
-                    setting.setDesc("撤销结果未确认；请刷新权威状态后再决定是否重试。");
-                    new Notice(`撤销结果未确认：${errorMessage(error)}`);
-                }
-            } finally {
-                if (this.headlessRequest === controller) {
-                    this.headlessRequest = null;
-                    setBusy(false);
-                }
-            }
-        };
-
-        setting
-            .addButton((button) => {
-                refreshButton = button.setButtonText("刷新").onClick(() => void load());
-            })
-            .addButton((button) => {
-                revokeButton = button
-                    .setButtonText("撤销 Web 授权")
-                    .setWarning()
-                    .setDisabled(true)
-                    .onClick(() => void revoke());
-            });
-        void load();
-    }
-
-    private beginHeadlessRequest(): AbortController {
-        this.cancelHeadlessRequest();
-        const controller = new AbortController();
-        this.headlessRequest = controller;
-        return controller;
-    }
-
-    private cancelHeadlessRequest(): void {
-        this.headlessRequest?.abort();
-        this.headlessRequest = null;
-    }
-}
-
-export function parseHeadlessVaultWriteStatus(raw: JsonValue): HeadlessVaultWriteStatusView {
-    const value = requireJsonObject(raw);
-    const state = headlessEnum(value.state, "Vault 写入状态", HEADLESS_VAULT_WRITE_STATES);
-    const pipeConnectionCount = headlessInteger(value.pipeConnectionCount, "Pipe 连接数", 0, 16);
-    const baselineReliable = headlessBoolean(value.baselineReliable, "磁盘基线可靠性");
-    const workspaceRevision = headlessInteger(value.workspaceRevision, "Workspace revision");
-    const approvalId = headlessOptionalPattern(
-        value.approvalId,
-        "审批 ID",
-        /^apr_[A-Za-z0-9][A-Za-z0-9_-]*$/,
-        128,
-    );
-    const operationId = headlessOptionalPattern(
-        value.operationId,
-        "headless operation ID",
-        /^op_headless_[0-9a-f]{32}$/,
-        44,
-    );
-    const argsHash = headlessOptionalPattern(
-        value.argsHash,
-        "headless argsHash",
-        /^sha256:[0-9a-f]{64}$/,
-        71,
-    );
-    const revision = headlessInteger(value.revision, "headless 授权 revision");
-    const expiresAt = headlessOptionalDateTime(value.expiresAt, "headless 授权过期时间");
-    const reasonCode = headlessPattern(
-        value.reasonCode,
-        "headless 原因码",
-        /^[a-z][a-z0-9_]*$/,
-        128,
-    );
-    const userMessage = headlessText(value.userMessage, "headless 状态说明", 1024);
-    const canRequest = headlessBoolean(value.canRequest, "headless 可请求标记");
-    const canActivate = headlessBoolean(value.canActivate, "headless 可激活标记");
-    const canRevoke = headlessBoolean(value.canRevoke, "headless 可撤销标记");
-
-    const authorizationIdentity = [approvalId, operationId, argsHash, expiresAt];
-    if (authorizationIdentity.some((item) => item !== null) && authorizationIdentity.some((item) => item === null)) {
-        throw new Error("headless Vault 授权身份字段不完整");
-    }
-    if (canActivate && state !== "approved") throw new Error("只有已批准的 headless 授权可激活");
-    if (canRevoke && (approvalId === null || revision < 1)) {
-        throw new Error("可撤销的 headless 授权缺少审批身份或 revision");
-    }
-
-    return {
-        state,
-        pipeConnectionCount,
-        baselineReliable,
-        workspaceRevision,
-        approvalId,
-        operationId,
-        argsHash,
-        revision,
-        expiresAt,
-        reasonCode,
-        userMessage,
-        canRequest,
-        canActivate,
-        canRevoke,
-    };
-}
-
-export function headlessVaultWriteDescription(status: HeadlessVaultWriteStatusView): string {
-    const authority = status.pipeConnectionCount === 0
-        ? status.userMessage
-        : status.pipeConnectionCount === 1
-            ? "Pipe/Client Tool 权威：当前唯一 Vault 写入通道；Web 授权已动态撤销。"
-            : `Pipe/Client Tool 权威：检测到 ${status.pipeConnectionCount} 条认证 Pipe，歧义写入已关闭；Web 授权已动态撤销。`;
-    const baseline = status.baselineReliable ? "磁盘基线可靠" : "磁盘基线不可靠";
-    return `${authority} ${baseline}；Workspace revision ${status.workspaceRevision}。`;
 }
 
 export function parseLocalSettings(raw: unknown): LocalOfferAgentSettings {
@@ -640,10 +439,10 @@ export function parseLocalSettings(raw: unknown): LocalOfferAgentSettings {
             : null;
     const reasoning = ["minimal", "low", "medium", "high", "max"].includes(String(value.reasoningEffort))
         ? value.reasoningEffort as LocalOfferAgentSettings["reasoningEffort"] : DEFAULT_LOCAL_SETTINGS.reasoningEffort;
-    const parsedPermission = ["read-only", "normal", "trusted-workspace", "plan"].includes(String(value.permissionMode))
+    const parsedPermission = ["read-only", "normal", "trusted-workspace", "plan", "bypass"].includes(String(value.permissionMode))
         ? value.permissionMode as LocalOfferAgentSettings["permissionMode"] : DEFAULT_LOCAL_SETTINGS.permissionMode;
     const workspaceTrusted = value.workspaceTrusted === true;
-    const permission = parsedPermission === "trusted-workspace" && !workspaceTrusted
+    const permission = ["trusted-workspace", "bypass"].includes(parsedPermission) && !workspaceTrusted
         ? "normal"
         : parsedPermission;
     const defaultModel = provider === DEEPSEEK_PROVIDER ? DEEPSEEK_DEFAULT_MODEL : DEFAULT_RESPONSES_MODEL;
@@ -661,7 +460,6 @@ export function parseLocalSettings(raw: unknown): LocalOfferAgentSettings {
         permissionMode: permission,
         workspaceTrusted,
         autoApproveVaultWrites: workspaceTrusted && value.autoApproveVaultWrites === true,
-        enabledSkills: stringList(value.enabledSkills, 256),
         shellEnabled: value.shellEnabled === true,
         subagentsEnabled: value.subagentsEnabled === true,
         hooksEnabled: value.hooksEnabled === true,
@@ -686,7 +484,7 @@ export function effectivePermissionMode(
 
 export function vaultWriteAvailable(settings: LocalOfferAgentSettings): boolean {
     const mode = effectivePermissionMode(settings);
-    return mode === "normal" || mode === "trusted-workspace";
+    return mode === "normal" || mode === "trusted-workspace" || mode === "bypass";
 }
 
 export function runConfig(settings: LocalOfferAgentSettings): TurnRunConfig {
@@ -698,7 +496,6 @@ export function runConfig(settings: LocalOfferAgentSettings): TurnRunConfig {
         model: settings.model,
         reasoningEffort: settings.reasoningEffort,
         permissionMode: settings.permissionMode,
-        enabledSkills: [...settings.enabledSkills],
     };
 }
 
@@ -730,7 +527,6 @@ export function modelRuntimePatch(settings: LocalOfferAgentSettings, credentialH
 
 export function snapshotLocalSettings(settings: LocalOfferAgentSettings): LocalOfferAgentSettings {
     const snapshot = parseLocalSettings(settings);
-    snapshot.enabledSkills = Object.freeze([...snapshot.enabledSkills]) as unknown as string[];
     return Object.freeze(snapshot);
 }
 
@@ -871,70 +667,4 @@ function parseNames(raw: string, limit: number): string[] {
         return [];
     }
     return values;
-}
-
-function headlessBoolean(value: JsonValue | undefined, label: string): boolean {
-    if (typeof value !== "boolean") throw new Error(`${label} 无效`);
-    return value;
-}
-
-function headlessInteger(
-    value: JsonValue | undefined,
-    label: string,
-    minimum = 0,
-    maximum = Number.MAX_SAFE_INTEGER,
-): number {
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum || value > maximum) {
-        throw new Error(`${label} 无效`);
-    }
-    return value;
-}
-
-function headlessText(value: JsonValue | undefined, label: string, maximum: number): string {
-    if (typeof value !== "string" || value.length < 1 || value.length > maximum) throw new Error(`${label} 无效`);
-    return value;
-}
-
-function headlessPattern(
-    value: JsonValue | undefined,
-    label: string,
-    pattern: RegExp,
-    maximum: number,
-): string {
-    const candidate = headlessText(value, label, maximum);
-    if (!pattern.test(candidate)) throw new Error(`${label} 格式无效`);
-    return candidate;
-}
-
-function headlessOptionalPattern(
-    value: JsonValue | undefined,
-    label: string,
-    pattern: RegExp,
-    maximum: number,
-): string | null {
-    if (value === null) return null;
-    return headlessPattern(value, label, pattern, maximum);
-}
-
-function headlessOptionalDateTime(value: JsonValue | undefined, label: string): string | null {
-    if (value === null) return null;
-    const candidate = headlessText(value, label, 64);
-    if (!/(?:Z|[+-]\d\d:\d\d)$/.test(candidate) || Number.isNaN(Date.parse(candidate))) {
-        throw new Error(`${label} 无效`);
-    }
-    return candidate;
-}
-
-function headlessEnum<T extends string>(
-    value: JsonValue | undefined,
-    label: string,
-    allowed: readonly T[],
-): T {
-    const candidate = headlessText(value, label, 128);
-    if (!allowed.includes(candidate as T)) throw new Error(`${label} 无效`);
-    return candidate as T;
-}
-
-function errorMessage(error: unknown): string {
-    return error instanceof Error && error.message ? error.message.slice(0, 1024) : "未知错误";
 }

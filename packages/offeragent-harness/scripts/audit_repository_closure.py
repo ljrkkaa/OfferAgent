@@ -54,7 +54,6 @@ REQUIRED_PATHS = (
     "packages/offeragent-harness/uv.lock",
     "packages/offeragent-harness/src/offeragent_harness/agent/loop.py",
     "packages/offeragent-harness/src/offeragent_harness/runtime/production_worker_composition.py",
-    "packages/offeragent-harness/scripts/legacy_exporter/exporter.py",
     "packages/offeragent-harness/scripts/build_windows_release.py",
     "packages/offeragent-harness/web/index.html",
     "src/interface/obsidian/manifest.json",

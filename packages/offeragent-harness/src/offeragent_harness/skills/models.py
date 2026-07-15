@@ -1,9 +1,9 @@
-"""Minimal, explicit domain records for Claude-style local Skills.
+"""Domain records for Claude-style, progressively disclosed local Skills.
 
-A Skill is a ``SKILL.md`` file discovered from an authorized root.  Discovery
-exposes only its small frontmatter; its instruction body is read only through
-the ``skill.read`` tool after the Skill's trust and the Run's authority have
-both been checked.
+Project Skills inherit the already explicit Workspace trust decision. User and
+builtin Skill roots are configuration owned by the local user/runtime. There is
+no second per-file trust state: discovery exposes metadata and the Skill body is
+opened only when the model or user invokes that Skill.
 """
 
 from __future__ import annotations
@@ -30,16 +30,6 @@ class SkillLayer(str, Enum):
         return {SkillLayer.BUILTIN: 100, SkillLayer.USER: 200, SkillLayer.WORKSPACE: 300}[self]
 
 
-class SkillTrustState(str, Enum):
-    VERIFIED = "verified"
-    CONFIRMED = "confirmed"
-    CONFIRMATION_REQUIRED = "confirmation_required"
-
-    @property
-    def enabled(self) -> bool:
-        return self in {SkillTrustState.VERIFIED, SkillTrustState.CONFIRMED}
-
-
 class SkillDiagnosticSeverity(str, Enum):
     WARNING = "warning"
     ERROR = "error"
@@ -56,8 +46,6 @@ class SkillErrorCode(str, Enum):
     DUPLICATE_KEY = "duplicate_key"
     ENCODING = "encoding_error"
     HASH_DRIFT = "hash_drift"
-    TRUST_INVALID = "trust_invalid"
-    TRUST_CONFIRMATION_REQUIRED = "trust_confirmation_required"
     WORKSPACE_UNTRUSTED = "workspace_untrusted"
     CONFLICT = "skill_conflict"
     CAPABILITY_UNAVAILABLE = "capability_unavailable"
@@ -166,8 +154,6 @@ class SkillDescriptor:
     allowed_tools: frozenset[str]
     content_hash: str
     file_fact: SkillFileFact
-    trust_state: SkillTrustState
-    trust_token: str | None
     metadata_bytes_read: int
 
     def __post_init__(self) -> None:
@@ -179,8 +165,6 @@ class SkillDescriptor:
             raise ValueError("Skill metadata hash must be canonical sha256")
         if any(_TOOL_NAME.fullmatch(name) is None for name in self.allowed_tools):
             raise ValueError("Skill allowed_tools contains an invalid tool name")
-        if self.trust_state.enabled != (self.trust_token is not None):
-            raise ValueError("Skill trust token does not match its state")
         if self.metadata_bytes_read <= 0:
             raise ValueError("Skill discovery must record positive metadata bytes")
 
@@ -190,9 +174,7 @@ class SkillDescriptor:
 
     @property
     def cache_key(self) -> str:
-        material = "\0".join(
-            (self.workspace_id, self.root_id, self.package_path, self.content_hash, self.trust_token or "")
-        )
+        material = "\0".join((self.workspace_id, self.root_id, self.package_path, self.content_hash))
         return f"sha256:{hashlib.sha256(material.encode()).hexdigest()}"
 
 
@@ -204,8 +186,6 @@ class SkillSummary:
     description: str
     layer: SkillLayer
     content_hash: str
-    enabled: bool
-    trust_state: SkillTrustState
     allowed_tools: frozenset[str]
 
 
@@ -283,6 +263,5 @@ __all__ = [
     "SkillRoot",
     "SkillSelection",
     "SkillSummary",
-    "SkillTrustState",
     "UntrustedSkillInstruction",
 ]

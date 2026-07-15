@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, cast
 
 from offeragent_harness.config import HarnessConfig
-from offeragent_harness.foundation import canonical_json_sha256
 from offeragent_harness.models import (
     ModelEvent,
     ModelEventKind,
@@ -206,53 +205,6 @@ async def _dispatch(
     return cast(dict[str, Any], result)
 
 
-async def _activate_headless_write(
-    application: ProductionWorkerApplication,
-    context: ApplicationCommandContext,
-) -> None:
-    status = await _dispatch(application, "vault/headless/status", {}, context)
-    pending = await _dispatch(
-        application,
-        "vault/headless/request",
-        {
-            "clientRequestId": "req_production_crash_headless",
-            "confirmation": "obsidian_closed_disk_authoritative",
-            "ttlSeconds": 300,
-            "expectedBaselineFingerprint": status["baselineFingerprint"],
-        },
-        context,
-    )
-    if pending["state"] != "pending_approval":
-        raise RuntimeError("headless write request did not enter pending approval")
-    resolved = await _dispatch(
-        application,
-        "approval/resolve",
-        {
-            "approvalId": pending["approvalId"],
-            "decision": "allow_once",
-            "scope": "once",
-            "expectedArgsHash": pending["argsHash"],
-        },
-        context,
-    )
-    if resolved["status"] != "approved":
-        raise RuntimeError("headless write approval was not persisted")
-    approved = await _dispatch(application, "vault/headless/status", {}, context)
-    active = await _dispatch(
-        application,
-        "vault/headless/activate",
-        {
-            "clientRequestId": "req_production_crash_activate",
-            "approvalId": approved["approvalId"],
-            "expectedArgsHash": approved["argsHash"],
-            "expectedRevision": approved["revision"],
-        },
-        context,
-    )
-    if active["state"] != "active":
-        raise RuntimeError("headless write grant did not become active")
-
-
 async def _crash(root: Path, stage: str) -> int:
     barrier = _CrashAndRecoveryBarrier(stage)
     model = _CrashRecoveryModel()
@@ -267,14 +219,12 @@ async def _crash(root: Path, stage: str) -> int:
         peer="127.0.0.1",
     )
     try:
-        await _activate_headless_write(application, context)
         created = await _dispatch(
             application,
             "session/create",
             {"title": "Production crash recovery", "clientRequestId": "req_production_crash_session"},
             context,
         )
-        intent = {"kind": "vault_write_required", "targetPaths": ["note.md"]}
         started = await _dispatch(
             application,
             "turn/start",
@@ -282,7 +232,6 @@ async def _crash(root: Path, stage: str) -> int:
                 "sessionId": created["session"]["sessionId"],
                 "turnId": "turn_production_crash",
                 "idempotencyKey": "production-crash-turn",
-                "writeIntent": {**intent, "intentHash": canonical_json_sha256(intent)},
                 "input": [{"type": "text", "text": "在 note.md 末尾追加指定内容。"}],
                 "runConfig": {"provider": "codex", "model": "fake", "permissionMode": "normal"},
             },

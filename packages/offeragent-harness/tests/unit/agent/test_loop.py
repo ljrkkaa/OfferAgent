@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -12,7 +13,7 @@ from offeragent_harness.agent.budgets import BudgetDelta, BudgetLedger, RunBudge
 from offeragent_harness.agent.composer import CompositionEvent, CompositionRetry
 from offeragent_harness.agent.loop import AgentLoopFailure, RecoveredToolBatch, ToolExecution, run_agent_loop
 from offeragent_harness.agent.model_planner import ModelProviderFailure
-from offeragent_harness.agent.planner import PlanningStep
+from offeragent_harness.agent.planner import PlanningAttempt, PlanningAttemptOutcome, PlanningStep
 from offeragent_harness.agent.state import PendingWork, RunPhase, RunState
 from offeragent_harness.error_codes import ErrorCode
 from offeragent_harness.hooks import HookEvent, HookExecutionContext, HookInvocation, HookOutcome
@@ -37,7 +38,6 @@ from offeragent_harness.tools import (
     SideEffectClass,
     ToolCall,
     ToolDefinition,
-    ToolError,
     ToolResult,
     ToolResultStatus,
     canonical_json_sha256,
@@ -52,7 +52,21 @@ class ScriptedPlanner:
         cancellation.checkpoint()
         if not self.steps:
             raise AssertionError("unexpected planner call")
-        return self.steps.pop(0)
+        step = self.steps.pop(0)
+        if step.attempts:
+            return step
+        return replace(
+            step,
+            attempts=(
+                PlanningAttempt(
+                    request_id=f"test-planner-{state.model_rounds + 1}",
+                    repair_index=0,
+                    outcome=PlanningAttemptOutcome.SUCCEEDED,
+                    usage=step.usage or ModelUsage(0, 0, 0, 0),
+                ),
+            ),
+            usage=None,
+        )
 
 
 class ProviderFailingPlanner:
@@ -89,6 +103,36 @@ class TextComposer:
                 currency="USD",
             )
         )
+
+
+class SummaryComposer(TextComposer):
+    async def stream(
+        self,
+        state: RunState,
+        *,
+        partial: bool,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[CompositionEvent]:
+        cancellation.checkpoint()
+        yield CompositionEvent(reasoning_summary_delta="检查本地")
+        yield CompositionEvent(reasoning_summary_delta="文件证据")
+        async for event in super().stream(state, partial=partial, cancellation=cancellation):
+            yield event
+
+
+class TokenSizedComposer(TextComposer):
+    async def stream(
+        self,
+        state: RunState,
+        *,
+        partial: bool,
+        cancellation: CancellationToken,
+    ) -> AsyncIterator[CompositionEvent]:
+        del state, partial
+        for _ in range(600):
+            cancellation.checkpoint()
+            yield CompositionEvent(text_delta="字")
+        yield CompositionEvent(usage=ModelUsage(1, 60, 0, 0))
 
 
 class ProviderFailingComposer:
@@ -174,12 +218,12 @@ class Kernel:
         observer: ToolLifecycleObserver | None = None,
     ) -> tuple[ToolExecution, ...]:
         cancellation.checkpoint()
-        if observer is not None:
-            await observer.execution_started()
-        assert self.recorder is not None
-        self.saw_accepted_event = ("tool.calls.accepted", False) in self.recorder.events
         if self.execution is None:
             raise AssertionError("unexpected tool execution")
+        if observer is not None and self.execution.result.status is not ToolResultStatus.DENIED:
+            await observer.execution_started(self.execution.call, self.execution.definition)
+        assert self.recorder is not None
+        self.saw_accepted_event = ("tool.calls.accepted", False) in self.recorder.events
         if observer is not None:
             await observer.result_available(
                 self.execution.call,
@@ -276,8 +320,8 @@ class ApprovalKernel:
                 include_descendants=False,
             ),
         )
-        await observer.execution_started()
-        execution = denied_execution()
+        await observer.execution_started(tool_call, write_definition())
+        execution = successful_execution(tool_call)
         await observer.result_available(execution.call, execution.definition, execution.result)
         return (execution,)
 
@@ -335,7 +379,7 @@ def write_definition() -> ToolDefinition:
             "additionalProperties": False,
         },
         output_schema={},
-        executor_location=ExecutorLocation.CLIENT,
+        executor_location=ExecutorLocation.LOCAL,
         risk=RiskClass.WRITE,
         side_effect_class=SideEffectClass.WRITE,
         required_capabilities=frozenset({"vault.write"}),
@@ -348,24 +392,6 @@ def write_definition() -> ToolDefinition:
         preflight_provider=None,
         approval_evidence=ApprovalEvidence.NONE,
     )
-
-
-def denied_execution() -> ToolExecution:
-    call = write_call()
-    result = ToolResult(
-        tool_call_id=call.tool_call_id,
-        status=ToolResultStatus.DENIED,
-        data=None,
-        user_visible_summary="user denied",
-        artifact_ids=(),
-        source_refs=(),
-        side_effects=(),
-        retryable=False,
-        before_state=None,
-        after_state=None,
-        error=ToolError("approval_denied", "user denied", False, False),
-    )
-    return ToolExecution(call, write_definition(), result)
 
 
 def successful_execution(call: ToolCall) -> ToolExecution:
@@ -400,7 +426,7 @@ class MidBatchApprovalKernel:
         first, second = calls
         first_execution = successful_execution(first)
         second_execution = successful_execution(second)
-        await observer.execution_started()
+        await observer.execution_started(first, first_execution.definition)
         await observer.result_available(first, first_execution.definition, first_execution.result)
         now = datetime.now(timezone.utc)
         request = ApprovalRequest(
@@ -437,7 +463,7 @@ class MidBatchApprovalKernel:
                 include_descendants=False,
             ),
         )
-        await observer.execution_started()
+        await observer.execution_started(second, second_execution.definition)
         await observer.result_available(second, second_execution.definition, second_execution.result)
         return (first_execution, second_execution)
 
@@ -452,7 +478,8 @@ class OutOfOrderResultKernel:
         del cancellation
         assert observer is not None
         executions = tuple(successful_execution(call) for call in calls)
-        await observer.execution_started()
+        for execution in executions:
+            await observer.execution_started(execution.call, execution.definition)
         for execution in reversed(executions):
             await observer.result_available(execution.call, execution.definition, execution.result)
         return executions
@@ -611,7 +638,58 @@ async def test_accepted_tool_event_thaws_nested_arguments_without_losing_structu
     accepted = next(payload for event_type, payload in recorder.payloads if event_type == "tool.calls.accepted")
     assert accepted["calls"][0]["arguments"] == arguments  # type: ignore[index]
     assert json.loads(json.dumps(accepted, ensure_ascii=False)) == accepted
+    assert recorder.events.index(("tool.calls.accepted", False)) < recorder.events.index(("tool.started", False))
+    assert recorder.events.index(("tool.started", False)) < recorder.events.index(("tool.completed", False))
     assert result.phase is RunPhase.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_persists_only_provider_reasoning_summaries_with_a_verified_final_snapshot() -> None:
+    recorder = Recorder()
+    kernel = Kernel()
+    kernel.recorder = recorder
+
+    result = await run_agent_loop(
+        run_state(),
+        planner=ScriptedPlanner([PlanningStep((), False, "done")]),
+        composer=SummaryComposer(),
+        tool_kernel=kernel,
+        recorder=recorder,
+        budget=run_budget(),
+        cancellation=CancellationScope(name="summary"),
+        now=lambda: datetime.now(timezone.utc),
+    )
+
+    summaries = [payload for event_type, payload in recorder.payloads if event_type == "reasoning.summary"]
+    assert summaries == [
+        {"summary": "检查本地文件证据", "partial": True},
+        {"summary": "检查本地文件证据", "partial": False},
+    ]
+    assert result.phase is RunPhase.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_token_sized_model_deltas_are_persisted_in_fixed_replay_chunks() -> None:
+    recorder = Recorder()
+    kernel = Kernel()
+    kernel.recorder = recorder
+
+    result = await run_agent_loop(
+        run_state(),
+        planner=ScriptedPlanner([PlanningStep((), False, "done")]),
+        composer=TokenSizedComposer(),
+        tool_kernel=kernel,
+        recorder=recorder,
+        budget=run_budget(),
+        cancellation=CancellationScope(name="fixed-delta-chunks"),
+        now=lambda: datetime.now(timezone.utc),
+    )
+
+    deltas = [payload for event_type, payload in recorder.payloads if event_type == "assistant.delta"]
+    assert [payload["offset"] for payload in deltas] == [0, 256, 512]
+    assert [len(str(payload["delta"])) for payload in deltas] == [256, 256, 88]
+    assert "".join(str(payload["delta"]) for payload in deltas) == "字" * 600
+    assert result.assistant_text == "字" * 600
 
 
 @pytest.mark.asyncio
@@ -707,7 +785,7 @@ async def test_before_model_hook_hints_reach_hint_aware_planner_and_composer() -
 
 
 @pytest.mark.asyncio
-async def test_write_request_cannot_compose_until_real_denial_is_recorded() -> None:
+async def test_write_request_cannot_compose_until_a_successful_write_is_recorded() -> None:
     call = write_call()
     planner = ScriptedPlanner(
         [
@@ -718,7 +796,7 @@ async def test_write_request_cannot_compose_until_real_denial_is_recorded() -> N
     )
     composer = TextComposer()
     recorder = Recorder()
-    kernel = Kernel(denied_execution())
+    kernel = Kernel(successful_execution(call))
     kernel.recorder = recorder
 
     result = await run_agent_loop(
@@ -735,6 +813,7 @@ async def test_write_request_cannot_compose_until_real_denial_is_recorded() -> N
     assert result.write_obligation.satisfied
     assert kernel.saw_accepted_event
     assert recorder.events.index(("tool.calls.accepted", False)) < recorder.events.index(("tool.completed", False))
+    assert ("tool.started", False) in recorder.events
     assert result.phase is RunPhase.COMPLETED
 
 
@@ -765,7 +844,7 @@ async def test_budget_exhaustion_with_unresolved_write_fails_without_composer() 
 
 
 @pytest.mark.asyncio
-async def test_each_legacy_planner_call_is_persisted_and_counted_once() -> None:
+async def test_each_audited_planner_call_is_persisted_and_counted_once() -> None:
     planner = ScriptedPlanner([PlanningStep((), False, "done", usage=ModelUsage(2, 3, 0, 0))])
     recorder = Recorder()
     kernel = Kernel()

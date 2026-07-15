@@ -8,7 +8,6 @@ from typing import cast
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from offeragent_harness.foundation import canonical_json_sha256, vault_write_intent_hash
 from offeragent_harness.protocol._base import WireModel
 from offeragent_harness.protocol.capabilities import (
     CapabilityName,
@@ -37,13 +36,11 @@ from offeragent_harness.protocol.jsonrpc import (
 from offeragent_harness.protocol.messages import (
     ALL_METHOD_REGISTRY,
     COMMAND_REGISTRY,
-    REVERSE_REQUEST_REGISTRY,
     EventsReplayParams,
     EventsReplayResult,
     InitializeParams,
     TurnStartParams,
     validate_command_params,
-    validate_command_result,
 )
 from offeragent_harness.protocol.schemas import build_examples
 
@@ -59,8 +56,6 @@ EXPECTED_COMMANDS = {
     "config/update",
     "skills/list",
     "skills/status",
-    "skills/rescan",
-    "skills/confirm-trust",
     "shell/list",
     "shell/install",
     "shell/confirm",
@@ -87,10 +82,6 @@ EXPECTED_COMMANDS = {
     "turn/cancel",
     "turn/retry",
     "turn/steer",
-    "vault/headless/status",
-    "vault/headless/request",
-    "vault/headless/activate",
-    "vault/headless/revoke",
     "approval/resolve",
     "agent/status",
     "agent/result",
@@ -104,17 +95,6 @@ EXPECTED_COMMANDS = {
     "shutdown",
 }
 
-EXPECTED_REVERSE_REQUESTS = {
-    "client/context/get",
-    "client/tool/commit-observe",
-    "client/tool/preview",
-    "client/tool/invoke",
-    "client/tool/lookup",
-    "client/tool/cancel",
-    "client/approval/present",
-}
-
-
 def _object(value: object) -> dict[str, object]:
     assert isinstance(value, dict)
     assert all(isinstance(key, str) for key in value)
@@ -123,10 +103,8 @@ def _object(value: object) -> dict[str, object]:
 
 def test_command_registry_is_complete_and_immutable() -> None:
     assert isinstance(COMMAND_REGISTRY, MappingProxyType)
-    assert isinstance(REVERSE_REQUEST_REGISTRY, MappingProxyType)
     assert set(COMMAND_REGISTRY) == EXPECTED_COMMANDS
-    assert set(REVERSE_REQUEST_REGISTRY) == EXPECTED_REVERSE_REQUESTS
-    assert set(ALL_METHOD_REGISTRY) == EXPECTED_COMMANDS | EXPECTED_REVERSE_REQUESTS
+    assert ALL_METHOD_REGISTRY is COMMAND_REGISTRY
     with pytest.raises(TypeError):
         COMMAND_REGISTRY["not/allowed"] = COMMAND_REGISTRY["initialize"]  # type: ignore[index]
 
@@ -155,63 +133,6 @@ def test_unknown_command_field_is_rejected_before_dispatch() -> None:
     assert first_violation.get("type") == "extra_forbidden"
 
 
-def test_turn_start_write_intent_is_explicit_closed_and_hash_bound() -> None:
-    example = build_examples()["turn-start.request.json"]
-    params = dict(_object(example["params"]))
-    params["writeIntent"] = {"kind": "none"}
-    assert validate_command_params("turn/start", params).to_wire()["writeIntent"] == {"kind": "none"}
-
-    missing = dict(params)
-    del missing["writeIntent"]
-    with pytest.raises(ProtocolViolation) as absent:
-        validate_command_params("turn/start", missing)
-    assert absent.value.error.code == ErrorCode.PROTOCOL_INVALID_PARAMS
-
-    binding = {
-        "kind": "vault_write_required",
-        "targetPaths": ["notes/offer.md", "notes/summary.md"],
-    }
-    required = dict(params)
-    required["writeIntent"] = {
-        **binding,
-        "intentHash": canonical_json_sha256(binding),
-    }
-    validated = validate_command_params("turn/start", required)
-    assert validated.to_wire()["writeIntent"] == required["writeIntent"]
-
-    wrong_hash = copy.deepcopy(required)
-    _object(wrong_hash["writeIntent"])["intentHash"] = "sha256:" + ("0" * 64)
-    with pytest.raises(ProtocolViolation) as mismatched:
-        validate_command_params("turn/start", wrong_hash)
-    assert mismatched.value.error.code == ErrorCode.PROTOCOL_INVALID_PARAMS
-
-    unknown = copy.deepcopy(required)
-    _object(unknown["writeIntent"])["allowAnyVaultWrite"] = True
-    with pytest.raises(ProtocolViolation) as extra:
-        validate_command_params("turn/start", unknown)
-    assert extra.value.error.code == ErrorCode.PROTOCOL_INVALID_PARAMS
-
-    unsorted = copy.deepcopy(required)
-    _object(unsorted["writeIntent"])["targetPaths"] = ["notes/summary.md", "notes/offer.md"]
-    with pytest.raises(ProtocolViolation):
-        validate_command_params("turn/start", unsorted)
-
-    unicode_paths = ["notes/\ue000.md", "notes/😀.md"]
-    assert vault_write_intent_hash(unicode_paths) == (
-        "sha256:30f42b95f8a9f84f5794d603e05de23bb6260532190ac6826bae7c2958f17bbb"
-    )
-    unicode_required = dict(params)
-    unicode_required["writeIntent"] = {
-        "kind": "vault_write_required",
-        "targetPaths": unicode_paths,
-        "intentHash": vault_write_intent_hash(unicode_paths),
-    }
-    assert (
-        validate_command_params("turn/start", unicode_required).to_wire()["writeIntent"]
-        == unicode_required["writeIntent"]
-    )
-
-
 def test_model_health_requires_an_explicit_admin_request_identity() -> None:
     with pytest.raises(ProtocolViolation) as missing:
         validate_command_params("models/health", {"provider": "openai"})
@@ -222,90 +143,6 @@ def test_model_health_requires_an_explicit_admin_request_identity() -> None:
         {"provider": "openai", "clientRequestId": "req_model_health_1"},
     )
     assert params.to_wire()["clientRequestId"] == "req_model_health_1"
-
-
-def test_headless_vault_write_protocol_is_closed_and_capability_gated() -> None:
-    methods = {
-        "vault/headless/status",
-        "vault/headless/request",
-        "vault/headless/activate",
-        "vault/headless/revoke",
-    }
-    assert all(
-        COMMAND_REGISTRY[method].required_capability is CapabilityName.HEADLESS_VAULT_WRITE for method in methods
-    )
-    assert CapabilitySet(headless_vault_write=True).model_dump(mode="json", by_alias=True)["headlessVaultWrite"] is True
-
-    assert validate_command_params("vault/headless/status", {}).to_wire() == {}
-    requested = validate_command_params(
-        "vault/headless/request",
-        {
-            "clientRequestId": "req_headless_protocol_1",
-            "confirmation": "obsidian_closed_disk_authoritative",
-            "ttlSeconds": 300,
-            "expectedBaselineFingerprint": "sha256:" + "a" * 64,
-        },
-    )
-    assert requested.to_wire()["confirmation"] == "obsidian_closed_disk_authoritative"
-
-    with pytest.raises(ProtocolViolation) as wrong_confirmation:
-        validate_command_params(
-            "vault/headless/request",
-            {
-                **requested.to_wire(),
-                "confirmation": "yes",
-            },
-        )
-    assert wrong_confirmation.value.error.code == ErrorCode.PROTOCOL_INVALID_PARAMS
-
-    with pytest.raises(ProtocolViolation):
-        validate_command_params("vault/headless/status", {"assumeObsidianClosed": True})
-
-
-def test_headless_status_identity_and_administrative_approval_target_are_exact() -> None:
-    status = validate_command_result(
-        "vault/headless/status",
-        {
-            "state": "approved",
-            "pipeConnectionCount": 0,
-            "baselineReliable": True,
-            "baselineFingerprint": "sha256:" + "2" * 64,
-            "approvalId": "apr_" + "1" * 64,
-            "operationId": "op_headless_" + "2" * 32,
-            "argsHash": "sha256:" + "3" * 64,
-            "revision": 2,
-            "expiresAt": "2026-07-13T08:05:00+00:00",
-            "reasonCode": "authorization_approved",
-            "userMessage": "一次性审批已通过。",
-            "canRequest": False,
-            "canActivate": True,
-            "canRevoke": True,
-        },
-    )
-    assert status.to_wire()["operationId"] == "op_headless_" + "2" * 32
-
-    partial_identity = status.to_wire()
-    partial_identity["argsHash"] = None
-    with pytest.raises(ProtocolViolation) as partial:
-        validate_command_result("vault/headless/status", partial_identity)
-    assert partial.value.error.code == ErrorCode.PROTOCOL_SCHEMA_MISMATCH
-
-    administrative = validate_command_result(
-        "approval/resolve",
-        {
-            "approvalId": "apr_" + "4" * 64,
-            "status": "approved",
-            "runId": None,
-            "operationId": "op_headless_" + "5" * 32,
-            "resumed": False,
-        },
-    )
-    assert administrative.to_wire()["runId"] is None
-
-    invalid_target = administrative.to_wire()
-    invalid_target["operationId"] = None
-    with pytest.raises(ProtocolViolation):
-        validate_command_result("approval/resolve", invalid_target)
 
 
 def test_models_are_frozen_and_emit_camel_case_wire_names() -> None:
@@ -409,7 +246,6 @@ def test_vault_source_ref_accepts_combined_stale_partial_freshness() -> None:
 def test_event_registry_is_complete_concrete_and_immutable() -> None:
     assert isinstance(EVENT_REGISTRY, MappingProxyType)
     assert set(EVENT_REGISTRY) == set(EventType)
-    assert len(EVENT_REGISTRY) == 44
     assert all(issubclass(payload, WireModel) for payload in EVENT_REGISTRY.values())
     assert EVENT_REGISTRY[EventType.TOOL_COMPLETED] is ToolCompletedPayload
     with pytest.raises(TypeError):
@@ -442,16 +278,16 @@ def test_capability_negotiation_selects_highest_common_minor_and_intersection() 
     result = negotiate_protocol(
         client_preferred="1.4",
         client_range=ProtocolRange(minimum="1.1", maximum="1.4"),
-        client_capabilities=CapabilitySet(client_tools=True, event_replay=True, shell=True),
-        client_required_capabilities=[CapabilityName.CLIENT_TOOLS],
+        client_capabilities=CapabilitySet(event_replay=True, shell=True),
+        client_required_capabilities=[CapabilityName.EVENT_REPLAY],
         client_schema_hash="sha256:" + "a" * 64,
         server_preferred="1.3",
         server_range=ProtocolRange(minimum="1.0", maximum="1.3"),
-        server_capabilities=CapabilitySet(client_tools=True, event_replay=True),
+        server_capabilities=CapabilitySet(event_replay=True),
         server_schema_hash="sha256:" + "a" * 64,
     )
     assert result.protocol_version == "1.3"
-    assert result.capabilities.client_tools is True
+    assert result.capabilities.event_replay is True
     assert result.capabilities.shell is False
     assert result.disabled_optional_capabilities == [CapabilityName.SHELL]
 
@@ -471,12 +307,12 @@ def test_capability_negotiation_fails_closed(change: dict[str, object], code: Er
     arguments: dict[str, object] = {
         "client_preferred": "1.0",
         "client_range": None,
-        "client_capabilities": CapabilitySet(client_tools=True, shell=True),
+        "client_capabilities": CapabilitySet(event_replay=True, shell=True),
         "client_required_capabilities": [],
         "client_schema_hash": "sha256:" + "a" * 64,
         "server_preferred": "1.0",
         "server_range": ProtocolRange(minimum="1.0", maximum="1.2"),
-        "server_capabilities": CapabilitySet(client_tools=True),
+        "server_capabilities": CapabilitySet(event_replay=True),
         "server_schema_hash": "sha256:" + "a" * 64,
     }
     arguments.update(change)

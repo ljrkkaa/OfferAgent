@@ -6,14 +6,7 @@ const path = require("node:path");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../../../web/app.js"), "utf8");
 
-for (const command of [
-  "vault/headless/status",
-  "vault/headless/request",
-  "vault/headless/activate",
-  "vault/headless/revoke",
-]) {
-  assert.ok(source.includes(`command(\"${command}\"`), `missing ${command}`);
-}
-assert.ok(source.includes("expectedBaselineFingerprint: baseline.baselineFingerprint"));
+assert.doesNotMatch(source, /vault\/headless|headlessVaultWrite|clientTools|reverseRequests/u);
+assert.doesNotMatch(source, /memory\/(?:settings|configure|list|get|review|edit|delete|export)/u);
 
-console.log("local web JS command contract passed");
+console.log("local web single Worker tool authority contract passed");

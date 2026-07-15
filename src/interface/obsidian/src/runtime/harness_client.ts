@@ -6,9 +6,6 @@ import type {
     ProtocolCommandMethod,
     ProtocolCommandParams,
     ProtocolCommandResult,
-    ProtocolReverseRequestMethod,
-    ProtocolReverseRequestParams,
-    ProtocolReverseRequestResult,
 } from "./generated_protocol";
 import {
     JsonObject,
@@ -19,21 +16,18 @@ import {
     RpcRequestTimeoutError,
     requireJsonObject,
 } from "./json_rpc";
-import { NamedPipeClient } from "./named_pipe";
+import { RpcTransport } from "./stdio_worker";
 
 export const CLIENT_CAPABILITIES: Readonly<Record<CapabilityName, boolean>> = {
-    clientTools: true,
     eventReplay: true,
     multiSession: true,
     approvals: true,
     skills: true,
     shell: true,
     hooks: true,
-    headlessVaultWrite: true,
     subagents: true,
     artifacts: true,
     loopbackWeb: true,
-    reverseRequests: true,
     contentBlocks: true,
     cancellation: true,
     diagnostics: true,
@@ -43,18 +37,15 @@ export const CLIENT_CAPABILITIES: Readonly<Record<CapabilityName, boolean>> = {
  * User configuration may disable execution without changing handshake support.
  */
 export const REQUIRED_RUNTIME_CAPABILITIES: readonly CapabilityName[] = Object.freeze([
-    "clientTools",
     "eventReplay",
     "multiSession",
     "approvals",
     "skills",
     "shell",
     "hooks",
-    "headlessVaultWrite",
     "subagents",
     "artifacts",
     "loopbackWeb",
-    "reverseRequests",
     "contentBlocks",
     "cancellation",
     "diagnostics",
@@ -85,41 +76,10 @@ export interface InitializeResult {
     readonly workspaceInstanceId: string;
     readonly hostPid: number;
     readonly workerPid: number;
-    readonly transport: "windows-named-pipe";
+    readonly transport: "stdio-dev";
     readonly runtimeArch: "win-x64" | "win-arm64";
     readonly capabilities: JsonObject;
     readonly buildCommit: string;
-}
-
-export interface ClientReverseHandlers {
-    contextGet(
-        params: ProtocolReverseRequestParams<"client/context/get">,
-        signal: AbortSignal,
-    ): Promise<ProtocolReverseRequestResult<"client/context/get">>;
-    toolPreview(
-        params: ProtocolReverseRequestParams<"client/tool/preview">,
-        signal: AbortSignal,
-    ): Promise<ProtocolReverseRequestResult<"client/tool/preview">>;
-    toolCommitObserve(
-        params: ProtocolReverseRequestParams<"client/tool/commit-observe">,
-        signal: AbortSignal,
-    ): Promise<ProtocolReverseRequestResult<"client/tool/commit-observe">>;
-    toolInvoke(
-        params: ProtocolReverseRequestParams<"client/tool/invoke">,
-        signal: AbortSignal,
-    ): Promise<ProtocolReverseRequestResult<"client/tool/invoke">>;
-    toolLookup(
-        params: ProtocolReverseRequestParams<"client/tool/lookup">,
-        signal: AbortSignal,
-    ): Promise<ProtocolReverseRequestResult<"client/tool/lookup">>;
-    toolCancel(
-        params: ProtocolReverseRequestParams<"client/tool/cancel">,
-        signal: AbortSignal,
-    ): Promise<ProtocolReverseRequestResult<"client/tool/cancel">>;
-    approvalPresent(
-        params: ProtocolReverseRequestParams<"client/approval/present">,
-        signal: AbortSignal,
-    ): Promise<ProtocolReverseRequestResult<"client/approval/present">>;
 }
 
 export interface ProtocolRequestClient {
@@ -147,9 +107,8 @@ export class HarnessCompatibilityError extends Error {
 
 export class HarnessClient {
     readonly reducer: EventReducer;
-    private readonly transport: NamedPipeClient;
+    private readonly transport: RpcTransport;
     private readonly context: HarnessClientContext;
-    private readonly handlers: ClientReverseHandlers;
     private readonly pingIntervalMs: number;
     private readonly pingDeadlineMs: number;
     private readonly onDisconnected: ((error: Error) => void) | undefined;
@@ -160,9 +119,8 @@ export class HarnessClient {
     private pingActive = false;
 
     constructor(
-        transport: NamedPipeClient,
+        transport: RpcTransport,
         context: HarnessClientContext,
-        handlers: ClientReverseHandlers,
         options: HarnessClientOptions = {},
     ) {
         requireIdentifier(context.workspaceId, "workspaceId");
@@ -172,7 +130,6 @@ export class HarnessClient {
         }
         this.transport = transport;
         this.context = context;
-        this.handlers = handlers;
         this.pingIntervalMs = positiveInteger(options.pingIntervalMs ?? 15_000, "pingIntervalMs");
         this.pingDeadlineMs = positiveInteger(options.pingDeadlineMs ?? 45_000, "pingDeadlineMs");
         this.onDisconnected = options.onDisconnected;
@@ -194,7 +151,6 @@ export class HarnessClient {
         try {
             const peer = await this.transport.connect(signal);
             this.peer = peer;
-            this.registerReverseHandlers(peer);
             peer.onNotification("event", (params) => this.reducer.accept(params));
             const raw = await this.requestOnPeer(peer, "initialize", {
                 protocolVersion: this.context.identity.protocolVersion,
@@ -314,16 +270,6 @@ export class HarnessClient {
         this.state = "closed";
     }
 
-    private registerReverseHandlers(peer: JsonRpcPeer): void {
-        this.registerReverse(peer, "client/context/get", this.handlers.contextGet);
-        this.registerReverse(peer, "client/tool/preview", this.handlers.toolPreview);
-        this.registerReverse(peer, "client/tool/commit-observe", this.handlers.toolCommitObserve);
-        this.registerReverse(peer, "client/tool/invoke", this.handlers.toolInvoke);
-        this.registerReverse(peer, "client/tool/lookup", this.handlers.toolLookup);
-        this.registerReverse(peer, "client/tool/cancel", this.handlers.toolCancel);
-        this.registerReverse(peer, "client/approval/present", this.handlers.approvalPresent);
-    }
-
     private startPing(): void {
         this.stopPing();
         this.pingTimer = setInterval(() => void this.ping(), this.pingIntervalMs);
@@ -359,23 +305,6 @@ export class HarnessClient {
         } finally {
             this.pingActive = false;
         }
-    }
-
-    private registerReverse<Method extends ProtocolReverseRequestMethod>(
-        peer: JsonRpcPeer,
-        method: Method,
-        handler: (
-            params: ProtocolReverseRequestParams<Method>,
-            signal: AbortSignal,
-        ) => Promise<ProtocolReverseRequestResult<Method>>,
-    ): void {
-        peer.register(method, async (params, context) => {
-            const result = await handler(
-                params as unknown as ProtocolReverseRequestParams<Method>,
-                context.signal,
-            );
-            return result as unknown as JsonValue;
-        });
     }
 
     private async requestOnPeer<Method extends ProtocolCommandMethod>(
@@ -419,7 +348,7 @@ function validateInitializeResultShape(raw: JsonValue, context: HarnessClientCon
     if (textField(value, "workspaceId") !== context.workspaceId) {
         throw new HarnessCompatibilityError("Runtime attached a different Workspace");
     }
-    if (value.transport !== "windows-named-pipe") throw new HarnessCompatibilityError("production plugin requires Named Pipe");
+    if (value.transport !== "stdio-dev") throw new HarnessCompatibilityError("local plugin requires direct stdio");
     const capabilities = validateCapabilitySet(value.capabilities);
     for (const required of context.requiredCapabilities) {
         if (capabilities[required] !== true) throw new HarnessCompatibilityError(`Runtime lacks required capability: ${required}`);
@@ -439,7 +368,7 @@ function validateInitializeResultShape(raw: JsonValue, context: HarnessClientCon
         workspaceInstanceId: textField(value, "workspaceInstanceId"),
         hostPid: integerField(value, "hostPid", 1),
         workerPid: integerField(value, "workerPid", 1),
-        transport: "windows-named-pipe",
+        transport: "stdio-dev",
         runtimeArch,
         capabilities,
         buildCommit,

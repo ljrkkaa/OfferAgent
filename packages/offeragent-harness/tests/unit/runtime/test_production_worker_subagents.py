@@ -61,8 +61,6 @@ class _CapturingFactory(ProductionRunComponentsFactory):
     def __init__(self, registry: ToolRegistry) -> None:
         self._registries = {"run_root": registry}
         self._effective_configs = {"run_root": HarnessConfig()}
-        self._client_connections = {"run_root": "pipe-root-owner"}
-        self._headless_grants: dict[str, str] = {}
         self.captured: dict[str, Any] = {}
 
     def _build(self, config: Any, state: Any, inputs: Any, **kwargs: Any) -> RunComponents:
@@ -326,7 +324,6 @@ def test_child_components_use_durable_budget_scope_and_exact_root_tool_snapshot(
 
     factory.build_child(execution, _state(record))
 
-    assert factory.captured["client_connection_id"] == "pipe-root-owner"
     assert factory.captured["definitions_override"] == (definition,)
     assert factory.captured["definitions_override"][0].executor_location is ExecutorLocation.LOCAL
     assert factory.captured["scope_override"] is record.effective_scope
@@ -367,8 +364,6 @@ def test_worker_factory_injects_one_gate_and_lock_pool_across_sessions_and_root_
         artifacts=LocalArtifactStore(tmp_path / "artifacts", workspace_id="ws_test"),
         local_read=cast(Any, SimpleNamespace(definitions=())),
         local_transaction=cast(Any, SimpleNamespace(provider_id="vault.transaction")),
-        headless_vault_write=cast(Any, object()),
-        channels=cast(Any, object()),
         parent_authorities=cast(Any, object()),
         optional_definitions=(definition,),
         optional_local_executors=(((definition,), _CountingExecutor()),),
@@ -471,8 +466,6 @@ def test_prepared_child_components_bind_the_complete_durable_subagent_record() -
         config=execution.run_config,
         inputs=object(),
         effective_config=HarnessConfig(),
-        client_connection_id="pipe-root-owner",
-        local_vault_write_grant_id=None,
         definitions=(definition,),
         budget=object(),
         scope=record.effective_scope,
@@ -584,8 +577,6 @@ async def test_production_child_kernel_rechecks_live_parent_before_local_side_ef
         artifacts=LocalArtifactStore(tmp_path / "artifacts", workspace_id=record.workspace_id),
         local_read=cast(Any, SimpleNamespace(definitions=())),
         local_transaction=cast(Any, SimpleNamespace(provider_id="vault.transaction")),
-        headless_vault_write=cast(Any, object()),
-        channels=cast(Any, object()),
         parent_authorities=authorities,
         optional_definitions=(definition,),
         optional_local_executors=(((definition,), executor),),

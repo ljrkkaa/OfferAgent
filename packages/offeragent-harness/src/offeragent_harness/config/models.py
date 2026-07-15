@@ -68,7 +68,6 @@ class RuntimeSettings(_StrictModel):
     worker_idle_seconds: PositiveInt = 300
     startup_timeout_seconds: PositiveInt = 30
     max_parallel_runs: PositiveInt = 2
-    diagnostic_stdio: StrictBool = False
 
 
 class ModelSettings(_StrictModel):
@@ -131,6 +130,7 @@ class PolicyApprovalSettings(_StrictModel):
     read_only: StrictBool = True
     workspace_trusted: StrictBool = False
     approve_vault_writes: StrictBool = True
+    allow_bypass: StrictBool = False
     approve_shell: StrictBool = True
     approve_network: StrictBool = True
     approval_ttl_seconds: PositiveInt = 300
@@ -149,7 +149,6 @@ class ExecutionSettings(_StrictModel):
 
 
 class ExtensibilitySettings(_StrictModel):
-    skills_enabled: StrictBool = False
     hooks_enabled: StrictBool = False
 
 
@@ -211,7 +210,6 @@ class RuntimePatch(_StrictModel):
     worker_idle_seconds: PositiveInt | None = None
     startup_timeout_seconds: PositiveInt | None = None
     max_parallel_runs: PositiveInt | None = None
-    diagnostic_stdio: StrictBool | None = None
 
 
 class ModelPatch(_StrictModel):
@@ -252,6 +250,7 @@ class PolicyPatch(_StrictModel):
     read_only: StrictBool | None = None
     workspace_trusted: StrictBool | None = None
     approve_vault_writes: StrictBool | None = None
+    allow_bypass: StrictBool | None = None
     approve_shell: StrictBool | None = None
     approve_network: StrictBool | None = None
     approval_ttl_seconds: PositiveInt | None = None
@@ -268,7 +267,6 @@ class ExecutionPatch(_StrictModel):
 
 
 class ExtensibilityPatch(_StrictModel):
-    skills_enabled: StrictBool | None = None
     hooks_enabled: StrictBool | None = None
 
 
@@ -339,7 +337,6 @@ class RunConfigSnapshot:
 
 RESTART_REQUIRED_PATHS = frozenset(
     {
-        "runtime.diagnostic_stdio",
         "runtime.startup_timeout_seconds",
         "model.provider",
         "model.wire_api",

@@ -202,10 +202,6 @@ def test_domain_factory_covers_every_non_identity_command_exactly_once() -> None
         diagnostics_owner_runs=shared,  # type: ignore[arg-type]
         gateway_provider=lambda: shared,  # type: ignore[return-value]
         transport_policy=shared,  # type: ignore[arg-type]
-        administrative_approvals=shared,  # type: ignore[arg-type]
-        headless_vault_write_handlers={
-            method: _unused for method in COMMAND_REGISTRY if method.startswith("vault/headless/")
-        },
         extension_management_handlers={
             method: _unused
             for method in COMMAND_REGISTRY

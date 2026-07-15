@@ -158,6 +158,29 @@ async def test_text_is_yielded_before_next_provider_event_is_requested() -> None
 
 
 @pytest.mark.asyncio
+async def test_provider_reasoning_summary_is_streamed_as_a_distinct_typed_event() -> None:
+    request = _request()
+    events = (
+        ModelEvent(request.request_id, 1, ModelEventKind.STARTED),
+        ModelEvent(request.request_id, 2, ModelEventKind.REASONING_SUMMARY, text="检查本地"),
+        ModelEvent(request.request_id, 3, ModelEventKind.REASONING_SUMMARY, text="文件证据"),
+        ModelEvent(request.request_id, 4, ModelEventKind.TEXT_DELTA, text="answer"),
+        ModelEvent(request.request_id, 5, ModelEventKind.USAGE, usage=USAGE),
+        ModelEvent(request.request_id, 6, ModelEventKind.COMPLETED, finish_reason=ModelFinishReason.STOP),
+    )
+    gateway = ScriptedModelGateway((ModelScriptStep.from_events(request, events),))
+
+    result = await _collect(_composer(gateway).stream(_state(), partial=False, cancellation=ManualCancellationToken()))
+
+    assert [event.reasoning_summary_delta for event in result if event.reasoning_summary_delta is not None] == [
+        "检查本地",
+        "文件证据",
+    ]
+    assert [event.text_delta for event in result if event.text_delta is not None] == ["answer"]
+    gateway.assert_exhausted()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "events, message",
     (

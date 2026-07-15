@@ -20,9 +20,7 @@ from offeragent_harness.agent.state import (
     RunControlMessage,
     RunPhase,
     RunState,
-    VaultWriteIntentBinding,
 )
-from offeragent_harness.foundation import vault_write_intent_hash
 from offeragent_harness.models import ModelPurpose, ModelRole, thaw_json
 from offeragent_harness.ports import Sensitivity
 from offeragent_harness.sessions import AgentLineage
@@ -74,7 +72,6 @@ def _state() -> RunState:
         pending=PendingWork(
             tool_call_ids=frozenset({"call-z", "call-a"}),
             approval_ids=frozenset({"approval-1"}),
-            client_invocation_ids=frozenset({"client-1"}),
             child_run_ids=frozenset({"child-1"}),
         ),
         write_obligation=base.write_obligation.require("必须写入用户指定的笔记"),
@@ -145,13 +142,11 @@ def test_context_has_fixed_layers_snapshot_sources_and_fail_closed_filtering() -
         "required": True,
         "reasons": ["必须写入用户指定的笔记"],
         "satisfied": False,
-        "intent": None,
         "outcomes": [],
     }
     assert snapshot["pending"] == {
         "toolCallIds": ["call-a", "call-z"],
         "approvalIds": ["approval-1"],
-        "clientInvocationIds": ["client-1"],
         "childRunIds": ["child-1"],
     }
     memory = thaw_json(window.messages[3].content[0].data)
@@ -165,31 +160,6 @@ def test_context_has_fixed_layers_snapshot_sources_and_fail_closed_filtering() -
     assert "private memory" not in serialized
     assert "secret skill" not in serialized
     assert "must stay hidden" not in serialized
-
-
-def test_context_exposes_the_exact_bound_write_targets_to_the_planner() -> None:
-    targets = ("notes/offer.md", "notes/summary.md")
-    binding = VaultWriteIntentBinding(
-        request_hash="sha256:" + ("1" * 64),
-        intent_hash=vault_write_intent_hash(targets),
-        target_paths=targets,
-    )
-    current = _state().require_write_outcome("turn.start.vault_write_required", intent=binding)
-    manager = ContextManager(
-        system_rules=("system",),
-        inputs=ContextInputs(
-            user_input=(_fragment("user", ContextLayer.USER_INPUT, "write", Sensitivity.PUBLIC),),
-        ),
-        visibility=ContextVisibilityPolicy.local_model(),
-        budget=ContextBudget.generous_default(),
-    )
-
-    window = manager.build(current, purpose=ModelPurpose.PLANNING)
-    snapshot = thaw_json(window.messages[1].content[0].data)
-    assert snapshot["writeObligation"]["intent"] == {
-        "intentHash": vault_write_intent_hash(targets),
-        "targetPaths": list(targets),
-    }
 
 
 def test_current_user_input_is_never_displaced_by_optional_conversation_history() -> None:

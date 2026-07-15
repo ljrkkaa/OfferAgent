@@ -1681,8 +1681,6 @@ def _active_run_is_effectful(state: RunState) -> bool:
         RunPhase.PERSISTING,
     }:
         return True
-    if state.pending.client_invocation_ids:
-        return True
     return False
 
 

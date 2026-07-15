@@ -15,7 +15,7 @@ import json
 import os
 import stat
 import tempfile
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path, PurePosixPath
@@ -324,31 +324,12 @@ class VaultTransactionCoordinator:
                     self._plans.pop(key, None)
 
     async def execute(self, call: ToolCall, cancellation: CancellationToken) -> ToolResult:
-        return await self._execute(call, cancellation, commit_validator=None)
-
-    async def execute_with_commit_validation(
-        self,
-        call: ToolCall,
-        cancellation: CancellationToken,
-        commit_validator: Callable[[Mapping[str, str]], Awaitable[None]],
-    ) -> ToolResult:
-        """Keep CAS rollback authority until an external observer confirms commit.
-
-        Client-bound transactions use this barrier to prove that the same
-        Obsidian connection still sees every affected editor closed and every
-        physical path at its planned after-hash.  A failed observation enters
-        the normal rollback/unknown handling before any CAS backup is cleaned.
-        Headless transactions continue to use :meth:`execute`.
-        """
-
-        return await self._execute(call, cancellation, commit_validator=commit_validator)
+        return await self._execute(call, cancellation)
 
     async def _execute(
         self,
         call: ToolCall,
         cancellation: CancellationToken,
-        *,
-        commit_validator: Callable[[Mapping[str, str]], Awaitable[None]] | None,
     ) -> ToolResult:
         key = self._plan_key(call)
         async with self._plan_lock:
@@ -410,13 +391,6 @@ class VaultTransactionCoordinator:
             for change in applied:
                 cancellation.checkpoint()
                 await _run_io(change.cas.verify_committed)
-                cancellation.checkpoint()
-            if commit_validator is not None:
-                after_hashes = {
-                    path: ABSENT_HASH if content is None else content_hash(content)
-                    for path, content in plan.final_contents.items()
-                }
-                await commit_validator(after_hashes)
                 cancellation.checkpoint()
             if manifest is not None:
                 await self._transition_durable_manifest(

@@ -12,11 +12,11 @@ from offeragent_harness.agent import BudgetLedger, RunBudget
 from offeragent_harness.agent.composer import CompositionEvent
 from offeragent_harness.agent.context_manager import ContextFragment, ContextLayer
 from offeragent_harness.agent.loop import AgentLoopFailure, ToolExecution
-from offeragent_harness.agent.planner import Planner, PlanningStep
+from offeragent_harness.agent.planner import Planner, PlanningAttempt, PlanningAttemptOutcome, PlanningStep
 from offeragent_harness.agent.preparation import RunPreparationFailure
-from offeragent_harness.agent.state import RunPhase, RunState, VaultWriteIntentBinding
+from offeragent_harness.agent.state import RunPhase, RunState
 from offeragent_harness.config import HarnessConfig, MemorySettings
-from offeragent_harness.foundation import vault_write_intent_hash
+from offeragent_harness.models import ModelUsage
 from offeragent_harness.ports import CancellationToken, Sensitivity, StoredEvent, ToolLifecycleObserver
 from offeragent_harness.protocol.events import TurnFailedPayload, parse_event, stored_event_to_envelope
 from offeragent_harness.runtime import TurnManager
@@ -45,7 +45,19 @@ from offeragent_harness.tools import ToolCall, canonical_json_sha256
 class StopPlanner:
     async def plan(self, state: RunState, cancellation: CancellationToken) -> PlanningStep:
         cancellation.checkpoint()
-        return PlanningStep((), False, "done")
+        return PlanningStep(
+            (),
+            False,
+            "done",
+            attempts=(
+                PlanningAttempt(
+                    request_id=f"test-stop-{state.model_rounds + 1}",
+                    repair_index=0,
+                    outcome=PlanningAttemptOutcome.SUCCEEDED,
+                    usage=ModelUsage(0, 0, 0, 0),
+                ),
+            ),
+        )
 
 
 class WaitingPlanner:
@@ -254,14 +266,6 @@ def turn_command(session_id: str, *, config: dict[str, object] | None = None) ->
     )
 
 
-def write_intent(*, target: str = "notes/required.md", marker: str = "1") -> VaultWriteIntentBinding:
-    return VaultWriteIntentBinding(
-        request_hash="sha256:" + (marker * 64),
-        intent_hash=vault_write_intent_hash((target,)),
-        target_paths=(target,),
-    )
-
-
 def test_command_boundary_rejects_unbounded_or_noncanonical_input_before_starting_a_run() -> None:
     with pytest.raises(ValueError, match="idempotency_key"):
         CreateSessionCommand("ws_main", "profile_main", "Session", "contains whitespace")
@@ -403,7 +407,7 @@ async def test_async_components_failure_uses_one_durable_terminal_commit() -> No
 
 
 @pytest.mark.asyncio
-async def test_turn_start_persists_client_context_and_shorter_absolute_deadline() -> None:
+async def test_turn_start_uses_the_shorter_absolute_deadline() -> None:
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     clock = ManualClock(now)
     manager = TurnManager()
@@ -424,7 +428,6 @@ async def test_turn_start_persists_client_context_and_shorter_absolute_deadline(
         idempotency_key=base.idempotency_key,
         input_blocks=base.input_blocks,
         run_config=base.run_config,
-        client_context={"activeFile": "note.md", "hasUnsavedChanges": True},
         deadline_at=now + timedelta(seconds=30),
     )
     receipt = await harness.start_turn(command)
@@ -433,8 +436,6 @@ async def test_turn_start_persists_client_context_and_shorter_absolute_deadline(
     await active.task
     run = await harness.get_run(receipt.run_id)
     assert run.deadline_at == now + timedelta(seconds=30)
-    event = stored_event_to_envelope((await harness.replay_events(receipt.run_id))[0])
-    assert event.payload.client_context.active_file == "note.md"  # type: ignore[union-attr]
 
 
 @pytest.mark.asyncio
@@ -519,73 +520,6 @@ async def test_idempotency_key_reuse_with_different_request_fails_closed() -> No
 
     with pytest.raises(IdempotencyKeyConflict):
         await harness.start_turn(turn_command(session.session_id, config={"model": "different"}))
-
-
-@pytest.mark.asyncio
-async def test_explicit_write_intent_survives_false_planner_and_blocks_completion() -> None:
-    harness, manager = service(StopPlanner())
-    session = await create_session(harness)
-    binding = write_intent()
-    command = replace(turn_command(session.session_id), write_intent=binding)
-
-    receipt = await harness.start_turn(command)
-    active = await manager.get(receipt.run_id)
-    assert active is not None
-    terminal = await active.task
-    assert terminal.phase is RunPhase.FAILED
-    assert terminal.write_obligation.required
-    assert not terminal.write_obligation.satisfied
-    assert terminal.write_obligation.intent == binding
-    assert (await harness.get_run(receipt.run_id)).status is RunStatus.FAILED
-    assert "turn.completed" not in {item.event_type for item in await harness.replay_events(receipt.run_id)}
-
-
-@pytest.mark.asyncio
-async def test_retry_inherits_structured_write_binding_and_cannot_downgrade() -> None:
-    harness, manager = service(StopPlanner())
-    session = await create_session(harness)
-    binding = write_intent()
-    original = await harness.start_turn(replace(turn_command(session.session_id), write_intent=binding))
-    original_active = await manager.get(original.run_id)
-    assert original_active is not None
-    assert (await original_active.task).phase is RunPhase.FAILED
-
-    retry = await harness.retry_turn(
-        RetryTurnCommand(
-            workspace_id="ws_main",
-            session_id=session.session_id,
-            turn_id=original.turn_id,
-            source_run_id=original.run_id,
-            idempotency_key="retry-write-intent",
-        )
-    )
-    retry_active = await manager.get(retry.run_id)
-    assert retry_active is not None
-    retry_terminal = await retry_active.task
-    assert retry_terminal.phase is RunPhase.FAILED
-    assert retry_terminal.write_obligation.intent == binding
-    assert retry_terminal.write_obligation.outcomes == ()
-    assert "turn.retry.inherited_write_intent" in retry_terminal.write_obligation.reasons
-    assert "turn.completed" not in {item.event_type for item in await harness.replay_events(retry.run_id)}
-
-
-@pytest.mark.asyncio
-async def test_turn_idempotency_hash_binds_the_structured_write_intent() -> None:
-    harness, manager = service(StopPlanner())
-    session = await create_session(harness)
-    base = turn_command(session.session_id)
-    original = await harness.start_turn(replace(base, write_intent=write_intent()))
-    original_active = await manager.get(original.run_id)
-    assert original_active is not None
-    await original_active.task
-
-    with pytest.raises(IdempotencyKeyConflict):
-        await harness.start_turn(
-            replace(
-                base,
-                write_intent=write_intent(target="notes/other.md", marker="4"),
-            )
-        )
 
 
 @pytest.mark.asyncio

@@ -25,8 +25,6 @@ export interface ExtensionSettingsPanelHost {
         params: ProtocolCommandParams<Method>,
         options?: { signal?: AbortSignal; timeoutMs?: number },
     ): Promise<ProtocolCommandResult<Method>>;
-    selectedSkillNames(): readonly string[];
-    setSkillSelected(name: string, selected: boolean): Promise<void>;
     extensionExecutionEnabled(kind: "shell" | "hooks"): boolean;
     setExtensionExecutionEnabled(kind: "shell" | "hooks", enabled: boolean): Promise<void>;
 }
@@ -102,37 +100,15 @@ export class ExtensionSettingsPanel {
         section.createEl("h4", { text: "Skills" });
         const status = snapshot.skillStatus;
         section.createEl("p", {
-            text: `revision ${status.revision} · ${status.enabledCount}/${status.discoveredCount} 已信任${status.partial ? " · partial（保持旧快照）" : ""}`,
+            text: `revision ${status.revision} · ${status.enabledCount}/${status.discoveredCount} 可用；工作区受信任后，Skill 元数据自动提供给模型，正文仅在调用 Skill 时按需读取${status.partial ? " · partial（保持旧快照）" : ""}`,
             cls: status.partial ? "offeragent-extension-warning" : "setting-item-description",
         });
-        section.appendChild(this.button("重新扫描（CAS）", () => this.mutate(
-            "Skill 扫描完成",
-            (signal) => this.manager.rescanSkills(status, signal).then(() => undefined),
-        )));
-        const selected = new Set(this.host.selectedSkillNames());
         if (!snapshot.skills.length) section.createEl("p", { text: "没有发现 Skill。", cls: "setting-item-description" });
         for (const skill of snapshot.skills) {
             const row = section.createDiv({ cls: "offeragent-extension-card" });
-            const setting = new Setting(row)
+            new Setting(row)
                 .setName(skill.name)
-                .setDesc(`${skill.layer} · ${skill.trustState} · ${skill.description}`);
-            setting.addToggle((toggle) => toggle
-                .setValue(selected.has(skill.name))
-                .setDisabled(!skill.enabled)
-                .onChange((value) => this.host.setSkillSelected(skill.name, value).catch((error) =>
-                    this.showError(error, "无法更新 Run Skill 选择"))));
-            if (skill.layer === "user" || skill.layer === "workspace") {
-                setting.addButton((button) => {
-                    button.setButtonText(skill.trustState === "confirmed" ? "撤销信任" : "确认 contentHash");
-                    if (skill.trustState === "confirmed") button.setWarning();
-                    button.onClick(() => void this.mutate(
-                        "Skill 信任已更新",
-                        (signal) => this.manager.confirmSkill(
-                            skill, status.revision, skill.trustState !== "confirmed", signal,
-                        ),
-                    ));
-                });
-            }
+                .setDesc(`${skill.layer} · ${skill.description}`);
         }
         for (const diagnostic of status.diagnostics) {
             section.createEl("p", {

@@ -7,13 +7,10 @@
       "approvals": true,
       "artifacts": true,
       "cancellation": true,
-      "clientTools": true,
       "contentBlocks": true,
       "diagnostics": true,
       "eventReplay": true,
-      "headlessVaultWrite": true,
       "multiSession": true,
-      "reverseRequests": true,
       "shell": true,
       "subagents": true
     },
@@ -22,7 +19,7 @@
     "protocolVersion": "1.0",
     "runtimeArch": "win-x64",
     "runtimeVersion": "2.0.0",
-    "schemaHash": "sha256:15e354b3aff2e830c7b799610e0da1d79ddc2659cf54c9a340fae7ac6bc12875",
+    "schemaHash": "sha256:7c2d0bee45032d24289a368eb276d502f956662c8252f39d54a40276a4d145ec",
     "supportedProtocolRange": {
       "maximum": "1.0",
       "minimum": "1.0"

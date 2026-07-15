@@ -61,7 +61,7 @@ class _FailureScript:
         raise self.factory()
 
 
-class _NoReverseRequests:
+class _RejectServerRequests:
     def require_ready(self) -> None:
         return None
 
@@ -74,7 +74,7 @@ class _NoReverseRequests:
         context: ApplicationCommandContext | None = None,
     ) -> object:
         del context
-        raise AssertionError(f"unexpected reverse request: {method}")
+        raise AssertionError(f"unexpected server request: {method}")
 
 
 class _MemoryPipeStream:
@@ -246,13 +246,17 @@ async def test_direct_pipe_http_and_websocket_share_sanitized_application_errors
     client = DuplexJsonRpcConnection(
         client_stream,
         role=ConnectionRole.CLIENT,
-        dispatcher=_NoReverseRequests(),
+        dispatcher=_RejectServerRequests(),
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
         connection_id="error-conformance-client",
     )
     pipe_server = DuplexJsonRpcConnection(
         server_stream,
         role=ConnectionRole.SERVER,
         dispatcher=dispatcher,
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
         connection_id="error-conformance-server",
     )
     await asyncio.gather(client.start(), pipe_server.start())

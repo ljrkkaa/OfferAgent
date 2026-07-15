@@ -25,7 +25,6 @@ from offeragent_harness.protocol.jsonrpc import (
 )
 from offeragent_harness.protocol.messages import (
     COMMAND_REGISTRY,
-    ClientToolInvokeResult,
     InitializeResult,
     RuntimePingParams,
     RuntimePingResult,
@@ -174,7 +173,6 @@ class ScriptedApplicationDispatcher:
     def __init__(self, *, initialize_result: Mapping[str, Any] | None = None) -> None:
         examples = build_examples()
         self.initialize_result = initialize_result or examples["initialize.response.json"]["result"]
-        self.client_tool_result = examples["client-tool-invoke.response.json"]["result"]
         self.calls: list[str] = []
         self.contexts: list[ApplicationCommandContext] = []
         self.ready_gate_calls = 0
@@ -218,8 +216,6 @@ class ScriptedApplicationDispatcher:
                 "timestamp": "2026-07-13T00:00:00Z",
                 "workerPid": 4242,
             }
-        if method == "client/tool/invoke":
-            return self.client_tool_result
         raise AssertionError(f"unexpected method: {method}")
 
 
@@ -253,6 +249,8 @@ async def initialized_connections(
         client_stream,
         role=ConnectionRole.CLIENT,
         dispatcher=client_dispatcher,
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
         config=config,
         nonce_source=SequenceNonce(1),
     )
@@ -260,6 +258,8 @@ async def initialized_connections(
         server_stream,
         role=ConnectionRole.SERVER,
         dispatcher=server_dispatcher,
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
         config=config,
         nonce_source=SequenceNonce(2),
         response_flushed=server_response_flushed,
@@ -410,28 +410,24 @@ def test_transport_configuration_rejects_unbounded_or_nonpositive_values(kwargs:
 
 
 @pytest.mark.asyncio
-async def test_initialize_gate_and_fully_duplex_same_ids_reverse_tools_and_serialized_writes() -> None:
+async def test_initialize_gate_concurrent_requests_and_serialized_writes() -> None:
     client, server, client_dispatcher, server_dispatcher, client_stream, server_stream = await initialized_connections(
         fragment_bytes=1
     )
     try:
-        client_tool_params = cast(dict[str, Any], build_examples()["client-tool-invoke.request.json"]["params"])
-        ping_one, ping_two, client_tool = await asyncio.gather(
+        ping_one, ping_two = await asyncio.gather(
             client.request("runtime/ping", {"nonce": "req_one"}),
             client.request("runtime/ping", {"nonce": "req_two"}),
-            server.request("client/tool/invoke", client_tool_params),
         )
 
         assert isinstance(ping_one, RuntimePingResult)
         assert isinstance(ping_two, RuntimePingResult)
         assert ping_one.nonce == "req_one"
         assert ping_two.nonce == "req_two"
-        assert isinstance(client_tool, ClientToolInvokeResult)
-        assert client_tool.status.value == "succeeded"
         assert server_dispatcher.calls == ["initialize", "runtime/ping", "runtime/ping"]
-        assert client_dispatcher.calls == ["client/tool/invoke"]
+        assert client_dispatcher.calls == []
         assert server_dispatcher.ready_gate_calls == 3
-        assert client_dispatcher.ready_gate_calls == 1
+        assert client_dispatcher.ready_gate_calls == 0
         assert not client_stream.concurrent_write_detected
         assert not server_stream.concurrent_write_detected
         assert client.pending_local_count == server.pending_local_count == 0
@@ -522,12 +518,16 @@ async def test_authenticated_pipe_preserves_secret_params_through_dispatcher_rev
         client_stream,
         role=ConnectionRole.CLIENT,
         dispatcher=ScriptedApplicationDispatcher(),
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
         nonce_source=SequenceNonce(1),
     )
     server = DuplexJsonRpcConnection(
         server_stream,
         role=ConnectionRole.SERVER,
         dispatcher=server_dispatcher,
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
         nonce_source=SequenceNonce(2),
     )
     await asyncio.gather(client.start(), server.start())
@@ -627,12 +627,16 @@ async def test_authenticated_pipe_creates_distinct_default_title_sessions_on_one
         client_stream,
         role=ConnectionRole.CLIENT,
         dispatcher=ScriptedApplicationDispatcher(),
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
         nonce_source=SequenceNonce(1),
     )
     server = DuplexJsonRpcConnection(
         server_stream,
         role=ConnectionRole.SERVER,
         dispatcher=server_dispatcher,
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
         nonce_source=SequenceNonce(2),
     )
     await asyncio.gather(client.start(), server.start())
@@ -841,17 +845,54 @@ async def test_non_initialize_request_is_rejected_before_application_dispatch() 
         client_stream,
         role=ConnectionRole.CLIENT,
         dispatcher=client_dispatcher,
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
     )
     server = DuplexJsonRpcConnection(
         server_stream,
         role=ConnectionRole.SERVER,
         dispatcher=server_dispatcher,
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
     )
     await asyncio.gather(client.start(), server.start())
     try:
         with pytest.raises(Exception, match="initialize"):
             await client.request("runtime/ping", {"nonce": "too_early"})
         assert server_dispatcher.calls == []
+    finally:
+        await asyncio.gather(client.close(), server.close())
+
+
+@pytest.mark.asyncio
+async def test_connection_dispatches_the_explicit_stdio_authority() -> None:
+    client_stream, server_stream = memory_pipe_pair()
+    server_dispatcher = ScriptedApplicationDispatcher()
+    client = DuplexJsonRpcConnection(
+        client_stream,
+        role=ConnectionRole.CLIENT,
+        dispatcher=ScriptedApplicationDispatcher(),
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
+    )
+    server = DuplexJsonRpcConnection(
+        server_stream,
+        role=ConnectionRole.SERVER,
+        dispatcher=server_dispatcher,
+        command_transport="stdio-dev",
+        command_peer="parent-process",
+    )
+    await asyncio.gather(client.start(), server.start())
+    try:
+        params = cast(dict[str, Any], build_examples()["initialize.request.json"]["params"])
+        await client.request("initialize", params)
+        assert server_dispatcher.contexts == [
+            ApplicationCommandContext(
+                transport="stdio-dev",
+                client_id=server.connection_id,
+                peer="parent-process",
+            )
+        ]
     finally:
         await asyncio.gather(client.close(), server.close())
 
@@ -925,11 +966,15 @@ async def test_invalid_initialize_does_not_stick_client_state_and_write_timeout_
         client_stream,
         role=ConnectionRole.CLIENT,
         dispatcher=ScriptedApplicationDispatcher(),
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
     )
     server = DuplexJsonRpcConnection(
         server_stream,
         role=ConnectionRole.SERVER,
         dispatcher=ScriptedApplicationDispatcher(),
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
     )
     await asyncio.gather(client.start(), server.start())
     try:
@@ -964,6 +1009,8 @@ async def test_invalid_remote_initialize_does_not_stick_server_state_or_reach_di
         server_stream,
         role=ConnectionRole.SERVER,
         dispatcher=server_dispatcher,
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
     )
     await server.start()
     invalid = build_examples()["initialize.request.json"] | {"params": {}}
@@ -977,6 +1024,8 @@ async def test_invalid_remote_initialize_does_not_stick_server_state_or_reach_di
         client_stream,
         role=ConnectionRole.CLIENT,
         dispatcher=ScriptedApplicationDispatcher(),
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
     )
     await client.start()
     try:
@@ -1024,6 +1073,8 @@ async def test_malformed_or_partial_frame_poison_closes_connection() -> None:
         partial_server,
         role=ConnectionRole.SERVER,
         dispatcher=dispatcher,
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
         config=config,
     )
     await connection.start()
@@ -1036,6 +1087,8 @@ async def test_malformed_or_partial_frame_poison_closes_connection() -> None:
         idle_server,
         role=ConnectionRole.SERVER,
         dispatcher=ScriptedApplicationDispatcher(),
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
         config=NamedPipeTransportConfig(idle_timeout_seconds=0.05),
     )
     await idle_connection.start()

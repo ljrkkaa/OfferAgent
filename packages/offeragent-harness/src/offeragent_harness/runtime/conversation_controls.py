@@ -110,14 +110,14 @@ class ConversationControlService:
                 boundary_artifact=None,
                 replaced_turn_count=0,
             )
-        boundary_turn = (
-            ordered[-1]
-            if through_turn_id is None
-            else next(
-                (item for item in ordered if item.turn_id == through_turn_id),
-                None,
-            )
-        )
+        boundary_turn: Turn | None = None
+        if through_turn_id is None:
+            boundary_turn = ordered[-1]
+        else:
+            for item in ordered:
+                if item.turn_id == through_turn_id:
+                    boundary_turn = item
+                    break
         if boundary_turn is None:
             raise ConversationControlError("compaction boundary Turn does not exist in this Session")
         included_turns = tuple(item for item in ordered if item.ordinal <= boundary_turn.ordinal)

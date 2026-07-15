@@ -14,7 +14,7 @@ from offeragent_harness.adapters.sqlite_stores import SqliteInvocationJournal, S
 from offeragent_harness.agent import BudgetLedger, RunBudget
 from offeragent_harness.agent.composer import CompositionEvent
 from offeragent_harness.agent.loop import ToolExecution, run_agent_loop
-from offeragent_harness.agent.planner import PlanningStep
+from offeragent_harness.agent.planner import PlanningAttempt, PlanningAttemptOutcome, PlanningStep
 from offeragent_harness.agent.state import RunPhase, RunState
 from offeragent_harness.config import HarnessConfig
 from offeragent_harness.hooks import (
@@ -404,15 +404,26 @@ async def test_bundle_exposes_same_port_to_worker_compaction_and_subagent_adapte
 
 class _OneStepPlanner:
     def __init__(self) -> None:
-        self._step = PlanningStep((), False, "done")
+        self._planned = False
 
     async def plan(self, state: RunState, cancellation: CancellationToken) -> PlanningStep:
-        del state
         cancellation.checkpoint()
-        step, self._step = self._step, None  # type: ignore[assignment]
-        if step is None:
+        if self._planned:
             raise AssertionError("unexpected second planning call")
-        return step
+        self._planned = True
+        return PlanningStep(
+            (),
+            False,
+            "done",
+            attempts=(
+                PlanningAttempt(
+                    request_id=f"test-hook-{state.model_rounds + 1}",
+                    repair_index=0,
+                    outcome=PlanningAttemptOutcome.SUCCEEDED,
+                    usage=ModelUsage(0, 0, 0, 0),
+                ),
+            ),
+        )
 
 
 class _TextComposer:
@@ -660,7 +671,7 @@ async def test_production_pretool_mutation_and_ask_bind_kernel_approval_to_mutat
         policy=RuleBasedPolicyEvaluator(audit_sink=NullPolicyAuditSink()),
         policy_context=lambda _: policy_context,
         scheduler=ToolScheduler(clock=clock, max_parallel_reads=1),
-        dispatcher=ToolDispatcher(clock=clock, local=executor),
+        dispatcher=ToolDispatcher(local=executor),
         journal=SqliteInvocationJournal(tmp_path / "hook-kernel.sqlite"),
         clock=clock,
         ids=DeterministicIdGenerator(start=100),

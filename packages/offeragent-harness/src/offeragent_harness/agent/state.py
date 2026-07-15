@@ -1,20 +1,16 @@
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Any
 
-from offeragent_harness.foundation import vault_write_intent_hash
 from offeragent_harness.models.json_types import FrozenJsonObject, freeze_json
 from offeragent_harness.sessions import AgentLineage
 from offeragent_harness.tools import (
     ResultSensitivity,
     SideEffectClass,
-    SideEffectKind,
-    SideEffectState,
     ToolCall,
     ToolDefinition,
     ToolResult,
@@ -22,26 +18,6 @@ from offeragent_harness.tools import (
 )
 
 from .budget_checkpoint import BudgetCheckpoint
-
-_WINDOWS_FORBIDDEN_PATH_CHARACTERS = frozenset('<>"|?*')
-_WINDOWS_RESERVED_PATH_BASENAMES = frozenset(
-    {
-        "CON",
-        "CONIN$",
-        "CONOUT$",
-        "PRN",
-        "AUX",
-        "NUL",
-        *(f"COM{suffix}" for suffix in "123456789¹²³"),
-        *(f"LPT{suffix}" for suffix in "123456789¹²³"),
-    }
-)
-_WRITE_EFFECT_STATES_BY_OUTCOME = {
-    ToolResultStatus.SUCCEEDED: frozenset({SideEffectState.COMMITTED}),
-    ToolResultStatus.CONFLICTED: frozenset({SideEffectState.ROLLED_BACK}),
-    ToolResultStatus.DENIED: frozenset({SideEffectState.ATTEMPTED, SideEffectState.ROLLED_BACK}),
-    ToolResultStatus.FAILED: frozenset({SideEffectState.ATTEMPTED, SideEffectState.ROLLED_BACK}),
-}
 
 
 class RunPhase(str, Enum):
@@ -140,56 +116,14 @@ class InvalidRunTransition(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class VaultWriteIntentBinding:
-    """Server-computed transport binding for one explicit Vault-write request."""
-
-    request_hash: str
-    intent_hash: str
-    target_paths: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        digest = re.compile(r"^sha256:[0-9a-f]{64}$")
-        if digest.fullmatch(self.request_hash) is None or digest.fullmatch(self.intent_hash) is None:
-            raise ValueError("Vault write intent hashes must be canonical SHA-256 digests")
-        paths = tuple(self.target_paths)
-        if not paths or len(paths) > 20 or paths != tuple(sorted(set(paths))):
-            raise ValueError("Vault write intent paths must be 1..20 sorted unique paths")
-        for path in paths:
-            components = path.split("/")
-            if (
-                not path
-                or len(path) > 1024
-                or path.startswith("/")
-                or "\\" in path
-                or ":" in path
-                or any(ord(character) < 0x20 or character in _WINDOWS_FORBIDDEN_PATH_CHARACTERS for character in path)
-                or any(component in {"", ".", ".."} for component in components)
-                or any(component[-1] in {".", " "} for component in components)
-                or any(
-                    component.split(".", maxsplit=1)[0].upper() in _WINDOWS_RESERVED_PATH_BASENAMES
-                    for component in components
-                )
-            ):
-                raise ValueError("Vault write intent contains an unsafe relative path")
-        if self.intent_hash != vault_write_intent_hash(paths):
-            raise ValueError("Vault write intent hash does not match its canonical target binding")
-        object.__setattr__(self, "target_paths", paths)
-
-
-@dataclass(frozen=True, slots=True)
 class WriteOutcome:
     tool_call_id: str
     status: ToolResultStatus
     summary: str
-    covered_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.tool_call_id or not self.summary:
             raise ValueError("write outcome identity and summary must not be empty")
-        paths = tuple(self.covered_paths)
-        if paths != tuple(sorted(set(paths))):
-            raise ValueError("write outcome covered paths must be sorted and unique")
-        object.__setattr__(self, "covered_paths", paths)
 
     @property
     def requires_manual_review(self) -> bool:
@@ -201,25 +135,12 @@ class WriteObligation:
     required: bool = False
     reasons: tuple[str, ...] = ()
     outcomes: tuple[WriteOutcome, ...] = ()
-    intent: VaultWriteIntentBinding | None = None
-
-    def __post_init__(self) -> None:
-        if self.intent is not None and not self.required:
-            raise ValueError("a Vault write intent requires an active write obligation")
-        covered_paths = {path for outcome in self.outcomes for path in outcome.covered_paths}
-        if self.intent is None and covered_paths:
-            raise ValueError("unscoped write outcomes cannot claim Vault intent path coverage")
-        if self.intent is not None and not covered_paths.issubset(self.intent.target_paths):
-            raise ValueError("write outcome claims a path outside its bound Vault write intent")
 
     @property
     def satisfied(self) -> bool:
         if not self.required:
             return True
-        if self.intent is None:
-            return bool(self.outcomes)
-        covered_paths = {path for outcome in self.outcomes for path in outcome.covered_paths}
-        return set(self.intent.target_paths).issubset(covered_paths)
+        return any(outcome.status is ToolResultStatus.SUCCEEDED for outcome in self.outcomes)
 
     @property
     def requires_manual_review(self) -> bool:
@@ -228,23 +149,17 @@ class WriteObligation:
     def require(
         self,
         reason: str,
-        *,
-        intent: VaultWriteIntentBinding | None = None,
     ) -> WriteObligation:
         if not reason:
             raise ValueError("write obligation reason must not be empty")
-        if self.intent is not None and intent is not None and self.intent != intent:
-            raise ValueError("write obligation intent cannot be replaced or narrowed")
-        effective_intent = self.intent or intent
-        if reason in self.reasons and effective_intent is self.intent:
+        if reason in self.reasons:
             return self
-        reasons = self.reasons if reason in self.reasons else (*self.reasons, reason)
-        return replace(self, required=True, reasons=reasons, intent=effective_intent)
+        return replace(self, required=True, reasons=(*self.reasons, reason))
 
     def inherited_for_retry(self) -> WriteObligation:
         if not self.required:
             return self
-        reason = "turn.retry.inherited_write_intent"
+        reason = "turn.retry.inherited_write_obligation"
         return replace(
             self,
             reasons=self.reasons if reason in self.reasons else (*self.reasons, reason),
@@ -263,90 +178,15 @@ class WriteObligation:
             SideEffectClass.UNKNOWN,
         }:
             return self
-        covered_paths: tuple[str, ...] = ()
-        if self.intent is not None:
-            matched_paths = _matched_vault_write_intent_paths(self.intent, definition, result, call)
-            if not matched_paths:
-                return self
-            covered_paths = tuple(sorted(matched_paths))
+        del call
         if any(existing.tool_call_id == result.tool_call_id for existing in self.outcomes):
             return self
         outcome = WriteOutcome(
             result.tool_call_id,
             result.status,
             result.user_visible_summary,
-            covered_paths,
         )
         return replace(self, outcomes=(*self.outcomes, outcome))
-
-
-def _matched_vault_write_intent_paths(
-    intent: VaultWriteIntentBinding,
-    definition: ToolDefinition,
-    result: ToolResult,
-    call: ToolCall | None,
-) -> frozenset[str]:
-    if (
-        definition.name != "vault.transaction"
-        or result.status not in _WRITE_EFFECT_STATES_BY_OUTCOME
-        or call is None
-        or call.name != definition.name
-        or call.version != definition.version
-        or call.definition_fingerprint != definition.fingerprint
-        or result.tool_call_id != call.tool_call_id
-    ):
-        return frozenset()
-    raw_operations = call.arguments.get("operations")
-    if not isinstance(raw_operations, tuple):
-        return frozenset()
-    operations: list[tuple[str, str, str | None]] = []
-    for operation in raw_operations:
-        if not isinstance(operation, Mapping):
-            return frozenset()
-        operation_kind = operation.get("op")
-        path = operation.get("path")
-        if not isinstance(operation_kind, str) or not isinstance(path, str):
-            return frozenset()
-        destination: str | None = None
-        if operation_kind == "rename":
-            destination = operation.get("destination")
-            if not isinstance(destination, str):
-                return frozenset()
-        elif operation_kind not in {"create", "append", "replace", "patch", "trash"}:
-            return frozenset()
-        operations.append((operation_kind, path, destination))
-    targets = set(intent.target_paths)
-    touched = {
-        endpoint
-        for _operation_kind, path, destination in operations
-        for endpoint in (path, destination)
-        if endpoint is not None
-    }
-    if targets.isdisjoint(touched):
-        return frozenset()
-
-    prefix = f"vault:{call.workspace_id}:"
-    effected_paths: set[str] = set()
-    for effect in result.side_effects:
-        if (
-            effect.state not in _WRITE_EFFECT_STATES_BY_OUTCOME[result.status]
-            or not effect.resource_id.startswith(prefix)
-            or effect.resource_id == prefix
-        ):
-            continue
-        effect_path = effect.resource_id[len(prefix) :]
-        for operation_kind, source, destination in operations:
-            if operation_kind == "rename":
-                if effect.kind is SideEffectKind.FILE_RENAME and effect_path in {source, destination}:
-                    effected_paths.add(source)
-                    assert destination is not None
-                    effected_paths.add(destination)
-            elif operation_kind == "trash":
-                if effect.kind is SideEffectKind.FILE_TRASH and effect_path == source:
-                    effected_paths.add(source)
-            elif effect.kind is SideEffectKind.FILE_WRITE and effect_path == source:
-                effected_paths.add(source)
-    return frozenset(targets.intersection(effected_paths))
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,12 +194,11 @@ class PendingWork:
     tool_call_ids: frozenset[str] = frozenset()
     tool_calls: tuple[ToolCall, ...] = ()
     approval_ids: frozenset[str] = frozenset()
-    client_invocation_ids: frozenset[str] = frozenset()
     child_run_ids: frozenset[str] = frozenset()
 
     @property
     def empty(self) -> bool:
-        return not (self.tool_call_ids or self.approval_ids or self.client_invocation_ids or self.child_run_ids)
+        return not (self.tool_call_ids or self.approval_ids or self.child_run_ids)
 
     def __post_init__(self) -> None:
         call_ids = tuple(call.tool_call_id for call in self.tool_calls)
@@ -432,12 +271,10 @@ class RunState:
     def require_write_outcome(
         self,
         reason: str,
-        *,
-        intent: VaultWriteIntentBinding | None = None,
     ) -> RunState:
         return replace(
             self,
-            write_obligation=self.write_obligation.require(reason, intent=intent),
+            write_obligation=self.write_obligation.require(reason),
             revision=self.revision + 1,
         )
 

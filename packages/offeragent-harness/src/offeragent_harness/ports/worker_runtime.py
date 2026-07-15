@@ -20,7 +20,6 @@ class WorkerBootstrap:
     workspace_instance_id: str
     canonical_root: Path
     state_directory: Path
-    diagnostic_stdio: bool = False
 
 
 @runtime_checkable

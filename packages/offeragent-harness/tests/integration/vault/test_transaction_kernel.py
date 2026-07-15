@@ -23,22 +23,10 @@ from offeragent_harness.permissions import (
 )
 from offeragent_harness.permissions.audit import NullPolicyAuditSink
 from offeragent_harness.permissions.evaluator import RuleBasedPolicyEvaluator
-from offeragent_harness.ports import ApplicationCommandContext, ApprovalObserver, CancellationToken
-from offeragent_harness.protocol.common import ApprovalDecision
-from offeragent_harness.protocol.common import ApprovalScope as WireApprovalScope
-from offeragent_harness.protocol.messages import (
-    ApprovalResolveParams,
-    HeadlessVaultWriteActivateParams,
-    HeadlessVaultWriteRequestParams,
-)
-from offeragent_harness.runtime.headless_vault_write import (
-    HeadlessAuthorizedVaultTransaction,
-    HeadlessVaultWriteAuthority,
-)
+from offeragent_harness.ports import ApprovalObserver, CancellationToken
 from offeragent_harness.sessions import AgentLineage
 from offeragent_harness.testing import (
     DeterministicIdGenerator,
-    InMemoryUnitOfWorkFactory,
     ManualCancellationToken,
     ManualClock,
 )
@@ -60,11 +48,6 @@ from offeragent_harness.vault import (
 )
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
-
-
-def _required(value: str | None) -> str:
-    assert value is not None
-    return value
 
 
 class RecordingApproval:
@@ -147,8 +130,6 @@ def _call(
 def _kernel(
     tmp_path: Path,
     approval: RecordingApproval,
-    *,
-    transaction_wrapper: Callable[[VaultTransactionCoordinator], HeadlessAuthorizedVaultTransaction] | None = None,
 ) -> tuple[UnifiedToolKernel, LocalArtifactStore, Path, BudgetLedger]:
     vault = tmp_path / "vault"
     vault.mkdir()
@@ -162,9 +143,8 @@ def _kernel(
         artifact_budget=budget,
         clock=clock,
     )
-    transaction = coordinator if transaction_wrapper is None else transaction_wrapper(coordinator)
     definition = vault_transaction_definition()
-    preflights = PreflightRegistry((transaction,))
+    preflights = PreflightRegistry((coordinator,))
     registry = ToolRegistry(
         "snapshot_vault_1",
         (definition,),
@@ -193,7 +173,7 @@ def _kernel(
         policy=RuleBasedPolicyEvaluator(audit_sink=NullPolicyAuditSink()),
         policy_context=lambda _: context,
         scheduler=ToolScheduler(clock=clock, max_parallel_reads=2),
-        dispatcher=ToolDispatcher(clock=clock, local=transaction),
+        dispatcher=ToolDispatcher(local=coordinator),
         journal=SqliteInvocationJournal(tmp_path / "state.sqlite"),
         clock=clock,
         ids=DeterministicIdGenerator(),
@@ -246,113 +226,3 @@ async def test_approval_window_mutation_conflicts_before_dispatch_and_never_over
     assert result[0].result.error.code == "preflight_state_changed"
     assert target[0].read_bytes() == changed
     assert len(approval.requests) == 1
-
-
-@pytest.mark.asyncio
-async def test_headless_grant_still_uses_real_kernel_diff_approval_journal_and_coordinator(
-    tmp_path: Path,
-) -> None:
-    root_identity = "sha256:" + "1" * 64
-    database_identity = "sha256:" + "2" * 64
-    pipe_count = [0]
-    authority_store = InMemoryUnitOfWorkFactory()
-    authority_clock = ManualClock(NOW)
-
-    authority = HeadlessVaultWriteAuthority(
-        workspace_id="ws_test",
-        workspace_instance_id="wsi_headless_kernel",
-        root_identity=root_identity,
-        database_identity=database_identity,
-        unit_of_work=authority_store,
-        clock=authority_clock,
-        identity_probe=lambda: (root_identity, database_identity),
-        pipe_connection_count=lambda: pipe_count[0],
-    )
-    await authority.recover_after_restart()
-    web = ApplicationCommandContext(
-        transport="loopback-http",
-        client_id="web-headless-kernel",
-        peer="127.0.0.1",
-    )
-    baseline = await authority.status(web, ManualCancellationToken())
-    pending = await authority.request(
-        HeadlessVaultWriteRequestParams(
-            client_request_id="req_headless_kernel",
-            confirmation="obsidian_closed_disk_authoritative",
-            ttl_seconds=300,
-            expected_baseline_fingerprint=baseline.baseline_fingerprint,
-        ),
-        web,
-        ManualCancellationToken(),
-    )
-    resolved = await authority.try_resolve(
-        ApprovalResolveParams(
-            approval_id=_required(pending.approval_id),
-            decision=ApprovalDecision.ALLOW_ONCE,
-            scope=WireApprovalScope.ONCE,
-            expected_args_hash=_required(pending.args_hash),
-        ),
-        web,
-    )
-    assert resolved is not None and resolved.run_id is None
-    approved = await authority.status(web, ManualCancellationToken())
-    active = await authority.activate(
-        HeadlessVaultWriteActivateParams(
-            client_request_id="req_activate_headless_kernel",
-            approval_id=_required(approved.approval_id),
-            expected_args_hash=_required(approved.args_hash),
-            expected_revision=approved.revision,
-        ),
-        web,
-        ManualCancellationToken(),
-    )
-    assert active.state == "active"
-    grant_id = await authority.claim_for_turn(
-        web.client_id,
-        canonical_json_sha256({"turn": "turn_headless_kernel", "idempotencyKey": "headless-kernel"}),
-    )
-    assert grant_id is not None
-
-    transaction_approval = RecordingApproval()
-    kernel, artifacts, vault, _budget_ledger = _kernel(
-        tmp_path,
-        transaction_approval,
-        transaction_wrapper=lambda coordinator: HeadlessAuthorizedVaultTransaction(
-            authority=authority,
-            grant_id=grant_id,
-            transaction=coordinator,
-        ),
-    )
-    before = b"before\n"
-    (vault / "note.md").write_bytes(before)
-    call = _call(content_hash(before), call_id="call_headless_1", idempotency_key="idem_headless_1")
-
-    first = await kernel.execute_batch((call,), ManualCancellationToken())
-    replay = await kernel.execute_batch((call,), ManualCancellationToken())
-
-    assert first[0].result.status is ToolResultStatus.SUCCEEDED
-    assert replay[0].result == first[0].result
-    assert (vault / "note.md").read_bytes() == b"before\nafter\n"
-    assert len(transaction_approval.requests) == 1
-    diff_id = transaction_approval.requests[0].diff_artifact_ids[0]
-    diff = b"".join([chunk async for chunk in artifacts.read(diff_id)])
-    assert b"--- a/note.md" in diff and b"+after" in diff
-
-    async with authority.pipe_registration():
-        pipe_count[0] = 1
-    after = (vault / "note.md").read_bytes()
-    blocked = await kernel.execute_batch(
-        (
-            _call(
-                content_hash(after),
-                call_id="call_headless_after_pipe",
-                idempotency_key="idem_headless_after_pipe",
-            ),
-        ),
-        ManualCancellationToken(),
-    )
-    assert blocked[0].result.status is ToolResultStatus.CONFLICTED
-    assert blocked[0].result.error is not None
-    assert blocked[0].result.error.code == "preflight_conflict"
-    assert blocked[0].result.error.details["reason"] == "headless_authority_invalid"
-    assert (vault / "note.md").read_bytes() == after

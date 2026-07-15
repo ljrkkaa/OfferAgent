@@ -1,14 +1,12 @@
 # OfferAgent for Obsidian
 
 这是 OfferAgent Windows 本地 Runtime 的桌面端 Obsidian 客户端。插件负责安装和连接签名的
-Host/Worker、提供 Obsidian Context/Client Tools，并渲染同一 Worker 的 Session、Run、工具、
+Host/Worker，并渲染同一 Worker 的 Session、Run、工具、
 审批与诊断事件。
 
 插件不连接 OfferAgent/Khoj Server，不上传或同步 Vault 内容，也不实现第二套 Agent Loop。
-Client Tool 对 Vault 写入仅提供活动编辑器、预览证明和同 Pipe 的提交后只读观察；磁盘
-create/append/patch/rename/trash 全部由 Worker 的单一原子事务协调器执行。Worker 在插件确认
-编辑器仍关闭且磁盘 after-hash 精确匹配前保留回滚能力，断连或状态漂移会回滚。受影响文件仍
-打开或未保存时会明确冲突并要求先保存、关闭后重新审批，插件不会用编辑器 debounce 冒充持久化成功。
+磁盘 create/append/patch/rename/trash 全部由 Worker 的单一原子事务协调器执行。插件不注册文件
+执行器、不代理工具调用，也不保存另一份调用状态；它只发送命令并消费 Worker 的可重放事件。
 生产 IPC 使用当前 Windows SID 专属 Named Pipe；“打开本地 Web”只访问同一 Worker 绑定的
 随机 Loopback 端口。模型 Provider URL 仅属于用户选择的推理边界，本地模型可完全断网运行。
 
@@ -40,6 +38,6 @@ corepack yarn build
 封闭 schema 重写数据，旧 Server URL、API key 与同步字段不会进入新配置。
 
 `npm run protocol:generate` 会从 Harness 的权威 JSON Schema 同时生成协议身份以及完整的
-TypeScript DTO、Command/Event/ReverseRequest 映射。`HarnessClient` 和 `EventReducer` 直接使用
+TypeScript DTO、Command/Event 映射。`HarnessClient` 和 `EventReducer` 直接使用
 这份生成映射；不要在插件中另写同名 wire DTO。生成器会复验 Schema 字节哈希，测试会比较完整
 method/event 目录，Schema 漂移必须先重新生成并通过 TypeScript 编译。

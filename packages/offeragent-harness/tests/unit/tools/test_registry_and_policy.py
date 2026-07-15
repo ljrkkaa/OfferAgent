@@ -34,11 +34,7 @@ from offeragent_harness.tools.registry import (
     ToolResultSensitivityUnavailable,
     ToolVersionUnavailable,
 )
-from offeragent_harness.vault import (
-    client_vault_transaction_definition,
-    legacy_vault_transaction_definition,
-    vault_transaction_definition,
-)
+from offeragent_harness.vault import vault_transaction_definition
 
 NOW = datetime(2026, 7, 12, tzinfo=timezone.utc)
 
@@ -160,32 +156,6 @@ def test_registry_rejects_required_preflight_without_registered_provider() -> No
         preflight_provider_ids=frozenset({"vault.transaction.v1"}),
     )
     assert registry.get(tool.name, tool.version) is tool
-
-
-def test_legacy_client_vault_route_is_recognizable_but_cannot_be_active() -> None:
-    local = vault_transaction_definition()
-    client = client_vault_transaction_definition()
-
-    assert client.name == local.name == "vault.transaction"
-    assert client.version == local.version
-    assert client.input_schema == local.input_schema
-    assert client.output_schema == local.output_schema
-    assert client.executor_location is ExecutorLocation.CLIENT
-    assert client.result_sensitivity is ResultSensitivity.UNKNOWN
-    assert local.result_sensitivity is ResultSensitivity.WORKSPACE
-    assert set(client.input_schema["properties"]) == {"operations"}
-    assert client.input_schema["properties"]["operations"]["maxItems"] == 1
-    legacy_local = legacy_vault_transaction_definition()
-    legacy_client = legacy_vault_transaction_definition(executor_location=ExecutorLocation.CLIENT)
-    assert legacy_local.fingerprint != local.fingerprint
-    assert legacy_client.fingerprint != client.fingerprint
-    assert legacy_local.input_schema["properties"]["operations"]["maxItems"] == 20
-    with pytest.raises(ToolResultSensitivityUnavailable):
-        ToolRegistry(
-            "snapshot_invalid_dual_route",
-            (local, client),
-            preflight_provider_ids=frozenset({"vault.transaction.v1"}),
-        )
 
 
 def test_registry_rejects_any_unknown_result_sensitivity() -> None:

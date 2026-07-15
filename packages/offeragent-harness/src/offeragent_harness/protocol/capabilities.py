@@ -17,36 +17,30 @@ from .ids import ProtocolVersion, Sha256Digest, split_protocol_version
 
 
 class CapabilityName(str, Enum):
-    CLIENT_TOOLS = "clientTools"
     EVENT_REPLAY = "eventReplay"
     MULTI_SESSION = "multiSession"
     APPROVALS = "approvals"
     SKILLS = "skills"
     SHELL = "shell"
     HOOKS = "hooks"
-    HEADLESS_VAULT_WRITE = "headlessVaultWrite"
     SUBAGENTS = "subagents"
     ARTIFACTS = "artifacts"
     LOOPBACK_WEB = "loopbackWeb"
-    REVERSE_REQUESTS = "reverseRequests"
     CONTENT_BLOCKS = "contentBlocks"
     CANCELLATION = "cancellation"
     DIAGNOSTICS = "diagnostics"
 
 
 class CapabilitySet(WireModel):
-    client_tools: bool = False
     event_replay: bool = False
     multi_session: bool = False
     approvals: bool = False
     skills: bool = False
     shell: bool = False
     hooks: bool = False
-    headless_vault_write: bool = False
     subagents: bool = False
     artifacts: bool = False
     loopback_web: bool = False
-    reverse_requests: bool = False
     content_blocks: bool = False
     cancellation: bool = False
     diagnostics: bool = False

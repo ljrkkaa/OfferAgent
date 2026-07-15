@@ -1,12 +1,7 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 
 import { EventEnvelope, ProjectionState } from "./event_reducer";
-import type {
-    ClientContextSnapshot,
-    ContentBlock,
-    NoWriteIntent,
-    VaultWriteRequiredIntent,
-} from "./generated_protocol";
+import type { ContentBlock } from "./generated_protocol";
 import { HarnessClient } from "./harness_client";
 import { JsonObject, JsonValue, requireJsonObject } from "./json_rpc";
 
@@ -39,28 +34,33 @@ export interface TurnRunConfig {
     provider: string;
     model: string;
     reasoningEffort: "minimal" | "low" | "medium" | "high" | "max";
-    permissionMode: "read-only" | "normal" | "trusted-workspace" | "plan";
-    enabledSkills: string[];
+    permissionMode: "read-only" | "normal" | "trusted-workspace" | "plan" | "bypass";
 }
 
 export interface SendTurnOptions {
-    readonly context?: ClientContextSnapshot | null;
     readonly attachments?: readonly ContentBlock[];
     readonly runConfig: TurnRunConfig;
     readonly deadline?: string | null;
-    readonly writeIntent?: SendTurnWriteIntent;
 }
-
-export type SendTurnWriteIntent =
-    | { readonly kind: "none" }
-    | { readonly kind: "vault_write_required"; readonly targetPaths: readonly string[] };
 
 export interface ChatStoreSnapshot {
     readonly tabs: readonly ChatTab[];
     readonly activeTabId: string;
     readonly projection: ProjectionState;
+    /**
+     * Transient, local submissions that have not yet been confirmed by the
+     * durable `turn.started` event.  They are keyed and reconciled by the
+     * exact Turn id; they are never persisted as conversation history.
+     */
+    readonly pendingSubmissions: readonly PendingSubmission[];
     readonly busy: boolean;
     readonly lastError: string | null;
+}
+
+export interface PendingSubmission {
+    readonly tabId: string;
+    readonly turnId: string;
+    readonly text: string;
 }
 
 interface HydratedSession {
@@ -87,6 +87,7 @@ export class ChatStore {
     private unsubscribeEvents: (() => void) | null = null;
     private readonly sessionHydrations = new Map<string, Promise<HydratedSession>>();
     private readonly sendsInFlight = new Set<string>();
+    private readonly pendingSubmissions = new Map<string, PendingSubmission>();
 
     constructor(client: HarnessClient, persistence: ChatStorePersistence) {
         this.client = client;
@@ -98,6 +99,7 @@ export class ChatStore {
             tabs: this.tabs.map((tab) => ({ ...tab })),
             activeTabId: this.activeTabId,
             projection: this.client.reducer.state,
+            pendingSubmissions: [...this.pendingSubmissions.values()].map((submission) => ({ ...submission })),
             busy: this.operationCount > 0,
             lastError: this.lastError,
         };
@@ -269,37 +271,46 @@ export class ChatStore {
         }
         this.sendsInFlight.add(tabSendKey);
         if (sessionSendKey !== null) this.sendsInFlight.add(sessionSendKey);
+        const turnId = opaqueId("turn_");
+        this.pendingSubmissions.set(turnId, { tabId, turnId, text: normalized });
         const operation = this.operation(async () => {
+            let accepted = false;
             const tab = this.tabs.find((candidate) => candidate.tabId === tabId);
-            if (!tab) throw new Error("OfferAgent tab was closed before send started");
-            const sessionId = tab.sessionId ?? await this.createSessionForTab(tabId);
-            sessionSendKey = `session:${sessionId}`;
-            this.sendsInFlight.add(sessionSendKey);
-            const turnId = opaqueId("turn_");
-            const idempotencyKey = opaqueId("turn_");
-            const input: ContentBlock[] = [{ type: "text", text: normalized }, ...(options.attachments ?? [])];
-            const result = requireJsonObject(await this.client.request("turn/start", {
-                sessionId,
-                turnId,
-                idempotencyKey,
-                input,
-                clientContext: options.context ?? null,
-                runConfig: {
-                    provider: options.runConfig.provider,
-                    model: options.runConfig.model,
-                    reasoningEffort: options.runConfig.reasoningEffort,
-                    permissionMode: options.runConfig.permissionMode,
-                    enabledSkills: [...options.runConfig.enabledSkills],
-                },
-                writeIntent: buildWriteIntent(options.writeIntent),
-                deadline: options.deadline ?? null,
-            }));
-            const runId = textField(result, "runId");
-            requireId(runId, "run_");
-            tab.selectedRunId = runId;
-            tab.draft = "";
-            await this.persistAndEmit();
-            return { turnId, runId };
+            try {
+                if (!tab) throw new Error("OfferAgent tab was closed before send started");
+                const sessionId = tab.sessionId ?? await this.createSessionForTab(tabId);
+                sessionSendKey = `session:${sessionId}`;
+                this.sendsInFlight.add(sessionSendKey);
+                const idempotencyKey = opaqueId("turn_");
+                const input: ContentBlock[] = [{ type: "text", text: normalized }, ...(options.attachments ?? [])];
+                const result = requireJsonObject(await this.client.request("turn/start", {
+                    sessionId,
+                    turnId,
+                    idempotencyKey,
+                    input,
+                    runConfig: {
+                        provider: options.runConfig.provider,
+                        model: options.runConfig.model,
+                        reasoningEffort: options.runConfig.reasoningEffort,
+                        permissionMode: options.runConfig.permissionMode,
+                    },
+                    deadline: options.deadline ?? null,
+                }));
+                const returnedTurnId = textField(result, "turnId");
+                if (returnedTurnId !== turnId) throw new Error("Worker returned a different Turn id");
+                const runId = textField(result, "runId");
+                requireId(runId, "run_");
+                accepted = true;
+                tab.selectedRunId = runId;
+                tab.draft = "";
+                await this.persistAndEmit();
+                return { turnId, runId };
+            } finally {
+                // A successful command remains visible until the exact durable
+                // event arrives.  Failed pre-acceptance attempts never become
+                // conversation history and disappear from the transient view.
+                if (!accepted) this.pendingSubmissions.delete(turnId);
+            }
         });
         return operation.finally(() => {
             this.sendsInFlight.delete(tabSendKey);
@@ -330,7 +341,6 @@ export class ChatStore {
                 model: runConfig.model,
                 reasoningEffort: runConfig.reasoningEffort,
                 permissionMode: runConfig.permissionMode,
-                enabledSkills: [...runConfig.enabledSkills],
             } : null,
         })));
     }
@@ -441,6 +451,9 @@ export class ChatStore {
     }
 
     private onEvent(event: EventEnvelope): void {
+        if (event.type === "turn.started" && event.turnId !== null) {
+            this.pendingSubmissions.delete(event.turnId);
+        }
         if (event.runId && event.sessionId && !this.sessionHydrations.has(event.sessionId)) {
             for (const tab of this.tabs) {
                 if (tab.sessionId === event.sessionId && tab.selectedRunId === null) tab.selectedRunId = event.runId;
@@ -555,63 +568,6 @@ export class ChatStore {
 
     private requireAlive(): void {
         if (this.disposed) throw new Error("ChatStore is disposed");
-    }
-}
-
-export function buildWriteIntent(
-    selection: SendTurnWriteIntent | undefined,
-): NoWriteIntent | VaultWriteRequiredIntent {
-    if (!selection || selection.kind === "none") return { kind: "none" };
-    const targetPaths = [...new Set(selection.targetPaths.map((path) => path.trim()))]
-        .filter((path) => path.length > 0)
-        .sort(compareUnicodeCodePoints);
-    if (targetPaths.length === 0 || targetPaths.length > 20) {
-        throw new RangeError("write intent requires 1..20 target Vault paths");
-    }
-    for (const path of targetPaths) requireSafeVaultPath(path);
-    const binding = { kind: "vault_write_required", targetPaths } as const;
-    const intentHash = hashVaultWriteIntentBinding(binding.targetPaths);
-    return { ...binding, intentHash };
-}
-
-export function hashVaultWriteIntentBinding(targetPaths: readonly string[]): string {
-    // The binding has a closed two-field schema.  This explicit field order is
-    // also its RFC 8785/JCS key order ("kind" before "targetPaths").
-    const canonical = JSON.stringify({ kind: "vault_write_required", targetPaths: [...targetPaths] });
-    return `sha256:${createHash("sha256").update(canonical, "utf8").digest("hex")}`;
-}
-
-function compareUnicodeCodePoints(left: string, right: string): number {
-    const leftPoints = Array.from(left, (character) => character.codePointAt(0) ?? 0);
-    const rightPoints = Array.from(right, (character) => character.codePointAt(0) ?? 0);
-    const length = Math.min(leftPoints.length, rightPoints.length);
-    for (let index = 0; index < length; index += 1) {
-        if (leftPoints[index] !== rightPoints[index]) return leftPoints[index] - rightPoints[index];
-    }
-    return leftPoints.length - rightPoints.length;
-}
-
-function requireSafeVaultPath(path: string): void {
-    const scalarLength = Array.from(path).length;
-    const hasLoneSurrogate = Array.from(path).some((character) => {
-        const point = character.codePointAt(0) ?? 0;
-        return character.length === 1 && point >= 0xd800 && point <= 0xdfff;
-    });
-    if (scalarLength > 1024 || hasLoneSurrogate || path.startsWith("/") || /[\\:\x00-\x1f<>"|?*]/u.test(path)) {
-        throw new TypeError(`unsafe write intent Vault path: ${path}`);
-    }
-    const reserved = new Set([
-        "CON", "CONIN$", "CONOUT$", "PRN", "AUX", "NUL",
-        ...Array.from("123456789¹²³", (suffix) => `COM${suffix}`),
-        ...Array.from("123456789¹²³", (suffix) => `LPT${suffix}`),
-    ]);
-    for (const component of path.split("/")) {
-        if (!component || component === "." || component === ".." || /[. ]$/u.test(component)) {
-            throw new TypeError(`unsafe write intent Vault path: ${path}`);
-        }
-        if (reserved.has(component.split(".", 1)[0].toUpperCase())) {
-            throw new TypeError(`unsafe write intent Vault path: ${path}`);
-        }
     }
 }
 

@@ -155,7 +155,6 @@ class Turn:
     created_at: datetime
     updated_at: datetime
     revision: int = 1
-    client_context: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.ordinal < 1:
@@ -168,11 +167,6 @@ class Turn:
         if any(not isinstance(block, FrozenJsonObject) for block in frozen_blocks):
             raise TypeError("turn input blocks must be JSON objects")
         object.__setattr__(self, "input_blocks", frozen_blocks)
-        if self.client_context is not None:
-            frozen_context = freeze_json(self.client_context)
-            if not isinstance(frozen_context, FrozenJsonObject):
-                raise TypeError("turn client_context must be a JSON object")
-            object.__setattr__(self, "client_context", frozen_context)
 
 
 @dataclass(frozen=True)

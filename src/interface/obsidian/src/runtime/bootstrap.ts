@@ -2,7 +2,6 @@ import { performance } from "node:perf_hooks";
 
 import { HarnessClient, HarnessCompatibilityError, InitializeResult } from "./harness_client";
 import { RemoteRpcError, RpcDisconnectedError, RpcRequestTimeoutError } from "./json_rpc";
-import { NamedPipeAuthenticationError, NamedPipeConnectionError } from "./named_pipe";
 
 export type BootstrapState =
     | "uninitialized"
@@ -30,14 +29,12 @@ export type InstallerPhase =
 
 export interface InstalledRuntime {
     readonly version: string;
-    readonly hostExecutable: string;
-    /** Bound for Host discovery, including a cold Worker start on this Runtime channel. */
-    readonly hostDiscoveryTimeoutMs: number;
+    readonly workerExecutable: string;
     readonly protocolMinimum: string;
     readonly protocolMaximum: string;
     readonly schemaHash: string;
-    /** Development builds may re-pin the complete tree at the actual spawn boundary. */
-    readonly beforeHostLaunch?: (signal?: AbortSignal) => Promise<void>;
+    /** Development builds verify the package once at the Worker spawn boundary. */
+    readonly beforeWorkerLaunch?: (signal?: AbortSignal) => Promise<void>;
 }
 
 export interface RuntimeInstaller {
@@ -333,13 +330,6 @@ function classifyBootstrapFailure(error: unknown): ClassifiedBootstrapFailure {
             retryAfterMs: null,
         };
     }
-    if (error instanceof NamedPipeAuthenticationError) {
-        return {
-            info: { code: "runtime_auth_failed", message: "本地 Runtime 身份验证失败，请运行诊断或重新安装。", actionable: true },
-            retryable: false,
-            retryAfterMs: null,
-        };
-    }
     if (error instanceof RemoteRpcError) {
         return {
             info: {
@@ -349,20 +339,6 @@ function classifyBootstrapFailure(error: unknown): ClassifiedBootstrapFailure {
             },
             retryable: error.envelope.retryable && !error.envelope.cancelled,
             retryAfterMs: error.envelope.retryAfterMs ?? null,
-        };
-    }
-    if (error instanceof NamedPipeConnectionError) {
-        return {
-            info: {
-                code: "runtime_transport_unavailable",
-                message: error.retryable
-                    ? "本地 Runtime 连接暂不可用，正在按退避策略重试。"
-                    : "本地 Runtime 连接失败，请运行诊断或重新安装。",
-                actionable: true,
-                causeCode: error.failureCode,
-            },
-            retryable: error.retryable,
-            retryAfterMs: null,
         };
     }
     if (error instanceof RpcRequestTimeoutError) {
@@ -409,8 +385,6 @@ function abortError(): Error {
 
 export {
     HarnessCompatibilityError,
-    NamedPipeAuthenticationError,
-    NamedPipeConnectionError,
     RemoteRpcError,
     RpcDisconnectedError,
     RpcRequestTimeoutError,

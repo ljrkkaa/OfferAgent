@@ -3,10 +3,6 @@
   "jsonrpc": "2.0",
   "method": "turn/start",
   "params": {
-    "clientContext": {
-      "activeFile": "raw/xxx.md",
-      "selectionRevision": 8
-    },
     "idempotencyKey": "turn_01",
     "input": [
       {
@@ -20,13 +16,6 @@
       "reasoningEffort": "high"
     },
     "sessionId": "ses_01",
-    "turnId": "turn_01",
-    "writeIntent": {
-      "intentHash": "sha256:df5c0fa89bf1611a1d7fb2ee017c9229988bce820365dc72e15154b7c60abef7",
-      "kind": "vault_write_required",
-      "targetPaths": [
-        "raw/xxx.md"
-      ]
-    }
+    "turnId": "turn_01"
   }
 }

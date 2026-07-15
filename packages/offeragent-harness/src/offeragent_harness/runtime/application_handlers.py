@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -66,7 +65,6 @@ from offeragent_harness.protocol.messages import (
 )
 from offeragent_harness.subagents.models import AgentCancelCommand, AgentUsage, SubagentRunStatus
 from offeragent_harness.subagents.service import SubagentService
-from offeragent_harness.tools import canonical_json_sha256
 
 from .application_dispatcher import ApplicationCommandHandler, CommandHandlerConfigurationError
 from .config_service import ConfigService
@@ -112,24 +110,9 @@ class ApplicationRuntimeIdentity:
 
 @dataclass(frozen=True, slots=True)
 class RunTransportRoute:
-    """Immutable Vault-write authority selected from authenticated transport facts."""
+    """Permission mode accepted for an authenticated local Runtime client."""
 
     permission_mode: PermissionMode
-    client_connection_id: str | None = None
-    local_vault_write_grant_id: str | None = None
-
-    def __post_init__(self) -> None:
-        write_capable = self.permission_mode not in {PermissionMode.READ_ONLY, PermissionMode.PLAN}
-        authorities = int(self.client_connection_id is not None) + int(self.local_vault_write_grant_id is not None)
-        if write_capable and authorities != 1:
-            raise ValueError("write-capable Run route requires exactly one Vault authority")
-        if not write_capable and authorities:
-            raise ValueError("read-only/plan Run route cannot retain Vault-write authority")
-        if (
-            self.local_vault_write_grant_id is not None
-            and re.fullmatch(r"hgrant_[0-9a-f]{64}", self.local_vault_write_grant_id) is None
-        ):
-            raise ValueError("local Vault write grant identity is invalid")
 
 
 class ApplicationTransportPolicy(Protocol):
@@ -139,9 +122,6 @@ class ApplicationTransportPolicy(Protocol):
         self,
         context: ApplicationCommandContext,
         requested_permission: PermissionMode,
-        *,
-        request_hash: str,
-        headless_eligible: bool,
     ) -> RunTransportRoute: ...
 
 
@@ -322,23 +302,20 @@ def conversation_control_handlers(
             run_config = validate_wire(RunConfigSnapshot, thaw_json(source_run.config_snapshot))
         if run_config.provider != snapshot.config.model.provider.value:
             raise ValueError("Run provider differs from the effective persisted configuration")
-        if run_config.permission_mode is PermissionMode.BYPASS:
-            raise ValueError("bypass permission cannot be self-granted by an application command")
+        if run_config.permission_mode is PermissionMode.BYPASS and not snapshot.config.policy.allow_bypass:
+            raise ValueError("bypass permission is disabled by the persisted Workspace policy")
         effective_mode = run_config.permission_mode
         if snapshot.config.policy.read_only or not snapshot.config.policy.workspace_trusted:
             effective_mode = PermissionMode.READ_ONLY
         route = await transport_policy.resolve_run_route(
             context,
             effective_mode,
-            request_hash=canonical_json_sha256(params.to_wire()),
-            headless_eligible=False,
         )
         run_config = run_config.model_copy(
             update={
                 "provider": snapshot.config.model.provider.value,
                 "model": snapshot.config.model.model or run_config.model,
                 "permission_mode": route.permission_mode,
-                "enabled_skills": (run_config.enabled_skills if snapshot.config.extensibility.skills_enabled else []),
             }
         )
         receipt = await harness.retry_turn(
@@ -349,7 +326,6 @@ def conversation_control_handlers(
                 source_run_id=params.source_run_id,
                 idempotency_key=params.idempotency_key,
                 run_config=run_config.to_wire(),
-                client_connection_id=route.client_connection_id,
                 effective_config=snapshot.config,
                 effective_config_fingerprint=snapshot.fingerprint,
             )

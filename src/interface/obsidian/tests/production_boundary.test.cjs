@@ -88,7 +88,7 @@ test("chat history delegates Session hydration and replay to the single ChatStor
     const main = await readFile(path.join(__dirname, "../src/main.ts"), "utf8");
     const view = await readFile(path.join(__dirname, "../src/local/chat_view.ts"), "utf8");
     const store = await readFile(path.join(__dirname, "../src/runtime/chat_store.ts"), "utf8");
-    const ensureStore = main.slice(main.indexOf("async ensureChatStore"), main.indexOf("async captureClientContext"));
+    const ensureStore = main.slice(main.indexOf("async ensureChatStore"), main.indexOf("async readArtifactText"));
 
     assert.match(view, /openSession\(session\.sessionId\)/);
     assert.doesNotMatch(view, /createTab\(session\.sessionId/);
@@ -125,6 +125,11 @@ test("workspace trust is an independent explicit confirmation and never follows 
     assert.match(settings, /尚未信任：当前有效权限为只读/);
 });
 
+test("bypass mode is rendered explicitly and cannot be mistaken for planning", async () => {
+    const view = await readFile(path.join(__dirname, "../src/local/chat_view.ts"), "utf8");
+    assert.match(view, /mode === "bypass"\) return "免审批执行"/);
+});
+
 test("model settings apply is serialized, generation-checked, and credential metadata is endpoint-bound", async () => {
     const main = await readFile(path.join(__dirname, "../src/main.ts"), "utf8");
     const apply = main.slice(
@@ -159,19 +164,13 @@ test("Subagent protocol support is structural while execution remains configurat
     assert.equal(main.includes("Object.keys(CLIENT_CAPABILITIES)"), false);
 });
 
-test("Obsidian exposes only Pipe-authoritative headless status and explicit revoke", async () => {
+test("Obsidian contains no plugin-owned Vault execution authority", async () => {
     const harness = await readFile(path.join(__dirname, "../src/runtime/harness_client.ts"), "utf8");
     const main = await readFile(path.join(__dirname, "../src/main.ts"), "utf8");
     const settings = await readFile(path.join(__dirname, "../src/local/settings.ts"), "utf8");
-    const headlessMethods = [...main.matchAll(/"(vault\/headless\/[a-z-]+)"/g)].map((match) => match[1]).sort();
-
-    assert.match(harness, /headlessVaultWrite:\s*true/);
-    assert.deepEqual(headlessMethods, ["vault/headless/revoke", "vault/headless/status"]);
-    assert.equal(main.includes("vault/headless/request"), false);
-    assert.equal(main.includes("vault/headless/activate"), false);
-    assert.match(settings, /Pipe\/Client Tool 权威/);
-    assert.match(settings, /Web 授权已动态撤销/);
-    assert.match(settings, /status\?\.canRevoke/);
+    for (const source of [harness, main, settings]) {
+        assert.doesNotMatch(source, /headlessVaultWrite|vault\/headless|client\/tool|ClientReverseHandlers/);
+    }
 });
 
 test("configuration restart drains client ACK windows and unload aborts before awaiting lifecycle work", async () => {

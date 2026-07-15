@@ -455,13 +455,12 @@ def test_release_and_inno_outputs_are_parameterized_for_x64_and_arm64() -> None:
     assert "OfferAgent-for-Obsidian-Setup-{#RuntimeArchitecture}" in inno_source
 
 
-def test_pyinstaller_environment_drops_ambient_toolchain_path(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pyinstaller_environment_rebuilds_path_from_the_active_interpreter(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PATH", r"E:\miniconda;E:\untrusted-tools")
     monkeypatch.setenv("CONDA_PREFIX", r"E:\miniconda")
     monkeypatch.setenv("_CONDA_EXE", r"E:\miniconda\Scripts\conda.exe")
     environment = pyinstaller_environment()
 
-    assert "miniconda" not in environment["PATH"].casefold()
     assert "untrusted-tools" not in environment["PATH"].casefold()
     assert "CONDA_PREFIX" not in environment
     assert "_CONDA_EXE" not in environment

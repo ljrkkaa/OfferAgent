@@ -16,10 +16,11 @@ from offeragent_harness.adapters.sqlite_stores import SqliteUnitOfWork, SqliteUn
 from offeragent_harness.agent import RunBudget
 from offeragent_harness.agent.composer import CompositionEvent
 from offeragent_harness.agent.loop import ToolExecution, ToolKernel
-from offeragent_harness.agent.planner import Planner, PlanningStep
+from offeragent_harness.agent.planner import Planner, PlanningAttempt, PlanningAttemptOutcome, PlanningStep
 from offeragent_harness.agent.state import PendingWork, RunPhase, RunState
 from offeragent_harness.config import HarnessConfig
 from offeragent_harness.hooks import HookDecision, HookEvent
+from offeragent_harness.models import ModelUsage
 from offeragent_harness.permissions import (
     ApprovalBinding,
     ApprovalGrantState,
@@ -297,7 +298,6 @@ async def _seed_dangerous_active_run(
     *,
     session_id: str,
     phase: RunPhase,
-    pending_client_invocation: bool,
     turn_id: str = "turn_effectful",
     run_id: str = "run_effectful",
 ) -> None:
@@ -339,18 +339,13 @@ async def _seed_dangerous_active_run(
             lineage=lineage,
             phase=phase,
             revision=5,
-            pending=(
-                PendingWork(client_invocation_ids=frozenset({"inv_unknown"}))
-                if pending_client_invocation
-                else PendingWork()
-            ),
+            pending=PendingWork(),
         )
         record = make_domain_event_record(
             event_type=EventType.TURN_STARTED,
             payload={
                 "input": [{"type": "text", "text": "execute"}],
                 "runConfig": {"model": "fake"},
-                "clientContext": None,
                 "attempt": 1,
             },
             trace_id="trace_effectful",
@@ -819,6 +814,14 @@ class _HistoricalEffectPlanner:
                 ),
                 True,
                 None,
+                attempts=(
+                    PlanningAttempt(
+                        request_id=f"test-historical-{state.model_rounds + 1}",
+                        repair_index=0,
+                        outcome=PlanningAttemptOutcome.SUCCEEDED,
+                        usage=ModelUsage(0, 0, 0, 0),
+                    ),
+                ),
             )
         self.entered.set()
         await cancellation.wait()
@@ -858,7 +861,7 @@ class _HistoricalEffectKernel:
             error=None,
         )
         execution = ToolExecution(call, _historical_write_definition(), result)
-        await observer.execution_started()
+        await observer.execution_started(call, execution.definition)
         await observer.result_available(call, execution.definition, result)
         return (execution,)
 
@@ -1007,21 +1010,11 @@ async def test_soft_delete_cancels_planning_run_with_historical_committed_write(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("phase", "pending_client_invocation"),
-    [
-        (RunPhase.EXECUTING_TOOLS, False),
-        (RunPhase.PLANNING, True),
-    ],
-)
 async def test_soft_delete_refuses_unconfirmed_effect_window_without_cancelling_it(
     tmp_path: Path,
-    phase: RunPhase,
-    pending_client_invocation: bool,
 ) -> None:
-    factory = SqliteUnitOfWorkFactory(
-        tmp_path / f"session-delete-danger-{phase.value}-{pending_client_invocation}.sqlite"
-    )
+    phase = RunPhase.EXECUTING_TOOLS
+    factory = SqliteUnitOfWorkFactory(tmp_path / f"session-delete-danger-{phase.value}.sqlite")
     manager = TurnManager()
     service = _service(factory, manager=manager)
     session_id = await _create(service, "effectful")
@@ -1029,7 +1022,6 @@ async def test_soft_delete_refuses_unconfirmed_effect_window_without_cancelling_
         factory,
         session_id=session_id,
         phase=phase,
-        pending_client_invocation=pending_client_invocation,
     )
 
     async def wait_for_cleanup(cancellation):  # type: ignore[no-untyped-def]
@@ -1047,7 +1039,7 @@ async def test_soft_delete_refuses_unconfirmed_effect_window_without_cancelling_
                 session_id,
                 "turn_effectful",
                 2,
-                f"fork-danger-{phase.value}-{pending_client_invocation}",
+                f"fork-danger-{phase.value}",
                 fork_run_id="run_effectful",
             )
         )

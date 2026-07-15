@@ -84,7 +84,7 @@
 1. Obsidian 加载安装包后，插件实际诊断显示 `ready`、协议 1.0、上述 Schema hash、索引 ready。
 2. 本地 Web 只能用插件 Pipe 签发的一次性 fragment 启动；直接访问根地址会 fail closed。
 3. 一次性令牌交换后 fragment 被清除，页面显示同一 Worker PID；Obsidian 在线时，Web 明确只把
-   Vault 写入交给唯一 Named Pipe Client Tool。
+   Vault 写入交给 Worker Tool Kernel 中唯一的本地 `vault.transaction` 执行器。
 4. Web 创建的空 Session 已持久化到 SQLite；关闭页面、从新的插件启动链接重开以及完整
    Obsidian/Host/Worker 冷启动后，均恢复同一“0 轮”Session。
 5. 真实 Vault 只读验证前后没有内容或 mtime 变化；本轮没有写入任何已有笔记。

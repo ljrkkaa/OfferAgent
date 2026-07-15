@@ -26,7 +26,7 @@ function responses() {
             workspaceId: "ws_test", revision: 2, snapshotHash: HASH_A, diagnostics: [],
             skills: [{
                 rootId: "user", packagePath: "review-helper", layer: "user", name: "review-helper",
-                description: "Review", metadataHash: HASH_A, trustState: "confirmed", enabled: true,
+                description: "Review", metadataHash: HASH_A,
                 allowedTools: [],
             }],
         },

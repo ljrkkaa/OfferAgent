@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -12,12 +11,10 @@ from offeragent_harness.config import HarnessConfig
 from offeragent_harness.hooks import HookLayer, HookScope
 from offeragent_harness.hooks.state import EntityHookConfigurationStore, HookConfigurationService
 from offeragent_harness.ports import ApplicationCommandContext
-from offeragent_harness.ports.skills import SkillTrustVerificationRequest, SkillTrustVerificationResult
 from offeragent_harness.protocol.messages import (
     HooksMutationResult,
     ShellListResult,
     ShellMutationResult,
-    SkillsConfirmTrustParams,
     validate_command_params,
 )
 from offeragent_harness.runtime.extension_management_application_handlers import (
@@ -31,12 +28,9 @@ from offeragent_harness.runtime.process_supervisor import (
 from offeragent_harness.runtime.production_skills import ProductionSkillBundleFactory
 from offeragent_harness.shell.state import EntityShellProfileStateStore, ShellProfileService
 from offeragent_harness.testing import (
-    DeterministicIdGenerator,
     InMemoryUnitOfWorkFactory,
     ManualCancellationToken,
-    ManualClock,
 )
-from offeragent_harness.tools import canonical_json_sha256
 
 WORKSPACE_ID = "ws_extension_admin"
 PROFILE_ID = "profile_local"
@@ -68,12 +62,6 @@ class _RevokingConfig(_Config):
 class _Skills:
     async def catalog_for_management(self, **_: object) -> object:
         raise AssertionError("Skill catalog is not used by this test")
-
-
-class _Verifier:
-    async def verify(self, request: SkillTrustVerificationRequest) -> SkillTrustVerificationResult:
-        del request
-        return SkillTrustVerificationResult(False, "test-verifier", None, "unsigned")
 
 
 class _Harness:
@@ -155,7 +143,7 @@ def _handlers(
     )
 
 
-def _skill_factory(tmp_path: Path, durable: InMemoryUnitOfWorkFactory) -> ProductionSkillBundleFactory:
+def _skill_factory(tmp_path: Path) -> ProductionSkillBundleFactory:
     runtime = tmp_path / "skill-runtime"
     workspace = tmp_path / "skill-workspace"
     local = tmp_path / "local-app-data"
@@ -174,10 +162,6 @@ def _skill_factory(tmp_path: Path, durable: InMemoryUnitOfWorkFactory) -> Produc
         workspace_root=workspace,
         runtime_root=runtime,
         user_home=local,
-        unit_of_work=durable,
-        trust_verifier=_Verifier(),
-        clock=ManualClock(datetime(2026, 7, 13, tzinfo=timezone.utc)),
-        ids=DeterministicIdGenerator(),
     )
 
 
@@ -436,10 +420,10 @@ async def test_queued_mutation_rechecks_workspace_authority_before_domain_write(
 
 
 @pytest.mark.asyncio
-async def test_skill_admin_lists_status_confirms_content_hash_and_replays(tmp_path: Path) -> None:
+async def test_skill_admin_lists_live_metadata_and_status(tmp_path: Path) -> None:
     durable = InMemoryUnitOfWorkFactory()
     executable, environment = _process_catalog(tmp_path)
-    skills = _skill_factory(tmp_path, durable)
+    skills = _skill_factory(tmp_path)
     handlers = _handlers(durable, executable, environment, skills=skills)
     cancellation = ManualCancellationToken()
 
@@ -451,130 +435,11 @@ async def test_skill_admin_lists_status_confirms_content_hash_and_replays(tmp_pa
     assert len(listed.skills) == 1
     skill = listed.skills[0]
     assert skill.name == "review-helper"
-    assert skill.trust_state == "confirmation_required"
+    assert skill.layer == "user"
     status = await handlers["skills/status"](
         validate_command_params("skills/status", {}),
         cancellation,
         ApplicationCommandContext(transport="loopback-http"),
     )
     assert status.status.revision == listed.revision
-
-    params = validate_command_params(
-        "skills/confirm-trust",
-        {
-            "clientRequestId": "req_skill_confirm",
-            "rootId": skill.root_id,
-            "packagePath": skill.package_path,
-            "expectedMetadataHash": skill.metadata_hash,
-            "expectedRevision": listed.revision,
-            "confirmed": True,
-        },
-    )
-    with pytest.raises(PermissionError, match="authenticated plugin Pipe"):
-        await handlers["skills/confirm-trust"](
-            params,
-            cancellation,
-            ApplicationCommandContext(transport="loopback-http"),
-        )
-    confirmed = await handlers["skills/confirm-trust"](
-        params,
-        cancellation,
-        ApplicationCommandContext(),
-    )
-    assert confirmed.status.enabled_count == 1
-    assert (
-        await handlers["skills/confirm-trust"](
-            params,
-            cancellation,
-            ApplicationCommandContext(),
-        )
-        == confirmed
-    )
-
-    rescan_params = validate_command_params(
-        "skills/rescan",
-        {
-            "clientRequestId": "req_skill_rescan",
-            "expectedRevision": confirmed.status.revision,
-        },
-    )
-    rescanned = await handlers["skills/rescan"](
-        rescan_params,
-        cancellation,
-        ApplicationCommandContext(),
-    )
-    assert rescanned.applied is False
-    assert rescanned.status.revision == confirmed.status.revision
-    assert (
-        await handlers["skills/rescan"](
-            rescan_params,
-            cancellation,
-            ApplicationCommandContext(),
-        )
-        == rescanned
-    )
-
-
-@pytest.mark.asyncio
-async def test_skill_confirmation_recovers_when_effect_committed_before_receipt(tmp_path: Path) -> None:
-    durable = InMemoryUnitOfWorkFactory()
-    executable, environment = _process_catalog(tmp_path)
-    skills = _skill_factory(tmp_path, durable)
-    handlers = _handlers(durable, executable, environment, skills=skills)
-    cancellation = ManualCancellationToken()
-    listed = await handlers["skills/list"](
-        validate_command_params("skills/list", {}),
-        cancellation,
-        ApplicationCommandContext(transport="loopback-http"),
-    )
-    skill = listed.skills[0]
-    params = validate_command_params(
-        "skills/confirm-trust",
-        {
-            "clientRequestId": "req_skill_ack_loss",
-            "rootId": skill.root_id,
-            "packagePath": skill.package_path,
-            "expectedMetadataHash": skill.metadata_hash,
-            "expectedRevision": listed.revision,
-            "confirmed": True,
-        },
-    )
-    assert isinstance(params, SkillsConfirmTrustParams)
-    catalog = await skills.catalog_for_management(
-        workspace_trusted=True,
-        cancellation=cancellation,
-    )
-    committed = await catalog.confirm_trust(
-        root_id=skill.root_id,
-        package_path=skill.package_path,
-        expected_metadata_hash=skill.metadata_hash,
-        expected_revision=listed.revision,
-        confirmed=True,
-        cancellation=cancellation,
-    )
-    assert committed.snapshot.revision == listed.revision + 1
-
-    method = "skills/confirm-trust"
-    request_id = params.client_request_id
-    request_hash = canonical_json_sha256({"method": method, "params": params.to_wire()})
-    entity_id = "extension-admin-" + hashlib.sha256(f"{WORKSPACE_ID}\0{request_id}".encode()).hexdigest()
-    async with durable.begin() as unit_of_work:
-        await unit_of_work.entities.put(
-            "extension_management_receipts",
-            entity_id,
-            {
-                "schemaVersion": 1,
-                "workspaceId": WORKSPACE_ID,
-                "clientRequestId": request_id,
-                "method": method,
-                "requestHash": request_hash,
-                "state": "pending",
-                "result": None,
-            },
-            expected_revision=0,
-        )
-        await unit_of_work.commit()
-
-    recovered = await handlers[method](params, cancellation, ApplicationCommandContext())
-    assert recovered.applied is True
-    assert recovered.status.revision == committed.snapshot.revision
+    assert status.status.discovered_count == status.status.enabled_count == 1

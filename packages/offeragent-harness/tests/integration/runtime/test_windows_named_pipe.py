@@ -12,7 +12,7 @@ from typing import Any, cast
 import pytest
 
 from offeragent_harness.ports import CancellationToken
-from offeragent_harness.protocol.messages import ClientToolInvokeResult, InitializeResult, RuntimePingResult
+from offeragent_harness.protocol.messages import InitializeResult, RuntimePingResult
 from offeragent_harness.protocol.schemas import build_examples
 from offeragent_harness.runtime.named_pipe import (
     ConnectionRole,
@@ -59,9 +59,7 @@ class ClientDispatcher:
 
     async def dispatch(self, method, params, cancellation, *, context=None):
         del context
-        if method == "client/tool/invoke":
-            return build_examples()["client-tool-invoke.response.json"]["result"]
-        raise AssertionError("unexpected reverse method")
+        raise AssertionError("the Worker must not send commands to its UI client")
 
 
 async def main():
@@ -70,7 +68,13 @@ async def main():
     material = store.load(now=datetime.now(timezone.utc))
     stream = await connect_windows_named_pipe(material.pipe_name)
     await authenticate_client_stream(stream, material, now=lambda: datetime.now(timezone.utc))
-    connection = DuplexJsonRpcConnection(stream, role=ConnectionRole.CLIENT, dispatcher=ClientDispatcher())
+    connection = DuplexJsonRpcConnection(
+        stream,
+        role=ConnectionRole.CLIENT,
+        dispatcher=ClientDispatcher(),
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
+    )
     await connection.start()
     examples = build_examples()
     initialized = await connection.request("initialize", examples["initialize.request.json"]["params"])
@@ -91,7 +95,6 @@ class RuntimeDispatcher:
     def __init__(self) -> None:
         examples = build_examples()
         self.initialize_result = cast(dict[str, Any], examples["initialize.response.json"]["result"])
-        self.client_tool_result = cast(dict[str, Any], examples["client-tool-invoke.response.json"]["result"])
         self.calls: list[str] = []
 
     def require_ready(self) -> None:
@@ -116,8 +119,6 @@ class RuntimeDispatcher:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "workerPid": os.getpid(),
             }
-        if method == "client/tool/invoke":
-            return self.client_tool_result
         raise AssertionError(f"unexpected method: {method}")
 
 
@@ -183,11 +184,15 @@ async def test_real_pipe_dpapi_dacl_flags_identity_handshake_and_full_duplex(tmp
         server_stream,
         role=ConnectionRole.SERVER,
         dispatcher=server_dispatcher,
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
     )
     client = DuplexJsonRpcConnection(
         client_stream,
         role=ConnectionRole.CLIENT,
         dispatcher=client_dispatcher,
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
     )
     await asyncio.gather(server.start(), client.start())
     examples = build_examples()
@@ -197,19 +202,11 @@ async def test_real_pipe_dpapi_dacl_flags_identity_handshake_and_full_duplex(tmp
             cast(dict[str, Any], examples["initialize.request.json"]["params"]),
         )
         assert isinstance(initialized, InitializeResult)
-        pong, reverse = await asyncio.gather(
-            client.request("runtime/ping", {"nonce": "req_real_pipe"}),
-            server.request(
-                "client/tool/invoke",
-                cast(dict[str, Any], examples["client-tool-invoke.request.json"]["params"]),
-            ),
-        )
+        pong = await client.request("runtime/ping", {"nonce": "req_real_pipe"})
         assert isinstance(pong, RuntimePingResult)
         assert pong.nonce == "req_real_pipe"
-        assert isinstance(reverse, ClientToolInvokeResult)
-        assert reverse.status.value == "succeeded"
         assert server_dispatcher.calls == ["initialize", "runtime/ping"]
-        assert client_dispatcher.calls == ["client/tool/invoke"]
+        assert client_dispatcher.calls == []
     finally:
         await asyncio.gather(client.close(), server.close())
         await listener.close()
@@ -335,6 +332,8 @@ async def test_real_two_process_pipe_uses_discovery_path_only_and_validates_chil
         server_stream,
         role=ConnectionRole.SERVER,
         dispatcher=dispatcher,
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
     )
     await connection.start()
     stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=20)

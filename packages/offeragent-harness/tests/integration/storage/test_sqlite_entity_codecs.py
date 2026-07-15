@@ -15,16 +15,16 @@ from offeragent_harness.adapters.sqlite_stores import SqliteEntityStore, SqliteU
 from offeragent_harness.agent import RunBudget
 from offeragent_harness.agent.composer import CompositionEvent
 from offeragent_harness.agent.loop import ToolExecution
-from offeragent_harness.agent.planner import Planner, PlanningStep
+from offeragent_harness.agent.planner import Planner, PlanningAttempt, PlanningAttemptOutcome, PlanningStep
 from offeragent_harness.agent.state import (
     PendingWork,
     RunPhase,
     RunState,
-    VaultWriteIntentBinding,
     WriteObligation,
     WriteOutcome,
 )
-from offeragent_harness.foundation import canonical_json_sha256, vault_write_intent_hash
+from offeragent_harness.foundation import canonical_json_sha256
+from offeragent_harness.models import ModelUsage
 from offeragent_harness.permissions import (
     ApprovalBinding,
     ApprovalRequest,
@@ -178,7 +178,6 @@ async def test_registered_domain_entities_round_trip_exactly_after_reopen(tmp_pa
             tool_call_ids=frozenset({"call_2"}),
             tool_calls=(pending_call,),
             approval_ids=frozenset({"approval_1"}),
-            client_invocation_ids=frozenset({"client_1"}),
             child_run_ids=frozenset({"child_1"}),
         ),
         write_obligation=WriteObligation(
@@ -189,13 +188,7 @@ async def test_registered_domain_entities_round_trip_exactly_after_reopen(tmp_pa
                     "call_1",
                     ToolResultStatus.SUCCEEDED,
                     "已写入",
-                    ("notes/result.md",),
                 ),
-            ),
-            intent=VaultWriteIntentBinding(
-                request_hash="sha256:" + ("1" * 64),
-                intent_hash=vault_write_intent_hash(("notes/result.md",)),
-                target_paths=("notes/result.md",),
             ),
         ),
         tool_results=(_tool_result(),),
@@ -361,7 +354,19 @@ async def test_entity_listing_has_stable_bounded_id_pagination(tmp_path: Path, b
 class _StopPlanner:
     async def plan(self, state: RunState, cancellation: CancellationToken) -> PlanningStep:
         cancellation.checkpoint()
-        return PlanningStep((), False, "done")
+        return PlanningStep(
+            (),
+            False,
+            "done",
+            attempts=(
+                PlanningAttempt(
+                    request_id=f"test-storage-{state.model_rounds + 1}",
+                    repair_index=0,
+                    outcome=PlanningAttemptOutcome.SUCCEEDED,
+                    usage=ModelUsage(0, 0, 0, 0),
+                ),
+            ),
+        )
 
 
 class _Composer:

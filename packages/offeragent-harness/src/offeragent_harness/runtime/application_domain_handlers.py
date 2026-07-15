@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, cast
 
-from offeragent_harness.agent.state import VaultWriteIntentBinding
 from offeragent_harness.config import ConfigPatch
 from offeragent_harness.config import ConfigScope as DomainConfigScope
 from offeragent_harness.hooks import HookDecision, HookEvent
@@ -73,7 +72,6 @@ from offeragent_harness.protocol.messages import (
     TurnGetResult,
     TurnStartParams,
     TurnStartResult,
-    VaultWriteRequiredIntent,
 )
 from offeragent_harness.subagents.service import SubagentService
 from offeragent_harness.tools import canonical_json_sha256
@@ -164,14 +162,6 @@ class ConversationProjectionService(Protocol):
     async def active_run_ids(self) -> tuple[str, ...]: ...
 
 
-class AdministrativeApprovalResolver(Protocol):
-    async def try_resolve(
-        self,
-        params: ApprovalResolveParams,
-        context: ApplicationCommandContext,
-    ) -> ApprovalResolveResult | None: ...
-
-
 def compose_domain_command_handlers(
     *,
     identity: DomainCommandIdentity,
@@ -191,8 +181,6 @@ def compose_domain_command_handlers(
     diagnostics_owner_runs: DiagnosticsOwnerRunAuthorizer,
     gateway_provider: Callable[[], LoopbackWebGateway | None],
     transport_policy: ApplicationTransportPolicy,
-    administrative_approvals: AdministrativeApprovalResolver,
-    headless_vault_write_handlers: Mapping[str, ApplicationCommandHandler],
     extension_management_handlers: Mapping[str, ApplicationCommandHandler],
 ) -> Mapping[str, ApplicationCommandHandler]:
     """Return every non-identity command exactly once or fail composition."""
@@ -207,7 +195,6 @@ def compose_domain_command_handlers(
 
     add(_config_handlers(identity=identity, config=config, activation=config_activation))
     add(extension_management_handlers)
-    add(headless_vault_write_handlers)
     add(_model_handlers(models=models))
     add(
         _session_handlers(
@@ -230,7 +217,6 @@ def compose_domain_command_handlers(
         _approval_handlers(
             identity=identity,
             approvals=harness.approvals,
-            administrative_approvals=administrative_approvals,
             clock=clock,
         )
     )
@@ -530,7 +516,6 @@ def _turn_handlers(
     async def start(raw: WireModel, cancellation: CancellationToken, context: ApplicationCommandContext) -> WireModel:
         cancellation.checkpoint()
         params = cast(TurnStartParams, raw)
-        transport_request_hash = canonical_json_sha256(params.to_wire())
         snapshot = await config.snapshot(
             managed_owner_id=identity.managed_owner_id,
             profile_id=identity.profile_id,
@@ -540,8 +525,8 @@ def _turn_handlers(
         if params.run_config.provider != snapshot.config.model.provider.value:
             raise ValueError("Run provider differs from the effective persisted configuration")
         requested_mode = params.run_config.permission_mode
-        if requested_mode is PermissionMode.BYPASS:
-            raise PermissionError("bypass permission cannot be self-granted by an application command")
+        if requested_mode is PermissionMode.BYPASS and not snapshot.config.policy.allow_bypass:
+            raise PermissionError("bypass permission is disabled by the persisted Workspace policy")
         effective_mode = requested_mode
         # PLAN is itself a fail-closed read surface and must remain visible to
         # the Agent.  Every other non-read mode is reduced to READ_ONLY until
@@ -554,17 +539,12 @@ def _turn_handlers(
         route = await transport_policy.resolve_run_route(
             context,
             effective_mode,
-            request_hash=transport_request_hash,
-            headless_eligible=True,
         )
         run_config = params.run_config.model_copy(
             update={
                 "provider": snapshot.config.model.provider.value,
                 "model": snapshot.config.model.model or params.run_config.model,
                 "permission_mode": route.permission_mode,
-                "enabled_skills": (
-                    params.run_config.enabled_skills if snapshot.config.extensibility.skills_enabled else []
-                ),
             }
         )
         receipt = await harness.start_turn(
@@ -575,21 +555,9 @@ def _turn_handlers(
                 idempotency_key=params.idempotency_key,
                 input_blocks=tuple(item.to_wire() for item in params.input),
                 run_config=run_config.to_wire(),
-                client_context=None if params.client_context is None else params.client_context.to_wire(),
-                client_connection_id=route.client_connection_id,
-                local_vault_write_grant_id=route.local_vault_write_grant_id,
                 effective_config=snapshot.config,
                 effective_config_fingerprint=snapshot.fingerprint,
                 deadline_at=None if params.deadline is None else _timestamp(params.deadline),
-                write_intent=(
-                    VaultWriteIntentBinding(
-                        request_hash=transport_request_hash,
-                        intent_hash=params.write_intent.intent_hash,
-                        target_paths=tuple(params.write_intent.target_paths),
-                    )
-                    if isinstance(params.write_intent, VaultWriteRequiredIntent)
-                    else None
-                ),
             )
         )
         return TurnStartResult(
@@ -628,7 +596,6 @@ def _approval_handlers(
     *,
     identity: DomainCommandIdentity,
     approvals: ApprovalManager,
-    administrative_approvals: AdministrativeApprovalResolver,
     clock: Clock,
 ) -> Mapping[str, ApplicationCommandHandler]:
     async def resolve(raw: WireModel, cancellation: CancellationToken, context: ApplicationCommandContext) -> WireModel:
@@ -636,10 +603,7 @@ def _approval_handlers(
         params = cast(ApprovalResolveParams, raw)
         record = await approvals.get(params.approval_id)
         if record is None:
-            administrative = await administrative_approvals.try_resolve(params, context)
-            if administrative is None:
-                raise ApprovalNotFound(params.approval_id)
-            return administrative
+            raise ApprovalNotFound(params.approval_id)
         if record.request.binding.args_hash != params.expected_args_hash:
             raise ValueError("approval args hash no longer matches the presented request")
         state, scope = _approval_intent(params)
@@ -661,7 +625,6 @@ def _approval_handlers(
                 "approvalId": params.approval_id,
                 "status": status,
                 "runId": record.request.binding.run_id,
-                "operationId": None,
                 "resumed": not already and result.state is ApprovalState.APPROVED,
             }
         )

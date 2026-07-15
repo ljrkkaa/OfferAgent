@@ -13,8 +13,6 @@ from pathlib import Path
 
 from pydantic.json_schema import models_json_schema
 
-from offeragent_harness.foundation import vault_write_intent_hash
-
 from ._base import WireModel
 from .content import (
     ArtifactContentBlock,
@@ -38,7 +36,7 @@ from .jsonrpc import (
     RpcCancelNotification,
     RpcCancelParams,
 )
-from .messages import ALL_METHOD_REGISTRY, CommandDirection
+from .messages import ALL_METHOD_REGISTRY
 
 PROTOCOL_VERSION = "1.0"
 SCHEMA_VERSION = "1"
@@ -122,7 +120,6 @@ def build_schema_bundle() -> dict[str, object]:
         return {"$ref": ref}
 
     commands: dict[str, object] = {}
-    reverse_requests: dict[str, object] = {}
     for method, spec in ALL_METHOD_REGISTRY.items():
         entry: dict[str, object] = {
             "params": model_ref(spec.params_model),
@@ -130,8 +127,7 @@ def build_schema_bundle() -> dict[str, object]:
         }
         if spec.required_capability is not None:
             entry["requiredCapability"] = spec.required_capability.value
-        target = commands if spec.direction == CommandDirection.CLIENT_TO_WORKER else reverse_requests
-        target[method] = entry
+        commands[method] = entry
 
     events = {
         event_type.value: {"payload": model_ref(payload_model)} for event_type, payload_model in EVENT_REGISTRY.items()
@@ -150,7 +146,6 @@ def build_schema_bundle() -> dict[str, object]:
         "protocolVersion": PROTOCOL_VERSION,
         "schemaVersion": SCHEMA_VERSION,
         "commands": commands,
-        "reverseRequests": reverse_requests,
         "events": events,
         "envelopes": {
             "request": model_ref(JsonRpcRequest),
@@ -177,8 +172,6 @@ def schema_hash() -> str:
 def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object]]:
     digest = bundle_hash or schema_hash()
     h_a = "sha256:" + "a" * 64
-    h_b = "sha256:" + "b" * 64
-    h_c = "sha256:" + "c" * 64
     return {
         "initialize.request.json": {
             "jsonrpc": "2.0",
@@ -189,10 +182,8 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
                 "clientVersion": "2.0.0",
                 "workspaceId": "ws_xxx",
                 "capabilities": {
-                    "clientTools": True,
                     "eventReplay": True,
                     "multiSession": True,
-                    "headlessVaultWrite": True,
                     "subagents": True,
                 },
             },
@@ -214,15 +205,12 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
                 "runtimeArch": "win-x64",
                 "buildCommit": "0123456789abcdef0123456789abcdef01234567",
                 "capabilities": {
-                    "clientTools": True,
                     "eventReplay": True,
                     "multiSession": True,
                     "approvals": True,
                     "shell": True,
-                    "headlessVaultWrite": True,
                     "subagents": True,
                     "artifacts": True,
-                    "reverseRequests": True,
                     "contentBlocks": True,
                     "cancellation": True,
                     "diagnostics": True,
@@ -243,19 +231,10 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
                 "turnId": "turn_01",
                 "idempotencyKey": "turn_01",
                 "input": [{"type": "text", "text": "整理当前笔记并补充相关链接"}],
-                "clientContext": {
-                    "activeFile": "raw/xxx.md",
-                    "selectionRevision": 8,
-                },
                 "runConfig": {
                     "model": "gpt-5.5",
                     "reasoningEffort": "high",
                     "permissionMode": "normal",
-                },
-                "writeIntent": {
-                    "kind": "vault_write_required",
-                    "targetPaths": ["raw/xxx.md"],
-                    "intentHash": vault_write_intent_hash(("raw/xxx.md",)),
                 },
             },
         },
@@ -308,77 +287,6 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
                 },
             },
         },
-        "client-tool-invoke.request.json": {
-            "jsonrpc": "2.0",
-            "id": "rpc_88",
-            "method": "client/tool/invoke",
-            "params": {
-                "invocationId": "inv_01",
-                "toolCallId": "call_04",
-                "runId": "run_01",
-                "name": "obsidian.vault.transaction",
-                "arguments": {"transactionId": "tx_01", "operations": []},
-                "argsHash": h_a,
-                "idempotencyKey": "inv_01",
-                "deadline": "2026-07-12T10:01:00Z",
-                "traceId": "trace_88",
-            },
-        },
-        "client-tool-invoke.response.json": {
-            "jsonrpc": "2.0",
-            "id": "rpc_88",
-            "result": {
-                "invocationId": "inv_01",
-                "toolCallId": "call_04",
-                "status": "succeeded",
-                "output": {"transactionId": "tx_01", "applied": True},
-                "userVisibleSummary": "已应用经审批的 Vault 事务。",
-                "beforeHash": h_b,
-                "afterHash": h_c,
-                "beforeState": {"workspaceRevision": 103},
-                "afterState": {"workspaceRevision": 104},
-                "workspaceRevision": 104,
-                "artifactIds": ["art_diff_01"],
-                "sourceReferenceIds": ["vault:raw/xxx.md"],
-                "sideEffectFacts": [
-                    {
-                        "kind": "file_write",
-                        "state": "committed",
-                        "resourceId": "vault:raw/xxx.md",
-                        "beforeState": {"hash": h_b},
-                        "afterState": {"hash": h_c},
-                        "metadata": {"workspaceRevision": 104},
-                    }
-                ],
-                "actualOperations": [
-                    {
-                        "operationId": "op_01",
-                        "kind": "patch",
-                        "path": "raw/xxx.md",
-                        "beforeHash": h_b,
-                        "afterHash": h_c,
-                        "applied": True,
-                        "summary": "已应用经审批的 patch。",
-                    }
-                ],
-                "error": None,
-            },
-        },
-        "client-tool-lookup.request.json": {
-            "jsonrpc": "2.0",
-            "id": "rpc_89",
-            "method": "client/tool/lookup",
-            "params": {"invocationId": "inv_01", "runId": "run_01"},
-        },
-        "client-tool-lookup.response.json": {
-            "jsonrpc": "2.0",
-            "id": "rpc_89",
-            "result": {
-                "invocationId": "inv_01",
-                "found": False,
-                "result": None,
-            },
-        },
     }
 
 
@@ -389,10 +297,6 @@ EXAMPLE_METHODS: Mapping[str, tuple[str, str]] = {
     "turn-start.request.json": ("request", "turn/start"),
     "turn-start.response.json": ("response", "turn/start"),
     "tool-completed.event.json": ("event", "event"),
-    "client-tool-invoke.request.json": ("request", "client/tool/invoke"),
-    "client-tool-invoke.response.json": ("response", "client/tool/invoke"),
-    "client-tool-lookup.request.json": ("request", "client/tool/lookup"),
-    "client-tool-lookup.response.json": ("response", "client/tool/lookup"),
 }
 
 

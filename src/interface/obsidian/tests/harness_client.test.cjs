@@ -63,7 +63,7 @@ function context() {
             schemaHash: SCHEMA_HASH,
             clientVersion: "2.1.0",
         },
-        requiredCapabilities: ["clientTools", "eventReplay", "multiSession"],
+        requiredCapabilities: ["eventReplay", "multiSession"],
     };
 }
 
@@ -78,13 +78,21 @@ function initializeResult(overrides = {}) {
         workspaceInstanceId: "wsi_01J00000000000000000000001",
         hostPid: 123,
         workerPid: 456,
-        transport: "windows-named-pipe",
+        transport: "stdio-dev",
         runtimeArch: "win-x64",
         capabilities: {
-            clientTools: true,
             eventReplay: true,
             multiSession: true,
+            approvals: true,
+            skills: true,
+            shell: true,
+            hooks: true,
             subagents: true,
+            artifacts: true,
+            loopbackWeb: true,
+            contentBlocks: true,
+            cancellation: true,
+            diagnostics: true,
         },
         buildCommit: "abcdef0123456789",
         ...overrides,
@@ -95,7 +103,7 @@ test("complete local Runtime requires structural Subagent protocol support indep
     const { CLIENT_CAPABILITIES, REQUIRED_RUNTIME_CAPABILITIES } = loadModule("harness_client.ts");
     assert.equal(CLIENT_CAPABILITIES.subagents, true);
     assert.equal(REQUIRED_RUNTIME_CAPABILITIES.includes("subagents"), true);
-    for (const required of ["clientTools", "eventReplay", "multiSession", "loopbackWeb", "diagnostics"]) {
+    for (const required of ["eventReplay", "multiSession", "loopbackWeb", "diagnostics"]) {
         assert.equal(REQUIRED_RUNTIME_CAPABILITIES.includes(required), true, `${required} must remain required`);
     }
 });
@@ -119,7 +127,7 @@ function runEvent(sequence, delta) {
     };
 }
 
-test("client performs strict initialize and serves reverse Client Tools on the same peer", async () => {
+test("client performs strict initialize and subscribes to Worker events", async () => {
     const { HarnessClient } = loadModule("harness_client.ts");
     const { JsonRpcPeer } = loadModule("json_rpc.ts");
     const [clientChannel, serverChannel] = pair();
@@ -135,19 +143,9 @@ test("client performs strict initialize and serves reverse Client Tools on the s
         timestamp: "2026-07-13T02:00:00+00:00",
         workerPid: 456,
     }));
-    const reverseCalls = [];
     const client = new HarnessClient(
         { connect: async () => clientPeer },
         context(),
-        {
-            contextGet: async (params) => { reverseCalls.push(["context", params]); return { context: {}, capturedAt: "2026-07-13T02:00:00+00:00" }; },
-            toolPreview: async (params) => { reverseCalls.push(["preview", params]); return { stateHash: `sha256:${"a".repeat(64)}` }; },
-            toolCommitObserve: async (params) => { reverseCalls.push(["commit-observe", params]); return { paths: params.paths }; },
-            toolInvoke: async (params) => { reverseCalls.push(["invoke", params]); return { status: "succeeded", actualOperations: [] }; },
-            toolLookup: async (params) => { reverseCalls.push(["lookup", params]); return { invocationId: params.invocationId, found: false, result: null }; },
-            toolCancel: async () => ({ invocationId: "inv_1", accepted: true, alreadyTerminal: false }),
-            approvalPresent: async () => ({ approvalId: "apr_1", presented: true }),
-        },
         { pingIntervalMs: 10_000 },
     );
 
@@ -159,17 +157,11 @@ test("client performs strict initialize and serves reverse Client Tools on the s
     assert.equal(initializeParams.capabilities.skills, true);
     assert.equal(initializeParams.capabilities.shell, true);
     assert.equal(initializeParams.capabilities.hooks, true);
-    assert.equal(initializeParams.capabilities.headlessVaultWrite, true);
-    const contextResult = await serverPeer.request("client/context/get", { fields: ["activeFile"] });
-    assert.equal(contextResult.capturedAt, "2026-07-13T02:00:00+00:00");
-    assert.equal(reverseCalls[0][0], "context");
-    await serverPeer.request("client/tool/preview", { invocationId: "inv_01" });
-    assert.equal(reverseCalls[1][0], "preview");
-    await serverPeer.request("client/tool/commit-observe", { invocationId: "inv_01", paths: ["notes/a.md"] });
-    assert.equal(reverseCalls[2][0], "commit-observe");
-    const lookup = await serverPeer.request("client/tool/lookup", { invocationId: "inv_01", runId: "run_01" });
-    assert.equal(lookup.found, false);
-    assert.equal(reverseCalls[3][0], "lookup");
+    assert.equal("headlessVaultWrite" in initializeParams.capabilities, false);
+    assert.equal("clientTools" in initializeParams.capabilities, false);
+    await serverPeer.notify("event", runEvent(1, "hel"));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(client.reducer.state.runs.get("run_01J00000000000000000000000").timeline.length, 1);
     await client.close();
 });
 
@@ -180,11 +172,9 @@ test("schema mismatch fails closed and never becomes ready", async () => {
     const clientPeer = new JsonRpcPeer(clientChannel);
     const serverPeer = new JsonRpcPeer(serverChannel);
     serverPeer.register("initialize", async () => initializeResult({ schemaHash: `sha256:${"b".repeat(64)}` }));
-    const noop = async () => ({});
     const client = new HarnessClient(
         { connect: async () => clientPeer },
         context(),
-        { contextGet: noop, toolPreview: noop, toolCommitObserve: noop, toolInvoke: noop, toolLookup: noop, toolCancel: noop, approvalPresent: noop },
     );
 
     await assert.rejects(() => client.connect(), HarnessCompatibilityError);
@@ -194,8 +184,8 @@ test("schema mismatch fails closed and never becomes ready", async () => {
 
 test("initialize capability set defaults missing known fields to false and rejects extra or non-boolean fields", async (t) => {
     const scenarios = [
-        { name: "extra", capabilities: { clientTools: true, eventReplay: true, multiSession: true, invented: true } },
-        { name: "non-boolean", capabilities: { clientTools: true, eventReplay: true, multiSession: "yes" } },
+        { name: "extra", capabilities: { ...initializeResult().capabilities, invented: true } },
+        { name: "non-boolean", capabilities: { ...initializeResult().capabilities, multiSession: "yes" } },
     ];
     for (const scenario of scenarios) {
         await t.test(scenario.name, async () => {
@@ -205,14 +195,9 @@ test("initialize capability set defaults missing known fields to false and rejec
             const clientPeer = new JsonRpcPeer(clientChannel);
             const serverPeer = new JsonRpcPeer(serverChannel);
             serverPeer.register("initialize", async () => initializeResult({ capabilities: scenario.capabilities }));
-            const noop = async () => ({});
             const client = new HarnessClient(
                 { connect: async () => clientPeer },
                 context(),
-                {
-                    contextGet: noop, toolPreview: noop, toolCommitObserve: noop, toolInvoke: noop,
-                    toolLookup: noop, toolCancel: noop, approvalPresent: noop,
-                },
             );
             await assert.rejects(() => client.connect(), HarnessCompatibilityError);
             assert.equal(client.ready, false);
@@ -234,11 +219,9 @@ test("event notification plus replay converge through one idempotent reducer", a
         runCursors: {},
         hasMore: false,
     }));
-    const noop = async () => ({});
     const client = new HarnessClient(
         { connect: async () => clientPeer },
         context(),
-        { contextGet: noop, toolPreview: noop, toolCommitObserve: noop, toolInvoke: noop, toolLookup: noop, toolCancel: noop, approvalPresent: noop },
     );
     await client.connect();
     await serverPeer.notify("event", runEvent(1, "hel"));
@@ -246,7 +229,11 @@ test("event notification plus replay converge through one idempotent reducer", a
     const cursor = await client.replay({ runId: "run_01J00000000000000000000000" }, 0);
 
     assert.equal(cursor, 2);
-    assert.equal(client.reducer.state.runs.get("run_01J00000000000000000000000").assistantBlocks[0], "hello");
+    assert.equal(
+        client.reducer.state.runs.get("run_01J00000000000000000000000").timeline
+            .find((item) => item.kind === "assistant_message").blocks[0],
+        "hello",
+    );
     await client.close();
 });
 
@@ -271,16 +258,18 @@ test("Session replay keeps one monotonic cursor per Run and never invents an agg
             runCursors: { run_01J00000000000000000000000: 2 }, hasMore: false,
         };
     });
-    const noop = async () => ({});
     const client = new HarnessClient(
         { connect: async () => clientPeer }, context(),
-        { contextGet: noop, toolPreview: noop, toolCommitObserve: noop, toolInvoke: noop, toolLookup: noop, toolCancel: noop, approvalPresent: noop },
     );
     await client.connect();
     const cursors = await client.replaySession("ses_01J00000000000000000000000");
 
     assert.deepEqual(cursors, { run_01J00000000000000000000000: 2 });
-    assert.equal(client.reducer.state.runs.get("run_01J00000000000000000000000").assistantBlocks[0], "ab");
+    assert.equal(
+        client.reducer.state.runs.get("run_01J00000000000000000000000").timeline
+            .find((item) => item.kind === "assistant_message").blocks[0],
+        "ab",
+    );
     await client.close();
 });
 
@@ -297,11 +286,9 @@ test("ping identity change disconnects and reports an actionable local error", a
         workerPid: 999,
     }));
     let disconnected;
-    const noop = async () => ({});
     const client = new HarnessClient(
         { connect: async () => clientPeer },
         context(),
-        { contextGet: noop, toolPreview: noop, toolCommitObserve: noop, toolInvoke: noop, toolLookup: noop, toolCancel: noop, approvalPresent: noop },
         { pingIntervalMs: 5, pingDeadlineMs: 100, onDisconnected: (error) => { disconnected = error; } },
     );
     await client.connect();

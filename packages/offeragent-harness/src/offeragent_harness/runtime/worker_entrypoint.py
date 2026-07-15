@@ -14,8 +14,7 @@ from offeragent_harness.ports.worker_runtime import (
 
 
 class WorkerTransportMode(str, Enum):
-    NAMED_PIPE = "named-pipe"
-    DIAGNOSTIC_STDIO = "diagnostic-stdio"
+    STDIO = "stdio"
 
 
 class WorkerEntrypointError(RuntimeError):
@@ -34,12 +33,10 @@ class WorkerEntrypoint:
         self,
         bootstrap: WorkerBootstrap,
         *,
-        transport: WorkerTransportMode = WorkerTransportMode.NAMED_PIPE,
+        transport: WorkerTransportMode = WorkerTransportMode.STDIO,
     ) -> WorkerApplication:
-        if transport is WorkerTransportMode.DIAGNOSTIC_STDIO and not bootstrap.diagnostic_stdio:
-            raise WorkerEntrypointError("stdio transport requires an explicit diagnostic bootstrap")
-        if transport is WorkerTransportMode.NAMED_PIPE and bootstrap.diagnostic_stdio:
-            raise WorkerEntrypointError("diagnostic stdio bootstrap cannot enter the production path")
+        if transport is not WorkerTransportMode.STDIO:
+            raise WorkerEntrypointError("unsupported Worker transport")
         async with self._lock:
             if self._application is not None:
                 raise WorkerEntrypointError("Worker application composition root was already consumed")

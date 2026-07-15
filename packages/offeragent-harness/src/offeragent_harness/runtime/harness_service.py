@@ -17,7 +17,7 @@ from offeragent_harness.agent import BudgetCheckpoint, BudgetExceeded, BudgetLed
 from offeragent_harness.agent.composer import Composer
 from offeragent_harness.agent.loop import AgentLoopFailure, RecoveredToolBatch, ToolKernel, run_agent_loop
 from offeragent_harness.agent.planner import Planner
-from offeragent_harness.agent.state import RunPhase, RunState, VaultWriteIntentBinding
+from offeragent_harness.agent.state import RunPhase, RunState
 from offeragent_harness.config import HarnessConfig
 from offeragent_harness.error_codes import ResourceConflictCause, ResourceNotFoundCause
 from offeragent_harness.hooks import HookExecutionContext
@@ -38,7 +38,7 @@ from offeragent_harness.ports import (
 )
 from offeragent_harness.ports.subagents import ChildRunExecution, RootCancellationRegistry, SubagentTreeController
 from offeragent_harness.protocol._base import validate_wire
-from offeragent_harness.protocol.common import ClientContextSnapshot, RunConfigSnapshot
+from offeragent_harness.protocol.common import RunConfigSnapshot
 from offeragent_harness.protocol.content import ContentBlock
 from offeragent_harness.protocol.events import make_domain_event_record, parse_persisted_domain_event
 from offeragent_harness.protocol.ids import ProfileId, RunId, SessionId, TurnId, WorkspaceId
@@ -112,24 +112,12 @@ _TURN_ID: TypeAdapter[str] = TypeAdapter(TurnId)
 _RUN_ID: TypeAdapter[str] = TypeAdapter(RunId)
 _CONTENT_BLOCK: TypeAdapter[Any] = TypeAdapter(ContentBlock)
 _IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
-_CLIENT_CONNECTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _MAX_COMMAND_JSON_BYTES = 4 * 1024 * 1024
 
 
 def _validate_idempotency_key(value: str) -> None:
     if _IDEMPOTENCY_KEY.fullmatch(value) is None:
         raise ValueError("idempotency_key must be a 1-256 character canonical opaque key")
-
-
-def _write_intent_value(value: VaultWriteIntentBinding | None) -> Mapping[str, Any] | None:
-    if value is None:
-        return None
-    return {
-        "kind": "vault_write_required",
-        "requestHash": value.request_hash,
-        "intentHash": value.intent_hash,
-        "targetPaths": list(value.target_paths),
-    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,13 +152,9 @@ class StartTurnCommand:
     idempotency_key: str
     input_blocks: tuple[Mapping[str, Any], ...]
     run_config: Mapping[str, Any]
-    client_context: Mapping[str, Any] | None = None
-    client_connection_id: str | None = None
-    local_vault_write_grant_id: str | None = None
     effective_config: HarnessConfig | None = None
     effective_config_fingerprint: str | None = None
     deadline_at: datetime | None = None
-    write_intent: VaultWriteIntentBinding | None = None
 
     def __post_init__(self) -> None:
         if not self.workspace_id or not self.session_id or not self.turn_id or not self.idempotency_key:
@@ -181,15 +165,6 @@ class StartTurnCommand:
         _SESSION_ID.validate_python(self.session_id, strict=True)
         _TURN_ID.validate_python(self.turn_id, strict=True)
         _validate_idempotency_key(self.idempotency_key)
-        if self.client_connection_id is not None and _CLIENT_CONNECTION_ID.fullmatch(self.client_connection_id) is None:
-            raise ValueError("client_connection_id must be a canonical authenticated transport identity")
-        if (
-            self.local_vault_write_grant_id is not None
-            and re.fullmatch(r"hgrant_[0-9a-f]{64}", self.local_vault_write_grant_id) is None
-        ):
-            raise ValueError("local_vault_write_grant_id must be a canonical headless grant identity")
-        if self.client_connection_id is not None and self.local_vault_write_grant_id is not None:
-            raise ValueError("a turn command cannot retain both CLIENT and LOCAL Vault authorities")
         if (self.effective_config is None) != (self.effective_config_fingerprint is None):
             raise ValueError("effective config and fingerprint must be present together")
         if self.effective_config_fingerprint is not None and not re.fullmatch(
@@ -202,11 +177,7 @@ class StartTurnCommand:
             {
                 "input": thaw_json(self.input_blocks),
                 "runConfig": thaw_json(self.run_config),
-                "clientContext": None if self.client_context is None else thaw_json(self.client_context),
-                "clientConnectionId": self.client_connection_id,
-                "localVaultWriteGrantId": self.local_vault_write_grant_id,
                 "deadline": None if self.deadline_at is None else self.deadline_at.isoformat(),
-                "writeIntent": _write_intent_value(self.write_intent),
             },
             ensure_ascii=False,
             allow_nan=False,
@@ -217,8 +188,6 @@ class StartTurnCommand:
         for block in self.input_blocks:
             _CONTENT_BLOCK.validate_json(json.dumps(thaw_json(block), ensure_ascii=False, allow_nan=False))
         validate_wire(RunConfigSnapshot, thaw_json(self.run_config))
-        if self.client_context is not None:
-            validate_wire(ClientContextSnapshot, thaw_json(self.client_context))
         if self.deadline_at is not None and (self.deadline_at.tzinfo is None or self.deadline_at.utcoffset() is None):
             raise ValueError("turn deadline must be timezone-aware")
         frozen_blocks = tuple(freeze_json(block) for block in self.input_blocks)
@@ -229,11 +198,6 @@ class StartTurnCommand:
             raise TypeError("run config must be a JSON object")
         object.__setattr__(self, "input_blocks", frozen_blocks)
         object.__setattr__(self, "run_config", frozen_config)
-        if self.client_context is not None:
-            frozen_context = freeze_json(self.client_context)
-            if not isinstance(frozen_context, FrozenJsonObject):
-                raise TypeError("client context must be a JSON object")
-            object.__setattr__(self, "client_context", frozen_context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,7 +208,6 @@ class RetryTurnCommand:
     source_run_id: str
     idempotency_key: str
     run_config: Mapping[str, Any] | None = None
-    client_connection_id: str | None = None
     effective_config: HarnessConfig | None = None
     effective_config_fingerprint: str | None = None
 
@@ -256,8 +219,6 @@ class RetryTurnCommand:
         _TURN_ID.validate_python(self.turn_id, strict=True)
         _RUN_ID.validate_python(self.source_run_id, strict=True)
         _validate_idempotency_key(self.idempotency_key)
-        if self.client_connection_id is not None and _CLIENT_CONNECTION_ID.fullmatch(self.client_connection_id) is None:
-            raise ValueError("client_connection_id must be a canonical authenticated transport identity")
         if (self.effective_config is None) != (self.effective_config_fingerprint is None):
             raise ValueError("effective config and fingerprint must be present together")
         if self.effective_config_fingerprint is not None and not re.fullmatch(
@@ -540,12 +501,8 @@ class HarnessService:
                 "turnId": command.turn_id,
                 "input": thaw_json(command.input_blocks),
                 "runConfig": thaw_json(command.run_config),
-                "clientContext": None if command.client_context is None else thaw_json(command.client_context),
-                "clientConnectionId": command.client_connection_id,
-                "localVaultWriteGrantId": command.local_vault_write_grant_id,
                 "effectiveConfigFingerprint": command.effective_config_fingerprint,
                 "deadline": None if command.deadline_at is None else command.deadline_at.isoformat(),
-                "writeIntent": _write_intent_value(command.write_intent),
             }
         )
         idempotency_id = f"{command.session_id}:{command.idempotency_key}"
@@ -577,11 +534,6 @@ class HarnessService:
                 run_id=run_id,
                 lineage=AgentLineage.root(run_id),
             )
-            if command.write_intent is not None:
-                state = state.require_write_outcome(
-                    f"turn.start.vault_write_required:{command.write_intent.request_hash}",
-                    intent=command.write_intent,
-                )
             deferred_components = self._async_components
             components = self._components.build(command, state) if deferred_components is None else None
             configured_budget = (
@@ -614,7 +566,7 @@ class HarnessService:
                     state=state,
                     profile_id=session.profile_id,
                     query_text=_context_query(command.input_blocks),
-                    active_file=_active_file_from_client_context(command.client_context),
+                    active_file=_explicit_instruction_scope(command.input_blocks),
                     effective_config=command.effective_config,
                     planner=initial_planner,
                     composer=components.composer,
@@ -673,7 +625,7 @@ class HarnessService:
                         state=current_state,
                         profile_id=session.profile_id,
                         query_text=_context_query(command.input_blocks),
-                        active_file=_active_file_from_client_context(command.client_context),
+                        active_file=_explicit_instruction_scope(command.input_blocks),
                         effective_config=command.effective_config,
                         planner=planner,
                         composer=run_components.composer,
@@ -752,7 +704,6 @@ class HarnessService:
                 "turnId": command.turn_id,
                 "sourceRunId": command.source_run_id,
                 "runConfig": command.run_config,
-                "clientConnectionId": command.client_connection_id,
                 "effectiveConfigFingerprint": command.effective_config_fingerprint,
             }
         )
@@ -808,8 +759,6 @@ class HarnessService:
                 idempotency_key=command.idempotency_key,
                 input_blocks=tuple(thaw_json(turn.input_blocks)),
                 run_config=thaw_json(effective_config),
-                client_context=None if turn.client_context is None else thaw_json(turn.client_context),
-                client_connection_id=command.client_connection_id,
                 effective_config=preparation_config,
                 effective_config_fingerprint=(
                     None
@@ -817,7 +766,6 @@ class HarnessService:
                     else command.effective_config_fingerprint
                     or canonical_json_sha256(preparation_config.model_dump(mode="json"))
                 ),
-                write_intent=source_state.write_obligation.intent,
             )
             run_id = self._ids.new_id("run")
             state = RunState(
@@ -1432,8 +1380,6 @@ class HarnessService:
             )
 
         async with self._unit_of_work.begin() as uow:
-            client_binding = await uow.entities.get("run_client_bindings", result.run.run_id)
-            headless_binding = await uow.entities.get("run_headless_vault_bindings", result.run.run_id)
             effective_record = await uow.entities.get("run_effective_configs", result.run.run_id)
             capability_record = await uow.entities.get("run_capability_snapshots", result.run.run_id)
             session_value = await uow.entities.get("sessions", result.run.session_id)
@@ -1447,37 +1393,9 @@ class HarnessService:
                 result.run.run_id,
                 "Recovered Run has no authoritative Session for context scope resolution.",
             )
-        client_connection_id: str | None = None
-        local_vault_write_grant_id: str | None = None
         effective_config: HarnessConfig | None = None
         effective_fingerprint: str | None = None
         try:
-            if client_binding is not None:
-                if not isinstance(client_binding, Mapping):
-                    raise TypeError("Run client binding is not an object")
-                if (
-                    client_binding.get("schemaVersion") != 1
-                    or client_binding.get("workspaceId") != result.run.workspace_id
-                    or client_binding.get("runId") != result.run.run_id
-                ):
-                    raise ValueError("Run client binding identity is invalid")
-                raw_client_id = client_binding.get("clientConnectionId")
-                if not isinstance(raw_client_id, str):
-                    raise TypeError("Run client binding identity is not text")
-                client_connection_id = raw_client_id
-            if headless_binding is not None:
-                if not isinstance(headless_binding, Mapping):
-                    raise TypeError("Run headless Vault binding is not an object")
-                if (
-                    headless_binding.get("schemaVersion") != 1
-                    or headless_binding.get("workspaceId") != result.run.workspace_id
-                    or headless_binding.get("runId") != result.run.run_id
-                ):
-                    raise ValueError("Run headless Vault binding identity is invalid")
-                raw_grant_id = headless_binding.get("grantId")
-                if not isinstance(raw_grant_id, str):
-                    raise TypeError("Run headless Vault grant identity is not text")
-                local_vault_write_grant_id = raw_grant_id
             if effective_record is not None:
                 if not isinstance(effective_record, Mapping):
                     raise TypeError("Run effective config is not an object")
@@ -1508,12 +1426,8 @@ class HarnessService:
                 idempotency_key=f"recovery:{result.run.run_id}",
                 input_blocks=tuple(dict(block) for block in raw_input_blocks),
                 run_config=dict(raw_run_config),
-                client_context=(None if result.turn.client_context is None else thaw_json(result.turn.client_context)),
-                client_connection_id=client_connection_id,
-                local_vault_write_grant_id=local_vault_write_grant_id,
                 effective_config=effective_config,
                 effective_config_fingerprint=effective_fingerprint,
-                write_intent=result.state.write_obligation.intent,
             )
         except (TypeError, ValueError) as error:
             raise RecoveryResumeRejected(
@@ -1972,7 +1886,6 @@ class HarnessService:
             input_blocks=command.input_blocks,
             created_at=started_at,
             updated_at=now,
-            client_context=command.client_context,
         )
         run = Run(
             run_id=state.run_id,
@@ -1995,7 +1908,6 @@ class HarnessService:
             payload={
                 "input": thaw_json(command.input_blocks),
                 "runConfig": thaw_json(command.run_config),
-                "clientContext": None if command.client_context is None else thaw_json(command.client_context),
                 "attempt": 1,
             },
             trace_id=trace_id,
@@ -2048,30 +1960,6 @@ class HarnessService:
             await uow.entities.put("turns", command.turn_id, turn, expected_revision=0)
             run_revision = await uow.entities.put("runs", state.run_id, run, expected_revision=0)
             entity_revision = await uow.entities.put("run_states", state.run_id, state, expected_revision=0)
-            if command.client_connection_id is not None:
-                await uow.entities.put(
-                    "run_client_bindings",
-                    state.run_id,
-                    {
-                        "schemaVersion": 1,
-                        "workspaceId": command.workspace_id,
-                        "runId": state.run_id,
-                        "clientConnectionId": command.client_connection_id,
-                    },
-                    expected_revision=0,
-                )
-            if command.local_vault_write_grant_id is not None:
-                await uow.entities.put(
-                    "run_headless_vault_bindings",
-                    state.run_id,
-                    {
-                        "schemaVersion": 1,
-                        "workspaceId": command.workspace_id,
-                        "runId": state.run_id,
-                        "grantId": command.local_vault_write_grant_id,
-                    },
-                    expected_revision=0,
-                )
             if command.effective_config is not None:
                 await uow.entities.put(
                     "run_effective_configs",
@@ -2163,9 +2051,6 @@ class HarnessService:
             payload={
                 "input": thaw_json(start_command.input_blocks),
                 "runConfig": thaw_json(start_command.run_config),
-                "clientContext": (
-                    None if start_command.client_context is None else thaw_json(start_command.client_context)
-                ),
                 "attempt": run.attempt,
             },
             trace_id=trace_id,
@@ -2206,18 +2091,6 @@ class HarnessService:
             await uow.entities.put("turns", turn.turn_id, updated_turn, expected_revision=turn.revision)
             run_revision = await uow.entities.put("runs", state.run_id, run, expected_revision=0)
             entity_revision = await uow.entities.put("run_states", state.run_id, state, expected_revision=0)
-            if start_command.client_connection_id is not None:
-                await uow.entities.put(
-                    "run_client_bindings",
-                    state.run_id,
-                    {
-                        "schemaVersion": 1,
-                        "workspaceId": command.workspace_id,
-                        "runId": state.run_id,
-                        "clientConnectionId": start_command.client_connection_id,
-                    },
-                    expected_revision=0,
-                )
             if start_command.effective_config is not None:
                 await uow.entities.put(
                     "run_effective_configs",
@@ -2557,18 +2430,25 @@ def _context_query(value: Any) -> str:
     return canonical_json_bytes(thaw_json(value)).decode("utf-8")
 
 
-def _active_file_from_client_context(value: Mapping[str, Any] | None) -> str | None:
-    if value is None:
-        return None
-    raw = thaw_json(value)
-    if not isinstance(raw, Mapping):
-        raise TypeError("validated client context must remain a JSON object")
-    active_file = raw.get("activeFile")
-    if active_file is None:
-        return None
-    if not isinstance(active_file, str):
-        raise TypeError("validated client context activeFile must remain a string")
-    return active_file
+def _explicit_instruction_scope(blocks: Sequence[Mapping[str, Any]]) -> str | None:
+    """Return the sole file explicitly attached to a Turn for path-scoped rules.
+
+    An editor's active tab is never task context.  Scope can change only when
+    the caller deliberately sends one typed ``file`` content block.  Multiple
+    attachments have no singular scope and therefore use root instructions.
+    """
+
+    paths: set[str] = set()
+    for block in blocks:
+        raw = thaw_json(block)
+        if not isinstance(raw, Mapping) or raw.get("type") != "file":
+            continue
+        file = raw.get("file")
+        path = file.get("path") if isinstance(file, Mapping) else None
+        if not isinstance(path, str):
+            raise TypeError("validated file content block path must remain text")
+        paths.add(path)
+    return next(iter(paths)) if len(paths) == 1 else None
 
 
 def _effective_config_from_record(

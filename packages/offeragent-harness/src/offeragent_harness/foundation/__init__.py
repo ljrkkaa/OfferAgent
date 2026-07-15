@@ -9,7 +9,6 @@ from .network_audit import (
     NetworkOperationPurpose,
     network_audit_event_id,
 )
-from .write_intent import vault_write_intent_hash
 
 __all__ = [
     "MAX_ARTIFACT_REFERENCES",
@@ -23,5 +22,4 @@ __all__ = [
     "canonical_json_bytes",
     "canonical_json_sha256",
     "network_audit_event_id",
-    "vault_write_intent_hash",
 ]

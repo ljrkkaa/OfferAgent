@@ -251,7 +251,7 @@ def _probe_signed_process_host(runtime_root: Path) -> None:
         raise RuntimeSelfTestError("signed Process Host probe failed")
 
 
-class _NoWorkerReverseRequests:
+class _RejectServerRequests:
     def require_ready(self) -> None:
         return None
 
@@ -350,7 +350,9 @@ async def _probe_packaged_host_worker_attach(
         connection = DuplexJsonRpcConnection(
             stream,
             role=ConnectionRole.CLIENT,
-            dispatcher=_NoWorkerReverseRequests(),
+            dispatcher=_RejectServerRequests(),
+            command_transport="windows-named-pipe",
+            command_peer="current-windows-sid",
             connection_id="runtime-self-test-host-attach",
         )
         await connection.start()
@@ -609,7 +611,9 @@ async def _probe_packaged_worker(runtime_root: Path, local_app_data: Path, vault
         connection = DuplexJsonRpcConnection(
             stream,
             role=ConnectionRole.CLIENT,
-            dispatcher=_NoWorkerReverseRequests(),
+            dispatcher=_RejectServerRequests(),
+            command_transport="windows-named-pipe",
+            command_peer="current-windows-sid",
             connection_id="runtime-self-test",
         )
         await connection.start()

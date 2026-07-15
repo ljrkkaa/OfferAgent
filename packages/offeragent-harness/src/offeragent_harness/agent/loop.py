@@ -16,10 +16,12 @@ from offeragent_harness.tools import ToolCall, ToolDefinition, ToolResult, ToolR
 from .budgets import BudgetDelta, BudgetExceeded, BudgetLedger, BudgetReservation
 from .composer import Composer
 from .model_planner import ModelProviderFailure
-from .planner import AuditedPlanningFailure, Planner, PlanningAttempt, PlanningAttemptOutcome
+from .planner import AuditedPlanningFailure, Planner, PlanningAttempt
 from .preparation import RunPreparationFailure, RunPreparationPort
 from .state import ALLOWED_PHASE_TRANSITIONS, RunControlMessage, RunPhase, RunState
 from .termination import StopReason, evaluate_termination
+
+_COMPOSITION_EVENT_CHUNK_CHARACTERS = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,11 +369,27 @@ def _approval_descriptor(state: RunState, approval: ApprovalRequest) -> dict[str
     }
 
 
+def _tool_call_descriptor(call: ToolCall, definition: ToolDefinition) -> dict[str, object]:
+    lineage = [*call.lineage.ancestor_run_ids, call.lineage.run_id]
+    return {
+        "toolCallId": call.tool_call_id,
+        "name": call.name,
+        "version": call.version,
+        "arguments": thaw_json(call.arguments),
+        "argsHash": call.args_hash,
+        "idempotencyKey": call.idempotency_key,
+        "risk": definition.risk.value,
+        "reason": None,
+        "agentLineage": lineage,
+    }
+
+
 class _LoopToolLifecycleObserver:
     def __init__(self, state: RunState, recorder: RunRecorder) -> None:
         self.state = state
         self._recorder = recorder
         self._lock = asyncio.Lock()
+        self._started_tool_call_ids: set[str] = set()
 
     async def call_replaced(self, original: ToolCall, replacement: ToolCall) -> None:
         """Keep approval/recovery state aligned with a schema-valid Hook mutation."""
@@ -462,8 +480,16 @@ class _LoopToolLifecycleObserver:
                 payload=payload,
             )
 
-    async def execution_started(self) -> None:
+    async def execution_started(self, call: ToolCall, definition: ToolDefinition) -> None:
         async with self._lock:
+            if call.tool_call_id in self._started_tool_call_ids:
+                return
+            pending = next(
+                (item for item in self.state.pending.tool_calls if item.tool_call_id == call.tool_call_id),
+                None,
+            )
+            if pending != call:
+                raise RuntimeError("tool execution start has no matching pending ToolCall")
             if self.state.pending.approval_ids:
                 raise RuntimeError("tool execution cannot start with pending approvals")
             if self.state.phase in {
@@ -474,6 +500,12 @@ class _LoopToolLifecycleObserver:
                 self.state = await _commit_phase(self.state, RunPhase.EXECUTING_TOOLS, self._recorder)
             elif self.state.phase is not RunPhase.EXECUTING_TOOLS:
                 raise RuntimeError(f"tool execution started from invalid phase {self.state.phase.value}")
+            self._started_tool_call_ids.add(call.tool_call_id)
+            await self._recorder.commit(
+                self.state,
+                event_type="tool.started",
+                payload={"call": _tool_call_descriptor(call, definition), "attempt": 1},
+            )
 
     async def result_available(
         self,
@@ -486,7 +518,11 @@ class _LoopToolLifecycleObserver:
                 raise RuntimeError("tool result callback identities differ")
             if call.tool_call_id not in self.state.pending.tool_call_ids:
                 raise RuntimeError("tool result callback has no matching pending ToolCall")
-            if self.state.phase is RunPhase.EXECUTING_TOOLS:
+            if self.state.phase in {
+                RunPhase.CHECKING_POLICY,
+                RunPhase.AWAITING_APPROVAL,
+                RunPhase.EXECUTING_TOOLS,
+            }:
                 self.state = await _commit_phase(self.state, RunPhase.RECORDING_RESULTS, self._recorder)
             elif self.state.phase is not RunPhase.RECORDING_RESULTS:
                 raise RuntimeError(f"tool result arrived from invalid phase {self.state.phase.value}")
@@ -549,8 +585,8 @@ async def _resume_recovered_tool_batch(
     }
     if state.phase not in allowed_phases:
         raise ValueError(f"cannot resume a recovered tool batch from phase {state.phase.value}")
-    if state.pending.client_invocation_ids or state.pending.child_run_ids:
-        raise ValueError("recovered tool batch cannot bypass pending Client Tool or child Run coordination")
+    if state.pending.child_run_ids:
+        raise ValueError("recovered tool batch cannot bypass pending child Run coordination")
     if state.pending.tool_calls != recovered.replay_calls:
         raise ValueError("recovered replay calls must exactly match the persisted pending ToolCalls")
     if state.pending.tool_call_ids != frozenset(call.tool_call_id for call in recovered.replay_calls):
@@ -619,10 +655,39 @@ async def _compose(
         payload={"partial": partial},
     )
     text_parts: list[str] = []
+    reasoning_summary_parts: list[str] = []
     offset = 0
+    pending_text = ""
+    pending_reasoning = ""
+
+    async def flush_text(*, final: bool) -> None:
+        nonlocal offset, pending_text
+        while len(pending_text) >= _COMPOSITION_EVENT_CHUNK_CHARACTERS or (final and pending_text):
+            size = min(len(pending_text), _COMPOSITION_EVENT_CHUNK_CHARACTERS)
+            delta, pending_text = pending_text[:size], pending_text[size:]
+            await recorder.commit(
+                state,
+                event_type="assistant.delta",
+                payload={"blockIndex": 0, "offset": offset, "delta": delta},
+            )
+            offset += len(delta)
+
+    async def flush_reasoning(*, final: bool) -> None:
+        nonlocal pending_reasoning
+        while len(pending_reasoning) >= _COMPOSITION_EVENT_CHUNK_CHARACTERS or (final and pending_reasoning):
+            size = min(len(pending_reasoning), _COMPOSITION_EVENT_CHUNK_CHARACTERS)
+            summary, pending_reasoning = pending_reasoning[:size], pending_reasoning[size:]
+            await recorder.commit(
+                state,
+                event_type="reasoning.summary",
+                payload={"summary": summary, "partial": True},
+            )
+
     async for event in composer.stream(state, partial=partial, cancellation=cancellation):
         cancellation.checkpoint()
         if event.retry is not None:
+            await flush_text(final=True)
+            await flush_reasoning(final=True)
             await budget.consume(BudgetDelta(model_rounds=1))
             state = replace(state, model_rounds=state.model_rounds + 1, revision=state.revision + 1)
             await recorder.commit(
@@ -639,14 +704,18 @@ async def _compose(
                 },
             )
         elif event.text_delta is not None:
+            await flush_reasoning(final=True)
             text_parts.append(event.text_delta)
-            await recorder.commit(
-                state,
-                event_type="assistant.delta",
-                payload={"blockIndex": 0, "offset": offset, "delta": event.text_delta},
-            )
-            offset += len(event.text_delta)
+            pending_text += event.text_delta
+            await flush_text(final=False)
+        elif event.reasoning_summary_delta is not None:
+            await flush_text(final=True)
+            reasoning_summary_parts.append(event.reasoning_summary_delta)
+            pending_reasoning += event.reasoning_summary_delta
+            await flush_reasoning(final=False)
         else:
+            await flush_text(final=True)
+            await flush_reasoning(final=True)
             await budget.consume(_usage_delta(event.usage))
             assert event.usage is not None
             await recorder.commit(
@@ -657,6 +726,14 @@ async def _compose(
                     "scope": "model_call",
                 },
             )
+    await flush_text(final=True)
+    await flush_reasoning(final=True)
+    if reasoning_summary_parts:
+        await recorder.commit(
+            state,
+            event_type="reasoning.summary",
+            payload={"summary": "".join(reasoning_summary_parts), "partial": False},
+        )
     await _invoke_agent_hook(
         hooks,
         hook_context,
@@ -734,29 +811,6 @@ async def _record_planning_attempts(
                 ),
             },
         )
-    return state
-
-
-async def _record_legacy_planning_attempt(
-    state: RunState,
-    recorder: RunRecorder,
-    *,
-    outcome: PlanningAttemptOutcome,
-    error_code: str | None,
-) -> RunState:
-    state = replace(state, model_rounds=state.model_rounds + 1, revision=state.revision + 1)
-    await recorder.commit(
-        state,
-        event_type="model.attempt",
-        payload={
-            "requestId": None,
-            "repairIndex": 0,
-            "outcome": outcome.value,
-            "errorCode": error_code,
-            "violations": [],
-            "usage": None,
-        },
-    )
     return state
 
 
@@ -1015,16 +1069,9 @@ async def run_agent_loop(
                 {"purpose": "planner", "status": "succeeded", "toolCallCount": len(step.calls)},
             )
             planning_in_flight = False
-            if step.attempts:
-                state = await _record_planning_attempts(state, step.attempts, recorder)
-            else:
-                state = await _record_legacy_planning_attempt(
-                    state,
-                    recorder,
-                    outcome=PlanningAttemptOutcome.SUCCEEDED,
-                    error_code=None,
-                )
-                await budget.consume(_usage_delta(step.usage))
+            if not step.attempts:
+                raise ValueError("planner returned a step without an auditable model attempt")
+            state = await _record_planning_attempts(state, step.attempts, recorder)
             state, steered_while_planning = await _apply_run_controls(state, control_inbox, recorder)
             if steered_while_planning:
                 # Discard decisions made before the newly accepted control
@@ -1105,23 +1152,9 @@ async def run_agent_loop(
             state = await _commit_phase(state, RunPhase.PLANNING, recorder)
     except OperationCancelled as cancelled:
         await composer_reservation.release()
-        if planning_in_flight:
-            state = await _record_legacy_planning_attempt(
-                state,
-                recorder,
-                outcome=PlanningAttemptOutcome.FAILED,
-                error_code="cancelled",
-            )
         return await _cancelled(state, recorder, cancelled, budget=budget, now=now)
     except asyncio.CancelledError as cancelled:
         await composer_reservation.release()
-        if planning_in_flight:
-            state = await _record_legacy_planning_attempt(
-                state,
-                recorder,
-                outcome=PlanningAttemptOutcome.FAILED,
-                error_code="runtime_interrupted",
-            )
         return await _native_interrupted(state, recorder, cancelled, budget=budget, now=now)
     except AgentLoopFailure:
         raise
@@ -1130,13 +1163,6 @@ async def run_agent_loop(
         if planning_in_flight:
             if isinstance(cause, AuditedPlanningFailure) and cause.planning_attempts:
                 state = await _record_planning_attempts(state, cause.planning_attempts, recorder)
-            else:
-                state = await _record_legacy_planning_attempt(
-                    state,
-                    recorder,
-                    outcome=PlanningAttemptOutcome.FAILED,
-                    error_code=type(cause).__name__,
-                )
         failed = await _failed(state, recorder, cause, budget=budget, now=now)
         raise AgentLoopFailure(failed, cause) from cause
     finally:

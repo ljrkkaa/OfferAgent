@@ -21,7 +21,6 @@ from offeragent_harness.agent.state import (
     PendingWork,
     RunPhase,
     RunState,
-    VaultWriteIntentBinding,
     WriteObligation,
     WriteOutcome,
 )
@@ -578,27 +577,16 @@ def _run_state_to_payload(value: Any) -> Mapping[str, Any]:
             "toolCallIds": sorted(state.pending.tool_call_ids),
             "toolCalls": [_tool_call_to_payload(call) for call in state.pending.tool_calls],
             "approvalIds": sorted(state.pending.approval_ids),
-            "clientInvocationIds": sorted(state.pending.client_invocation_ids),
             "childRunIds": sorted(state.pending.child_run_ids),
         },
         "writeObligation": {
             "required": state.write_obligation.required,
             "reasons": list(state.write_obligation.reasons),
-            "intent": (
-                None
-                if state.write_obligation.intent is None
-                else {
-                    "requestHash": state.write_obligation.intent.request_hash,
-                    "intentHash": state.write_obligation.intent.intent_hash,
-                    "targetPaths": list(state.write_obligation.intent.target_paths),
-                }
-            ),
             "outcomes": [
                 {
                     "toolCallId": outcome.tool_call_id,
                     "status": outcome.status.value,
                     "summary": outcome.summary,
-                    "coveredPaths": list(outcome.covered_paths),
                 }
                 for outcome in state.write_obligation.outcomes
             ],
@@ -634,60 +622,31 @@ def _run_state_from_payload(value: Mapping[str, Any]) -> RunState:
     raw = _exact_object(value, keys, "run state")
     pending_raw = _exact_object(
         raw["pending"],
-        {"toolCallIds", "toolCalls", "approvalIds", "clientInvocationIds", "childRunIds"},
+        {"toolCallIds", "toolCalls", "approvalIds", "childRunIds"},
         "pending work",
     )
     obligation_value = raw["writeObligation"]
     if not isinstance(obligation_value, Mapping):
         raise TypeError("write obligation must be an object")
-    obligation_keys = set(obligation_value)
-    obligation_raw: dict[str, Any]
-    if obligation_keys == {"required", "reasons", "outcomes"}:
-        obligation_raw = dict(obligation_value)
-        obligation_raw["intent"] = None
-    else:
-        obligation_raw = dict(
-            _exact_object(
-                obligation_value,
-                {"required", "reasons", "intent", "outcomes"},
-                "write obligation",
-            )
-        )
-    intent_value = obligation_raw["intent"]
-    intent: VaultWriteIntentBinding | None = None
-    if intent_value is not None:
-        intent_raw = _exact_object(
-            intent_value,
-            {"requestHash", "intentHash", "targetPaths"},
-            "Vault write intent",
-        )
-        intent = VaultWriteIntentBinding(
-            request_hash=_string(intent_raw["requestHash"], "write intent requestHash"),
-            intent_hash=_string(intent_raw["intentHash"], "write intent intentHash"),
-            target_paths=_string_tuple(intent_raw["targetPaths"], "write intent targetPaths"),
-        )
+    obligation_raw = _exact_object(
+        obligation_value,
+        {"required", "reasons", "outcomes"},
+        "write obligation",
+    )
     outcomes: list[WriteOutcome] = []
     for item in _array(obligation_raw["outcomes"], "write outcomes"):
         if not isinstance(item, Mapping):
             raise TypeError("write outcome must be an object")
-        outcome: dict[str, Any]
-        if set(item) == {"toolCallId", "status", "summary"}:
-            outcome = dict(item)
-            outcome["coveredPaths"] = []
-        else:
-            outcome = dict(
-                _exact_object(
-                    item,
-                    {"toolCallId", "status", "summary", "coveredPaths"},
-                    "write outcome",
-                )
-            )
+        outcome = _exact_object(
+            item,
+            {"toolCallId", "status", "summary"},
+            "write outcome",
+        )
         outcomes.append(
             WriteOutcome(
                 tool_call_id=_string(outcome["toolCallId"], "write outcome toolCallId"),
                 status=ToolResultStatus(_string(outcome["status"], "write outcome status")),
                 summary=_string(outcome["summary"], "write outcome summary"),
-                covered_paths=_string_tuple(outcome["coveredPaths"], "write outcome coveredPaths"),
             )
         )
     return RunState(
@@ -704,14 +663,12 @@ def _run_state_from_payload(value: Mapping[str, Any]) -> RunState:
             tool_call_ids=frozenset(_string_tuple(pending_raw["toolCallIds"], "toolCallIds")),
             tool_calls=tuple(_tool_call_from_payload(item) for item in _array(pending_raw["toolCalls"], "toolCalls")),
             approval_ids=frozenset(_string_tuple(pending_raw["approvalIds"], "approvalIds")),
-            client_invocation_ids=frozenset(_string_tuple(pending_raw["clientInvocationIds"], "clientInvocationIds")),
             child_run_ids=frozenset(_string_tuple(pending_raw["childRunIds"], "childRunIds")),
         ),
         write_obligation=WriteObligation(
             required=_boolean(obligation_raw["required"], "write obligation required"),
             reasons=_string_tuple(obligation_raw["reasons"], "write obligation reasons"),
             outcomes=tuple(outcomes),
-            intent=intent,
         ),
         tool_results=tuple(tool_result_from_value(item) for item in _array(raw["toolResults"], "toolResults")),
         assistant_text=_string(raw["assistantText"], "assistantText"),

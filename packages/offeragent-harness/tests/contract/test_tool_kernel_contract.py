@@ -31,7 +31,6 @@ from offeragent_harness.ports import (
     ApprovalPort,
     ArtifactMetadata,
     CancellationToken,
-    ClientToolInvocation,
     HookLifecyclePort,
     InvocationJournalConflict,
     InvocationRecord,
@@ -68,7 +67,7 @@ from offeragent_harness.tools import (
     canonical_json_sha256,
 )
 from offeragent_harness.tools.artifacts import ToolArtifactManager
-from offeragent_harness.tools.dispatcher import InvocationAcknowledgementLost, ToolDispatcher
+from offeragent_harness.tools.dispatcher import ToolDispatcher
 from offeragent_harness.tools.kernel import KeyedLockPool, UnifiedToolKernel
 from offeragent_harness.tools.registry import ToolRegistry
 from offeragent_harness.tools.scheduler import RetryPolicy, ToolScheduler
@@ -346,7 +345,7 @@ def kernel(
             max_parallel_reads=4,
             retry_policy=retry_policy or RetryPolicy(),
         ),
-        dispatcher=ToolDispatcher(clock=runtime_clock, local=executor),
+        dispatcher=ToolDispatcher(local=executor),
         journal=journal,
         clock=runtime_clock,
         ids=DeterministicIdGenerator(),
@@ -570,7 +569,7 @@ def resource_kernel(
         policy=RuleBasedPolicyEvaluator(audit_sink=NullPolicyAuditSink()),
         policy_context=context,
         scheduler=ToolScheduler(clock=runtime_clock, max_parallel_reads=1),
-        dispatcher=ToolDispatcher(clock=runtime_clock, local=executor),
+        dispatcher=ToolDispatcher(local=executor),
         journal=journal,
         clock=runtime_clock,
         ids=DeterministicIdGenerator(),
@@ -1213,92 +1212,6 @@ async def test_retryable_failure_retries_inside_one_journal_claim_and_finalizes_
     assert execution[0].result.status is ToolResultStatus.SUCCEEDED
     assert executor.calls == [tool_call, tool_call]
     assert next(iter(journal.records.values())).state is JournalState.COMPLETED
-
-
-class AckLostClient:
-    def __init__(self, result: ToolResult, *, queryable: bool) -> None:
-        self.result = result
-        self.queryable = queryable
-        self.invocations: list[ClientToolInvocation] = []
-        self.committed: dict[str, ToolResult] = {}
-
-    async def invoke(self, invocation: ClientToolInvocation, cancellation: CancellationToken) -> ToolResult:
-        cancellation.checkpoint()
-        self.invocations.append(invocation)
-        self.committed[invocation.invocation_id] = self.result
-        raise InvocationAcknowledgementLost()
-
-    async def lookup_result(self, invocation_id: str, *, run_id: str | None = None) -> ToolResult | None:
-        del run_id
-        return self.committed.get(invocation_id) if self.queryable else None
-
-    async def cancel(self, invocation_id: str, reason: str) -> None:
-        del invocation_id, reason
-
-
-def client_kernel(
-    tool: ToolDefinition,
-    client: AckLostClient,
-    journal: MemoryJournal,
-) -> UnifiedToolKernel:
-    context = make_context((tool,), PermissionMode.BYPASS)
-    clock = ManualClock(NOW)
-    return UnifiedToolKernel(
-        registry=ToolRegistry("snapshot_1", (tool,)),
-        validator=ToolValidator(),
-        policy=RuleBasedPolicyEvaluator(audit_sink=NullPolicyAuditSink()),
-        policy_context=lambda _: context,
-        scheduler=ToolScheduler(clock=clock, max_parallel_reads=1),
-        dispatcher=ToolDispatcher(clock=clock, client=client),
-        journal=journal,
-        clock=clock,
-        ids=DeterministicIdGenerator(),
-    )
-
-
-@pytest.mark.asyncio
-async def test_client_ack_loss_queries_result_and_journals_without_reexecution() -> None:
-    tool = definition(
-        "vault.write",
-        location=ExecutorLocation.CLIENT,
-        risk=RiskClass.WRITE,
-        effect=SideEffectClass.WRITE,
-        concurrent=False,
-    )
-    tool_call = call(tool, 1)
-    client = AckLostClient(success("call_1", 1), queryable=True)
-    journal = MemoryJournal()
-    tool_kernel = client_kernel(tool, client, journal)
-
-    assert (await tool_kernel.execute_batch((tool_call,), ManualCancellationToken()))[0].result.status is (
-        ToolResultStatus.SUCCEEDED
-    )
-    assert (await tool_kernel.execute_batch((tool_call,), ManualCancellationToken()))[0].result.status is (
-        ToolResultStatus.SUCCEEDED
-    )
-    assert len(client.invocations) == 1
-
-
-@pytest.mark.asyncio
-async def test_unqueryable_effectful_ack_loss_becomes_unknown_and_is_never_replayed() -> None:
-    tool = definition(
-        "vault.write",
-        location=ExecutorLocation.CLIENT,
-        risk=RiskClass.WRITE,
-        effect=SideEffectClass.WRITE,
-        concurrent=False,
-    )
-    tool_call = call(tool, 1)
-    client = AckLostClient(success("call_1", 1), queryable=False)
-    journal = MemoryJournal()
-    tool_kernel = client_kernel(tool, client, journal)
-
-    first = await tool_kernel.execute_batch((tool_call,), ManualCancellationToken())
-    second = await tool_kernel.execute_batch((tool_call,), ManualCancellationToken())
-    assert first[0].result.status is ToolResultStatus.UNKNOWN_OUTCOME
-    assert second[0].result.status is ToolResultStatus.UNKNOWN_OUTCOME
-    assert len(client.invocations) == 1
-    assert next(iter(journal.records.values())).state is JournalState.UNKNOWN
 
 
 class HookFake:

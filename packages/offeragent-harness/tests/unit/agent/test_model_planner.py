@@ -315,9 +315,9 @@ def test_catalog_is_canonical_immutable_and_excludes_harness_security_fields() -
 
 
 def test_skill_body_load_is_a_planning_barrier() -> None:
-    catalog = ToolPlanCatalog((_definition("skill.read"), _definition("glob")), max_calls=3)
+    catalog = ToolPlanCatalog((_definition("skill"), _definition("glob")), max_calls=3)
     skill_read = {
-        "name": "skill.read",
+        "name": "skill",
         "version": "1",
         "arguments": {"path": "daily-study-workflow"},
         "reason": "load the selected Skill body before following it",
@@ -331,7 +331,7 @@ def test_skill_body_load_is_a_planning_barrier() -> None:
 
     assert catalog.violations({"requiresWriteOutcome": False, "calls": [skill_read], "stopReason": None}) == ()
     assert catalog.violations({"requiresWriteOutcome": False, "calls": [skill_read, glob], "stopReason": None}) == (
-        "$.calls: a planning step that reads Skill instructions may contain only skill.read calls; "
+        "$.calls: a planning step that invokes a Skill may contain only skill calls; "
         "plan other tools after the Skill body is available",
     )
 

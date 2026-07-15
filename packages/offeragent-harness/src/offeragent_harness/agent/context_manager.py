@@ -343,7 +343,7 @@ class ContextManager:
 
         Conversation history is immutable session evidence.  It is intentionally
         distinct from Memory: it preserves exact user/assistant turn ordering,
-        while Memory remains retrieved and scoped auxiliary context.
+        while the fixed Vault Memory file remains bounded, scoped auxiliary context.
         """
 
         selected = tuple(conversation)
@@ -661,20 +661,11 @@ class ContextManager:
                 "required": state.write_obligation.required,
                 "reasons": list(state.write_obligation.reasons),
                 "satisfied": state.write_obligation.satisfied,
-                "intent": (
-                    None
-                    if state.write_obligation.intent is None
-                    else {
-                        "intentHash": state.write_obligation.intent.intent_hash,
-                        "targetPaths": list(state.write_obligation.intent.target_paths),
-                    }
-                ),
                 "outcomes": [
                     {
                         "toolCallId": outcome.tool_call_id,
                         "status": outcome.status.value,
                         "summary": outcome.summary,
-                        "coveredPaths": list(outcome.covered_paths),
                     }
                     for outcome in state.write_obligation.outcomes
                 ],
@@ -682,7 +673,6 @@ class ContextManager:
             "pending": {
                 "toolCallIds": sorted(state.pending.tool_call_ids),
                 "approvalIds": sorted(state.pending.approval_ids),
-                "clientInvocationIds": sorted(state.pending.client_invocation_ids),
                 "childRunIds": sorted(state.pending.child_run_ids),
             },
         }

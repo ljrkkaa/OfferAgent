@@ -36,8 +36,6 @@ export interface SkillView {
     readonly name: string;
     readonly description: string;
     readonly metadataHash: string;
-    readonly trustState: "verified" | "confirmed" | "confirmation_required";
-    readonly enabled: boolean;
 }
 
 export interface SkillStatusView {
@@ -366,24 +364,6 @@ export class ExtensionRuntimeManager {
         }, { signal });
     }
 
-    async rescanSkills(status: SkillStatusView, signal?: AbortSignal): Promise<SkillStatusView> {
-        const result = requireJsonObject(await this.client.request("skills/rescan", {
-            clientRequestId: requestId(), expectedRevision: status.revision,
-        }, { signal, timeoutMs: 120_000 }));
-        return parseSkillStatus(requireJsonObject(result.status));
-    }
-
-    async confirmSkill(skill: SkillView, expectedRevision: number, confirmed: boolean, signal?: AbortSignal): Promise<void> {
-        await this.client.request("skills/confirm-trust", {
-            clientRequestId: requestId(),
-            rootId: skill.rootId,
-            packagePath: skill.packagePath,
-            expectedMetadataHash: skill.metadataHash,
-            expectedRevision,
-            confirmed,
-        }, { signal, timeoutMs: 120_000 });
-    }
-
     async installShell(draft: ShellInstallDraft, signal?: AbortSignal): Promise<void> {
         validateShellDraft(draft);
         await this.client.request("shell/install", {
@@ -495,9 +475,6 @@ function parseSkill(raw: JsonValue): SkillView {
         name,
         description: text(value.description, "Skill description"),
         metadataHash: digest(value.metadataHash, "Skill metadata hash"),
-        trustState: oneOf(value.trustState,
-            ["verified", "confirmed", "confirmation_required"] as const, "Skill trust"),
-        enabled: value.enabled === true,
     };
 }
 

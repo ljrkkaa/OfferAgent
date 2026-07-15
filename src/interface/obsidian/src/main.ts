@@ -1,31 +1,25 @@
 import { randomBytes } from "node:crypto";
 import { Buffer } from "node:buffer";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 
 import {
     FileSystemAdapter,
     Modal,
     Notice,
     Plugin,
-    TAbstractFile,
     WorkspaceLeaf,
 } from "obsidian";
 
-import { ClientInvocationJournal } from "./local/client_invocation_journal";
-import { ObsidianClientToolBridge } from "./local/client_tool_bridge";
 import { LocalChatView, LOCAL_CHAT_VIEW } from "./local/chat_view";
 import type { ExtensionCommandMethod } from "./local/extension_settings";
-import { ObsidianContextBridge } from "./local/obsidian_context";
 import {
     DEFAULT_LOCAL_SETTINGS,
-    HeadlessVaultWriteStatusView,
     LocalOfferAgentSettings,
     LocalOfferAgentSettingTab,
     SerializedOperationQueue,
     modelCredentialProviderId,
     modelHealthMessage,
     modelRuntimePatch,
-    parseHeadlessVaultWriteStatus,
     parseLocalSettings,
     snapshotLocalSettings,
     usesProviderSecretStore,
@@ -34,29 +28,15 @@ import {
 import { canBackgroundStartRuntime, RuntimeBootstrap } from "./runtime/bootstrap";
 import { ChatStore, PersistedChatTabs, parsePersistedTabs } from "./runtime/chat_store";
 import { RELEASE_PUBLIC_KEYS } from "./runtime/generated_release_keyring";
-import {
-    ClientReverseHandlers,
-    HarnessClient,
-    REQUIRED_RUNTIME_CAPABILITIES,
-} from "./runtime/harness_client";
-import type { RuntimePrivilegeApprovalRequest } from "./runtime/installer";
+import { HarnessClient, REQUIRED_RUNTIME_CAPABILITIES } from "./runtime/harness_client";
 import { createRuntimeInstaller } from "./runtime/installer_mode";
 import { JsonObject, JsonValue, requireJsonObject } from "./runtime/json_rpc";
-import { HostDiscoveryLoader, NamedPipeClient, requestHostStop } from "./runtime/named_pipe";
+import { StdioWorkerTransport } from "./runtime/stdio_worker";
 import {
     PROTOCOL_SCHEMA_HASH,
     PROTOCOL_VERSION,
 } from "./runtime/generated_protocol_identity";
 import type {
-    ClientApprovalPresentParams,
-    ClientApprovalPresentResult,
-    ClientContextGetResult,
-    ClientContextSnapshot,
-    ClientToolCancelResult,
-    ClientToolCommitObserveResult,
-    ClientToolInvokeResult,
-    ClientToolLookupResult,
-    ClientToolPreviewResult,
     ProtocolCommandParams,
     ProtocolCommandResult,
     SecretsPutParams,
@@ -72,8 +52,6 @@ interface LocalPluginData {
 const EXTENSION_ADMIN_METHODS: ReadonlySet<ExtensionCommandMethod> = new Set<ExtensionCommandMethod>([
     "skills/list",
     "skills/status",
-    "skills/rescan",
-    "skills/confirm-trust",
     "shell/list",
     "shell/install",
     "shell/confirm",
@@ -92,8 +70,6 @@ export default class OfferAgentPlugin extends Plugin {
     settings: LocalOfferAgentSettings = { ...DEFAULT_LOCAL_SETTINGS };
     private data: LocalPluginData = { schemaVersion: 2, settings: this.settings, chatTabs: null };
     private runtime: RuntimeBootstrap | null = null;
-    private contextBridge: ObsidianContextBridge | null = null;
-    private clientBridge: ObsidianClientToolBridge | null = null;
     private chatStore: ChatStore | null = null;
     private chatClient: HarnessClient | null = null;
     private runtimeStart: Promise<void> | null = null;
@@ -112,7 +88,6 @@ export default class OfferAgentPlugin extends Plugin {
     async onload(): Promise<void> {
         this.vaultRoot = desktopVaultRoot(this);
         await this.loadLocalData();
-        this.contextBridge = new ObsidianContextBridge(this.app);
         const portable = await loadOrCreatePortableWorkspaceIdentity(this.vaultRoot);
         this.workspaceId = portable.portableWorkspaceId;
         this.runtime = this.createRuntime();
@@ -129,7 +104,6 @@ export default class OfferAgentPlugin extends Plugin {
             callback: () => void this.stopAllLocalRuntime(),
         });
         this.addSettingTab(new LocalOfferAgentSettingTab(this.app, this));
-        this.registerContextEvents();
 
         void this.beginRuntimeStart().catch((error) => new Notice(actionableError(error)));
     }
@@ -143,8 +117,7 @@ export default class OfferAgentPlugin extends Plugin {
         await this.chatStore?.dispose().catch(() => undefined);
         this.chatStore = null;
         this.chatClient = null;
-        // Plugin reload/disable detaches only. Host owns idle shutdown and active Runs continue.
-        await this.runtime?.stop({ shutdownWorker: false }).catch(() => undefined);
+        await this.runtime?.stop({ shutdownWorker: true }).catch(() => undefined);
         // stop() aborts an installer, reconnect sleep, or configuration restart.
         // Await those operations only after the abort boundary, otherwise unload
         // can wait forever for the very operation it needs to cancel.
@@ -180,10 +153,6 @@ export default class OfferAgentPlugin extends Plugin {
         this.chatStore = store;
         this.chatClient = client;
         return store;
-    }
-
-    async captureClientContext(): Promise<ClientContextSnapshot> {
-        return await this.requireContext().capture() as unknown as ClientContextSnapshot;
     }
 
     async readArtifactText(artifactId: string): Promise<string> {
@@ -283,6 +252,7 @@ export default class OfferAgentPlugin extends Plugin {
                 read_only: settings.permissionMode === "read-only" || settings.permissionMode === "plan",
                 workspace_trusted: settings.workspaceTrusted,
                 approve_vault_writes: !settings.autoApproveVaultWrites,
+                allow_bypass: settings.permissionMode === "bypass",
             },
             execution: {
                 shell_enabled: settings.shellEnabled,
@@ -290,7 +260,6 @@ export default class OfferAgentPlugin extends Plugin {
                 max_subagents_per_vault: settings.subagentsEnabled ? 8 : 0,
             },
             extensibility: {
-                skills_enabled: settings.enabledSkills.length > 0,
                 hooks_enabled: settings.hooksEnabled,
             },
             telemetry: { enabled: false, include_content: false },
@@ -395,37 +364,6 @@ export default class OfferAgentPlugin extends Plugin {
         return modelHealthMessage(settings, status, reason);
     }
 
-    async loadHeadlessVaultWriteStatus(signal?: AbortSignal): Promise<HeadlessVaultWriteStatusView> {
-        await this.ensureReady();
-        const result = await (this.runtime as RuntimeBootstrap).harness.request(
-            "vault/headless/status",
-            {},
-            { signal },
-        );
-        return parseHeadlessVaultWriteStatus(result);
-    }
-
-    async revokeHeadlessVaultWrite(
-        status: HeadlessVaultWriteStatusView,
-        signal?: AbortSignal,
-    ): Promise<HeadlessVaultWriteStatusView> {
-        if (!status.canRevoke || status.approvalId === null || status.revision < 1) {
-            throw new Error("当前没有可撤销的 Web headless Vault 写入授权");
-        }
-        await this.ensureReady();
-        const result = await (this.runtime as RuntimeBootstrap).harness.request(
-            "vault/headless/revoke",
-            {
-                clientRequestId: opaqueId("req_headless_revoke_"),
-                approvalId: status.approvalId,
-                expectedRevision: status.revision,
-                reason: "用户从 Obsidian 设置页显式撤销 Web headless Vault 写入授权",
-            },
-            { signal },
-        );
-        return parseHeadlessVaultWriteStatus(result);
-    }
-
     async extensionRequest<Method extends ExtensionCommandMethod>(
         method: Method,
         params: ProtocolCommandParams<Method>,
@@ -434,27 +372,6 @@ export default class OfferAgentPlugin extends Plugin {
         if (!EXTENSION_ADMIN_METHODS.has(method)) throw new Error("扩展面板请求了未授权的方法");
         await this.ensureReady();
         return (this.runtime as RuntimeBootstrap).harness.request(method, params, options);
-    }
-
-    selectedSkillNames(): readonly string[] {
-        return [...this.settings.enabledSkills];
-    }
-
-    async setSkillSelected(name: string, selected: boolean): Promise<void> {
-        if (!/^[a-z][a-z0-9-]{0,63}$/.test(name)) throw new Error("Skill 名称无效");
-        const previous = [...this.settings.enabledSkills];
-        const next = new Set(previous);
-        if (selected) next.add(name);
-        else next.delete(name);
-        this.settings.enabledSkills = [...next].sort();
-        try {
-            await this.saveLocalSettings();
-            await this.applyRuntimeSettings();
-        } catch (error) {
-            this.settings.enabledSkills = previous;
-            await this.saveLocalSettings().catch(() => undefined);
-            throw error;
-        }
     }
 
     extensionExecutionEnabled(kind: "shell" | "hooks"): boolean {
@@ -514,24 +431,12 @@ export default class OfferAgentPlugin extends Plugin {
         await this.chatStore?.dispose().catch(() => undefined);
         this.chatStore = null;
         this.chatClient = null;
-        await runtime.stop({ shutdownWorker: false });
+        await runtime.stop({ shutdownWorker: true });
         await Promise.all([
             pendingStart?.catch(() => undefined),
             pendingRestart?.catch(() => undefined),
         ]);
-        const installed = runtime.installedRuntime;
-        if (!installed) {
-            new Notice("OfferAgent Runtime 当前未运行");
-            return;
-        }
-        try {
-            const result = await requestHostStop(installed.hostExecutable, {
-                beforeLaunch: installed.beforeHostLaunch,
-            });
-            new Notice(result.status === "already_stopped" ? "OfferAgent Runtime 已停止" : "已停止所有 OfferAgent Runtime");
-        } catch (error) {
-            new Notice(`停止失败：${actionableError(error)}`);
-        }
+        new Notice("OfferAgent Runtime 已停止");
     }
 
     private createRuntime(): RuntimeBootstrap {
@@ -545,41 +450,14 @@ export default class OfferAgentPlugin extends Plugin {
             releasePublicKeys: RELEASE_PUBLIC_KEYS,
             ownerId: `workspace:${this.workspaceId}`,
             legacyOwnerId: `obsidian-${process.pid}`,
-            approvePrivilegeExpansion: (request, signal) => this.confirmRuntimePrivileges(request, signal),
         });
-        const handlers: ClientReverseHandlers = {
-            contextGet: async (params, signal) => await this.requireContext().handleContextGet(
-                params as unknown as JsonObject,
-                signal,
-            ) as unknown as ClientContextGetResult,
-            toolPreview: async (params, signal) => await this.requireClientBridge().preview(
-                params as unknown as JsonObject,
-                signal,
-            ) as unknown as ClientToolPreviewResult,
-            toolCommitObserve: async (params, signal) => await this.requireClientBridge().observeCommit(
-                params as unknown as JsonObject,
-                signal,
-            ) as unknown as ClientToolCommitObserveResult,
-            toolInvoke: async (params, signal) => await this.requireClientBridge().invoke(
-                params as unknown as JsonObject,
-                signal,
-            ) as unknown as ClientToolInvokeResult,
-            toolLookup: async (params, signal) => await this.requireClientBridge().lookup(
-                params as unknown as JsonObject,
-                signal,
-            ) as unknown as ClientToolLookupResult,
-            toolCancel: async (params, signal) => await this.requireClientBridge().cancel(
-                params as unknown as JsonObject,
-                signal,
-            ) as unknown as ClientToolCancelResult,
-            approvalPresent: (params, signal) => this.presentApproval(params, signal),
-        };
         return new RuntimeBootstrap(installer, {
             create: (installed, onDisconnected) => new HarnessClient(
-                new NamedPipeClient(new HostDiscoveryLoader(installed.hostExecutable, this.vaultRoot, {
-                    beforeLaunch: installed.beforeHostLaunch,
-                    timeoutMs: installed.hostDiscoveryTimeoutMs,
-                })),
+                new StdioWorkerTransport(
+                    installed.workerExecutable,
+                    this.vaultRoot,
+                    installed.version,
+                ),
                 {
                     workspaceId: this.workspaceId,
                     identity: {
@@ -591,58 +469,17 @@ export default class OfferAgentPlugin extends Plugin {
                     },
                     requiredCapabilities: REQUIRED_RUNTIME_CAPABILITIES,
                 },
-                handlers,
                 { onDisconnected },
             ),
         });
     }
 
-    private confirmRuntimePrivileges(request: RuntimePrivilegeApprovalRequest, signal: AbortSignal): Promise<boolean> {
-        return new Promise<boolean>((resolvePromise) => {
-            if (signal.aborted) {
-                resolvePromise(false);
-                return;
-            }
-            let modal: RuntimePrivilegeApprovalModal;
-            const onAbort = () => modal.cancelForRuntimeShutdown();
-            const settle = (approved: boolean) => {
-                signal.removeEventListener("abort", onAbort);
-                resolvePromise(approved);
-            };
-            modal = new RuntimePrivilegeApprovalModal(this, request, settle);
-            signal.addEventListener("abort", onAbort, { once: true });
-            if (signal.aborted) {
-                onAbort();
-                return;
-            }
-            modal.open();
-        });
-    }
-
     private async startRuntime(): Promise<void> {
-        const identity = await (this.runtime as RuntimeBootstrap).start();
+        await (this.runtime as RuntimeBootstrap).start();
         if (this.unloading || this.runtimeExplicitlyStopped) {
             await this.runtime?.stop({ shutdownWorker: false }).catch(() => undefined);
             return;
         }
-        const localAppData = process.env.LOCALAPPDATA;
-        if (!localAppData) throw new Error("Windows LOCALAPPDATA 不可用");
-        const journal = new ClientInvocationJournal(
-            join(localAppData, "OfferAgent", "workspaces", identity.workspaceInstanceId, "client-invocations.json"),
-            identity.workspaceInstanceId,
-        );
-        this.clientBridge = new ObsidianClientToolBridge(
-            this.app,
-            this.requireContext(),
-            journal,
-            {
-                present: async () => {
-                    new Notice("OfferAgent 有一项操作等待审批");
-                    await this.activateChat();
-                    return true;
-                },
-            },
-        );
         const settings = snapshotLocalSettings(this.settings);
         await this.enqueueRuntimeSettingsApply(settings, this.settingsGeneration)
             .catch((error) => new Notice(actionableError(error)));
@@ -689,7 +526,7 @@ export default class OfferAgentPlugin extends Plugin {
         if (this.unloading || this.runtimeExplicitlyStopped) return;
         await this.runtime.start();
         if (this.unloading || this.runtimeExplicitlyStopped) {
-            await this.runtime.stop({ shutdownWorker: false }).catch(() => undefined);
+            await this.runtime.stop({ shutdownWorker: true }).catch(() => undefined);
             return;
         }
         const refreshed = requireJsonObject(await this.runtime.harness.request(
@@ -781,47 +618,6 @@ export default class OfferAgentPlugin extends Plugin {
         return this.localDataWrites.run(() => this.saveData(snapshot));
     }
 
-    private registerContextEvents(): void {
-        const noteFileChanged = (file: TAbstractFile): void => {
-            if (!safeVaultRelativePath(file.path)) return;
-            this.requireContext().noteFileChanged(file.path);
-        };
-        this.registerEvent(this.app.vault.on("create", noteFileChanged));
-        this.registerEvent(this.app.vault.on("modify", noteFileChanged));
-        this.registerEvent(this.app.vault.on("delete", noteFileChanged));
-        this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
-            noteFileChanged(file);
-            if (safeVaultRelativePath(oldPath)) this.requireContext().noteFileChanged(oldPath);
-        }));
-        this.registerEvent(this.app.workspace.on("editor-change", () => this.requireContext().noteEditorChanged()));
-        this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.requireContext().noteEditorChanged()));
-        this.registerEvent(this.app.metadataCache.on("changed", (file) => {
-            this.requireContext().noteMetadataChanged(file);
-        }));
-        this.registerEvent(this.app.metadataCache.on("resolved", () => this.requireContext().noteMetadataChanged()));
-    }
-
-    private async presentApproval(
-        params: ClientApprovalPresentParams,
-        signal: AbortSignal,
-    ): Promise<ClientApprovalPresentResult> {
-        signal.throwIfAborted();
-        return await this.requireClientBridge().presentApproval(
-            params as unknown as JsonObject,
-            signal,
-        ) as unknown as ClientApprovalPresentResult;
-    }
-
-    private requireContext(): ObsidianContextBridge {
-        if (!this.contextBridge) throw new Error("Obsidian Context Bridge 尚未就绪");
-        return this.contextBridge;
-    }
-
-    private requireClientBridge(): ObsidianClientToolBridge {
-        if (!this.clientBridge) throw new Error("Obsidian Client Tool Bridge 尚未就绪");
-        return this.clientBridge;
-    }
-
     private async activateChat(): Promise<void> {
         let leaf = this.app.workspace.getLeavesOfType(LOCAL_CHAT_VIEW)[0];
         if (!leaf) {
@@ -857,60 +653,6 @@ class DiagnosticsModal extends Modal {
         const errors = Array.isArray(this.snapshot.recentErrors) ? this.snapshot.recentErrors : [];
         this.contentEl.createEl("p", { text: `最近脱敏错误：${errors.length}` });
         this.contentEl.createEl("p", { text: "遥测关闭；诊断不会自动上传。" });
-    }
-}
-
-class RuntimePrivilegeApprovalModal extends Modal {
-    private settled = false;
-
-    constructor(
-        private readonly plugin: OfferAgentPlugin,
-        private readonly request: RuntimePrivilegeApprovalRequest,
-        private readonly resolvePromise: (approved: boolean) => void,
-    ) {
-        super(plugin.app);
-    }
-
-    onOpen(): void {
-        this.setTitle("OfferAgent Runtime 权限确认");
-        this.contentEl.createEl("p", {
-            text: this.request.currentRuntimeVersion === null
-                ? `首次安装 Runtime ${this.request.candidateRuntimeVersion} 需要明确授予以下权限。`
-                : `Runtime ${this.request.currentRuntimeVersion} → ${this.request.candidateRuntimeVersion} 包含新增或无法自动证明为收窄的权限。`,
-        });
-        const list = this.contentEl.createEl("ul", { cls: "offeragent-runtime-privilege-diff" });
-        for (const line of this.request.summary.slice(0, 12)) list.createEl("li", { text: line.slice(0, 180) });
-        this.contentEl.createEl("p", {
-            text: `完整签名差异指纹：${this.request.diffHash}`,
-            cls: "offeragent-runtime-privilege-hash",
-        });
-        this.contentEl.createEl("p", {
-            text: "此确认仅对当前签名版本和上述完整差异有效，五分钟内一次性使用。",
-        });
-        const actions = this.contentEl.createDiv({ cls: "modal-button-container" });
-        const cancel = actions.createEl("button", { text: "取消" });
-        const approve = actions.createEl("button", { text: "确认授予并继续", cls: "mod-cta" });
-        cancel.addEventListener("click", () => this.finish(false));
-        approve.addEventListener("click", () => this.finish(true));
-    }
-
-    onClose(): void {
-        this.contentEl.empty();
-        if (!this.settled) {
-            this.settled = true;
-            this.resolvePromise(false);
-        }
-    }
-
-    cancelForRuntimeShutdown(): void {
-        this.finish(false);
-    }
-
-    private finish(approved: boolean): void {
-        if (this.settled) return;
-        this.settled = true;
-        this.resolvePromise(approved);
-        this.close();
     }
 }
 

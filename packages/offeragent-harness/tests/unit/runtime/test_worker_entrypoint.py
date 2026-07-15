@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -41,17 +42,16 @@ class FakeCompositionRoot:
         return self.application
 
 
-def bootstrap(*, diagnostic_stdio: bool = False) -> WorkerBootstrap:
+def bootstrap() -> WorkerBootstrap:
     return WorkerBootstrap(
         "wsi_12345678-1234-4234-8234-123456789abc",
         Path(r"C:\Vault"),
         Path(r"C:\Users\user\AppData\Local\OfferAgent\workspaces\id"),
-        diagnostic_stdio,
     )
 
 
 @pytest.mark.asyncio
-async def test_worker_consumes_exactly_one_composition_root_for_named_pipe_production() -> None:
+async def test_worker_consumes_exactly_one_composition_root_for_direct_stdio() -> None:
     application = FakeApplication()
     root = FakeCompositionRoot(application)
     entrypoint = WorkerEntrypoint(root)
@@ -67,22 +67,7 @@ async def test_worker_consumes_exactly_one_composition_root_for_named_pipe_produ
 
 
 @pytest.mark.asyncio
-async def test_stdio_is_impossible_without_explicit_diagnostic_bootstrap() -> None:
+async def test_worker_rejects_every_transport_other_than_direct_stdio() -> None:
     entrypoint = WorkerEntrypoint(FakeCompositionRoot(FakeApplication()))
-    with pytest.raises(WorkerEntrypointError, match="explicit diagnostic"):
-        await entrypoint.start(bootstrap(), transport=WorkerTransportMode.DIAGNOSTIC_STDIO)
-
-    diagnostic = WorkerEntrypoint(FakeCompositionRoot(FakeApplication()))
-    application = await diagnostic.start(
-        bootstrap(diagnostic_stdio=True),
-        transport=WorkerTransportMode.DIAGNOSTIC_STDIO,
-    )
-    assert application.ready
-    await diagnostic.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_diagnostic_bootstrap_cannot_enter_production_transport() -> None:
-    entrypoint = WorkerEntrypoint(FakeCompositionRoot(FakeApplication()))
-    with pytest.raises(WorkerEntrypointError, match="cannot enter"):
-        await entrypoint.start(bootstrap(diagnostic_stdio=True))
+    with pytest.raises(WorkerEntrypointError, match="unsupported Worker transport"):
+        await entrypoint.start(bootstrap(), transport=cast(WorkerTransportMode, "named-pipe"))

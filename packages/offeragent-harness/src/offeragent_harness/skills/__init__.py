@@ -1,4 +1,4 @@
-"""Local layered Skills discovery, trust, loading and Tool Kernel adapters."""
+"""Local layered Skills discovery, lazy invocation, and Tool Kernel adapters."""
 
 from .catalog import SkillCatalog, SkillCatalogStatus
 from .models import (
@@ -16,10 +16,8 @@ from .models import (
     SkillRoot,
     SkillSelection,
     SkillSummary,
-    SkillTrustState,
     UntrustedSkillInstruction,
 )
-from .state import EntitySkillStateStore, InMemorySkillStateStore
 from .tools import (
     SKILL_TOOL_VERSION,
     SkillAuthorityProvider,
@@ -29,8 +27,6 @@ from .tools import (
 
 __all__ = [
     "SKILL_TOOL_VERSION",
-    "EntitySkillStateStore",
-    "InMemorySkillStateStore",
     "LoadedSkill",
     "SkillAuthority",
     "SkillAuthorityProvider",
@@ -49,7 +45,6 @@ __all__ = [
     "SkillSelection",
     "SkillSummary",
     "SkillToolExecutor",
-    "SkillTrustState",
     "UntrustedSkillInstruction",
     "skill_tool_definitions",
 ]

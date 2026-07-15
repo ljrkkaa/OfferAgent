@@ -1,21 +1,5 @@
 {
   "examples": {
-    "examples/client-tool-invoke.request.json": {
-      "kind": "request",
-      "method": "client/tool/invoke"
-    },
-    "examples/client-tool-invoke.response.json": {
-      "kind": "response",
-      "method": "client/tool/invoke"
-    },
-    "examples/client-tool-lookup.request.json": {
-      "kind": "request",
-      "method": "client/tool/lookup"
-    },
-    "examples/client-tool-lookup.response.json": {
-      "kind": "response",
-      "method": "client/tool/lookup"
-    },
     "examples/initialize.request.json": {
       "kind": "request",
       "method": "initialize"
@@ -42,29 +26,13 @@
     }
   },
   "files": {
-    "examples/client-tool-invoke.request.json": {
-      "sha256": "sha256:5a0bd7bb1147541a6074a08396782896b20ceb94aa5e319aba31c8d578a3dcd7",
-      "sizeBytes": 488
-    },
-    "examples/client-tool-invoke.response.json": {
-      "sha256": "sha256:08c90c37457758ad8bc7b0279a09fa2c1a41ad07fe4c26df1bf1ba4f3b3375a3",
-      "sizeBytes": 1626
-    },
-    "examples/client-tool-lookup.request.json": {
-      "sha256": "sha256:4a99e8ba9f83a32276d553d807b68079b01c69182824e76bfca0adfcf123eb42",
-      "sizeBytes": 146
-    },
-    "examples/client-tool-lookup.response.json": {
-      "sha256": "sha256:064d052d34a3bcefbaa43a86d7b120093d3728aa2f4f00935bf53592dd29e49b",
-      "sizeBytes": 129
-    },
     "examples/initialize.request.json": {
-      "sha256": "sha256:9c1e5d02bcad85e7963f8b3a2ae5f7665e240b48b83066001760bffad36a0c77",
-      "sizeBytes": 336
+      "sha256": "sha256:871b57303e98b38ee195bb24fd855857753e8c4cc5ceb3b0281e03e8b6e91fd7",
+      "sizeBytes": 275
     },
     "examples/initialize.response.json": {
-      "sha256": "sha256:f8819e6296f8c604f7e51f7e5cb9245eca7c0754856cd6ee493af435b46bbce8",
-      "sizeBytes": 920
+      "sha256": "sha256:ac7b75529b1bc65b2ef8a75828abe51061a8b157a8d461072d2bc9bed8c28e2f",
+      "sizeBytes": 828
     },
     "examples/rpc-cancel.notification.json": {
       "sha256": "sha256:0b95354d44f009fc0dee3afe519288c1428015c874253bfd3d0f92c61074c0e2",
@@ -75,22 +43,22 @@
       "sizeBytes": 1011
     },
     "examples/turn-start.request.json": {
-      "sha256": "sha256:7dff74702df655e2c51ecdba8287278ae65800e9cf50372f37a9254386d566b1",
-      "sizeBytes": 708
+      "sha256": "sha256:07e84aafa61299b4e34737b33409fed8bd192a191d127cfa4619d91caf9294e5",
+      "sizeBytes": 402
     },
     "examples/turn-start.response.json": {
       "sha256": "sha256:9ba30042ddf17b1cee7fd0ff5a79876a29ba06792f0ae4d682b1c7e9401480b0",
       "sizeBytes": 150
     },
     "offeragent-protocol-v1.schema.json": {
-      "sha256": "sha256:15e354b3aff2e830c7b799610e0da1d79ddc2659cf54c9a340fae7ac6bc12875",
-      "sizeBytes": 252749
+      "sha256": "sha256:7c2d0bee45032d24289a368eb276d502f956662c8252f39d54a40276a4d145ec",
+      "sizeBytes": 210239
     }
   },
   "generatorVersion": "1",
   "manifestVersion": 1,
   "protocolVersion": "1.0",
   "schemaBundle": "offeragent-protocol-v1.schema.json",
-  "schemaHash": "sha256:15e354b3aff2e830c7b799610e0da1d79ddc2659cf54c9a340fae7ac6bc12875",
+  "schemaHash": "sha256:7c2d0bee45032d24289a368eb276d502f956662c8252f39d54a40276a4d145ec",
   "schemaVersion": "1"
 }

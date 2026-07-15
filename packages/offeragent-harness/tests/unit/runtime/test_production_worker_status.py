@@ -18,6 +18,8 @@ from offeragent_harness.runtime.production_worker_composition import _effective_
         (WirePermissionMode.TRUSTED_WORKSPACE, False, False, PermissionMode.READ_ONLY),
         (WirePermissionMode.NORMAL, True, True, PermissionMode.READ_ONLY),
         (WirePermissionMode.PLAN, True, False, PermissionMode.PLAN),
+        (WirePermissionMode.BYPASS, False, True, PermissionMode.BYPASS),
+        (WirePermissionMode.BYPASS, False, False, PermissionMode.READ_ONLY),
     ],
 )
 def test_effective_permission_requires_explicit_workspace_trust_without_losing_plan(

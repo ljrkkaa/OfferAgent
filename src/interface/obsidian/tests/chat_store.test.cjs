@@ -62,7 +62,6 @@ const runConfig = {
     model: "qwen-test",
     reasoningEffort: "medium",
     permissionMode: "normal",
-    enabledSkills: [],
 };
 
 const SESSION = "ses_01J10000000000000000000000";
@@ -150,8 +149,8 @@ test("history reopen and tab selection hydrate durable events from the reducer c
 
     const opened = await store.openSession(SESSION);
     assert.equal(opened.title, "Durable history");
-    assert.deepEqual(client.reducer.state.runs.get(RUN).userBlocks, ["persisted question"]);
-    assert.deepEqual(client.reducer.state.runs.get(RUN).assistantBlocks, ["persisted answer"]);
+    assert.deepEqual(client.reducer.state.runs.get(RUN).timeline.find((item) => item.kind === "user_message").blocks, ["persisted question"]);
+    assert.deepEqual(client.reducer.state.runs.get(RUN).timeline.find((item) => item.kind === "assistant_message").blocks, ["persisted answer"]);
     assert.deepEqual(hydrationCalls.filter(([method]) => method === "events/replay")[0][1].runCursors, { [RUN]: 0 });
 
     await store.createTab();
@@ -166,7 +165,7 @@ test("history reopen and tab selection hydrate durable events from the reducer c
     await store.openSession(SESSION);
     assert.equal(store.snapshot.tabs.filter((tab) => tab.sessionId === SESSION).length, 1);
     assert.deepEqual(hydrationCalls.filter(([method]) => method === "events/replay")[2][1].runCursors, { [RUN]: 3 });
-    assert.deepEqual(client.reducer.state.runs.get(RUN).assistantBlocks, ["persisted answer"]);
+    assert.deepEqual(client.reducer.state.runs.get(RUN).timeline.find((item) => item.kind === "assistant_message").blocks, ["persisted answer"]);
 });
 
 test("Store and client reconstruction replay persisted tabs from their respective applied cursors", async () => {
@@ -194,7 +193,7 @@ test("Store and client reconstruction replay persisted tabs from their respectiv
     const rebuiltStore = new ChatStore(sameClient, persistence);
     await rebuiltStore.initialize();
     assert.deepEqual(sameClientCursors, [{ [RUN]: 0 }, { [RUN]: 2 }]);
-    assert.deepEqual(sameClient.reducer.state.runs.get(RUN).assistantBlocks, ["rebuild answer"]);
+    assert.deepEqual(sameClient.reducer.state.runs.get(RUN).timeline.find((item) => item.kind === "assistant_message").blocks, ["rebuild answer"]);
     await rebuiltStore.dispose();
 
     const freshClientCursors = [];
@@ -208,7 +207,7 @@ test("Store and client reconstruction replay persisted tabs from their respectiv
     const pluginRebuiltStore = new ChatStore(freshClient, persistence);
     await pluginRebuiltStore.initialize();
     assert.deepEqual(freshClientCursors, [{ [RUN]: 0 }]);
-    assert.deepEqual(freshClient.reducer.state.runs.get(RUN).assistantBlocks, ["rebuild answer"]);
+    assert.deepEqual(freshClient.reducer.state.runs.get(RUN).timeline.find((item) => item.kind === "assistant_message").blocks, ["rebuild answer"]);
 });
 
 test("concurrent history opens single-flight an empty Session hydration and create one tab", async () => {
@@ -269,7 +268,7 @@ test("live Run created during replay is selected only after the durable Session 
     assert.equal(opened.title, "After live Run");
     assert.equal(opened.selectedRunId, RUN);
     assert.equal(store.activeTab.selectedRunId, RUN);
-    assert.equal(client.reducer.state.runs.get(RUN).status, "turn.started");
+    assert.equal(client.reducer.state.runs.get(RUN).status, "running");
     assert.equal(sessionGets, 3);
     assert.equal(replays, 2);
 });
@@ -352,16 +351,97 @@ test("send creates a Session then submits one typed turn/start command", async (
     const store = new ChatStore(client, memoryPersistence());
     await store.initialize();
     await store.updateDraft(store.activeTab.tabId, "draft");
-    const result = await store.send("  hello  ", { runConfig, context: null });
+    const result = await store.send("  hello  ", { runConfig });
 
     assert.equal(result.runId, "run_01J00000000000000000000000");
     assert.deepEqual(calls.map(([method]) => method), ["session/create", "turn/start"]);
     assert.equal(calls[1][1].input[0].text, "hello");
     assert.equal(calls[1][1].runConfig.provider, "local");
-    assert.deepEqual(calls[1][1].writeIntent, { kind: "none" });
+    assert.deepEqual(
+        Object.keys(calls[1][1]).sort(),
+        ["deadline", "idempotencyKey", "input", "runConfig", "sessionId", "turnId"],
+    );
     assert.match(calls[1][1].turnId, /^turn_[0-9a-f]{32}$/);
     assert.equal(store.activeTab.draft, "");
     assert.equal(store.activeTab.sessionId, "ses_01J00000000000000000000000");
+});
+
+test("send immediately exposes a transient user submission and reconciles it by exact Turn id", async () => {
+    const { ChatStore } = loadModule("chat_store.ts");
+    let receivedStart;
+    let releaseStart;
+    const startGate = new Promise((resolve) => { releaseStart = resolve; });
+    const client = createClient(async (method, params) => {
+        assert.equal(method, "turn/start");
+        receivedStart = params;
+        await startGate;
+        return {
+            sessionId: params.sessionId,
+            turnId: params.turnId,
+            runId: "run_01J00000000000000000000033",
+            accepted: true,
+            duplicate: false,
+        };
+    });
+    const store = new ChatStore(client, memoryPersistence({
+        schemaVersion: 1,
+        activeTabId: "tab_pending",
+        tabs: [{
+            tabId: "tab_pending",
+            sessionId: SESSION,
+            title: "Pending",
+            draft: "",
+            selectedRunId: null,
+        }],
+    }));
+    await store.initialize();
+
+    const send = store.send("show this immediately", {
+        runConfig,
+    });
+    assert.deepEqual(store.snapshot.pendingSubmissions, [{
+        tabId: "tab_pending",
+        turnId: store.snapshot.pendingSubmissions[0].turnId,
+        text: "show this immediately",
+    }]);
+    assert.match(store.snapshot.pendingSubmissions[0].turnId, /^turn_[0-9a-f]{32}$/);
+
+    await new Promise((resolve) => setImmediate(resolve));
+    client.reducer.accept({
+        ...runEvent(1, "turn.started", { input: [{ type: "text", text: "show this immediately" }] }),
+        turnId: receivedStart.turnId,
+        runId: "run_01J00000000000000000000033",
+        rootRunId: "run_01J00000000000000000000033",
+    });
+    assert.equal(store.snapshot.pendingSubmissions.length, 0);
+    assert.deepEqual(
+        client.reducer.state.runs.get("run_01J00000000000000000000033").timeline
+            .find((item) => item.kind === "user_message").blocks,
+        ["show this immediately"],
+    );
+
+    releaseStart();
+    await send;
+});
+
+test("failed pre-acceptance send removes its transient submission", async () => {
+    const { ChatStore } = loadModule("chat_store.ts");
+    const client = createClient(async () => { throw new Error("runtime unavailable"); });
+    const store = new ChatStore(client, memoryPersistence({
+        schemaVersion: 1,
+        activeTabId: "tab_rejected",
+        tabs: [{
+            tabId: "tab_rejected",
+            sessionId: SESSION,
+            title: "Rejected",
+            draft: "",
+            selectedRunId: null,
+        }],
+    }));
+    await store.initialize();
+
+    await assert.rejects(store.send("will fail", { runConfig }), /runtime unavailable/);
+    assert.equal(store.snapshot.pendingSubmissions.length, 0);
 });
 
 test("draft persistence stays on its originating tab and does not emit a render snapshot", async () => {
@@ -480,71 +560,6 @@ test("send refuses a second root Turn while the Session has a nonterminal Run", 
 
     await assert.rejects(store.send("duplicate", { runConfig }), /仍在运行/);
     assert.equal(requests, 0);
-});
-
-test("send binds an explicit Vault write requirement to canonical target paths", async () => {
-    const { ChatStore } = loadModule("chat_store.ts");
-    let startParams;
-    const client = createClient(async (method, params) => {
-        assert.equal(method, "turn/start");
-        startParams = params;
-        return {
-            sessionId: params.sessionId,
-            turnId: params.turnId,
-            runId: "run_01J00000000000000000000001",
-            accepted: true,
-            duplicate: false,
-        };
-    });
-    const persistence = memoryPersistence({
-        schemaVersion: 1,
-        activeTabId: "tab_01",
-        tabs: [{
-            tabId: "tab_01",
-            sessionId: "ses_01J00000000000000000000000",
-            title: "Write",
-            draft: "",
-            selectedRunId: null,
-        }],
-    });
-    const store = new ChatStore(client, persistence);
-    await store.initialize();
-    await store.send("write", {
-        runConfig,
-        writeIntent: {
-            kind: "vault_write_required",
-            targetPaths: ["notes/summary.md", "notes/offer.md", "notes/summary.md"],
-        },
-    });
-
-    assert.deepEqual(startParams.writeIntent, {
-        kind: "vault_write_required",
-        targetPaths: ["notes/offer.md", "notes/summary.md"],
-        intentHash: "sha256:fa5a23b66ecbf251c33f8a0f46e3c719d416d3b1109ecdb0baed08466f3b9490",
-    });
-    await assert.rejects(
-        store.send("escape", {
-            runConfig,
-            writeIntent: { kind: "vault_write_required", targetPaths: ["../outside.md"] },
-        }),
-        /unsafe write intent Vault path/,
-    );
-});
-
-test("write intent uses Unicode-scalar path order and the cross-language canonical hash vector", () => {
-    const { buildWriteIntent } = loadModule("chat_store.ts");
-    assert.deepEqual(buildWriteIntent({
-        kind: "vault_write_required",
-        targetPaths: ["notes/😀.md", "notes/\ue000.md"],
-    }), {
-        kind: "vault_write_required",
-        targetPaths: ["notes/\ue000.md", "notes/😀.md"],
-        intentHash: "sha256:30f42b95f8a9f84f5794d603e05de23bb6260532190ac6826bae7c2958f17bbb",
-    });
-    assert.throws(
-        () => buildWriteIntent({ kind: "vault_write_required", targetPaths: ["notes/\ud800.md"] }),
-        /unsafe write intent Vault path/,
-    );
 });
 
 test("semantic events update the selected Run without UI terminal heuristics", async () => {

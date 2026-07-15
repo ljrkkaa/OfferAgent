@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
-import difflib
 import hashlib
 import msvcrt
 import os
@@ -12,13 +11,12 @@ from collections import deque
 from collections.abc import AsyncIterator, Mapping, Sequence
 from ctypes import wintypes
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
 from offeragent_harness.config import HarnessConfig
-from offeragent_harness.foundation import vault_write_intent_hash
 from offeragent_harness.models import (
     ModelEvent,
     ModelEventKind,
@@ -36,12 +34,6 @@ from offeragent_harness.protocol.messages import (
     ApprovalResolveResult,
     ArtifactEncoding,
     ArtifactReadResult,
-    ClientToolCommitObserveParams,
-    ClientToolCommitObserveResult,
-    ClientToolCommitPathState,
-    ClientToolPathState,
-    ClientToolPreviewParams,
-    ClientToolPreviewResult,
     InitializeResult,
     SessionCreateResult,
     TurnStartResult,
@@ -205,14 +197,6 @@ class _VaultWriteFakeModel:
         elif request.purpose is ModelPurpose.COMPOSING:
             yield ModelEvent(request.request_id, 2, ModelEventKind.TEXT_DELTA, text="本地 Vault 事务结果已核验。")
             sequence = 3
-        elif request.purpose is ModelPurpose.MEMORY:
-            yield ModelEvent(
-                request.request_id,
-                2,
-                ModelEventKind.STRUCTURED_OUTPUT,
-                data={"proposals": []},
-            )
-            sequence = 3
         elif request.purpose is ModelPurpose.GROUNDING:
             sequence = 2
         else:
@@ -231,14 +215,7 @@ class _VaultWriteFakeModel:
         )
 
 
-class _ObsidianPreviewDispatcher:
-    """Read-only Obsidian-side authority used by the real reverse Pipe."""
-
-    def __init__(self, vault_root: Path) -> None:
-        self._vault_root = vault_root
-        self.previews: list[dict[str, Any]] = []
-        self.commit_observations: list[dict[str, Any]] = []
-
+class _RejectingClientDispatcher:
     def require_ready(self) -> None:
         return None
 
@@ -250,135 +227,9 @@ class _ObsidianPreviewDispatcher:
         *,
         context: object | None = None,
     ) -> object:
-        del context
+        del params, context
         cancellation.checkpoint()
-        if method == "client/tool/preview":
-            return self._preview(ClientToolPreviewParams.model_validate(params)).to_wire()
-        if method == "client/tool/commit-observe":
-            return self._observe_commit(ClientToolCommitObserveParams.model_validate(params)).to_wire()
-        raise AssertionError(f"unexpected production reverse request: {method}")
-
-    def _preview(self, params: ClientToolPreviewParams) -> ClientToolPreviewResult:
-        arguments = cast(dict[str, Any], thaw_json(params.arguments))
-        assert params.name == "obsidian.vault.transaction"
-        assert set(arguments) == {"transactionId", "operations"}
-        operations = cast(list[dict[str, Any]], arguments["operations"])
-        assert len(operations) == 1
-        operation = operations[0]
-        path, before, after = self._planned_contents(operation)
-        before_hash = ABSENT_HASH if before is None else content_hash(before)
-        after_hash = content_hash(after)
-        assert operation["expectedHash"] == before_hash
-        diff = "".join(
-            difflib.unified_diff(
-                (before or b"").decode("utf-8").splitlines(keepends=True),
-                after.decode("utf-8").splitlines(keepends=True),
-                fromfile=f"a/{path}" if before is not None else "/dev/null",
-                tofile=f"b/{path}",
-            )
-        )
-        assert diff
-        record = {
-            "invocationId": params.invocation_id,
-            "toolCallId": params.tool_call_id,
-            "operation": dict(operation),
-            "beforeHash": before_hash,
-            "afterHash": after_hash,
-            "diff": diff,
-        }
-        self.previews.append(record)
-        return ClientToolPreviewResult(
-            invocation_id=params.invocation_id,
-            tool_call_id=params.tool_call_id,
-            state_hash=canonical_json_sha256({"path": path, "beforeHash": before_hash}),
-            after_state_hash=canonical_json_sha256({"path": path, "afterHash": after_hash}),
-            paths=[path],
-            diff=diff,
-            diff_sha256=content_hash(diff.encode("utf-8")),
-            has_unsaved_editors=False,
-            has_open_editors=False,
-            path_states=[
-                ClientToolPathState(
-                    path=path,
-                    before_hash=before_hash,
-                    after_hash=after_hash,
-                    unsaved_editor=False,
-                    open_editor=False,
-                )
-            ],
-        )
-
-    def _observe_commit(self, params: ClientToolCommitObserveParams) -> ClientToolCommitObserveResult:
-        states: list[ClientToolCommitPathState] = []
-        for path in params.paths:
-            target = self._target(path)
-            observed_hash = content_hash(_read_like_obsidian(target)) if target.is_file() else ABSENT_HASH
-            states.append(
-                ClientToolCommitPathState(
-                    path=path,
-                    observed_hash=observed_hash,
-                    unsaved_editor=False,
-                    open_editor=False,
-                )
-            )
-        self.commit_observations.append(
-            {
-                "invocationId": params.invocation_id,
-                "toolCallId": params.tool_call_id,
-                "paths": list(params.paths),
-                "hashes": [item.observed_hash for item in states],
-            }
-        )
-        return ClientToolCommitObserveResult(
-            invocation_id=params.invocation_id,
-            tool_call_id=params.tool_call_id,
-            paths=list(params.paths),
-            has_unsaved_editors=False,
-            has_open_editors=False,
-            path_states=states,
-        )
-
-    def _planned_contents(self, operation: Mapping[str, Any]) -> tuple[str, bytes | None, bytes]:
-        path = cast(str, operation["path"])
-        target = self._target(path)
-        before = target.read_bytes() if target.is_file() else None
-        kind = operation["op"]
-        if kind == "create":
-            assert before is None
-            after = cast(str, operation["content"]).encode("utf-8")
-        elif kind == "append":
-            assert before is not None
-            after = before + cast(str, operation["content"]).encode("utf-8")
-        elif kind == "replace":
-            assert before is not None
-            text = before.decode("utf-8")
-            find = cast(str, operation["find"])
-            assert text.count(find) == 1
-            after = text.replace(find, cast(str, operation["replace"]), 1).encode("utf-8")
-        elif kind == "patch":
-            assert before is not None
-            lines = before.decode("utf-8").splitlines(keepends=True)
-            edits = cast(list[dict[str, Any]], operation["edits"])
-            ranges = sorted(
-                (
-                    cast(int, edit["startLine"]),
-                    cast(int, edit["endLine"]),
-                    cast(str, edit["replacement"]),
-                )
-                for edit in edits
-            )
-            for start, end, replacement in reversed(ranges):
-                assert 1 <= start <= end <= len(lines)
-                lines[start - 1 : end] = replacement.splitlines(keepends=True)
-            after = "".join(lines).encode("utf-8")
-        else:
-            raise AssertionError(f"non-public operation reached Obsidian preview: {kind}")
-        return path, before, after
-
-    def _target(self, path: str) -> Path:
-        relative = PurePosixPath(path)
-        assert not relative.is_absolute() and ".." not in relative.parts
-        return self._vault_root.joinpath(*relative.parts)
+        raise AssertionError(f"Worker must not delegate tools to the client: {method}")
 
 
 def _development_web_assets() -> tuple[LoopbackAsset, ...]:
@@ -397,7 +248,6 @@ def _development_web_assets() -> tuple[LoopbackAsset, ...]:
 async def _connect_pipe(
     application: ProductionWorkerApplication,
     workspace_id: str,
-    reverse_dispatcher: _ObsidianPreviewDispatcher,
 ) -> tuple[DuplexJsonRpcConnection, InitializeResult]:
     material = DiscoveryMaterialStore(
         application.state_directory / "transport",
@@ -408,7 +258,9 @@ async def _connect_pipe(
     connection = DuplexJsonRpcConnection(
         stream,
         role=ConnectionRole.CLIENT,
-        dispatcher=reverse_dispatcher,
+        dispatcher=_RejectingClientDispatcher(),
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
         connection_id="pipe-production-vault-write-e2e",
     )
     await connection.start()
@@ -419,7 +271,7 @@ async def _connect_pipe(
             "clientVersion": "2.0.0",
             "workspaceId": workspace_id,
             "capabilities": CapabilitySet.from_enabled(set(CapabilityName)).to_wire(),
-            "requiredCapabilities": ["eventReplay", "multiSession", "loopbackWeb", "clientTools"],
+            "requiredCapabilities": ["eventReplay", "multiSession", "loopbackWeb"],
             "schemaHash": schema_hash(),
         },
     )
@@ -436,7 +288,6 @@ async def production_vault_application(
     tuple[
         ProductionWorkerApplication,
         _VaultWriteFakeModel,
-        _ObsidianPreviewDispatcher,
         DuplexJsonRpcConnection,
         str,
         Path,
@@ -469,14 +320,13 @@ async def production_vault_application(
     )
     entrypoint = WorkerEntrypoint(root)
     application = await entrypoint.start(WorkerBootstrap(workspace_instance_id, vault, state))
-    reverse_dispatcher = _ObsidianPreviewDispatcher(vault)
     pipe: DuplexJsonRpcConnection | None = None
     try:
         assert isinstance(application, ProductionWorkerApplication)
-        pipe, initialized = await _connect_pipe(application, portable.portable_workspace_id, reverse_dispatcher)
+        pipe, initialized = await _connect_pipe(application, portable.portable_workspace_id)
         assert initialized.worker_pid == os.getpid() == application.worker_pid
         assert initialized.workspace_instance_id == workspace_instance_id
-        yield application, model, reverse_dispatcher, pipe, portable.portable_workspace_id, vault
+        yield application, model, pipe, portable.portable_workspace_id, vault
     finally:
         if pipe is not None:
             await pipe.close()
@@ -529,17 +379,16 @@ def _journal_rows(database_path: Path, run_id: str) -> list[tuple[str, str, str]
 
 
 @pytest.mark.asyncio
-async def test_real_production_pipe_approves_and_commits_every_public_single_file_operation(
+async def test_real_production_worker_approves_and_commits_every_public_single_file_operation_locally(
     production_vault_application: tuple[
         ProductionWorkerApplication,
         _VaultWriteFakeModel,
-        _ObsidianPreviewDispatcher,
         DuplexJsonRpcConnection,
         str,
         Path,
     ],
 ) -> None:
-    application, model, reverse, pipe, _workspace_id, vault = production_vault_application
+    application, model, pipe, _workspace_id, vault = production_vault_application
     created = await pipe.request(
         "session/create",
         {"title": "生产 Vault 写入闭环", "clientRequestId": "req_production_vault_write_session"},
@@ -555,20 +404,12 @@ async def test_real_production_pipe_approves_and_commits_every_public_single_fil
         diff_fragments: tuple[str, ...],
     ) -> None:
         operation_name = cast(str, operation["op"])
-        expected_before_hash = cast(str, operation["expectedHash"])
         model.enqueue((operation,), requires_write_outcome=True)
-        preview_count = len(reverse.previews)
-        observation_count = len(reverse.commit_observations)
         model_request_count = len(model.requests)
         turn_params = {
             "sessionId": session_id,
             "turnId": f"turn_production_{operation_name}",
             "idempotencyKey": f"turn-idempotency-{operation_name}",
-            "writeIntent": {
-                "kind": "vault_write_required",
-                "targetPaths": ["note.md"],
-                "intentHash": vault_write_intent_hash(("note.md",)),
-            },
             "input": [{"type": "text", "text": f"请执行 {operation_name} 单文件写入"}],
             "runConfig": {"provider": "codex", "model": "fake", "permissionMode": "normal"},
         }
@@ -582,10 +423,6 @@ async def test_real_production_pipe_approves_and_commits_every_public_single_fil
         assert pending.request.binding.expected_state_hash is not None
         assert pending.request.binding.expected_state_hash.startswith("sha256:")
         assert len(pending.request.diff_artifact_ids) == 1
-        assert len(reverse.previews) == preview_count + 1
-        first_preview = reverse.previews[-1]
-        assert first_preview["beforeHash"] == expected_before_hash
-        assert cast(dict[str, Any], first_preview["operation"])["expectedHash"] == expected_before_hash
 
         artifact = await pipe.request(
             "artifact/read",
@@ -621,9 +458,6 @@ async def test_real_production_pipe_approves_and_commits_every_public_single_fil
         assert result.status is ToolResultStatus.SUCCEEDED
         assert result.data is not None and thaw_json(result.data)["paths"] == ["note.md"]
         assert target.read_bytes() == expected_content
-        assert len(reverse.previews) == preview_count + 3
-        assert len(reverse.commit_observations) == observation_count + 1
-        assert reverse.commit_observations[-1]["hashes"] == [content_hash(expected_content)]
 
         durable = await application.approvals.get(pending.request.approval_id)
         assert durable is not None
@@ -640,8 +474,6 @@ async def test_real_production_pipe_approves_and_commits_every_public_single_fil
         await asyncio.sleep(0.02)
         assert target.read_bytes() == expected_content
         assert _journal_rows(application.database_path, started.run_id) == rows
-        assert len(reverse.previews) == preview_count + 3
-        assert len(reverse.commit_observations) == observation_count + 1
         assert len(model.requests) > model_request_count
 
     await execute_operation(
@@ -690,13 +522,12 @@ async def test_real_production_registry_fails_closed_for_rename_trash_and_multi_
     production_vault_application: tuple[
         ProductionWorkerApplication,
         _VaultWriteFakeModel,
-        _ObsidianPreviewDispatcher,
         DuplexJsonRpcConnection,
         str,
         Path,
     ],
 ) -> None:
-    application, model, reverse, pipe, _workspace_id, vault = production_vault_application
+    application, model, pipe, _workspace_id, vault = production_vault_application
     created = await pipe.request(
         "session/create",
         {"title": "生产宽写入失败关闭", "clientRequestId": "req_production_broad_write_session"},
@@ -736,7 +567,6 @@ async def test_real_production_registry_fails_closed_for_rename_trash_and_multi_
                 "sessionId": created.session.session_id,
                 "turnId": f"turn_fail_closed_{label}",
                 "idempotencyKey": f"turn-fail-closed-{label}",
-                "writeIntent": {"kind": "none"},
                 "input": [{"type": "text", "text": f"尝试不可公开的 {label} 写入"}],
                 "runConfig": {"provider": "codex", "model": "fake", "permissionMode": "normal"},
             },
@@ -764,7 +594,6 @@ async def test_real_production_registry_fails_closed_for_rename_trash_and_multi_
             for item in records
         )
 
-    assert reverse.previews == [] and reverse.commit_observations == []
     assert guard.read_bytes() == b"safe\n"
     assert not (vault / "renamed.md").exists()
     assert not (vault / "multi-a.md").exists()

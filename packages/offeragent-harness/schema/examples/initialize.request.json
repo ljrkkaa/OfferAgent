@@ -4,9 +4,7 @@
   "method": "initialize",
   "params": {
     "capabilities": {
-      "clientTools": true,
       "eventReplay": true,
-      "headlessVaultWrite": true,
       "multiSession": true,
       "subagents": true
     },

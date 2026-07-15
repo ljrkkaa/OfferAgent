@@ -376,13 +376,6 @@ class RecoveryCoordinator:
                 )
                 if issue is not None:
                     issues.append(issue)
-            for invocation_id in sorted(pending.client_invocation_ids):
-                issues.append(
-                    _manual(
-                        "pending_client_invocation",
-                        f"Client invocation {invocation_id} 尚未协调, 禁止假定其结果。",
-                    )
-                )
             for child_run_id in sorted(pending.child_run_ids):
                 issues.append(_manual("pending_child_run", f"Child Run {child_run_id} 尚未协调, 必须先恢复 Run tree。"))
 

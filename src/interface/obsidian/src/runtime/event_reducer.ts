@@ -15,14 +15,36 @@ export type EventEnvelope = Omit<GeneratedEventEnvelope, "payload" | NullableLin
 
 const EVENT_TYPES: ReadonlySet<string> = new Set(PROTOCOL_EVENT_TYPES);
 
-export interface ToolCardState {
+interface TimelineItemBase {
+    readonly itemId: string;
+    readonly sequence: number;
+}
+
+export interface UserMessageTimelineItem extends TimelineItemBase {
+    readonly kind: "user_message";
+    readonly source: "turn" | "steer";
+    blocks: string[];
+}
+
+export interface ReasoningTimelineItem extends TimelineItemBase {
+    readonly kind: "reasoning";
+    summary: string;
+    partial: boolean;
+}
+
+export interface AssistantMessageTimelineItem extends TimelineItemBase {
+    readonly kind: "assistant_message";
+    blocks: string[];
+    completed: boolean;
+}
+
+export interface ToolCallTimelineItem extends TimelineItemBase {
+    readonly kind: "tool_call";
     readonly toolCallId: string;
     name: string;
+    version: string;
     status: string;
     arguments: JsonObject;
-    progressMessage: string | null;
-    completedUnits: number | null;
-    totalUnits: number | null;
     artifactIds: string[];
     sourceReferenceIds: string[];
     sideEffects: JsonObject[];
@@ -30,7 +52,8 @@ export interface ToolCardState {
     error: JsonObject | null;
 }
 
-export interface ApprovalCardState {
+export interface ApprovalTimelineItem extends TimelineItemBase {
+    readonly kind: "approval";
     readonly approvalId: string;
     status: string;
     explanation: string;
@@ -38,6 +61,25 @@ export interface ApprovalCardState {
     diffArtifactIds: string[];
     scope: string | null;
 }
+
+export interface SubagentTimelineItem extends TimelineItemBase {
+    readonly kind: "subagent";
+    readonly childRunId: string;
+    agentName: string;
+    task: string;
+    depth: number;
+    status: string;
+    message: string | null;
+    summary: string | null;
+}
+
+export type TimelineItem =
+    | UserMessageTimelineItem
+    | ReasoningTimelineItem
+    | AssistantMessageTimelineItem
+    | ToolCallTimelineItem
+    | ApprovalTimelineItem
+    | SubagentTimelineItem;
 
 export interface RunViewState {
     readonly runId: string;
@@ -47,11 +89,7 @@ export interface RunViewState {
     turnId: string;
     status: string;
     phase: string | null;
-    userBlocks: string[];
-    reasoningSummary: string;
-    assistantBlocks: string[];
-    tools: Map<string, ToolCardState>;
-    approvals: Map<string, ApprovalCardState>;
+    timeline: TimelineItem[];
     references: SourceRef[];
     artifacts: Map<string, JsonObject>;
     usage: JsonObject | null;
@@ -70,8 +108,6 @@ export interface ProjectionState {
     readonly workspaceId: string;
     readonly sessions: Map<string, SessionViewState>;
     readonly runs: Map<string, RunViewState>;
-    skillCatalog: JsonObject | null;
-    readonly skillTrust: Map<string, JsonObject>;
     readonly workspaceWarnings: JsonObject[];
 }
 
@@ -112,8 +148,6 @@ export class EventReducer {
             workspaceId,
             sessions: new Map(),
             runs: new Map(),
-            skillCatalog: null,
-            skillTrust: new Map(),
             workspaceWarnings: [],
         };
     }
@@ -219,16 +253,6 @@ export class EventReducer {
             this.state.sessions.set(sessionId, session);
             return;
         }
-        if (event.type === "skill.catalog_updated") {
-            this.state.skillCatalog = payload;
-            return;
-        }
-        if (event.type === "skill.trust_changed") {
-            const skillId = optionalText(payload, "skillId") ?? optionalText(payload, "name");
-            if (!skillId) throw new EventProjectionError("skill trust event has no identity");
-            this.state.skillTrust.set(skillId, payload);
-            return;
-        }
         if (event.type === "runtime.warning" && event.runId === null) {
             this.state.workspaceWarnings.push(payload);
             return;
@@ -237,7 +261,7 @@ export class EventReducer {
             throw new EventProjectionError(`run event ${event.type} lacks lineage`);
         }
         const run = this.ensureRun(event);
-        this.applyRun(run, event.type, payload);
+        this.applyRun(run, event);
     }
 
     private ensureRun(event: EventEnvelope): RunViewState {
@@ -258,11 +282,7 @@ export class EventReducer {
             turnId: event.turnId as string,
             status: "running",
             phase: null,
-            userBlocks: [],
-            reasoningSummary: "",
-            assistantBlocks: [],
-            tools: new Map(),
-            approvals: new Map(),
+            timeline: [],
             references: [],
             artifacts: new Map(),
             usage: null,
@@ -282,79 +302,136 @@ export class EventReducer {
         return run;
     }
 
-    private applyRun(run: RunViewState, type: string, payload: JsonObject): void {
+    private applyRun(run: RunViewState, event: EventEnvelope): void {
+        const { type, payload } = event;
         switch (type) {
             case "turn.started":
-                run.userBlocks = contentText(arrayField(payload, "input"));
-                run.status = type;
+                appendTimelineItem(run, {
+                    kind: "user_message",
+                    itemId: `turn:${run.turnId}`,
+                    sequence: event.sequence,
+                    source: "turn",
+                    blocks: contentText(arrayField(payload, "input")),
+                });
                 return;
-            case "subagent.queued":
-            case "subagent.started":
-            case "subagent.recovered":
-                run.status = type;
+            case "turn.steered":
+                appendTimelineItem(run, {
+                    kind: "user_message",
+                    itemId: `steer:${textField(payload, "messageId")}`,
+                    sequence: event.sequence,
+                    source: "steer",
+                    blocks: contentText(arrayField(payload, "input")),
+                });
                 return;
             case "phase.changed":
                 run.phase = textField(payload, "phase");
                 return;
-            case "reasoning.summary":
-                run.reasoningSummary = textField(payload, "summary");
+            case "reasoning.summary": {
+                const summary = textField(payload, "summary");
+                const partial = payload.partial === true;
+                const existing = run.timeline.find(
+                    (item): item is ReasoningTimelineItem => item.kind === "reasoning",
+                );
+                if (!existing) {
+                    appendTimelineItem(run, {
+                        kind: "reasoning",
+                        itemId: `reasoning:${event.sequence}`,
+                        sequence: event.sequence,
+                        summary,
+                        partial,
+                    });
+                } else if (partial) {
+                    if (!existing.partial) throw new EventProjectionError("reasoning summary resumed after completion");
+                    existing.summary += summary;
+                } else {
+                    if (!existing.partial || existing.summary !== summary) {
+                        throw new EventProjectionError("reasoning summary final snapshot does not match deltas");
+                    }
+                    existing.partial = false;
+                }
                 return;
+            }
             case "assistant.delta": {
                 const index = integerField(payload, "blockIndex", 0);
                 const offset = integerField(payload, "offset", 0);
-                while (run.assistantBlocks.length <= index) run.assistantBlocks.push("");
-                if (run.assistantBlocks[index].length !== offset) {
+                const assistant = run.timeline.find(
+                    (item): item is AssistantMessageTimelineItem => item.kind === "assistant_message",
+                ) ?? appendTimelineItem(run, {
+                    kind: "assistant_message",
+                    itemId: `assistant:${event.sequence}`,
+                    sequence: event.sequence,
+                    blocks: [],
+                    completed: false,
+                });
+                if (assistant.completed) throw new EventProjectionError("assistant delta arrived after completion");
+                while (assistant.blocks.length <= index) assistant.blocks.push("");
+                if (assistant.blocks[index].length !== offset) {
                     throw new EventProjectionError("assistant delta offset is non-contiguous");
                 }
-                run.assistantBlocks[index] += textField(payload, "delta");
+                assistant.blocks[index] += textField(payload, "delta");
                 return;
             }
-            case "assistant.completed":
-                run.assistantBlocks = contentText(arrayField(payload, "content"));
+            case "assistant.completed": {
+                const assistant = run.timeline.find(
+                    (item): item is AssistantMessageTimelineItem => item.kind === "assistant_message",
+                ) ?? appendTimelineItem(run, {
+                    kind: "assistant_message",
+                    itemId: `assistant:${event.sequence}`,
+                    sequence: event.sequence,
+                    blocks: [],
+                    completed: false,
+                });
+                if (assistant.completed) throw new EventProjectionError("assistant completed more than once");
+                assistant.blocks = contentText(arrayField(payload, "content"));
+                assistant.completed = true;
                 return;
-            case "tool.queued":
+            }
+            case "tool.calls.accepted": {
+                for (const call of arrayField(payload, "calls")) {
+                    const descriptor = objectValue(call);
+                    const toolCallId = textField(descriptor, "toolCallId");
+                    appendTimelineItem(run, {
+                        kind: "tool_call",
+                        itemId: `tool:${toolCallId}`,
+                        sequence: event.sequence,
+                        toolCallId,
+                        name: textField(descriptor, "name"),
+                        version: textField(descriptor, "version"),
+                        status: "accepted",
+                        arguments: objectField(descriptor, "arguments"),
+                        artifactIds: [],
+                        sourceReferenceIds: [],
+                        sideEffects: [],
+                        result: null,
+                        error: null,
+                    });
+                }
+                return;
+            }
             case "tool.started": {
                 const call = objectField(payload, "call");
-                const toolCallId = textField(call, "toolCallId");
-                const existing = run.tools.get(toolCallId);
-                const card = existing ?? {
-                    toolCallId,
-                    name: textField(call, "name"),
-                    status: type,
-                    arguments: objectField(call, "arguments"),
-                    progressMessage: null,
-                    completedUnits: null,
-                    totalUnits: null,
-                    artifactIds: [],
-                    sourceReferenceIds: [],
-                    sideEffects: [],
-                    result: null,
-                    error: null,
-                };
-                card.status = type;
-                run.tools.set(toolCallId, card);
-                return;
-            }
-            case "tool.progress": {
-                const card = requireTool(run, textField(payload, "toolCallId"));
-                card.status = type;
-                card.progressMessage = textField(payload, "message");
-                card.completedUnits = optionalInteger(payload, "completedUnits");
-                card.totalUnits = optionalInteger(payload, "totalUnits");
+                const tool = requireTool(run, textField(call, "toolCallId"));
+                const name = textField(call, "name");
+                const version = textField(call, "version");
+                if (tool.name !== name || tool.version !== version) {
+                    throw new EventProjectionError("tool identity changed after acceptance");
+                }
+                tool.arguments = objectField(call, "arguments");
+                tool.status = "running";
                 return;
             }
             case "tool.completed":
             case "tool.failed": {
                 const result = objectField(payload, "result");
-                const card = requireTool(run, textField(result, "toolCallId"));
-                card.status = textField(result, "status");
-                card.result = result;
-                card.error = payload.error && typeof payload.error === "object" && !Array.isArray(payload.error)
-                    ? objectField(payload, "error")
+                const tool = requireTool(run, textField(result, "toolCallId"));
+                tool.status = textField(result, "status");
+                tool.result = result;
+                tool.error = result.error && typeof result.error === "object" && !Array.isArray(result.error)
+                    ? objectField(result, "error")
                     : null;
-                card.artifactIds = textArray(payload, "artifactIds");
-                card.sourceReferenceIds = textArray(payload, "sourceReferenceIds");
-                card.sideEffects = objectArray(payload, "sideEffectFacts");
+                tool.artifactIds = textArray(payload, "artifactIds");
+                tool.sourceReferenceIds = textArray(payload, "sourceReferenceIds");
+                tool.sideEffects = objectArray(payload, "sideEffectFacts");
                 run.references = mergeSourceReferences(
                     run.references,
                     sourceReferenceArray(result.sourceRefs),
@@ -364,11 +441,14 @@ export class EventReducer {
             case "approval.required": {
                 const approval = objectField(payload, "approval");
                 const approvalId = textField(approval, "approvalId");
-                run.approvals.set(approvalId, {
+                appendTimelineItem(run, {
+                    kind: "approval",
+                    itemId: `approval:${approvalId}`,
+                    sequence: event.sequence,
                     approvalId,
                     status: "pending",
                     explanation: textField(payload, "explanation"),
-                    expectedArgsHash: optionalText(approval, "argsHash"),
+                    expectedArgsHash: textField(objectField(approval, "toolCall"), "argsHash"),
                     diffArtifactIds: textArray(payload, "diffArtifactIds"),
                     scope: null,
                 });
@@ -376,11 +456,77 @@ export class EventReducer {
             }
             case "approval.resolved":
             case "approval.expired": {
-                const approvalId = textField(payload, "approvalId");
-                const approval = run.approvals.get(approvalId);
-                if (!approval) throw new EventProjectionError("approval terminal event has no pending projection");
+                const approval = requireApproval(run, textField(payload, "approvalId"));
                 approval.status = optionalText(payload, "status") ?? "expired";
                 approval.scope = optionalText(payload, "scope");
+                return;
+            }
+            case "subagent.queued": {
+                const childRunId = textField(payload, "childRunId");
+                appendTimelineItem(run, {
+                    kind: "subagent",
+                    itemId: `subagent:${childRunId}`,
+                    sequence: event.sequence,
+                    childRunId,
+                    agentName: textField(payload, "agentName"),
+                    task: textField(payload, "task"),
+                    depth: integerField(payload, "depth", 1),
+                    status: "queued",
+                    message: null,
+                    summary: null,
+                });
+                return;
+            }
+            case "subagent.started": {
+                const subagent = requireSubagent(run, textField(payload, "childRunId"));
+                subagent.agentName = textField(payload, "agentName");
+                subagent.status = "started";
+                return;
+            }
+            case "subagent.progress": {
+                const subagent = requireSubagent(run, textField(payload, "childRunId"));
+                subagent.status = "running";
+                subagent.message = textField(payload, "message");
+                return;
+            }
+            case "subagent.waiting": {
+                const subagent = requireSubagent(run, textField(payload, "childRunId"));
+                subagent.status = "waiting";
+                subagent.message = textField(payload, "reason");
+                return;
+            }
+            case "subagent.result_available": {
+                const subagent = requireSubagent(run, textField(payload, "childRunId"));
+                subagent.status = "result_available";
+                subagent.summary = textField(payload, "summary");
+                return;
+            }
+            case "subagent.completed": {
+                const result = objectField(payload, "result");
+                const subagent = requireSubagent(run, textField(result, "runId"));
+                subagent.status = "completed";
+                subagent.summary = optionalText(result, "summary");
+                return;
+            }
+            case "subagent.failed": {
+                const subagent = requireSubagent(run, textField(payload, "childRunId"));
+                subagent.status = "failed";
+                return;
+            }
+            case "subagent.cancelled": {
+                const subagent = requireSubagent(run, textField(payload, "childRunId"));
+                subagent.status = "cancelled";
+                return;
+            }
+            case "subagent.interrupted":
+            case "subagent.orphaned": {
+                const subagent = requireSubagent(run, textField(payload, "childRunId"));
+                subagent.status = type.endsWith("orphaned") ? "orphaned" : "interrupted";
+                return;
+            }
+            case "subagent.recovered": {
+                const subagent = requireSubagent(run, textField(payload, "childRunId"));
+                subagent.status = "recovered";
                 return;
             }
             case "references.updated": {
@@ -402,25 +548,19 @@ export class EventReducer {
                 run.warnings.push(payload);
                 return;
             case "turn.completed":
-            case "subagent.completed":
                 terminal(run, "completed", payload);
                 return;
             case "turn.cancelled":
-            case "subagent.cancelled":
                 terminal(run, "cancelled", payload);
                 return;
             case "turn.failed":
-            case "subagent.failed":
                 terminal(run, "failed", payload);
                 return;
             case "turn.interrupted":
-            case "subagent.interrupted":
-            case "subagent.orphaned":
-                terminal(run, type.endsWith("orphaned") ? "orphaned" : "interrupted", payload);
+                terminal(run, "interrupted", payload);
                 return;
             default:
-                // Durable recovery/audit events remain in the event store. They do not
-                // mutate visual state, and must never be interpreted as completion.
+                // Audit-only events remain durable but do not create visual items.
                 return;
         }
     }
@@ -491,10 +631,36 @@ function terminal(run: RunViewState, status: string, payload: JsonObject): void 
     run.termination = payload;
 }
 
-function requireTool(run: RunViewState, toolCallId: string): ToolCardState {
-    const card = run.tools.get(toolCallId);
-    if (!card) throw new EventProjectionError("tool event has no queued/started projection");
-    return card;
+function appendTimelineItem<T extends TimelineItem>(run: RunViewState, item: T): T {
+    if (run.timeline.some((existing) => existing.itemId === item.itemId)) {
+        throw new EventProjectionError(`duplicate timeline item ${item.itemId}`);
+    }
+    run.timeline.push(item);
+    return item;
+}
+
+function requireTool(run: RunViewState, toolCallId: string): ToolCallTimelineItem {
+    const tool = run.timeline.find(
+        (item): item is ToolCallTimelineItem => item.kind === "tool_call" && item.toolCallId === toolCallId,
+    );
+    if (!tool) throw new EventProjectionError("tool event has no accepted-call projection");
+    return tool;
+}
+
+function requireApproval(run: RunViewState, approvalId: string): ApprovalTimelineItem {
+    const approval = run.timeline.find(
+        (item): item is ApprovalTimelineItem => item.kind === "approval" && item.approvalId === approvalId,
+    );
+    if (!approval) throw new EventProjectionError("approval resolution has no required projection");
+    return approval;
+}
+
+function requireSubagent(run: RunViewState, childRunId: string): SubagentTimelineItem {
+    const subagent = run.timeline.find(
+        (item): item is SubagentTimelineItem => item.kind === "subagent" && item.childRunId === childRunId,
+    );
+    if (!subagent) throw new EventProjectionError("subagent event has no queued projection");
+    return subagent;
 }
 
 function contentText(content: JsonValue[]): string[] {

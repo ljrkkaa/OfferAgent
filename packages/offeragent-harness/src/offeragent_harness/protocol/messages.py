@@ -1,4 +1,4 @@
-"""Command and reverse-request DTOs for protocol v1."""
+"""Client-to-Worker command DTOs for protocol v1."""
 
 from __future__ import annotations
 
@@ -8,33 +8,28 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import PureWindowsPath
 from types import MappingProxyType
-from typing import Annotated, Literal
+from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, JsonValue, SecretStr, ValidationError, field_validator, model_validator
-
-from offeragent_harness.foundation import vault_write_intent_hash
+from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 
 from ._base import EmptyParams, JsonObject, WireModel, validate_wire
 from .capabilities import CapabilityName, CapabilitySet, ProtocolRange
 from .common import (
     ApprovalDecision,
     ApprovalScope,
-    ClientContextSnapshot,
     RunConfigSnapshot,
     RunSnapshot,
     SessionSummary,
     SubagentResult,
-    ToolCallStatus,
     TurnSnapshot,
 )
-from .content import ArtifactRef, ContentBlock, RelativeVaultPath
+from .content import ArtifactRef, ContentBlock
 from .errors import ErrorCode, ErrorEnvelope, protocol_error
-from .events import EventEnvelope, EventType, PersistedSideEffectFact
+from .events import EventEnvelope, EventType
 from .ids import (
     ApprovalId,
     ArtifactId,
-    InvocationId,
     MessageId,
     ProtocolVersion,
     RequestId,
@@ -43,8 +38,6 @@ from .ids import (
     SemanticVersion,
     SessionId,
     Sha256Digest,
-    ToolCallId,
-    TraceId,
     TurnId,
     WorkspaceId,
     WorkspaceInstanceId,
@@ -318,8 +311,6 @@ class SkillSnapshot(WireModel):
     name: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9-]{0,63}$")
     description: str = Field(min_length=1, max_length=2048)
     metadata_hash: Sha256Digest
-    trust_state: Literal["verified", "confirmed", "confirmation_required"]
-    enabled: bool
     allowed_tools: list[str] = Field(default_factory=list, max_length=256)
 
 
@@ -336,26 +327,6 @@ class SkillsStatusParams(EmptyParams):
 
 
 class SkillsStatusResult(WireModel):
-    status: SkillCatalogStatusSnapshot
-
-
-class SkillsRescanParams(WireModel):
-    client_request_id: RequestId
-    expected_revision: int = Field(ge=0)
-
-
-class SkillsConfirmTrustParams(WireModel):
-    client_request_id: RequestId
-    root_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9._-]{0,63}$")
-    package_path: str = Field(min_length=1, max_length=2048)
-    expected_metadata_hash: Sha256Digest
-    expected_revision: int = Field(ge=0)
-    confirmed: bool
-
-
-class SkillsMutationResult(WireModel):
-    client_request_id: RequestId
-    applied: bool
     status: SkillCatalogStatusSnapshot
 
 
@@ -966,40 +937,12 @@ class SessionCompactResult(WireModel):
     replaced_turn_count: int = Field(ge=0)
 
 
-class NoWriteIntent(WireModel):
-    kind: Literal["none"]
-
-
-class VaultWriteRequiredIntent(WireModel):
-    kind: Literal["vault_write_required"]
-    target_paths: list[RelativeVaultPath] = Field(min_length=1, max_length=20)
-    intent_hash: Sha256Digest
-
-    @model_validator(mode="after")
-    def _binding_is_canonical(self) -> VaultWriteRequiredIntent:
-        canonical_paths = sorted(set(self.target_paths))
-        if self.target_paths != canonical_paths:
-            raise ValueError("write intent targetPaths must be sorted and unique")
-        expected = vault_write_intent_hash(canonical_paths)
-        if self.intent_hash != expected:
-            raise ValueError("write intent intentHash does not match its canonical target binding")
-        return self
-
-
-TurnWriteIntent = Annotated[
-    NoWriteIntent | VaultWriteRequiredIntent,
-    Field(discriminator="kind"),
-]
-
-
 class TurnStartParams(WireModel):
     session_id: SessionId
     turn_id: TurnId
     idempotency_key: str = Field(min_length=1, max_length=256)
     input: list[ContentBlock] = Field(min_length=1, max_length=256)
-    client_context: ClientContextSnapshot | None = None
     run_config: RunConfigSnapshot
-    write_intent: TurnWriteIntent
     deadline: Rfc3339DateTime | None = None
 
 
@@ -1062,74 +1005,6 @@ class TurnSteerResult(WireModel):
     apply_after_sequence: int = Field(ge=0)
 
 
-class HeadlessVaultWriteState(str, Enum):
-    READ_ONLY = "read_only"
-    PIPE_CLIENT_TOOL = "pipe_client_tool"
-    AMBIGUOUS_PIPE = "ambiguous_pipe"
-    BASELINE_UNRELIABLE = "baseline_unreliable"
-    PENDING_APPROVAL = "pending_approval"
-    APPROVED = "approved"
-    ACTIVE = "active"
-    CLAIMED = "claimed"
-    DENIED = "denied"
-    EXPIRED = "expired"
-    REVOKED = "revoked"
-    CONSUMED = "consumed"
-
-
-class HeadlessVaultWriteStatusParams(EmptyParams):
-    pass
-
-
-class HeadlessVaultWriteStatusResult(WireModel):
-    state: HeadlessVaultWriteState
-    pipe_connection_count: int = Field(ge=0, le=16)
-    baseline_reliable: bool
-    baseline_fingerprint: Sha256Digest
-    approval_id: ApprovalId | None = None
-    operation_id: str | None = Field(default=None, pattern=r"^op_headless_[0-9a-f]{32}$")
-    args_hash: Sha256Digest | None = None
-    revision: int = Field(ge=0)
-    expires_at: Rfc3339DateTime | None = None
-    reason_code: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]*$")
-    user_message: str = Field(min_length=1, max_length=1024)
-    can_request: bool
-    can_activate: bool
-    can_revoke: bool
-
-    @model_validator(mode="after")
-    def _authorization_identity_is_complete(self) -> HeadlessVaultWriteStatusResult:
-        values = (self.approval_id, self.operation_id, self.args_hash, self.expires_at)
-        if any(value is not None for value in values) and not all(value is not None for value in values):
-            raise ValueError("headless Vault authorization identity must be complete")
-        if self.can_activate and self.state is not HeadlessVaultWriteState.APPROVED:
-            raise ValueError("only an approved headless authorization can be activated")
-        if self.can_revoke and self.approval_id is None:
-            raise ValueError("revocable headless authorization requires an approval identity")
-        return self
-
-
-class HeadlessVaultWriteRequestParams(WireModel):
-    client_request_id: RequestId
-    confirmation: Literal["obsidian_closed_disk_authoritative"]
-    ttl_seconds: int = Field(ge=60, le=3600)
-    expected_baseline_fingerprint: Sha256Digest
-
-
-class HeadlessVaultWriteActivateParams(WireModel):
-    client_request_id: RequestId
-    approval_id: ApprovalId
-    expected_args_hash: Sha256Digest
-    expected_revision: int = Field(ge=1)
-
-
-class HeadlessVaultWriteRevokeParams(WireModel):
-    client_request_id: RequestId
-    approval_id: ApprovalId
-    expected_revision: int = Field(ge=1)
-    reason: str = Field(min_length=1, max_length=512)
-
-
 class ApprovalResolveParams(WireModel):
     approval_id: ApprovalId
     decision: ApprovalDecision
@@ -1142,17 +1017,8 @@ class ApprovalResolveParams(WireModel):
 class ApprovalResolveResult(WireModel):
     approval_id: ApprovalId
     status: Literal["approved", "denied", "expired", "cancelled", "already_resolved"]
-    run_id: RunId | None = None
-    operation_id: str | None = Field(default=None, pattern=r"^op_[a-z][A-Za-z0-9_-]{0,119}$")
+    run_id: RunId
     resumed: bool
-
-    @model_validator(mode="after")
-    def _one_approval_target(self) -> ApprovalResolveResult:
-        if (self.run_id is None) == (self.operation_id is None):
-            raise ValueError("approval resolution requires exactly one Run or administrative operation target")
-        if self.operation_id is not None and self.resumed:
-            raise ValueError("administrative approval resolution cannot resume an Agent Run")
-        return self
 
 
 class AgentStatusParams(WireModel):
@@ -1306,262 +1172,11 @@ class ShutdownResult(WireModel):
     active_runs_cancel_requested: list[RunId] = Field(default_factory=list, max_length=10_000)
 
 
-# Harness -> plugin reverse requests -------------------------------------------------
-
-
-class ClientContextGetParams(WireModel):
-    request_id: RequestId
-    run_id: RunId
-    fields: list[Literal["activeFile", "selection", "cursor", "metadata", "backlinks", "unsavedState"]] = Field(
-        min_length=1,
-        max_length=6,
-    )
-    deadline: Rfc3339DateTime
-
-
-class ClientContextGetResult(WireModel):
-    context: ClientContextSnapshot
-    captured_at: Rfc3339DateTime
-
-
-class ClientToolInvokeParams(WireModel):
-    invocation_id: InvocationId
-    tool_call_id: ToolCallId
-    run_id: RunId
-    name: str = Field(min_length=3, max_length=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-    arguments: JsonObject
-    args_hash: Sha256Digest
-    idempotency_key: str = Field(min_length=1, max_length=256)
-    deadline: Rfc3339DateTime
-    trace_id: TraceId
-
-
-class ClientToolPreviewParams(WireModel):
-    invocation_id: InvocationId
-    tool_call_id: ToolCallId
-    run_id: RunId
-    name: str = Field(min_length=3, max_length=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-    arguments: JsonObject
-    args_hash: Sha256Digest
-    deadline: Rfc3339DateTime
-    trace_id: TraceId
-
-
-class ClientToolPathState(WireModel):
-    path: RelativeVaultPath
-    before_hash: Sha256Digest | Literal["absent"]
-    after_hash: Sha256Digest | Literal["absent"]
-    unsaved_editor: bool
-    open_editor: bool
-
-    @model_validator(mode="after")
-    def _editor_state_is_consistent(self) -> ClientToolPathState:
-        if self.unsaved_editor and not self.open_editor:
-            raise ValueError("an unsaved Client Tool editor must also be open")
-        return self
-
-
-class ClientToolPreviewResult(WireModel):
-    invocation_id: InvocationId
-    tool_call_id: ToolCallId
-    state_hash: Sha256Digest
-    after_state_hash: Sha256Digest
-    paths: list[RelativeVaultPath] = Field(min_length=1, max_length=64)
-    diff: str = Field(min_length=1, max_length=4 * 1024 * 1024)
-    diff_sha256: Sha256Digest
-    has_unsaved_editors: bool
-    has_open_editors: bool
-    path_states: list[ClientToolPathState] = Field(min_length=1, max_length=64)
-
-    @model_validator(mode="after")
-    def _preview_is_canonical(self) -> ClientToolPreviewResult:
-        import hashlib
-
-        if len(set(path.casefold() for path in self.paths)) != len(self.paths):
-            raise ValueError("Client Tool preview paths must be case-insensitively unique")
-        if [item.path for item in self.path_states] != self.paths:
-            raise ValueError("Client Tool preview path states must exactly match its ordered paths")
-        if self.has_unsaved_editors != any(item.unsaved_editor for item in self.path_states):
-            raise ValueError("Client Tool preview unsaved-editor aggregate is inconsistent")
-        if self.has_open_editors != any(item.open_editor for item in self.path_states):
-            raise ValueError("Client Tool preview open-editor aggregate is inconsistent")
-        digest = f"sha256:{hashlib.sha256(self.diff.encode('utf-8')).hexdigest()}"
-        if digest != self.diff_sha256:
-            raise ValueError("Client Tool preview diff hash does not match its UTF-8 bytes")
-        return self
-
-
-class ClientToolCommitObserveParams(WireModel):
-    invocation_id: InvocationId
-    tool_call_id: ToolCallId
-    run_id: RunId
-    paths: list[RelativeVaultPath] = Field(min_length=1, max_length=64)
-    deadline: Rfc3339DateTime
-    trace_id: TraceId
-
-    @model_validator(mode="after")
-    def _paths_are_unique(self) -> ClientToolCommitObserveParams:
-        if len(set(path.casefold() for path in self.paths)) != len(self.paths):
-            raise ValueError("Client Tool commit observation paths must be case-insensitively unique")
-        return self
-
-
-class ClientToolCommitPathState(WireModel):
-    path: RelativeVaultPath
-    observed_hash: Sha256Digest | Literal["absent"]
-    unsaved_editor: bool
-    open_editor: bool
-
-    @model_validator(mode="after")
-    def _editor_state_is_consistent(self) -> ClientToolCommitPathState:
-        if self.unsaved_editor and not self.open_editor:
-            raise ValueError("an unsaved Client Tool editor must also be open")
-        return self
-
-
-class ClientToolCommitObserveResult(WireModel):
-    invocation_id: InvocationId
-    tool_call_id: ToolCallId
-    paths: list[RelativeVaultPath] = Field(min_length=1, max_length=64)
-    has_unsaved_editors: bool
-    has_open_editors: bool
-    path_states: list[ClientToolCommitPathState] = Field(min_length=1, max_length=64)
-
-    @model_validator(mode="after")
-    def _observation_is_canonical(self) -> ClientToolCommitObserveResult:
-        if len(set(path.casefold() for path in self.paths)) != len(self.paths):
-            raise ValueError("Client Tool commit observation paths must be case-insensitively unique")
-        if [item.path for item in self.path_states] != self.paths:
-            raise ValueError("Client Tool commit observation states must exactly match its ordered paths")
-        if self.has_unsaved_editors != any(item.unsaved_editor for item in self.path_states):
-            raise ValueError("Client Tool commit observation unsaved-editor aggregate is inconsistent")
-        if self.has_open_editors != any(item.open_editor for item in self.path_states):
-            raise ValueError("Client Tool commit observation open-editor aggregate is inconsistent")
-        return self
-
-
-class ClientActualOperation(WireModel):
-    operation_id: str = Field(min_length=1, max_length=128)
-    kind: Literal[
-        "create",
-        "append",
-        "patch",
-        "replace",
-        "rename",
-        "trash",
-        "editor_insert",
-        "editor_open",
-        "editor_reveal",
-    ]
-    path: RelativeVaultPath
-    destination_path: RelativeVaultPath | None = None
-    before_hash: Sha256Digest | None = None
-    after_hash: Sha256Digest | None = None
-    applied: bool
-    summary: str = Field(min_length=1, max_length=4096)
-
-    @model_validator(mode="after")
-    def _rename_destination_is_exact(self) -> ClientActualOperation:
-        if (self.kind == "rename") != (self.destination_path is not None):
-            raise ValueError("destinationPath is required exactly for rename operations")
-        return self
-
-
-class ClientToolInvokeResult(WireModel):
-    invocation_id: InvocationId
-    tool_call_id: ToolCallId
-    status: ToolCallStatus
-    output: JsonValue | None = None
-    user_visible_summary: str = Field(min_length=1, max_length=8192)
-    before_hash: Sha256Digest | None = None
-    after_hash: Sha256Digest | None = None
-    before_state: JsonValue | None = None
-    after_state: JsonValue | None = None
-    workspace_revision: int | None = Field(default=None, ge=0)
-    artifact_ids: list[ArtifactId] = Field(default_factory=list, max_length=256)
-    source_reference_ids: list[str] = Field(default_factory=list, max_length=512)
-    side_effect_facts: list[PersistedSideEffectFact] = Field(default_factory=list, max_length=256)
-    actual_operations: list[ClientActualOperation] = Field(default_factory=list, max_length=1024)
-    error: ClientToolError | None = None
-
-    @model_validator(mode="after")
-    def _status_has_consistent_error(self) -> ClientToolInvokeResult:
-        failed = self.status is not ToolCallStatus.SUCCEEDED
-        if failed and self.error is None:
-            raise ValueError("non-success client tool results require an error")
-        if self.status == ToolCallStatus.SUCCEEDED and self.error is not None:
-            raise ValueError("succeeded client tool result cannot contain an error")
-        if self.status is ToolCallStatus.UNKNOWN_OUTCOME and not any(
-            item.state == "unknown" for item in self.side_effect_facts
-        ):
-            raise ValueError("unknown client tool outcome requires an unknown side-effect fact")
-        return self
-
-
-class ClientToolError(WireModel):
-    code: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$")
-    message: str = Field(min_length=1, max_length=4096)
-    retryable: bool
-    cancelled: bool
-    details: JsonObject = Field(default_factory=dict)
-
-
-class ClientToolLookupParams(WireModel):
-    invocation_id: InvocationId
-    run_id: RunId
-
-
-class ClientToolLookupResult(WireModel):
-    invocation_id: InvocationId
-    found: bool
-    result: ClientToolInvokeResult | None = None
-
-    @model_validator(mode="after")
-    def _found_has_exact_result(self) -> ClientToolLookupResult:
-        if self.found != (self.result is not None):
-            raise ValueError("lookup result is required exactly when found is true")
-        if self.result is not None and self.result.invocation_id != self.invocation_id:
-            raise ValueError("lookup invocation identity does not match the durable result")
-        return self
-
-
-class ClientToolCancelParams(WireModel):
-    invocation_id: InvocationId
-    run_id: RunId
-    reason: str = Field(min_length=1, max_length=4096)
-
-
-class ClientToolCancelResult(WireModel):
-    invocation_id: InvocationId
-    accepted: bool
-    already_terminal: bool
-
-
-class ClientApprovalPresentParams(WireModel):
-    approval_id: ApprovalId
-    run_id: RunId
-    title: str = Field(min_length=1, max_length=512)
-    explanation: str = Field(min_length=1, max_length=8192)
-    expires_at: Rfc3339DateTime
-    diff_artifact: ArtifactRef | None = None
-
-
-class ClientApprovalPresentResult(WireModel):
-    approval_id: ApprovalId
-    presented: bool
-
-
-class CommandDirection(str, Enum):
-    CLIENT_TO_WORKER = "client_to_worker"
-    WORKER_TO_CLIENT = "worker_to_client"
-
-
 @dataclass(frozen=True)
 class CommandSpec:
     method: str
     params_model: type[WireModel]
     result_model: type[WireModel]
-    direction: CommandDirection
     required_capability: CapabilityName | None = None
 
 
@@ -1571,9 +1186,8 @@ def _spec(
     result: type[WireModel],
     *,
     capability: CapabilityName | None = None,
-    direction: CommandDirection = CommandDirection.CLIENT_TO_WORKER,
 ) -> CommandSpec:
-    return CommandSpec(method, params, result, direction, capability)
+    return CommandSpec(method, params, result, capability)
 
 
 _COMMAND_SPECS = [
@@ -1588,13 +1202,6 @@ _COMMAND_SPECS = [
     _spec("config/update", ConfigUpdateParams, ConfigUpdateResult),
     _spec("skills/list", SkillsListParams, SkillsListResult, capability=CapabilityName.SKILLS),
     _spec("skills/status", SkillsStatusParams, SkillsStatusResult, capability=CapabilityName.SKILLS),
-    _spec("skills/rescan", SkillsRescanParams, SkillsMutationResult, capability=CapabilityName.SKILLS),
-    _spec(
-        "skills/confirm-trust",
-        SkillsConfirmTrustParams,
-        SkillsMutationResult,
-        capability=CapabilityName.SKILLS,
-    ),
     _spec("shell/list", ShellListParams, ShellListResult, capability=CapabilityName.SHELL),
     _spec("shell/install", ShellInstallParams, ShellMutationResult, capability=CapabilityName.SHELL),
     _spec("shell/confirm", ShellConfirmParams, ShellMutationResult, capability=CapabilityName.SHELL),
@@ -1639,30 +1246,6 @@ _COMMAND_SPECS = [
     _spec("turn/cancel", TurnCancelParams, TurnCancelResult, capability=CapabilityName.CANCELLATION),
     _spec("turn/retry", TurnRetryParams, TurnRetryResult),
     _spec("turn/steer", TurnSteerParams, TurnSteerResult),
-    _spec(
-        "vault/headless/status",
-        HeadlessVaultWriteStatusParams,
-        HeadlessVaultWriteStatusResult,
-        capability=CapabilityName.HEADLESS_VAULT_WRITE,
-    ),
-    _spec(
-        "vault/headless/request",
-        HeadlessVaultWriteRequestParams,
-        HeadlessVaultWriteStatusResult,
-        capability=CapabilityName.HEADLESS_VAULT_WRITE,
-    ),
-    _spec(
-        "vault/headless/activate",
-        HeadlessVaultWriteActivateParams,
-        HeadlessVaultWriteStatusResult,
-        capability=CapabilityName.HEADLESS_VAULT_WRITE,
-    ),
-    _spec(
-        "vault/headless/revoke",
-        HeadlessVaultWriteRevokeParams,
-        HeadlessVaultWriteStatusResult,
-        capability=CapabilityName.HEADLESS_VAULT_WRITE,
-    ),
     _spec("approval/resolve", ApprovalResolveParams, ApprovalResolveResult, capability=CapabilityName.APPROVALS),
     _spec("agent/status", AgentStatusParams, AgentStatusResult, capability=CapabilityName.SUBAGENTS),
     _spec("agent/result", AgentResultParams, AgentResultResult, capability=CapabilityName.SUBAGENTS),
@@ -1691,59 +1274,6 @@ _COMMAND_SPECS = [
     _spec("shutdown", ShutdownParams, ShutdownResult),
 ]
 
-_REVERSE_REQUEST_SPECS = [
-    _spec(
-        "client/context/get",
-        ClientContextGetParams,
-        ClientContextGetResult,
-        capability=CapabilityName.CLIENT_TOOLS,
-        direction=CommandDirection.WORKER_TO_CLIENT,
-    ),
-    _spec(
-        "client/tool/invoke",
-        ClientToolInvokeParams,
-        ClientToolInvokeResult,
-        capability=CapabilityName.CLIENT_TOOLS,
-        direction=CommandDirection.WORKER_TO_CLIENT,
-    ),
-    _spec(
-        "client/tool/preview",
-        ClientToolPreviewParams,
-        ClientToolPreviewResult,
-        capability=CapabilityName.CLIENT_TOOLS,
-        direction=CommandDirection.WORKER_TO_CLIENT,
-    ),
-    _spec(
-        "client/tool/commit-observe",
-        ClientToolCommitObserveParams,
-        ClientToolCommitObserveResult,
-        capability=CapabilityName.CLIENT_TOOLS,
-        direction=CommandDirection.WORKER_TO_CLIENT,
-    ),
-    _spec(
-        "client/tool/cancel",
-        ClientToolCancelParams,
-        ClientToolCancelResult,
-        capability=CapabilityName.CANCELLATION,
-        direction=CommandDirection.WORKER_TO_CLIENT,
-    ),
-    _spec(
-        "client/tool/lookup",
-        ClientToolLookupParams,
-        ClientToolLookupResult,
-        capability=CapabilityName.CLIENT_TOOLS,
-        direction=CommandDirection.WORKER_TO_CLIENT,
-    ),
-    _spec(
-        "client/approval/present",
-        ClientApprovalPresentParams,
-        ClientApprovalPresentResult,
-        capability=CapabilityName.APPROVALS,
-        direction=CommandDirection.WORKER_TO_CLIENT,
-    ),
-]
-
-
 def _build_registry(specs: list[CommandSpec]) -> Mapping[str, CommandSpec]:
     registry: dict[str, CommandSpec] = {}
     for item in specs:
@@ -1754,8 +1284,7 @@ def _build_registry(specs: list[CommandSpec]) -> Mapping[str, CommandSpec]:
 
 
 COMMAND_REGISTRY = _build_registry(_COMMAND_SPECS)
-REVERSE_REQUEST_REGISTRY = _build_registry(_REVERSE_REQUEST_SPECS)
-ALL_METHOD_REGISTRY: Mapping[str, CommandSpec] = MappingProxyType({**COMMAND_REGISTRY, **REVERSE_REQUEST_REGISTRY})
+ALL_METHOD_REGISTRY: Mapping[str, CommandSpec] = COMMAND_REGISTRY
 
 
 def _validation_details(error: ValidationError) -> JsonObject:
@@ -1771,10 +1300,9 @@ def _validation_details(error: ValidationError) -> JsonObject:
     }
 
 
-def command_spec(method: str, *, include_reverse: bool = True) -> CommandSpec:
-    registry = ALL_METHOD_REGISTRY if include_reverse else COMMAND_REGISTRY
+def command_spec(method: str) -> CommandSpec:
     try:
-        return registry[method]
+        return COMMAND_REGISTRY[method]
     except KeyError:
         raise protocol_error(
             ErrorCode.PROTOCOL_METHOD_NOT_FOUND,
@@ -1811,8 +1339,6 @@ __all__ = (
     [
         "ALL_METHOD_REGISTRY",
         "COMMAND_REGISTRY",
-        "REVERSE_REQUEST_REGISTRY",
-        "CommandDirection",
         "CommandSpec",
         "command_spec",
         "validate_command_params",

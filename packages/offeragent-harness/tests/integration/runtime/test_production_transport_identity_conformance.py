@@ -13,7 +13,6 @@ from typing import Any, cast
 import pytest
 
 from offeragent_harness.config import HarnessConfig
-from offeragent_harness.foundation import canonical_json_sha256
 from offeragent_harness.models import (
     ModelEvent,
     ModelEventKind,
@@ -35,7 +34,6 @@ from offeragent_harness.protocol.messages import (
     RuntimeStatusResult,
     SessionCreateResult,
     TurnGetResult,
-    TurnStartParams,
 )
 from offeragent_harness.protocol.schemas import PROTOCOL_VERSION, schema_hash
 from offeragent_harness.runtime.loopback_gateway import LoopbackAsset
@@ -118,7 +116,7 @@ class _BlockingFakeModel:
         )
 
 
-class _NoReverseRequests:
+class _RejectServerRequests:
     def require_ready(self) -> None:
         return None
 
@@ -131,7 +129,7 @@ class _NoReverseRequests:
         context: ApplicationCommandContext | None = None,
     ) -> object:
         del params, cancellation, context
-        raise AssertionError(f"unexpected reverse request: {method}")
+        raise AssertionError(f"unexpected server request: {method}")
 
 
 def _development_web_assets() -> tuple[LoopbackAsset, ...]:
@@ -254,7 +252,9 @@ async def _connect_pipe(
     connection = DuplexJsonRpcConnection(
         stream,
         role=ConnectionRole.CLIENT,
-        dispatcher=_NoReverseRequests(),
+        dispatcher=_RejectServerRequests(),
+        command_transport="windows-named-pipe",
+        command_peer="current-windows-sid",
         connection_id="pipe-client-transport-conformance",
     )
     await connection.start()
@@ -449,7 +449,6 @@ async def test_real_pipe_and_loopback_share_identity_session_active_run_and_repl
                 "sessionId": session_id,
                 "turnId": "turn_transport_identity",
                 "idempotencyKey": "transport-identity-turn",
-                "writeIntent": {"kind": "none"},
                 "input": [{"type": "text", "text": "验证两种真实传输共用活动 Run"}],
                 "runConfig": {"provider": "codex", "model": "fake", "permissionMode": "normal"},
             },
@@ -548,51 +547,6 @@ async def test_real_pipe_and_loopback_share_identity_session_active_run_and_repl
         assert isinstance(terminal_status, RuntimeStatusResult)
         assert terminal_status.active_run_ids == web_terminal_status["activeRunIds"] == []
 
-        intent_binding = {
-            "kind": "vault_write_required",
-            "targetPaths": ["notes/required.md"],
-        }
-        guarded_params = {
-            "sessionId": session_id,
-            "turnId": "turn_transport_write_required",
-            "idempotencyKey": "transport-write-required",
-            "writeIntent": {
-                **intent_binding,
-                "intentHash": canonical_json_sha256(intent_binding),
-            },
-            "input": [{"type": "text", "text": "必须写入目标文件, 但恶意 Planner 声称无需写入"}],
-            "runConfig": {"provider": "codex", "model": "fake", "permissionMode": "normal"},
-        }
-        guarded = await loopback.command(
-            "turn/start",
-            guarded_params,
-        )
-        guarded_run_id = cast(str, guarded["runId"])
-        guarded_status: str | None = None
-        for _ in range(500):
-            guarded_turn = await loopback.command(
-                "turn/get",
-                {"sessionId": session_id, "turnId": "turn_transport_write_required"},
-            )
-            guarded_status = cast(str, guarded_turn["turn"]["runs"][0]["status"])
-            if guarded_status in {"completed", "cancelled", "failed", "interrupted"}:
-                break
-            await asyncio.sleep(0.01)
-        assert guarded_status == RunStatus.FAILED.value
-        guarded_state = await application.harness.get_run_state(guarded_run_id)
-        assert guarded_state.write_obligation.intent is not None
-        assert guarded_state.write_obligation.intent.request_hash == canonical_json_sha256(
-            TurnStartParams.model_validate_json(json.dumps(guarded_params)).to_wire()
-        )
-        assert guarded_state.write_obligation.intent.intent_hash == canonical_json_sha256(intent_binding)
-        assert guarded_state.write_obligation.intent.target_paths == ("notes/required.md",)
-        guarded_replay = await loopback.command(
-            "events/replay",
-            {"runId": guarded_run_id, "afterSequence": 0, "limit": 1000},
-        )
-        guarded_types = [item["type"] for item in guarded_replay["events"]]
-        assert "turn.completed" not in guarded_types
-        assert guarded_types[-1] == "turn.failed"
         assert {request.purpose for request in fake_model.requests} == {
             ModelPurpose.PLANNING,
             ModelPurpose.COMPOSING,

@@ -14,7 +14,6 @@
       <div class="brand"><span class="mark">O</span><span>OfferAgent</span><span class="local">本地</span></div>
       <nav>
         <button id="new-session" type="button">新会话</button>
-        <button id="memory" type="button">Memory</button>
         <button id="capabilities" type="button">能力</button>
         <button id="diagnostics" type="button">诊断</button>
       </nav>
@@ -49,28 +48,7 @@
               </select>
             </label>
           </div>
-          <section id="headless-write" class="headless-write" aria-label="无 Obsidian 连接时的 Vault 写入授权" hidden>
-            <div class="headless-copy">
-              <strong>Web Vault 写入</strong>
-              <span id="headless-status" aria-live="polite">正在核对 Obsidian 与磁盘基线…</span>
-              <code id="headless-args-hash" hidden></code>
-            </div>
-            <div class="headless-actions">
-              <button id="headless-request" type="button" hidden>确认 Obsidian 已关闭</button>
-              <button id="headless-activate" type="button" hidden>核对并批准一次</button>
-              <button id="headless-revoke" type="button" class="deny" hidden>撤销</button>
-            </div>
-          </section>
           <textarea id="prompt" rows="3" maxlength="1048576" placeholder="询问工作区内容，或交给 OfferAgent 一个任务…"></textarea>
-          <section class="write-intent" aria-label="本轮 Vault 写完成要求">
-            <label class="write-intent-toggle">
-              <input id="write-required" type="checkbox">
-              本轮必须产生目标 Vault 写结果
-            </label>
-            <textarea id="write-target-paths" rows="2" maxlength="20480"
-              aria-label="本轮必须写入的 Vault 目标路径"
-              placeholder="目标 Vault 路径（每行一个，例如 notes/offer.md）" hidden></textarea>
-          </section>
           <div class="composer-actions">
             <select id="permission" aria-label="权限模式">
               <option value="read-only">只读</option>

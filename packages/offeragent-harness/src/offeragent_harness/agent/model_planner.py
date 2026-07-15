@@ -193,9 +193,9 @@ class ToolPlanCatalog:
         if not isinstance(calls, list):
             raise AssertionError("the validated ToolPlan calls field is not an array")
         names = tuple(call.get("name") for call in calls if isinstance(call, Mapping))
-        if "skill.read" in names and any(name != "skill.read" for name in names):
+        if "skill" in names and any(name != "skill" for name in names):
             return (
-                "$.calls: a planning step that reads Skill instructions may contain only skill.read calls; "
+                "$.calls: a planning step that invokes a Skill may contain only skill calls; "
                 "plan other tools after the Skill body is available",
             )
         return ()

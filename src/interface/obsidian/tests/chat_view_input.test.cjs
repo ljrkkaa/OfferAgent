@@ -56,3 +56,20 @@ test("composer wires both composition lifecycle events before its input and key 
     assert.ok(input > end && keydown > input);
     assert.match(source, /event\.keyCode !== 229/);
 });
+
+test("timeline renders a submitted user message before its durable turn event arrives", () => {
+    const source = readFileSync(path.join(__dirname, "../src/local/chat_view.ts"), "utf8");
+
+    assert.match(source, /snapshot\.pendingSubmissions\.filter/);
+    assert.match(source, /renderPendingSubmission/);
+    assert.match(source, /正在提交给 OfferAgent/);
+});
+
+test("timeline renders ordered durable items instead of legacy grouped cards", () => {
+    const source = readFileSync(path.join(__dirname, "../src/local/chat_view.ts"), "utf8");
+
+    assert.match(source, /for \(const item of run\.timeline\)/);
+    assert.match(source, /case "reasoning"/);
+    assert.match(source, /case "tool_call"/);
+    assert.match(source, /case "subagent"/);
+});

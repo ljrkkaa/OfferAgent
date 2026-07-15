@@ -2,27 +2,11 @@
   "use strict";
 
   const PROTOCOL_VERSION = "1.0";
-  const SCHEMA_HASH = "sha256:d648da50bc84d5834578bfc70f980efaf3b165e721d951dbd26f0ae507cdc1ae";
+  const SCHEMA_HASH = "sha256:28c500ce7f0557958ee320492ac2f001ad4dcb4ba279992a4772d12b31308493";
   const CLIENT_VERSION = "0.1.0";
   const ARTIFACT_PAGE_BYTES = 65_536;
   const ARTIFACT_TOTAL_BYTES = 524_288;
-  const MEMORY_EXPORT_PAGE_BYTES = 262_144;
-  const MEMORY_EXPORT_TOTAL_BYTES = 8_388_608;
   const POLL_INTERVAL_MS = 750;
-  const HEADLESS_STATES = new Set([
-    "read_only",
-    "pipe_client_tool",
-    "ambiguous_pipe",
-    "baseline_unreliable",
-    "pending_approval",
-    "approved",
-    "active",
-    "claimed",
-    "denied",
-    "expired",
-    "revoked",
-    "consumed",
-  ]);
   const state = {
     csrf: null,
     workspaceId: null,
@@ -34,22 +18,16 @@
     sessionEpoch: 0,
     runIds: [],
     runs: new Map(),
+    pendingSubmissions: [],
     cursors: new Map(),
     artifacts: new Map(),
     models: new Map(),
     selectedModelKey: null,
     modelHealth: null,
-    selectedSkills: new Set(),
     skillCatalog: null,
     skillStatus: null,
     shellCatalog: null,
     hookCatalog: null,
-    headlessVaultWrite: null,
-    memorySettings: null,
-    memories: [],
-    memoryScope: "workspace",
-    memoryNextAfterId: null,
-    memoryExport: null,
     artifactView: null,
     poll: null,
     pollTick: 0,
@@ -62,8 +40,6 @@
   const timelineEl = el("timeline");
   const statusEl = el("status");
   const promptEl = el("prompt");
-  const writeRequiredEl = el("write-required");
-  const writeTargetPathsEl = el("write-target-paths");
   const sendEl = el("send");
   const steerEl = el("steer");
   const cancelEl = el("cancel");
@@ -71,12 +47,6 @@
   const modelEl = el("model");
   const modelHealthEl = el("model-health");
   const modelStatusEl = el("model-status");
-  const headlessWriteEl = el("headless-write");
-  const headlessStatusEl = el("headless-status");
-  const headlessArgsHashEl = el("headless-args-hash");
-  const headlessRequestEl = el("headless-request");
-  const headlessActivateEl = el("headless-activate");
-  const headlessRevokeEl = el("headless-revoke");
 
   async function boot() {
     try {
@@ -97,22 +67,18 @@
           clientVersion: CLIENT_VERSION,
           workspaceId: state.workspaceId,
           capabilities: {
-            clientTools: false,
             eventReplay: true,
             multiSession: true,
             approvals: true,
-            memory: true,
             skills: true,
             shell: true,
             hooks: true,
             subagents: true,
             artifacts: true,
             loopbackWeb: true,
-            reverseRequests: false,
             contentBlocks: true,
             cancellation: true,
             diagnostics: true,
-            headlessVaultWrite: true,
           },
           supportedProtocolRange: { minimum: PROTOCOL_VERSION, maximum: PROTOCOL_VERSION },
           requiredCapabilities: ["eventReplay", "multiSession", "approvals", "artifacts", "cancellation"],
@@ -136,15 +102,10 @@
       state.initialized = true;
       setStatus(`同一 Worker PID ${state.workerPid} · Runtime ${result.runtimeVersion}`);
 
-      const controls = await Promise.allSettled([loadModels(), loadHeadlessVaultWrite()]);
+      const controls = await Promise.allSettled([loadModels()]);
       if (controls[0].status === "rejected") {
         modelStatusEl.textContent = `模型目录不可用：${safeError(controls[0].reason)}`;
         modelStatusEl.classList.add("error");
-      }
-      if (controls[1].status === "rejected") {
-        headlessWriteEl.hidden = false;
-        headlessStatusEl.textContent = `Vault 写入状态不可用：${safeError(controls[2].reason)}`;
-        headlessWriteEl.classList.add("danger");
       }
       await loadSessions({ selectIfNeeded: true });
       startPolling();
@@ -278,165 +239,6 @@
     modelStatusEl.classList.toggle("error", !["healthy", "degraded"].includes(result.status));
   }
 
-  async function loadHeadlessVaultWrite() {
-    if (state.capabilities.headlessVaultWrite !== true) {
-      state.headlessVaultWrite = null;
-      headlessWriteEl.hidden = true;
-      return null;
-    }
-    const snapshot = validateHeadlessStatus(await command("vault/headless/status", {}));
-    state.headlessVaultWrite = snapshot;
-    renderHeadlessVaultWrite();
-    return snapshot;
-  }
-
-  function validateHeadlessStatus(value) {
-    if (!value || typeof value !== "object" || Array.isArray(value) || !HEADLESS_STATES.has(value.state)) {
-      throw new Error("Runtime 返回了无效的 Web Vault 写入状态");
-    }
-    for (const key of ["baselineReliable", "canRequest", "canActivate", "canRevoke"]) {
-      if (typeof value[key] !== "boolean") throw new Error(`Web Vault 写入状态缺少 ${key}`);
-    }
-    for (const key of ["pipeConnectionCount", "revision"]) {
-      integer(value[key], `headless.${key}`, 0);
-    }
-    if (!/^sha256:[0-9a-f]{64}$/.test(value.baselineFingerprint)) {
-      throw new Error("Web Vault 写入基线指纹无效");
-    }
-    if (typeof value.reasonCode !== "string" || !/^[a-z][a-z0-9_]{0,127}$/.test(value.reasonCode)) {
-      throw new Error("Web Vault 写入 reasonCode 无效");
-    }
-    requiredText(value.userMessage, "headless.userMessage");
-    const identity = [value.approvalId, value.operationId, value.argsHash, value.expiresAt];
-    const present = identity.filter((item) => item !== null).length;
-    if (present !== 0 && present !== identity.length) throw new Error("Web Vault 写入授权身份不完整");
-    if (present) {
-      if (!/^apr_[0-9a-f]{64}$/.test(value.approvalId)) throw new Error("Web Vault approvalId 无效");
-      if (!/^op_headless_[0-9a-f]{32}$/.test(value.operationId)) throw new Error("Web Vault operationId 无效");
-      if (!/^sha256:[0-9a-f]{64}$/.test(value.argsHash)) throw new Error("Web Vault argsHash 无效");
-      requiredText(value.expiresAt, "headless.expiresAt");
-      if (value.revision < 1) throw new Error("Web Vault 授权 revision 无效");
-    } else if (value.revision !== 0) {
-      throw new Error("无授权身份时 Web Vault revision 必须为 0");
-    }
-    return { ...value };
-  }
-
-  function renderHeadlessVaultWrite() {
-    const snapshot = state.headlessVaultWrite;
-    if (!snapshot || state.capabilities.headlessVaultWrite !== true) {
-      headlessWriteEl.hidden = true;
-      return;
-    }
-    headlessWriteEl.hidden = false;
-    headlessStatusEl.textContent = snapshot.userMessage;
-    headlessArgsHashEl.hidden = !snapshot.argsHash;
-    headlessArgsHashEl.textContent = snapshot.argsHash ? `argsHash ${snapshot.argsHash}` : "";
-    headlessRequestEl.hidden = !snapshot.canRequest;
-    headlessActivateEl.hidden = !["pending_approval", "approved"].includes(snapshot.state);
-    headlessActivateEl.textContent =
-      snapshot.state === "pending_approval" ? "核对 argsHash 并批准一次" : "激活给下一 Turn";
-    headlessRevokeEl.hidden = !snapshot.canRevoke;
-    headlessWriteEl.classList.toggle(
-      "active",
-      ["pending_approval", "approved", "active", "claimed"].includes(snapshot.state),
-    );
-    headlessWriteEl.classList.toggle(
-      "danger",
-      ["ambiguous_pipe", "baseline_unreliable", "denied", "expired", "revoked"].includes(snapshot.state),
-    );
-    updateControls();
-  }
-
-  async function requestHeadlessVaultWrite() {
-    if (
-      !confirm(
-        "第一次确认：Obsidian 已完全关闭，当前没有插件 Pipe 连接，并且本机磁盘中的 Vault 是权威版本。\n\n继续只会创建一个短期审批请求，不会直接写文件。",
-      )
-    ) {
-      return;
-    }
-    const baseline = await loadHeadlessVaultWrite();
-    if (
-      !baseline ||
-      !baseline.canRequest ||
-      !baseline.baselineReliable ||
-      baseline.pipeConnectionCount !== 0
-    ) {
-      throw new Error("Obsidian/Pipe 或 Workspace 基线已变化，当前不能请求 Web Vault 写入");
-    }
-    state.headlessVaultWrite = validateHeadlessStatus(
-      await command("vault/headless/request", {
-        clientRequestId: opaque("req_"),
-        confirmation: "obsidian_closed_disk_authoritative",
-        ttlSeconds: 300,
-        expectedBaselineFingerprint: baseline.baselineFingerprint,
-      }),
-    );
-    renderHeadlessVaultWrite();
-    setStatus("审批请求已创建；请核对完整 argsHash 后进行第二次确认");
-  }
-
-  async function approveAndActivateHeadlessVaultWrite() {
-    let snapshot = state.headlessVaultWrite;
-    if (!snapshot || !["pending_approval", "approved"].includes(snapshot.state)) {
-      snapshot = await loadHeadlessVaultWrite();
-    }
-    if (!snapshot || !["pending_approval", "approved"].includes(snapshot.state) || !snapshot.argsHash) {
-      throw new Error("没有可批准或激活的 Web Vault 写入请求");
-    }
-    if (
-      !confirm(
-        `第二次确认：核对以下 argsHash，并只授权下一次完全一致的 turn/start。\n\n${snapshot.argsHash}\n\n真实写入仍会逐次展示 diff、校验 expectedHash，并要求 vault.transaction 审批。`,
-      )
-    ) {
-      return;
-    }
-    if (snapshot.state === "pending_approval") {
-      const resolved = await command("approval/resolve", {
-        approvalId: snapshot.approvalId,
-        decision: "allow_once",
-        scope: "once",
-        expectedArgsHash: snapshot.argsHash,
-        includeDescendants: false,
-        comment: "本地 Web 用户核对 argsHash 后批准一个 headless Turn",
-      });
-      if (resolved.runId != null || resolved.operationId !== snapshot.operationId || resolved.resumed !== false) {
-        throw new Error("Runtime 将 headless 管理审批错误地绑定到了 Agent Run");
-      }
-      snapshot = await loadHeadlessVaultWrite();
-    }
-    if (!snapshot || snapshot.state !== "approved" || !snapshot.canActivate) {
-      throw new Error("Web Vault 写入审批状态已变化，未执行激活");
-    }
-    state.headlessVaultWrite = validateHeadlessStatus(
-      await command("vault/headless/activate", {
-        clientRequestId: opaque("req_"),
-        approvalId: snapshot.approvalId,
-        expectedArgsHash: snapshot.argsHash,
-        expectedRevision: snapshot.revision,
-      }),
-    );
-    renderHeadlessVaultWrite();
-    setStatus("一次性 Web Vault 写入授权已激活；只会由下一次标准权限 Turn 领取");
-  }
-
-  async function revokeHeadlessVaultWrite() {
-    const snapshot = state.headlessVaultWrite;
-    if (!snapshot?.canRevoke || !snapshot.approvalId) return;
-    if (!confirm("撤销当前 Web Vault 写入授权？已领取但尚未执行的本地事务也会失权。")) return;
-    state.headlessVaultWrite = validateHeadlessStatus(
-      await command("vault/headless/revoke", {
-        clientRequestId: opaque("req_"),
-        approvalId: snapshot.approvalId,
-        expectedRevision: snapshot.revision,
-        reason: "用户从本地 Web UI 显式撤销 headless Vault 写入授权",
-      }),
-    );
-    renderHeadlessVaultWrite();
-    setStatus("Web Vault 写入授权已撤销");
-  }
-
   async function loadSessions({ selectIfNeeded = false } = {}) {
     const result = await command("session/list", { cursor: null, limit: 100, includeDeleted: false });
     state.sessions = Array.isArray(result.sessions) ? result.sessions : [];
@@ -465,6 +267,7 @@
     sessionStorage.setItem(sessionStorageKey(), state.sessionId);
     state.runIds = [];
     state.runs.clear();
+    state.pendingSubmissions = [];
     state.cursors.clear();
     state.artifacts.clear();
     renderSessions();
@@ -477,45 +280,9 @@
       throw new Error("Session 详情身份或结构无效");
     }
     upsertSessionSummary(session.summary);
-    for (const turn of session.turns) seedTurnSnapshot(turn);
     await replaySession(selectedSessionId, epoch);
     if (epoch !== state.sessionEpoch) return;
-    applySnapshotFallbacks();
     renderTimeline();
-  }
-
-  function seedTurnSnapshot(turn) {
-    if (!turn || typeof turn.turnId !== "string" || !Array.isArray(turn.runs)) return;
-    const input = contentProjection(turn.input);
-    const assistant = contentProjection(turn.assistantContent);
-    for (const snapshot of turn.runs) {
-      if (!snapshot || typeof snapshot.runId !== "string") continue;
-      const run = emptyRun(snapshot.runId);
-      run.sessionId = snapshot.sessionId;
-      run.turnId = snapshot.turnId;
-      run.rootRunId = snapshot.rootRunId;
-      run.parentRunId = snapshot.parentRunId;
-      run.lineageBound = true;
-      run.status = snapshot.status;
-      run.phase = snapshot.phase;
-      run.agentName = snapshot.agentName ?? "root";
-      run.depth = Number.isSafeInteger(snapshot.depth) ? snapshot.depth : 0;
-      run.startedAt = snapshot.startedAt ?? null;
-      run.completedAt = snapshot.completedAt ?? null;
-      run.usage = snapshot.usage ?? null;
-      run.user = snapshot.parentRunId ? [] : input.text;
-      run.snapshotAssistant = snapshot.runId === turn.selectedRunId ? assistant.text : [];
-      registerArtifacts(input.artifacts);
-      registerArtifacts(assistant.artifacts);
-      state.runs.set(run.runId, run);
-      if (!state.runIds.includes(run.runId)) state.runIds.push(run.runId);
-    }
-  }
-
-  function applySnapshotFallbacks() {
-    for (const run of state.runs.values()) {
-      if (!run.assistant.length && run.snapshotAssistant.length) run.assistant = [...run.snapshotAssistant];
-    }
   }
 
   async function renameSession() {
@@ -608,92 +375,36 @@
     if (!model) throw new Error("请先选择一个 Runtime 返回的可用模型");
     if (!state.sessionId) await createSession();
     const turnId = opaque("turn_");
-    const writeIntent = await buildWriteIntent();
-    const result = await command("turn/start", {
-      sessionId: state.sessionId,
-      turnId,
-      idempotencyKey: opaque("turn_"),
-      input: [{ type: "text", text: textValue }],
-      clientContext: null,
-      runConfig: {
-        provider: model.provider,
-        model: model.model,
-        reasoningEffort: el("reasoning").value,
-        permissionMode: el("permission").value,
-        enabledSkills: [...state.selectedSkills].sort(),
-      },
-      writeIntent,
-      deadline: null,
-    });
+    state.pendingSubmissions.push({ sessionId: state.sessionId, turnId, text: textValue });
+    renderTimeline();
+    let result;
+    try {
+      result = await command("turn/start", {
+        sessionId: state.sessionId,
+        turnId,
+        idempotencyKey: opaque("turn_"),
+        input: [{ type: "text", text: textValue }],
+        runConfig: {
+          provider: model.provider,
+          model: model.model,
+          reasoningEffort: el("reasoning").value,
+          permissionMode: el("permission").value,
+        },
+        deadline: null,
+      });
+    } catch (error) {
+      state.pendingSubmissions = state.pendingSubmissions.filter((pending) => pending.turnId !== turnId);
+      renderTimeline();
+      throw error;
+    }
     if (!state.runIds.includes(result.runId)) state.runIds.push(result.runId);
     const run = emptyRun(result.runId);
     run.sessionId = result.sessionId;
     run.turnId = result.turnId;
-    run.user = [textValue];
     state.runs.set(result.runId, run);
     promptEl.value = "";
-    writeRequiredEl.checked = false;
-    writeTargetPathsEl.value = "";
-    writeTargetPathsEl.hidden = true;
     renderTimeline();
     updateControls();
-    if (state.capabilities.headlessVaultWrite === true) {
-      void loadHeadlessVaultWrite().catch(showError);
-    }
-  }
-
-  async function buildWriteIntent() {
-    if (!writeRequiredEl.checked) return { kind: "none" };
-    const targetPaths = [...new Set(
-      writeTargetPathsEl.value.split(/\r?\n/u).map((pathValue) => pathValue.trim()).filter(Boolean),
-    )].sort(compareUnicodeCodePoints);
-    if (targetPaths.length === 0 || targetPaths.length > 20) {
-      throw new Error("勾选写完成要求后，必须提供 1–20 个目标 Vault 路径");
-    }
-    for (const pathValue of targetPaths) requireSafeVaultPath(pathValue);
-    const binding = { kind: "vault_write_required", targetPaths };
-    // Closed write-intent schema in RFC 8785/JCS key order.
-    const encoded = new TextEncoder().encode(JSON.stringify({
-      kind: binding.kind,
-      targetPaths: binding.targetPaths,
-    }));
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", encoded));
-    const intentHash = `sha256:${[...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
-    return { ...binding, intentHash };
-  }
-
-  function compareUnicodeCodePoints(left, right) {
-    const leftPoints = Array.from(left, (character) => character.codePointAt(0));
-    const rightPoints = Array.from(right, (character) => character.codePointAt(0));
-    const length = Math.min(leftPoints.length, rightPoints.length);
-    for (let index = 0; index < length; index += 1) {
-      if (leftPoints[index] !== rightPoints[index]) return leftPoints[index] - rightPoints[index];
-    }
-    return leftPoints.length - rightPoints.length;
-  }
-
-  function requireSafeVaultPath(pathValue) {
-    const scalarLength = Array.from(pathValue).length;
-    const hasLoneSurrogate = Array.from(pathValue).some((character) => {
-      const point = character.codePointAt(0);
-      return character.length === 1 && point >= 0xd800 && point <= 0xdfff;
-    });
-    if (scalarLength > 1024 || hasLoneSurrogate || pathValue.startsWith("/") || /[\\:\x00-\x1f<>"|?*]/u.test(pathValue)) {
-      throw new Error(`不安全的 Vault 目标路径：${pathValue}`);
-    }
-    const reserved = new Set([
-      "CON", "CONIN$", "CONOUT$", "PRN", "AUX", "NUL",
-      ...Array.from("123456789¹²³", (suffix) => `COM${suffix}`),
-      ...Array.from("123456789¹²³", (suffix) => `LPT${suffix}`),
-    ]);
-    for (const component of pathValue.split("/")) {
-      if (!component || component === "." || component === ".." || /[. ]$/u.test(component)) {
-        throw new Error(`不安全的 Vault 目标路径：${pathValue}`);
-      }
-      if (reserved.has(component.split(".", 1)[0].toUpperCase())) {
-        throw new Error(`不安全的 Vault 目标路径：${pathValue}`);
-      }
-    }
   }
 
   async function steerActive() {
@@ -775,7 +486,7 @@
         }
         state.pollTick += 1;
         if (state.pollTick % 8 === 0) {
-          await Promise.all([loadSessions(), loadHeadlessVaultWrite()]);
+          await loadSessions();
         }
       } catch (error) {
         setStatus(safeError(error), true);
@@ -816,63 +527,94 @@
 
     if (event.type === "turn.started") {
       const content = contentProjection(payload.input);
-      run.user = content.text;
+      appendTimelineItem(run, {
+        kind: "user_message",
+        itemId: `turn:${run.turnId}`,
+        sequence: event.sequence,
+        source: "turn",
+        blocks: content.text,
+      });
       registerArtifacts(content.artifacts);
       run.startedAt = event.timestamp;
       run.status = "running";
+      state.pendingSubmissions = state.pendingSubmissions.filter((pending) => pending.turnId !== run.turnId);
+    } else if (event.type === "turn.steered") {
+      const content = contentProjection(payload.input);
+      appendTimelineItem(run, {
+        kind: "user_message",
+        itemId: `steer:${requiredText(payload.messageId, "messageId")}`,
+        sequence: event.sequence,
+        source: "steer",
+        blocks: content.text,
+      });
+      registerArtifacts(content.artifacts);
     } else if (event.type === "phase.changed") {
       run.phase = payload.phase;
     } else if (event.type === "reasoning.summary") {
-      run.reasoning = String(payload.summary ?? "");
+      const summary = requiredText(payload.summary, "reasoning summary");
+      const partial = payload.partial === true;
+      const existing = run.timeline.find((item) => item.kind === "reasoning");
+      if (!existing) {
+        appendTimelineItem(run, {
+          kind: "reasoning",
+          itemId: `reasoning:${event.sequence}`,
+          sequence: event.sequence,
+          summary,
+          partial,
+        });
+      } else if (partial) {
+        if (!existing.partial) throw new Error("已完成的推理摘要不能继续追加");
+        existing.summary += summary;
+      } else {
+        if (!existing.partial || existing.summary !== summary) throw new Error("推理摘要最终快照不匹配");
+        existing.partial = false;
+      }
     } else if (event.type === "assistant.delta") {
       const index = integer(payload.blockIndex, "blockIndex", 0);
       const offset = integer(payload.offset, "offset", 0);
-      while (run.assistant.length <= index) run.assistant.push("");
-      if (run.assistant[index].length !== offset) throw new Error("文本 delta 不连续");
-      run.assistant[index] += String(payload.delta ?? "");
+      const assistant = requireAssistantItem(run, event.sequence);
+      while (assistant.blocks.length <= index) assistant.blocks.push("");
+      if (assistant.blocks[index].length !== offset) throw new Error("文本 delta 不连续");
+      assistant.blocks[index] += requiredText(payload.delta, "assistant delta");
     } else if (event.type === "assistant.completed") {
-      applyAssistantContent(run, payload.content);
-    } else if (event.type === "tool.queued" || event.type === "tool.started") {
-      const call = payload.call ?? {};
-      const id = call.toolCallId;
-      if (typeof id === "string") {
-        const tool = run.tools.get(id) ?? {
-          id,
-          name: call.name,
+      applyAssistantContent(run, payload.content, event.sequence);
+    } else if (event.type === "tool.calls.accepted") {
+      if (!Array.isArray(payload.calls) || payload.calls.length === 0) throw new Error("工具接受事件缺少调用记录");
+      for (const call of payload.calls) {
+        const id = requiredText(call?.toolCallId, "toolCallId");
+        appendTimelineItem(run, {
+          kind: "tool_call",
+          itemId: `tool:${id}`,
+          sequence: event.sequence,
+          toolCallId: id,
+          name: requiredText(call.name, "tool name"),
+          version: requiredText(call.version, "tool version"),
           arguments: call.arguments ?? {},
-          status: event.type,
-          progress: "",
+          status: "accepted",
           result: null,
+          error: null,
           artifacts: [],
-        };
-        tool.name = call.name ?? tool.name;
-        tool.arguments = call.arguments ?? tool.arguments;
-        tool.status = event.type;
-        run.tools.set(id, tool);
+        });
       }
-    } else if (event.type === "tool.progress") {
-      const tool = run.tools.get(payload.toolCallId);
-      if (tool) {
-        tool.status = event.type;
-        tool.progress = payload.message ?? "";
-        if (payload.artifact) {
-          registerArtifacts([payload.artifact]);
-          tool.artifacts.push(payload.artifact.artifactId);
-        }
-      }
+    } else if (event.type === "tool.started") {
+      const call = payload.call ?? {};
+      const id = requiredText(call.toolCallId, "toolCallId");
+      const tool = requireToolItem(run, id);
+      if (tool.name !== call.name || tool.version !== call.version) throw new Error("工具身份在开始后改变");
+      tool.arguments = call.arguments ?? tool.arguments;
+      tool.status = "running";
     } else if (event.type === "tool.completed" || event.type === "tool.failed") {
       const result = payload.result ?? {};
-      const tool = run.tools.get(result.toolCallId);
+      const tool = requireToolItem(run, requiredText(result.toolCallId, "toolCallId"));
       registerArtifacts(result.artifactRefs);
       const artifactIds = uniqueStrings([
         ...(Array.isArray(payload.artifactIds) ? payload.artifactIds : []),
         ...(Array.isArray(result.artifactRefs) ? result.artifactRefs.map((item) => item.artifactId) : []),
       ]);
-      if (tool) {
-        tool.status = result.status;
-        tool.result = result;
-        tool.artifacts = uniqueStrings([...tool.artifacts, ...artifactIds]);
-      }
+      tool.status = requiredText(result.status, "tool result status");
+      tool.result = result;
+      tool.error = result.error ?? null;
+      tool.artifacts = uniqueStrings([...tool.artifacts, ...artifactIds]);
       const sourceRefs = Array.isArray(result.sourceRefs) ? result.sourceRefs : [];
       run.references = mergeRefs(run.references, sourceRefs);
       registerReferenceArtifacts(sourceRefs);
@@ -886,18 +628,21 @@
         ...(Array.isArray(payload.diffArtifactIds) ? payload.diffArtifactIds : []),
         ...(approval.diffArtifact?.artifactId ? [approval.diffArtifact.artifactId] : []),
       ]);
-      if (approval.approvalId) {
-        run.approvals.set(approval.approvalId, {
-          ...approval,
-          argsHash: approval.toolCall?.argsHash,
-          explanation: payload.explanation,
-          diffs,
-          status: "pending",
-        });
-      }
+      const approvalId = requiredText(approval.approvalId, "approvalId");
+      appendTimelineItem(run, {
+        kind: "approval",
+        itemId: `approval:${approvalId}`,
+        sequence: event.sequence,
+        approvalId,
+        ...approval,
+        argsHash: approval.toolCall?.argsHash,
+        explanation: requiredText(payload.explanation, "approval explanation"),
+        diffs,
+        status: "pending",
+      });
     } else if (event.type === "approval.resolved" || event.type === "approval.expired") {
-      const approval = run.approvals.get(payload.approvalId);
-      if (approval) approval.status = payload.status ?? "expired";
+      const approval = requireApprovalItem(run, requiredText(payload.approvalId, "approvalId"));
+      approval.status = payload.status ?? "expired";
     } else if (event.type === "references.updated") {
       run.references = payload.replace ? payload.references ?? [] : mergeRefs(run.references, payload.references ?? []);
       registerReferenceArtifacts(run.references);
@@ -906,109 +651,145 @@
     } else if (event.type === "context.compacted") {
       registerArtifacts([payload.summaryArtifact]);
       if (payload.summaryArtifact?.artifactId) run.compactions.push(payload.summaryArtifact.artifactId);
-    } else if (event.type === "turn.steered") {
-      run.steers.push({ messageId: payload.messageId, input: contentProjection(payload.input).text });
     } else if (event.type.startsWith("subagent.")) {
-      reduceSubagentEvent(run, event.type, payload, event.timestamp);
+      reduceSubagentEvent(run, event.type, payload, event.sequence);
     }
 
     if (event.type === "turn.completed") {
       run.status = "completed";
       run.completedAt = event.timestamp;
       run.usage = payload.usage ?? run.usage;
-      applyAssistantContent(run, payload.assistantContent);
+      applyAssistantContent(run, payload.assistantContent, event.sequence);
     } else if (event.type === "turn.cancelled") {
       run.status = "cancelled";
       run.completedAt = event.timestamp;
       run.usage = payload.usage ?? run.usage;
-      applyPartialContent(run, payload.partialContent);
+      applyPartialContent(run, payload.partialContent, event.sequence);
     } else if (event.type === "turn.failed") {
       run.status = "failed";
       run.completedAt = event.timestamp;
       run.usage = payload.usage ?? run.usage;
       run.error = payload.error ?? null;
-      applyPartialContent(run, payload.partialContent);
+      applyPartialContent(run, payload.partialContent, event.sequence);
     } else if (event.type === "turn.interrupted") {
       run.status = "interrupted";
       run.completedAt = event.timestamp;
       run.usage = payload.usage ?? run.usage;
       run.error = payload.error ?? null;
-      applyPartialContent(run, payload.partialContent);
+      applyPartialContent(run, payload.partialContent, event.sequence);
     }
     run.lastSequence = event.sequence;
     state.runs.set(run.runId, run);
     if (!state.runIds.includes(run.runId)) state.runIds.push(run.runId);
   }
 
-  function reduceSubagentEvent(run, type, payload, timestamp) {
-    const childRunId = payload.childRunId ?? payload.result?.runId ?? run.runId;
-    let child = state.runs.get(childRunId);
-    if (childRunId !== run.runId) {
-      child = child ?? emptyRun(childRunId);
-      child.sessionId = run.sessionId;
-      child.turnId = run.turnId;
-      child.rootRunId = run.rootRunId;
-      child.parentRunId = payload.parentRunId ?? run.runId;
-      child.lineageBound = false;
-      state.runs.set(childRunId, child);
-      if (!state.runIds.includes(childRunId)) state.runIds.push(childRunId);
-    } else {
-      child = run;
+  function reduceSubagentEvent(run, type, payload, sequence) {
+    const childRunId = requiredText(payload.childRunId ?? payload.result?.runId, "childRunId");
+    if (type === "subagent.queued") {
+      appendTimelineItem(run, {
+        kind: "subagent",
+        itemId: `subagent:${childRunId}`,
+        sequence,
+        childRunId,
+        agentName: requiredText(payload.agentName, "subagent agentName"),
+        task: requiredText(payload.task, "subagent task"),
+        depth: integer(payload.depth, "subagent depth", 1),
+        status: "queued",
+        message: null,
+        summary: null,
+      });
+      return;
     }
-    child.agentName = payload.agentName ?? child.agentName ?? "subagent";
-    if (Number.isSafeInteger(payload.depth)) child.depth = payload.depth;
-    if (typeof payload.task === "string") child.task = payload.task;
-    if (type === "subagent.queued") child.status = "queued";
-    else if (type === "subagent.started") {
-      child.status = "running";
-      child.startedAt = timestamp;
+    const subagent = requireSubagentItem(run, childRunId);
+    if (type === "subagent.started") {
+      subagent.agentName = requiredText(payload.agentName, "subagent agentName");
+      subagent.status = "running";
     } else if (type === "subagent.progress") {
-      child.phase = payload.phase;
-      child.progress = payload.message ?? "";
+      subagent.status = "running";
+      subagent.message = requiredText(payload.message, "subagent progress");
     } else if (type === "subagent.waiting") {
-      child.phase = payload.reason === "children" ? "waiting_children" : child.phase;
-      child.progress = `等待：${payload.reason ?? "依赖"}`;
+      subagent.status = "waiting";
+      subagent.message = `等待：${requiredText(payload.reason, "subagent wait reason")}`;
     } else if (type === "subagent.result_available") {
-      child.assistant = [String(payload.summary ?? "")];
-      if (payload.resultArtifactId) child.artifacts.add(payload.resultArtifactId);
+      subagent.status = "result_available";
+      subagent.summary = requiredText(payload.summary, "subagent summary");
+      if (payload.resultArtifactId) run.artifacts.add(payload.resultArtifactId);
     } else if (type === "subagent.completed") {
-      child.status = "completed";
-      child.completedAt = timestamp;
-      child.assistant = [String(payload.result?.summary ?? "")];
-      child.usage = payload.result?.usage ?? child.usage;
+      subagent.status = "completed";
+      subagent.summary = requiredText(payload.result?.summary, "subagent summary");
       registerArtifacts(payload.result?.artifacts);
-      for (const artifact of payload.result?.artifacts ?? []) child.artifacts.add(artifact.artifactId);
+      for (const artifact of payload.result?.artifacts ?? []) run.artifacts.add(artifact.artifactId);
     } else if (type === "subagent.failed") {
-      child.status = "failed";
-      child.completedAt = timestamp;
-      child.error = payload.error ?? null;
-      child.usage = payload.usage ?? child.usage;
+      subagent.status = "failed";
+      subagent.message = payload.error?.userVisibleMessage ?? "子任务失败";
     } else if (type === "subagent.cancelled") {
-      child.status = "cancelled";
-      child.completedAt = timestamp;
-      child.usage = payload.usage ?? child.usage;
+      subagent.status = "cancelled";
+      subagent.message = payload.reason ?? null;
     } else if (type === "subagent.interrupted") {
-      child.status = "interrupted";
-      child.completedAt = timestamp;
-      child.error = payload.error ?? null;
+      subagent.status = "interrupted";
+      subagent.message = payload.error?.userVisibleMessage ?? "子任务中断";
     } else if (type === "subagent.orphaned") {
-      child.status = "orphaned";
+      subagent.status = "orphaned";
     } else if (type === "subagent.recovered") {
-      child.status = "running";
+      subagent.status = "running";
     }
   }
 
-  function applyAssistantContent(run, value) {
+  function applyAssistantContent(run, value, sequence) {
     const projection = contentProjection(value);
-    if (projection.text.length) run.assistant = projection.text;
+    const assistant = requireAssistantItem(run, sequence);
+    assistant.blocks = projection.text;
+    assistant.completed = true;
     registerArtifacts(projection.artifacts);
     for (const artifact of projection.artifacts) run.artifacts.add(artifact.artifactId);
   }
 
-  function applyPartialContent(run, value) {
+  function applyPartialContent(run, value, sequence) {
     const projection = contentProjection(value);
-    if (projection.text.length) run.assistant = projection.text;
+    if (projection.text.length) {
+      const assistant = requireAssistantItem(run, sequence);
+      assistant.blocks = projection.text;
+      assistant.completed = true;
+    }
     registerArtifacts(projection.artifacts);
+  }
+
+  function appendTimelineItem(run, item) {
+    if (run.timeline.some((existing) => existing.itemId === item.itemId)) {
+      throw new Error(`时间线条目重复：${item.itemId}`);
+    }
+    run.timeline.push(item);
+    return item;
+  }
+
+  function requireAssistantItem(run, sequence) {
+    const existing = run.timeline.find((item) => item.kind === "assistant_message");
+    if (existing) return existing;
+    return appendTimelineItem(run, {
+      kind: "assistant_message",
+      itemId: `assistant:${sequence}`,
+      sequence,
+      blocks: [],
+      completed: false,
+    });
+  }
+
+  function requireToolItem(run, toolCallId) {
+    const tool = run.timeline.find((item) => item.kind === "tool_call" && item.toolCallId === toolCallId);
+    if (!tool) throw new Error("工具事件缺少已接受调用");
+    return tool;
+  }
+
+  function requireApprovalItem(run, approvalId) {
+    const approval = run.timeline.find((item) => item.kind === "approval" && item.approvalId === approvalId);
+    if (!approval) throw new Error("审批事件缺少请求");
+    return approval;
+  }
+
+  function requireSubagentItem(run, childRunId) {
+    const subagent = run.timeline.find((item) => item.kind === "subagent" && item.childRunId === childRunId);
+    if (!subagent) throw new Error("子 Agent 事件缺少排队记录");
+    return subagent;
   }
 
   async function resolveApproval(run, approval, decision, scope) {
@@ -1111,71 +892,34 @@
   }
 
   function renderTimeline() {
-    const runs = state.runIds.map((id) => state.runs.get(id)).filter(Boolean);
-    if (!runs.length) {
+    const runs = state.runIds
+      .map((id) => state.runs.get(id))
+      .filter((run) => run && run.parentRunId === null && (run.timeline.length > 0 || terminal(run.status) || run.error));
+    const pending = state.pendingSubmissions.filter((submission) => submission.sessionId === state.sessionId);
+    if (!runs.length && !pending.length) {
       renderEmpty("此会话尚无消息", "发送消息后，流式文本、工具、审批和引用会从持久事件投影。", false);
       updateControls();
       return;
     }
-    const runIds = new Set(runs.map((run) => run.runId));
-    const children = new Map();
-    const roots = [];
-    for (const run of runs) {
-      if (run.parentRunId && runIds.has(run.parentRunId)) {
-        const bucket = children.get(run.parentRunId) ?? [];
-        bucket.push(run);
-        children.set(run.parentRunId, bucket);
-      } else {
-        roots.push(run);
-      }
-    }
     const fragment = document.createDocumentFragment();
-    for (const run of roots) fragment.append(renderRunTree(run, children, 0, new Set()));
+    for (const run of runs) fragment.append(renderRun(run));
+    for (const submission of pending) fragment.append(renderPendingSubmission(submission));
     timelineEl.replaceChildren(fragment);
     timelineEl.scrollTop = timelineEl.scrollHeight;
     updateControls();
   }
 
-  function renderRunTree(run, children, depth, ancestors) {
-    const container = node("div", null, depth ? "child-run" : "root-run");
-    container.dataset.runId = run.runId;
-    container.dataset.parentRunId = run.parentRunId ?? "";
-    container.append(renderRun(run));
-    if (ancestors.has(run.runId)) {
-      container.append(node("p", "检测到异常的 Subagent 层级循环，已停止渲染。", "error"));
-      return container;
-    }
-    const nextAncestors = new Set(ancestors);
-    nextAncestors.add(run.runId);
-    for (const child of children.get(run.runId) ?? []) {
-      container.append(renderRunTree(child, children, depth + 1, nextAncestors));
-    }
-    return container;
+  function renderPendingSubmission(submission) {
+    const article = node("article", null, "run pending-run");
+    article.append(message("你", [submission.text], "user"), node("p", "正在提交给 OfferAgent…", "thinking"));
+    return article;
   }
 
   function renderRun(run) {
-    const article = node("article", null, `run${run.parentRunId ? " subagent-run" : ""}`);
-    if (!run.parentRunId && run.user.length) article.append(message("你", run.user, "user"));
-    if (run.parentRunId) {
-      const header = node("div", null, "subagent-header");
-      header.append(
-        node("strong", run.agentName || "子任务"),
-        node("span", `Run ${shortId(run.runId)} · parent ${shortId(run.parentRunId)}`),
-      );
-      article.append(header);
-      if (run.task) article.append(node("p", run.task, "subagent-task"));
-    }
-    const assistant = message(run.parentRunId ? "子任务结果" : "OfferAgent", run.assistant, "assistant");
-    if (run.reasoning) {
-      const details = node("details", null, "reasoning");
-      details.append(node("summary", "推理摘要"), node("p", run.reasoning));
-      assistant.prepend(details);
-    }
-    if (!run.assistant.length && !terminal(run.status)) assistant.append(node("p", run.progress || phaseText(run.phase)));
-    if (run.error?.userVisibleMessage) assistant.append(node("p", run.error.userVisibleMessage, "error"));
-    article.append(assistant);
-    for (const tool of run.tools.values()) article.append(renderTool(tool));
-    for (const approval of run.approvals.values()) article.append(renderApproval(run, approval));
+    const article = node("article", null, "run");
+    for (const item of run.timeline) article.append(renderTimelineItem(run, item));
+    if (!terminal(run.status)) article.append(node("p", phaseText(run.phase), "thinking"));
+    if (run.error?.userVisibleMessage) article.append(node("p", run.error.userVisibleMessage, "error"));
     if (run.artifacts.size) article.append(renderArtifactLinks([...run.artifacts], "Run Artifacts"));
     if (run.references.length) article.append(renderReferences(run.references));
     if (run.compactions.length) article.append(renderArtifactLinks(run.compactions, "压缩摘要"));
@@ -1205,6 +949,26 @@
     return article;
   }
 
+  function renderTimelineItem(run, item) {
+    if (item.kind === "user_message") {
+      return message(item.source === "steer" ? "你（追加）" : "你", item.blocks, "user");
+    }
+    if (item.kind === "reasoning") {
+      const details = node("details", null, "reasoning");
+      details.append(node("summary", item.partial ? "推理摘要（生成中）" : "推理摘要"), node("p", item.summary));
+      return details;
+    }
+    if (item.kind === "assistant_message") {
+      const assistant = message("OfferAgent", item.blocks, "assistant");
+      if (!item.completed) assistant.append(node("p", "正在生成回答…", "thinking"));
+      return assistant;
+    }
+    if (item.kind === "tool_call") return renderTool(item);
+    if (item.kind === "approval") return renderApproval(run, item);
+    if (item.kind === "subagent") return renderSubagent(item);
+    throw new Error("未知时间线条目");
+  }
+
   function message(label, blocks, kind) {
     const box = node("div", null, `message ${kind}`);
     box.append(node("div", label, "label"));
@@ -1218,11 +982,21 @@
     head.append(node("span", tool.name ?? "tool"), node("span", statusText(tool.status)));
     card.append(head);
     const details = node("details");
-    details.append(node("summary", tool.progress || "参数与结果"), node("pre", boundedJson(tool.arguments)));
+    details.append(node("summary", "参数与结果"), node("pre", boundedJson(tool.arguments)));
     if (tool.result) details.append(node("pre", boundedJson(tool.result)));
+    if (tool.error) details.append(node("pre", boundedJson(tool.error)));
     card.append(details);
     if (tool.artifacts.length) card.append(renderArtifactLinks(tool.artifacts, "查看工具 Artifact"));
     return card;
+  }
+
+  function renderSubagent(subagent) {
+    const details = node("details", null, `subagent ${subagent.status}`);
+    details.append(node("summary", `子 Agent · ${subagent.agentName} · ${statusText(subagent.status)}`));
+    details.append(node("p", subagent.task));
+    if (subagent.message) details.append(node("p", subagent.message));
+    if (subagent.summary) details.append(node("pre", subagent.summary));
+    return details;
   }
 
   function renderApproval(run, approval) {
@@ -1288,444 +1062,6 @@
     return box;
   }
 
-  async function showMemoryManager(scope = state.memoryScope, append = false) {
-    if (state.capabilities.memory !== true) {
-      openInspector("Memory 管理");
-      inspectorEl.append(
-        node("p", "当前 Worker 未协商 Memory 管理能力。请升级 Runtime 或在 Obsidian 诊断中检查协议能力。", "error"),
-      );
-      return;
-    }
-    if (!["session", "workspace", "profile"].includes(scope)) throw new Error("Memory scope 无效");
-    if (scope === "session" && !state.sessionId) throw new Error("请先选择一个会话再查看 Session Memory");
-    state.memoryScope = scope;
-    const params = {
-      scope,
-      sessionId: scope === "session" ? state.sessionId : null,
-      statuses: ["active", "proposed", "review_required", "superseded", "rejected", "deleted", "expired"],
-      afterId: append ? state.memoryNextAfterId : null,
-      limit: 100,
-    };
-    const [settingsResult, listResult] = await Promise.all([
-      append && state.memorySettings ? Promise.resolve({ settings: state.memorySettings }) : command("memory/settings", {}),
-      command("memory/list", params),
-    ]);
-    state.memorySettings = settingsResult.settings;
-    const page = Array.isArray(listResult.memories) ? listResult.memories : [];
-    state.memories = append
-      ? [...new Map([...state.memories, ...page].map((memory) => [memory.memoryId, memory])).values()]
-      : page;
-    state.memoryNextAfterId = listResult.nextAfterId ?? null;
-    renderMemoryManager();
-  }
-
-  function renderMemoryManager() {
-    const settings = state.memorySettings;
-    if (!settings) return;
-    openInspector("Memory 管理");
-    const settingsCard = node("section", null, "capability-card memory-settings");
-    settingsCard.append(node("h3", "设置"));
-    const enabled = checkboxControl("启用 Workspace/Session Memory", settings.enabled === true);
-    const profile = checkboxControl("允许 Profile Memory 跨 Workspace", settings.profileMemoryEnabled === true);
-    const autoAccept = checkboxControl(
-      "自动接受用户明确、低敏感度偏好",
-      settings.autoAcceptExplicitLowSensitivity === true,
-    );
-    const synchronizeSettings = () => {
-      if (!enabled.input.checked) {
-        profile.input.checked = false;
-        autoAccept.input.checked = false;
-      }
-      profile.input.disabled = !enabled.input.checked;
-      autoAccept.input.disabled = !enabled.input.checked;
-    };
-    enabled.input.addEventListener("change", synchronizeSettings);
-    synchronizeSettings();
-    settingsCard.append(enabled.label, profile.label, autoAccept.label);
-    const settingsActions = node("div", null, "memory-actions");
-    const apply = node("button", "应用设置");
-    apply.type = "button";
-    apply.onclick = () =>
-      configureMemory(
-        enabled.input.checked,
-        profile.input.checked,
-        autoAccept.input.checked,
-        false,
-      ).catch(showError);
-    const disableAndPurge = node("button", "关闭并彻底清除", "deny");
-    disableAndPurge.type = "button";
-    disableAndPurge.onclick = () => {
-      if (
-        window.confirm(
-          "这会关闭 Memory 并请求清除当前 Worker 管理的 Memory；该操作不可撤销。确认继续？",
-        )
-      ) {
-        configureMemory(false, false, false, true).catch(showError);
-      }
-    };
-    settingsActions.append(apply, disableAndPurge);
-    settingsCard.append(
-      settingsActions,
-      node(
-        "small",
-        `Config revision ${settings.configLayerRevision} · Memory revision ${settings.memoryRevision}`,
-      ),
-    );
-    inspectorEl.append(settingsCard);
-
-    const toolbar = node("div", null, "memory-toolbar");
-    const scope = node("select");
-    scope.setAttribute?.("aria-label", "Memory scope");
-    for (const [value, label] of [
-      ["workspace", "Workspace"],
-      ["session", "当前 Session"],
-      ["profile", "Profile"],
-    ]) {
-      const option = node("option", label);
-      option.value = value;
-      option.disabled = value === "session" && !state.sessionId;
-      scope.append(option);
-    }
-    scope.value = state.memoryScope;
-    scope.addEventListener("change", () => showMemoryManager(scope.value, false).catch(showError));
-    const refresh = node("button", "刷新");
-    refresh.type = "button";
-    refresh.onclick = () => showMemoryManager(state.memoryScope, false).catch(showError);
-    const exportFormat = node("select");
-    for (const value of ["markdown", "json"]) {
-      const option = node("option", value.toUpperCase());
-      option.value = value;
-      exportFormat.append(option);
-    }
-    exportFormat.value = "markdown";
-    const exportButton = node("button", "导出稳定快照");
-    exportButton.type = "button";
-    exportButton.onclick = () => startMemoryExport(exportFormat.value).catch(showError);
-    toolbar.append(scope, refresh, exportFormat, exportButton);
-    inspectorEl.append(toolbar);
-
-    const list = node("div", null, "memory-list");
-    for (const memory of state.memories) list.append(renderMemorySummary(memory));
-    if (!state.memories.length) list.append(node("p", "此 scope 暂无 Memory。", "empty-inline"));
-    inspectorEl.append(list);
-    if (state.memoryNextAfterId) {
-      const more = node("button", "加载下一页（最多 100 条）");
-      more.type = "button";
-      more.onclick = () => showMemoryManager(state.memoryScope, true).catch(showError);
-      inspectorEl.append(more);
-    }
-  }
-
-  function renderMemorySummary(memory) {
-    const card = node("article", null, `memory-card ${memory.status ?? ""}`);
-    const heading = node("div", null, "memory-card-heading");
-    heading.append(
-      node("strong", `${memory.scope ?? "memory"} · ${memory.status ?? "unknown"}`),
-      node("span", `rev ${memory.revision ?? "-"}`),
-    );
-    card.append(
-      heading,
-      node("p", memory.contentPreview ?? ""),
-      node(
-        "small",
-        `${memory.sensitivity ?? "-"} · confidence ${formatConfidence(memory.confidence)} · ${memory.updatedAt ?? ""}`,
-      ),
-    );
-    if (Array.isArray(memory.reviewReasonCodes) && memory.reviewReasonCodes.length) {
-      card.append(node("p", `需确认：${memory.reviewReasonCodes.join("、")}`, "warning"));
-    }
-    const view = node("button", "查看/管理");
-    view.type = "button";
-    view.onclick = () => showMemoryDetail(memory).catch(showError);
-    card.append(view);
-    return card;
-  }
-
-  async function configureMemory(enabled, profileMemoryEnabled, autoAccept, purge) {
-    const settings = state.memorySettings;
-    if (!settings) throw new Error("Memory 设置尚未加载");
-    const result = await command("memory/configure", {
-      enabled,
-      profileMemoryEnabled,
-      autoAcceptExplicitLowSensitivity: autoAccept,
-      expectedConfigRevision: settings.configLayerRevision,
-      clientRequestId: opaque("req_"),
-      purge,
-    });
-    state.memorySettings = result.settings;
-    setStatus(
-      purge
-        ? `Memory 已关闭并清除 ${result.purged} 条${result.purgeRemaining ? "；仍有待清除记录，请再次执行" : ""}`
-        : "Memory 设置已按 config revision CAS 更新",
-    );
-    await showMemoryManager(state.memoryScope, false);
-  }
-
-  async function showMemoryDetail(summary) {
-    const result = await command("memory/get", {
-      memoryId: summary.memoryId,
-      sessionId: summary.scope === "session" ? summary.sessionId : null,
-    });
-    const memory = result.memory;
-    if (!memory || memory.memoryId !== summary.memoryId) throw new Error("Memory 详情身份不匹配");
-    openInspector(`Memory ${shortId(memory.memoryId)}`);
-    const back = node("button", "返回 Memory 列表");
-    back.type = "button";
-    back.onclick = () => renderMemoryManager();
-    inspectorEl.append(back);
-    const metadata = node("dl", null, "diagnostic-grid");
-    for (const [key, value] of [
-      ["Scope", memory.scope],
-      ["状态", memory.status],
-      ["敏感度", memory.sensitivity],
-      ["置信度", formatConfidence(memory.confidence)],
-      ["Revision", memory.revision],
-      ["Content hash", memory.contentHash],
-      ["更新时间", memory.updatedAt],
-    ]) {
-      metadata.append(node("dt", key), node("dd", String(value ?? "-")));
-    }
-    const content = node("textarea", null, "memory-editor");
-    content.rows = 10;
-    content.maxLength = 262_144;
-    content.value = memory.content;
-    const confidence = node("input");
-    confidence.type = "number";
-    confidence.min = "0";
-    confidence.max = "1";
-    confidence.step = "0.01";
-    confidence.value = String(memory.confidence);
-    const confirmation = renderMemoryConfirmations(memory);
-    inspectorEl.append(metadata, node("h3", "内容"), content, node("label", "置信度"), confidence, confirmation.box);
-
-    const actions = node("div", null, "memory-actions");
-    if (["proposed", "review_required"].includes(memory.status)) {
-      const approve = node("button", "确认并接受");
-      approve.type = "button";
-      approve.onclick = () => reviewMemory(memory, "approve", confirmation.value()).catch(showError);
-      const reject = node("button", "拒绝提案", "deny");
-      reject.type = "button";
-      reject.onclick = () => reviewMemory(memory, "reject", confirmation.value()).catch(showError);
-      actions.append(approve, reject);
-    }
-    if (!["deleted", "expired"].includes(memory.status)) {
-      const save = node("button", "按 Revision 保存编辑");
-      save.type = "button";
-      save.onclick = () =>
-        editMemory(memory, content.value, Number(confidence.value), confirmation.value()).catch(showError);
-      const remove = node("button", "删除", "deny");
-      remove.type = "button";
-      remove.onclick = () => deleteMemory(memory).catch(showError);
-      actions.append(save, remove);
-    }
-    inspectorEl.append(actions);
-    const provenance = node("details", null, "memory-provenance");
-    provenance.append(node("summary", `Provenance（${memory.provenances?.length ?? 0}）`));
-    const provenanceText = node("pre");
-    provenanceText.textContent = boundedJson(memory.provenances ?? []);
-    provenance.append(provenanceText);
-    inspectorEl.append(provenance);
-  }
-
-  function renderMemoryConfirmations(memory) {
-    const box = node("fieldset", null, "memory-confirmations");
-    box.append(node("legend", "显式确认（仅在对应风险确实可接受时勾选）"));
-    const sensitive = checkboxControl("允许保存 private/敏感内容", false);
-    const profile = checkboxControl("允许 Profile 跨 Workspace 共享", false);
-    const external = checkboxControl("允许来自外部来源", false);
-    const conflict = checkboxControl("允许冲突解决/覆盖旧 Memory", false);
-    const supersede = node("select");
-    const noSupersede = node("option", "不指定被替代 Memory");
-    noSupersede.value = "";
-    supersede.append(noSupersede);
-    for (const memoryId of memory.conflictMemoryIds ?? []) {
-      const option = node("option", `替代冲突记录 ${shortId(memoryId)}`);
-      option.value = memoryId;
-      supersede.append(option);
-    }
-    const reason = node("textarea");
-    reason.rows = 2;
-    reason.maxLength = 4096;
-    reason.placeholder = "可选：说明确认理由";
-    box.append(sensitive.label, profile.label, external.label, conflict.label);
-    if ((memory.conflictMemoryIds?.length ?? 0) > 0) box.append(supersede);
-    box.append(reason);
-    if (memory.sensitivity === "private") box.append(node("p", "此记录为 private，接受或编辑通常需要敏感内容确认。", "warning"));
-    return {
-      box,
-      value: () => ({
-        allowSensitive: sensitive.input.checked,
-        allowProfileSharing: profile.input.checked,
-        allowExternalSource: external.input.checked,
-        allowConflictResolution: conflict.input.checked,
-        reason: reason.value.trim() || null,
-        supersedeMemoryId: supersede.value || null,
-      }),
-    };
-  }
-
-  async function reviewMemory(memory, decision, confirmation) {
-    const { supersedeMemoryId, ...reviewConfirmation } = confirmation;
-    let expectedSupersedeRevision = null;
-    if (decision === "approve" && supersedeMemoryId) {
-      const target = await command("memory/get", {
-        memoryId: supersedeMemoryId,
-        sessionId: memory.scope === "session" ? memory.sessionId : null,
-      });
-      expectedSupersedeRevision = target.memory?.revision ?? null;
-      if (!Number.isSafeInteger(expectedSupersedeRevision)) throw new Error("冲突 Memory 缺少可用 revision");
-    }
-    const result = await command("memory/review", {
-      memoryId: memory.memoryId,
-      sessionId: memory.scope === "session" ? memory.sessionId : null,
-      decision,
-      expectedRevision: memory.revision,
-      clientRequestId: opaque("req_"),
-      confirmation: reviewConfirmation,
-      supersedeMemoryId: decision === "approve" ? supersedeMemoryId : null,
-      expectedSupersedeRevision: decision === "approve" ? expectedSupersedeRevision : null,
-    });
-    setStatus(`Memory review 已提交：${result.status}`);
-    await showMemoryManager(state.memoryScope, false);
-  }
-
-  async function editMemory(memory, content, confidence, confirmation) {
-    const { supersedeMemoryId: _supersedeMemoryId, ...editConfirmation } = confirmation;
-    if (!content.trim()) throw new Error("Memory 内容不能为空");
-    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) throw new Error("Memory 置信度必须在 0–1");
-    const result = await command("memory/edit", {
-      memoryId: memory.memoryId,
-      sessionId: memory.scope === "session" ? memory.sessionId : null,
-      content,
-      confidence,
-      expectedRevision: memory.revision,
-      clientRequestId: opaque("req_"),
-      confirmation: editConfirmation,
-    });
-    setStatus(`Memory 已编辑：${result.status} · revision ${result.revision ?? "-"}`);
-    await showMemoryManager(state.memoryScope, false);
-  }
-
-  async function deleteMemory(memory) {
-    if (!window.confirm("删除此 Memory？删除使用 revision CAS，已被并发修改时会拒绝。")) return;
-    const result = await command("memory/delete", {
-      memoryId: memory.memoryId,
-      sessionId: memory.scope === "session" ? memory.sessionId : null,
-      expectedRevision: memory.revision,
-      clientRequestId: opaque("req_"),
-    });
-    setStatus(`Memory 已删除：${result.status}`);
-    await showMemoryManager(state.memoryScope, false);
-  }
-
-  async function startMemoryExport(format) {
-    if (!["markdown", "json"].includes(format)) throw new Error("Memory 导出格式无效");
-    state.memoryExport = {
-      format,
-      includeSessionId: state.memoryScope === "session" ? state.sessionId : null,
-      snapshotAt: null,
-      contentHash: null,
-      offset: 0,
-      totalByteSize: null,
-      exportedCount: null,
-      eof: false,
-      content: "",
-    };
-    await readMemoryExportPage();
-  }
-
-  async function readMemoryExportPage() {
-    const view = state.memoryExport;
-    if (!view || view.eof || view.offset >= MEMORY_EXPORT_TOTAL_BYTES) return;
-    const requestedOffset = view.offset;
-    const result = await command("memory/export", {
-      format: view.format,
-      includeSessionId: view.includeSessionId,
-      snapshotAt: view.snapshotAt,
-      expectedContentHash: view.contentHash,
-      offset: requestedOffset,
-      maxBytes: MEMORY_EXPORT_PAGE_BYTES,
-    });
-    const contentBytes = new TextEncoder().encode(result.content ?? "").length;
-    if (
-      result.format !== view.format ||
-      result.offset !== requestedOffset ||
-      !Number.isSafeInteger(result.nextOffset) ||
-      result.nextOffset !== requestedOffset + contentBytes ||
-      (!result.eof && result.nextOffset <= requestedOffset) ||
-      !Number.isSafeInteger(result.totalByteSize) ||
-      result.totalByteSize > MEMORY_EXPORT_TOTAL_BYTES ||
-      result.nextOffset > result.totalByteSize ||
-      result.eof !== (result.nextOffset === result.totalByteSize) ||
-      (view.snapshotAt !== null && result.snapshotAt !== view.snapshotAt) ||
-      (view.contentHash !== null && result.contentHash !== view.contentHash)
-    ) {
-      throw new Error("Memory 导出分页或快照证明无效");
-    }
-    view.snapshotAt = result.snapshotAt;
-    view.contentHash = result.contentHash;
-    view.offset = result.nextOffset;
-    view.totalByteSize = result.totalByteSize;
-    view.exportedCount = result.exportedCount;
-    view.eof = result.eof;
-    view.content += result.content;
-    renderMemoryExport();
-  }
-
-  function renderMemoryExport() {
-    const view = state.memoryExport;
-    if (!view) return;
-    openInspector("Memory 稳定快照导出");
-    const metadata = node("dl", null, "diagnostic-grid");
-    for (const [key, value] of [
-      ["格式", view.format],
-      ["Snapshot", view.snapshotAt],
-      ["Content hash", view.contentHash],
-      ["记录数", view.exportedCount],
-      ["进度", `${view.offset}/${view.totalByteSize ?? "?"} bytes`],
-    ]) {
-      metadata.append(node("dt", key), node("dd", String(value ?? "-")));
-    }
-    const content = node("pre", null, "memory-export-content");
-    content.textContent = view.content;
-    inspectorEl.append(metadata, content);
-    if (!view.eof) {
-      const next = node("button", "读取下一页（快照/hash 固定）");
-      next.type = "button";
-      next.onclick = () => readMemoryExportPage().catch(showError);
-      inspectorEl.append(next);
-    } else {
-      const download = node("button", "保存导出文件");
-      download.type = "button";
-      download.onclick = () => downloadMemoryExport(view);
-      inspectorEl.append(download);
-    }
-  }
-
-  function downloadMemoryExport(view) {
-    if (!view.eof) throw new Error("Memory 导出尚未完成");
-    const mediaType = view.format === "json" ? "application/json" : "text/markdown";
-    const url = URL.createObjectURL(new Blob([view.content], { type: `${mediaType};charset=utf-8` }));
-    const link = node("a");
-    link.href = url;
-    link.download = `offeragent-memory-${view.snapshotAt.replace(/[:.]/g, "-")}.${view.format === "json" ? "json" : "md"}`;
-    link.click();
-    setTimeout(() => URL.revokeObjectURL(url), 0);
-  }
-
-  function checkboxControl(labelText, checked) {
-    const label = node("label", null, "checkbox-control");
-    const input = node("input");
-    input.type = "checkbox";
-    input.checked = checked;
-    label.append(input, node("span", labelText));
-    return { label, input };
-  }
-
-  function formatConfidence(value) {
-    return Number.isFinite(value) ? Number(value).toFixed(2) : "-";
-  }
-
   async function showDiagnostics() {
     const result = await command("diagnostics/get", { includeRecentErrors: true, includePaths: false });
     openInspector("本地诊断");
@@ -1769,28 +1105,6 @@
       else if (label === "shell") state.shellCatalog = values[index];
       else if (label === "hooks") state.hookCatalog = values[index];
     }
-    restoreSkillSelection();
-  }
-
-  function restoreSkillSelection() {
-    const available = new Set(
-      (Array.isArray(state.skillCatalog?.skills) ? state.skillCatalog.skills : [])
-        .filter((skill) => skill?.enabled === true && typeof skill.name === "string")
-        .map((skill) => skill.name),
-    );
-    let stored = [];
-    try {
-      const parsed = JSON.parse(sessionStorage.getItem(skillStorageKey()) ?? "[]");
-      if (Array.isArray(parsed)) stored = parsed.filter((value) => typeof value === "string").slice(0, 256);
-    } catch {
-      stored = [];
-    }
-    state.selectedSkills = new Set(stored.filter((name) => available.has(name)));
-    persistSkillSelection();
-  }
-
-  function persistSkillSelection() {
-    sessionStorage.setItem(skillStorageKey(), JSON.stringify([...state.selectedSkills].sort()));
   }
 
   async function showCapabilities() {
@@ -1800,16 +1114,14 @@
     openInspector("能力与管理入口");
     const intro = node(
       "p",
-      "此页面读取同一 Worker 的真实管理目录。信任、安装、启停等持久管理变更必须回到认证 Obsidian Named Pipe；只有在 Obsidian 关闭并完成两次显式确认后，页面才可授权一个普通 Turn 走本地 Vault 事务。",
+      "此页面读取同一 Worker 的真实管理目录。所有工具执行都由 Worker 的统一权限与审计链负责。",
     );
     inspectorEl.append(intro);
     const managed = [
       ["模型", "可用", "使用 models/list 与 models/health；在输入区选择。"],
-      ["Memory", state.capabilities.memory === true ? "可用" : "未协商", "使用 memory/settings/configure/list/get/review/edit/delete/export；点击顶栏 Memory 管理。"],
       ["Skills", state.capabilities.skills === true ? "目录已读取" : "未协商", "可在下方选择本页面新 Run 使用的已信任 Skills；信任确认在 Obsidian 设置中完成。"],
       ["Shell", state.capabilities.shell === true ? "目录已读取" : "未协商", "下方显示持久 profile、revision、信任与启停状态。"],
       ["Hooks", state.capabilities.hooks === true ? "目录已读取" : "未协商", "下方显示 layer、contentHash trust 与 Workspace command definitionHash 确认状态。"],
-      ["无头 Vault 写入", state.capabilities.headlessVaultWrite === true ? "显式一次性授权" : "未协商", state.headlessVaultWrite?.userMessage ?? "状态尚未读取。"],
     ];
     for (const [name, status, action] of managed) {
       const section = node("section", null, "capability-card");
@@ -1841,20 +1153,10 @@
     );
     for (const skill of Array.isArray(state.skillCatalog.skills) ? state.skillCatalog.skills : []) {
       if (!skill || typeof skill.name !== "string") continue;
-      const row = node("label", null, `extension-row${skill.enabled === true ? "" : " unavailable"}`);
-      const checkbox = node("input");
-      checkbox.type = "checkbox";
-      checkbox.checked = state.selectedSkills.has(skill.name);
-      checkbox.disabled = skill.enabled !== true;
-      checkbox.addEventListener("change", () => {
-        if (checkbox.checked && skill.enabled === true) state.selectedSkills.add(skill.name);
-        else state.selectedSkills.delete(skill.name);
-        persistSkillSelection();
-      });
+      const row = node("div", null, "extension-row");
       row.append(
-        checkbox,
-        node("span", `${skill.name}@${skill.version}`),
-        node("small", `${skill.layer} · ${skill.trustState}`),
+        node("span", skill.name),
+        node("small", `${skill.layer} · ${skill.description}`),
       );
       section.append(row);
     }
@@ -1938,17 +1240,11 @@
   function updateControls() {
     const active = activeRootRun();
     const busy = state.commandPending > 0;
-    sendEl.disabled = busy || active !== null || selectedModel() === null ||
-      (writeRequiredEl.checked && !writeTargetPathsEl.value.trim());
+    sendEl.disabled = busy || active !== null || selectedModel() === null;
     steerEl.disabled = busy || active === null || !promptEl.value.trim();
     cancelEl.disabled = busy || active === null;
     modelHealthEl.disabled = busy || selectedModel() === null;
     modelEl.disabled = busy || state.models.size === 0;
-    writeRequiredEl.disabled = busy || active !== null;
-    writeTargetPathsEl.disabled = busy || active !== null;
-    headlessRequestEl.disabled = busy || active !== null;
-    headlessActivateEl.disabled = busy || active !== null;
-    headlessRevokeEl.disabled = busy;
     for (const id of ["rename-session", "compact-session", "delete-session"]) {
       el(id).disabled = busy || !state.sessionId;
     }
@@ -2034,7 +1330,6 @@
       ].join(":");
     }
     if (reference?.type === "artifact") return `artifact:${reference.artifact?.artifactId}`;
-    if (reference?.type === "memory") return `memory:${reference.memoryId}`;
     return JSON.stringify(reference);
   }
 
@@ -2049,7 +1344,6 @@
       return `${reference.label ?? reference.file?.path ?? "Vault"}${line}${freshness}`;
     }
     if (reference?.type === "artifact") return reference.label ?? reference.artifact?.title ?? reference.artifact?.artifactId;
-    if (reference?.type === "memory") return `${reference.label ?? "Memory"} · ${reference.scope}`;
     return "未知引用";
   }
 
@@ -2086,20 +1380,10 @@
       lineageBound: false,
       status: "running",
       phase: null,
-      user: [],
-      assistant: [],
-      snapshotAssistant: [],
-      reasoning: "",
-      progress: "",
-      task: "",
-      agentName: "root",
-      depth: 0,
-      tools: new Map(),
-      approvals: new Map(),
+      timeline: [],
       artifacts: new Set(),
       references: [],
       compactions: [],
-      steers: [],
       usage: null,
       error: null,
       startedAt: null,
@@ -2124,7 +1408,10 @@
     return (
       {
         queued: "排队中",
+        accepted: "已接受",
         running: "运行中",
+        waiting: "等待中",
+        result_available: "结果可用",
         completed: "已完成",
         cancelled: "已取消",
         failed: "失败",
@@ -2137,9 +1424,6 @@
         timed_out: "超时",
         partial: "部分完成",
         unknown_outcome: "结果未知",
-        "tool.queued": "已排队",
-        "tool.started": "执行中",
-        "tool.progress": "执行中",
       }[value] ?? value ?? "未知"
     );
   }
@@ -2149,7 +1433,7 @@
       {
         created: "已创建…",
         loading_context: "正在加载上下文…",
-        selecting_memory: "正在选择 Memory…",
+        selecting_memory: "正在读取固定 Vault Memory 文件…",
         planning: "正在规划…",
         validating_calls: "正在校验工具…",
         checking_policy: "正在检查权限…",
@@ -2229,10 +1513,6 @@
     return `offeragent.model.${state.workspaceId}`;
   }
 
-  function skillStorageKey() {
-    return `offeragent.skills.${state.workspaceId}`;
-  }
-
   function sessionStorageKey() {
     return `offeragent.session.${state.workspaceId}`;
   }
@@ -2255,11 +1535,6 @@
     sendTurn(promptEl.value).catch(showError);
   });
   promptEl.addEventListener("input", updateControls);
-  writeRequiredEl.addEventListener("change", () => {
-    writeTargetPathsEl.hidden = !writeRequiredEl.checked;
-    updateControls();
-  });
-  writeTargetPathsEl.addEventListener("input", updateControls);
   promptEl.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
@@ -2275,10 +1550,6 @@
   el("compact-session").addEventListener("click", () => compactSession().catch(showError));
   steerEl.addEventListener("click", () => steerActive().catch(showError));
   cancelEl.addEventListener("click", () => cancelActive().catch(showError));
-  el("memory").addEventListener("click", () => showMemoryManager().catch(showError));
-  headlessRequestEl.addEventListener("click", () => requestHeadlessVaultWrite().catch(showError));
-  headlessActivateEl.addEventListener("click", () => approveAndActivateHeadlessVaultWrite().catch(showError));
-  headlessRevokeEl.addEventListener("click", () => revokeHeadlessVaultWrite().catch(showError));
   el("capabilities").addEventListener("click", () => showCapabilities().catch(showError));
   el("diagnostics").addEventListener("click", () => showDiagnostics().catch(showError));
   window.addEventListener("beforeunload", () => {

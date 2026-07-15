@@ -1878,7 +1878,8 @@ button.reference-button:hover {
 .offeragent-reasoning,
 .offeragent-references,
 .offeragent-tool-card,
-.offeragent-approval {
+.offeragent-approval,
+.offeragent-subagent {
     border: 1px solid var(--oa-border);
     border-radius: 9px;
     background: var(--oa-soft);
@@ -1896,14 +1897,18 @@ button.reference-button:hover {
 }
 
 .offeragent-tool-card,
-.offeragent-approval {
+.offeragent-approval,
+.offeragent-subagent {
     padding: 9px 11px;
 }
 
 .offeragent-tool-card.status-failed,
 .offeragent-tool-card.status-conflict,
 .offeragent-tool-card.status-unknown_outcome,
-.offeragent-approval.status-denied {
+.offeragent-approval.status-denied,
+.offeragent-subagent.status-failed,
+.offeragent-subagent.status-interrupted,
+.offeragent-subagent.status-orphaned {
     border-color: var(--color-red);
 }
 
@@ -1930,6 +1935,24 @@ button.reference-button:hover {
 
 .offeragent-tool-card progress {
     width: 100%;
+}
+
+.offeragent-subagent {
+    padding: 9px 11px;
+}
+
+.offeragent-subagent p {
+    margin: 7px 0 0;
+    white-space: pre-wrap;
+}
+
+.offeragent-subagent pre {
+    overflow: auto;
+    max-height: 240px;
+    padding: 8px;
+    border-radius: 6px;
+    background: var(--background-primary-alt);
+    white-space: pre-wrap;
 }
 
 .offeragent-approval-actions {
@@ -1965,29 +1988,6 @@ button.reference-button:hover {
 
 .offeragent-permission-status {
     color: var(--text-muted);
-}
-
-.offeragent-write-intent {
-    display: grid;
-    gap: 6px;
-    margin-top: 7px;
-    padding: 7px 9px;
-    border: 1px solid var(--oa-border);
-    border-radius: 8px;
-    background: var(--background-secondary);
-    color: var(--text-muted);
-    font-size: var(--font-ui-smaller);
-}
-
-.offeragent-write-intent-toggle {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-}
-
-.offeragent-write-intent-targets {
-    width: 100%;
-    resize: vertical;
 }
 
 .offeragent-composer-controls {

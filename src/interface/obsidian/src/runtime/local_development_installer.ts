@@ -16,9 +16,7 @@ const PROTOCOL = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/;
 const COMMIT = /^[0-9a-f]{40}$/;
 const CANONICAL_PATH = /^[^\\\0]+$/;
 const REQUIRED_EXECUTABLES = new Set([
-    "offeragent-host.exe",
     "offeragent-process-host.exe",
-    "offeragent-self-test.exe",
     "offeragent-worker.exe",
 ]);
 
@@ -125,27 +123,22 @@ export class LocalDevelopmentRuntimeInstaller implements RuntimeInstaller {
             launchSignal?.throwIfAborted();
         };
         signal.throwIfAborted();
-        const hostExecutable = confinedPath(runtimeRoot, "offeragent-host.exe");
+        const workerExecutable = confinedPath(runtimeRoot, "offeragent-worker.exe");
         onPhase("ready");
         return {
             version: manifest.runtimeVersion,
-            hostExecutable,
-            // This is the real Host/Worker attach allowance, not a self-test
-            // timeout.  Keep the cold-start budget unchanged after removing
-            // the expensive pre-start diagnostic.
-            hostDiscoveryTimeoutMs: 180_000,
+            workerExecutable,
             protocolMinimum: manifest.protocol.minimum,
             protocolMaximum: manifest.protocol.maximum,
             schemaHash: manifest.protocol.schemaHash,
-            beforeHostLaunch: async (launchSignal?: AbortSignal): Promise<void> => {
-                // Startup must still fail closed if the hash-pinned bundle was
-                // changed.  Do this once, at the actual executable launch
-                // boundary, rather than twice during prepare plus a full
-                // Host/Worker/SQLite/Vault/pipe self-test on every launch.
+            beforeWorkerLaunch: async (launchSignal?: AbortSignal): Promise<void> => {
+                // Verify the pinned bundle once at the sole executable launch
+                // boundary.  The plugin never starts a Host or publishes a
+                // discoverable local endpoint.
                 await verifyPinnedTree(launchSignal);
-                if (resolve(await fs.realpath(hostExecutable)).toLocaleLowerCase("en-US") !==
-                    resolve(hostExecutable).toLocaleLowerCase("en-US")) {
-                    fail("development_host_path_changed");
+                if (resolve(await fs.realpath(workerExecutable)).toLocaleLowerCase("en-US") !==
+                    resolve(workerExecutable).toLocaleLowerCase("en-US")) {
+                    fail("development_worker_path_changed");
                 }
             },
         };

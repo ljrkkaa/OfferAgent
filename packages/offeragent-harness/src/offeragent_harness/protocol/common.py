@@ -10,7 +10,7 @@ from pydantic import Field, model_validator
 from offeragent_harness.foundation import MAX_SOURCE_REFERENCES
 
 from ._base import JsonObject, WireModel
-from .content import ArtifactRef, ContentBlock, FileRef, RelativeVaultPath, SourceRef
+from .content import ArtifactRef, ContentBlock, FileRef, SourceRef
 from .errors import ErrorEnvelope
 from .ids import (
     ApprovalId,
@@ -156,38 +156,6 @@ class RunConfigSnapshot(WireModel):
     reasoning_effort: ReasoningEffort = ReasoningEffort.MEDIUM
     permission_mode: PermissionMode = PermissionMode.NORMAL
     budgets: BudgetSnapshot | None = None
-    enabled_skills: list[str] = Field(default_factory=list, max_length=256)
-
-
-class EditorSelection(WireModel):
-    text: str = Field(max_length=262_144)
-    anchor_offset: int = Field(ge=0)
-    head_offset: int = Field(ge=0)
-
-
-class ClientMetadataSnapshot(WireModel):
-    frontmatter: JsonObject = Field(default_factory=dict, max_length=256)
-    tags: list[str] = Field(default_factory=list, max_length=1024)
-    links: list[RelativeVaultPath] = Field(default_factory=list, max_length=2048)
-    unresolved_links: list[str] = Field(default_factory=list, max_length=2048)
-
-
-class ClientBacklinkSnapshot(WireModel):
-    path: RelativeVaultPath
-    count: int = Field(ge=1, le=1_000_000)
-
-
-class ClientContextSnapshot(WireModel):
-    active_file: RelativeVaultPath | None = None
-    active_file_hash: Sha256Digest | None = None
-    active_file_revision: int | None = Field(default=None, ge=0)
-    selection: EditorSelection | None = None
-    selection_revision: int | None = Field(default=None, ge=0)
-    cursor_offset: int | None = Field(default=None, ge=0)
-    has_unsaved_changes: bool = False
-    metadata_cache_revision: int | None = Field(default=None, ge=0)
-    metadata: ClientMetadataSnapshot | None = None
-    backlinks: list[ClientBacklinkSnapshot] | None = Field(default=None, max_length=2048)
 
 
 class UsageSnapshot(WireModel):
@@ -331,10 +299,6 @@ __all__ = [
     "ApprovalScope",
     "ApprovalStatus",
     "BudgetSnapshot",
-    "ClientBacklinkSnapshot",
-    "ClientContextSnapshot",
-    "ClientMetadataSnapshot",
-    "EditorSelection",
     "Finding",
     "PermissionMode",
     "ProposedAction",

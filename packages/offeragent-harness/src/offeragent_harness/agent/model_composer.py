@@ -254,6 +254,7 @@ class ModelComposer:
             elif event.kind is ModelEventKind.REASONING_SUMMARY:
                 if not event.text:
                     raise ModelStreamProtocolError(request.request_id, "empty reasoning summary", usage=usage)
+                yield CompositionEvent(reasoning_summary_delta=event.text)
             elif event.kind is ModelEventKind.USAGE:
                 assert event.usage is not None
                 validate_usage_progression(usage, event.usage, request.request_id)

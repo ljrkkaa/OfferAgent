@@ -49,7 +49,6 @@ from offeragent_harness.protocol.jsonrpc import (
     validate_request,
     validate_response,
 )
-from offeragent_harness.protocol.messages import CommandDirection
 
 from .application_errors import map_application_exception
 from .cancellation import CancellationCode, CancellationReason, CancellationScope
@@ -445,9 +444,9 @@ class _OutboundFrame:
 class DuplexJsonRpcConnection:
     """One authenticated full-duplex JSON-RPC connection.
 
-    Requests in each direction have independent pending-ID namespaces.  A single
-    reader remains active while application handlers and reverse Client Tools run
-    in separate tasks; a single writer serializes all frames.
+    Application requests flow only from client to Worker. A single reader handles
+    responses, Worker event notifications, and client commands while one writer
+    serializes every frame.
     """
 
     def __init__(
@@ -456,6 +455,8 @@ class DuplexJsonRpcConnection:
         *,
         role: ConnectionRole,
         dispatcher: ApplicationCommandDispatcher,
+        command_transport: str,
+        command_peer: str,
         config: NamedPipeTransportConfig | None = None,
         nonce_source: NonceSource = secrets.token_bytes,
         connection_id: str | None = None,
@@ -475,6 +476,11 @@ class DuplexJsonRpcConnection:
             for character in self._connection_id
         ):
             raise ValueError("Named Pipe connection identity is invalid")
+        self._command_context = ApplicationCommandContext(
+            transport=command_transport,
+            client_id=self._connection_id,
+            peer=command_peer,
+        )
         self._decoder = LengthPrefixedJsonRpcDecoder(max_message_bytes=self._config.max_message_bytes)
         self._ids = BidirectionalRequestIds()
         self._pending_local: dict[int | str, _PendingLocalRequest] = {}
@@ -552,8 +558,7 @@ class DuplexJsonRpcConnection:
         request_id = self._new_request_id()
         params_value = params.to_wire() if isinstance(params, WireModel) else dict(params)
         request = JsonRpcRequest(jsonrpc="2.0", id=request_id, method=method, params=cast(JsonObject, params_value))
-        validated = validate_request(request)
-        self._validate_direction(validated.spec.direction, local=True)
+        validate_request(request)
         future: asyncio.Future[object] = asyncio.get_running_loop().create_future()
         self._ids.register(RequestDirection.LOCAL, request_id)
         self._pending_local[request_id] = _PendingLocalRequest(method=method, future=future)
@@ -609,8 +614,10 @@ class DuplexJsonRpcConnection:
         raise NamedPipeTransportError("could not allocate a unique local request ID")
 
     def _validate_local_request_state(self, method: str) -> bool:
+        if self._role is not ConnectionRole.CLIENT:
+            raise NamedPipeTransportError("application requests can only originate from the client")
         if self._state is ConnectionState.AUTHENTICATED:
-            if self._role is not ConnectionRole.CLIENT or method != "initialize":
+            if method != "initialize":
                 raise NamedPipeTransportError("initialize must be the first client request")
             return True
         if self._state is ConnectionState.INITIALIZING:
@@ -620,19 +627,6 @@ class DuplexJsonRpcConnection:
         if method == "initialize":
             raise NamedPipeTransportError("initialize cannot be repeated")
         return False
-
-    def _validate_direction(self, direction: CommandDirection, *, local: bool) -> None:
-        expected = (
-            CommandDirection.CLIENT_TO_WORKER
-            if (self._role is ConnectionRole.CLIENT) == local
-            else CommandDirection.WORKER_TO_CLIENT
-        )
-        if direction is not expected:
-            raise protocol_error(
-                ErrorCode.PROTOCOL_INVALID_REQUEST,
-                "JSON-RPC method is not permitted in this transport direction.",
-                details={"expectedDirection": expected.value},
-            )
 
     async def _send_message(self, message: object) -> None:
         if self._closing:
@@ -741,6 +735,18 @@ class DuplexJsonRpcConnection:
                 "remote pending request limit was exceeded",
             )
         initializes = False
+        if self._role is ConnectionRole.CLIENT:
+            error = protocol_error(
+                ErrorCode.PROTOCOL_INVALID_REQUEST,
+                "Worker-initiated application requests are not supported.",
+            )
+            self._track_background(
+                asyncio.create_task(
+                    self._send_message(make_error_response(request.id, error)),
+                    name=f"pipe-reject:{request.id}",
+                )
+            )
+            return
         if self._role is ConnectionRole.SERVER:
             if self._state is ConnectionState.AUTHENTICATED and request.method == "initialize":
                 initializes = True
@@ -751,14 +757,8 @@ class DuplexJsonRpcConnection:
                 )
             elif request.method == "initialize":
                 raise protocol_error(ErrorCode.PROTOCOL_INVALID_REQUEST, "initialize cannot be repeated")
-        elif self._state is not ConnectionState.READY:
-            raise protocol_error(
-                ErrorCode.PROTOCOL_INVALID_REQUEST,
-                "reverse requests cannot arrive before initialize succeeds",
-            )
         try:
-            validated = validate_request(request)
-            self._validate_direction(validated.spec.direction, local=False)
+            validate_request(request)
         except ProtocolViolation as error:
             self._track_background(
                 asyncio.create_task(
@@ -801,11 +801,7 @@ class DuplexJsonRpcConnection:
                 # application handler can move it into the DPAPI SecretStore.
                 request.params,
                 scope,
-                context=ApplicationCommandContext(
-                    transport="windows-named-pipe",
-                    client_id=self._connection_id,
-                    peer="current-windows-sid",
-                ),
+                context=self._command_context,
             )
             validated_result = validate_response(
                 request.method,

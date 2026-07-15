@@ -29,8 +29,6 @@ def evaluate_termination(state: RunState, *, reason: StopReason) -> TerminationD
         blockers.append("tool_calls_pending")
     if state.pending.approval_ids:
         blockers.append("approvals_pending")
-    if state.pending.client_invocation_ids:
-        blockers.append("client_invocations_pending")
     if state.pending.child_run_ids:
         blockers.append("child_runs_pending")
     if not state.write_obligation.satisfied:

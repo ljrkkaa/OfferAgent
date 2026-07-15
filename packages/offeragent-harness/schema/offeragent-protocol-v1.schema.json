@@ -312,33 +312,12 @@
         "approvalId": {
           "$ref": "#/$defs/ApprovalId"
         },
-        "operationId": {
-          "anyOf": [
-            {
-              "pattern": "^op_[a-z][A-Za-z0-9_-]{0,119}$",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Operationid"
-        },
         "resumed": {
           "title": "Resumed",
           "type": "boolean"
         },
         "runId": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RunId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
+          "$ref": "#/$defs/RunId"
         },
         "status": {
           "enum": [
@@ -355,6 +334,7 @@
       "required": [
         "approvalId",
         "status",
+        "runId",
         "resumed"
       ],
       "title": "ApprovalResolveResult",
@@ -845,18 +825,15 @@
     },
     "CapabilityName": {
       "enum": [
-        "clientTools",
         "eventReplay",
         "multiSession",
         "approvals",
         "skills",
         "shell",
         "hooks",
-        "headlessVaultWrite",
         "subagents",
         "artifacts",
         "loopbackWeb",
-        "reverseRequests",
         "contentBlocks",
         "cancellation",
         "diagnostics"
@@ -882,11 +859,6 @@
           "title": "Cancellation",
           "type": "boolean"
         },
-        "clientTools": {
-          "default": false,
-          "title": "Clienttools",
-          "type": "boolean"
-        },
         "contentBlocks": {
           "default": false,
           "title": "Contentblocks",
@@ -902,11 +874,6 @@
           "title": "Eventreplay",
           "type": "boolean"
         },
-        "headlessVaultWrite": {
-          "default": false,
-          "title": "Headlessvaultwrite",
-          "type": "boolean"
-        },
         "hooks": {
           "default": false,
           "title": "Hooks",
@@ -920,11 +887,6 @@
         "multiSession": {
           "default": false,
           "title": "Multisession",
-          "type": "boolean"
-        },
-        "reverseRequests": {
-          "default": false,
-          "title": "Reverserequests",
           "type": "boolean"
         },
         "shell": {
@@ -944,1005 +906,6 @@
         }
       },
       "title": "CapabilitySet",
-      "type": "object"
-    },
-    "ClientActualOperation": {
-      "additionalProperties": false,
-      "properties": {
-        "afterHash": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Sha256Digest"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "applied": {
-          "title": "Applied",
-          "type": "boolean"
-        },
-        "beforeHash": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Sha256Digest"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "destinationPath": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RelativeVaultPath"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "kind": {
-          "enum": [
-            "create",
-            "append",
-            "patch",
-            "replace",
-            "rename",
-            "trash",
-            "editor_insert",
-            "editor_open",
-            "editor_reveal"
-          ],
-          "title": "Kind",
-          "type": "string"
-        },
-        "operationId": {
-          "maxLength": 128,
-          "minLength": 1,
-          "title": "Operationid",
-          "type": "string"
-        },
-        "path": {
-          "$ref": "#/$defs/RelativeVaultPath"
-        },
-        "summary": {
-          "maxLength": 4096,
-          "minLength": 1,
-          "title": "Summary",
-          "type": "string"
-        }
-      },
-      "required": [
-        "operationId",
-        "kind",
-        "path",
-        "applied",
-        "summary"
-      ],
-      "title": "ClientActualOperation",
-      "type": "object"
-    },
-    "ClientApprovalPresentParams": {
-      "additionalProperties": false,
-      "properties": {
-        "approvalId": {
-          "$ref": "#/$defs/ApprovalId"
-        },
-        "diffArtifact": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ArtifactRef"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "expiresAt": {
-          "$ref": "#/$defs/Rfc3339DateTime"
-        },
-        "explanation": {
-          "maxLength": 8192,
-          "minLength": 1,
-          "title": "Explanation",
-          "type": "string"
-        },
-        "runId": {
-          "$ref": "#/$defs/RunId"
-        },
-        "title": {
-          "maxLength": 512,
-          "minLength": 1,
-          "title": "Title",
-          "type": "string"
-        }
-      },
-      "required": [
-        "approvalId",
-        "runId",
-        "title",
-        "explanation",
-        "expiresAt"
-      ],
-      "title": "ClientApprovalPresentParams",
-      "type": "object"
-    },
-    "ClientApprovalPresentResult": {
-      "additionalProperties": false,
-      "properties": {
-        "approvalId": {
-          "$ref": "#/$defs/ApprovalId"
-        },
-        "presented": {
-          "title": "Presented",
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "approvalId",
-        "presented"
-      ],
-      "title": "ClientApprovalPresentResult",
-      "type": "object"
-    },
-    "ClientBacklinkSnapshot": {
-      "additionalProperties": false,
-      "properties": {
-        "count": {
-          "maximum": 1000000,
-          "minimum": 1,
-          "title": "Count",
-          "type": "integer"
-        },
-        "path": {
-          "$ref": "#/$defs/RelativeVaultPath"
-        }
-      },
-      "required": [
-        "path",
-        "count"
-      ],
-      "title": "ClientBacklinkSnapshot",
-      "type": "object"
-    },
-    "ClientContextGetParams": {
-      "additionalProperties": false,
-      "properties": {
-        "deadline": {
-          "$ref": "#/$defs/Rfc3339DateTime"
-        },
-        "fields": {
-          "items": {
-            "enum": [
-              "activeFile",
-              "selection",
-              "cursor",
-              "metadata",
-              "backlinks",
-              "unsavedState"
-            ],
-            "type": "string"
-          },
-          "maxItems": 6,
-          "minItems": 1,
-          "title": "Fields",
-          "type": "array"
-        },
-        "requestId": {
-          "$ref": "#/$defs/RequestId"
-        },
-        "runId": {
-          "$ref": "#/$defs/RunId"
-        }
-      },
-      "required": [
-        "requestId",
-        "runId",
-        "fields",
-        "deadline"
-      ],
-      "title": "ClientContextGetParams",
-      "type": "object"
-    },
-    "ClientContextGetResult": {
-      "additionalProperties": false,
-      "properties": {
-        "capturedAt": {
-          "$ref": "#/$defs/Rfc3339DateTime"
-        },
-        "context": {
-          "$ref": "#/$defs/ClientContextSnapshot"
-        }
-      },
-      "required": [
-        "context",
-        "capturedAt"
-      ],
-      "title": "ClientContextGetResult",
-      "type": "object"
-    },
-    "ClientContextSnapshot": {
-      "additionalProperties": false,
-      "properties": {
-        "activeFile": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RelativeVaultPath"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "activeFileHash": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Sha256Digest"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "activeFileRevision": {
-          "anyOf": [
-            {
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Activefilerevision"
-        },
-        "backlinks": {
-          "anyOf": [
-            {
-              "items": {
-                "$ref": "#/$defs/ClientBacklinkSnapshot"
-              },
-              "maxItems": 2048,
-              "type": "array"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Backlinks"
-        },
-        "cursorOffset": {
-          "anyOf": [
-            {
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Cursoroffset"
-        },
-        "hasUnsavedChanges": {
-          "default": false,
-          "title": "Hasunsavedchanges",
-          "type": "boolean"
-        },
-        "metadata": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ClientMetadataSnapshot"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "metadataCacheRevision": {
-          "anyOf": [
-            {
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Metadatacacherevision"
-        },
-        "selection": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/EditorSelection"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "selectionRevision": {
-          "anyOf": [
-            {
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Selectionrevision"
-        }
-      },
-      "title": "ClientContextSnapshot",
-      "type": "object"
-    },
-    "ClientMetadataSnapshot": {
-      "additionalProperties": false,
-      "properties": {
-        "frontmatter": {
-          "additionalProperties": {
-            "$ref": "#/$defs/JsonValue"
-          },
-          "maxProperties": 256,
-          "title": "Frontmatter",
-          "type": "object"
-        },
-        "links": {
-          "items": {
-            "$ref": "#/$defs/RelativeVaultPath"
-          },
-          "maxItems": 2048,
-          "title": "Links",
-          "type": "array"
-        },
-        "tags": {
-          "items": {
-            "type": "string"
-          },
-          "maxItems": 1024,
-          "title": "Tags",
-          "type": "array"
-        },
-        "unresolvedLinks": {
-          "items": {
-            "type": "string"
-          },
-          "maxItems": 2048,
-          "title": "Unresolvedlinks",
-          "type": "array"
-        }
-      },
-      "title": "ClientMetadataSnapshot",
-      "type": "object"
-    },
-    "ClientToolCancelParams": {
-      "additionalProperties": false,
-      "properties": {
-        "invocationId": {
-          "$ref": "#/$defs/InvocationId"
-        },
-        "reason": {
-          "maxLength": 4096,
-          "minLength": 1,
-          "title": "Reason",
-          "type": "string"
-        },
-        "runId": {
-          "$ref": "#/$defs/RunId"
-        }
-      },
-      "required": [
-        "invocationId",
-        "runId",
-        "reason"
-      ],
-      "title": "ClientToolCancelParams",
-      "type": "object"
-    },
-    "ClientToolCancelResult": {
-      "additionalProperties": false,
-      "properties": {
-        "accepted": {
-          "title": "Accepted",
-          "type": "boolean"
-        },
-        "alreadyTerminal": {
-          "title": "Alreadyterminal",
-          "type": "boolean"
-        },
-        "invocationId": {
-          "$ref": "#/$defs/InvocationId"
-        }
-      },
-      "required": [
-        "invocationId",
-        "accepted",
-        "alreadyTerminal"
-      ],
-      "title": "ClientToolCancelResult",
-      "type": "object"
-    },
-    "ClientToolCommitObserveParams": {
-      "additionalProperties": false,
-      "properties": {
-        "deadline": {
-          "$ref": "#/$defs/Rfc3339DateTime"
-        },
-        "invocationId": {
-          "$ref": "#/$defs/InvocationId"
-        },
-        "paths": {
-          "items": {
-            "$ref": "#/$defs/RelativeVaultPath"
-          },
-          "maxItems": 64,
-          "minItems": 1,
-          "title": "Paths",
-          "type": "array"
-        },
-        "runId": {
-          "$ref": "#/$defs/RunId"
-        },
-        "toolCallId": {
-          "$ref": "#/$defs/ToolCallId"
-        },
-        "traceId": {
-          "$ref": "#/$defs/TraceId"
-        }
-      },
-      "required": [
-        "invocationId",
-        "toolCallId",
-        "runId",
-        "paths",
-        "deadline",
-        "traceId"
-      ],
-      "title": "ClientToolCommitObserveParams",
-      "type": "object"
-    },
-    "ClientToolCommitObserveResult": {
-      "additionalProperties": false,
-      "properties": {
-        "hasOpenEditors": {
-          "title": "Hasopeneditors",
-          "type": "boolean"
-        },
-        "hasUnsavedEditors": {
-          "title": "Hasunsavededitors",
-          "type": "boolean"
-        },
-        "invocationId": {
-          "$ref": "#/$defs/InvocationId"
-        },
-        "pathStates": {
-          "items": {
-            "$ref": "#/$defs/ClientToolCommitPathState"
-          },
-          "maxItems": 64,
-          "minItems": 1,
-          "title": "Pathstates",
-          "type": "array"
-        },
-        "paths": {
-          "items": {
-            "$ref": "#/$defs/RelativeVaultPath"
-          },
-          "maxItems": 64,
-          "minItems": 1,
-          "title": "Paths",
-          "type": "array"
-        },
-        "toolCallId": {
-          "$ref": "#/$defs/ToolCallId"
-        }
-      },
-      "required": [
-        "invocationId",
-        "toolCallId",
-        "paths",
-        "hasUnsavedEditors",
-        "hasOpenEditors",
-        "pathStates"
-      ],
-      "title": "ClientToolCommitObserveResult",
-      "type": "object"
-    },
-    "ClientToolCommitPathState": {
-      "additionalProperties": false,
-      "properties": {
-        "observedHash": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Sha256Digest"
-            },
-            {
-              "const": "absent",
-              "type": "string"
-            }
-          ],
-          "title": "Observedhash"
-        },
-        "openEditor": {
-          "title": "Openeditor",
-          "type": "boolean"
-        },
-        "path": {
-          "$ref": "#/$defs/RelativeVaultPath"
-        },
-        "unsavedEditor": {
-          "title": "Unsavededitor",
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "path",
-        "observedHash",
-        "unsavedEditor",
-        "openEditor"
-      ],
-      "title": "ClientToolCommitPathState",
-      "type": "object"
-    },
-    "ClientToolError": {
-      "additionalProperties": false,
-      "properties": {
-        "cancelled": {
-          "title": "Cancelled",
-          "type": "boolean"
-        },
-        "code": {
-          "maxLength": 128,
-          "minLength": 1,
-          "pattern": "^[a-z][a-z0-9_.-]*$",
-          "title": "Code",
-          "type": "string"
-        },
-        "details": {
-          "additionalProperties": {
-            "$ref": "#/$defs/JsonValue"
-          },
-          "title": "Details",
-          "type": "object"
-        },
-        "message": {
-          "maxLength": 4096,
-          "minLength": 1,
-          "title": "Message",
-          "type": "string"
-        },
-        "retryable": {
-          "title": "Retryable",
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "code",
-        "message",
-        "retryable",
-        "cancelled"
-      ],
-      "title": "ClientToolError",
-      "type": "object"
-    },
-    "ClientToolInvokeParams": {
-      "additionalProperties": false,
-      "properties": {
-        "argsHash": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "arguments": {
-          "additionalProperties": {
-            "$ref": "#/$defs/JsonValue"
-          },
-          "title": "Arguments",
-          "type": "object"
-        },
-        "deadline": {
-          "$ref": "#/$defs/Rfc3339DateTime"
-        },
-        "idempotencyKey": {
-          "maxLength": 256,
-          "minLength": 1,
-          "title": "Idempotencykey",
-          "type": "string"
-        },
-        "invocationId": {
-          "$ref": "#/$defs/InvocationId"
-        },
-        "name": {
-          "maxLength": 256,
-          "minLength": 3,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
-          "title": "Name",
-          "type": "string"
-        },
-        "runId": {
-          "$ref": "#/$defs/RunId"
-        },
-        "toolCallId": {
-          "$ref": "#/$defs/ToolCallId"
-        },
-        "traceId": {
-          "$ref": "#/$defs/TraceId"
-        }
-      },
-      "required": [
-        "invocationId",
-        "toolCallId",
-        "runId",
-        "name",
-        "arguments",
-        "argsHash",
-        "idempotencyKey",
-        "deadline",
-        "traceId"
-      ],
-      "title": "ClientToolInvokeParams",
-      "type": "object"
-    },
-    "ClientToolInvokeResult": {
-      "additionalProperties": false,
-      "properties": {
-        "actualOperations": {
-          "items": {
-            "$ref": "#/$defs/ClientActualOperation"
-          },
-          "maxItems": 1024,
-          "title": "Actualoperations",
-          "type": "array"
-        },
-        "afterHash": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Sha256Digest"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "afterState": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/JsonValue"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "artifactIds": {
-          "items": {
-            "$ref": "#/$defs/ArtifactId"
-          },
-          "maxItems": 256,
-          "title": "Artifactids",
-          "type": "array"
-        },
-        "beforeHash": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Sha256Digest"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "beforeState": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/JsonValue"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "error": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ClientToolError"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "invocationId": {
-          "$ref": "#/$defs/InvocationId"
-        },
-        "output": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/JsonValue"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "sideEffectFacts": {
-          "items": {
-            "$ref": "#/$defs/PersistedSideEffectFact"
-          },
-          "maxItems": 256,
-          "title": "Sideeffectfacts",
-          "type": "array"
-        },
-        "sourceReferenceIds": {
-          "items": {
-            "type": "string"
-          },
-          "maxItems": 512,
-          "title": "Sourcereferenceids",
-          "type": "array"
-        },
-        "status": {
-          "$ref": "#/$defs/ToolCallStatus"
-        },
-        "toolCallId": {
-          "$ref": "#/$defs/ToolCallId"
-        },
-        "userVisibleSummary": {
-          "maxLength": 8192,
-          "minLength": 1,
-          "title": "Uservisiblesummary",
-          "type": "string"
-        },
-        "workspaceRevision": {
-          "anyOf": [
-            {
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Workspacerevision"
-        }
-      },
-      "required": [
-        "invocationId",
-        "toolCallId",
-        "status",
-        "userVisibleSummary"
-      ],
-      "title": "ClientToolInvokeResult",
-      "type": "object"
-    },
-    "ClientToolLookupParams": {
-      "additionalProperties": false,
-      "properties": {
-        "invocationId": {
-          "$ref": "#/$defs/InvocationId"
-        },
-        "runId": {
-          "$ref": "#/$defs/RunId"
-        }
-      },
-      "required": [
-        "invocationId",
-        "runId"
-      ],
-      "title": "ClientToolLookupParams",
-      "type": "object"
-    },
-    "ClientToolLookupResult": {
-      "additionalProperties": false,
-      "properties": {
-        "found": {
-          "title": "Found",
-          "type": "boolean"
-        },
-        "invocationId": {
-          "$ref": "#/$defs/InvocationId"
-        },
-        "result": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ClientToolInvokeResult"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        }
-      },
-      "required": [
-        "invocationId",
-        "found"
-      ],
-      "title": "ClientToolLookupResult",
-      "type": "object"
-    },
-    "ClientToolPathState": {
-      "additionalProperties": false,
-      "properties": {
-        "afterHash": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Sha256Digest"
-            },
-            {
-              "const": "absent",
-              "type": "string"
-            }
-          ],
-          "title": "Afterhash"
-        },
-        "beforeHash": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Sha256Digest"
-            },
-            {
-              "const": "absent",
-              "type": "string"
-            }
-          ],
-          "title": "Beforehash"
-        },
-        "openEditor": {
-          "title": "Openeditor",
-          "type": "boolean"
-        },
-        "path": {
-          "$ref": "#/$defs/RelativeVaultPath"
-        },
-        "unsavedEditor": {
-          "title": "Unsavededitor",
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "path",
-        "beforeHash",
-        "afterHash",
-        "unsavedEditor",
-        "openEditor"
-      ],
-      "title": "ClientToolPathState",
-      "type": "object"
-    },
-    "ClientToolPreviewParams": {
-      "additionalProperties": false,
-      "properties": {
-        "argsHash": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "arguments": {
-          "additionalProperties": {
-            "$ref": "#/$defs/JsonValue"
-          },
-          "title": "Arguments",
-          "type": "object"
-        },
-        "deadline": {
-          "$ref": "#/$defs/Rfc3339DateTime"
-        },
-        "invocationId": {
-          "$ref": "#/$defs/InvocationId"
-        },
-        "name": {
-          "maxLength": 256,
-          "minLength": 3,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
-          "title": "Name",
-          "type": "string"
-        },
-        "runId": {
-          "$ref": "#/$defs/RunId"
-        },
-        "toolCallId": {
-          "$ref": "#/$defs/ToolCallId"
-        },
-        "traceId": {
-          "$ref": "#/$defs/TraceId"
-        }
-      },
-      "required": [
-        "invocationId",
-        "toolCallId",
-        "runId",
-        "name",
-        "arguments",
-        "argsHash",
-        "deadline",
-        "traceId"
-      ],
-      "title": "ClientToolPreviewParams",
-      "type": "object"
-    },
-    "ClientToolPreviewResult": {
-      "additionalProperties": false,
-      "properties": {
-        "afterStateHash": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "diff": {
-          "maxLength": 4194304,
-          "minLength": 1,
-          "title": "Diff",
-          "type": "string"
-        },
-        "diffSha256": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "hasOpenEditors": {
-          "title": "Hasopeneditors",
-          "type": "boolean"
-        },
-        "hasUnsavedEditors": {
-          "title": "Hasunsavededitors",
-          "type": "boolean"
-        },
-        "invocationId": {
-          "$ref": "#/$defs/InvocationId"
-        },
-        "pathStates": {
-          "items": {
-            "$ref": "#/$defs/ClientToolPathState"
-          },
-          "maxItems": 64,
-          "minItems": 1,
-          "title": "Pathstates",
-          "type": "array"
-        },
-        "paths": {
-          "items": {
-            "$ref": "#/$defs/RelativeVaultPath"
-          },
-          "maxItems": 64,
-          "minItems": 1,
-          "title": "Paths",
-          "type": "array"
-        },
-        "stateHash": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "toolCallId": {
-          "$ref": "#/$defs/ToolCallId"
-        }
-      },
-      "required": [
-        "invocationId",
-        "toolCallId",
-        "stateHash",
-        "afterStateHash",
-        "paths",
-        "diff",
-        "diffSha256",
-        "hasUnsavedEditors",
-        "hasOpenEditors",
-        "pathStates"
-      ],
-      "title": "ClientToolPreviewResult",
       "type": "object"
     },
     "CompactBoundaryId": {
@@ -2445,33 +1408,6 @@
       "title": "DiagnosticsSnapshotResult",
       "type": "object"
     },
-    "EditorSelection": {
-      "additionalProperties": false,
-      "properties": {
-        "anchorOffset": {
-          "minimum": 0,
-          "title": "Anchoroffset",
-          "type": "integer"
-        },
-        "headOffset": {
-          "minimum": 0,
-          "title": "Headoffset",
-          "type": "integer"
-        },
-        "text": {
-          "maxLength": 262144,
-          "title": "Text",
-          "type": "string"
-        }
-      },
-      "required": [
-        "text",
-        "anchorOffset",
-        "headOffset"
-      ],
-      "title": "EditorSelection",
-      "type": "object"
-    },
     "ErrorCode": {
       "enum": [
         "protocol.invalid_json",
@@ -2719,13 +1655,7 @@
           "$ref": "#/$defs/AssistantCompletedPayload"
         },
         {
-          "$ref": "#/$defs/ToolQueuedPayload"
-        },
-        {
           "$ref": "#/$defs/ToolStartedPayload"
-        },
-        {
-          "$ref": "#/$defs/ToolProgressPayload"
         },
         {
           "$ref": "#/$defs/ToolCompletedPayload"
@@ -2812,12 +1742,6 @@
           "$ref": "#/$defs/RuntimeWarningPayload"
         },
         {
-          "$ref": "#/$defs/SkillCatalogUpdatedPayload"
-        },
-        {
-          "$ref": "#/$defs/SkillTrustChangedPayload"
-        },
-        {
           "$ref": "#/$defs/ModelAttemptPayload"
         },
         {
@@ -2844,9 +1768,7 @@
         "reasoning.summary",
         "assistant.delta",
         "assistant.completed",
-        "tool.queued",
         "tool.started",
-        "tool.progress",
         "tool.completed",
         "tool.failed",
         "approval.required",
@@ -2857,8 +1779,6 @@
         "usage.updated",
         "context.compacted",
         "session.updated",
-        "skill.catalog_updated",
-        "skill.trust_changed",
         "subagent.queued",
         "subagent.started",
         "subagent.progress",
@@ -3169,228 +2089,6 @@
       ],
       "title": "Freshness",
       "type": "string"
-    },
-    "HeadlessVaultWriteActivateParams": {
-      "additionalProperties": false,
-      "properties": {
-        "approvalId": {
-          "$ref": "#/$defs/ApprovalId"
-        },
-        "clientRequestId": {
-          "$ref": "#/$defs/RequestId"
-        },
-        "expectedArgsHash": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "expectedRevision": {
-          "minimum": 1,
-          "title": "Expectedrevision",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "clientRequestId",
-        "approvalId",
-        "expectedArgsHash",
-        "expectedRevision"
-      ],
-      "title": "HeadlessVaultWriteActivateParams",
-      "type": "object"
-    },
-    "HeadlessVaultWriteRequestParams": {
-      "additionalProperties": false,
-      "properties": {
-        "clientRequestId": {
-          "$ref": "#/$defs/RequestId"
-        },
-        "confirmation": {
-          "const": "obsidian_closed_disk_authoritative",
-          "title": "Confirmation",
-          "type": "string"
-        },
-        "expectedBaselineFingerprint": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "ttlSeconds": {
-          "maximum": 3600,
-          "minimum": 60,
-          "title": "Ttlseconds",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "clientRequestId",
-        "confirmation",
-        "ttlSeconds",
-        "expectedBaselineFingerprint"
-      ],
-      "title": "HeadlessVaultWriteRequestParams",
-      "type": "object"
-    },
-    "HeadlessVaultWriteRevokeParams": {
-      "additionalProperties": false,
-      "properties": {
-        "approvalId": {
-          "$ref": "#/$defs/ApprovalId"
-        },
-        "clientRequestId": {
-          "$ref": "#/$defs/RequestId"
-        },
-        "expectedRevision": {
-          "minimum": 1,
-          "title": "Expectedrevision",
-          "type": "integer"
-        },
-        "reason": {
-          "maxLength": 512,
-          "minLength": 1,
-          "title": "Reason",
-          "type": "string"
-        }
-      },
-      "required": [
-        "clientRequestId",
-        "approvalId",
-        "expectedRevision",
-        "reason"
-      ],
-      "title": "HeadlessVaultWriteRevokeParams",
-      "type": "object"
-    },
-    "HeadlessVaultWriteState": {
-      "enum": [
-        "read_only",
-        "pipe_client_tool",
-        "ambiguous_pipe",
-        "baseline_unreliable",
-        "pending_approval",
-        "approved",
-        "active",
-        "claimed",
-        "denied",
-        "expired",
-        "revoked",
-        "consumed"
-      ],
-      "title": "HeadlessVaultWriteState",
-      "type": "string"
-    },
-    "HeadlessVaultWriteStatusParams": {
-      "additionalProperties": false,
-      "properties": {},
-      "title": "HeadlessVaultWriteStatusParams",
-      "type": "object"
-    },
-    "HeadlessVaultWriteStatusResult": {
-      "additionalProperties": false,
-      "properties": {
-        "approvalId": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ApprovalId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "argsHash": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Sha256Digest"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "baselineFingerprint": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "baselineReliable": {
-          "title": "Baselinereliable",
-          "type": "boolean"
-        },
-        "canActivate": {
-          "title": "Canactivate",
-          "type": "boolean"
-        },
-        "canRequest": {
-          "title": "Canrequest",
-          "type": "boolean"
-        },
-        "canRevoke": {
-          "title": "Canrevoke",
-          "type": "boolean"
-        },
-        "expiresAt": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Rfc3339DateTime"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "operationId": {
-          "anyOf": [
-            {
-              "pattern": "^op_headless_[0-9a-f]{32}$",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Operationid"
-        },
-        "pipeConnectionCount": {
-          "maximum": 16,
-          "minimum": 0,
-          "title": "Pipeconnectioncount",
-          "type": "integer"
-        },
-        "reasonCode": {
-          "maxLength": 128,
-          "minLength": 1,
-          "pattern": "^[a-z][a-z0-9_]*$",
-          "title": "Reasoncode",
-          "type": "string"
-        },
-        "revision": {
-          "minimum": 0,
-          "title": "Revision",
-          "type": "integer"
-        },
-        "state": {
-          "$ref": "#/$defs/HeadlessVaultWriteState"
-        },
-        "userMessage": {
-          "maxLength": 1024,
-          "minLength": 1,
-          "title": "Usermessage",
-          "type": "string"
-        }
-      },
-      "required": [
-        "state",
-        "pipeConnectionCount",
-        "baselineReliable",
-        "baselineFingerprint",
-        "revision",
-        "reasonCode",
-        "userMessage",
-        "canRequest",
-        "canActivate",
-        "canRevoke"
-      ],
-      "title": "HeadlessVaultWriteStatusResult",
-      "type": "object"
     },
     "HookCommandInput": {
       "additionalProperties": false,
@@ -4105,12 +2803,6 @@
       "title": "InitializeResult",
       "type": "object"
     },
-    "InvocationId": {
-      "maxLength": 128,
-      "minLength": 5,
-      "pattern": "^inv_[A-Za-z0-9][A-Za-z0-9_-]*$",
-      "type": "string"
-    },
     "JsonRpcError": {
       "additionalProperties": false,
       "properties": {
@@ -4759,21 +3451,6 @@
         "configRevision"
       ],
       "title": "ModelsListResult",
-      "type": "object"
-    },
-    "NoWriteIntent": {
-      "additionalProperties": false,
-      "properties": {
-        "kind": {
-          "const": "none",
-          "title": "Kind",
-          "type": "string"
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "title": "NoWriteIntent",
       "type": "object"
     },
     "NonEmptyText": {
@@ -6129,14 +4806,6 @@
             }
           ],
           "default": null
-        },
-        "enabledSkills": {
-          "items": {
-            "type": "string"
-          },
-          "maxItems": 256,
-          "title": "Enabledskills",
-          "type": "array"
         },
         "model": {
           "maxLength": 256,
@@ -7931,50 +6600,6 @@
       "title": "SkillCatalogStatusSnapshot",
       "type": "object"
     },
-    "SkillCatalogUpdatedPayload": {
-      "additionalProperties": false,
-      "properties": {
-        "discoveredCount": {
-          "maximum": 100000,
-          "minimum": 0,
-          "title": "Discoveredcount",
-          "type": "integer"
-        },
-        "enabledCount": {
-          "maximum": 100000,
-          "minimum": 0,
-          "title": "Enabledcount",
-          "type": "integer"
-        },
-        "partial": {
-          "title": "Partial",
-          "type": "boolean"
-        },
-        "recordRevision": {
-          "minimum": 1,
-          "title": "Recordrevision",
-          "type": "integer"
-        },
-        "revision": {
-          "minimum": 1,
-          "title": "Revision",
-          "type": "integer"
-        },
-        "snapshotHash": {
-          "$ref": "#/$defs/Sha256Digest"
-        }
-      },
-      "required": [
-        "revision",
-        "snapshotHash",
-        "recordRevision",
-        "discoveredCount",
-        "enabledCount",
-        "partial"
-      ],
-      "title": "SkillCatalogUpdatedPayload",
-      "type": "object"
-    },
     "SkillDiagnosticSnapshot": {
       "additionalProperties": false,
       "properties": {
@@ -8053,10 +6678,6 @@
           "title": "Description",
           "type": "string"
         },
-        "enabled": {
-          "title": "Enabled",
-          "type": "boolean"
-        },
         "layer": {
           "enum": [
             "builtin",
@@ -8088,15 +6709,6 @@
           "pattern": "^[a-z][a-z0-9._-]{0,63}$",
           "title": "Rootid",
           "type": "string"
-        },
-        "trustState": {
-          "enum": [
-            "verified",
-            "confirmed",
-            "confirmation_required"
-          ],
-          "title": "Truststate",
-          "type": "string"
         }
       },
       "required": [
@@ -8105,101 +6717,9 @@
         "layer",
         "name",
         "description",
-        "metadataHash",
-        "trustState",
-        "enabled"
+        "metadataHash"
       ],
       "title": "SkillSnapshot",
-      "type": "object"
-    },
-    "SkillTrustChangedPayload": {
-      "additionalProperties": false,
-      "properties": {
-        "confirmed": {
-          "title": "Confirmed",
-          "type": "boolean"
-        },
-        "metadataHash": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "name": {
-          "maxLength": 128,
-          "minLength": 1,
-          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
-          "title": "Name",
-          "type": "string"
-        },
-        "packagePath": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "title": "Packagepath",
-          "type": "string"
-        },
-        "recordRevision": {
-          "minimum": 1,
-          "title": "Recordrevision",
-          "type": "integer"
-        },
-        "rootId": {
-          "maxLength": 128,
-          "minLength": 1,
-          "pattern": "^[a-z][a-z0-9_-]*$",
-          "title": "Rootid",
-          "type": "string"
-        }
-      },
-      "required": [
-        "rootId",
-        "packagePath",
-        "name",
-        "metadataHash",
-        "confirmed",
-        "recordRevision"
-      ],
-      "title": "SkillTrustChangedPayload",
-      "type": "object"
-    },
-    "SkillsConfirmTrustParams": {
-      "additionalProperties": false,
-      "properties": {
-        "clientRequestId": {
-          "$ref": "#/$defs/RequestId"
-        },
-        "confirmed": {
-          "title": "Confirmed",
-          "type": "boolean"
-        },
-        "expectedMetadataHash": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "expectedRevision": {
-          "minimum": 0,
-          "title": "Expectedrevision",
-          "type": "integer"
-        },
-        "packagePath": {
-          "maxLength": 2048,
-          "minLength": 1,
-          "title": "Packagepath",
-          "type": "string"
-        },
-        "rootId": {
-          "maxLength": 64,
-          "minLength": 1,
-          "pattern": "^[a-z][a-z0-9._-]{0,63}$",
-          "title": "Rootid",
-          "type": "string"
-        }
-      },
-      "required": [
-        "clientRequestId",
-        "rootId",
-        "packagePath",
-        "expectedMetadataHash",
-        "expectedRevision",
-        "confirmed"
-      ],
-      "title": "SkillsConfirmTrustParams",
       "type": "object"
     },
     "SkillsListParams": {
@@ -8245,47 +6765,6 @@
         "snapshotHash"
       ],
       "title": "SkillsListResult",
-      "type": "object"
-    },
-    "SkillsMutationResult": {
-      "additionalProperties": false,
-      "properties": {
-        "applied": {
-          "title": "Applied",
-          "type": "boolean"
-        },
-        "clientRequestId": {
-          "$ref": "#/$defs/RequestId"
-        },
-        "status": {
-          "$ref": "#/$defs/SkillCatalogStatusSnapshot"
-        }
-      },
-      "required": [
-        "clientRequestId",
-        "applied",
-        "status"
-      ],
-      "title": "SkillsMutationResult",
-      "type": "object"
-    },
-    "SkillsRescanParams": {
-      "additionalProperties": false,
-      "properties": {
-        "clientRequestId": {
-          "$ref": "#/$defs/RequestId"
-        },
-        "expectedRevision": {
-          "minimum": 0,
-          "title": "Expectedrevision",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "clientRequestId",
-        "expectedRevision"
-      ],
-      "title": "SkillsRescanParams",
       "type": "object"
     },
     "SkillsStatusParams": {
@@ -9006,82 +7485,6 @@
       "title": "ToolFailedPayload",
       "type": "object"
     },
-    "ToolProgressPayload": {
-      "additionalProperties": false,
-      "properties": {
-        "artifact": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ArtifactRef"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "completedUnits": {
-          "anyOf": [
-            {
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Completedunits"
-        },
-        "message": {
-          "maxLength": 4096,
-          "minLength": 1,
-          "title": "Message",
-          "type": "string"
-        },
-        "toolCallId": {
-          "$ref": "#/$defs/ToolCallId"
-        },
-        "totalUnits": {
-          "anyOf": [
-            {
-              "minimum": 1,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Totalunits"
-        }
-      },
-      "required": [
-        "toolCallId",
-        "message"
-      ],
-      "title": "ToolProgressPayload",
-      "type": "object"
-    },
-    "ToolQueuedPayload": {
-      "additionalProperties": false,
-      "properties": {
-        "call": {
-          "$ref": "#/$defs/ToolCallDescriptor"
-        },
-        "ordinal": {
-          "minimum": 0,
-          "title": "Ordinal",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "call",
-        "ordinal"
-      ],
-      "title": "ToolQueuedPayload",
-      "type": "object"
-    },
     "ToolResultDescriptor": {
       "additionalProperties": false,
       "properties": {
@@ -9554,17 +7957,6 @@
     "TurnStartParams": {
       "additionalProperties": false,
       "properties": {
-        "clientContext": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ClientContextSnapshot"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
         "deadline": {
           "anyOf": [
             {
@@ -9599,24 +7991,6 @@
         },
         "turnId": {
           "$ref": "#/$defs/TurnId"
-        },
-        "writeIntent": {
-          "discriminator": {
-            "mapping": {
-              "none": "#/$defs/NoWriteIntent",
-              "vault_write_required": "#/$defs/VaultWriteRequiredIntent"
-            },
-            "propertyName": "kind"
-          },
-          "oneOf": [
-            {
-              "$ref": "#/$defs/NoWriteIntent"
-            },
-            {
-              "$ref": "#/$defs/VaultWriteRequiredIntent"
-            }
-          ],
-          "title": "Writeintent"
         }
       },
       "required": [
@@ -9624,8 +7998,7 @@
         "turnId",
         "idempotencyKey",
         "input",
-        "runConfig",
-        "writeIntent"
+        "runConfig"
       ],
       "title": "TurnStartParams",
       "type": "object"
@@ -9670,17 +8043,6 @@
           "minimum": 1,
           "title": "Attempt",
           "type": "integer"
-        },
-        "clientContext": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ClientContextSnapshot"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
         },
         "input": {
           "items": {
@@ -9948,35 +8310,6 @@
         "file"
       ],
       "title": "VaultSourceRef",
-      "type": "object"
-    },
-    "VaultWriteRequiredIntent": {
-      "additionalProperties": false,
-      "properties": {
-        "intentHash": {
-          "$ref": "#/$defs/Sha256Digest"
-        },
-        "kind": {
-          "const": "vault_write_required",
-          "title": "Kind",
-          "type": "string"
-        },
-        "targetPaths": {
-          "items": {
-            "$ref": "#/$defs/RelativeVaultPath"
-          },
-          "maxItems": 20,
-          "minItems": 1,
-          "title": "Targetpaths",
-          "type": "array"
-        }
-      },
-      "required": [
-        "kind",
-        "targetPaths",
-        "intentHash"
-      ],
-      "title": "VaultWriteRequiredIntent",
       "type": "object"
     },
     "WebLaunchParams": {
@@ -10395,15 +8728,6 @@
         "$ref": "#/$defs/ShutdownResult"
       }
     },
-    "skills/confirm-trust": {
-      "params": {
-        "$ref": "#/$defs/SkillsConfirmTrustParams"
-      },
-      "requiredCapability": "skills",
-      "result": {
-        "$ref": "#/$defs/SkillsMutationResult"
-      }
-    },
     "skills/list": {
       "params": {
         "$ref": "#/$defs/SkillsListParams"
@@ -10411,15 +8735,6 @@
       "requiredCapability": "skills",
       "result": {
         "$ref": "#/$defs/SkillsListResult"
-      }
-    },
-    "skills/rescan": {
-      "params": {
-        "$ref": "#/$defs/SkillsRescanParams"
-      },
-      "requiredCapability": "skills",
-      "result": {
-        "$ref": "#/$defs/SkillsMutationResult"
       }
     },
     "skills/status": {
@@ -10470,42 +8785,6 @@
       },
       "result": {
         "$ref": "#/$defs/TurnSteerResult"
-      }
-    },
-    "vault/headless/activate": {
-      "params": {
-        "$ref": "#/$defs/HeadlessVaultWriteActivateParams"
-      },
-      "requiredCapability": "headlessVaultWrite",
-      "result": {
-        "$ref": "#/$defs/HeadlessVaultWriteStatusResult"
-      }
-    },
-    "vault/headless/request": {
-      "params": {
-        "$ref": "#/$defs/HeadlessVaultWriteRequestParams"
-      },
-      "requiredCapability": "headlessVaultWrite",
-      "result": {
-        "$ref": "#/$defs/HeadlessVaultWriteStatusResult"
-      }
-    },
-    "vault/headless/revoke": {
-      "params": {
-        "$ref": "#/$defs/HeadlessVaultWriteRevokeParams"
-      },
-      "requiredCapability": "headlessVaultWrite",
-      "result": {
-        "$ref": "#/$defs/HeadlessVaultWriteStatusResult"
-      }
-    },
-    "vault/headless/status": {
-      "params": {
-        "$ref": "#/$defs/HeadlessVaultWriteStatusParams"
-      },
-      "requiredCapability": "headlessVaultWrite",
-      "result": {
-        "$ref": "#/$defs/HeadlessVaultWriteStatusResult"
       }
     },
     "web/launch": {
@@ -10620,16 +8899,6 @@
         "$ref": "#/$defs/SessionUpdatedPayload"
       }
     },
-    "skill.catalog_updated": {
-      "payload": {
-        "$ref": "#/$defs/SkillCatalogUpdatedPayload"
-      }
-    },
-    "skill.trust_changed": {
-      "payload": {
-        "$ref": "#/$defs/SkillTrustChangedPayload"
-      }
-    },
     "subagent.cancel_requested": {
       "payload": {
         "$ref": "#/$defs/SubagentCancelRequestedPayload"
@@ -10710,16 +8979,6 @@
         "$ref": "#/$defs/ToolFailedPayload"
       }
     },
-    "tool.progress": {
-      "payload": {
-        "$ref": "#/$defs/ToolProgressPayload"
-      }
-    },
-    "tool.queued": {
-      "payload": {
-        "$ref": "#/$defs/ToolQueuedPayload"
-      }
-    },
     "tool.started": {
       "payload": {
         "$ref": "#/$defs/ToolStartedPayload"
@@ -10767,71 +9026,6 @@
     }
   },
   "protocolVersion": "1.0",
-  "reverseRequests": {
-    "client/approval/present": {
-      "params": {
-        "$ref": "#/$defs/ClientApprovalPresentParams"
-      },
-      "requiredCapability": "approvals",
-      "result": {
-        "$ref": "#/$defs/ClientApprovalPresentResult"
-      }
-    },
-    "client/context/get": {
-      "params": {
-        "$ref": "#/$defs/ClientContextGetParams"
-      },
-      "requiredCapability": "clientTools",
-      "result": {
-        "$ref": "#/$defs/ClientContextGetResult"
-      }
-    },
-    "client/tool/cancel": {
-      "params": {
-        "$ref": "#/$defs/ClientToolCancelParams"
-      },
-      "requiredCapability": "cancellation",
-      "result": {
-        "$ref": "#/$defs/ClientToolCancelResult"
-      }
-    },
-    "client/tool/commit-observe": {
-      "params": {
-        "$ref": "#/$defs/ClientToolCommitObserveParams"
-      },
-      "requiredCapability": "clientTools",
-      "result": {
-        "$ref": "#/$defs/ClientToolCommitObserveResult"
-      }
-    },
-    "client/tool/invoke": {
-      "params": {
-        "$ref": "#/$defs/ClientToolInvokeParams"
-      },
-      "requiredCapability": "clientTools",
-      "result": {
-        "$ref": "#/$defs/ClientToolInvokeResult"
-      }
-    },
-    "client/tool/lookup": {
-      "params": {
-        "$ref": "#/$defs/ClientToolLookupParams"
-      },
-      "requiredCapability": "clientTools",
-      "result": {
-        "$ref": "#/$defs/ClientToolLookupResult"
-      }
-    },
-    "client/tool/preview": {
-      "params": {
-        "$ref": "#/$defs/ClientToolPreviewParams"
-      },
-      "requiredCapability": "clientTools",
-      "result": {
-        "$ref": "#/$defs/ClientToolPreviewResult"
-      }
-    }
-  },
   "schemaVersion": "1",
   "title": "OfferAgent Local Harness Protocol v1"
 }

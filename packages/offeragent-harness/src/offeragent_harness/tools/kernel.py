@@ -55,7 +55,7 @@ from .definitions import (
     ToolCall,
     ToolDefinition,
 )
-from .dispatcher import InvocationAcknowledgementLost, ToolDispatcher, ToolDispatchError
+from .dispatcher import ToolDispatcher, ToolDispatchError
 from .preflight import (
     PreflightConflict,
     PreflightEvidence,
@@ -255,9 +255,18 @@ class UnifiedToolKernel:
             for call in calls:
                 started[call.tool_call_id] = self._clock.monotonic()
                 prepared.append(await self._prepare_scheduled(call, cancellation, observer))
-            scheduled = tuple(prepared)
-            if observer is not None:
-                await observer.execution_started()
+            scheduled = tuple(
+                invocation
+                if observer is None or invocation.precomputed_result is not None
+                else replace(
+                    invocation,
+                    on_started=lambda started_invocation: observer.execution_started(
+                        started_invocation.call,
+                        started_invocation.definition,
+                    ),
+                )
+                for invocation in prepared
+            )
         except BaseException:
             await abort_scheduled_invocations(prepared)
             raise
@@ -1001,8 +1010,6 @@ class UnifiedToolKernel:
             observer,
             prepared_preflight,
         )
-        if result is None and observer is not None:
-            await observer.execution_started()
         return result
 
     @staticmethod
@@ -1063,10 +1070,6 @@ class UnifiedToolKernel:
                 return self._validated_completed_replay(definition, call, record)
             if record.state is JournalState.UNKNOWN:
                 return self._unknown(call, "journal_unknown_outcome", "此前调用结果未知, 禁止自动重放。")
-            recovered = await self._dispatcher.lookup_result(definition, call)
-            if recovered is not None:
-                recovered = await self._normalize_result(definition, call, recovered)
-                return await self._finalize_journal(scope, call, recovered)
             if not is_side_effect_free(definition):
                 await self._journal.mark_unknown(
                     scope,
@@ -1220,24 +1223,7 @@ class UnifiedToolKernel:
         call: ToolCall,
         cancellation: CancellationToken,
     ) -> ToolResult:
-        try:
-            result = await self._dispatcher.execute(definition, call, cancellation)
-        except InvocationAcknowledgementLost as acknowledgement_lost:
-            try:
-                recovered = await self._dispatcher.lookup_result(definition, call)
-            except ToolDispatchError as lookup_error:
-                if not is_side_effect_free(definition):
-                    return self._unknown(call, "ack_lookup_failed", "执行 ACK 丢失且结果查询失败。")
-                if not is_safe_crash_replay(definition):
-                    return self._failed(call, "ack_lookup_failed", "执行 ACK 丢失, 查询失败且未声明可重试。")
-                raise acknowledgement_lost from lookup_error
-            if recovered is not None:
-                return await self._normalize_result(definition, call, recovered)
-            if not is_side_effect_free(definition):
-                return self._unknown(call, "ack_lost_unknown_outcome", "执行 ACK 丢失且无法确认副作用。")
-            if not is_safe_crash_replay(definition):
-                return self._failed(call, "ack_lost_not_retryable", "执行 ACK 丢失, 且工具未声明可安全重试。")
-            raise
+        result = await self._dispatcher.execute(definition, call, cancellation)
         return await self._normalize_result(definition, call, result)
 
     async def _normalize_result(

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from offeragent_harness.models.json_types import thaw_json
 from offeragent_harness.permissions import RiskClass
 from offeragent_harness.tools.definitions import (
     ApprovalEvidence,
@@ -156,14 +155,12 @@ def vault_transaction_definition(
 ) -> ToolDefinition:
     """Return the one model-facing Vault write definition for a Run.
 
-    Production composition always selects ``LOCAL``: Obsidian contributes a
-    read-only live-editor proof, while the Worker's one transaction coordinator
-    owns every durable mutation.  ``CLIENT`` remains accepted only so recovery
-    can recognize journals written by pre-migration development builds.
+    The Worker transaction coordinator owns every durable mutation.  The
+    model-facing contract executes only in that single local authority.
     """
 
-    if executor_location not in {ExecutorLocation.LOCAL, ExecutorLocation.CLIENT}:
-        raise ValueError("vault.transaction can execute only in the local Worker or authenticated client")
+    if executor_location is not ExecutorLocation.LOCAL:
+        raise ValueError("vault.transaction executes only in the local Worker")
     return ToolDefinition(
         name="vault.transaction",
         version="1",
@@ -186,90 +183,11 @@ def vault_transaction_definition(
     )
 
 
-def legacy_vault_transaction_definition(
-    *,
-    executor_location: ExecutorLocation = ExecutorLocation.LOCAL,
-) -> ToolDefinition:
-    """Recognize the retired broad fingerprint during fail-closed recovery.
-
-    Callers may place this definition in a fingerprint resolver only.  It is
-    intentionally distinct from :func:`vault_transaction_definition` and must
-    never be inserted into an active Tool Registry.
-    """
-
-    if executor_location not in {ExecutorLocation.LOCAL, ExecutorLocation.CLIENT}:
-        raise ValueError("vault.transaction can execute only in the local Worker or authenticated client")
-    return ToolDefinition(
-        name="vault.transaction",
-        version="1",
-        description="Apply an approved, hash-bound local Vault transaction.",
-        input_schema=INTERNAL_VAULT_TRANSACTION_SCHEMA,
-        output_schema=VAULT_TRANSACTION_OUTPUT_SCHEMA,
-        executor_location=executor_location,
-        risk=RiskClass.WRITE,
-        side_effect_class=SideEffectClass.WRITE,
-        required_capabilities=frozenset({"workspace.read", "vault.write"}),
-        concurrency_safe=False,
-        idempotent=True,
-        retryable=False,
-        timeout_ms=120_000,
-        output_limit_bytes=64 * 1024,
-        preflight_mode=PreflightMode.REQUIRED,
-        preflight_provider=VAULT_TRANSACTION_PREFLIGHT_PROVIDER,
-        approval_evidence=ApprovalEvidence.DIFF,
-        result_sensitivity=ResultSensitivity.UNKNOWN,
-    )
-
-
-def legacy_public_vault_transaction_definition(
-    *,
-    executor_location: ExecutorLocation = ExecutorLocation.LOCAL,
-) -> ToolDefinition:
-    """Recognize the pre-classification public-schema fingerprint only.
-
-    Recovery may resolve this immutable definition to explain an old snapshot,
-    but UNKNOWN prevents insertion into an active Registry or silent replay.
-    """
-
-    if executor_location not in {ExecutorLocation.LOCAL, ExecutorLocation.CLIENT}:
-        raise ValueError("vault.transaction can execute only in the local Worker or authenticated client")
-    definition = vault_transaction_definition(executor_location=executor_location)
-    return ToolDefinition(
-        name=definition.name,
-        version=definition.version,
-        description=definition.description,
-        input_schema=thaw_json(definition.input_schema),
-        output_schema=thaw_json(definition.output_schema),
-        executor_location=definition.executor_location,
-        risk=definition.risk,
-        side_effect_class=definition.side_effect_class,
-        required_capabilities=definition.required_capabilities,
-        concurrency_safe=definition.concurrency_safe,
-        idempotent=definition.idempotent,
-        retryable=definition.retryable,
-        timeout_ms=definition.timeout_ms,
-        output_limit_bytes=definition.output_limit_bytes,
-        preflight_mode=definition.preflight_mode,
-        preflight_provider=definition.preflight_provider,
-        approval_evidence=definition.approval_evidence,
-        result_sensitivity=ResultSensitivity.UNKNOWN,
-    )
-
-
-def client_vault_transaction_definition() -> ToolDefinition:
-    """Return the legacy CLIENT fingerprint for fail-closed journal recovery."""
-
-    return legacy_public_vault_transaction_definition(executor_location=ExecutorLocation.CLIENT)
-
-
 __all__ = [
     "ABSENT_HASH",
     "INTERNAL_VAULT_TRANSACTION_SCHEMA",
     "VAULT_TRANSACTION_OUTPUT_SCHEMA",
     "VAULT_TRANSACTION_PREFLIGHT_PROVIDER",
     "VAULT_TRANSACTION_SCHEMA",
-    "client_vault_transaction_definition",
-    "legacy_public_vault_transaction_definition",
-    "legacy_vault_transaction_definition",
     "vault_transaction_definition",
 ]

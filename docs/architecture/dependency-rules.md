@@ -33,8 +33,6 @@ app / cli composition root
   console entry point、`uv.lock`、Runtime SBOM 和 UI 边界做 fail-closed 检查。
 - 迁移文档可以描述旧类型和命令；任何可执行 Python/TypeScript、package script、CI 或发行脚本
   都不能 import、动态加载、启动或打包这些历史入口。
-- 一次性 `packages/offeragent-harness/scripts/legacy_exporter` 只接受离线 JSONL 或调用方注入的只读 iterable；它不拥有
-  Django 配置、数据库连接、Router 或服务器生命周期。
 
 ## 状态与副作用
 

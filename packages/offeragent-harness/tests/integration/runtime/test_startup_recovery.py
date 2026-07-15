@@ -13,7 +13,7 @@ from offeragent_harness.adapters.sqlite_stores import SqliteUnitOfWorkFactory
 from offeragent_harness.agent import BudgetCheckpoint, BudgetDelta, BudgetLedger, RunBudget
 from offeragent_harness.agent.composer import CompositionEvent
 from offeragent_harness.agent.loop import AgentLoopFailure, ToolExecution
-from offeragent_harness.agent.planner import Planner, PlanningStep
+from offeragent_harness.agent.planner import Planner, PlanningAttempt, PlanningAttemptOutcome, PlanningStep
 from offeragent_harness.agent.state import RunPhase, RunState
 from offeragent_harness.app import ApplicationNotReady, create_application, start_application
 from offeragent_harness.models import ModelUsage, thaw_json
@@ -118,7 +118,19 @@ class _GateStopPlanner:
         self.entered.set()
         await self.release.wait()
         cancellation.checkpoint()
-        return PlanningStep((), False, "done")
+        return PlanningStep(
+            (),
+            False,
+            "done",
+            attempts=(
+                PlanningAttempt(
+                    request_id=f"test-gate-{state.model_rounds + 1}",
+                    repair_index=0,
+                    outcome=PlanningAttemptOutcome.SUCCEEDED,
+                    usage=ModelUsage(0, 0, 0, 0),
+                ),
+            ),
+        )
 
 
 class _PhantomTerminalPlanner:
@@ -180,7 +192,8 @@ class _ReplayKernel:
         assert observer is not None
         batch = tuple(calls)
         self.batches.append(batch)
-        await observer.execution_started()
+        for call in batch:
+            await observer.execution_started(call, self._definitions[call.name])
         executions: list[ToolExecution] = []
         for call in batch:
             definition = self._definitions[call.name]
@@ -430,7 +443,6 @@ async def _persist_fixture(
         payload={
             "input": thaw_json(fixture.turn.input_blocks),
             "runConfig": thaw_json(fixture.run.config_snapshot),
-            "clientContext": None,
             "attempt": 1,
         },
         trace_id=f"trace_{fixture.run.run_id.removeprefix('run_')}",

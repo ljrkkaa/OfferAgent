@@ -93,7 +93,7 @@ corepack yarn build
 - TypeScript 检查和 production esbuild：通过
 - 生成 `main.js`：约 129.3 KiB
 
-现有测试主要证明旧 HTTP Server Adapter、流式帧解析和回答后 VaultAction Apply 的行为。目标插件会删除 HTTP Agent/sync 路径，因此这些测试只能作为迁移行为基线；必须新增 Named Pipe 双工 RPC、Event replay、Client Tool exactly-once、Runtime bootstrap 和同一 Worker identity 契约测试。
+现有测试主要证明旧 HTTP Server Adapter、流式帧解析和回答后 VaultAction Apply 的行为。目标插件会删除 HTTP Agent/sync 路径，因此这些测试只能作为迁移行为基线；必须新增 Named Pipe RPC、Event replay、Worker-local Tool Journal、Runtime bootstrap 和同一 Worker identity 契约测试。
 
 ## 环境与安全状态
 

@@ -25,7 +25,6 @@ class ModelPurpose(str, Enum):
     COMPOSING = "composing"
     COMPACTION = "compaction"
     GROUNDING = "grounding"
-    MEMORY = "memory"
 
 
 class ModelOutputMode(str, Enum):

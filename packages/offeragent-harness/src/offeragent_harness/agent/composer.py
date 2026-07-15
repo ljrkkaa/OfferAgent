@@ -30,14 +30,20 @@ class CompositionRetry:
 @dataclass(frozen=True, slots=True)
 class CompositionEvent:
     text_delta: str | None = None
+    reasoning_summary_delta: str | None = None
     usage: ModelUsage | None = None
     retry: CompositionRetry | None = None
 
     def __post_init__(self) -> None:
-        if sum(value is not None for value in (self.text_delta, self.usage, self.retry)) != 1:
-            raise ValueError("composition event must contain exactly one of text_delta, usage, or retry")
+        if (
+            sum(value is not None for value in (self.text_delta, self.reasoning_summary_delta, self.usage, self.retry))
+            != 1
+        ):
+            raise ValueError("composition event must contain exactly one payload")
         if self.text_delta == "":
             raise ValueError("empty text deltas are not allowed")
+        if self.reasoning_summary_delta == "":
+            raise ValueError("empty reasoning summary deltas are not allowed")
 
 
 class Composer(Protocol):

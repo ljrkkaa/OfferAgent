@@ -217,8 +217,7 @@ def _configured_capabilities(snapshot: RunConfigSnapshot) -> frozenset[RuntimeCa
         enabled.add(RuntimeCapability.SHELL)
     if config.execution.subagents_enabled:
         enabled.add(RuntimeCapability.SUBAGENT)
-    if config.extensibility.skills_enabled:
-        enabled.add(RuntimeCapability.SKILLS)
+    enabled.add(RuntimeCapability.SKILLS)
     if config.extensibility.hooks_enabled:
         enabled.add(RuntimeCapability.HOOKS)
     if config.ui.loopback_web_enabled:

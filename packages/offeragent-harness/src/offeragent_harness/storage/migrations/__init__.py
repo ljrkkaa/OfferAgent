@@ -5,7 +5,13 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 
-from . import v0001_initial, v0002_remove_legacy_skill_state
+from . import (
+    v0001_initial,
+    v0002_remove_legacy_skill_state,
+    v0003_remove_obsolete_runtime_config,
+    v0004_remove_client_vault_authority,
+    v0005_remove_obsolete_write_intent_snapshots,
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,23 @@ MIGRATIONS = (
         v0002_remove_legacy_skill_state.VERSION,
         v0002_remove_legacy_skill_state.NAME,
         v0002_remove_legacy_skill_state.STATEMENTS,
+        vacuum_after=True,
+    ),
+    Migration.create(
+        v0003_remove_obsolete_runtime_config.VERSION,
+        v0003_remove_obsolete_runtime_config.NAME,
+        v0003_remove_obsolete_runtime_config.STATEMENTS,
+    ),
+    Migration.create(
+        v0004_remove_client_vault_authority.VERSION,
+        v0004_remove_client_vault_authority.NAME,
+        v0004_remove_client_vault_authority.STATEMENTS,
+        vacuum_after=True,
+    ),
+    Migration.create(
+        v0005_remove_obsolete_write_intent_snapshots.VERSION,
+        v0005_remove_obsolete_write_intent_snapshots.NAME,
+        v0005_remove_obsolete_write_intent_snapshots.STATEMENTS,
         vacuum_after=True,
     ),
 )
