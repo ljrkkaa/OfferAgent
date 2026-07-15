@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
+  generateConversationTitle,
   PROTOCOL_VERSION,
   type AgentRunEvent,
   type AgentRunRecord,
@@ -23,7 +24,8 @@ import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.
 import type { ModelConversationItem } from "./model-provider";
 import type { RunAttachmentMetadata as StoredRunAttachmentMetadata } from "./run-attachments";
 
-const CURRENT_SCHEMA_VERSION = 17;
+const CURRENT_SCHEMA_VERSION = 18;
+const INVALIDATED_PROTOCOL_RESPONSE = "__offeragent_invalidated_after_resource_deletion__";
 const MAX_CONVERSATION_CONTEXT_BYTES = 64 * 1_024;
 
 export interface RunCheckpoint {
@@ -1175,6 +1177,14 @@ const MIGRATIONS = [
       CREATE INDEX vault_change_batches_by_state ON vault_change_batches(state, updated_at);
     `,
   },
+  {
+    version: 18,
+    sql: `
+      UPDATE conversations SET title_origin = 'placeholder' WHERE title = 'New Conversation';
+      CREATE INDEX IF NOT EXISTS conversations_by_archive_activity
+        ON conversations(archived, updated_at DESC, id);
+    `,
+  },
 ] as const;
 
 interface ConversationSnapshot {
@@ -1256,6 +1266,7 @@ export class RuntimeStateStore {
     store.#database.run("PRAGMA foreign_keys = ON");
     await store.#migrate();
     await store.interruptActiveRuns();
+    await store.#backfillLegacyConversationTitles();
     return store;
   }
 
@@ -1263,23 +1274,47 @@ export class RuntimeStateStore {
     conversation: ConversationSummary,
   ): Promise<ConversationSummary> {
     return this.#write(() => {
+      const titleOrigin = conversation.titleOrigin ??
+        (conversation.title === "New Conversation" || conversation.title === "新对话"
+          ? "placeholder"
+          : "manual");
+      const archived = conversation.archived ?? false;
       const existing = firstRow(
         this.#database,
-        "SELECT title, model_id FROM conversations WHERE id = ?",
+        "SELECT title, model_id, title_origin, archived, updated_at FROM conversations WHERE id = ?",
         [conversation.id],
       );
       if (existing) {
-        if (existing[0] === conversation.title && existing[1] === conversation.modelId) {
-          return conversation;
+        if (
+          existing[0] === conversation.title &&
+          existing[1] === conversation.modelId &&
+          existing[2] === titleOrigin &&
+          Boolean(existing[3]) === archived
+        ) {
+          return {
+            ...conversation,
+            titleOrigin,
+            archived,
+            updatedAt: existing[4] as string,
+          };
         }
       }
       const timestamp = now();
       this.#database.run(
-        `INSERT INTO conversations (id, title, model_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)`,
-        [conversation.id, conversation.title, conversation.modelId, timestamp, timestamp],
+        `INSERT INTO conversations
+          (id, title, model_id, title_origin, archived, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          conversation.id,
+          conversation.title,
+          conversation.modelId,
+          titleOrigin,
+          archived ? 1 : 0,
+          timestamp,
+          timestamp,
+        ],
       );
-      return conversation;
+      return { ...conversation, titleOrigin, archived, updatedAt: timestamp };
     });
   }
 
@@ -1287,8 +1322,9 @@ export class RuntimeStateStore {
     await this.#write(() => {
       const timestamp = now();
       this.#database.run(
-        `INSERT OR IGNORE INTO conversations (id, title, model_id, created_at, updated_at)
-         VALUES (?, 'New Conversation', ?, ?, ?)`,
+        `INSERT OR IGNORE INTO conversations
+          (id, title, model_id, title_origin, archived, created_at, updated_at)
+         VALUES (?, '新对话', ?, 'placeholder', 0, ?, ?)`,
         [conversationId, modelId, timestamp, timestamp],
       );
     });
@@ -1435,7 +1471,7 @@ export class RuntimeStateStore {
     ) {
       throw new Error(`Protocol event '${requestEventId}' was reused with conflicting identity.`);
     }
-    if (row[4] === null) {
+    if (row[4] === null || row[4] === INVALIDATED_PROTOCOL_RESPONSE) {
       throw new Error(`Protocol event '${requestEventId}' was invalidated after resource deletion.`);
     }
     return JSON.parse(row[4] as string) as unknown;
@@ -1466,7 +1502,7 @@ export class RuntimeStateStore {
         ) {
           throw new Error(`Protocol event '${requestEventId}' was reused with conflicting identity.`);
         }
-        if (existing[4] === null) {
+        if (existing[4] === null || existing[4] === INVALIDATED_PROTOCOL_RESPONSE) {
           throw new Error(`Protocol event '${requestEventId}' was invalidated after resource deletion.`);
         }
         return JSON.parse(existing[4] as string) as unknown;
@@ -1539,8 +1575,9 @@ export class RuntimeStateStore {
       }
       const messageId = randomUUID();
       this.#database.run(
-        `INSERT OR IGNORE INTO conversations (id, title, model_id, created_at, updated_at)
-         VALUES (?, 'New Conversation', ?, ?, ?)`,
+        `INSERT OR IGNORE INTO conversations
+          (id, title, model_id, title_origin, archived, created_at, updated_at)
+         VALUES (?, '新对话', ?, 'placeholder', 0, ?, ?)`,
         [conversationId, modelId, timestamp, timestamp],
       );
       const sequence = this.#nextMessageSequence(conversationId);
@@ -2263,7 +2300,8 @@ export class RuntimeStateStore {
     await this.#writeTail;
     const conversationRow = firstRow(
       this.#database,
-      "SELECT id, title, model_id FROM conversations WHERE id = ?",
+      `SELECT id, title, model_id, title_origin, archived, updated_at
+       FROM conversations WHERE id = ?`,
       [conversationId],
     );
     if (!conversationRow) throw new Error(`Conversation '${conversationId}' does not exist.`);
@@ -2295,6 +2333,9 @@ export class RuntimeStateStore {
         id: conversationRow[0] as string,
         title: conversationRow[1] as string,
         modelId: conversationRow[2] as string,
+        titleOrigin: conversationRow[3] as ConversationSummary["titleOrigin"],
+        archived: Boolean(conversationRow[4]),
+        updatedAt: conversationRow[5] as string,
       },
       messages: messageRows.map(([
         id,
@@ -2407,37 +2448,76 @@ export class RuntimeStateStore {
     await this.#writeTail;
     const rows =
       this.#database.exec(
-        "SELECT id, title, model_id FROM conversations ORDER BY updated_at DESC, id",
+        `SELECT id, title, model_id, title_origin, archived, updated_at
+         FROM conversations ORDER BY updated_at DESC, id`,
       )[0]?.values ?? [];
-    return rows.map(([id, title, modelId]) => ({
+    return rows.map(([id, title, modelId, titleOrigin, archived, updatedAt]) => ({
       id: id as string,
       title: title as string,
       modelId: modelId as string,
+      titleOrigin: titleOrigin as ConversationSummary["titleOrigin"],
+      archived: Boolean(archived),
+      updatedAt: updatedAt as string,
     }));
+  }
+
+  async updateConversation(
+    conversationId: string,
+    patch: Partial<Pick<ConversationSummary, "archived" | "modelId" | "title" | "titleOrigin">>,
+  ): Promise<ConversationSummary> {
+    return this.#write(() => {
+      const row = firstRow(
+        this.#database,
+        `SELECT id, title, model_id, title_origin, archived, updated_at
+         FROM conversations WHERE id = ?`,
+        [conversationId],
+      );
+      if (!row) throw new Error(`Conversation '${conversationId}' does not exist.`);
+      const current: ConversationSummary = {
+        id: row[0] as string,
+        title: row[1] as string,
+        modelId: row[2] as string,
+        titleOrigin: row[3] as ConversationSummary["titleOrigin"],
+        archived: Boolean(row[4]),
+        updatedAt: row[5] as string,
+      };
+      const next = { ...current, ...patch, updatedAt: now() };
+      if (!next.title.trim() || next.title.length > 512) {
+        throw new Error("Conversation titles must contain between 1 and 512 characters.");
+      }
+      this.#database.run(
+        `UPDATE conversations
+         SET title = ?, model_id = ?, title_origin = ?, archived = ?, updated_at = ?
+         WHERE id = ?`,
+        [
+          next.title,
+          next.modelId,
+          next.titleOrigin,
+          next.archived ? 1 : 0,
+          next.updatedAt,
+          conversationId,
+        ],
+      );
+      if (this.#database.getRowsModified() !== 1) {
+        throw new Error(`Conversation '${conversationId}' does not exist.`);
+      }
+      return next;
+    });
   }
 
   async updateConversationModel(
     conversationId: string,
     modelId: string,
   ): Promise<ConversationSummary> {
-    await this.#write(() => {
-      this.#database.run(
-        "UPDATE conversations SET model_id = ?, updated_at = ? WHERE id = ?",
-        [modelId, now(), conversationId],
-      );
-      if (this.#database.getRowsModified() !== 1) {
-        throw new Error(`Conversation '${conversationId}' does not exist.`);
-      }
-    });
-    return (await this.getConversation(conversationId)).conversation;
+    return this.updateConversation(conversationId, { modelId });
   }
 
   async deleteConversation(conversationId: string): Promise<void> {
     await this.#write(() => {
       this.#database.run(
-        `UPDATE protocol_responses SET response_json = NULL
+        `UPDATE protocol_responses SET response_json = ?
          WHERE conversation_id = ? OR owner_conversation_id = ?`,
-        [conversationId, conversationId],
+        [INVALIDATED_PROTOCOL_RESPONSE, conversationId, conversationId],
       );
       this.#database.run("DELETE FROM conversations WHERE id = ?", [conversationId]);
     });
@@ -2696,6 +2776,7 @@ export class RuntimeStateStore {
       this.#database.run("BEGIN IMMEDIATE");
       try {
         if (migration.version === 9) this.#ensureProtocolColumns();
+        if (migration.version === 18) this.#ensureConversationMetadataColumns();
         this.#database.run(migration.sql);
         if (migration.version === 7) this.#scrubPersistedVaultChangeArguments();
         if (migration.version === 8) this.#ensureCitationsColumn();
@@ -2724,8 +2805,43 @@ export class RuntimeStateStore {
     // protocol columns existed. Keep the repair idempotent for already-versioned State.
     this.#ensureProtocolColumns();
     this.#ensureAttachmentStorageColumns();
+    this.#ensureConversationMetadataColumns();
     if (version < 10) this.#database.run("VACUUM");
     await this.#persist();
+  }
+
+  async #backfillLegacyConversationTitles(): Promise<void> {
+    await this.#write(() => {
+      const rows = this.#database.exec(
+        `SELECT conversations.id, messages.text, messages.attachments_json
+         FROM conversations
+         JOIN messages ON messages.conversation_id = conversations.id
+         WHERE conversations.title = 'New Conversation'
+           AND conversations.title_origin = 'placeholder'
+           AND messages.role = 'user'
+           AND messages.sequence = (
+             SELECT MIN(first_message.sequence)
+             FROM messages AS first_message
+             WHERE first_message.conversation_id = conversations.id
+               AND first_message.role = 'user'
+           )
+         ORDER BY conversations.id`,
+      )[0]?.values ?? [];
+      for (const [conversationId, text, attachmentsJson] of rows) {
+        const attachments = JSON.parse((attachmentsJson as string | null) ?? "[]") as Array<{
+          fileName?: string;
+        }>;
+        const message = text as string;
+        const imageFileName = attachments.find(({ fileName }) => Boolean(fileName?.trim()))?.fileName;
+        if (!message.trim() && !imageFileName) continue;
+        this.#database.run(
+          `UPDATE conversations
+           SET title = ?, title_origin = 'automatic'
+           WHERE id = ? AND title = 'New Conversation' AND title_origin = 'placeholder'`,
+          [generateConversationTitle({ text: message, imageFileName }), conversationId],
+        );
+      }
+    });
   }
 
   #scrubPersistedVaultChangeArguments(): void {
@@ -2845,6 +2961,32 @@ export class RuntimeStateStore {
         this.#database.run("UPDATE tool_calls SET result_json = NULL WHERE id = ?", [id]);
       }
     }
+  }
+
+  #ensureConversationMetadataColumns(): void {
+    const columns = new Set(
+      (this.#database.exec("PRAGMA table_info(conversations)")[0]?.values ?? [])
+        .map((column) => column[1]),
+    );
+    if (!columns.has("title_origin")) {
+      this.#database.run(
+        `ALTER TABLE conversations ADD COLUMN title_origin TEXT NOT NULL DEFAULT 'manual'
+         CHECK (title_origin IN ('placeholder', 'automatic', 'manual'))`,
+      );
+      this.#database.run(
+        "UPDATE conversations SET title_origin = 'placeholder' WHERE title = 'New Conversation'",
+      );
+    }
+    if (!columns.has("archived")) {
+      this.#database.run(
+        `ALTER TABLE conversations ADD COLUMN archived INTEGER NOT NULL DEFAULT 0
+         CHECK (archived IN (0, 1))`,
+      );
+    }
+    this.#database.run(
+      `CREATE INDEX IF NOT EXISTS conversations_by_archive_activity
+       ON conversations(archived, updated_at DESC, id)`,
+    );
   }
 
   #ensureProtocolColumns(): void {

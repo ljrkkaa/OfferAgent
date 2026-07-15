@@ -53,9 +53,48 @@ export type AgentRunStatus =
   | "running";
 
 export interface ConversationSummary {
+  archived: boolean;
   id: string;
   modelId: string;
   title: string;
+  titleOrigin: "automatic" | "manual" | "placeholder";
+  updatedAt: string;
+}
+
+export function generateConversationTitle(input: {
+  date?: Date;
+  imageFileName?: string;
+  text: string;
+}): string {
+  const cleanedLines = input.text
+    .replace(/```[^\n]*\n?/g, "\n")
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/^(?:#{1,6}|[-*>])\s*/, ""))
+    .filter((line) => line.length > 0);
+  let candidate = cleanedLines.find((line) => !/^https?:\/\/\S+$/i.test(line)) ??
+    cleanedLines[0] ?? "";
+  const usesStandaloneUrl = /^https?:\/\/\S+$/i.test(candidate);
+  if (!usesStandaloneUrl) {
+    candidate = candidate
+      .replace(/^(?:请|麻烦)?(?:帮我|帮忙)?(?:分析一下|分析|解释一下|解释|看看|说明一下)?[：:，,\s]*/u, "")
+      .replace(/^(?:please\s+)?(?:help\s+me\s+)?(?:to\s+)?/i, "")
+      .trim();
+    candidate = candidate.split(/[。！？?!：:；;.]/u)[0]?.trim() ?? "";
+  }
+  let usesImageFileName = false;
+  if (!candidate && input.imageFileName) {
+    candidate = input.imageFileName.replace(/\.[^.]+$/, "").trim();
+    usesImageFileName = true;
+  }
+  if (!candidate) {
+    const date = input.date ?? new Date();
+    return `图片分析 · ${date.getMonth() + 1}月${date.getDate()}日`;
+  }
+  if (!usesImageFileName && !usesStandaloneUrl && /^[a-z]/.test(candidate)) {
+    candidate = `${candidate[0]?.toUpperCase()}${candidate.slice(1)}`;
+  }
+  const maximum = /[\u3400-\u9fff]/u.test(candidate) ? 28 : 56;
+  return [...candidate].slice(0, maximum).join("").trim();
 }
 
 export interface ConversationMessage {
@@ -498,11 +537,18 @@ export type ConversationCommand =
       type: "conversation.create";
       model: string;
       title: string;
+      titleOrigin?: ConversationSummary["titleOrigin"];
     })
   | (ConversationCommandBase & { type: "conversation.delete" })
   | (ConversationCommandBase & { type: "conversation.list" })
   | (ConversationCommandBase & { type: "conversation.open" })
-  | (ConversationCommandBase & { type: "conversation.update"; model: string });
+  | (ConversationCommandBase & {
+      type: "conversation.update";
+      archived?: boolean;
+      model?: string;
+      title?: string;
+      titleOrigin?: ConversationSummary["titleOrigin"];
+    });
 
 export type ConversationEvent =
   | (ConversationCommandBase & {

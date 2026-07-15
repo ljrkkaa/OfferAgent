@@ -1107,14 +1107,27 @@ function isConversationCommand(value: unknown): value is ConversationCommand {
   if (message.type === "conversation.create") {
     return typeof message.title === "string" &&
       message.title.length <= 512 &&
+      (message.titleOrigin === undefined ||
+        message.titleOrigin === "placeholder" ||
+        message.titleOrigin === "automatic" ||
+        message.titleOrigin === "manual") &&
       typeof message.model === "string" &&
       message.model.length > 0 &&
       message.model.length <= 128;
   }
   if (message.type === "conversation.update") {
-    return typeof message.model === "string" &&
-      message.model.length > 0 &&
-      message.model.length <= 128;
+    const hasUpdate = message.model !== undefined || message.title !== undefined ||
+      message.titleOrigin !== undefined || message.archived !== undefined;
+    return hasUpdate &&
+      (message.model === undefined ||
+        (typeof message.model === "string" && message.model.length > 0 && message.model.length <= 128)) &&
+      (message.title === undefined ||
+        (typeof message.title === "string" && message.title.trim().length > 0 && message.title.length <= 512)) &&
+      (message.titleOrigin === undefined ||
+        message.titleOrigin === "placeholder" ||
+        message.titleOrigin === "automatic" ||
+        message.titleOrigin === "manual") &&
+      (message.archived === undefined || typeof message.archived === "boolean");
   }
   return (
     message.type === "conversation.delete" ||
@@ -1189,6 +1202,12 @@ async function handleConversationCommand(
       id: command.conversationId,
       title: command.title,
       modelId: command.model,
+      titleOrigin: command.titleOrigin ??
+        (command.title === "New Conversation" || command.title === "新对话"
+          ? "placeholder"
+          : "manual"),
+      archived: false,
+      updatedAt: new Date().toISOString(),
     });
     event = { ...base, type: "conversation.created", conversation };
   } else if (command.type === "conversation.open") {
@@ -1198,10 +1217,12 @@ async function handleConversationCommand(
     const conversations = await store.listConversations();
     event = { ...base, type: "conversation.list", conversations };
   } else if (command.type === "conversation.update") {
-    const conversation = await store.updateConversationModel(
-      command.conversationId,
-      command.model,
-    );
+    const conversation = await store.updateConversation(command.conversationId, {
+      ...(command.model !== undefined ? { modelId: command.model } : {}),
+      ...(command.title !== undefined ? { title: command.title } : {}),
+      ...(command.titleOrigin !== undefined ? { titleOrigin: command.titleOrigin } : {}),
+      ...(command.archived !== undefined ? { archived: command.archived } : {}),
+    });
     event = { ...base, type: "conversation.updated", conversation };
   } else {
     await attachments.deleteConversation(command.conversationId);

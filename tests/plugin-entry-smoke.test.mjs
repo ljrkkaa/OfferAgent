@@ -125,6 +125,10 @@ class StubElement {
     return this.attributes.get(name);
   }
 
+  focus() {
+    this.focused = true;
+  }
+
   dispatch(type, event = {}) {
     const dispatched = {
       defaultPrevented: false,
@@ -682,11 +686,27 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     "OfferAgent did not render its model selector",
   );
   assert.equal(modelSelect.value, "fake-interview-model");
-  assert.equal(
-    activeView.contentEl.findByClass("offeragent-sidebar__conversation-select")
-      .getAttribute("aria-label"),
-    "Conversation history",
+  const historyButton = activeView.contentEl.findByClass("offeragent-sidebar__history");
+  assert.ok(historyButton);
+  assert.equal(historyButton.getAttribute("aria-expanded"), "false");
+  assert.ok(historyButton.getAttribute("aria-label"));
+  historyButton.dispatch("click");
+  const historyDrawer = activeView.contentEl.findByClass("offeragent-sidebar__history-drawer");
+  const historySearch = historyDrawer?.findByClass("offeragent-sidebar__history-search");
+  const historyItem = historyDrawer?.findByClass("offeragent-sidebar__history-item");
+  assert.ok(historySearch);
+  assert.ok(historyItem);
+  assert.equal(historySearch.focused, true);
+  assert.ok(historyItem.findByClass("offeragent-sidebar__history-updated"));
+  historySearch.value = "title-that-does-not-exist";
+  historySearch.dispatch("input");
+  assert.equal(historyItem.hidden, true);
+  historyDrawer.findByClass("offeragent-sidebar__history-select").dispatch("click");
+  await waitUntil(
+    () => !activeView.contentEl.findByClass("offeragent-sidebar__history-drawer"),
+    "Conversation history did not close after selection",
   );
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__history").focused, true);
   assert.equal(
     activeView.contentEl.findByClass("offeragent-sidebar__input").getAttribute("aria-label"),
     "给 OfferAgent 的消息",
@@ -855,21 +875,37 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     activeView.contentEl.findAllByClass("offeragent-sidebar__message").length,
     messageCountBeforeKeyboard,
   );
-  keyboardInput.value = "Practice my introduction.";
-  keyboardInput.dispatch("input");
-  const sendEnter = keyboardInput.dispatch("keydown", {
+  activeView.contentEl.findByClass("offeragent-sidebar__history").dispatch("click");
+  assert.ok(activeView.contentEl.findByClass("offeragent-sidebar__history-drawer"));
+  const historyOpenInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
+  historyOpenInput.value = "Practice my introduction.";
+  historyOpenInput.dispatch("input");
+  const sendEnter = historyOpenInput.dispatch("keydown", {
     isComposing: false,
     key: "Enter",
     keyCode: 13,
     shiftKey: false,
   });
   assert.equal(sendEnter.defaultPrevented, true);
+  const stopButton = await waitUntil(
+    () => activeView.contentEl.findByClass("offeragent-sidebar__stop"),
+    "OfferAgent did not begin the keyboard-submitted Run",
+  );
   const activeInput = activeView.contentEl.findByClass("offeragent-sidebar__input");
   assert.equal(activeInput.disabled, false);
   assert.equal(
-    activeView.contentEl.findByClass("offeragent-sidebar__stop")?.getAttribute("aria-label"),
+    stopButton.getAttribute("aria-label"),
     "停止当前运行",
   );
+  const streamingDrawer = activeView.contentEl.findByClass("offeragent-sidebar__history-drawer");
+  for (const className of [
+    "offeragent-sidebar__history-select",
+    "offeragent-sidebar__history-rename",
+    "offeragent-sidebar__history-archive",
+    "offeragent-sidebar__history-delete",
+  ]) {
+    assert.equal(streamingDrawer.findByClass(className).disabled, true);
+  }
   activeInput.value = "Draft retained during the active Run";
   activeInput.dispatch("input");
   const blockedSecondEnter = activeInput.dispatch("keydown", {
@@ -887,6 +923,8 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     () => activeView.contentEl.findByClass("offeragent-sidebar__send")?.disabled === false,
     "OfferAgent did not finish the first Agent Run",
   );
+  activeView.contentEl.findByClass("offeragent-sidebar__history").dispatch("click");
+  assert.equal(activeView.contentEl.findByClass("offeragent-sidebar__history-drawer"), undefined);
   assert.equal(
     activeView.contentEl.findByClass("offeragent-sidebar__input").value,
     "Draft retained during the active Run",
@@ -983,12 +1021,12 @@ test("Obsidian loads the packaged plugin and opens its connected sidebar", async
     activeView.contentEl.findByClass("offeragent-sidebar__input").value,
     "stop_and_revise_demo",
   );
-  const stoppedConversationId = activeView.contentEl
-    .findByClass("offeragent-sidebar__conversation-select").value;
+  const stoppedConversationTitle = activeView.contentEl
+    .findByClass("offeragent-sidebar__history").text;
   activeView.contentEl.findByClass("offeragent-sidebar__new-conversation").dispatch("click");
   await waitUntil(
-    () => activeView.contentEl.findByClass("offeragent-sidebar__conversation-select").value !==
-      stoppedConversationId,
+    () => activeView.contentEl.findByClass("offeragent-sidebar__history").text !==
+      stoppedConversationTitle,
     "OfferAgent did not isolate later smoke checks from the Stopped Run",
   );
 

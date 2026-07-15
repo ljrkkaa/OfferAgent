@@ -180,18 +180,27 @@ test("the Sidebar presentation keeps activity, composer, and common settings com
 test("one image draft survives staging failure and sends only an opaque Attachment ID", async () => {
   let rejectUpload = true;
   let runRequest;
+  const updates = [];
+  let conversation = {
+    archived: false,
+    id: "image-conversation",
+    title: "新对话",
+    titleOrigin: "placeholder",
+    modelId: "model-a",
+    updatedAt: "2026-07-15T12:00:00.000Z",
+  };
   const runtime = {
     cancelAgentRun() {},
     async createConversation(conversation) { return conversation; },
     async deleteConversation() {},
     async listConversations() {
-      return [{ id: "image-conversation", title: "Image", modelId: "model-a" }];
+      return [conversation];
     },
     async listModels() { return [{ id: "model-a", label: "Model A" }]; },
     onUnavailable() { return () => {}; },
     async openConversation() {
       return {
-        conversation: { id: "image-conversation", title: "Image", modelId: "model-a" },
+        conversation,
         agentRuns: [], messages: [], toolCalls: [],
       };
     },
@@ -215,8 +224,17 @@ test("one image draft survives staging failure and sends only an opaque Attachme
     },
     async start() {},
     async stop() {},
+    async updateConversation(conversationId, patch) {
+      updates.push({ conversationId, patch });
+      conversation = {
+        ...conversation,
+        ...patch,
+        updatedAt: "2026-07-15T12:00:01.000Z",
+      };
+      return conversation;
+    },
     async updateConversationModel(conversationId, modelId) {
-      return { id: conversationId, title: "Image", modelId };
+      return this.updateConversation(conversationId, { modelId });
     },
   };
   const controller = new SidebarController(runtime);
@@ -235,11 +253,17 @@ test("one image draft survives staging failure and sends only an opaque Attachme
   });
 
   await assert.rejects(controller.sendMessage(), /unsupported/);
+  assert.deepEqual(updates, []);
+  assert.equal(controller.getViewModel().conversation.conversations[0].titleOrigin, "placeholder");
   assert.equal(controller.getViewModel().presentation.composer.draftText, "Read this screenshot.");
   assert.equal(controller.getViewModel().presentation.composer.attachment.fileName, "interview.png");
 
   rejectUpload = false;
   await controller.sendMessage();
+  assert.deepEqual(updates[0], {
+    conversationId: "image-conversation",
+    patch: { title: "Read this screenshot", titleOrigin: "automatic" },
+  });
   assert.deepEqual(runRequest.attachments, [{ attachmentId: "opaque-attachment-id", order: 0 }]);
   assert.equal("bytes" in runRequest, false);
   assert.equal(controller.getViewModel().presentation.composer.draftText, "");
@@ -1421,6 +1445,116 @@ test("the Sidebar creates, switches, and deletes Conversations", async () => {
   await controller.deleteCurrentConversation();
   assert.notEqual(controller.getViewModel().conversation.activeConversationId, createdId);
   assert.equal(controller.getViewModel().conversation.conversations.length, 2);
+});
+
+test("the Sidebar titles a first message and manages archived Conversation metadata", async () => {
+  let holdRun = false;
+  let releaseRun;
+  let revision = 0;
+  const updates = [];
+  const conversations = [
+    {
+      archived: false,
+      id: "conversation-placeholder",
+      modelId: "model-a",
+      title: "新对话",
+      titleOrigin: "placeholder",
+      updatedAt: "2026-07-15T12:00:00.000Z",
+    },
+    {
+      archived: false,
+      id: "conversation-existing",
+      modelId: "model-a",
+      title: "Existing interview",
+      titleOrigin: "automatic",
+      updatedAt: "2026-07-14T12:00:00.000Z",
+    },
+  ];
+  const runtime = {
+    cancelAgentRun() {},
+    async createConversation(conversation) {
+      conversations.unshift(conversation);
+      return conversation;
+    },
+    async deleteConversation() {},
+    async listConversations() { return [...conversations]; },
+    async listModels() { return [{ id: "model-a", label: "Model A" }]; },
+    onUnavailable() { return () => {}; },
+    async openConversation(conversationId) {
+      return {
+        conversation: conversations.find(({ id }) => id === conversationId),
+        agentRuns: [],
+        messages: [],
+      };
+    },
+    async *runAgent(request) {
+      yield { type: "agent_run.started", model: request.model };
+      if (holdRun) await new Promise((resolve) => { releaseRun = resolve; });
+      yield { type: "agent_run.completed", output: { role: "assistant", text: "Done" } };
+    },
+    async start() {},
+    async stop() {},
+    async updateConversation(conversationId, patch) {
+      updates.push({ conversationId, patch });
+      const index = conversations.findIndex(({ id }) => id === conversationId);
+      conversations[index] = {
+        ...conversations[index],
+        ...patch,
+        updatedAt: `2026-07-15T12:00:0${++revision}.000Z`,
+      };
+      return conversations[index];
+    },
+    async updateConversationModel(conversationId, modelId) {
+      return this.updateConversation(conversationId, { modelId });
+    },
+  };
+  const controller = new SidebarController(runtime);
+
+  await controller.start();
+  await controller.sendMessage("Please help me explain event loop behavior.");
+  assert.deepEqual(updates[0], {
+    conversationId: "conversation-placeholder",
+    patch: { title: "Explain event loop behavior", titleOrigin: "automatic" },
+  });
+  assert.equal(
+    controller.getViewModel().conversation.conversations
+      .find(({ id }) => id === "conversation-placeholder").titleOrigin,
+    "automatic",
+  );
+
+  await controller.renameConversation("conversation-placeholder", "Backend prep");
+  assert.deepEqual(updates[1].patch, { title: "Backend prep", titleOrigin: "manual" });
+  await controller.setConversationArchived("conversation-placeholder", true);
+  assert.equal(controller.getViewModel().conversation.activeConversationId, "conversation-existing");
+  assert.equal(
+    controller.getViewModel().conversation.conversations
+      .find(({ id }) => id === "conversation-placeholder").archived,
+    true,
+  );
+  await controller.setConversationArchived("conversation-placeholder", false);
+  assert.equal(
+    controller.getViewModel().conversation.conversations
+      .find(({ id }) => id === "conversation-placeholder").archived,
+    false,
+  );
+
+  await controller.openConversation("conversation-placeholder");
+  holdRun = true;
+  const sending = controller.sendMessage("Keep this Conversation active.");
+  while (!releaseRun) await new Promise((resolve) => setImmediate(resolve));
+  const updateCount = updates.length;
+  await assert.rejects(
+    controller.setConversationArchived("conversation-placeholder", true),
+    /Stop the current Agent Run/,
+  );
+  assert.equal(updates.length, updateCount);
+  assert.equal(
+    controller.getViewModel().conversation.conversations
+      .find(({ id }) => id === "conversation-placeholder").archived,
+    false,
+  );
+  releaseRun();
+  await sending;
 });
 
 test("deleting a Conversation discards its durable pending proposal before Runtime state", async () => {

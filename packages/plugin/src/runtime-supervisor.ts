@@ -113,6 +113,10 @@ export interface RuntimeClient {
   }): Promise<StagedRunAttachment>;
   stop(): Promise<void>;
   updateConversationModel(conversationId: string, modelId: string): Promise<ConversationSummary>;
+  updateConversation(
+    conversationId: string,
+    patch: Partial<Pick<ConversationSummary, "archived" | "modelId" | "title" | "titleOrigin">>,
+  ): Promise<ConversationSummary>;
 }
 
 type UnavailableSubscriber = (message: string) => void;
@@ -840,6 +844,7 @@ export class RuntimeSupervisor implements RuntimeClient {
       type: "conversation.create",
       conversationId: conversation.id,
       title: conversation.title,
+      titleOrigin: conversation.titleOrigin,
       model: conversation.modelId,
     });
     if (event.type !== "conversation.created") throw new Error("Unexpected Conversation response.");
@@ -868,10 +873,20 @@ export class RuntimeSupervisor implements RuntimeClient {
     conversationId: string,
     modelId: string,
   ): Promise<ConversationSummary> {
+    return this.updateConversation(conversationId, { modelId });
+  }
+
+  async updateConversation(
+    conversationId: string,
+    patch: Partial<Pick<ConversationSummary, "archived" | "modelId" | "title" | "titleOrigin">>,
+  ): Promise<ConversationSummary> {
     const event = await this.#requestConversation({
       type: "conversation.update",
       conversationId,
-      model: modelId,
+      ...(patch.modelId !== undefined ? { model: patch.modelId } : {}),
+      ...(patch.title !== undefined ? { title: patch.title } : {}),
+      ...(patch.titleOrigin !== undefined ? { titleOrigin: patch.titleOrigin } : {}),
+      ...(patch.archived !== undefined ? { archived: patch.archived } : {}),
     });
     if (event.type !== "conversation.updated") throw new Error("Unexpected Conversation response.");
     return event.conversation;
@@ -1410,8 +1425,21 @@ export class RuntimeSupervisor implements RuntimeClient {
 
   #requestConversation(
     input:
-      | { type: "conversation.create"; conversationId: string; title: string; model: string }
-      | { type: "conversation.update"; conversationId: string; model: string }
+      | {
+          type: "conversation.create";
+          conversationId: string;
+          title: string;
+          titleOrigin: ConversationSummary["titleOrigin"];
+          model: string;
+        }
+      | {
+          type: "conversation.update";
+          conversationId: string;
+          archived?: boolean;
+          model?: string;
+          title?: string;
+          titleOrigin?: ConversationSummary["titleOrigin"];
+        }
       | { type: "conversation.delete" | "conversation.list" | "conversation.open"; conversationId: string },
   ): Promise<ConversationEvent> {
     const socket = this.#eventSocket;

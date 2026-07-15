@@ -342,11 +342,16 @@ test("a Conversation and its completed Agent Run survive restart and delete tran
       model: "fake-interview-model",
     }),
   );
-  assert.deepEqual((await created).conversation, {
+  const createdConversation = (await created).conversation;
+  assert.deepEqual({ ...createdConversation, updatedAt: undefined }, {
+    archived: false,
     id: conversationId,
     title: "Interview preparation",
     modelId: "fake-interview-model",
+    titleOrigin: "manual",
+    updatedAt: undefined,
   });
+  assert.match(createdConversation.updatedAt, /^\d{4}-\d{2}-\d{2}T/);
 
   const completed = waitForEvent(
     instance.socket,

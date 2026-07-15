@@ -1,4 +1,5 @@
 import path from "node:path";
+import type { ConversationSummary } from "@offeragent/protocol";
 import {
   Component,
   type App,
@@ -174,6 +175,10 @@ class OfferAgentSidebarView extends ItemView {
   readonly #streamedMessageElements = new Map<string, HTMLDivElement>();
   readonly #transcriptItemElements = new Map<string, HTMLElement>();
   #composerInput?: HTMLTextAreaElement;
+  #focusHistorySearch = false;
+  #historyOpen = false;
+  #restoreHistoryFocus = false;
+  #showArchived = false;
   #newContentButton?: HTMLButtonElement;
   #renderedViewModel?: SidebarViewModel;
   #transcriptElement?: HTMLDivElement;
@@ -566,40 +571,36 @@ class OfferAgentSidebarView extends ItemView {
     }
 
     const conversationRow = header.createDiv({ cls: "offeragent-sidebar__conversations" });
-    const conversationSelect = conversationRow.createEl("select", {
-      cls: "offeragent-sidebar__conversation-select",
+    const activeConversation = viewModel.conversation.conversations.find(
+      ({ id }) => id === viewModel.conversation.activeConversationId,
+    );
+    const history = conversationRow.createEl("button", {
+      cls: "offeragent-sidebar__history",
+      text: activeConversation?.title ?? "对话历史",
     });
-    for (const conversation of viewModel.conversation.conversations) {
-      const option = conversationSelect.createEl("option", { text: conversation.title });
-      option.value = conversation.id;
+    history.type = "button";
+    history.setAttribute("aria-label", "打开对话历史");
+    history.setAttribute("aria-expanded", `${this.#historyOpen}`);
+    history.disabled = viewModel.conversation.runState === "streaming";
+    history.addEventListener("click", () => {
+      this.#historyOpen = !this.#historyOpen;
+      this.#focusHistorySearch = this.#historyOpen;
+      this.#restoreHistoryFocus = !this.#historyOpen;
+      this.#render(viewModel);
+    });
+    if (this.#restoreHistoryFocus && !this.#historyOpen) {
+      this.#restoreHistoryFocus = false;
+      history.focus();
     }
-    conversationSelect.value = viewModel.conversation.activeConversationId ?? "";
-    conversationSelect.setAttribute("aria-label", "Conversation history");
-    conversationSelect.disabled = viewModel.conversation.runState === "streaming";
-    conversationSelect.addEventListener("change", () => {
-      void this.#controller.openConversation(conversationSelect.value);
-    });
     const newConversation = conversationRow.createEl("button", {
       cls: "offeragent-sidebar__new-conversation",
-      text: "New",
+      text: "新建",
     });
     newConversation.type = "button";
-    newConversation.setAttribute("aria-label", "New Conversation");
+    newConversation.setAttribute("aria-label", "新建对话");
     newConversation.disabled = viewModel.conversation.runState === "streaming";
     newConversation.addEventListener("click", () => {
       void this.#controller.createConversation();
-    });
-    const deleteConversation = conversationRow.createEl("button", {
-      cls: "offeragent-sidebar__delete-conversation",
-      text: "Delete",
-    });
-    deleteConversation.type = "button";
-    deleteConversation.setAttribute("aria-label", "Delete Conversation");
-    deleteConversation.disabled =
-      !viewModel.conversation.activeConversationId ||
-      viewModel.conversation.runState === "streaming";
-    deleteConversation.addEventListener("click", () => {
-      void this.#controller.deleteCurrentConversation();
     });
     const settings = conversationRow.createEl("button", {
       cls: "offeragent-sidebar__settings",
@@ -608,6 +609,105 @@ class OfferAgentSidebarView extends ItemView {
     settings.type = "button";
     settings.setAttribute("aria-label", "Open OfferAgent settings");
     settings.addEventListener("click", this.#openSettings);
+
+    if (this.#historyOpen) {
+      const drawer = header.createDiv({ cls: "offeragent-sidebar__history-drawer" });
+      const search = drawer.createEl("input", { cls: "offeragent-sidebar__history-search" });
+      search.type = "search";
+      search.placeholder = "搜索对话";
+      search.setAttribute("aria-label", "搜索对话标题");
+      if (this.#focusHistorySearch) {
+        this.#focusHistorySearch = false;
+        search.focus();
+      }
+      const archiveToggle = drawer.createEl("button", {
+        cls: "offeragent-sidebar__history-archive-toggle",
+        text: this.#showArchived ? "显示当前对话" : "显示已归档",
+      });
+      archiveToggle.type = "button";
+      archiveToggle.addEventListener("click", () => {
+        this.#showArchived = !this.#showArchived;
+        this.#render(viewModel);
+      });
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+      const yesterday = today - 86_400_000;
+      const grouped = new Map<string, ConversationSummary[]>();
+      for (const conversation of viewModel.conversation.conversations.filter(
+        ({ archived }) => archived === this.#showArchived,
+      )) {
+        const updated = new Date(conversation.updatedAt).getTime();
+        const label = updated >= today ? "今天" : updated >= yesterday ? "昨天" : "更早";
+        const entries = grouped.get(label) ?? [];
+        entries.push(conversation);
+        grouped.set(label, entries);
+      }
+      const searchable: Array<{ element: HTMLElement; title: string }> = [];
+      for (const label of ["今天", "昨天", "更早"]) {
+        const entries = grouped.get(label);
+        if (!entries?.length) continue;
+        const group = drawer.createDiv({ cls: "offeragent-sidebar__history-group" });
+        group.createDiv({ cls: "offeragent-sidebar__history-group-label", text: label });
+        for (const conversation of entries) {
+          const item = group.createDiv({ cls: "offeragent-sidebar__history-item" });
+          const select = item.createEl("button", {
+            cls: "offeragent-sidebar__history-select",
+            text: conversation.title,
+          });
+          select.type = "button";
+          select.dataset.titleOrigin = conversation.titleOrigin;
+          select.disabled = viewModel.conversation.runState === "streaming";
+          select.addEventListener("click", () => {
+            this.#historyOpen = false;
+            this.#restoreHistoryFocus = true;
+            void this.#controller.openConversation(conversation.id);
+          });
+          const updated = item.createEl("time", {
+            cls: "offeragent-sidebar__history-updated",
+            text: new Intl.DateTimeFormat("zh-CN", {
+              hour: "2-digit",
+              minute: "2-digit",
+              month: "numeric",
+              day: "numeric",
+            }).format(new Date(conversation.updatedAt)),
+          });
+          updated.dateTime = conversation.updatedAt;
+          const rename = item.createEl("button", { cls: "offeragent-sidebar__history-rename", text: "重命名" });
+          rename.type = "button";
+          rename.disabled = viewModel.conversation.runState === "streaming";
+          rename.addEventListener("click", () => {
+            const title = window.prompt("重命名对话", conversation.title);
+            if (title !== null) void this.#controller.renameConversation(conversation.id, title);
+          });
+          const archive = item.createEl("button", {
+            cls: "offeragent-sidebar__history-archive",
+            text: conversation.archived ? "恢复" : "归档",
+          });
+          archive.type = "button";
+          archive.disabled = viewModel.conversation.runState === "streaming";
+          archive.addEventListener("click", () => {
+            void this.#controller.setConversationArchived(conversation.id, !conversation.archived);
+          });
+          const remove = item.createEl("button", { cls: "offeragent-sidebar__history-delete", text: "删除" });
+          remove.type = "button";
+          remove.disabled = viewModel.conversation.runState === "streaming";
+          remove.addEventListener("click", () => {
+            if (!window.confirm(`确定永久删除“${conversation.title}”吗？`)) return;
+            if (conversation.id === viewModel.conversation.activeConversationId) {
+              void this.#controller.deleteCurrentConversation();
+            } else {
+              void this.#controller.openConversation(conversation.id)
+                .then(() => this.#controller.deleteCurrentConversation());
+            }
+          });
+          searchable.push({ element: item, title: conversation.title.toLocaleLowerCase() });
+        }
+      }
+      search.addEventListener("input", () => {
+        const query = search.value.trim().toLocaleLowerCase();
+        for (const entry of searchable) entry.element.hidden = !entry.title.includes(query);
+      });
+    }
 
     const transcript = container.createDiv({ cls: "offeragent-sidebar__transcript" });
     this.#transcriptElement = transcript;

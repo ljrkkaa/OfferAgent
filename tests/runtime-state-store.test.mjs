@@ -13,6 +13,191 @@ const { CURRENT_SCHEMA_VERSION, RuntimeStateStore } = require(
   path.join(repositoryRoot, "packages", "runtime", "dist", "state-store.js"),
 );
 
+test("Conversation metadata persists and legacy placeholders backfill idempotently", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-conversation-metadata-"));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  let store = await RuntimeStateStore.open(statePath);
+  await store.createConversation({
+    id: "legacy-titled",
+    title: "New Conversation",
+    titleOrigin: "placeholder",
+    modelId: "fake-interview-model",
+    archived: false,
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.beginAgentRun(
+    "legacy-titled",
+    "legacy-title-run",
+    "fake-interview-model",
+    "Please help me explain event loop behavior.",
+  );
+  await store.cancelAgentRun("legacy-title-run");
+  await store.createConversation({
+    id: "legacy-empty",
+    title: "New Conversation",
+    titleOrigin: "placeholder",
+    modelId: "fake-interview-model",
+    archived: false,
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.createConversation({
+    id: "custom-title",
+    title: "Keep me",
+    titleOrigin: "manual",
+    modelId: "fake-interview-model",
+    archived: false,
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.createConversation({
+    id: "manual-exact-title",
+    title: "New Conversation",
+    titleOrigin: "manual",
+    modelId: "fake-interview-model",
+    archived: false,
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.beginAgentRun(
+    "manual-exact-title",
+    "manual-exact-title-run",
+    "fake-interview-model",
+    "This message must not replace a manual title.",
+  );
+  await store.cancelAgentRun("manual-exact-title-run");
+  await store.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  let conversations = await store.listConversations();
+  assert.equal(conversations.find(({ id }) => id === "legacy-titled").title, "Explain event loop behavior");
+  assert.equal(conversations.find(({ id }) => id === "legacy-titled").titleOrigin, "automatic");
+  assert.equal(conversations.find(({ id }) => id === "legacy-empty").title, "New Conversation");
+  assert.equal(conversations.find(({ id }) => id === "custom-title").title, "Keep me");
+  assert.equal(conversations.find(({ id }) => id === "manual-exact-title").title, "New Conversation");
+  assert.equal(conversations.find(({ id }) => id === "manual-exact-title").titleOrigin, "manual");
+  const renamed = await store.updateConversation("legacy-titled", {
+    title: "Manual title",
+    titleOrigin: "manual",
+  });
+  assert.equal(renamed.title, "Manual title");
+  assert.equal(renamed.titleOrigin, "manual");
+  await Promise.all([
+    store.updateConversation("legacy-titled", {
+      title: "Concurrent title",
+      titleOrigin: "manual",
+    }),
+    store.updateConversation("legacy-titled", { archived: true }),
+  ]);
+  const concurrentlyUpdated = (await store.getConversation("legacy-titled")).conversation;
+  assert.equal(concurrentlyUpdated.title, "Concurrent title");
+  assert.equal(concurrentlyUpdated.titleOrigin, "manual");
+  assert.equal(concurrentlyUpdated.archived, true);
+  await store.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  conversations = await store.listConversations();
+  assert.equal(conversations.find(({ id }) => id === "legacy-titled").title, "Concurrent title");
+  assert.equal(conversations.find(({ id }) => id === "legacy-titled").archived, true);
+  await store.updateConversation("legacy-titled", { archived: false });
+  await store.createConversation({
+    id: "deleted-conversation",
+    title: "Delete me",
+    titleOrigin: "manual",
+    modelId: "fake-interview-model",
+    archived: false,
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.deleteConversation("deleted-conversation");
+  await store.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  conversations = await store.listConversations();
+  assert.equal(conversations.find(({ id }) => id === "legacy-titled").archived, false);
+  assert.equal(conversations.some(({ id }) => id === "deleted-conversation"), false);
+  await store.close();
+});
+
+test("Conversation deletion invalidates cached responses in legacy NOT NULL State", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-legacy-delete-"));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const request = {
+    type: "conversation.open",
+    eventId: "legacy-delete-open",
+    conversationId: "legacy-delete-conversation",
+  };
+  let store = await RuntimeStateStore.open(statePath);
+  await store.createConversation({
+    id: "legacy-delete-conversation",
+    title: "Delete me",
+    titleOrigin: "manual",
+    modelId: "fake-interview-model",
+    archived: false,
+    updatedAt: "2026-07-15T00:00:00.000Z",
+  });
+  await store.storeProtocolResponse(
+    "legacy-delete-open",
+    "conversation.open",
+    "legacy-delete-conversation",
+    "legacy-delete-request",
+    request,
+    { type: "conversation.snapshot" },
+    "legacy-delete-conversation",
+  );
+  await store.close();
+
+  const SQL = await initSqlJs();
+  const legacy = new SQL.Database(await readFile(statePath));
+  legacy.run("DROP INDEX protocol_responses_by_conversation");
+  legacy.run("DROP INDEX protocol_responses_by_owner");
+  legacy.run("ALTER TABLE protocol_responses RENAME TO protocol_responses_legacy");
+  legacy.run(`
+    CREATE TABLE protocol_responses (
+      request_event_id TEXT PRIMARY KEY,
+      request_type TEXT NOT NULL,
+      conversation_id TEXT NOT NULL,
+      agent_run_id TEXT NOT NULL,
+      owner_conversation_id TEXT,
+      request_hash TEXT NOT NULL,
+      response_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    INSERT INTO protocol_responses SELECT * FROM protocol_responses_legacy;
+    DROP TABLE protocol_responses_legacy;
+    CREATE INDEX protocol_responses_by_conversation ON protocol_responses(conversation_id);
+    CREATE INDEX protocol_responses_by_owner ON protocol_responses(owner_conversation_id);
+  `);
+  await writeFile(statePath, legacy.export());
+  legacy.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  await store.deleteConversation("legacy-delete-conversation");
+  await assert.rejects(
+    store.getProtocolResponse(
+      "legacy-delete-open",
+      "conversation.open",
+      "legacy-delete-conversation",
+      "legacy-delete-request",
+      request,
+    ),
+    /invalidated after resource deletion/,
+  );
+  assert.equal(await store.hasConversation("legacy-delete-conversation"), false);
+  await store.close();
+
+  store = await RuntimeStateStore.open(statePath);
+  await assert.rejects(
+    store.getProtocolResponse(
+      "legacy-delete-open",
+      "conversation.open",
+      "legacy-delete-conversation",
+      "legacy-delete-request",
+      request,
+    ),
+    /invalidated after resource deletion/,
+  );
+  await store.close();
+});
+
 test("Runtime State applies explicit schema migrations and rejects newer schemas", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-migrations-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
@@ -31,6 +216,42 @@ test("Runtime State applies explicit schema migrations and rejects newer schemas
     migrated.exec("SELECT value FROM settings_metadata WHERE key = 'schema_version'")[0].values[0][0],
     `${CURRENT_SCHEMA_VERSION}`,
   );
+
+  const upgradeFromV17Path = path.join(temporaryDirectory, "upgrade-from-v17.db");
+  const pre18 = new SQL.Database(migrated.export());
+  pre18.run("DROP INDEX conversations_by_archive_activity");
+  pre18.run("ALTER TABLE conversations DROP COLUMN title_origin");
+  pre18.run("ALTER TABLE conversations DROP COLUMN archived");
+  pre18.run(
+    `INSERT INTO conversations (id, title, model_id, created_at, updated_at)
+     VALUES ('pre-v18-conversation', 'New Conversation', 'fake-interview-model', ?, ?)`,
+    [new Date().toISOString(), new Date().toISOString()],
+  );
+  pre18.run("DELETE FROM schema_migrations WHERE version = 18");
+  pre18.run("UPDATE settings_metadata SET value = '17' WHERE key = 'schema_version'");
+  pre18.run("PRAGMA user_version = 17");
+  await writeFile(upgradeFromV17Path, pre18.export());
+  pre18.close();
+  const upgradedFromV17 = await RuntimeStateStore.open(upgradeFromV17Path);
+  await upgradedFromV17.close();
+  const verifiedV18 = new SQL.Database(await readFile(upgradeFromV17Path));
+  const conversationColumns = verifiedV18.exec("PRAGMA table_info(conversations)")[0].values
+    .map((column) => column[1]);
+  assert.ok(conversationColumns.includes("title_origin"));
+  assert.ok(conversationColumns.includes("archived"));
+  assert.deepEqual(
+    verifiedV18.exec(
+      "SELECT title_origin, archived FROM conversations WHERE id = 'pre-v18-conversation'",
+    )[0].values,
+    [["placeholder", 0]],
+  );
+  assert.deepEqual(
+    verifiedV18.exec(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'conversations_by_archive_activity'",
+    )[0].values,
+    [["conversations_by_archive_activity"]],
+  );
+  verifiedV18.close();
 
   const upgradePath = path.join(temporaryDirectory, "upgrade-from-v1.db");
   const timestamp = new Date().toISOString();

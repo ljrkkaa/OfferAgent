@@ -14,6 +14,7 @@ import type {
   VaultToolErrorCode,
   WebCitation,
 } from "@offeragent/protocol";
+import { generateConversationTitle } from "@offeragent/protocol";
 import { RuntimeRequestError, type RuntimeClient } from "./runtime-supervisor";
 import type { VaultPermissionMode } from "./vault-change-coordinator";
 
@@ -379,16 +380,20 @@ export class SidebarController {
         const models = await this.#runtime.listModels();
         this.#providerStatus = "connected";
         let conversations = await this.#runtime.listConversations();
-        if (conversations.length === 0 && models[0]) {
+        if (!conversations.some(({ archived }) => !archived) && models[0]) {
           conversations = [
             await this.#runtime.createConversation({
               id: randomUUID(),
-              title: "New Conversation",
+              title: "新对话",
               modelId: models[0].id,
+              titleOrigin: "placeholder",
+              archived: false,
+              updatedAt: new Date().toISOString(),
             }),
+            ...conversations,
           ];
         }
-        const active = conversations[0];
+        const active = conversations.find(({ archived }) => !archived);
         const snapshot = active ? await this.#runtime.openConversation(active.id) : undefined;
         this.#recoveredToolResults.clear();
         if (snapshot) await this.#rehydratePendingVaultChanges(snapshot.toolCalls ?? []);
@@ -433,13 +438,16 @@ export class SidebarController {
     }
   }
 
-  async createConversation(title = "New Conversation"): Promise<void> {
+  async createConversation(title = "新对话"): Promise<void> {
     const modelId = this.#viewModel.conversation.selectedModelId;
     if (!modelId) throw new Error("Choose an available model before creating a Conversation.");
     const conversation = await this.#runtime.createConversation({
       id: randomUUID(),
       title,
       modelId,
+      titleOrigin: title === "新对话" ? "placeholder" : "manual",
+      archived: false,
+      updatedAt: new Date().toISOString(),
     });
     this.#recoveredToolResults.clear();
     this.#resetTranscriptFollowing();
@@ -469,6 +477,9 @@ export class SidebarController {
     this.#updateConversation({
       ...this.#viewModel.conversation,
       activeConversationId: snapshot.conversation.id,
+      conversations: this.#viewModel.conversation.conversations.map((conversation) =>
+        conversation.id === snapshot.conversation.id ? snapshot.conversation : conversation
+      ),
       agentRuns: snapshot.agentRuns,
       messages: snapshot.messages.map(({ id, agentRunId, role, text, citations }) => ({
         id,
@@ -515,8 +526,34 @@ export class SidebarController {
       vaultChanges: [],
       error: undefined,
     });
-    if (conversations[0]) await this.openConversation(conversations[0].id);
+    const next = conversations.find(({ archived }) => !archived);
+    if (next) await this.openConversation(next.id);
     else await this.createConversation();
+  }
+
+  async renameConversation(conversationId: string, title: string): Promise<void> {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    const updated = await this.#runtime.updateConversation(conversationId, {
+      title: trimmed,
+      titleOrigin: "manual",
+    });
+    this.#replaceConversationSummary(updated);
+  }
+
+  async setConversationArchived(conversationId: string, archived: boolean): Promise<void> {
+    if (this.#viewModel.conversation.runState === "streaming") {
+      throw new Error("Stop the current Agent Run before archiving Conversations.");
+    }
+    const updated = await this.#runtime.updateConversation(conversationId, { archived });
+    this.#replaceConversationSummary(updated);
+    if (archived && this.#viewModel.conversation.activeConversationId === conversationId) {
+      const next = this.#viewModel.conversation.conversations.find(
+        (conversation) => !conversation.archived && conversation.id !== conversationId,
+      );
+      if (next) await this.openConversation(next.id);
+      else await this.createConversation();
+    }
   }
 
   async selectModel(modelId: string): Promise<void> {
@@ -549,6 +586,18 @@ export class SidebarController {
     }
   }
 
+  #replaceConversationSummary(updated: ConversationSummary): void {
+    this.#updateConversation({
+      ...this.#viewModel.conversation,
+      conversations: this.#viewModel.conversation.conversations
+        .map((conversation) => conversation.id === updated.id ? updated : conversation)
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+      selectedModelId: this.#viewModel.conversation.activeConversationId === updated.id
+        ? updated.modelId
+        : this.#viewModel.conversation.selectedModelId,
+    });
+  }
+
   async sendMessage(input = this.#draftText): Promise<void> {
     const text = input.trim();
     const selectedModelId = this.#viewModel.conversation.selectedModelId;
@@ -564,6 +613,15 @@ export class SidebarController {
     }
     this.#sendPending = true;
     this.refreshPresentation();
+    const activeSummary = this.#viewModel.conversation.conversations.find(
+      ({ id }) => id === conversationId,
+    );
+    const automaticTitle = activeSummary?.titleOrigin === "placeholder"
+      ? generateConversationTitle({
+          text,
+          imageFileName: this.#draftImages[0]?.fileName,
+        })
+      : undefined;
     const agentRunId = randomUUID();
     const submittedDraft = {
       images: this.#draftImages.map((image) => ({
@@ -628,8 +686,14 @@ export class SidebarController {
     ];
     this.#activeRun = { agentRunId, conversationId };
     this.#sendPending = false;
+    const activityTimestamp = new Date().toISOString();
     this.#updateConversation({
       ...this.#viewModel.conversation,
+      conversations: this.#viewModel.conversation.conversations
+        .map((conversation) => conversation.id === conversationId
+          ? { ...conversation, updatedAt: activityTimestamp }
+          : conversation)
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
       agentRuns,
       messages,
       runState: "streaming",
@@ -650,6 +714,23 @@ export class SidebarController {
       })) {
         if (event.type === "agent_run.started") {
           runStarted = true;
+          if (automaticTitle) {
+            try {
+              const updated = await this.#runtime.updateConversation(conversationId, {
+                title: automaticTitle,
+                titleOrigin: "automatic",
+              });
+              this.#replaceConversationSummary(updated);
+            } catch (error) {
+              this.#updateConversation({
+                ...this.#viewModel.conversation,
+                error: {
+                  code: "provider_error",
+                  message: error instanceof Error ? error.message : String(error),
+                },
+              });
+            }
+          }
           if (this.#draftRevision === submittedDraftRevision) {
             this.#draftText = "";
             this.#draftImages = [];
