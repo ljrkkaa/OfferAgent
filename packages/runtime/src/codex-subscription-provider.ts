@@ -619,6 +619,9 @@ function isLocalToolName(value: unknown): value is LocalToolName {
   return (
     value === "daily_note_context" ||
     value === "interview_catalog" ||
+    value === "project_list" ||
+    value === "project_read" ||
+    value === "project_search" ||
     value === "skill_read" ||
     value === "hosted_web_search_probe" ||
     value === "vault_list" ||

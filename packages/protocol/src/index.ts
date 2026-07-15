@@ -98,6 +98,9 @@ export type LocalToolName =
   | "interview_catalog"
   | "planning_memory_list"
   | "planning_memory_read"
+  | "project_list"
+  | "project_read"
+  | "project_search"
   | "research_browser"
   | "skill_read"
   | "vault_list"
@@ -141,6 +144,46 @@ export interface VaultReadResult {
   path: string;
   truncated: boolean;
   type: "vault_read";
+}
+
+export interface ProjectEvidenceEntry {
+  contentHash: string;
+  modifiedVersion: string;
+  path: string;
+}
+
+export interface ProjectListResult {
+  entries: ProjectEvidenceEntry[];
+  projectId: string;
+  truncated: boolean;
+  type: "project_list";
+}
+
+export interface ProjectSearchResult {
+  entries: Array<ProjectEvidenceEntry & {
+    snippets: Array<{
+      content: string;
+      lineEnd: number;
+      lineStart: number;
+      truncated: boolean;
+    }>;
+  }>;
+  projectId: string;
+  truncated: boolean;
+  type: "project_search";
+}
+
+export interface ProjectReadResult {
+  content: string;
+  contentHash: string;
+  evidencePath: string;
+  lineEnd: number;
+  lineStart: number;
+  modifiedVersion: string;
+  path: string;
+  projectId: string;
+  truncated: boolean;
+  type: "project_read";
 }
 
 export interface VaultSearchResult {
@@ -423,6 +466,9 @@ export type LocalToolResultPayload =
         | InterviewCatalogResult
         | PlanningMemoryListResult
         | PlanningMemoryReadResult
+        | ProjectListResult
+        | ProjectReadResult
+        | ProjectSearchResult
         | ResearchBrowserResult
         | SkillReadResult
         | VaultListResult

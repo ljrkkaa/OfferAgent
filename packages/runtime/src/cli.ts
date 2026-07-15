@@ -150,6 +150,55 @@ const LOCAL_TOOLS: LocalToolDefinition[] = [
   },
   {
     kind: "local",
+    name: "project_list",
+    description:
+      "List bounded UTF-8 source, configuration, and documentation paths from one Project Registry entry. Paths are project-relative and the capability cannot write or execute commands.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        projectId: { type: "string", pattern: "^[a-z0-9][a-z0-9_-]{0,63}$" },
+        directory: { type: "string", maxLength: 512 },
+        limit: { type: "integer", minimum: 1, maximum: 100 },
+      },
+      required: ["projectId"],
+    },
+  },
+  {
+    kind: "local",
+    name: "project_search",
+    description:
+      "Search bounded UTF-8 source, configuration, and documentation in one Project Registry entry. Search candidates are not exact evidence; call project_read before making implementation claims.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        projectId: { type: "string", pattern: "^[a-z0-9][a-z0-9_-]{0,63}$" },
+        query: { type: "string", minLength: 1, maxLength: 512 },
+        limit: { type: "integer", minimum: 1, maximum: 20 },
+      },
+      required: ["projectId", "query"],
+    },
+  },
+  {
+    kind: "local",
+    name: "project_read",
+    description:
+      "Read an exact bounded line range from one eligible UTF-8 source, configuration, or documentation file in a Project Registry entry. The result is versioned Project Evidence and cannot write or execute the source.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        projectId: { type: "string", pattern: "^[a-z0-9][a-z0-9_-]{0,63}$" },
+        path: { type: "string", minLength: 1, maxLength: 512 },
+        lineStart: { type: "integer", minimum: 1 },
+        lineEnd: { type: "integer", minimum: 1 },
+      },
+      required: ["projectId", "path"],
+    },
+  },
+  {
+    kind: "local",
     name: "vault_list",
     description: "List bounded Markdown or text files available in the connected Obsidian Vault.",
     parameters: {
@@ -609,6 +658,50 @@ function isLocalToolResultPayload(value: unknown): value is LocalToolResultPaylo
           topic.modifiedVersion.length <= 128,
       )
     );
+  }
+  if (
+    result.value.type === "project_list" ||
+    result.value.type === "project_search" ||
+    result.value.type === "project_read"
+  ) {
+    const id = result.value.projectId;
+    const commonEntry = (entry: unknown): boolean => {
+      if (!entry || typeof entry !== "object") return false;
+      const candidate = entry as Record<string, unknown>;
+      return (
+        isBoundedVaultPath(candidate.path) &&
+        typeof candidate.modifiedVersion === "string" &&
+        candidate.modifiedVersion.length > 0 && candidate.modifiedVersion.length <= 128 &&
+        /^sha256:[a-f0-9]{64}$/u.test(String(candidate.contentHash))
+      );
+    };
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/u.test(id)) return false;
+    if (result.value.type === "project_list") {
+      return Array.isArray(result.value.entries) && result.value.entries.length <= 100 &&
+        result.value.entries.every(commonEntry) && typeof result.value.truncated === "boolean";
+    }
+    if (result.value.type === "project_search") {
+      return Array.isArray(result.value.entries) && result.value.entries.length <= 20 &&
+        typeof result.value.truncated === "boolean" && result.value.entries.every((entry) =>
+          commonEntry(entry) && Array.isArray(entry.snippets) && entry.snippets.length <= 3 &&
+          entry.snippets.every((snippet) =>
+            typeof snippet.content === "string" && Buffer.byteLength(snippet.content, "utf8") <= 512 &&
+            Number.isInteger(snippet.lineStart) && snippet.lineStart >= 1 &&
+            Number.isInteger(snippet.lineEnd) && snippet.lineEnd >= snippet.lineStart &&
+            typeof snippet.truncated === "boolean"));
+    }
+    if (result.value.type === "project_read") {
+      return isBoundedVaultPath(result.value.path) &&
+        result.value.evidencePath === `project/${id}/${result.value.path}` &&
+        Number.isInteger(result.value.lineStart) && result.value.lineStart >= 1 &&
+        Number.isInteger(result.value.lineEnd) && result.value.lineEnd >= result.value.lineStart &&
+        result.value.lineEnd - result.value.lineStart < 200 &&
+        typeof result.value.content === "string" && Buffer.byteLength(result.value.content, "utf8") <= 32_768 &&
+        typeof result.value.modifiedVersion === "string" && result.value.modifiedVersion.length <= 128 &&
+        /^sha256:[a-f0-9]{64}$/u.test(result.value.contentHash) &&
+        typeof result.value.truncated === "boolean";
+    }
+    return false;
   }
   if (result.value.type === "skill_read") {
     const expectedPath = `.codex/skills/${result.value.skill}/${result.value.resource}`;
@@ -2222,8 +2315,9 @@ async function startRuntime({
                 (item): item is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
                   item.type === "local_tool_call" && item.callId === priorCallId,
               );
-              if (!priorCall || priorCall.name !== "vault_read") continue;
-              const reread = await executeLocalTool("vault_read", priorCall.arguments);
+              const isProjectRead = priorCall?.name === "project_read";
+              if (!priorCall || (priorCall.name !== "vault_read" && !isProjectRead)) continue;
+              const reread = await executeLocalTool(priorCall.name, priorCall.arguments);
               input = input.filter(
                 (item) =>
                   !(
@@ -2235,12 +2329,14 @@ async function startRuntime({
               for (const stalePath of reread.stalePaths) requiredRereads.add(stalePath);
               const providerResult: LocalToolResultPayload =
                 reread.stalePaths.length > 0 &&
-                !(reread.result.ok && reread.result.value.type === "vault_read")
+                !(reread.result.ok &&
+                  (reread.result.value.type === "vault_read" ||
+                    reread.result.value.type === "project_read"))
                   ? {
                       ok: false,
                       error: {
                         code: "stale_evidence",
-                        message: `Vault evidence changed for ${reread.stalePaths.join(", ")}. Reread and replan.`,
+                        message: `Evidence changed for ${reread.stalePaths.join(", ")}. Reread and replan.`,
                       },
                     }
                   : reread.result;
@@ -2248,13 +2344,20 @@ async function startRuntime({
                 {
                   type: "local_tool_call",
                   callId: reread.toolCallId,
-                  name: "vault_read",
+                  name: priorCall.name,
                   arguments: priorCall.arguments,
                 },
                 { type: "local_tool_result", callId: reread.toolCallId, result: providerResult },
               );
-              if (reread.result.ok && reread.result.value.type === "vault_read") {
-                canonicalReadPaths.set(reread.toolCallId, reread.result.value.path);
+              const rereadPath = reread.result.ok
+                ? reread.result.value.type === "vault_read"
+                  ? reread.result.value.path
+                  : reread.result.value.type === "project_read"
+                    ? reread.result.value.evidencePath
+                    : undefined
+                : undefined;
+              if (rereadPath) {
+                canonicalReadPaths.set(reread.toolCallId, rereadPath);
                 requiredRereads.delete(path);
               }
               await saveCheckpoint();
@@ -2522,8 +2625,13 @@ async function startRuntime({
               ) {
                 localSkills.set(result.value.skill, result.value.content);
               }
-              const currentReadPath =
-                result.ok && result.value.type === "vault_read" ? result.value.path : undefined;
+              const currentReadPath = result.ok
+                ? result.value.type === "vault_read"
+                  ? result.value.path
+                  : result.value.type === "project_read"
+                    ? result.value.evidencePath
+                    : undefined
+                : undefined;
               if (currentReadPath) canonicalReadPaths.set(providerEvent.callId, currentReadPath);
               const appliedProposal =
                 result.ok &&
@@ -2537,7 +2645,7 @@ async function startRuntime({
                       (item): item is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
                         item.type === "local_tool_call" &&
                         item.callId !== providerEvent.callId &&
-                        item.name === "vault_read" &&
+                        (item.name === "vault_read" || item.name === "project_read") &&
                         stalePathSet.has(canonicalReadPaths.get(item.callId) ?? ""),
                     )
                     .map((item) => item.callId),
@@ -2566,7 +2674,7 @@ async function startRuntime({
                       ok: false,
                       error: {
                         code: "stale_evidence",
-                        message: `Vault evidence changed for ${stalePaths.join(", ")}. Call vault_read for each changed path before continuing.`,
+                        message: `Evidence changed for ${stalePaths.join(", ")}. Reread each changed source with its exact read tool before continuing.`,
                       },
                     }
                   : result;

@@ -17,6 +17,7 @@ import {
   type SidebarViewModel,
 } from "./sidebar-controller";
 import { ObsidianVaultToolAdapter } from "./vault-tool-adapter";
+import { ProjectEvidenceAdapter } from "./project-evidence-adapter";
 import {
   GitCheckpointStore,
   ObsidianVaultChangeFileApi,
@@ -570,6 +571,7 @@ export default class OfferAgentPlugin extends Plugin {
         formatDate: (date, format) => localMoment(date, "YYYY-MM-DD", true).format(format),
       },
     );
+    const projectEvidence = new ProjectEvidenceAdapter(this.app.vault);
     const researchBrowser = createHostResearchBrowser();
     this.#researchBrowser = researchBrowser;
     let runtime!: RuntimeSupervisor;
@@ -597,6 +599,10 @@ export default class OfferAgentPlugin extends Plugin {
             ? changeCoordinator.execute(event)
             : event.tool.name === "research_browser"
               ? researchBrowser.execute(event)
+            : event.tool.name === "project_list" ||
+                event.tool.name === "project_search" ||
+                event.tool.name === "project_read"
+              ? projectEvidence.execute(event)
             : readTools.execute(event),
       },
     });

@@ -411,6 +411,78 @@ test("hosted Web Search capability is persisted per backend and model", async (t
   await store.close();
 });
 
+test("Project Evidence reads become snapshots and later observations invalidate stale versions", async (t) => {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-project-state-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const statePath = path.join(temporaryDirectory, "state.db");
+  const store = await RuntimeStateStore.open(statePath);
+  await store.beginAgentRun("project-conversation", "project-run", "fake-interview-model", "Explain cache invalidation");
+  const readMarker = "PROJECT-READ-BODY-MUST-ONLY-BE-EVIDENCE";
+  const searchMarker = "PROJECT-SEARCH-SNIPPET-MUST-NOT-PERSIST";
+
+  const request = async (id, name, arguments_, result, sequence) => {
+    await store.requestToolCall("project-run", {
+      type: "tool_call.requested", protocolVersion: 1, eventId: `${id}-requested`,
+      conversationId: "project-conversation", agentRunId: "project-run", sequence,
+      toolCallId: id, tool: { kind: "local", name, arguments: arguments_ },
+    });
+    return store.completeToolCall("project-run", { ok: true, value: result }, {
+      type: "tool_call.completed", protocolVersion: 1, eventId: `${id}-completed`,
+      conversationId: "project-conversation", agentRunId: "project-run", sequence: sequence + 1,
+      toolCallId: id, tool: { kind: "local", name }, status: "completed",
+    });
+  };
+
+  const readResult = {
+    type: "project_read", projectId: "offeragent", path: "src/cache.ts",
+    evidencePath: "project/offeragent/src/cache.ts", lineStart: 1, lineEnd: 1,
+    modifiedVersion: "mtime:1:size:3", contentHash: "sha256:old", content: readMarker, truncated: false,
+  };
+  const searchResult = {
+    type: "project_search", projectId: "offeragent", truncated: false,
+    entries: [{
+      path: "src/cache.ts", modifiedVersion: "mtime:2:size:3", contentHash: "sha256:new",
+      snippets: [{ content: searchMarker, lineStart: 1, lineEnd: 1, truncated: false }],
+    }],
+  };
+  assert.deepEqual(await request("project-read-old", "project_read", {
+    projectId: "offeragent", path: "src/cache.ts",
+  }, readResult, 2), []);
+  assert.deepEqual(await request("project-search-new", "project_search", {
+    projectId: "offeragent", query: "new",
+  }, searchResult, 4), ["project/offeragent/src/cache.ts"]);
+
+  await store.saveRunCheckpoint("project-run", {
+    version: 1,
+    input: [
+      { type: "user_message", text: "Explain cache invalidation" },
+      { type: "local_tool_call", callId: "provider-search", name: "project_search", arguments: { projectId: "offeragent", query: "new" } },
+      { type: "local_tool_result", callId: "provider-search", result: { ok: true, value: searchResult } },
+      { type: "local_tool_call", callId: "provider-read", name: "project_read", arguments: { projectId: "offeragent", path: "src/cache.ts" } },
+      { type: "local_tool_result", callId: "provider-read", result: { ok: true, value: readResult } },
+    ],
+    localSkills: [], canonicalReadPaths: [["provider-read", "project/offeragent/src/cache.ts"]],
+    requiredRereads: [], hostedWebSearchProbeAttempted: false, completedSteps: 2,
+  });
+
+  await store.close();
+  const SQL = await initSqlJs();
+  const database = new SQL.Database(await readFile(statePath));
+  assert.deepEqual(database.exec(
+    "SELECT path, content_hash, content, is_stale FROM evidence_snapshots",
+  )[0].values, [["project/offeragent/src/cache.ts", "sha256:old", readMarker, 1]]);
+  const toolResults = database.exec("SELECT result_json FROM tool_calls ORDER BY created_at")[0].values.flat().join("\n");
+  const checkpoint = database.exec("SELECT checkpoint_json FROM run_checkpoints")[0].values[0][0];
+  assert.equal(toolResults.includes(readMarker), false);
+  assert.equal(toolResults.includes(searchMarker), false);
+  assert.equal(checkpoint.includes(readMarker), false);
+  assert.equal(checkpoint.includes(searchMarker), false);
+  const serialized = Buffer.from(await readFile(statePath)).toString("utf8");
+  assert.equal(serialized.includes(temporaryDirectory), false);
+  assert.equal(serialized.includes(searchMarker), false);
+  database.close();
+});
+
 test("Runtime State rolls back a failed write and serves consistent concurrent reads", async (t) => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "offeragent-transactions-"));
   t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));

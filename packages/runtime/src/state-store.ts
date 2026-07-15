@@ -23,7 +23,7 @@ import initSqlJs, { type Database, type SqlJsStatic } from "sql.js/dist/sql-asm.
 import type { ModelConversationItem } from "./model-provider";
 import type { RunAttachmentMetadata as StoredRunAttachmentMetadata } from "./run-attachments";
 
-const CURRENT_SCHEMA_VERSION = 16;
+const CURRENT_SCHEMA_VERSION = 17;
 const MAX_CONVERSATION_CONTEXT_BYTES = 64 * 1_024;
 
 export interface RunCheckpoint {
@@ -106,11 +106,36 @@ function persistedRunCheckpoint(checkpoint: RunCheckpoint): RunCheckpoint {
       )
       .map((item) => item.callId),
   );
+  const projectSearchCallIds = new Set(
+    checkpoint.input
+      .filter(
+        (item): item is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
+          item.type === "local_tool_call" && item.name === "project_search",
+      )
+      .map((item) => item.callId),
+  );
+  const projectReadCallIds = new Set(
+    checkpoint.input
+      .filter(
+        (item): item is Extract<ModelConversationItem, { type: "local_tool_call" }> =>
+          item.type === "local_tool_call" && item.name === "project_read",
+      )
+      .map((item) => item.callId),
+  );
   const input = checkpoint.input.flatMap((item) => {
     if (
       (item.type === "local_tool_call" || item.type === "local_tool_result") &&
       ephemeralCallIds.has(item.callId)
     ) {
+      return [];
+    }
+    if (
+      (item.type === "local_tool_call" || item.type === "local_tool_result") &&
+      projectSearchCallIds.has(item.callId)
+    ) {
+      return [];
+    }
+    if (item.type === "local_tool_result" && projectReadCallIds.has(item.callId)) {
       return [];
     }
     if (item.type === "user_message" && item.attachments?.length) {
@@ -198,6 +223,22 @@ function persistedToolResult(
       value: {
         type: "planning_memory_read",
         topics: result.value.topics.map(({ content: _content, ...metadata }) => metadata),
+      },
+    };
+  }
+  if (result.ok && result.value.type === "project_read") {
+    const { content: _content, ...metadata } = result.value;
+    return { ok: true, value: metadata };
+  }
+  if (result.ok && result.value.type === "project_search") {
+    return {
+      ok: true,
+      value: {
+        ...result.value,
+        entries: result.value.entries.map((entry) => ({
+          ...entry,
+          snippets: entry.snippets.map(({ content: _content, ...metadata }) => metadata),
+        })),
       },
     };
   }
@@ -1045,6 +1086,95 @@ const MIGRATIONS = [
       CREATE INDEX vault_change_batches_by_state ON vault_change_batches(state, updated_at);
     `,
   },
+  {
+    version: 17,
+    sql: `
+      CREATE TABLE tool_calls_v17 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        name TEXT NOT NULL CHECK (name IN (
+          'agent_contract_read', 'daily_note_context', 'hosted_web_search_probe',
+          'interview_catalog', 'planning_memory_list', 'planning_memory_read',
+          'project_list', 'project_read', 'project_search', 'research_browser',
+          'skill_read', 'vault_list',
+          'vault_propose_changes', 'vault_read', 'vault_search', 'web_read'
+        )),
+        arguments_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('requested', 'completed', 'failed')),
+        error_code TEXT,
+        error_message TEXT,
+        result_json TEXT,
+        result_event_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO tool_calls_v17
+        (id, conversation_id, agent_run_id, name, arguments_json, status,
+         error_code, error_message, result_json, result_event_id, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, name, arguments_json, status,
+             error_code, error_message, result_json, result_event_id, created_at, updated_at
+      FROM tool_calls;
+      CREATE TABLE evidence_snapshots_v17 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v17(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        line_start INTEGER NOT NULL,
+        line_end INTEGER NOT NULL,
+        modified_version TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        is_stale INTEGER NOT NULL DEFAULT 0 CHECK (is_stale IN (0, 1)),
+        stale_detected_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO evidence_snapshots_v17
+        (id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+         modified_version, content_hash, content, is_stale, stale_detected_at, created_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
+             modified_version, content_hash, content, is_stale, stale_detected_at, created_at
+      FROM evidence_snapshots;
+      CREATE TABLE vault_change_batches_v17 (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        agent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        tool_call_id TEXT NOT NULL UNIQUE REFERENCES tool_calls_v17(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        task TEXT NOT NULL,
+        target_paths_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+          'pending', 'applying', 'applied', 'rejected', 'failed', 'rolled_back',
+          'recovery_failed', 'undone', 'expired'
+        )),
+        checkpoint_ref TEXT,
+        before_hashes_json TEXT,
+        after_hashes_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO vault_change_batches_v17
+        (id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+         target_paths_json, state, checkpoint_ref, before_hashes_json,
+         after_hashes_json, created_at, updated_at)
+      SELECT id, conversation_id, agent_run_id, tool_call_id, idempotency_key, task,
+             target_paths_json, state, checkpoint_ref, before_hashes_json,
+             after_hashes_json, created_at, updated_at
+      FROM vault_change_batches;
+      DROP TABLE evidence_snapshots;
+      DROP TABLE vault_change_batches;
+      DROP TABLE tool_calls;
+      ALTER TABLE tool_calls_v17 RENAME TO tool_calls;
+      ALTER TABLE evidence_snapshots_v17 RENAME TO evidence_snapshots;
+      ALTER TABLE vault_change_batches_v17 RENAME TO vault_change_batches;
+      CREATE INDEX tool_calls_by_run ON tool_calls(agent_run_id, created_at);
+      CREATE INDEX evidence_by_run ON evidence_snapshots(agent_run_id, created_at);
+      CREATE INDEX evidence_by_source ON evidence_snapshots(path, content_hash, is_stale);
+      CREATE INDEX vault_change_batches_by_run ON vault_change_batches(agent_run_id, created_at);
+      CREATE INDEX vault_change_batches_by_state ON vault_change_batches(state, updated_at);
+    `,
+  },
 ] as const;
 
 interface ConversationSnapshot {
@@ -1626,10 +1756,13 @@ export class RuntimeStateStore {
     await this.#writeTail;
     const row = firstRow(
       this.#database,
-      `SELECT status, result_json FROM tool_calls WHERE id = ? AND agent_run_id = ?`,
+      `SELECT status, result_json, name FROM tool_calls WHERE id = ? AND agent_run_id = ?`,
       [toolCallId, agentRunId],
     );
     if (!row || (row[0] !== "completed" && row[0] !== "failed") || typeof row[1] !== "string") {
+      return undefined;
+    }
+    if (row[2] === "project_list" || row[2] === "project_search" || row[2] === "project_read") {
       return undefined;
     }
     return JSON.parse(row[1]) as LocalToolResultPayload;
@@ -2008,6 +2141,16 @@ export class RuntimeStateStore {
         const sources =
           result.value.type === "vault_read"
             ? [{ path: result.value.path, contentHash: result.value.contentHash }]
+            : result.value.type === "project_read"
+              ? [{ path: result.value.evidencePath, contentHash: result.value.contentHash }]
+            : result.value.type === "project_list" || result.value.type === "project_search"
+              ? (() => {
+                  const projectEvidence = result.value;
+                  return projectEvidence.entries.map(({ path, contentHash }) => ({
+                    path: `project/${projectEvidence.projectId}/${path}`,
+                    contentHash,
+                  }));
+                })()
             : result.value.type === "vault_propose_changes" &&
                 result.value.decision === "applied"
               ? result.value.targets.map(({ path, afterHash }) => ({
@@ -2027,8 +2170,12 @@ export class RuntimeStateStore {
           if (this.#database.getRowsModified() > 0) stalePaths.push(source.path);
         }
       }
-      if (result.ok && result.value.type === "vault_read") {
+      if (
+        result.ok &&
+        (result.value.type === "vault_read" || result.value.type === "project_read")
+      ) {
         const evidence = result.value;
+        const evidencePath = evidence.type === "vault_read" ? evidence.path : evidence.evidencePath;
         this.#database.run(
           `INSERT INTO evidence_snapshots
             (id, conversation_id, agent_run_id, tool_call_id, path, line_start, line_end,
@@ -2039,7 +2186,7 @@ export class RuntimeStateStore {
             run.conversationId,
             agentRunId,
             event.toolCallId,
-            evidence.path,
+            evidencePath,
             evidence.lineStart,
             evidence.lineEnd,
             evidence.modifiedVersion,

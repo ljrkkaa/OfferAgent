@@ -18,11 +18,13 @@ import { publicInterviewResearchEvents } from "./fake-public-interview-research-
 import { dynamicInterviewResearchEvent } from "./fake-dynamic-interview-research-scenario";
 import { interviewAnswerResearchEvent } from "./fake-answer-research-scenario";
 import { interviewKnowledgePlanningEvent } from "./fake-interview-knowledge-planning-scenario";
+import { projectEvidenceQuestionEvent } from "./fake-project-evidence-scenario";
 import { toolResultFor, toolResultForAfter } from "./fake-provider-conversation";
 
 export const FAKE_SCENARIOS = [
   "interview-answer-research",
   "interview-knowledge-planning",
+  "project-question-answer",
   "dynamic-interview-research",
   "interview-deduplication",
   "multi-image-interview-ingestion",
@@ -242,6 +244,13 @@ export class FakeModelProvider implements ModelProvider {
         return `${prefix}-${this.#toolCallSequence}`;
       });
       for (const event of Array.isArray(events) ? events : [events]) yield event;
+      return;
+    }
+    if (this.#scenario === "project-question-answer") {
+      yield projectEvidenceQuestionEvent(request, (prefix) => {
+        this.#toolCallSequence += 1;
+        return `${prefix}-${this.#toolCallSequence}`;
+      });
       return;
     }
     if (this.#scenario === "dynamic-interview-research") {
@@ -1149,6 +1158,43 @@ export class FakeModelProvider implements ModelProvider {
         return;
       }
       yield { type: "output_text.delta", delta: "Final answer without a citation" };
+      return;
+    }
+    const projectStaleFlow = /^project_stale_evidence_flow\s+([a-z0-9][a-z0-9_-]{0,63})\s+([^\s]+)$/i.exec(userInput.trim());
+    if (projectStaleFlow) {
+      const calls = request.input.filter((item) => item.type === "local_tool_call");
+      const results = request.input.filter((item) => item.type === "local_tool_result");
+      const successfulRead = results.find(
+        (item) => item.result.ok && item.result.value.type === "project_read",
+      );
+      const hasSearchCall = calls.some((item) => item.name === "project_search");
+      if (!successfulRead) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-project-stale-read-${this.#toolCallSequence}`,
+          name: "project_read",
+          arguments: {
+            projectId: projectStaleFlow[1], path: projectStaleFlow[2], lineStart: 1, lineEnd: 1,
+          },
+        };
+        return;
+      }
+      if (!hasSearchCall) {
+        this.#toolCallSequence += 1;
+        yield {
+          type: "local_tool_call",
+          callId: `fake-project-stale-search-${this.#toolCallSequence}`,
+          name: "project_search",
+          arguments: { projectId: projectStaleFlow[1], query: "content", limit: 5 },
+        };
+        return;
+      }
+      const contents = results.flatMap((item) =>
+        item.result.ok && item.result.value.type === "project_read"
+          ? [item.result.value.content]
+          : []);
+      yield { type: "output_text.delta", delta: `OfferAgent received fresh Project Evidence: ${JSON.stringify(contents)}` };
       return;
     }
     const staleFlow = /^stale_evidence_flow\s+([^\s]+)$/i.exec(userInput.trim());
