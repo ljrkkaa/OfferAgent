@@ -60,7 +60,8 @@ def map_application_exception(error: BaseException) -> ProtocolViolation:
     if isinstance(error, ResourceConflictCause):
         return protocol_error(
             ErrorCode.RESOURCE_CONFLICT,
-            "requested operation conflicts with current resource state",
+            error.conflict_user_message,
+            details={"reason": error.conflict_reason},
         )
     if isinstance(error, TimeoutError):
         return protocol_error(

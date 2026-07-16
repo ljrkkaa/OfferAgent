@@ -88,16 +88,15 @@ class ProductionSkillBundleFactory:
         workspace_id: str,
         workspace_root: Path,
         runtime_root: Path,
-        user_home: Path | None,
+        user_home: Path,
         limits: SkillLimits | None = None,
     ) -> None:
         if not workspace_id or "\x00" in workspace_id:
             raise ValueError("Production Skill factory requires a valid Workspace ID")
-        home = user_home or Path.home()
         self.workspace_id = workspace_id
         self.workspace_root = _absolute_path(workspace_root, "Workspace root")
         self.runtime_root = _absolute_path(runtime_root, "Runtime root")
-        self.user_root = _absolute_path(home, "User home") / ".claude" / "skills"
+        self.user_root = _absolute_path(user_home, "User home") / ".claude" / "skills"
         self.builtin_root = self.runtime_root / "skills"
         self.workspace_skill_root = self.workspace_root / ".claude" / "skills"
         self._limits = limits or SkillLimits()

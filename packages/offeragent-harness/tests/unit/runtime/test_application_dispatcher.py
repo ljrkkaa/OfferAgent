@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -26,6 +26,7 @@ from offeragent_harness.runtime.application_handlers import (
     compose_application_command_handlers,
 )
 from offeragent_harness.runtime.config_service import ConfigRevisionConflict
+from offeragent_harness.runtime.loopback_gateway import LoopbackWebGateway
 from offeragent_harness.testing import ManualCancellationToken, ManualClock
 
 
@@ -125,19 +126,24 @@ async def test_dispatcher_checks_readiness_before_command_validation() -> None:
 
 
 @pytest.mark.parametrize(
-    ("failure", "expected"),
+    ("failure", "expected", "expected_details"),
     [
-        (lambda: PermissionError("private permission rule"), ErrorCode.POLICY_DENIED),
-        (lambda: FileNotFoundError("C:/private/notebook.md"), ErrorCode.RESOURCE_NOT_FOUND),
-        (lambda: ConfigRevisionConflict(7, 9), ErrorCode.RESOURCE_CONFLICT),
-        (lambda: asyncio.CancelledError("private cancellation reason"), ErrorCode.REQUEST_CANCELLED),
-        (lambda: RuntimeError("private internal failure"), ErrorCode.INTERNAL_ERROR),
+        (lambda: PermissionError("private permission rule"), ErrorCode.POLICY_DENIED, {}),
+        (lambda: FileNotFoundError("C:/private/notebook.md"), ErrorCode.RESOURCE_NOT_FOUND, {}),
+        (
+            lambda: ConfigRevisionConflict(7, 9),
+            ErrorCode.RESOURCE_CONFLICT,
+            {"reason": "resource_state_conflict"},
+        ),
+        (lambda: asyncio.CancelledError("private cancellation reason"), ErrorCode.REQUEST_CANCELLED, {}),
+        (lambda: RuntimeError("private internal failure"), ErrorCode.INTERNAL_ERROR, {}),
     ],
 )
 @pytest.mark.asyncio
 async def test_dispatcher_sanitizes_application_failures(
     failure: Callable[[], BaseException],
     expected: ErrorCode,
+    expected_details: dict[str, str],
 ) -> None:
     async def fail(_raw: WireModel, _cancellation: Any, _context: Any) -> WireModel:
         raise failure()
@@ -151,7 +157,7 @@ async def test_dispatcher_sanitizes_application_failures(
     envelope = rejected.value.error
     assert envelope.code is expected
     assert envelope.cancelled is (expected is ErrorCode.REQUEST_CANCELLED)
-    assert envelope.details == {}
+    assert envelope.details == expected_details
     serialized = envelope.model_dump_json()
     assert all(secret not in serialized for secret in ("private", "C:/", "7", "9"))
 
@@ -184,6 +190,10 @@ def test_domain_factory_covers_every_non_identity_command_exactly_once() -> None
         approvals = object()
 
     shared = object()
+
+    def gateway_provider() -> LoopbackWebGateway | None:
+        return cast(LoopbackWebGateway, shared)
+
     handlers = compose_domain_command_handlers(
         identity=DomainCommandIdentity("ws_test", "profile_1", "managed", "actor_1"),
         clock=shared,  # type: ignore[arg-type]
@@ -200,7 +210,7 @@ def test_domain_factory_covers_every_non_identity_command_exactly_once() -> None
         subagent_artifacts=shared,  # type: ignore[arg-type]
         diagnostics=shared,  # type: ignore[arg-type]
         diagnostics_owner_runs=shared,  # type: ignore[arg-type]
-        gateway_provider=lambda: shared,  # type: ignore[return-value]
+        gateway_provider=gateway_provider,
         transport_policy=shared,  # type: ignore[arg-type]
         extension_management_handlers={
             method: _unused

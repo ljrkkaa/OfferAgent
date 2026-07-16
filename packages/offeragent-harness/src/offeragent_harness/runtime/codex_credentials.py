@@ -98,7 +98,14 @@ class CodexFileCredentialSource:
 
 def default_codex_auth_path() -> Path:
     configured = os.environ.get("CODEX_HOME")
-    root = Path(configured) if configured else Path.home() / ".codex"
+    if configured:
+        root = Path(configured)
+    elif os.name == "nt":
+        from .windows_process import current_user_profile_directory
+
+        root = current_user_profile_directory() / ".codex"
+    else:
+        root = Path.home() / ".codex"
     path = root / "auth.json"
     _validate_local_path_shape(path)
     return path

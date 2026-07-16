@@ -333,7 +333,7 @@ def _bundle(suffix: str, calls: tuple[ToolCall, ...]) -> _RunBundle:
             budget=RunBudget(8, 20, 4, 300, 20_000, 8_000, Decimal("10"), 1_000_000, 4),
             started_at=NOW,
             used=BudgetDelta(model_rounds=1, tool_calls=len(calls)),
-            reserved=BudgetDelta(model_rounds=1),
+            reserved=BudgetDelta(),
             captured_at=NOW,
             elapsed_seconds=0,
         ),

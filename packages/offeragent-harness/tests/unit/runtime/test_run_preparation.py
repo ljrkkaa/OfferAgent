@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import Sequence
 from datetime import datetime, timezone
 
 import pytest
 
-from offeragent_harness.agent.composer import CompositionEvent
 from offeragent_harness.agent.context_manager import ContextFragment, ContextLayer
 from offeragent_harness.agent.planner import PlanningStep
 from offeragent_harness.agent.preparation import RunPreparationFailure
@@ -87,37 +86,6 @@ class _Planner:
         del state
         cancellation.checkpoint()
         return PlanningStep((), False, "done")
-
-
-class _Composer:
-    def __init__(self) -> None:
-        self.conversation: list[ContextFragment] = []
-        self.memories: list[ContextFragment] = []
-        self.skills: list[ContextFragment] = []
-
-    def add_conversation_context(self, fragments: Sequence[ContextFragment]) -> None:
-        self.conversation.extend(fragments)
-
-    def add_memory_context(self, fragments: Sequence[ContextFragment]) -> None:
-        self.memories.extend(fragments)
-
-    def add_skill_context(self, fragments: Sequence[ContextFragment]) -> None:
-        self.skills.extend(fragments)
-
-    def stream(
-        self,
-        state: RunState,
-        *,
-        partial: bool,
-        cancellation: CancellationToken,
-    ) -> AsyncIterator[CompositionEvent]:
-        del state, partial
-
-        async def generate() -> AsyncIterator[CompositionEvent]:
-            cancellation.checkpoint()
-            yield CompositionEvent(text_delta="done")
-
-        return generate()
 
 
 class _Provider:
@@ -219,17 +187,15 @@ async def test_vault_memory_adapter_rejects_other_workspace_and_fixed_limits() -
 
 
 @pytest.mark.asyncio
-async def test_prepared_context_is_bounded_retried_once_and_idempotently_enriches_both_models() -> None:
+async def test_prepared_context_is_bounded_retried_once_and_idempotently_enriches_agent() -> None:
     fragment = _fragment()
     provider = _Provider((fragment, fragment))
     provider.failures = 1
     planner = _Planner()
-    composer = _Composer()
     prepared = PreparedRunContext(
         request=_request(),
         provider=provider,
         planner=planner,
-        composer=composer,
         limits=RunPreparationLimits(max_attempts=2),
     )
     token = ManualCancellationToken()
@@ -244,7 +210,6 @@ async def test_prepared_context_is_bounded_retried_once_and_idempotently_enriche
         RunPhase.SELECTING_MEMORY,
     ]
     assert planner.memories == [fragment]
-    assert composer.memories == [fragment]
 
 
 @pytest.mark.asyncio
@@ -263,7 +228,6 @@ async def test_workspace_instructions_are_injected_before_planning() -> None:
         _Provider(()),
     )
     planner = _Planner()
-    composer = _Composer()
     request = RunPreparationRequest(
         profile_id="profile_main",
         workspace_id="ws_main",
@@ -274,7 +238,7 @@ async def test_workspace_instructions_are_injected_before_planning() -> None:
         query_text="请安排今天的学习内容",
         memory_enabled=True,
     )
-    prepared = PreparedRunContext(request=request, provider=provider, planner=planner, composer=composer)
+    prepared = PreparedRunContext(request=request, provider=provider, planner=planner)
     token = ManualCancellationToken()
 
     await prepared.prepare(_state(RunPhase.LOADING_CONTEXT), RunPhase.LOADING_CONTEXT, token)
@@ -283,7 +247,6 @@ async def test_workspace_instructions_are_injected_before_planning() -> None:
     assert [item.source_refs for item in planner.skills] == [
         ("vault:ws_main:AGENTS.md",),
     ]
-    assert planner.skills == composer.skills
 
 
 @pytest.mark.asyncio
@@ -400,8 +363,7 @@ async def test_completed_session_turns_are_injected_as_exact_native_role_history
 
     adapter = ConversationHistoryRunPreparationAdapter(workspace_id="ws_main", unit_of_work=unit_of_work)
     planner = _Planner()
-    composer = _Composer()
-    prepared = PreparedRunContext(request=_request(), provider=adapter, planner=planner, composer=composer)
+    prepared = PreparedRunContext(request=_request(), provider=adapter, planner=planner)
     token = ManualCancellationToken()
 
     await prepared.prepare(_state(RunPhase.LOADING_CONTEXT), RunPhase.LOADING_CONTEXT, token)
@@ -414,26 +376,23 @@ async def test_completed_session_turns_are_injected_as_exact_native_role_history
     ]
     assert "Python" in planner.conversation[0].text
     assert planner.conversation[1].text == "已记住: 你有两年 Python 经验。"
-    assert planner.conversation == composer.conversation
 
 
 @pytest.mark.asyncio
 async def test_prepared_context_fails_closed_before_enrichment_on_oversized_or_foreign_state() -> None:
     provider = _Provider((_fragment(text="x" * 100),))
     planner = _Planner()
-    composer = _Composer()
     prepared = PreparedRunContext(
         request=_request(),
         provider=provider,
         planner=planner,
-        composer=composer,
         limits=RunPreparationLimits(max_fragment_bytes=64, max_total_bytes=128),
     )
     token = ManualCancellationToken()
 
     with pytest.raises(RunPreparationFailure, match="byte limit"):
         await prepared.prepare(_state(RunPhase.SELECTING_MEMORY), RunPhase.SELECTING_MEMORY, token)
-    assert planner.memories == [] and composer.memories == []
+    assert planner.memories == []
 
     foreign = RunState("ws_other", "ses_main", "turn_main", "run_main", AgentLineage.root("run_main"))
     with pytest.raises(RunPreparationFailure, match="identity"):
@@ -441,15 +400,14 @@ async def test_prepared_context_fails_closed_before_enrichment_on_oversized_or_f
 
 
 def test_run_preparation_request_rejects_non_boolean_memory_enablement() -> None:
-    values = {
-        "profile_id": "profile_main",
-        "workspace_id": "ws_main",
-        "session_id": "ses_main",
-        "turn_id": "turn_main",
-        "run_id": "run_main",
-        "lineage": AgentLineage.root("run_main"),
-        "query_text": "query",
-        "memory_enabled": "false",
-    }
     with pytest.raises(TypeError, match="boolean"):
-        RunPreparationRequest(**values)
+        RunPreparationRequest(
+            profile_id="profile_main",
+            workspace_id="ws_main",
+            session_id="ses_main",
+            turn_id="turn_main",
+            run_id="run_main",
+            lineage=AgentLineage.root("run_main"),
+            query_text="query",
+            memory_enabled="false",  # type: ignore[arg-type]
+        )

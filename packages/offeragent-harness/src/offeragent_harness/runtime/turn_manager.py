@@ -12,7 +12,8 @@ from .cancellation import CancellationCode, CancellationReason, CancellationScop
 
 
 class SessionRunConflict(RuntimeError, ResourceConflictCause):
-    pass
+    conflict_reason = "session_active_run"
+    conflict_user_message = "the Session already has an active Run"
 
 
 RunFactory = Callable[[CancellationScope], Awaitable[Any]]

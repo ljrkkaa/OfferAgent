@@ -33,7 +33,7 @@ def budget() -> RunBudget:
 
 
 @pytest.mark.asyncio
-async def test_budget_checkpoint_round_trips_after_sqlite_reopen_and_v3_fails_closed(tmp_path: Path) -> None:
+async def test_budget_checkpoint_round_trips_after_sqlite_reopen_and_old_codec_fails_closed(tmp_path: Path) -> None:
     database_path = tmp_path / "budget-state.sqlite"
     ledger = BudgetLedger(budget(), started_at=STARTED)
     await ledger.consume(BudgetDelta(model_rounds=2, tool_calls=4, cost=Decimal("2.1250")))
@@ -73,7 +73,7 @@ async def test_budget_checkpoint_round_trips_after_sqlite_reopen_and_v3_fails_cl
         ).fetchone()
         assert row is not None
         envelope = json.loads(row[0])
-        assert envelope["schemaVersion"] == 4
+        assert envelope["schemaVersion"] == 5
         assert envelope["payload"]["budgetCheckpoint"]["limits"]["maxCost"] == "25.1250"
         assert envelope["payload"]["budgetCheckpoint"]["used"]["cost"] == "2.1250"
         envelope["schemaVersion"] = 3
@@ -82,7 +82,7 @@ async def test_budget_checkpoint_round_trips_after_sqlite_reopen_and_v3_fails_cl
             (json.dumps(envelope), state.run_id),
         )
 
-    with pytest.raises(EntityCodecVersionError, match=r"v4, found .* v3"):
+    with pytest.raises(EntityCodecVersionError, match=r"v5, found .* v3"):
         await SqliteUnitOfWorkFactory(database_path).get_entity("run_states", state.run_id)
 
 

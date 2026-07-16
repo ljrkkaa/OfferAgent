@@ -13,7 +13,7 @@
 - 本地迁移分支：`codex/windows-local-harness`
 - 本地迁移基线提交：`b3ab685b`（`chore: preserve audited server working tree baseline`）
 
-服务器 patch、状态、HEAD、未跟踪清单和校验记录保存在工作区外层的 `snapshots/`。本地应用后的 `git diff HEAD` 与服务器 binary diff 逐字节相同；本地与服务器 `git status --porcelain=v2 -z` 也具有相同 SHA-256。
+迁移时的一次性服务器快照已于 2026-07-16 从外层工作区清理；可追溯代码基线保留在本地迁移基线提交 `b3ab685b` 和归档分支 `archive/khoj-server-baseline-20260713`。审计时，本地应用后的 `git diff HEAD` 与服务器 binary diff 逐字节相同；本地与服务器 `git status --porcelain=v2 -z` 也具有相同 SHA-256。
 
 ## 本地工具链
 

@@ -20,6 +20,7 @@ from offeragent_harness.agent.context_manager import (
     ContextVisibilityPolicy,
 )
 from offeragent_harness.agent.model_planner import (
+    AgentStepCatalog,
     ModelInvalidOutput,
     ModelPlanner,
     ModelProviderFailure,
@@ -27,7 +28,6 @@ from offeragent_harness.agent.model_planner import (
     PlannerModelConfig,
     SchemaRepairFailed,
     SchemaRepairUnavailable,
-    ToolPlanCatalog,
 )
 from offeragent_harness.agent.planner import PlanningAttemptOutcome
 from offeragent_harness.agent.state import RunState
@@ -45,6 +45,7 @@ from offeragent_harness.models import (
 from offeragent_harness.permissions import RiskClass
 from offeragent_harness.ports import ModelGateway, Sensitivity
 from offeragent_harness.sessions import AgentLineage
+from offeragent_harness.skills import skill_tool_definitions
 from offeragent_harness.testing import (
     ControlledBarrier,
     DeterministicIdGenerator,
@@ -152,7 +153,7 @@ def _budget(*, rounds: int = 4) -> BudgetLedger:
 def _planner(
     gateway: ModelGateway,
     *,
-    catalog: ToolPlanCatalog | None = None,
+    catalog: AgentStepCatalog | None = None,
     ids: DeterministicIdGenerator | None = None,
     budget: BudgetLedger | None = None,
     context_manager: ContextManager | None = None,
@@ -160,7 +161,7 @@ def _planner(
     return ModelPlanner(
         gateway=gateway,
         context_manager=context_manager or _context(),
-        catalog=catalog or ToolPlanCatalog((_definition(),), max_calls=3),
+        catalog=catalog or AgentStepCatalog((_definition(),), max_calls=3),
         config=PlannerModelConfig("scripted-model", 512, seed=17),
         clock=ManualClock(NOW),
         ids=ids or DeterministicIdGenerator(),
@@ -241,7 +242,7 @@ def _tool_plan(*, extra_call_fields: Mapping[str, Any] | None = None) -> dict[st
     }
     if extra_call_fields is not None:
         call.update(extra_call_fields)
-    return {"requiresWriteOutcome": False, "calls": [call], "stopReason": None}
+    return {"requiresWriteOutcome": False, "calls": [call], "finalResponse": None}
 
 
 def _events(
@@ -266,7 +267,7 @@ def _frozen_object(value: Mapping[str, Any]) -> FrozenJsonObject:
 
 
 def _invalid(
-    catalog: ToolPlanCatalog,
+    catalog: AgentStepCatalog,
     request: ModelRequest,
     output: Mapping[str, Any],
     *,
@@ -284,16 +285,16 @@ def _invalid(
 def test_catalog_is_canonical_immutable_and_excludes_harness_security_fields() -> None:
     first = _definition("workspace.read", "1")
     second = _definition("workspace.stat", "2")
-    left = ToolPlanCatalog((second, first), max_calls=4)
-    right = ToolPlanCatalog((first, second), max_calls=4)
+    left = AgentStepCatalog((second, first), max_calls=4)
+    right = AgentStepCatalog((first, second), max_calls=4)
 
     assert left.definitions == (first, second)
     assert left.fingerprint == right.fingerprint
-    private_catalog = ToolPlanCatalog(
+    private_catalog = AgentStepCatalog(
         (replace(first, result_sensitivity=ResultSensitivity.PRIVATE),),
         max_calls=4,
     )
-    assert private_catalog.fingerprint != ToolPlanCatalog((first,), max_calls=4).fingerprint
+    assert private_catalog.fingerprint != AgentStepCatalog((first,), max_calls=4).fingerprint
     assert left.schema == right.schema
     schema = cast(dict[str, Any], thaw_json(left.schema))
     variants = cast(list[dict[str, Any]], schema["properties"]["calls"]["items"]["oneOf"])
@@ -315,7 +316,7 @@ def test_catalog_is_canonical_immutable_and_excludes_harness_security_fields() -
 
 
 def test_skill_body_load_is_a_planning_barrier() -> None:
-    catalog = ToolPlanCatalog((_definition("skill"), _definition("glob")), max_calls=3)
+    catalog = AgentStepCatalog((_definition("skill"), _definition("glob")), max_calls=3)
     skill_read = {
         "name": "skill",
         "version": "1",
@@ -329,11 +330,67 @@ def test_skill_body_load_is_a_planning_barrier() -> None:
         "reason": "locate the daily notes after loading the workflow",
     }
 
-    assert catalog.violations({"requiresWriteOutcome": False, "calls": [skill_read], "stopReason": None}) == ()
-    assert catalog.violations({"requiresWriteOutcome": False, "calls": [skill_read, glob], "stopReason": None}) == (
-        "$.calls: a planning step that invokes a Skill may contain only skill calls; "
-        "plan other tools after the Skill body is available",
+    assert catalog.violations({"requiresWriteOutcome": False, "calls": [skill_read], "finalResponse": None}) == ()
+    mixed_violations = catalog.violations(
+        {"requiresWriteOutcome": False, "calls": [skill_read, glob], "finalResponse": None}
     )
+    duplicate_violations = catalog.violations(
+        {"requiresWriteOutcome": False, "calls": [skill_read, skill_read], "finalResponse": None}
+    )
+    assert len(mixed_violations) == len(duplicate_violations) == 1
+    assert "may contain only skill calls" in mixed_violations[0]
+    assert "exactly one Skill" in duplicate_violations[0]
+
+
+def test_only_idempotent_effectful_calls_can_share_a_serial_agent_step() -> None:
+    read = _definition("glob")
+    write = replace(
+        _definition("vault.transaction"),
+        risk=RiskClass.WRITE,
+        side_effect_class=SideEffectClass.WRITE,
+        concurrency_safe=False,
+    )
+    catalog = AgentStepCatalog((read, write), max_calls=3)
+    write_call = {
+        "name": "vault.transaction",
+        "version": "1",
+        "arguments": {"path": "daily/2026-07-13.md"},
+        "reason": "create one Daily after observing the previous result",
+    }
+    plan = {
+        "requiresWriteOutcome": True,
+        "calls": [write_call, write_call],
+        "finalResponse": None,
+    }
+
+    assert catalog.violations(plan) == ()
+
+    unsafe = AgentStepCatalog((read, replace(write, idempotent=False, retryable=False)), max_calls=3)
+    violations = unsafe.violations(plan)
+    assert len(violations) == 1
+    assert "never mix reads with effects or batch a non-idempotent tool" in violations[0]
+
+
+def test_already_activated_skill_cannot_be_loaded_twice_in_one_run() -> None:
+    catalog = AgentStepCatalog(skill_tool_definitions(), max_calls=2)
+    plan = {
+        "requiresWriteOutcome": False,
+        "calls": [
+            {
+                "name": "skill",
+                "version": "1",
+                "arguments": {"name": "daily-study-workflow", "arguments": "2026-07-15"},
+                "reason": "load the matching workflow",
+            }
+        ],
+        "finalResponse": None,
+    }
+
+    assert catalog.violations(plan) == ()
+    assert catalog.violations(
+        plan,
+        context_activations=frozenset({"skill:daily-study-workflow"}),
+    ) == ("$.calls: an already activated Skill cannot be invoked again in the same Run",)
 
 
 @pytest.mark.asyncio
@@ -348,12 +405,11 @@ async def test_valid_plan_generates_all_security_identity_from_harness_ports() -
 
     step = await planner.plan(_state(), ManualCancellationToken())
 
-    assert step.usage is None
     assert len(step.attempts) == 1
     assert step.attempts[0].outcome is PlanningAttemptOutcome.SUCCEEDED
     assert step.attempts[0].usage == USAGE
     assert step.requires_write_outcome is False
-    assert step.stop_reason is None
+    assert step.final_response is None
     assert len(step.calls) == 1
     call = step.calls[0]
     assert call.tool_call_id == "call_0001"
@@ -373,7 +429,7 @@ async def test_valid_plan_generates_all_security_identity_from_harness_ports() -
 
 @pytest.mark.asyncio
 async def test_schema_extra_security_field_gets_exactly_one_explicit_repair() -> None:
-    catalog = ToolPlanCatalog((_definition(),), max_calls=3)
+    catalog = AgentStepCatalog((_definition(),), max_calls=3)
     invalid_plan = _tool_plan(extra_call_fields={"toolCallId": "model-forged-call"})
     builder = _planner(ScriptedModelGateway(()), catalog=catalog)
     first_request = builder.create_request(_state())
@@ -396,7 +452,7 @@ async def test_schema_extra_security_field_gets_exactly_one_explicit_repair() ->
         PlanningAttemptOutcome.SUCCEEDED,
     ]
     assert thaw_json(gateway.requests[1].metadata)["schemaRepairAttempt"] == 1
-    assert gateway.requests[1].messages[-1].name == "offeragent-invalid-tool-plan"
+    assert gateway.requests[1].messages[-1].name == "offeragent-invalid-agent-step"
     assert "model-forged-call" in repr(gateway.requests[1].messages[-1])
     snapshot = await ledger.snapshot(now=NOW)
     assert snapshot.used.model_rounds == 1
@@ -406,7 +462,7 @@ async def test_schema_extra_security_field_gets_exactly_one_explicit_repair() ->
 
 @pytest.mark.asyncio
 async def test_second_invalid_output_fails_without_a_third_model_request() -> None:
-    catalog = ToolPlanCatalog((_definition(),), max_calls=3)
+    catalog = AgentStepCatalog((_definition(),), max_calls=3)
     invalid_plan = _tool_plan(extra_call_fields={"argsHash": "sha256:" + "0" * 64})
     builder = _planner(ScriptedModelGateway(()), catalog=catalog)
     first = builder.create_request(_state())
@@ -433,7 +489,7 @@ async def test_second_invalid_output_fails_without_a_third_model_request() -> No
 
 @pytest.mark.asyncio
 async def test_repair_is_not_started_when_model_round_budget_is_exhausted() -> None:
-    catalog = ToolPlanCatalog((_definition(),), max_calls=3)
+    catalog = AgentStepCatalog((_definition(),), max_calls=3)
     invalid_plan = _tool_plan(extra_call_fields={"deadline": "2099-01-01T00:00:00Z"})
     builder = _planner(ScriptedModelGateway(()), catalog=catalog)
     request = builder.create_request(_state())
@@ -558,7 +614,7 @@ async def test_context_overflow_retry_is_bounded_to_one_attempt() -> None:
 
 @pytest.mark.asyncio
 async def test_length_finish_is_repairable_but_stream_sequence_error_is_not() -> None:
-    catalog = ToolPlanCatalog((_definition(),), max_calls=3)
+    catalog = AgentStepCatalog((_definition(),), max_calls=3)
     builder = _planner(ScriptedModelGateway(()), catalog=catalog)
     first = builder.create_request(_state())
     length_error = _invalid(

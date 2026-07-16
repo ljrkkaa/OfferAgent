@@ -89,7 +89,6 @@ class EventType(str, Enum):
     # Durable Core facts which are required for deterministic recovery and
     # auditing, even though a UI may choose not to render them.
     MODEL_ATTEMPT = "model.attempt"
-    MODEL_COMPOSITION_STARTED = "model.composition.started"
     TOOL_CALLS_ACCEPTED = "tool.calls.accepted"
     WRITE_OUTCOME_REQUIRED = "write.outcome_required"
     RUN_CONTINUATION_REQUIRED = "run.continuation_required"
@@ -436,32 +435,6 @@ class ModelAttemptPayload(WireModel):
         return self
 
 
-class ModelCompositionStartedPayload(WireModel):
-    partial: bool
-    request_id: str | None = Field(default=None, min_length=1, max_length=256)
-    retry_of_request_id: str | None = Field(default=None, min_length=1, max_length=256)
-    projection: Literal["overflow_references"] | None = None
-    projection_hash: Sha256Digest | None = None
-    omitted_context_ids: list[str] = Field(default_factory=list, max_length=4096)
-    reason: Literal["context_overflow"] | None = None
-
-    @model_validator(mode="after")
-    def _retry_identity_is_complete(self) -> ModelCompositionStartedPayload:
-        identity = (
-            self.request_id,
-            self.retry_of_request_id,
-            self.projection,
-            self.projection_hash,
-            self.reason,
-        )
-        if any(value is not None for value in identity) and any(value is None for value in identity):
-            raise ValueError("composition retry projection identity must be complete")
-        if all(value is None for value in identity) and self.omitted_context_ids:
-            raise ValueError("initial composition cannot carry retry omissions")
-        _validate_context_ids(self.omitted_context_ids)
-        return self
-
-
 def _validate_context_ids(values: list[str]) -> None:
     if len(values) != len(set(values)) or any(not value or len(value) > 256 or "\x00" in value for value in values):
         raise ValueError("omittedContextIds must be unique bounded identifiers")
@@ -562,7 +535,6 @@ _EventPayloadUnion = (
     | TurnInterruptedPayload
     | RuntimeWarningPayload
     | ModelAttemptPayload
-    | ModelCompositionStartedPayload
     | ToolCallsAcceptedPayload
     | WriteOutcomeRequiredPayload
     | RunContinuationRequiredPayload
@@ -607,7 +579,6 @@ _EVENT_REGISTRY: dict[EventType, type[WireModel]] = {
     EventType.TURN_FAILED: TurnFailedPayload,
     EventType.RUNTIME_WARNING: RuntimeWarningPayload,
     EventType.MODEL_ATTEMPT: ModelAttemptPayload,
-    EventType.MODEL_COMPOSITION_STARTED: ModelCompositionStartedPayload,
     EventType.TOOL_CALLS_ACCEPTED: ToolCallsAcceptedPayload,
     EventType.WRITE_OUTCOME_REQUIRED: WriteOutcomeRequiredPayload,
     EventType.RUN_CONTINUATION_REQUIRED: RunContinuationRequiredPayload,

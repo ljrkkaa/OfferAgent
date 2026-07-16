@@ -229,6 +229,7 @@ def _success(call: ToolCall, data: Mapping[str, Any], refs: tuple[str, ...], sum
         after_state=None,
         error=None,
         source_references=(),
+        context_activations=(f"skill:{data['name']}",),
     )
 
 

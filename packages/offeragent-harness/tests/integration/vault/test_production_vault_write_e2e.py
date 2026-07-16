@@ -127,7 +127,7 @@ class _PlannedTurn:
 
 
 class _VaultWriteFakeModel:
-    """Emit one Harness-owned public ToolPlan, then a terminal planning step."""
+    """Emit one Harness-owned AgentStep, then a terminal response step."""
 
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
@@ -176,14 +176,14 @@ class _VaultWriteFakeModel:
                             "reason": "执行用户明确要求的单文件 Vault 修改",
                         }
                     ],
-                    "stopReason": None,
+                    "finalResponse": None,
                 }
                 self._planning_step = 1
             else:
                 output = {
                     "requiresWriteOutcome": active.requires_write_outcome,
                     "calls": [],
-                    "stopReason": "已依据真实工具结果结束本轮",
+                    "finalResponse": "本地 Vault 事务结果已核验。",
                 }
                 self._active = None
                 self._planning_step = 0
@@ -193,9 +193,6 @@ class _VaultWriteFakeModel:
                 ModelEventKind.STRUCTURED_OUTPUT,
                 data=cast(Mapping[str, Any], output),
             )
-            sequence = 3
-        elif request.purpose is ModelPurpose.COMPOSING:
-            yield ModelEvent(request.request_id, 2, ModelEventKind.TEXT_DELTA, text="本地 Vault 事务结果已核验。")
             sequence = 3
         elif request.purpose is ModelPurpose.GROUNDING:
             sequence = 2

@@ -702,11 +702,11 @@ def _validate_state(
                     "BudgetCheckpoint used 计数与 RunState model/tool 计数不一致。",
                 )
             )
-        if state.pending.tool_call_ids and checkpoint.reserved != BudgetDelta(model_rounds=1):
+        if checkpoint.reserved != BudgetDelta():
             issues.append(
                 _interrupt(
-                    "composer_reservation_missing",
-                    "待恢复 ToolCall 的 reservation 必须只包含一个 canonical Composer model round。",
+                    "budget_checkpoint_reservation_present",
+                    "Root Run 恢复点包含未结算预算预留, 其执行结果无法安全推断。",
                 )
             )
         if (

@@ -918,6 +918,13 @@ def trusted_worker_environment() -> dict[str, str]:
     }
 
 
+def current_user_profile_directory() -> Path:
+    """Return the current Windows user's canonical Profile Known Folder."""
+
+    _require_windows()
+    return _known_folder(_FOLDERID_PROFILE)
+
+
 def self_test_runtime_sandbox_root(nonce: str) -> Path:
     """Return the non-production state root reserved for one release self-test.
 
@@ -1091,6 +1098,7 @@ __all__ = [
     "WindowsProcessError",
     "WindowsWorkerJob",
     "WindowsWorkerProcessBackend",
+    "current_user_profile_directory",
     "fixed_worker_argv",
     "minimal_worker_environment",
     "self_test_runtime_sandbox_root",

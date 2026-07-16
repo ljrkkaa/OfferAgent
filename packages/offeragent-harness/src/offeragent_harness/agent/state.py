@@ -30,7 +30,7 @@ class RunPhase(str, Enum):
     AWAITING_APPROVAL = "awaiting_approval"
     EXECUTING_TOOLS = "executing_tools"
     RECORDING_RESULTS = "recording_results"
-    COMPOSING = "composing"
+    RESPONDING = "responding"
     PERSISTING = "persisting"
     CANCELLING = "cancelling"
     COMPLETED = "completed"
@@ -52,7 +52,7 @@ ALLOWED_PHASE_TRANSITIONS: dict[RunPhase, frozenset[RunPhase]] = {
         {RunPhase.PLANNING, RunPhase.CANCELLING, RunPhase.FAILED, RunPhase.INTERRUPTED}
     ),
     RunPhase.PLANNING: frozenset(
-        {RunPhase.VALIDATING_CALLS, RunPhase.COMPOSING, RunPhase.CANCELLING, RunPhase.FAILED, RunPhase.INTERRUPTED}
+        {RunPhase.VALIDATING_CALLS, RunPhase.RESPONDING, RunPhase.CANCELLING, RunPhase.FAILED, RunPhase.INTERRUPTED}
     ),
     RunPhase.VALIDATING_CALLS: frozenset(
         {
@@ -101,7 +101,7 @@ ALLOWED_PHASE_TRANSITIONS: dict[RunPhase, frozenset[RunPhase]] = {
             RunPhase.INTERRUPTED,
         }
     ),
-    RunPhase.COMPOSING: frozenset({RunPhase.PERSISTING, RunPhase.CANCELLING, RunPhase.FAILED, RunPhase.INTERRUPTED}),
+    RunPhase.RESPONDING: frozenset({RunPhase.PERSISTING, RunPhase.CANCELLING, RunPhase.FAILED, RunPhase.INTERRUPTED}),
     RunPhase.PERSISTING: frozenset({RunPhase.COMPLETED, RunPhase.INTERRUPTED, RunPhase.FAILED}),
     RunPhase.CANCELLING: frozenset({RunPhase.CANCELLED, RunPhase.INTERRUPTED}),
     RunPhase.COMPLETED: frozenset(),

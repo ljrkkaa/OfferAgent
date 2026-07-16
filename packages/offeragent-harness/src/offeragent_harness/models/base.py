@@ -22,7 +22,7 @@ class ModelRole(str, Enum):
 
 class ModelPurpose(str, Enum):
     PLANNING = "planning"
-    COMPOSING = "composing"
+    RESPONDING = "responding"
     COMPACTION = "compaction"
     GROUNDING = "grounding"
 
@@ -101,7 +101,7 @@ class ModelRequest:
     """The only request shape visible to a model provider.
 
     It intentionally has no cwd, tool executor, session store, approval, Vault or
-    subagent handle.  Structured tool plans are requested through ``output_schema``.
+    subagent handle. Structured Agent steps are requested through ``output_schema``.
     """
 
     request_id: str

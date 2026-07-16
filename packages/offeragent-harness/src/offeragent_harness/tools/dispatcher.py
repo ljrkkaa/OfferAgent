@@ -78,6 +78,7 @@ class ToolDispatcher:
                 side_effect_possible=True,
             ) from error
 
+
 __all__ = [
     "DispatcherUnavailable",
     "ToolDispatchError",

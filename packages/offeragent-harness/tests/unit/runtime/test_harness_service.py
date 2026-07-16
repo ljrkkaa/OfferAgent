@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -9,7 +9,6 @@ from decimal import Decimal
 import pytest
 
 from offeragent_harness.agent import BudgetLedger, RunBudget
-from offeragent_harness.agent.composer import CompositionEvent
 from offeragent_harness.agent.context_manager import ContextFragment, ContextLayer
 from offeragent_harness.agent.loop import AgentLoopFailure, ToolExecution
 from offeragent_harness.agent.planner import Planner, PlanningAttempt, PlanningAttemptOutcome, PlanningStep
@@ -82,21 +81,6 @@ class StubbornPlanner:
         raise AssertionError("unreachable")
 
 
-class Composer:
-    def stream(
-        self,
-        state: RunState,
-        *,
-        partial: bool,
-        cancellation: CancellationToken,
-    ) -> AsyncIterator[CompositionEvent]:
-        async def generate() -> AsyncIterator[CompositionEvent]:
-            cancellation.checkpoint()
-            yield CompositionEvent(text_delta="answer")
-
-        return generate()
-
-
 class NoToolKernel:
     async def execute_batch(
         self,
@@ -126,7 +110,6 @@ class Components:
         return RunComponents(
             planner_factory=self._planner,
             tool_kernel_factory=self._tool_kernel,
-            composer=Composer(),
             budget=RunBudget(
                 max_model_rounds=4,
                 max_tool_calls=4,
@@ -190,7 +173,7 @@ class DeferredComponents(Components):
         prepared: PreparedRunComponents,
     ) -> RunComponents:
         assert prepared.token is self.token
-        return RunComponents(self._planner, self._tool_kernel, Composer(), self.budget_root(command, state))
+        return RunComponents(self._planner, self._tool_kernel, self.budget_root(command, state))
 
     def budget_child(self, execution: object, state: RunState) -> RunBudget:
         del execution, state
@@ -312,7 +295,7 @@ async def test_session_and_turn_idempotency_share_one_authoritative_run() -> Non
     assert stored_run.termination_reason is TerminationReason.COMPLETED
     stored_state = await harness.get_run_state(receipt.run_id)
     assert stored_state.budget_checkpoint is not None
-    assert stored_state.budget_checkpoint.used.model_rounds == 2
+    assert stored_state.budget_checkpoint.used.model_rounds == 1
     assert stored_state.budget_checkpoint.reserved.model_rounds == 0
     assert stored_state.budget_checkpoint.started_at == datetime(2026, 1, 1, tzinfo=timezone.utc)
     assert components.planner_budgets == components.tool_kernel_budgets
@@ -700,21 +683,9 @@ class _VaultMemoryPlanner(StopPlanner):
         self.memories.extend(fragments)
 
 
-class _VaultMemoryComposer(Composer):
-    def __init__(self) -> None:
-        self.memories: list[ContextFragment] = []
-
-    def add_memory_context(self, fragments: Sequence[ContextFragment]) -> None:
-        self.memories.extend(fragments)
-
-
 class _VaultMemoryComponents(Components):
-    def __init__(self, planner: _VaultMemoryPlanner, composer: _VaultMemoryComposer) -> None:
+    def __init__(self, planner: _VaultMemoryPlanner) -> None:
         super().__init__(planner)
-        self.composer = composer
-
-    def build(self, command: StartTurnCommand, state: RunState) -> RunComponents:
-        return replace(super().build(command, state), composer=self.composer)
 
 
 class _RunContextProvider:
@@ -754,13 +725,12 @@ def _vault_memory_enabled_command(session_id: str) -> StartTurnCommand:
 
 
 @pytest.mark.asyncio
-async def test_vault_memory_preparation_enters_planner_and_composer_without_touching_tool_kernel() -> None:
+async def test_vault_memory_preparation_enters_agent_context_without_touching_tool_kernel() -> None:
     clock = ManualClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
     manager = TurnManager()
     factory = InMemoryUnitOfWorkFactory()
     planner = _VaultMemoryPlanner()
-    composer = _VaultMemoryComposer()
-    components = _VaultMemoryComponents(planner, composer)
+    components = _VaultMemoryComponents(planner)
     provider = _RunContextProvider()
     harness = HarnessService(
         unit_of_work=factory,
@@ -779,7 +749,6 @@ async def test_vault_memory_preparation_enters_planner_and_composer_without_touc
     assert (await active.task).phase is RunPhase.COMPLETED
 
     assert planner.memories == [provider.fragment]
-    assert composer.memories == [provider.fragment]
     assert [phase for _, phase, _ in provider.calls] == [RunPhase.LOADING_CONTEXT, RunPhase.SELECTING_MEMORY]
     request = provider.calls[0][0]
     assert request.workspace_id == "ws_main" and request.session_id == session.session_id
@@ -800,7 +769,7 @@ async def test_vault_memory_preparation_failure_is_a_typed_durable_terminal_fail
         event_sink=RecordingEventSink(),
         clock=clock,
         ids=DeterministicIdGenerator(),
-        components=_VaultMemoryComponents(_VaultMemoryPlanner(), _VaultMemoryComposer()),
+        components=_VaultMemoryComponents(_VaultMemoryPlanner()),
         turn_manager=manager,
         run_context_provider=provider,
     )

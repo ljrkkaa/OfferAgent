@@ -59,6 +59,7 @@ def tool_result_to_value(result: ToolResult) -> dict[str, Any]:
         "artifactIds": list(result.artifact_ids),
         "sourceRefs": list(result.source_refs),
         "sourceReferences": [thaw_json(reference) for reference in result.source_references],
+        "contextActivations": list(result.context_activations),
         "sideEffects": [
             {
                 "kind": effect.kind.value,
@@ -129,6 +130,7 @@ def tool_result_from_value(raw: Any) -> ToolResult:
         after_state=raw.get("afterState"),
         error=error,
         source_references=tuple(raw.get("sourceReferences", ())),
+        context_activations=tuple(raw["contextActivations"]),
     )
 
 

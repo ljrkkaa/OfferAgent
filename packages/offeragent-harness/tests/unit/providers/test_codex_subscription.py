@@ -10,7 +10,7 @@ from types import MappingProxyType
 import httpx
 import pytest
 
-from offeragent_harness.agent.model_planner import ToolPlanCatalog
+from offeragent_harness.agent.model_planner import AgentStepCatalog
 from offeragent_harness.config import ModelProvider, ModelSettings
 from offeragent_harness.models import (
     ModelContentBlock,
@@ -110,7 +110,7 @@ def _request(*, blocks: tuple[ModelContentBlock, ...] | None = None) -> ModelReq
     return ModelRequest(
         request_id="req_subscription",
         model="gpt-5.6-luna",
-        purpose=ModelPurpose.COMPOSING,
+        purpose=ModelPurpose.RESPONDING,
         messages=(ModelMessage(ModelRole.USER, blocks or (ModelContentBlock.text("Reply OK"),)),),
         output_mode=ModelOutputMode.TEXT,
         output_schema=None,
@@ -253,13 +253,13 @@ async def test_subscription_uses_fixed_endpoint_headers_and_dialect_without_temp
 @pytest.mark.asyncio
 async def test_subscription_projects_production_tool_plan_to_supported_strict_schema_subset() -> None:
     captured: dict[str, object] = {}
-    output = '{"requiresWriteOutcome":false,"calls":[],"stopReason":"no tools needed"}'
+    output = '{"requiresWriteOutcome":false,"calls":[],"finalResponse":"no tools needed"}'
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["body"] = json.loads(request.content)
         return httpx.Response(200, content=_completed(output), request=request)
 
-    catalog = ToolPlanCatalog(
+    catalog = AgentStepCatalog(
         (*code_tool_definitions(), *subagent_tool_definitions()),
         max_calls=32,
     )
@@ -284,7 +284,7 @@ async def test_subscription_projects_production_tool_plan_to_supported_strict_sc
     assert thaw_json(structured[0].data) == {
         "requiresWriteOutcome": False,
         "calls": [],
-        "stopReason": "no tools needed",
+        "finalResponse": "no tools needed",
     }
     body = captured["body"]
     assert isinstance(body, dict)

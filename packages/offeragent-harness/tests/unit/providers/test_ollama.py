@@ -45,7 +45,7 @@ def _request(mode: ModelOutputMode = ModelOutputMode.TEXT) -> ModelRequest:
     return ModelRequest(
         request_id="req_ollama",
         model="qwen-test:latest",
-        purpose=ModelPurpose.PLANNING if mode is ModelOutputMode.JSON else ModelPurpose.COMPOSING,
+        purpose=ModelPurpose.PLANNING if mode is ModelOutputMode.JSON else ModelPurpose.RESPONDING,
         messages=(
             ModelMessage(ModelRole.SYSTEM, (ModelContentBlock.text("system"),)),
             ModelMessage(ModelRole.USER, (ModelContentBlock.text("user"),)),

@@ -1274,6 +1274,7 @@ _COMMAND_SPECS = [
     _spec("shutdown", ShutdownParams, ShutdownResult),
 ]
 
+
 def _build_registry(specs: list[CommandSpec]) -> Mapping[str, CommandSpec]:
     registry: dict[str, CommandSpec] = {}
     for item in specs:

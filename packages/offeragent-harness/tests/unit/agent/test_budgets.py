@@ -72,10 +72,10 @@ async def test_restart_restores_usage_and_adopts_each_persisted_reservation_once
         reserved=BudgetDelta(model_rounds=1),
     )
 
-    composer = await restored.adopt_reservation(BudgetDelta(model_rounds=1))
+    model_round = await restored.adopt_reservation(BudgetDelta(model_rounds=1))
     with pytest.raises(ValueError, match="does not contain"):
         await restored.adopt_reservation(BudgetDelta(model_rounds=1))
-    await composer.consume(BudgetDelta(model_rounds=1))
+    await model_round.consume(BudgetDelta(model_rounds=1))
 
     snapshot = await restored.snapshot(now=started + timedelta(seconds=7))
     assert snapshot.used == BudgetDelta(model_rounds=3, tool_calls=3)

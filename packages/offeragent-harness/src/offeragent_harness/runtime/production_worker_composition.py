@@ -35,8 +35,7 @@ from offeragent_harness.agent.context_manager import (
     ContextVisibilityPolicy,
 )
 from offeragent_harness.agent.loop import ToolKernel
-from offeragent_harness.agent.model_composer import ComposerModelConfig, ModelComposer
-from offeragent_harness.agent.model_planner import ModelPlanner, PlannerModelConfig, ToolPlanCatalog
+from offeragent_harness.agent.model_planner import AgentStepCatalog, ModelPlanner, PlannerModelConfig
 from offeragent_harness.agent.state import RunState
 from offeragent_harness.app import ApplicationIdentity, HarnessApplication
 from offeragent_harness.config import ConfigPatch, ConfigScope, HarnessConfig, ModelProvider, ModelSettings
@@ -191,7 +190,7 @@ from offeragent_harness.runtime.windows_named_pipe import (
     DpapiCurrentUserProtector,
     Win32NamedPipeListener,
 )
-from offeragent_harness.runtime.windows_process import WindowsAuthenticodeVerifier
+from offeragent_harness.runtime.windows_process import WindowsAuthenticodeVerifier, current_user_profile_directory
 from offeragent_harness.runtime.windows_process_supervisor import (
     PinnedProcessExecutableVerifier,
     ProcessReleaseManifestTrust,
@@ -1115,12 +1114,23 @@ class ProductionRunComponentsFactory(
         context = ContextManager(
             system_rules=(
                 "你是 OfferAgent。只能依据 Harness 提供的上下文和工具结果工作。",
+                "每个 AgentStep 只能提交本地 ToolCall 或 finalResponse, 两者不得同时存在。",
+                "同一 AgentStep 的多调用只能全是相互独立且 concurrency-safe 的只读 ToolCall, "
+                "或全是可按序执行的幂等副作用 ToolCall; 不得混合读写或批量提交非幂等工具。",
+                "仅在证据充分且没有未完成义务时提交 finalResponse。",
+                "run_snapshot.time 是本轮唯一权威日期与时区来源。",
+                "不得从模型知识、文件时间或用户未明确提供的信息猜测当前日期。",
+                "Skill 目录只提供元数据。任务匹配某个 Skill 描述时先调用 skill 读取正文。",
+                "run_snapshot.activeContexts 中已激活的 Skill 不得重复调用。",
+                "工具结果会进入下一 AgentStep。读取、写入或校验未真实完成时不得用 finalResponse 替代工具动作。",
                 "不得声称未执行、未审批、冲突或结果未知的写操作已经完成。",
-                "文件、Shell、Memory 与 Subagent 只能经 Tool Kernel 使用。",
+                "除固定、受限加载的 Vault MEMORY.md 外, 额外记忆文件只能通过 Glob、Grep 和 Read 按需读取。",
+                "所有其他文件操作、Shell 与 Subagent 只能经 Tool Kernel 使用。",
             ),
             inputs=inputs,
             visibility=visibility,
             budget=ContextBudget.generous_default(),
+            local_timezone=self._clock.utcnow().astimezone().tzinfo,
         )
         permission = permission_override or _effective_permission(config, effective_config)
         workspace_trusted = effective_config.policy.workspace_trusted
@@ -1345,16 +1355,10 @@ class ProductionRunComponentsFactory(
             )
             return bound_kernel
 
-        catalog = ToolPlanCatalog(definitions, max_calls=max(1, budget.max_tool_calls))
+        catalog = AgentStepCatalog(definitions, max_calls=max(1, budget.max_tool_calls))
         planner_config = PlannerModelConfig(
             model=selected_model,
             max_output_tokens=min(16_384, budget.max_output_tokens),
-            reasoning_effort=config.reasoning_effort.value,
-            temperature=settings.temperature,
-        )
-        composer_config = ComposerModelConfig(
-            model=selected_model,
-            max_output_tokens=min(32_768, budget.max_output_tokens),
             reasoning_effort=config.reasoning_effort.value,
             temperature=settings.temperature,
         )
@@ -1369,12 +1373,6 @@ class ProductionRunComponentsFactory(
                 budget=active,
             ),
             tool_kernel_factory=tool_kernel,
-            composer=ModelComposer(
-                gateway=gateway,
-                context_manager=context,
-                config=composer_config,
-                ids=self._ids,
-            ),
             budget=budget,
             hook_binding_factory=(
                 hook_binding if prepared_capabilities is not None and prepared_capabilities.hooks is not None else None
@@ -3173,7 +3171,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
         subagent_definitions = subagent_tool_definitions()
         late_subagent = _LateToolExecutor()
         late_parent_authorities = _LateParentRunAuthorityProvider()
-        configured_user_home = self._overrides.skill_user_home or Path.home()
+        configured_user_home = self._overrides.skill_user_home or current_user_profile_directory()
         skill_runtime_root = self._overrides.skill_runtime_root or Path(sys.executable).resolve().parent
         skill_factory = ProductionSkillBundleFactory(
             workspace_id=workspace_id,

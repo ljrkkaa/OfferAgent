@@ -42,6 +42,7 @@ from offeragent_harness.tools.kernel import UnifiedToolKernel
 from offeragent_harness.tools.registry import ToolRegistry
 from offeragent_harness.tools.scheduler import ToolScheduler
 from offeragent_harness.vault import (
+    ABSENT_HASH,
     VaultTransactionCoordinator,
     content_hash,
     vault_transaction_definition,
@@ -108,6 +109,34 @@ def _call(
                 "path": "note.md",
                 "content": "after\n",
                 "expectedHash": expected_hash,
+            }
+        ]
+    }
+    return ToolCall(
+        tool_call_id=call_id,
+        run_id="run_1",
+        workspace_id="ws_test",
+        name=definition.name,
+        version=definition.version,
+        arguments=arguments,
+        args_hash=canonical_json_sha256(arguments),
+        idempotency_key=idempotency_key,
+        deadline=None,
+        lineage=AgentLineage.root("run_1"),
+        definition_fingerprint=definition.fingerprint,
+        result_sensitivity=definition.result_sensitivity,
+    )
+
+
+def _create_call(path: str, *, call_id: str, idempotency_key: str) -> ToolCall:
+    definition = vault_transaction_definition()
+    arguments = {
+        "operations": [
+            {
+                "op": "create",
+                "path": path,
+                "content": f"# {path}\n",
+                "expectedHash": ABSENT_HASH,
             }
         ]
     }
@@ -207,6 +236,49 @@ async def test_kernel_approval_uses_real_diff_and_sqlite_journal_replays_exactly
     snapshot = await budget.snapshot(now=NOW)
     assert snapshot.used.artifact_bytes == len(diff)
     assert snapshot.reserved.artifact_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_effectful_batch_preflights_each_call_after_the_previous_commit(tmp_path: Path) -> None:
+    approval = RecordingApproval()
+    kernel, _store, vault, _budget_ledger = _kernel(tmp_path, approval)
+    calls = (
+        _create_call("daily/2026-07-13.md", call_id="call_create_13", idempotency_key="idem_create_13"),
+        _create_call("daily/2026-07-14.md", call_id="call_create_14", idempotency_key="idem_create_14"),
+    )
+
+    results = await kernel.execute_batch(calls, ManualCancellationToken())
+
+    assert [item.result.status for item in results] == [
+        ToolResultStatus.SUCCEEDED,
+        ToolResultStatus.SUCCEEDED,
+    ]
+    assert (vault / "daily" / "2026-07-13.md").is_file()
+    assert (vault / "daily" / "2026-07-14.md").is_file()
+    assert len(approval.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_effectful_batch_stops_after_first_unsuccessful_call(tmp_path: Path) -> None:
+    approval = RecordingApproval()
+    kernel, _store, vault, _budget_ledger = _kernel(tmp_path, approval)
+    first_path = vault / "daily" / "2026-07-13.md"
+    first_path.parent.mkdir()
+    first_path.write_text("existing\n", encoding="utf-8")
+    calls = (
+        _create_call("daily/2026-07-13.md", call_id="call_create_13", idempotency_key="idem_create_13"),
+        _create_call("daily/2026-07-14.md", call_id="call_create_14", idempotency_key="idem_create_14"),
+    )
+
+    results = await kernel.execute_batch(calls, ManualCancellationToken())
+
+    assert [item.result.status for item in results] == [
+        ToolResultStatus.CONFLICTED,
+        ToolResultStatus.CANCELLED,
+    ]
+    assert results[1].result.error is not None
+    assert results[1].result.error.code == "prior_serial_call_failed"
+    assert not (vault / "daily" / "2026-07-14.md").exists()
 
 
 @pytest.mark.asyncio

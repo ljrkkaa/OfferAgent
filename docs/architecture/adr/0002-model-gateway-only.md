@@ -7,9 +7,10 @@
 DeepSeek/Codex/OpenAI/兼容/本地模型只实现 `ModelGateway`。Provider 接收规范化请求并产生结构化
 `ModelEvent`；它不知道 cwd、Vault、工具、Session、审批、Memory 或 Subagent。
 
-DeepSeek 使用固定的官方 Chat Completions 推理端点。Adapter 不发送 Provider 原生工具；JSON 模式只把
-Harness 的 canonical JSON Schema 作为受信 system 约束发送，并在本机用原始 Draft 2020-12 Schema
-再次严格校验。DeepSeek 流中的原始 `reasoning_content` 是思维链，不是摘要，必须在 Provider 边界
+DeepSeek 使用固定的官方 Chat Completions 推理端点。Adapter 不发送 Provider 原生工具；JSON 模式把
+Harness 的 canonical JSON Schema 作为受信 system 约束发送。Provider Adapter 只负责严格 JSON object
+与流协议，唯一的 AgentStep Catalog 在本机用原始 Draft 2020-12 Schema 校验并执行一次有界修复。
+DeepSeek 流中的原始 `reasoning_content` 是思维链，不是摘要，必须在 Provider 边界
 丢弃；只允许 reasoning token 计数进入 `ModelUsage`。
 
 ## 后果

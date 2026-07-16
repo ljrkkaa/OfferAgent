@@ -14,7 +14,6 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import httpx
-from jsonschema import Draft202012Validator
 
 from offeragent_harness.models import (
     ModelError,
@@ -146,7 +145,10 @@ class _DeepSeekAccumulator:
         if not isinstance(delta, Mapping) or any(not isinstance(key, str) for key in delta):
             raise ModelProviderProtocolError("DeepSeek choice delta must be an object")
         if delta.get("tool_calls") not in (None, []) or delta.get("function_call") is not None:
-            raise ModelProviderProtocolError("DeepSeek attempted an unrequested remote tool call")
+            raise ModelProviderProtocolError(
+                "DeepSeek attempted an unrequested remote tool call",
+                reason="unrequested_remote_tool_call",
+            )
         role = delta.get("role")
         if role not in {None, "assistant"}:
             raise ModelProviderProtocolError("DeepSeek delta role is invalid")
@@ -161,7 +163,10 @@ class _DeepSeekAccumulator:
             if self._finish_reason is not None:
                 raise ModelProviderProtocolError("DeepSeek emitted duplicate finish reasons")
             if finish == "tool_calls":
-                raise ModelProviderProtocolError("DeepSeek attempted an unrequested remote tool call")
+                raise ModelProviderProtocolError(
+                    "DeepSeek attempted an unrequested remote tool call",
+                    reason="unrequested_remote_tool_call",
+                )
             self._finish_reason = finish
 
         content = delta.get("content")
@@ -223,7 +228,10 @@ class _DeepSeekAccumulator:
 
     def _complete(self) -> tuple[_SemanticEvent, ...]:
         if self._response_id is None or self._finish_reason is None or self._usage is None:
-            raise ModelProviderProtocolError("DeepSeek stream ended without identity, finish reason, or usage")
+            raise ModelProviderProtocolError(
+                "DeepSeek stream ended without identity, finish reason, or usage",
+                reason="terminal_metadata_missing",
+            )
         self.terminal = True
         finish = self._finish_reason
         events: list[_SemanticEvent] = []
@@ -258,16 +266,22 @@ class _DeepSeekAccumulator:
     def _structured_output(self) -> _SemanticEvent:
         text = "".join(self._output)
         if not text:
-            raise ModelProviderProtocolError("DeepSeek returned empty structured output")
+            raise ModelProviderProtocolError(
+                "DeepSeek returned empty structured output",
+                reason="structured_output_empty",
+            )
         try:
             value = json.loads(text, parse_constant=_reject_json_constant)
         except (json.JSONDecodeError, ValueError) as error:
-            raise ModelProviderProtocolError("DeepSeek structured output is not strict JSON") from error
+            raise ModelProviderProtocolError(
+                "DeepSeek structured output is not strict JSON",
+                reason="structured_output_invalid_json",
+            ) from error
         if not isinstance(value, dict):
-            raise ModelProviderProtocolError("DeepSeek structured output must be a JSON object")
-        assert self.request.output_schema is not None
-        if any(Draft202012Validator(self.request.output_schema).iter_errors(value)):
-            raise ModelProviderProtocolError("DeepSeek structured output does not match its requested schema")
+            raise ModelProviderProtocolError(
+                "DeepSeek structured output must be a JSON object",
+                reason="structured_output_not_object",
+            )
         return _SemanticEvent(ModelEventKind.STRUCTURED_OUTPUT, data=value)
 
 

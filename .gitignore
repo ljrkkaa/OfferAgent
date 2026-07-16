@@ -36,6 +36,8 @@ docs/
 !docs/
 docs/*
 !docs/WINDOWS_LOCAL_BASELINE.md
+!docs/GENERAL_ENGINEERING_REFACTOR_CONSTRAINTS.md
+!docs/personal-local-plugin-install.md
 !docs/architecture/
 !docs/architecture/**
 

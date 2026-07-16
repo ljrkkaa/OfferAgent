@@ -12,7 +12,6 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from jsonschema import Draft202012Validator
 
 from offeragent_harness.models import (
     ModelContentBlock,
@@ -391,9 +390,6 @@ class _OllamaAccumulator:
                 raise ModelProviderProtocolError("Ollama structured output is not strict JSON") from error
             if not isinstance(parsed, dict):
                 raise ModelProviderProtocolError("Ollama structured output must be a JSON object")
-            assert self._request.output_schema is not None
-            if list(Draft202012Validator(self._request.output_schema).iter_errors(parsed)):
-                raise ModelProviderProtocolError("Ollama structured output does not match its schema")
             events.append(ModelEvent(request_id, sequence, ModelEventKind.STRUCTURED_OUTPUT, data=parsed))
             sequence += 1
         usage = ModelUsage(

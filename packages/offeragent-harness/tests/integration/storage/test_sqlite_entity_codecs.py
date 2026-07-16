@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -13,7 +13,6 @@ import pytest
 
 from offeragent_harness.adapters.sqlite_stores import SqliteEntityStore, SqliteUnitOfWorkFactory
 from offeragent_harness.agent import RunBudget
-from offeragent_harness.agent.composer import CompositionEvent
 from offeragent_harness.agent.loop import ToolExecution
 from offeragent_harness.agent.planner import Planner, PlanningAttempt, PlanningAttemptOutcome, PlanningStep
 from offeragent_harness.agent.state import (
@@ -369,21 +368,6 @@ class _StopPlanner:
         )
 
 
-class _Composer:
-    def stream(
-        self,
-        state: RunState,
-        *,
-        partial: bool,
-        cancellation: CancellationToken,
-    ) -> AsyncIterator[CompositionEvent]:
-        async def generate() -> AsyncIterator[CompositionEvent]:
-            cancellation.checkpoint()
-            yield CompositionEvent(text_delta="answer")
-
-        return generate()
-
-
 class _NoToolKernel:
     async def execute_batch(
         self,
@@ -402,7 +386,6 @@ class _Components:
         return RunComponents(
             planner_factory=lambda budget: self.planner,
             tool_kernel_factory=lambda budget: _NoToolKernel(),
-            composer=_Composer(),
             budget=RunBudget(
                 max_model_rounds=4,
                 max_tool_calls=4,
@@ -468,7 +451,7 @@ async def test_real_harness_turn_completes_and_recovers_exactly_after_reopen(tmp
     events_before_reopen = await first.replay_events(turn_receipt.run_id)
 
     assert completed_state.phase is RunPhase.COMPLETED
-    assert completed_state.assistant_text == "answer"
+    assert completed_state.assistant_text == "done"
     assert completed_turn.status is TurnStatus.COMPLETED
     assert completed_run.status is RunStatus.COMPLETED
     assert completed_run.termination_reason is TerminationReason.COMPLETED

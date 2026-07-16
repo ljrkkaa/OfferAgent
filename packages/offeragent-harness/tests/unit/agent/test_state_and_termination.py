@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from offeragent_harness.agent.state import PendingWork, RunState
-from offeragent_harness.agent.termination import StopReason, evaluate_termination
+from offeragent_harness.agent.termination import evaluate_response_readiness
 from offeragent_harness.foundation import canonical_json_sha256
 from offeragent_harness.permissions import RiskClass
 from offeragent_harness.sessions import AgentLineage
@@ -111,9 +111,7 @@ def record(current: RunState, tool_definition: ToolDefinition, status: ToolResul
 
 def test_write_obligation_requires_a_successful_write_tool_result() -> None:
     current = state().require_write_outcome("canonical plan requires a write outcome")
-    assert evaluate_termination(current, reason=StopReason.MODEL_FINISHED).blockers == (
-        "write_outcome_required",
-    )
+    assert evaluate_response_readiness(current).blockers == ("write_outcome_required",)
 
     current = record(current, definition(SideEffectClass.READ), ToolResultStatus.SUCCEEDED)
     assert not current.write_obligation.satisfied
@@ -123,7 +121,7 @@ def test_write_obligation_requires_a_successful_write_tool_result() -> None:
 
     current = record(current, definition(SideEffectClass.WRITE), ToolResultStatus.SUCCEEDED)
     assert current.write_obligation.satisfied
-    assert evaluate_termination(current, reason=StopReason.MODEL_FINISHED).can_compose
+    assert evaluate_response_readiness(current).can_respond
 
 
 def test_tool_result_binding_is_exactly_once_and_call_ids_cannot_be_reused() -> None:
@@ -143,10 +141,10 @@ def test_tool_result_binding_is_exactly_once_and_call_ids_cannot_be_reused() -> 
         completed.accept_tool_calls((tool_call,))
 
 
-def test_pending_work_blocks_composer_without_a_write_obligation() -> None:
+def test_pending_work_blocks_final_response_without_a_write_obligation() -> None:
     current = replace(state(), pending=PendingWork(child_run_ids=frozenset({"child"})))
-    decision = evaluate_termination(current, reason=StopReason.MODEL_FINISHED)
-    assert not decision.can_compose
+    decision = evaluate_response_readiness(current)
+    assert not decision.can_respond
     assert decision.blockers == ("child_runs_pending",)
 
 
@@ -157,6 +155,6 @@ def test_unknown_write_outcome_requires_manual_review_and_does_not_satisfy_the_o
         ToolResultStatus.UNKNOWN_OUTCOME,
     )
     assert current.write_obligation.requires_manual_review
-    decision = evaluate_termination(current, reason=StopReason.MODEL_FINISHED)
-    assert not decision.can_compose
+    decision = evaluate_response_readiness(current)
+    assert not decision.can_respond
     assert decision.blockers == ("write_outcome_required",)

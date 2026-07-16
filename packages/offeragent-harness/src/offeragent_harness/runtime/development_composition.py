@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -26,6 +27,7 @@ from .local_process_host import VerifiedRuntimeInfo
 from .local_process_host import main as process_host_main
 from .production_host_composition import create_windows_host_application
 from .production_worker_composition import _run_worker, parse_worker_arguments
+from .startup import RuntimeStartupBlocked
 from .windows_process import (
     PinnedWorkerExecutableVerifier,
     WindowsWorkerProcessBackend,
@@ -121,12 +123,22 @@ def worker_main(arguments: Sequence[str] | None = None) -> int:
         asyncio.run(_run_worker(command, development_trust=trust))
     except BaseException as error:
         try:
-            code = getattr(error, "code", type(error).__name__)
+            code = _worker_failure_code(error)
             os.write(2, f"offeragent-worker: local development startup failed ({code})\n".encode())
         except OSError:
             pass
         return 2
     return 0
+
+
+def _worker_failure_code(error: BaseException) -> str:
+    if isinstance(error, RuntimeStartupBlocked):
+        return f"startup_{error.phase.value}_failed"
+    candidate = getattr(error, "code", None)
+    if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", candidate):
+        return candidate
+    name = type(error).__name__
+    return name if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", name) else "worker_startup_failed"
 
 
 def process_host_main_entry(arguments: list[str] | None = None) -> int:

@@ -104,7 +104,15 @@ class ModelProviderConfigurationError(ValueError):
 
 
 class ModelProviderProtocolError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, reason: str = "provider_protocol_violation") -> None:
+        if (
+            not reason
+            or len(reason) > 128
+            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in reason)
+        ):
+            raise ValueError("provider protocol reason must be a bounded snake-case identifier")
+        self.reason = reason
+        super().__init__(message)
 
 
 class ModelCredentialSourceError(RuntimeError):
@@ -629,11 +637,11 @@ class OpenAIResponsesGateway:
                     {"providerId": self._config.provider_id},
                 )
                 retry_after = None
-            except ModelProviderProtocolError:
+            except ModelProviderProtocolError as error:
                 failure = _ProducerFault(
                     "provider_protocol_error",
                     False,
-                    {"providerId": self._config.provider_id},
+                    {"providerId": self._config.provider_id, "protocolReason": error.reason},
                 )
                 retry_after = None
             if failure is None:
@@ -713,21 +721,30 @@ class OpenAIResponsesGateway:
                     control.register(response)
                     try:
                         if 300 <= response.status_code < 400:
-                            raise ModelProviderProtocolError("model provider redirects are forbidden")
+                            raise ModelProviderProtocolError(
+                                "model provider redirects are forbidden",
+                                reason="unexpected_redirect",
+                            )
                         if response.status_code >= 400:
                             raise _read_http_failure(response, self._config.max_event_bytes)
                         media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
                         if media_type != "text/event-stream" and not (
                             not media_type and self._config.allow_missing_event_stream_content_type
                         ):
-                            raise ModelProviderProtocolError("model provider response is not an SSE stream")
+                            raise ModelProviderProtocolError(
+                                "model provider response is not an SSE stream",
+                                reason="invalid_stream_content_type",
+                            )
                         total = 0
                         for chunk in response.iter_bytes():
                             if control.stop.is_set():
                                 raise _StopRequested
                             total += len(chunk)
                             if total > self._config.max_stream_bytes:
-                                raise ModelProviderProtocolError("model provider stream exceeds its byte limit")
+                                raise ModelProviderProtocolError(
+                                    "model provider stream exceeds its byte limit",
+                                    reason="stream_byte_limit_exceeded",
+                                )
                             for event_name, data in decoder.feed(chunk):
                                 for semantic in accumulator.accept(event_name, data):
                                     publish(semantic)
@@ -735,7 +752,10 @@ class OpenAIResponsesGateway:
                             for semantic in accumulator.accept(event_name, data):
                                 publish(semantic)
                         if not accumulator.terminal:
-                            raise ModelProviderProtocolError("model provider stream ended without a terminal event")
+                            raise ModelProviderProtocolError(
+                                "model provider stream ended without a terminal event",
+                                reason="stream_terminal_event_missing",
+                            )
                         outcome = "provider_error" if terminal_error else "completed"
                     finally:
                         control.unregister(response)
@@ -995,10 +1015,6 @@ class _ResponseAccumulator:
             raise ModelProviderProtocolError("structured model output is not strict JSON") from error
         if not isinstance(value, dict):
             raise ModelProviderProtocolError("structured model output must be a JSON object")
-        assert self.request.output_schema is not None
-        errors = list(Draft202012Validator(self.request.output_schema).iter_errors(value))
-        if errors:
-            raise ModelProviderProtocolError("structured model output does not match its requested schema")
         return (_SemanticEvent(ModelEventKind.STRUCTURED_OUTPUT, data=value),)
 
 
@@ -1056,8 +1072,8 @@ def _encode_request(request: ModelRequest, config: OpenAIResponsesConfig) -> byt
 def _project_codex_subscription_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
     """Project full Harness JSON Schema into the Codex endpoint's strict subset.
 
-    The original schema remains attached to ``ModelRequest`` and is always used
-    for local validation.  This provider-facing projection therefore may only
+    The original schema remains attached to ``ModelRequest`` and the AgentStep
+    Catalog is the sole local validator.  This provider-facing projection may only
     remove constraints (which local validation restores) or narrow accepted
     values.  In particular, arbitrary object maps become empty strict objects;
     this keeps generated arguments valid without pretending the endpoint can

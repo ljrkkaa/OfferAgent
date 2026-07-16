@@ -9,7 +9,7 @@
 - Obsidian 与本地 Web UI 是同一 Vault Worker 的客户端，不拥有第二套 Agent 状态机。
 - 生产依赖不得包含 Khoj、Django、PostgreSQL、LangChain 或远程 Conversation/Workspace Store。
 - 个人本机默认 DeepSeek 通过固定 Chat Completions Adapter 推理；Provider 原生工具和原始思维链不进入
-  Harness，JSON 输出在本机按 canonical Schema 再校验。
+  Harness，JSON object 由唯一 AgentStep Catalog 在本机按 canonical Schema 校验。
 
 开发命令：
 

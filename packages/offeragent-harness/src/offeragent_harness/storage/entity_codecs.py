@@ -891,7 +891,7 @@ def core_entity_codec_registry() -> EntityCodecRegistry:
             EntityCodec(
                 "run_states",
                 "offeragent.run_state",
-                4,
+                5,
                 RunState,
                 _run_state_to_payload,
                 _run_state_from_payload,

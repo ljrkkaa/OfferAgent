@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -11,7 +11,6 @@ import pytest
 
 from offeragent_harness.adapters.sqlite_stores import SqliteUnitOfWorkFactory
 from offeragent_harness.agent import BudgetCheckpoint, BudgetDelta, BudgetLedger, RunBudget
-from offeragent_harness.agent.composer import CompositionEvent
 from offeragent_harness.agent.loop import AgentLoopFailure, ToolExecution
 from offeragent_harness.agent.planner import Planner, PlanningAttempt, PlanningAttemptOutcome, PlanningStep
 from offeragent_harness.agent.state import RunPhase, RunState
@@ -140,33 +139,6 @@ class _PhantomTerminalPlanner:
         raise AgentLoopFailure(phantom, OSError("terminal recorder commit was not confirmed"))
 
 
-class _TextComposer:
-    def stream(
-        self,
-        state: RunState,
-        *,
-        partial: bool,
-        cancellation: CancellationToken,
-    ) -> AsyncIterator[CompositionEvent]:
-        del state, partial
-
-        async def generate() -> AsyncIterator[CompositionEvent]:
-            cancellation.checkpoint()
-            yield CompositionEvent(text_delta="done")
-            yield CompositionEvent(
-                usage=ModelUsage(
-                    input_tokens=1,
-                    output_tokens=1,
-                    cached_input_tokens=0,
-                    reasoning_tokens=0,
-                    cost=Decimal("0"),
-                    currency="USD",
-                )
-            )
-
-        return generate()
-
-
 class _ReplayKernel:
     def __init__(
         self,
@@ -241,7 +213,6 @@ class _Components:
         return RunComponents(
             planner_factory=self._planner,
             tool_kernel_factory=self._kernel,
-            composer=_TextComposer(),
             budget=self.budget,
         )
 
@@ -372,7 +343,7 @@ def _fixture(suffix: str) -> _CrashFixture:
         budget=BUDGET,
         started_at=STARTED,
         used=BudgetDelta(model_rounds=1, tool_calls=2),
-        reserved=BudgetDelta(model_rounds=1),
+        reserved=BudgetDelta(),
         captured_at=STARTED + timedelta(seconds=10),
         elapsed_seconds=10,
     )

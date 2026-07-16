@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -102,7 +103,12 @@ async def test_workspace_trust_discovers_metadata_and_invocation_loads_body_lazi
 
     assert result.status is ToolResultStatus.SUCCEEDED
     assert result.data is not None
-    assert result.data["instruction"]["text"].replace("\r\n", "\n") == body
+    assert isinstance(result.data, Mapping)
+    instruction = result.data["instruction"]
+    assert isinstance(instruction, Mapping)
+    instruction_text = instruction["text"]
+    assert isinstance(instruction_text, str)
+    assert instruction_text.replace("\r\n", "\n") == body
     assert result.data["arguments"] == "7.21"
     assert result.data["effectiveAllowedTools"] == ("glob", "grep", "read", "vault.transaction")
     assert skill_file.stat().st_size > len(prepared.prompt_descriptors[0].description)
@@ -157,7 +163,12 @@ async def test_workspace_skill_changes_are_discovered_on_the_next_run_without_pe
     )
     assert result.status is ToolResultStatus.SUCCEEDED
     assert result.data is not None
-    assert result.data["instruction"]["text"].replace("\r\n", "\n") == "second body"
+    assert isinstance(result.data, Mapping)
+    instruction = result.data["instruction"]
+    assert isinstance(instruction, Mapping)
+    instruction_text = instruction["text"]
+    assert isinstance(instruction_text, str)
+    assert instruction_text.replace("\r\n", "\n") == "second body"
 
 
 @pytest.mark.asyncio

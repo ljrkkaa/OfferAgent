@@ -86,7 +86,7 @@ def _request() -> ModelRequest:
     return ModelRequest(
         request_id="model_request_1",
         model="gpt-test",
-        purpose=ModelPurpose.COMPOSING,
+        purpose=ModelPurpose.RESPONDING,
         messages=(
             ModelMessage(
                 ModelRole.USER,

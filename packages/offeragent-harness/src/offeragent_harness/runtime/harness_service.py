@@ -14,7 +14,6 @@ from typing import Any, Protocol, cast
 from pydantic import TypeAdapter
 
 from offeragent_harness.agent import BudgetCheckpoint, BudgetExceeded, BudgetLedger, RunBudget, RunPreparationPort
-from offeragent_harness.agent.composer import Composer
 from offeragent_harness.agent.loop import AgentLoopFailure, RecoveredToolBatch, ToolKernel, run_agent_loop
 from offeragent_harness.agent.planner import Planner
 from offeragent_harness.agent.state import RunPhase, RunState
@@ -89,15 +88,18 @@ class EntityNotFound(HarnessServiceError, ResourceNotFoundCause):
 
 
 class IdempotencyKeyConflict(HarnessServiceError, ResourceConflictCause):
-    pass
+    conflict_reason = "idempotency_key_conflict"
 
 
 class SessionRunConflict(HarnessServiceError, ResourceConflictCause):
-    pass
+    conflict_reason = "session_active_or_mutating"
+    conflict_user_message = "the Session already has an active Run or lifecycle operation"
 
 
 class RecoveryResumeRejected(HarnessServiceError, ResourceConflictCause):
     """A durable recovery result is stale or unsafe to enter the Agent Loop."""
+
+    conflict_reason = "recovery_resume_rejected"
 
     def __init__(self, code: str, run_id: str, message: str) -> None:
         self.code = code
@@ -271,7 +273,6 @@ class RunEventReplayPage:
 class RunComponents:
     planner_factory: PlannerFactory
     tool_kernel_factory: ToolKernelFactory
-    composer: Composer
     budget: RunBudget
     hook_binding_factory: HookBindingFactory | None = None
 
@@ -318,7 +319,7 @@ class RunComponentsFactory(Protocol):
 
 
 class ChildRunComponentsFactory(Protocol):
-    """Build child components using the same Planner, Kernel and Composer implementations."""
+    """Build child components using the same Planner and Kernel implementations."""
 
     def build_child(self, execution: ChildRunExecution, state: RunState) -> RunComponents: ...
 
@@ -393,7 +394,6 @@ class _PreparedRecoveredRun:
     budget: BudgetLedger
     planner: Planner
     tool_kernel: ToolKernel
-    composer: Composer
     recorder: UowRunRecorder
     recovered_batch: RecoveredToolBatch
     hooks: HookLifecyclePort | None
@@ -569,7 +569,6 @@ class HarnessService:
                     active_file=_explicit_instruction_scope(command.input_blocks),
                     effective_config=command.effective_config,
                     planner=initial_planner,
-                    composer=components.composer,
                 )
             )
             ready: asyncio.Future[UowRunRecorder] = asyncio.get_running_loop().create_future()
@@ -628,7 +627,6 @@ class HarnessService:
                         active_file=_explicit_instruction_scope(command.input_blocks),
                         effective_config=command.effective_config,
                         planner=planner,
-                        composer=run_components.composer,
                     )
                 assert (
                     run_components is not None
@@ -639,7 +637,6 @@ class HarnessService:
                 return await self._execute_agent_run(
                     state=current_state,
                     planner=planner,
-                    composer=run_components.composer,
                     tool_kernel=tool_kernel,
                     recorder=recorder,
                     budget=budget,
@@ -802,7 +799,6 @@ class HarnessService:
                     query_text=_context_query(start_command.input_blocks),
                     effective_config=preparation_config,
                     planner=initial_planner,
-                    composer=components.composer,
                 )
             )
             ready: asyncio.Future[UowRunRecorder] = asyncio.get_running_loop().create_future()
@@ -851,7 +847,6 @@ class HarnessService:
                             query_text=_context_query(start_command.input_blocks),
                             effective_config=preparation_config,
                             planner=planner,
-                            composer=run_components.composer,
                         )
                     except BaseException as error:
                         terminal = await self._terminalize_component_preparation_failure(
@@ -871,7 +866,6 @@ class HarnessService:
                 return await self._execute_agent_run(
                     state=current_state,
                     planner=planner,
-                    composer=run_components.composer,
                     tool_kernel=tool_kernel,
                     recorder=recorder,
                     budget=budget,
@@ -1031,12 +1025,10 @@ class HarnessService:
             query_text=_context_query(execution.context.content),
             effective_config=effective_config,
             planner=planner,
-            composer=components.composer,
         )
         result = await self._execute_agent_run(
             state=state,
             planner=planner,
-            composer=components.composer,
             tool_kernel=tool_kernel,
             recorder=recorder,
             budget=budget,
@@ -1071,7 +1063,6 @@ class HarnessService:
         *,
         state: RunState,
         planner: Planner,
-        composer: Composer,
         tool_kernel: ToolKernel,
         recorder: UowRunRecorder,
         budget: BudgetLedger,
@@ -1110,7 +1101,6 @@ class HarnessService:
             result = await run_agent_loop(
                 state,
                 planner=planner,
-                composer=composer,
                 tool_kernel=tool_kernel,
                 recorder=recorder,
                 budget=budget,
@@ -1270,7 +1260,6 @@ class HarnessService:
                     return await self._execute_agent_run(
                         state=prepared_run.result.state,
                         planner=prepared_run.planner,
-                        composer=prepared_run.composer,
                         tool_kernel=prepared_run.tool_kernel,
                         recorder=prepared_run.recorder,
                         budget=prepared_run.budget,
@@ -1371,14 +1360,6 @@ class HarnessService:
                 result.run.run_id,
                 "Recovered Run lacks a strict BudgetCheckpoint.",
             )
-        if checkpoint.reserved.model_rounds < 1:
-            raise RecoveryResumeRejected(
-                "composer_reservation_missing",
-                result.run.run_id,
-                "Recovered budget no longer contains the canonical Composer reservation; "
-                "additional durable child reservations are allowed but remain budget-accounted.",
-            )
-
         async with self._unit_of_work.begin() as uow:
             effective_record = await uow.entities.get("run_effective_configs", result.run.run_id)
             capability_record = await uow.entities.get("run_capability_snapshots", result.run.run_id)
@@ -1504,7 +1485,6 @@ class HarnessService:
             query_text=_context_query(command.input_blocks),
             effective_config=effective_config,
             planner=planner,
-            composer=components.composer,
         )
         recorder = UowRunRecorder(
             unit_of_work=self._unit_of_work,
@@ -1523,7 +1503,6 @@ class HarnessService:
             budget=budget,
             planner=planner,
             tool_kernel=tool_kernel,
-            composer=components.composer,
             recorder=recorder,
             recovered_batch=RecoveredToolBatch(result.accepted_tool_call_ids, result.replay_calls),
             hooks=hook_binding.hooks,
@@ -1681,7 +1660,6 @@ class HarnessService:
         query_text: str,
         effective_config: HarnessConfig | None,
         planner: Planner,
-        composer: Composer,
         active_file: str | None = None,
     ) -> RunPreparationPort | None:
         provider = self._run_context_provider
@@ -1702,7 +1680,6 @@ class HarnessService:
             request=request,
             provider=provider,
             planner=planner,
-            composer=composer,
             limits=self._run_preparation_limits,
             enricher=self._context_enricher,
         )

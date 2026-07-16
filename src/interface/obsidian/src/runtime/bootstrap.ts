@@ -317,7 +317,7 @@ function classifyBootstrapFailure(error: unknown): ClassifiedBootstrapFailure {
                 code: "runtime_crash_loop",
                 message: "Runtime 连续失败，已暂停自动重启。",
                 actionable: true,
-                causeCode: error.lastFailure.code,
+                causeCode: error.lastFailure.causeCode ?? error.lastFailure.code,
             },
             retryable: false,
             retryAfterMs: null,
@@ -349,8 +349,16 @@ function classifyBootstrapFailure(error: unknown): ClassifiedBootstrapFailure {
         };
     }
     if (error instanceof RpcDisconnectedError) {
+        const causeCode = workerExitCauseCode(error.message);
         return {
-            info: { code: "runtime_disconnected", message: "本地 Runtime 连接已中断，正在按退避策略重连。", actionable: true },
+            info: {
+                code: "runtime_disconnected",
+                message: causeCode
+                    ? `本地 Worker 已退出（${causeCode}），正在按退避策略重连。`
+                    : "本地 Runtime 连接已中断，正在按退避策略重连。",
+                actionable: true,
+                ...(causeCode ? { causeCode } : {}),
+            },
             retryable: true,
             retryAfterMs: null,
         };
@@ -360,6 +368,11 @@ function classifyBootstrapFailure(error: unknown): ClassifiedBootstrapFailure {
         retryable: false,
         retryAfterMs: null,
     };
+}
+
+function workerExitCauseCode(message: string): string | undefined {
+    const match = /OfferAgent Worker exited \([^\r\n]{1,64}\): offeragent-worker: local development startup failed \(([A-Za-z][A-Za-z0-9_.-]{0,63})\)$/.exec(message);
+    return match?.[1];
 }
 
 function abortableSleep(milliseconds: number, signal: AbortSignal): Promise<void> {

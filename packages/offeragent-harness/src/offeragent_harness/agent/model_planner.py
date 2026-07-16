@@ -1,4 +1,4 @@
-"""Model-backed Planner with a Harness-owned strict ToolPlan contract."""
+"""Model-backed Agent loop step with a Harness-owned strict output contract."""
 
 from __future__ import annotations
 
@@ -25,8 +25,9 @@ from offeragent_harness.models import (
     TraceContext,
 )
 from offeragent_harness.models.json_types import FrozenJsonObject, freeze_json, thaw_json
+from offeragent_harness.permissions import RiskClass
 from offeragent_harness.ports import CancellationToken, Clock, IdGenerator, ModelGateway
-from offeragent_harness.tools import ToolCall, ToolDefinition, canonical_json_sha256
+from offeragent_harness.tools import SideEffectClass, ToolCall, ToolDefinition, canonical_json_sha256
 
 from .budgets import BudgetDelta, BudgetExceeded, BudgetLedger
 from .context_manager import ContextFragment, ContextManager, ContextProjection, ContextWindow
@@ -46,7 +47,7 @@ class ModelPlannerError(RuntimeError):
         return self
 
 
-class ToolPlanCatalogError(ModelPlannerError):
+class AgentStepCatalogError(ModelPlannerError):
     pass
 
 
@@ -78,7 +79,7 @@ class ModelInvalidOutput(ModelPlannerError):
         normalized = tuple(violations)
         if not normalized:
             raise ValueError("invalid model output requires at least one violation")
-        super().__init__(f"model output {request_id} violated the ToolPlan schema: {'; '.join(normalized)}")
+        super().__init__(f"model output {request_id} violated the AgentStep schema: {'; '.join(normalized)}")
         self.request_id = request_id
         self.violations = normalized
         self.raw_output = raw_output
@@ -95,7 +96,7 @@ class SchemaRepairUnavailable(ModelPlannerError):
 
 class SchemaRepairFailed(ModelPlannerError):
     def __init__(self, first: ModelInvalidOutput, second: ModelInvalidOutput) -> None:
-        super().__init__("the single permitted ToolPlan schema repair also failed")
+        super().__init__("the single permitted AgentStep schema repair also failed")
         self.first = first
         self.second = second
 
@@ -124,7 +125,7 @@ class StructuredModelResponse:
     usage: ModelUsage
 
 
-class ToolPlanCatalog:
+class AgentStepCatalog:
     """Immutable tool directory and its exact provider-facing output schema."""
 
     def __init__(self, definitions: Sequence[ToolDefinition], *, max_calls: int) -> None:
@@ -133,7 +134,7 @@ class ToolPlanCatalog:
         ordered = tuple(sorted(definitions, key=lambda item: (item.name, item.version)))
         keys = [(definition.name, definition.version) for definition in ordered]
         if len(keys) != len(set(keys)):
-            raise ToolPlanCatalogError("tool catalog contains duplicate name/version entries")
+            raise AgentStepCatalogError("tool catalog contains duplicate name/version entries")
         self._definitions = ordered
         self._by_key = MappingProxyType(dict(zip(keys, ordered, strict=True)))
         self._max_calls = max_calls
@@ -156,7 +157,7 @@ class ToolPlanCatalog:
         Draft202012Validator.check_schema(schema)
         frozen = freeze_json(schema)
         if not isinstance(frozen, FrozenJsonObject):
-            raise ToolPlanCatalogError("generated ToolPlan schema must be an object")
+            raise AgentStepCatalogError("generated AgentStep schema must be an object")
         self._schema = frozen
         self._validator = Draft202012Validator(thaw_json(frozen))
 
@@ -184,20 +185,49 @@ class ToolPlanCatalog:
                 repairable=False,
             ) from None
 
-    def violations(self, value: Mapping[str, Any]) -> tuple[str, ...]:
+    def violations(
+        self,
+        value: Mapping[str, Any],
+        *,
+        context_activations: frozenset[str] = frozenset(),
+    ) -> tuple[str, ...]:
         errors = sorted(self._validator.iter_errors(value), key=lambda item: tuple(str(part) for part in item.path))
         structural = tuple(f"{_json_path(error.absolute_path)}: {error.message}" for error in errors)
         if structural:
             return structural
         calls = value.get("calls")
         if not isinstance(calls, list):
-            raise AssertionError("the validated ToolPlan calls field is not an array")
+            raise AssertionError("the validated AgentStep calls field is not an array")
         names = tuple(call.get("name") for call in calls if isinstance(call, Mapping))
         if "skill" in names and any(name != "skill" for name in names):
             return (
                 "$.calls: a planning step that invokes a Skill may contain only skill calls; "
                 "plan other tools after the Skill body is available",
             )
+        if names.count("skill") > 1:
+            return (
+                "$.calls: a planning step may invoke exactly one Skill so its body is available before "
+                "selecting another Skill",
+            )
+        definitions = tuple(
+            self._by_key[(cast(str, call["name"]), cast(str, call["version"]))]
+            for call in calls
+            if isinstance(call, Mapping)
+        )
+        if len(definitions) > 1:
+            parallel_reads = all(_parallel_safe_read(definition) for definition in definitions)
+            serial_idempotent_effects = all(_serial_batch_safe(definition) for definition in definitions)
+            if not parallel_reads and not serial_idempotent_effects:
+                return (
+                    "$.calls: a multi-call AgentStep must contain either independent concurrency-safe reads or "
+                    "idempotent effectful calls; never mix reads with effects or batch a non-idempotent tool",
+                )
+        for call in calls:
+            if not isinstance(call, Mapping) or call.get("name") != "skill":
+                continue
+            arguments = call.get("arguments")
+            if isinstance(arguments, Mapping) and f"skill:{arguments.get('name')}" in context_activations:
+                return ("$.calls: an already activated Skill cannot be invoked again in the same Run",)
         return ()
 
     def _build_schema(self) -> dict[str, Any]:
@@ -208,7 +238,7 @@ class ToolPlanCatalog:
             input_schema = cast(dict[str, Any], thaw_json(definition.input_schema))
             # Give each embedded schema its own resource root.  Existing local
             # #/$defs references then remain local instead of resolving against
-            # the surrounding ToolPlan document.
+            # the surrounding AgentStep document.
             input_schema = dict(input_schema)
             input_schema["$id"] = f"urn:offeragent:tool-input:{self._fingerprint[7:]}:{schema_key}"
             definitions[schema_key] = input_schema
@@ -228,12 +258,19 @@ class ToolPlanCatalog:
             )
         call_items: bool | dict[str, Any]
         call_items = {"oneOf": variants} if variants else False
+        step_constraints = [
+            {
+                "if": {"properties": {"calls": {"maxItems": 0}}, "required": ["calls"]},
+                "then": {"properties": {"finalResponse": {"type": "string", "minLength": 1}}},
+                "else": {"properties": {"finalResponse": {"type": "null"}}},
+            }
+        ]
         return {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "$id": f"urn:offeragent:tool-plan:{self._fingerprint[7:]}",
+            "$id": f"urn:offeragent:agent-step:{self._fingerprint[7:]}",
             "type": "object",
             "additionalProperties": False,
-            "required": ["requiresWriteOutcome", "calls", "stopReason"],
+            "required": ["requiresWriteOutcome", "calls", "finalResponse"],
             "properties": {
                 "requiresWriteOutcome": {"type": "boolean"},
                 "calls": {
@@ -241,20 +278,14 @@ class ToolPlanCatalog:
                     "maxItems": self._max_calls,
                     "items": call_items,
                 },
-                "stopReason": {
+                "finalResponse": {
                     "oneOf": [
                         {"type": "null"},
                         {"type": "string", "minLength": 1, "maxLength": 4096},
                     ]
                 },
             },
-            "allOf": [
-                {
-                    "if": {"properties": {"calls": {"maxItems": 0}}, "required": ["calls"]},
-                    "then": {"properties": {"stopReason": {"type": "string", "minLength": 1}}},
-                    "else": {"properties": {"stopReason": {"type": "null"}}},
-                }
-            ],
+            "allOf": step_constraints,
             "$defs": definitions,
         }
 
@@ -267,7 +298,7 @@ class ModelPlanner:
         *,
         gateway: ModelGateway,
         context_manager: ContextManager,
-        catalog: ToolPlanCatalog,
+        catalog: AgentStepCatalog,
         config: PlannerModelConfig,
         clock: Clock,
         ids: IdGenerator,
@@ -324,8 +355,8 @@ class ModelPlanner:
                 ModelRole.SYSTEM,
                 (
                     ModelContentBlock.text(
-                        "上一次输出未通过给定 JSON Schema。仅修复结构并重新输出一个完整 ToolPlan; "
-                        "不得添加 Schema 之外字段, 也不得自报 callId、hash、deadline 或权限。"
+                        "上一次输出未通过 AgentStep contract。严格按照 violations 修复并重新输出一个完整 "
+                        "AgentStep; 不得添加 Schema 之外字段, 也不得自报 callId、hash、deadline 或权限。"
                     ),
                 ),
                 name="offeragent-schema-repair",
@@ -343,7 +374,7 @@ class ModelPlanner:
                         },
                     ),
                 ),
-                name="offeragent-invalid-tool-plan",
+                name="offeragent-invalid-agent-step",
             )
             system_count = next(
                 (index for index, message in enumerate(messages) if message.role is not ModelRole.SYSTEM),
@@ -530,7 +561,10 @@ class ModelPlanner:
 
     def _to_planning_step(self, state: RunState, response: StructuredModelResponse) -> PlanningStep:
         raw = cast(dict[str, Any], thaw_json(response.output))
-        violations = self._catalog.violations(raw)
+        activations = frozenset(
+            activation for result in state.tool_results for activation in result.context_activations
+        )
+        violations = self._catalog.violations(raw, context_activations=activations)
         if violations:
             raise ModelInvalidOutput(
                 response.request_id,
@@ -568,11 +602,7 @@ class ModelPlanner:
         return PlanningStep(
             calls=tuple(calls),
             requires_write_outcome=cast(bool, raw["requiresWriteOutcome"]),
-            stop_reason=cast(str | None, raw["stopReason"]),
-            # Usage is charged inside this implementation so a failed schema
-            # attempt is never omitted from the ledger and the outer loop does
-            # not double-charge a successful attempt.
-            usage=None,
+            final_response=cast(str | None, raw["finalResponse"]),
         )
 
 
@@ -592,7 +622,7 @@ def _failed_attempt(error: ModelPlannerError, request: ModelRequest, repair_inde
             repair_index=repair_index,
             outcome=PlanningAttemptOutcome.INVALID,
             usage=error.usage,
-            error_code="invalid_tool_plan",
+            error_code="invalid_agent_step",
             violations=error.violations,
             **metadata,
         )
@@ -761,7 +791,25 @@ def _zero_usage() -> ModelUsage:
     return ModelUsage(0, 0, 0, 0)
 
 
+def _parallel_safe_read(definition: ToolDefinition) -> bool:
+    return (
+        definition.risk is RiskClass.READ
+        and definition.side_effect_class in {SideEffectClass.NONE, SideEffectClass.READ}
+        and definition.concurrency_safe
+    )
+
+
+def _serial_batch_safe(definition: ToolDefinition) -> bool:
+    return definition.idempotent and definition.side_effect_class not in {
+        SideEffectClass.NONE,
+        SideEffectClass.READ,
+        SideEffectClass.UNKNOWN,
+    }
+
+
 __all__ = [
+    "AgentStepCatalog",
+    "AgentStepCatalogError",
     "ModelInvalidOutput",
     "ModelPlanner",
     "ModelPlannerError",
@@ -771,8 +819,6 @@ __all__ = [
     "SchemaRepairFailed",
     "SchemaRepairUnavailable",
     "StructuredModelResponse",
-    "ToolPlanCatalog",
-    "ToolPlanCatalogError",
     "collect_structured_response",
     "validate_usage_progression",
 ]

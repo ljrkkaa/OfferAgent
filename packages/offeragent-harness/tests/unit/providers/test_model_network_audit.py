@@ -113,7 +113,7 @@ def _request(*, health: bool = False, with_run_identity: bool = True) -> ModelRe
     return ModelRequest(
         request_id=request_id,
         model="test-model",
-        purpose=ModelPurpose.GROUNDING if health else ModelPurpose.COMPOSING,
+        purpose=ModelPurpose.GROUNDING if health else ModelPurpose.RESPONDING,
         messages=(ModelMessage(ModelRole.SYSTEM, (ModelContentBlock.text("fixed"),)),),
         output_mode=ModelOutputMode.TEXT,
         output_schema=None,

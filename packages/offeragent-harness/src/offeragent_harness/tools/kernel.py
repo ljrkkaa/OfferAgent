@@ -249,6 +249,63 @@ class UnifiedToolKernel:
         observer: ToolLifecycleObserver | None = None,
     ) -> tuple[ToolExecution, ...]:
         cancellation.checkpoint()
+        executions: list[ToolExecution] = []
+        index = 0
+        while index < len(calls):
+            end = index + 1
+            if self._parallel_preparation_safe(calls[index]):
+                while end < len(calls) and self._parallel_preparation_safe(calls[end]):
+                    end += 1
+            group = await self._execute_prepared_group(calls[index:end], cancellation, observer)
+            executions.extend(group)
+            index = end
+            if (
+                len(group) == 1
+                and not self._parallel_preparation_safe(group[0].call)
+                and group[0].result.status is not ToolResultStatus.SUCCEEDED
+            ):
+                for call in calls[index:]:
+                    executions.append(await self._abort_remaining_batch_call(call, observer))
+                break
+        return tuple(executions)
+
+    async def _abort_remaining_batch_call(
+        self,
+        call: ToolCall,
+        observer: ToolLifecycleObserver | None,
+    ) -> ToolExecution:
+        try:
+            definition = self._registry.get(call.name, call.version)
+        except (ToolNotFound, ToolVersionUnavailable):
+            definition = self._unavailable_definition(call)
+        result = self._cancelled(
+            call,
+            "prior_serial_call_failed",
+            "前一个串行工具调用未成功, 后续调用未执行。",
+        )
+        if observer is not None:
+            await observer.result_available(call, definition, result)
+        from offeragent_harness.agent.loop import ToolExecution
+
+        return ToolExecution(call=call, definition=definition, result=result)
+
+    def _parallel_preparation_safe(self, call: ToolCall) -> bool:
+        try:
+            definition = self._registry.get(call.name, call.version)
+        except (ToolNotFound, ToolVersionUnavailable):
+            return False
+        return (
+            definition.risk is RiskClass.READ
+            and definition.side_effect_class in {SideEffectClass.NONE, SideEffectClass.READ}
+            and definition.concurrency_safe
+        )
+
+    async def _execute_prepared_group(
+        self,
+        calls: Sequence[ToolCall],
+        cancellation: CancellationToken,
+        observer: ToolLifecycleObserver | None,
+    ) -> tuple[ToolExecution, ...]:
         started: dict[str, float] = {}
         prepared: list[ScheduledInvocation] = []
         try:

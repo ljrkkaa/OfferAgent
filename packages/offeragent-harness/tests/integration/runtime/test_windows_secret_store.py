@@ -58,7 +58,7 @@ def test_secret_crud_rotation_scope_isolation_and_plaintext_never_hits_disk(tmp_
     secrets = store(tmp_path)
     assert isinstance(secrets, SecretStore)
     assert isinstance(secrets, SecretResolver)
-    plaintext = "sk-super-secret-OfferAgent"
+    plaintext = "test-super-secret-OfferAgent"
     original_env = dict(os.environ)
     original_argv = tuple(sys.argv)
     input_value = SecretInput(plaintext)

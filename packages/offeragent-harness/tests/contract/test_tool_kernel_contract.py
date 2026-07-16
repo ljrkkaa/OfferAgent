@@ -653,13 +653,15 @@ async def test_shared_kernel_resource_lock_serializes_same_path_across_runs_and_
 
 
 @pytest.mark.asyncio
-async def test_batch_prepare_cancellation_releases_only_previously_prepared_provider_plans() -> None:
+async def test_effectful_batch_cancellation_preserves_committed_call_and_releases_blocked_preflight() -> None:
     tool = resource_definition()
     provider = TrackingPathPreflight(block_prepare_number=2)
     journal = MemoryJournal()
+    first = resource_call(tool, 1, run_id="run_a")
+    second = resource_call(tool, 2, run_id="run_a")
     tool_kernel = resource_kernel(
         tool,
-        ExactAttemptExecutor(()),
+        ExactAttemptExecutor((Attempt(first, success(first.tool_call_id, 1)),)),
         journal,
         KeyedLockPool(),
         provider=provider,
@@ -668,8 +670,8 @@ async def test_batch_prepare_cancellation_releases_only_previously_prepared_prov
     running = asyncio.create_task(
         tool_kernel.execute_batch(
             (
-                resource_call(tool, 1, run_id="run_a"),
-                resource_call(tool, 2, run_id="run_a"),
+                first,
+                second,
             ),
             token,
         )
@@ -681,8 +683,8 @@ async def test_batch_prepare_cancellation_releases_only_previously_prepared_prov
         await running
 
     assert provider.prepared == ["call_1"]
-    assert provider.completed == [("call_1", ToolResultStatus.CANCELLED)]
-    assert journal.records == {}
+    assert provider.completed == [("call_1", ToolResultStatus.SUCCEEDED)]
+    assert [record.state for record in journal.records.values()] == [JournalState.COMPLETED]
 
 
 @pytest.mark.asyncio
@@ -937,7 +939,7 @@ async def test_result_sensitivity_snapshot_mismatch_is_denied_before_policy_or_d
 
 
 @pytest.mark.asyncio
-async def test_policy_scope_is_revalidated_after_waiting_for_the_effect_gate() -> None:
+async def test_policy_scope_is_revalidated_before_each_effectful_preflight() -> None:
     tool = definition(
         "vault.write",
         risk=RiskClass.WRITE,
@@ -985,7 +987,7 @@ async def test_policy_scope_is_revalidated_after_waiting_for_the_effect_gate() -
     assert result[0].result.status is ToolResultStatus.SUCCEEDED
     assert result[1].result.status is ToolResultStatus.DENIED
     assert result[1].result.error is not None
-    assert result[1].result.error.code == "execution_policy_denied"
+    assert result[1].result.error.code == "scope_tool_denied"
     assert executor.calls == [calls[0]]
 
 

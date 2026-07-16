@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -12,7 +12,6 @@ import pytest
 
 from offeragent_harness.adapters.sqlite_stores import SqliteInvocationJournal, SqliteUnitOfWorkFactory
 from offeragent_harness.agent import BudgetLedger, RunBudget
-from offeragent_harness.agent.composer import CompositionEvent
 from offeragent_harness.agent.loop import ToolExecution, run_agent_loop
 from offeragent_harness.agent.planner import PlanningAttempt, PlanningAttemptOutcome, PlanningStep
 from offeragent_harness.agent.state import RunPhase, RunState
@@ -426,29 +425,6 @@ class _OneStepPlanner:
         )
 
 
-class _TextComposer:
-    async def stream(
-        self,
-        state: RunState,
-        *,
-        partial: bool,
-        cancellation: CancellationToken,
-    ) -> AsyncIterator[CompositionEvent]:
-        del state, partial
-        cancellation.checkpoint()
-        yield CompositionEvent(text_delta="done")
-        yield CompositionEvent(
-            usage=ModelUsage(
-                input_tokens=1,
-                output_tokens=1,
-                cached_input_tokens=0,
-                reasoning_tokens=0,
-                cost=Decimal("0"),
-                currency="USD",
-            )
-        )
-
-
 class _NoToolKernel:
     async def execute_batch(
         self,
@@ -509,7 +485,6 @@ async def test_prepared_production_port_drives_the_canonical_agent_loop_lifecycl
     result = await run_agent_loop(
         RunState("workspace-1", "session-1", "turn-1", "run-1", AgentLineage.root("run-1")),
         planner=_OneStepPlanner(),
-        composer=_TextComposer(),
         tool_kernel=_NoToolKernel(),
         recorder=_Recorder(),
         budget=_run_budget(),
@@ -522,8 +497,6 @@ async def test_prepared_production_port_drives_the_canonical_agent_loop_lifecycl
     assert result.phase is RunPhase.COMPLETED
     assert [item.event for item in handler.invocations] == [
         HookEvent.TURN_START,
-        HookEvent.BEFORE_MODEL,
-        HookEvent.AFTER_MODEL,
         HookEvent.BEFORE_MODEL,
         HookEvent.AFTER_MODEL,
         HookEvent.TURN_STOP,

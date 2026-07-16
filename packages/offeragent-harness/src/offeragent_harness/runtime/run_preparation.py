@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Protocol, cast, runtime_checkable
 
-from offeragent_harness.agent.composer import Composer
 from offeragent_harness.agent.context_manager import ContextFragment, ContextLayer
 from offeragent_harness.agent.planner import Planner
 from offeragent_harness.agent.preparation import RunPreparationFailure, RunPreparationPort
@@ -157,49 +156,33 @@ class ContextInputsEnricher:
         cast(ContextMemoryConsumer, planner).add_memory_context(fragments)
         return planner
 
-    def enrich_composer(self, composer: Composer, fragments: tuple[ContextFragment, ...]) -> Composer:
-        if not isinstance(composer, ContextMemoryConsumer):
-            raise RunPreparationFailure(
-                "composer_context_enrichment_unavailable",
-                "Composer does not expose the bounded ContextInputs enrichment boundary",
-                retryable=False,
-            )
-        cast(ContextMemoryConsumer, composer).add_memory_context(fragments)
-        return composer
-
     def enrich(
         self,
         planner: Planner,
-        composer: Composer,
         fragments: tuple[ContextFragment, ...],
-    ) -> tuple[Planner, Composer]:
+    ) -> Planner:
         conversation = tuple(item for item in fragments if item.layer is ContextLayer.CONVERSATION)
         memories = tuple(item for item in fragments if item.layer is ContextLayer.MEMORY)
         skills = tuple(item for item in fragments if item.layer is ContextLayer.SKILLS)
         if conversation:
-            if not isinstance(planner, ContextConversationConsumer) or not isinstance(
-                composer, ContextConversationConsumer
-            ):
+            if not isinstance(planner, ContextConversationConsumer):
                 raise RunPreparationFailure(
                     "conversation_context_enrichment_unavailable",
-                    "Planner 或 Composer 未提供会话上下文入口",
+                    "Planner 未提供会话上下文入口",
                     retryable=False,
                 )
             cast(ContextConversationConsumer, planner).add_conversation_context(conversation)
-            cast(ContextConversationConsumer, composer).add_conversation_context(conversation)
         if memories:
             planner = self.enrich_planner(planner, memories)
-            composer = self.enrich_composer(composer, memories)
         if skills:
-            if not isinstance(planner, ContextSkillConsumer) or not isinstance(composer, ContextSkillConsumer):
+            if not isinstance(planner, ContextSkillConsumer):
                 raise RunPreparationFailure(
                     "workspace_context_enrichment_unavailable",
-                    "Planner 或 Composer 未提供 Workspace 指令上下文入口",
+                    "Planner 未提供 Workspace 指令上下文入口",
                     retryable=False,
                 )
             cast(ContextSkillConsumer, planner).add_skill_context(skills)
-            cast(ContextSkillConsumer, composer).add_skill_context(skills)
-        return planner, composer
+        return planner
 
 
 class CompositeRunContextProvider:
@@ -789,14 +772,12 @@ class PreparedRunContext(RunPreparationPort):
         request: RunPreparationRequest,
         provider: RunContextProvider,
         planner: Planner,
-        composer: Composer,
         limits: RunPreparationLimits | None = None,
         enricher: ContextInputsEnricher | None = None,
     ) -> None:
         self._request = request
         self._provider = provider
         self._planner = planner
-        self._composer = composer
         self._limits = limits or RunPreparationLimits()
         self._enricher = enricher or ContextInputsEnricher()
         self._completed: dict[RunPhase, tuple[ContextFragment, ...]] = {}
@@ -831,7 +812,7 @@ class PreparedRunContext(RunPreparationPort):
                     ),
                     self._limits,
                 )
-                self._planner, self._composer = self._enricher.enrich(self._planner, self._composer, combined)
+                self._planner = self._enricher.enrich(self._planner, combined)
                 self._enriched = True
 
     async def _load_with_retry(

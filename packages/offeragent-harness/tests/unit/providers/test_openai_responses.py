@@ -82,7 +82,7 @@ def _request(*, output_mode: ModelOutputMode = ModelOutputMode.TEXT) -> ModelReq
     return ModelRequest(
         request_id="req_test_1",
         model="gpt-test",
-        purpose=ModelPurpose.PLANNING if output_mode is ModelOutputMode.JSON else ModelPurpose.COMPOSING,
+        purpose=ModelPurpose.PLANNING if output_mode is ModelOutputMode.JSON else ModelPurpose.RESPONDING,
         messages=(
             ModelMessage(ModelRole.SYSTEM, (ModelContentBlock.text("system boundary"),)),
             ModelMessage(ModelRole.USER, (ModelContentBlock.text("user prompt"),)),
@@ -365,7 +365,7 @@ async def test_unstructured_overflow_words_never_trigger_typed_context_overflow(
 
 
 @pytest.mark.asyncio
-async def test_invalid_structured_output_fails_closed_without_echoing_output() -> None:
+async def test_schema_invalid_object_is_emitted_for_canonical_agent_step_validation() -> None:
     invalid = '{"unexpected":"private payload"}'
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -394,8 +394,13 @@ async def test_invalid_structured_output_fails_closed_without_echoing_output() -
 
     events = await _collect(_gateway(httpx.MockTransport(handler)), _request(output_mode=ModelOutputMode.JSON))
 
-    assert [event.kind for event in events] == [ModelEventKind.STARTED, ModelEventKind.ERROR]
-    assert "private payload" not in repr(events[-1])
+    assert [event.kind for event in events] == [
+        ModelEventKind.STARTED,
+        ModelEventKind.STRUCTURED_OUTPUT,
+        ModelEventKind.USAGE,
+        ModelEventKind.COMPLETED,
+    ]
+    assert events[1].data == {"unexpected": "private payload"}
 
 
 @pytest.mark.asyncio

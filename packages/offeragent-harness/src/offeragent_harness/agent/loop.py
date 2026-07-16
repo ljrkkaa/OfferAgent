@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -8,20 +9,19 @@ from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from offeragent_harness.error_codes import ErrorCode, PolicyDeniedCause
 from offeragent_harness.hooks import HookDecision, HookEvent, HookExecutionContext, HookInvocation, HookOutcome
-from offeragent_harness.models import ModelUsage, thaw_json
+from offeragent_harness.models import thaw_json
 from offeragent_harness.permissions import ApprovalRequest, ApprovalResolution, ApprovalState
 from offeragent_harness.ports import CancellationToken, HookLifecyclePort, OperationCancelled, ToolLifecycleObserver
 from offeragent_harness.tools import ToolCall, ToolDefinition, ToolResult, ToolResultStatus
 
-from .budgets import BudgetDelta, BudgetExceeded, BudgetLedger, BudgetReservation
-from .composer import Composer
+from .budgets import BudgetDelta, BudgetExceeded, BudgetLedger
 from .model_planner import ModelProviderFailure
 from .planner import AuditedPlanningFailure, Planner, PlanningAttempt
 from .preparation import RunPreparationFailure, RunPreparationPort
 from .state import ALLOWED_PHASE_TRANSITIONS, RunControlMessage, RunPhase, RunState
-from .termination import StopReason, evaluate_termination
+from .termination import evaluate_response_readiness
 
-_COMPOSITION_EVENT_CHUNK_CHARACTERS = 256
+_ASSISTANT_EVENT_CHUNK_CHARACTERS = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,23 +158,10 @@ async def _run_usage_payload(
     }
 
 
-def _model_usage_payload(usage: ModelUsage) -> dict[str, int | None]:
-    return {
-        "inputTokens": usage.input_tokens,
-        "outputTokens": usage.output_tokens,
-        "cachedInputTokens": usage.cached_input_tokens,
-        "reasoningTokens": usage.reasoning_tokens,
-        "modelCalls": 1,
-        "toolCalls": 0,
-        "costMicros": _cost_micros(usage.cost),
-        "wallTimeMs": 0,
-    }
-
-
 def _failure_category(state: RunState, cause: BaseException) -> str:
     if isinstance(cause, BudgetExceeded):
         return "budget"
-    if state.phase in {RunPhase.PLANNING, RunPhase.COMPOSING}:
+    if state.phase in {RunPhase.PLANNING, RunPhase.RESPONDING}:
         return "model"
     if state.phase in {
         RunPhase.VALIDATING_CALLS,
@@ -234,6 +221,8 @@ _MODEL_PROVIDER_ERROR_CODES: Mapping[str, ErrorCode] = {
     "model_unsupported": ErrorCode.PROVIDER_UNSUPPORTED,
 }
 
+_PROVIDER_PROTOCOL_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
 
 def _error_payload(cause: BaseException, *, category: str, cancelled: bool = False) -> dict[str, object]:
     if isinstance(cause, BudgetExceeded):
@@ -253,6 +242,9 @@ def _error_payload(cause: BaseException, *, category: str, cancelled: bool = Fal
     elif isinstance(cause, ModelProviderFailure):
         details["providerErrorCode"] = cause.error.code
         details["modelRequestId"] = cause.request_id
+        protocol_reason = cause.error.details.get("protocolReason")
+        if isinstance(protocol_reason, str) and _PROVIDER_PROTOCOL_REASON.fullmatch(protocol_reason):
+            details["providerProtocolReason"] = protocol_reason
     return {
         "code": code.value,
         "retryable": retryable,
@@ -612,144 +604,38 @@ async def _resume_recovered_tool_batch(
     return await _commit_phase(state, RunPhase.PLANNING, recorder)
 
 
-def _usage_delta(usage: ModelUsage | None) -> BudgetDelta:
-    if usage is None:
-        return BudgetDelta()
-    return BudgetDelta(
-        input_tokens=usage.input_tokens,
-        output_tokens=usage.output_tokens,
-        cost=usage.cost or Decimal("0"),
-    )
-
-
-async def _compose(
+async def _complete_with_response(
     state: RunState,
     *,
-    partial: bool,
-    composer: Composer,
+    response: str,
     recorder: RunRecorder,
     budget: BudgetLedger,
-    model_call_reservation: BudgetReservation,
     cancellation: CancellationToken,
     now: Callable[[], Any],
     hooks: HookLifecyclePort | None,
     hook_context: HookExecutionContext | None,
 ) -> RunState:
-    hook_sequence = f"composer-{state.model_rounds + 1}"
-    before_model = await _invoke_agent_hook(
-        hooks,
-        hook_context,
-        state,
-        HookEvent.BEFORE_MODEL,
-        hook_sequence,
-        cancellation,
-        {"purpose": "composer", "partial": partial},
-    )
-    _apply_hook_context_hints(composer, before_model)
-    state = await _commit_phase(state, RunPhase.COMPOSING, recorder)
-    await model_call_reservation.consume(BudgetDelta(model_rounds=1))
-    state = replace(state, model_rounds=state.model_rounds + 1, revision=state.revision + 1)
-    await recorder.commit(
-        state,
-        event_type="model.composition.started",
-        payload={"partial": partial},
-    )
-    text_parts: list[str] = []
-    reasoning_summary_parts: list[str] = []
+    cancellation.checkpoint()
+    if not response.strip():
+        raise ValueError("a completed Agent step requires a non-empty final response")
+    state = await _commit_phase(state, RunPhase.RESPONDING, recorder)
     offset = 0
-    pending_text = ""
-    pending_reasoning = ""
-
-    async def flush_text(*, final: bool) -> None:
-        nonlocal offset, pending_text
-        while len(pending_text) >= _COMPOSITION_EVENT_CHUNK_CHARACTERS or (final and pending_text):
-            size = min(len(pending_text), _COMPOSITION_EVENT_CHUNK_CHARACTERS)
-            delta, pending_text = pending_text[:size], pending_text[size:]
-            await recorder.commit(
-                state,
-                event_type="assistant.delta",
-                payload={"blockIndex": 0, "offset": offset, "delta": delta},
-            )
-            offset += len(delta)
-
-    async def flush_reasoning(*, final: bool) -> None:
-        nonlocal pending_reasoning
-        while len(pending_reasoning) >= _COMPOSITION_EVENT_CHUNK_CHARACTERS or (final and pending_reasoning):
-            size = min(len(pending_reasoning), _COMPOSITION_EVENT_CHUNK_CHARACTERS)
-            summary, pending_reasoning = pending_reasoning[:size], pending_reasoning[size:]
-            await recorder.commit(
-                state,
-                event_type="reasoning.summary",
-                payload={"summary": summary, "partial": True},
-            )
-
-    async for event in composer.stream(state, partial=partial, cancellation=cancellation):
+    while offset < len(response):
         cancellation.checkpoint()
-        if event.retry is not None:
-            await flush_text(final=True)
-            await flush_reasoning(final=True)
-            await budget.consume(BudgetDelta(model_rounds=1))
-            state = replace(state, model_rounds=state.model_rounds + 1, revision=state.revision + 1)
-            await recorder.commit(
-                state,
-                event_type="model.composition.started",
-                payload={
-                    "partial": partial,
-                    "requestId": event.retry.request_id,
-                    "retryOfRequestId": event.retry.retry_of_request_id,
-                    "projection": event.retry.projection,
-                    "projectionHash": event.retry.projection_hash,
-                    "omittedContextIds": list(event.retry.omitted_context_ids),
-                    "reason": "context_overflow",
-                },
-            )
-        elif event.text_delta is not None:
-            await flush_reasoning(final=True)
-            text_parts.append(event.text_delta)
-            pending_text += event.text_delta
-            await flush_text(final=False)
-        elif event.reasoning_summary_delta is not None:
-            await flush_text(final=True)
-            reasoning_summary_parts.append(event.reasoning_summary_delta)
-            pending_reasoning += event.reasoning_summary_delta
-            await flush_reasoning(final=False)
-        else:
-            await flush_text(final=True)
-            await flush_reasoning(final=True)
-            await budget.consume(_usage_delta(event.usage))
-            assert event.usage is not None
-            await recorder.commit(
-                state,
-                event_type="usage.updated",
-                payload={
-                    "usage": _model_usage_payload(event.usage),
-                    "scope": "model_call",
-                },
-            )
-    await flush_text(final=True)
-    await flush_reasoning(final=True)
-    if reasoning_summary_parts:
+        delta = response[offset : offset + _ASSISTANT_EVENT_CHUNK_CHARACTERS]
         await recorder.commit(
             state,
-            event_type="reasoning.summary",
-            payload={"summary": "".join(reasoning_summary_parts), "partial": False},
+            event_type="assistant.delta",
+            payload={"blockIndex": 0, "offset": offset, "delta": delta},
         )
-    await _invoke_agent_hook(
-        hooks,
-        hook_context,
-        state,
-        HookEvent.AFTER_MODEL,
-        hook_sequence,
-        cancellation,
-        {"purpose": "composer", "partial": partial, "status": "succeeded"},
-    )
-    state = replace(state, assistant_text="".join(text_parts), revision=state.revision + 1)
+        offset += len(delta)
+    state = replace(state, assistant_text=response, revision=state.revision + 1)
     await recorder.commit(
         state,
         event_type="assistant.completed",
         payload={
             "content": _text_content(state.assistant_text),
-            "finishReason": "length" if partial else "stop",
+            "finishReason": "stop",
         },
     )
     await _invoke_agent_hook(
@@ -759,7 +645,7 @@ async def _compose(
         HookEvent.TURN_STOP,
         "completed",
         cancellation,
-        {"reason": "budget_exhausted" if partial else "completed"},
+        {"reason": "completed"},
     )
     state = await _commit_phase(state, RunPhase.PERSISTING, recorder)
     state = state.transition(RunPhase.COMPLETED)
@@ -767,7 +653,7 @@ async def _compose(
         state,
         event_type="turn.completed",
         payload={
-            "reason": "budget_exhausted" if partial else "completed",
+            "reason": "completed",
             "assistantContent": _text_content(state.assistant_text),
             "usage": await _run_usage_payload(state, budget, now=now),
         },
@@ -953,7 +839,6 @@ async def run_agent_loop(
     initial_state: RunState,
     *,
     planner: Planner,
-    composer: Composer,
     tool_kernel: ToolKernel,
     recorder: RunRecorder,
     budget: BudgetLedger,
@@ -974,13 +859,10 @@ async def run_agent_loop(
     if recovered_tool_batch is None:
         if state.phase is not RunPhase.CREATED:
             raise ValueError("a fresh Agent Loop must start from the created phase")
-        composer_reservation = await budget.reserve(BudgetDelta(model_rounds=1))
     else:
         checkpoint = state.budget_checkpoint
         if checkpoint is None:
             raise ValueError("a recovered Agent Loop requires a durable budget checkpoint")
-        if checkpoint.reserved != BudgetDelta(model_rounds=1):
-            raise ValueError("a recovered Agent Loop requires exactly one Composer model-round reservation")
         snapshot = await budget.snapshot(now=checkpoint.captured_at)
         if (
             budget.budget != checkpoint.budget
@@ -990,7 +872,6 @@ async def run_agent_loop(
             or snapshot.elapsed_seconds != checkpoint.elapsed_seconds
         ):
             raise ValueError("recovered Agent Loop budget ledger does not match its durable checkpoint")
-        composer_reservation = await budget.adopt_reservation(BudgetDelta(model_rounds=1))
     try:
         cancellation.checkpoint()
         await _invoke_agent_hook(
@@ -1029,21 +910,6 @@ async def run_agent_loop(
             try:
                 await budget.consume(BudgetDelta(model_rounds=1))
             except BudgetExceeded as exhausted:
-                decision = evaluate_termination(state, reason=StopReason.BUDGET_EXHAUSTED)
-                if decision.can_compose:
-                    return await _compose(
-                        state,
-                        partial=True,
-                        composer=composer,
-                        recorder=recorder,
-                        budget=budget,
-                        model_call_reservation=composer_reservation,
-                        cancellation=cancellation,
-                        now=now,
-                        hooks=hooks,
-                        hook_context=hook_context,
-                    )
-                await composer_reservation.release()
                 return await _failed(state, recorder, exhausted, budget=budget, now=now)
 
             planning_in_flight = True
@@ -1086,15 +952,14 @@ async def run_agent_loop(
                 )
 
             if not step.calls:
-                decision = evaluate_termination(state, reason=StopReason.MODEL_FINISHED)
-                if decision.can_compose:
-                    return await _compose(
+                decision = evaluate_response_readiness(state)
+                if decision.can_respond:
+                    assert step.final_response is not None
+                    return await _complete_with_response(
                         state,
-                        partial=decision.partial,
-                        composer=composer,
+                        response=step.final_response,
                         recorder=recorder,
                         budget=budget,
-                        model_call_reservation=composer_reservation,
                         cancellation=cancellation,
                         now=now,
                         hooks=hooks,
@@ -1151,22 +1016,17 @@ async def run_agent_loop(
             state = _restore_planned_result_order(state, expected_ids)
             state = await _commit_phase(state, RunPhase.PLANNING, recorder)
     except OperationCancelled as cancelled:
-        await composer_reservation.release()
         return await _cancelled(state, recorder, cancelled, budget=budget, now=now)
     except asyncio.CancelledError as cancelled:
-        await composer_reservation.release()
         return await _native_interrupted(state, recorder, cancelled, budget=budget, now=now)
     except AgentLoopFailure:
         raise
     except BaseException as cause:
-        await composer_reservation.release()
         if planning_in_flight:
             if isinstance(cause, AuditedPlanningFailure) and cause.planning_attempts:
                 state = await _record_planning_attempts(state, cause.planning_attempts, recorder)
         failed = await _failed(state, recorder, cause, budget=budget, now=now)
         raise AgentLoopFailure(failed, cause) from cause
-    finally:
-        await composer_reservation.release()
 
 
 __all__ = [

@@ -31,7 +31,7 @@
       "sizeBytes": 275
     },
     "examples/initialize.response.json": {
-      "sha256": "sha256:ac7b75529b1bc65b2ef8a75828abe51061a8b157a8d461072d2bc9bed8c28e2f",
+      "sha256": "sha256:0255033a7b22d375651b33c7a89dde7784336efda8a80ee24ae12a5187fe1950",
       "sizeBytes": 828
     },
     "examples/rpc-cancel.notification.json": {
@@ -51,14 +51,14 @@
       "sizeBytes": 150
     },
     "offeragent-protocol-v1.schema.json": {
-      "sha256": "sha256:7c2d0bee45032d24289a368eb276d502f956662c8252f39d54a40276a4d145ec",
-      "sizeBytes": 210239
+      "sha256": "sha256:bf5d2343d754e26b916bd410ce027f2a76f72e849b5ef43bd41a26a2990b1916",
+      "sizeBytes": 208050
     }
   },
   "generatorVersion": "1",
   "manifestVersion": 1,
   "protocolVersion": "1.0",
   "schemaBundle": "offeragent-protocol-v1.schema.json",
-  "schemaHash": "sha256:7c2d0bee45032d24289a368eb276d502f956662c8252f39d54a40276a4d145ec",
+  "schemaHash": "sha256:bf5d2343d754e26b916bd410ce027f2a76f72e849b5ef43bd41a26a2990b1916",
   "schemaVersion": "1"
 }

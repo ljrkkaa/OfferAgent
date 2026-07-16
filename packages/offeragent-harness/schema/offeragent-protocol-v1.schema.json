@@ -1745,9 +1745,6 @@
           "$ref": "#/$defs/ModelAttemptPayload"
         },
         {
-          "$ref": "#/$defs/ModelCompositionStartedPayload"
-        },
-        {
           "$ref": "#/$defs/ToolCallsAcceptedPayload"
         },
         {
@@ -1797,7 +1794,6 @@
         "turn.failed",
         "runtime.warning",
         "model.attempt",
-        "model.composition.started",
         "tool.calls.accepted",
         "write.outcome_required",
         "run.continuation_required",
@@ -3136,93 +3132,6 @@
         "outputTokens"
       ],
       "title": "ModelAttemptUsage",
-      "type": "object"
-    },
-    "ModelCompositionStartedPayload": {
-      "additionalProperties": false,
-      "properties": {
-        "omittedContextIds": {
-          "items": {
-            "type": "string"
-          },
-          "maxItems": 4096,
-          "title": "Omittedcontextids",
-          "type": "array"
-        },
-        "partial": {
-          "title": "Partial",
-          "type": "boolean"
-        },
-        "projection": {
-          "anyOf": [
-            {
-              "const": "overflow_references",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Projection"
-        },
-        "projectionHash": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Sha256Digest"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "reason": {
-          "anyOf": [
-            {
-              "const": "context_overflow",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Reason"
-        },
-        "requestId": {
-          "anyOf": [
-            {
-              "maxLength": 256,
-              "minLength": 1,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Requestid"
-        },
-        "retryOfRequestId": {
-          "anyOf": [
-            {
-              "maxLength": 256,
-              "minLength": 1,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Retryofrequestid"
-        }
-      },
-      "required": [
-        "partial"
-      ],
-      "title": "ModelCompositionStartedPayload",
       "type": "object"
     },
     "ModelDescriptor": {
@@ -4872,7 +4781,7 @@
         "executing_tools",
         "recording_results",
         "waiting_children",
-        "composing",
+        "responding",
         "persisting",
         "cancelling",
         "terminal"
@@ -8862,11 +8771,6 @@
     "model.attempt": {
       "payload": {
         "$ref": "#/$defs/ModelAttemptPayload"
-      }
-    },
-    "model.composition.started": {
-      "payload": {
-        "$ref": "#/$defs/ModelCompositionStartedPayload"
       }
     },
     "phase.changed": {

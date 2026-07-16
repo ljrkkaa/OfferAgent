@@ -75,7 +75,7 @@ def _request(*, output_mode: ModelOutputMode = ModelOutputMode.TEXT) -> ModelReq
     return ModelRequest(
         request_id="req_deepseek_test",
         model="deepseek-v4-flash",
-        purpose=ModelPurpose.PLANNING if output_mode is ModelOutputMode.JSON else ModelPurpose.COMPOSING,
+        purpose=ModelPurpose.PLANNING if output_mode is ModelOutputMode.JSON else ModelPurpose.RESPONDING,
         messages=(
             ModelMessage(ModelRole.SYSTEM, (ModelContentBlock.text("system boundary"),)),
             ModelMessage(ModelRole.USER, (ModelContentBlock.text("user prompt"),)),
@@ -285,7 +285,7 @@ async def test_json_mode_injects_canonical_schema_prompt_and_validates_locally()
 
 
 @pytest.mark.asyncio
-async def test_json_mode_rejects_schema_invalid_provider_output_without_echo() -> None:
+async def test_json_mode_emits_object_for_canonical_agent_step_validation() -> None:
     private_output = '{"answer":"","unexpected":"private payload"}'
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -300,10 +300,13 @@ async def test_json_mode_rejects_schema_invalid_provider_output_without_echo() -
         _request(output_mode=ModelOutputMode.JSON),
     )
 
-    assert [event.kind for event in events] == [ModelEventKind.STARTED, ModelEventKind.ERROR]
-    assert events[-1].error is not None
-    assert events[-1].error.code == "provider_protocol_error"
-    assert "private payload" not in repr(events[-1])
+    assert [event.kind for event in events] == [
+        ModelEventKind.STARTED,
+        ModelEventKind.STRUCTURED_OUTPUT,
+        ModelEventKind.USAGE,
+        ModelEventKind.COMPLETED,
+    ]
+    assert events[1].data == {"answer": "", "unexpected": "private payload"}
 
 
 @pytest.mark.asyncio
@@ -348,6 +351,12 @@ async def test_incomplete_or_remote_tool_streams_fail_closed(failure: str) -> No
     assert events[-1].kind is ModelEventKind.ERROR
     assert events[-1].error is not None
     assert events[-1].error.code == "provider_protocol_error"
+    expected_reason = {
+        "missing_usage": "terminal_metadata_missing",
+        "tool_calls": "unrequested_remote_tool_call",
+        "missing_done": "stream_terminal_event_missing",
+    }[failure]
+    assert events[-1].error.details == {"providerId": "deepseek", "protocolReason": expected_reason}
     assert all(event.kind is not ModelEventKind.COMPLETED for event in events)
 
 

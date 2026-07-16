@@ -87,6 +87,7 @@ export class ChatStore {
     private unsubscribeEvents: (() => void) | null = null;
     private readonly sessionHydrations = new Map<string, Promise<HydratedSession>>();
     private readonly sendsInFlight = new Set<string>();
+    private readonly sessionMutationsInFlight = new Set<string>();
     private readonly pendingSubmissions = new Map<string, PendingSubmission>();
 
     constructor(client: HarnessClient, persistence: ChatStorePersistence) {
@@ -331,7 +332,9 @@ export class ChatStore {
     }
 
     async retry(sessionId: string, turnId: string, sourceRunId: string, runConfig?: TurnRunConfig): Promise<JsonObject> {
-        return this.operation(async () => requireJsonObject(await this.client.request("turn/retry", {
+        requireId(turnId, "turn_");
+        requireId(sourceRunId, "run_");
+        return this.sessionMutation(sessionId, async () => requireJsonObject(await this.client.request("turn/retry", {
             sessionId,
             turnId,
             sourceRunId,
@@ -377,9 +380,8 @@ export class ChatStore {
     }
 
     async compact(sessionId: string, throughTurnId: string | null = null, force = false): Promise<JsonObject> {
-        requireId(sessionId, "ses_");
         if (throughTurnId !== null) requireId(throughTurnId, "turn_");
-        return this.operation(async () => requireJsonObject(await this.client.request("session/compact", {
+        return this.sessionMutation(sessionId, async () => requireJsonObject(await this.client.request("session/compact", {
             sessionId,
             throughTurnId,
             force,
@@ -387,7 +389,9 @@ export class ChatStore {
     }
 
     async fork(sessionId: string, turnId: string, runId: string | null = null, title: string | null = null): Promise<string> {
-        return this.operation(async () => {
+        requireId(turnId, "turn_");
+        if (runId !== null) requireId(runId, "run_");
+        return this.sessionMutation(sessionId, async () => {
             const result = requireJsonObject(await this.client.request("session/fork", {
                 sessionId,
                 forkTurnId: turnId,
@@ -423,6 +427,22 @@ export class ChatStore {
         } finally {
             this.operationCount -= 1;
             this.emit();
+        }
+    }
+
+    private async sessionMutation<T>(sessionId: string, action: () => Promise<T>): Promise<T> {
+        requireId(sessionId, "ses_");
+        if (this.sessionHasActiveRun(sessionId)) {
+            throw new Error("当前会话仍有运行中的任务；请等待完成或先取消当前任务");
+        }
+        if (this.sessionMutationsInFlight.has(sessionId)) {
+            throw new Error("当前会话已有操作正在提交，请等待完成");
+        }
+        this.sessionMutationsInFlight.add(sessionId);
+        try {
+            return await this.operation(action);
+        } finally {
+            this.sessionMutationsInFlight.delete(sessionId);
         }
     }
 

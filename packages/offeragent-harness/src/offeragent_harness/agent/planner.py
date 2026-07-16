@@ -59,19 +59,18 @@ class PlanningAttempt:
 class PlanningStep:
     calls: tuple[ToolCall, ...]
     requires_write_outcome: bool
-    stop_reason: str | None
-    usage: ModelUsage | None = None
+    final_response: str | None
     attempts: tuple[PlanningAttempt, ...] = ()
 
     def __post_init__(self) -> None:
         call_ids = [call.tool_call_id for call in self.calls]
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("planning step contains duplicate tool_call_id values")
-        if self.calls and self.stop_reason is not None:
-            raise ValueError("a planning step with calls cannot also declare stop_reason")
+        if self.calls and self.final_response is not None:
+            raise ValueError("a planning step with calls cannot also contain a final response")
+        if not self.calls and (self.final_response is None or not self.final_response.strip()):
+            raise ValueError("a planning step without calls requires a non-empty final response")
         if self.attempts:
-            if self.usage is not None:
-                raise ValueError("audited planning attempts and legacy step usage are mutually exclusive")
             request_ids = [attempt.request_id for attempt in self.attempts]
             if len(request_ids) != len(set(request_ids)):
                 raise ValueError("planning attempts contain duplicate request IDs")

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
 
 from offeragent_harness.agent import RunBudget
-from offeragent_harness.agent.composer import CompositionEvent
 from offeragent_harness.agent.loop import ToolExecution, ToolKernel
 from offeragent_harness.agent.planner import Planner, PlanningAttempt, PlanningAttemptOutcome, PlanningStep
 from offeragent_harness.agent.state import RunState
@@ -89,12 +88,12 @@ def _audited_step(
     state: RunState,
     calls: tuple[ToolCall, ...],
     requires_write_outcome: bool,
-    stop_reason: str | None,
+    final_response: str | None,
 ) -> PlanningStep:
     return PlanningStep(
         calls,
         requires_write_outcome,
-        stop_reason,
+        final_response,
         attempts=(
             PlanningAttempt(
                 request_id=f"test-replay-{state.model_rounds + 1}",
@@ -104,19 +103,6 @@ def _audited_step(
             ),
         ),
     )
-
-
-class _Composer:
-    async def stream(
-        self,
-        state: RunState,
-        *,
-        partial: bool,
-        cancellation: CancellationToken,
-    ) -> AsyncIterator[CompositionEvent]:
-        del state, partial
-        cancellation.checkpoint()
-        yield CompositionEvent(text_delta="answer")
 
 
 class _NoToolKernel:
@@ -290,7 +276,6 @@ class _Components:
         return RunComponents(
             planner_factory=lambda budget: planner,
             tool_kernel_factory=lambda budget: kernel,
-            composer=_Composer(),
             budget=RunBudget(8, 8, 2, 60, 1_000, 1_000, Decimal("1"), 10_000, 2),
         )
 

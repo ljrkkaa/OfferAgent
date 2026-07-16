@@ -18,6 +18,7 @@ from offeragent_harness.runtime.windows_process import (
     PinnedWorkerExecutableVerifier,
     WindowsProcessError,
     WindowsWorkerJob,
+    current_user_profile_directory,
     fixed_worker_argv,
     minimal_worker_environment,
     trusted_worker_environment,
@@ -192,6 +193,7 @@ def test_production_environment_ignores_poisoned_parent_environment(monkeypatch:
         "WINDIR",
     }
     assert all(Path(value).is_absolute() and Path(value).is_dir() for value in environment.values())
+    assert current_user_profile_directory() == Path(environment["USERPROFILE"])
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows path rules")

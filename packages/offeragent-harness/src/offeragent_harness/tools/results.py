@@ -100,6 +100,7 @@ class ToolResult:
     # intentionally retained as the opaque identifier set consumed by
     # Context/Memory/Compaction; it is not safe to project directly into UI.
     source_references: tuple[Mapping[str, Any], ...] = ()
+    context_activations: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.tool_call_id or not self.user_visible_summary:
@@ -123,6 +124,10 @@ class ToolResult:
                 raise TypeError("tool result source references must be JSON objects")
             source_references.append(frozen)
         object.__setattr__(self, "source_references", tuple(source_references))
+        if len(self.context_activations) != len(set(self.context_activations)) or any(
+            not value or len(value) > 256 or "\x00" in value for value in self.context_activations
+        ):
+            raise ValueError("tool result context activations must be unique bounded identifiers")
         if self.status is ToolResultStatus.SUCCEEDED and self.error is not None:
             raise ValueError("successful tool result cannot contain an error")
         if self.status is not ToolResultStatus.SUCCEEDED and self.error is None:

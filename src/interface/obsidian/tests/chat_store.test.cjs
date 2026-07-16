@@ -562,6 +562,60 @@ test("send refuses a second root Turn while the Session has a nonterminal Run", 
     assert.equal(requests, 0);
 });
 
+test("retry fork and compact are blocked locally while the Session has an active Run", async () => {
+    const { ChatStore } = loadModule("chat_store.ts");
+    let requests = 0;
+    const client = createClient(async () => { requests += 1; return {}; });
+    const store = new ChatStore(client, memoryPersistence({
+        schemaVersion: 1,
+        activeTabId: "tab_active_mutation",
+        tabs: [{
+            tabId: "tab_active_mutation",
+            sessionId: SESSION,
+            title: "Active",
+            draft: "",
+            selectedRunId: RUN,
+        }],
+    }));
+    await store.initialize();
+    client.reducer.accept(runEvent(1, "turn.started", { input: [{ type: "text", text: "running" }] }));
+
+    await assert.rejects(store.retry(SESSION, TURN, RUN, runConfig), /仍有运行中的任务/);
+    await assert.rejects(store.fork(SESSION, TURN, RUN), /仍有运行中的任务/);
+    await assert.rejects(store.compact(SESSION, TURN), /仍有运行中的任务/);
+    assert.equal(requests, 0);
+});
+
+test("Session mutations are single-flight before the Worker reply", async () => {
+    const { ChatStore } = loadModule("chat_store.ts");
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const calls = [];
+    const client = createClient(async (method) => {
+        calls.push(method);
+        await gate;
+        return { accepted: true };
+    });
+    const store = new ChatStore(client, memoryPersistence({
+        schemaVersion: 1,
+        activeTabId: "tab_mutation_flight",
+        tabs: [{
+            tabId: "tab_mutation_flight",
+            sessionId: SESSION,
+            title: "Terminal",
+            draft: "",
+            selectedRunId: RUN,
+        }],
+    }));
+    await store.initialize();
+
+    const retry = store.retry(SESSION, TURN, RUN, runConfig);
+    await assert.rejects(store.compact(SESSION, TURN), /已有操作正在提交/);
+    assert.deepEqual(calls, ["turn/retry"]);
+    release();
+    await retry;
+});
+
 test("semantic events update the selected Run without UI terminal heuristics", async () => {
     const { ChatStore } = loadModule("chat_store.ts");
     const client = createClient(async () => ({}));

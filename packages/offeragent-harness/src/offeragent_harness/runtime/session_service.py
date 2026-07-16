@@ -80,15 +80,15 @@ class SessionNotFound(SessionLifecycleError, ResourceNotFoundCause):
 
 
 class SessionDeleted(SessionLifecycleError, ResourceConflictCause):
-    pass
+    conflict_reason = "session_deleted"
 
 
 class SessionRevisionConflict(SessionLifecycleError, ResourceConflictCause):
-    pass
+    conflict_reason = "session_revision_conflict"
 
 
 class SessionIdempotencyConflict(SessionLifecycleError, ResourceConflictCause):
-    pass
+    conflict_reason = "session_idempotency_conflict"
 
 
 class SessionProjectionCorrupt(SessionLifecycleError):
@@ -96,19 +96,19 @@ class SessionProjectionCorrupt(SessionLifecycleError):
 
 
 class SessionOperationConflict(SessionLifecycleError, ResourceConflictCause):
-    pass
+    conflict_reason = "session_operation_in_progress"
 
 
 class SessionActiveEffectfulRun(SessionLifecycleError, ResourceConflictCause):
-    pass
+    conflict_reason = "session_active_effectful_run"
 
 
 class SessionActiveRunUnavailable(SessionLifecycleError, ResourceConflictCause):
-    pass
+    conflict_reason = "session_active_run_unavailable"
 
 
 class SessionForkRejected(SessionLifecycleError, ResourceConflictCause):
-    pass
+    conflict_reason = "session_fork_rejected"
 
 
 class SessionCreateState(str, Enum):

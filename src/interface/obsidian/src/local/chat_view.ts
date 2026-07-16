@@ -9,7 +9,7 @@ import type {
     TimelineItem,
     ToolCallTimelineItem,
 } from "../runtime/event_reducer";
-import { JsonObject } from "../runtime/json_rpc";
+import { JsonObject, RemoteRpcError } from "../runtime/json_rpc";
 import { sourceReferenceLabel, vaultReferenceTarget } from "../runtime/source_references";
 import { LocalOfferAgentSettings, effectivePermissionMode, runConfig } from "./settings";
 
@@ -161,7 +161,12 @@ export class LocalChatView extends ItemView {
         const panel = root.createDiv({ cls: "offeragent-runtime-state" });
         panel.createEl("h3", { text: runtimeTitle(snapshot.state) });
         panel.createEl("p", { text: runtimeDescription(snapshot) });
-        if (snapshot.error) panel.createEl("code", { text: snapshot.error.code });
+        if (snapshot.error) {
+            const code = snapshot.error.causeCode
+                ? `${snapshot.error.code} · ${snapshot.error.causeCode}`
+                : snapshot.error.code;
+            panel.createEl("code", { text: code });
+        }
     }
 
     private renderTabs(root: HTMLElement, snapshot: ChatStoreSnapshot): void {
@@ -265,14 +270,20 @@ export class LocalChatView extends ItemView {
         if (run.usage) footer.createSpan({ text: usageLabel(run.usage) });
         if (isTerminal(run.status)) {
             const actions = footer.createDiv({ cls: "offeragent-run-actions" });
+            const snapshot = this.snapshot;
+            const blocked = snapshot === null || snapshot.busy || this.sendPending ||
+                activeRunForTab(snapshot, run.sessionId, null) !== undefined;
             const retry = actions.createEl("button", { text: "重试" });
+            retry.disabled = blocked;
             retry.onclick = () => void this.store?.retry(
                 run.sessionId, run.turnId, run.runId, runConfig(this.host.settings),
             ).catch((error) => new Notice(actionableMessage(error)));
             const fork = actions.createEl("button", { text: "Fork" });
+            fork.disabled = blocked;
             fork.onclick = () => void this.store?.fork(run.sessionId, run.turnId, run.runId)
                 .catch((error) => new Notice(actionableMessage(error)));
             const compact = actions.createEl("button", { text: "压缩至此" });
+            compact.disabled = blocked;
             compact.onclick = () => void this.store?.compact(run.sessionId, run.turnId)
                 .catch((error) => new Notice(actionableMessage(error)));
         }
@@ -560,7 +571,7 @@ function phaseLabel(phase: string | null): string {
         awaiting_approval: "等待审批…",
         executing_tools: "正在执行工具…",
         waiting_children: "等待子任务…",
-        composing: "正在组织回答…",
+        responding: "正在组织回答…",
         persisting: "正在保存结果…",
         cancelling: "正在取消…",
     };
@@ -589,6 +600,25 @@ function safeJson(value: JsonObject): string {
 }
 
 function actionableMessage(error: unknown): string {
+    if (error instanceof RemoteRpcError && error.envelope.code === "resource.conflict") {
+        const reason = error.envelope.details?.reason;
+        if ([
+            "session_active_or_mutating",
+            "session_active_run",
+            "session_operation_in_progress",
+            "session_active_effectful_run",
+            "session_active_run_unavailable",
+        ].includes(typeof reason === "string" ? reason : "")) {
+            return "OfferAgent：当前会话仍有任务运行或会话操作尚未完成；请等待完成，或先取消当前任务。";
+        }
+        if (reason === "session_revision_conflict") {
+            return "OfferAgent：会话已被其他操作更新，请重新打开会话后再试。";
+        }
+        if (reason === "session_fork_rejected") {
+            return "OfferAgent：当前节点不能 Fork；请选择已完成且仍存在的对话节点。";
+        }
+        return "OfferAgent：资源状态已变化，请刷新当前会话后重试。";
+    }
     return error instanceof Error ? `OfferAgent：${error.message}` : "OfferAgent 操作失败，请打开诊断。";
 }
 

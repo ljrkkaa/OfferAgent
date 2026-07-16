@@ -11,6 +11,7 @@ from . import (
     v0003_remove_obsolete_runtime_config,
     v0004_remove_client_vault_authority,
     v0005_remove_obsolete_write_intent_snapshots,
+    v0006_canonicalize_tool_result_context,
 )
 
 
@@ -71,6 +72,12 @@ MIGRATIONS = (
         v0005_remove_obsolete_write_intent_snapshots.VERSION,
         v0005_remove_obsolete_write_intent_snapshots.NAME,
         v0005_remove_obsolete_write_intent_snapshots.STATEMENTS,
+        vacuum_after=True,
+    ),
+    Migration.create(
+        v0006_canonicalize_tool_result_context.VERSION,
+        v0006_canonicalize_tool_result_context.NAME,
+        v0006_canonicalize_tool_result_context.STATEMENTS,
         vacuum_after=True,
     ),
 )

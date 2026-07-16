@@ -1597,7 +1597,7 @@ def _status_for_phase(phase: str, fallback: SubagentRunStatus) -> SubagentRunSta
         return SubagentRunStatus.WAITING_APPROVAL
     if phase == "executing_tools":
         return SubagentRunStatus.WAITING_TOOL
-    if phase in {"composing", "persisting", "recording_results"}:
+    if phase in {"responding", "persisting", "recording_results"}:
         return SubagentRunStatus.COMPLETING
     if phase == "cancelling":
         return SubagentRunStatus.CANCEL_REQUESTED

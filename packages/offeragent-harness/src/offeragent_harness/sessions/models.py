@@ -45,7 +45,7 @@ class RunStatus(str, Enum):
     RECORDING_RESULTS = "recording_results"
     WAITING_TOOL = "waiting_tool"
     WAITING_CHILDREN = "waiting_children"
-    COMPOSING = "composing"
+    RESPONDING = "responding"
     PERSISTING = "persisting"
     COMPLETING = "completing"
     CANCELLING = "cancelling"

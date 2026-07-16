@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import sqlite3
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -14,7 +14,6 @@ import pytest
 
 from offeragent_harness.adapters.sqlite_stores import SqliteUnitOfWork, SqliteUnitOfWorkFactory
 from offeragent_harness.agent import RunBudget
-from offeragent_harness.agent.composer import CompositionEvent
 from offeragent_harness.agent.loop import ToolExecution, ToolKernel
 from offeragent_harness.agent.planner import Planner, PlanningAttempt, PlanningAttemptOutcome, PlanningStep
 from offeragent_harness.agent.state import PendingWork, RunPhase, RunState
@@ -740,9 +739,20 @@ class _PauseAfterDeleteGate(SessionLifecycleService):
 
 class _StopPlanner:
     async def plan(self, state: RunState, cancellation: CancellationToken) -> PlanningStep:
-        del state
         cancellation.checkpoint()
-        return PlanningStep((), False, "done")
+        return PlanningStep(
+            (),
+            False,
+            "done",
+            attempts=(
+                PlanningAttempt(
+                    request_id=f"test-stop-{state.model_rounds + 1}",
+                    repair_index=0,
+                    outcome=PlanningAttemptOutcome.SUCCEEDED,
+                    usage=ModelUsage(0, 0, 0, 0),
+                ),
+            ),
+        )
 
 
 class _WaitingPlanner:
@@ -866,23 +876,6 @@ class _HistoricalEffectKernel:
         return (execution,)
 
 
-class _Composer:
-    def stream(
-        self,
-        state: RunState,
-        *,
-        partial: bool,
-        cancellation: CancellationToken,
-    ) -> AsyncIterator[CompositionEvent]:
-        del state, partial
-
-        async def generate() -> AsyncIterator[CompositionEvent]:
-            cancellation.checkpoint()
-            yield CompositionEvent(text_delta="answer")
-
-        return generate()
-
-
 class _NoToolKernel:
     async def execute_batch(
         self,
@@ -904,7 +897,6 @@ class _Components:
         return RunComponents(
             planner_factory=lambda _budget: self._planner,
             tool_kernel_factory=lambda _budget: self._kernel,
-            composer=_Composer(),
             budget=RunBudget(
                 max_model_rounds=4,
                 max_tool_calls=4,

@@ -2,13 +2,13 @@
 
 | 旧测试/行为 | 必须保留的不变量 | 新测试层 | 状态 |
 |---|---|---|---|
-| `test_tool_protocol.py` | canonical ToolPlan、严格 Schema、未知字段拒绝 | `unit/tools`、`schema`、Tool Kernel contract | 已迁移 |
+| `test_tool_protocol.py` | canonical AgentStep、严格 Schema、未知字段拒绝 | `unit/tools`、`schema`、Tool Kernel contract | 已迁移 |
 | `test_agent_tool_loop.py` | 只读并发、写串行、顺序稳定、兄弟失败隔离 | `unit/agent`、`unit/tools`、Tool Kernel contract | 已迁移 |
 | `test_conversation_turn.py` | terminal exactly-once、重复 turn 幂等、interrupted 恢复 | Session lifecycle、SQLite UoW、startup recovery | 已迁移 |
 | `test_vault_actions.py` | Diff、expectedHash、冲突、幂等、ACK 丢失、回滚/人工复核 | Worker-local Vault transaction、recovery integration | 已迁移 |
-| `test_local_kb.py` | root containment、范围/限额、来源 hash、链接解析 | Workspace path/filesystem、Vault read、Markdown file-tool tests | 已迁移 |
-| `test_knowledge_workspace.py` | 来源绑定、read-before-edit、Skill 路径安全 | File Tool Kernel、Skill trust/state/tool tests | 已迁移 |
-| `test_codex_conversation_adapter.py` | Provider payload/normalization、真流式、取消、usage | OpenAI/Ollama ModelGateway、Planner/Composer contracts | 已迁移 |
+| 旧本地知识检索测试 | root containment、范围/限额、来源 hash、链接解析 | Workspace path/filesystem、Vault read、Markdown file-tool tests | 已按文件工具架构重写 |
+| 旧知识工作区测试 | 来源绑定、read-before-edit、Skill 路径安全 | File Tool Kernel、Skill trust/state/tool tests | 已按文件工具架构重写 |
+| `test_codex_conversation_adapter.py` | Provider payload/normalization、真流式、取消、usage | OpenAI/Ollama ModelGateway、统一 AgentStep contract | 已迁移 |
 | 旧 HTTP/Router tests | 相同用户场景，不保留 Router/HTTP 所有权 | 真实 Named Pipe + Loopback identity/conformance | 已重写 |
 | 插件旧 tests | 流拆包、stale event、写前检查等目标语义 | Generated protocol、EventReducer 与只读事件客户端 | 已重写 |
 

@@ -19,6 +19,8 @@ class ResourceConflictCause:
     """Marker for a domain exception that must cross the wire as state conflict."""
 
     __slots__ = ()
+    conflict_reason = "resource_state_conflict"
+    conflict_user_message = "requested operation conflicts with current resource state"
 
 
 class RuntimeNotReadyCause:

@@ -76,7 +76,7 @@ class _CrashRecoveryModel:
                 output: dict[str, Any] = {
                     "requiresWriteOutcome": True,
                     "calls": [],
-                    "stopReason": "已根据恢复后的持久化工具结果结束。",
+                    "finalResponse": "已依据持久化的工具结果完成恢复。",
                 }
             else:
                 arguments = {
@@ -99,17 +99,9 @@ class _CrashRecoveryModel:
                             "reason": "执行用户明确要求的单文件追加。",
                         }
                     ],
-                    "stopReason": None,
+                    "finalResponse": None,
                 }
             yield ModelEvent(request.request_id, sequence, ModelEventKind.STRUCTURED_OUTPUT, data=output)
-            sequence += 1
-        elif request.purpose is ModelPurpose.COMPOSING:
-            yield ModelEvent(
-                request.request_id,
-                sequence,
-                ModelEventKind.TEXT_DELTA,
-                text="已依据持久化的工具结果完成恢复。",
-            )
             sequence += 1
         elif request.purpose is not ModelPurpose.GROUNDING:
             raise AssertionError(f"unexpected model purpose: {request.purpose}")

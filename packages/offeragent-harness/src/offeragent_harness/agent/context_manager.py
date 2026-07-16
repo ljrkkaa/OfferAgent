@@ -11,6 +11,7 @@ import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import timedelta, timezone, tzinfo
 from enum import Enum
 from typing import Any
 
@@ -238,6 +239,7 @@ class ContextManager:
         inputs: ContextInputs,
         visibility: ContextVisibilityPolicy,
         budget: ContextBudget,
+        local_timezone: tzinfo | None = None,
     ) -> None:
         if not system_rules or any(not rule for rule in system_rules):
             raise ValueError("system_rules must contain non-empty rules")
@@ -245,6 +247,7 @@ class ContextManager:
         self._inputs = inputs
         self._visibility = visibility
         self._budget = budget
+        self._local_timezone = local_timezone
 
     @property
     def inputs(self) -> ContextInputs:
@@ -256,6 +259,7 @@ class ContextManager:
             inputs=inputs,
             visibility=self._visibility,
             budget=self._budget,
+            local_timezone=self._local_timezone,
         )
 
     def with_memories(self, memories: Sequence[ContextFragment]) -> ContextManager:
@@ -641,9 +645,8 @@ class ContextManager:
             tuple(dict.fromkeys(compaction_reasons)),
         )
 
-    @staticmethod
-    def _run_snapshot(state: RunState, purpose: ModelPurpose) -> dict[str, object]:
-        return {
+    def _run_snapshot(self, state: RunState, purpose: ModelPurpose) -> dict[str, object]:
+        snapshot: dict[str, object] = {
             "workspaceId": state.workspace_id,
             "sessionId": state.session_id,
             "turnId": state.turn_id,
@@ -675,7 +678,37 @@ class ContextManager:
                 "approvalIds": sorted(state.pending.approval_ids),
                 "childRunIds": sorted(state.pending.child_run_ids),
             },
+            "activeContexts": sorted(
+                {activation for result in state.tool_results for activation in result.context_activations}
+            ),
         }
+        checkpoint = state.budget_checkpoint
+        if self._local_timezone is not None:
+            if checkpoint is None:
+                raise ValueError("a production temporal context requires a durable Run budget checkpoint")
+            local_started = checkpoint.started_at.astimezone(self._local_timezone)
+            week_start = local_started.date() - timedelta(days=local_started.weekday())
+            iso_year, iso_week, _ = local_started.date().isocalendar()
+            offset = local_started.utcoffset()
+            if offset is None:
+                raise ValueError("local Run timezone must produce a UTC offset")
+            offset_seconds = int(offset.total_seconds())
+            sign = "+" if offset_seconds >= 0 else "-"
+            absolute = abs(offset_seconds)
+            snapshot["time"] = {
+                "runStartedAtUtc": checkpoint.started_at.astimezone(timezone.utc).isoformat(),
+                "localDateTime": local_started.isoformat(timespec="seconds"),
+                "localDate": local_started.date().isoformat(),
+                "utcOffset": f"{sign}{absolute // 3600:02d}:{absolute % 3600 // 60:02d}",
+                "timeZoneName": local_started.tzname() or "",
+                "isoWeek": {
+                    "year": iso_year,
+                    "week": iso_week,
+                    "startDate": week_start.isoformat(),
+                    "endDate": (week_start + timedelta(days=6)).isoformat(),
+                },
+            }
+        return snapshot
 
     @staticmethod
     def _fragment_message(fragment: ContextFragment) -> ModelMessage:
@@ -744,6 +777,7 @@ class ContextManager:
                 "data": thaw_json(result.data),
                 "artifactIds": list(result.artifact_ids),
                 "sourceRefs": list(result.source_refs),
+                "contextActivations": list(result.context_activations),
                 "retryable": result.retryable,
                 "beforeState": thaw_json(result.before_state),
                 "afterState": thaw_json(result.after_state),
@@ -796,6 +830,7 @@ class ContextManager:
                 "summary": _bounded_text(result.user_visible_summary, 2_048),
                 "artifactIds": list(result.artifact_ids),
                 "sourceRefs": list(result.source_refs),
+                "contextActivations": list(result.context_activations),
                 "retryable": result.retryable,
                 "criticalHashes": critical_hashes,
                 "stateHashes": state_hashes,

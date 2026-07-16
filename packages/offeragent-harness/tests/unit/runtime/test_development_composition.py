@@ -9,6 +9,7 @@ import pytest
 from offeragent_harness.runtime import development_composition, production_host_composition
 from offeragent_harness.runtime.host_supervisor import RestartPolicy
 from offeragent_harness.runtime.production_worker_composition import _protocol_capabilities
+from offeragent_harness.runtime.startup import RuntimeStartupBlocked, StartupFailurePhase
 
 
 def test_development_host_overrides_only_worker_cold_start_budget(
@@ -57,3 +58,15 @@ def test_protocol_capabilities_are_structural_not_workspace_policy() -> None:
 
     assert capabilities.loopback_web is True
     assert capabilities.event_replay is True
+
+
+def test_worker_failure_code_exposes_only_stable_startup_phase() -> None:
+    blocked = RuntimeStartupBlocked(
+        phase=StartupFailurePhase.SCAN,
+        run_id=None,
+        applied_results=(),
+        cause=KeyError("must-not-leak"),
+    )
+
+    assert development_composition._worker_failure_code(blocked) == "startup_scan_failed"
+    assert development_composition._worker_failure_code(RuntimeError("must-not-leak")) == "RuntimeError"

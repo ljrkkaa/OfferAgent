@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
+from offeragent_harness.agent.budget_checkpoint import BudgetCheckpoint
+from offeragent_harness.agent.budgets import BudgetDelta, RunBudget
 from offeragent_harness.agent.context_manager import (
     ContextBudget,
     ContextBudgetExceeded,
@@ -162,6 +166,41 @@ def test_context_has_fixed_layers_snapshot_sources_and_fail_closed_filtering() -
     assert "must stay hidden" not in serialized
 
 
+def test_run_snapshot_exposes_authoritative_local_date_and_iso_week() -> None:
+    started_at = datetime(2026, 7, 15, 2, 30, tzinfo=timezone.utc)
+    budget = RunBudget(8, 8, 2, 60, 10_000, 10_000, Decimal("1"), 10_000, 2)
+    checkpoint = BudgetCheckpoint(
+        budget=budget,
+        started_at=started_at,
+        used=BudgetDelta(),
+        reserved=BudgetDelta(),
+        captured_at=started_at,
+        elapsed_seconds=0,
+    )
+    state = replace(_state(), budget_checkpoint=checkpoint)
+    manager = ContextManager(
+        system_rules=("use the explicit runtime clock",),
+        inputs=ContextInputs(
+            user_input=(_fragment("user-time", ContextLayer.USER_INPUT, "制定本周计划", Sensitivity.PUBLIC),)
+        ),
+        visibility=ContextVisibilityPolicy.local_model(),
+        budget=ContextBudget.generous_default(),
+        local_timezone=timezone(timedelta(hours=8), "China Standard Time"),
+    )
+
+    window = manager.build(state, purpose=ModelPurpose.PLANNING)
+    snapshot = thaw_json(window.messages[1].content[0].data)
+
+    assert snapshot["time"] == {
+        "runStartedAtUtc": "2026-07-15T02:30:00+00:00",
+        "localDateTime": "2026-07-15T10:30:00+08:00",
+        "localDate": "2026-07-15",
+        "utcOffset": "+08:00",
+        "timeZoneName": "China Standard Time",
+        "isoWeek": {"year": 2026, "week": 29, "startDate": "2026-07-13", "endDate": "2026-07-19"},
+    }
+
+
 def test_current_user_input_is_never_displaced_by_optional_conversation_history() -> None:
     history = ContextFragment(
         "conversation:previous:assistant",
@@ -234,7 +273,7 @@ def test_sensitivity_is_typed_metadata_not_a_keyword_heuristic() -> None:
         budget=ContextBudget.generous_default(),
     )
 
-    window = manager.build(_state(), purpose=ModelPurpose.COMPOSING)
+    window = manager.build(_state(), purpose=ModelPurpose.RESPONDING)
 
     assert "public-keyword" in window.included_context_ids
     assert "secret-innocent" not in window.included_context_ids

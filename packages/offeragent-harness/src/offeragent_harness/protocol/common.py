@@ -53,7 +53,7 @@ class RunPhase(str, Enum):
     EXECUTING_TOOLS = "executing_tools"
     RECORDING_RESULTS = "recording_results"
     WAITING_CHILDREN = "waiting_children"
-    COMPOSING = "composing"
+    RESPONDING = "responding"
     PERSISTING = "persisting"
     CANCELLING = "cancelling"
     TERMINAL = "terminal"

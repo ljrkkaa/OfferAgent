@@ -95,6 +95,7 @@ EXPECTED_COMMANDS = {
     "shutdown",
 }
 
+
 def _object(value: object) -> dict[str, object]:
     assert isinstance(value, dict)
     assert all(isinstance(key, str) for key in value)

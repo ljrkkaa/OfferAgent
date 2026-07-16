@@ -101,10 +101,8 @@ class _BlockingFakeModel:
                 request.request_id,
                 2,
                 ModelEventKind.STRUCTURED_OUTPUT,
-                data={"requiresWriteOutcome": False, "calls": [], "stopReason": "传输一致性验证完成"},
+                data={"requiresWriteOutcome": False, "calls": [], "finalResponse": "传输一致性验证完成"},
             )
-        elif request.purpose is ModelPurpose.COMPOSING:
-            yield ModelEvent(request.request_id, 2, ModelEventKind.TEXT_DELTA, text="同一 Worker 事件流正常。")
         else:
             raise AssertionError(f"unexpected model purpose: {request.purpose}")
         yield ModelEvent(request.request_id, 3, ModelEventKind.USAGE, usage=ModelUsage(5, 4, 0, 0))
@@ -202,17 +200,20 @@ async def _http_post_json(
 class _LoopbackClient:
     def __init__(self, application: ProductionWorkerApplication) -> None:
         self._application = application
+        gateway = application.gateway
+        assert gateway is not None
+        self._gateway = gateway
         self._cookie: str | None = None
         self._csrf_token: str | None = None
 
     async def authenticate(self) -> dict[str, Any]:
-        launch = self._application.gateway.issue_launch()
+        launch = self._gateway.issue_launch()
         token = launch.url.rsplit("#", maxsplit=1)[1]
         status, headers, payload = await _http_post_json(
-            port=self._application.gateway.port,
+            port=self._gateway.port,
             path="/auth/exchange",
             value={"token": token},
-            origin=self._application.gateway.origin,
+            origin=self._gateway.origin,
         )
         assert status == 200
         cookie = headers["set-cookie"].split(";", maxsplit=1)[0]
@@ -229,10 +230,10 @@ class _LoopbackClient:
     async def command_response(self, method: str, params: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
         assert self._cookie is not None and self._csrf_token is not None
         status, _headers, payload = await _http_post_json(
-            port=self._application.gateway.port,
+            port=self._gateway.port,
             path="/api/command",
             value={"method": method, "params": dict(params)},
-            origin=self._application.gateway.origin,
+            origin=self._gateway.origin,
             cookie=self._cookie,
             csrf_token=self._csrf_token,
         )
@@ -547,10 +548,7 @@ async def test_real_pipe_and_loopback_share_identity_session_active_run_and_repl
         assert isinstance(terminal_status, RuntimeStatusResult)
         assert terminal_status.active_run_ids == web_terminal_status["activeRunIds"] == []
 
-        assert {request.purpose for request in fake_model.requests} == {
-            ModelPurpose.PLANNING,
-            ModelPurpose.COMPOSING,
-        }
+        assert {request.purpose for request in fake_model.requests} == {ModelPurpose.PLANNING}
     finally:
         fake_model.release_planning.set()
         await pipe.close()

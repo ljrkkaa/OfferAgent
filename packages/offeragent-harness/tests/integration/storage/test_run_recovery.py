@@ -218,7 +218,7 @@ def _budget_checkpoint(tool_calls: int) -> BudgetCheckpoint:
         budget=RunBudget(8, 20, 4, 300, 20_000, 8_000, Decimal("10"), 1_000_000, 4),
         started_at=NOW,
         used=BudgetDelta(model_rounds=1, tool_calls=tool_calls),
-        reserved=BudgetDelta(model_rounds=1),
+        reserved=BudgetDelta(),
         captured_at=NOW,
         elapsed_seconds=0,
     )
@@ -686,7 +686,7 @@ async def test_valid_pending_approval_is_a_recoverable_checkpoint_but_expiry_fai
 
 
 @pytest.mark.asyncio
-async def test_budget_counters_composer_reservation_and_deadline_are_strict_recovery_invariants(
+async def test_budget_counters_reservations_and_deadline_are_strict_recovery_invariants(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "budget-invariants.sqlite"
@@ -719,15 +719,15 @@ async def test_budget_counters_composer_reservation_and_deadline_are_strict_reco
             ),
         ),
     )
-    composer_missing = bundle_for("run-budget-composer")
-    assert composer_missing.state.budget_checkpoint is not None
-    composer_missing = replace(
-        composer_missing,
+    unsettled_reservation = bundle_for("run-budget-reservation")
+    assert unsettled_reservation.state.budget_checkpoint is not None
+    unsettled_reservation = replace(
+        unsettled_reservation,
         state=replace(
-            composer_missing.state,
+            unsettled_reservation.state,
             budget_checkpoint=replace(
-                composer_missing.state.budget_checkpoint,
-                reserved=BudgetDelta(),
+                unsettled_reservation.state.budget_checkpoint,
+                reserved=BudgetDelta(model_rounds=1),
             ),
         ),
     )
@@ -774,7 +774,7 @@ async def test_budget_counters_composer_reservation_and_deadline_are_strict_reco
         for bundle in (
             model_mismatch,
             tool_mismatch,
-            composer_missing,
+            unsettled_reservation,
             stray_reservation,
             deadline_missing,
             deadline_mismatch,
@@ -792,8 +792,8 @@ async def test_budget_counters_composer_reservation_and_deadline_are_strict_reco
     issues_by_run = {plan.run_id: {issue.code for issue in plan.issues} for plan in plans}
     assert "budget_checkpoint_counter_mismatch" in issues_by_run["run-budget-model"]
     assert "budget_checkpoint_counter_mismatch" in issues_by_run["run-budget-tool"]
-    assert "composer_reservation_missing" in issues_by_run["run-budget-composer"]
-    assert "composer_reservation_missing" in issues_by_run["run-budget-stray-reservation"]
+    assert "budget_checkpoint_reservation_present" in issues_by_run["run-budget-reservation"]
+    assert "budget_checkpoint_reservation_present" in issues_by_run["run-budget-stray-reservation"]
     assert "run_deadline_missing" in issues_by_run["run-deadline-missing"]
     assert "run_deadline_budget_mismatch" in issues_by_run["run-deadline-mismatch"]
     assert "run_budget_start_mismatch" in issues_by_run["run-budget-start-mismatch"]
