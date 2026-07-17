@@ -11,6 +11,7 @@ import type {
 import { MetadataReadPort, VaultEvidenceAdapter } from "./vault_evidence";
 import { VaultControlAdapter, VaultControlOptions } from "./vault_control";
 import { ProjectEvidenceAdapter } from "./project_evidence";
+import { PlanningMemoryAdapter } from "./planning_memory";
 import { VaultChangeCoordinator } from "./vault_changes";
 
 export interface VaultReadPort {
@@ -49,11 +50,13 @@ export class VaultToolAdapter {
         this.evidence = new VaultEvidenceAdapter(vault, workspaceId, metadata);
         this.control = new VaultControlAdapter(vault, workspaceId, controls);
         this.projects = new ProjectEvidenceAdapter(vault);
+        this.planningMemory = new PlanningMemoryAdapter(vault, workspaceId);
     }
 
     private readonly evidence: VaultEvidenceAdapter;
     private readonly control: VaultControlAdapter;
     private readonly projects: ProjectEvidenceAdapter;
+    private readonly planningMemory: PlanningMemoryAdapter;
 
     async execute(call: ExecutableToolCallDescriptor): Promise<PluginToolCompleteResult> {
         this.validateBinding(call);
@@ -74,6 +77,7 @@ export class VaultToolAdapter {
         if (call.executorLocation !== "plugin") throw new Error("Vault Tool Adapter accepts only plugin calls");
         if (![
             "agent_contract.read", "skill.read", "daily_note.context",
+            "planning_memory.list", "planning_memory.read",
             "vault.list", "vault.search", "vault.read",
             "project.list", "project.search", "project.read",
             "vault.changes.apply",
@@ -93,6 +97,7 @@ export class VaultToolAdapter {
         }
         if (call.name.startsWith("vault.")) return this.evidence.execute(call);
         if (call.name.startsWith("project.")) return this.projects.execute(call);
+        if (call.name.startsWith("planning_memory.")) return this.planningMemory.execute(call);
         return this.control.execute(call);
     }
 }

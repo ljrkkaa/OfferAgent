@@ -194,6 +194,95 @@ test("Planning Memory delete rejects malformed topic metadata or a missing index
     }
 });
 
+test("Daily plan create fill append rewrite stale and no-op scenarios preserve unrelated evidence", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const target = "daily/2026-07-17.md";
+
+    async function apply(batchId, before, operation) {
+        const vault = new MemoryVault(before === undefined ? {} : { [target]: before });
+        const journal = new MemoryJournal();
+        const coordinator = new VaultChangeCoordinator({
+            vault,
+            journal,
+            checkpoints: new MemoryCheckpoints(vault),
+            permissionMode: () => "trusted_vault",
+        });
+        const result = await coordinator.execute(call(batchId, [operation]));
+        return { result, content: vault.entries.get(target), journal };
+    }
+
+    const createdContent = "---\ndate: 2026-07-17\n---\n\n## 今日计划\n\n- [ ] Agentic RL\n";
+    const created = await apply("daily_create", undefined, {
+        op: "create", path: target, content: createdContent, expectedContentHash: "absent",
+    });
+    assert.equal(created.result.status, "succeeded");
+    assert.equal(created.content, createdContent);
+
+    const fillBefore = [
+        "---", "date: 2026-07-17", "---", "", "- [x] Completed review", "", "## 今日计划", "",
+        "<!-- offeragent-plan -->", "", "## 随手记录", "", "Keep this.", "",
+    ].join("\n");
+    const filled = await apply("daily_fill", fillBefore, {
+        op: "replace",
+        path: target,
+        find: "## 今日计划\n\n<!-- offeragent-plan -->",
+        replacement: "## 今日计划\n\n- [ ] Reward modeling",
+        expectedContentHash: digest(fillBefore),
+    });
+    assert.equal(filled.result.status, "succeeded");
+    assert.match(filled.content, /- \[x\] Completed review/u);
+    assert.match(filled.content, /- \[ \] Reward modeling/u);
+    assert.match(filled.content, /Keep this\./u);
+
+    const appendBefore = "---\ndate: 2026-07-17\n---\n\n- [x] Evidence\n\nUnrelated note.\n";
+    const appended = await apply("daily_append", appendBefore, {
+        op: "append",
+        path: target,
+        content: "\n## 今日计划\n\n- [ ] Policy optimization\n",
+        expectedContentHash: digest(appendBefore),
+    });
+    assert.equal(appended.result.status, "succeeded");
+    assert.match(appended.content, /- \[x\] Evidence/u);
+    assert.match(appended.content, /Unrelated note\./u);
+    assert.match(appended.content, /- \[ \] Policy optimization/u);
+
+    const oldPlan = "## 今日计划\n\n- [ ] Old future task";
+    const rewriteBefore = `---\ndate: 2026-07-17\n---\n\n- [x] Study Evidence\n\n${oldPlan}\n\nKeep this.\n`;
+    const rewritten = await apply("daily_rewrite", rewriteBefore, {
+        op: "replace",
+        path: target,
+        find: oldPlan,
+        replacement: "## 今日计划\n\n- [ ] Explicitly rescheduled task",
+        expectedContentHash: digest(rewriteBefore),
+    });
+    assert.equal(rewritten.result.status, "succeeded");
+    assert.match(rewritten.content, /- \[x\] Study Evidence/u);
+    assert.doesNotMatch(rewritten.content, /Old future task/u);
+    assert.match(rewritten.content, /Keep this\./u);
+
+    const stale = await apply("daily_stale", appendBefore, {
+        op: "append",
+        path: target,
+        content: "\n- [ ] Must not apply\n",
+        expectedContentHash: digest("stale version"),
+    });
+    assert.equal(stale.result.status, "failed");
+    assert.equal(stale.result.error.code, "resource.conflict");
+    assert.equal(stale.content, appendBefore);
+
+    const noOp = await apply("daily_noop", appendBefore, {
+        op: "replace",
+        path: target,
+        find: "Unrelated note.",
+        replacement: "Unrelated note.",
+        expectedContentHash: digest(appendBefore),
+    });
+    assert.equal(noOp.result.status, "failed");
+    assert.equal(noOp.result.error.code, "protocol.invalid_params");
+    assert.equal(noOp.content, appendBefore);
+    assert.equal(await noOp.journal.load("daily_noop"), undefined);
+});
+
 test("crash reconciliation reaches a stable rolled-back state and exact replay is idempotent", async () => {
     const { VaultChangeCoordinator, VaultChangeCrashInjectionError } = loadModule();
     const vault = new MemoryVault({ "notes/a.md": "alpha\n", "notes/b.md": "beta\n" });

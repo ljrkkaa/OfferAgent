@@ -410,6 +410,109 @@ def plugin_tool_definitions() -> tuple[ToolDefinition, ...]:
             output_limit_bytes=65_536,
         ),
         _plugin_read_definition(
+            name="planning_memory.list",
+            description=(
+                "List bounded Planning Memory topic metadata without returning MEMORY.md or topic bodies. "
+                "Use semantic relevance to choose no more than five paths for planning_memory.read."
+            ),
+            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "topics": {
+                        "type": "array",
+                        "maxItems": 100,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "pattern": "^memory/(user|feedback|project|study)/[^/]+[.]md$",
+                                },
+                                "type": {"enum": ["user", "feedback", "project", "study"]},
+                                "name": {"type": "string", "minLength": 1, "maxLength": 128},
+                                "description": {"type": "string", "minLength": 1, "maxLength": 512},
+                                "modifiedVersion": {"type": "string", "minLength": 1, "maxLength": 128},
+                                "contentHash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                            },
+                            "required": [
+                                "path",
+                                "type",
+                                "name",
+                                "description",
+                                "modifiedVersion",
+                                "contentHash",
+                            ],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "truncated": {"type": "boolean"},
+                },
+                "required": ["topics", "truncated"],
+                "additionalProperties": False,
+            },
+            output_limit_bytes=131_072,
+        ),
+        _plugin_read_definition(
+            name="planning_memory.read",
+            description=(
+                "Read one to five exact semantically selected Planning Memory topics. "
+                "The returned topics are preference context, not Study Evidence."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "topics": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 5,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "pattern": "^memory/(user|feedback|project|study)/[^/]+[.]md$",
+                                },
+                                "expectedModifiedVersion": {"type": "string", "minLength": 1, "maxLength": 128},
+                                "expectedContentHash": {
+                                    "type": "string",
+                                    "pattern": "^sha256:[0-9a-f]{64}$",
+                                },
+                            },
+                            "required": ["path", "expectedModifiedVersion", "expectedContentHash"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["topics"],
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "topics": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 5,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "modifiedVersion": {"type": "string", "minLength": 1, "maxLength": 128},
+                                "contentHash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                                "content": {"type": "string", "minLength": 1, "maxLength": 32_768},
+                            },
+                            "required": ["path", "modifiedVersion", "contentHash", "content"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["topics"],
+                "additionalProperties": False,
+            },
+            output_limit_bytes=131_072,
+        ),
+        _plugin_read_definition(
             name="vault.list",
             description="List bounded current Markdown and text files from the Obsidian Vault.",
             input_schema={

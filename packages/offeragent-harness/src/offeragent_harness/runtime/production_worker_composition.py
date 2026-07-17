@@ -179,7 +179,6 @@ from offeragent_harness.runtime.recovery_apply import RecoveryPlanApplier
 from offeragent_harness.runtime.run_preparation import (
     CompositeRunContextProvider,
     ConversationHistoryRunPreparationAdapter,
-    VaultMemoryRunPreparationAdapter,
     WorkspaceInstructionRunPreparationAdapter,
 )
 from offeragent_harness.runtime.startup import RuntimeStartupCoordinator
@@ -254,6 +253,23 @@ if TYPE_CHECKING:
 _LOCAL_PROFILE_ID = "profile_local"
 _LOCAL_MANAGED_ID = "managed_local"
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+_ROOT_PRODUCT_RULES = (
+    "Agent Contract 加载后, 先调用 planning_memory.list 取得主题元数据, 再依据当前请求与 Conversation "
+    "语义选择最多五个相关主题并用 planning_memory.read 精读; 不得把 memory/MEMORY.md、完整索引或"
+    "无关主题注入上下文。",
+    "Planning Memory 的决策优先级是 Agent Contract、当前明确请求、Feedback Memory、相关 User/Project/Study "
+    "Memory、默认行为; Planning Memory 不是 Study Evidence。",
+    "明确记忆写入与回答前的兜底 Memory Capture 在同一 Run 不得重复修改同一路径; 兜底只检查本轮新增的"
+    "用户与 Agent 消息, 只合并当前有效理解, 纠正旧事实、消除重复并同步 memory/MEMORY.md, 删除 Memory "
+    "Topic 必须经过确认。",
+    "Daily Study Plan 必须先调用 daily_note.context 并保留已有 frontmatter、勾选项、Study Evidence 和"
+    "无关内容; 只有用户明确要求重写时才替换已有计划。新计划全部保持未完成, 不能推进 Learning State。",
+    "Daily Study Plan 按语义综合当前公司、岗位、日期与学习目标, 最近匹配的 Interview Question 与 Answer "
+    "State, Project Evidence 风险, 相关 Planning Memory 和历史 daily; 不得用固定分数公式, 并避免"
+    "无意义重复。",
+    "Daily Study Plan 如产生跨天主题、顺序或暂缓方向, 必须在同一个 vault.changes.apply 批次更新精简的 "
+    "Study Memory, 不得复制完整日清单。Study-State Synchronization 在 daily 缺失时只报告缺失且不得创建文件。",
+)
 
 
 class ProductionWorkerError(RuntimeError):
@@ -1170,7 +1186,7 @@ class ProductionRunComponentsFactory(
                 "run_snapshot.activeContexts 中已激活的 Skill 不得重复调用。",
                 "工具结果会进入下一 AgentStep。读取、写入或校验未真实完成时不得用 finalResponse 替代工具动作。",
                 "不得声称未执行、未审批、冲突或结果未知的写操作已经完成。",
-                "除固定、受限加载的 Vault MEMORY.md 外, 额外记忆文件只能通过 Glob、Grep 和 Read 按需读取。",
+                *(_ROOT_PRODUCT_RULES if child_record is None else ()),
                 "所有其他文件操作、Shell 与 Subagent 只能经 Tool Kernel 使用。",
             ),
             inputs=inputs,
@@ -3106,10 +3122,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                     unit_of_work=uow,
                 ),
                 WorkspaceInstructionRunPreparationAdapter(
-                    workspace_id=workspace_id,
-                    vault=vault_fs,
-                ),
-                VaultMemoryRunPreparationAdapter(
                     workspace_id=workspace_id,
                     vault=vault_fs,
                 ),

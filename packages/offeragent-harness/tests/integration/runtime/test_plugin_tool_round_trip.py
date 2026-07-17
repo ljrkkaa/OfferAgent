@@ -621,3 +621,313 @@ async def test_vault_change_round_trip_returns_one_durable_write_outcome_and_rep
     assert result.phase is RunPhase.COMPLETED
     assert recorder.events.index("tool.started") < recorder.events.index("tool.completed")
     assert [item["replayed"] for item in recorder.completion_results if isinstance(item, Mapping)] == [False, True]
+
+
+class _SequentialProductPlanner:
+    def __init__(self, calls: Sequence[ToolCall], final_response: str) -> None:
+        self._calls = tuple(calls)
+        self._final_response = final_response
+        self._round = 0
+
+    async def plan(self, state: RunState, cancellation: CancellationToken) -> PlanningStep:
+        cancellation.checkpoint()
+        assert len(state.tool_results) == min(self._round, len(self._calls))
+        if self._round < len(self._calls):
+            call = self._calls[self._round]
+            step = PlanningStep((call,), call.name == "vault.changes.apply", None)
+        else:
+            step = PlanningStep((), False, self._final_response)
+        self._round += 1
+        return replace(
+            step,
+            attempts=(
+                PlanningAttempt(
+                    request_id=f"planning-product-{self._round}",
+                    repair_index=0,
+                    outcome=PlanningAttemptOutcome.SUCCEEDED,
+                    usage=ModelUsage(1, 1, 0, 0),
+                ),
+            ),
+        )
+
+
+class _PlanningProductRecorder:
+    def __init__(self, dispatcher: RuntimeApplicationCommandDispatcher) -> None:
+        self.events: list[str] = []
+        self.started_calls: list[Mapping[str, object]] = []
+        self._dispatcher = dispatcher
+        self._completions: list[asyncio.Task[object]] = []
+
+    async def commit(
+        self,
+        state: RunState,
+        *,
+        event_type: str,
+        payload: Mapping[str, object],
+        terminal: bool = False,
+    ) -> None:
+        del state, terminal
+        self.events.append(event_type)
+        if event_type != "tool.started":
+            return
+        call = cast(Mapping[str, object], payload["call"])
+        self.started_calls.append(call)
+        name = cast(str, call["name"])
+        arguments = cast(Mapping[str, object], call["arguments"])
+        source_refs: list[Mapping[str, object]] = []
+        side_effects: list[Mapping[str, object]] = []
+        if name == "agent_contract.read":
+            data: Mapping[str, object] = {
+                "path": "agent.md",
+                "content": "# OfferAgent\n\nUse Planning Memory and preserve Study Evidence.",
+                "contentHash": "sha256:" + "1" * 64,
+            }
+        elif name == "planning_memory.list":
+            data = {
+                "topics": [
+                    {
+                        "path": "memory/feedback/corrections.md",
+                        "type": "feedback",
+                        "name": "Corrections",
+                        "description": "Durable planning corrections",
+                        "modifiedVersion": "mtime:1:size:100",
+                        "contentHash": "sha256:" + "2" * 64,
+                    },
+                    {
+                        "path": "memory/study/agentic-rl.md",
+                        "type": "study",
+                        "name": "Agentic RL",
+                        "description": "Cross-day study order",
+                        "modifiedVersion": "mtime:2:size:100",
+                        "contentHash": "sha256:" + "3" * 64,
+                    },
+                    {
+                        "path": "memory/study/cooking.md",
+                        "type": "study",
+                        "name": "Cooking",
+                        "description": "Unrelated weekend recipes",
+                        "modifiedVersion": "mtime:3:size:100",
+                        "contentHash": "sha256:" + "4" * 64,
+                    },
+                ],
+                "truncated": False,
+            }
+        elif name == "planning_memory.read":
+            assert arguments == {
+                "topics": [
+                    {
+                        "path": "memory/feedback/corrections.md",
+                        "expectedModifiedVersion": "mtime:1:size:100",
+                        "expectedContentHash": "sha256:" + "2" * 64,
+                    },
+                    {
+                        "path": "memory/study/agentic-rl.md",
+                        "expectedModifiedVersion": "mtime:2:size:100",
+                        "expectedContentHash": "sha256:" + "3" * 64,
+                    },
+                ]
+            }
+            data = {
+                "topics": [
+                    {
+                        "path": "memory/feedback/corrections.md",
+                        "modifiedVersion": "mtime:1:size:100",
+                        "contentHash": "sha256:" + "2" * 64,
+                        "content": "Prefer current explicit goals over older plans.",
+                    },
+                    {
+                        "path": "memory/study/agentic-rl.md",
+                        "modifiedVersion": "mtime:2:size:100",
+                        "contentHash": "sha256:" + "3" * 64,
+                        "content": "Continue reward modeling before policy optimization.",
+                    },
+                ]
+            }
+        elif name == "daily_note.context":
+            data = {
+                "resolvedDate": "2026-07-17",
+                "dateFormat": "YYYY-MM-DD",
+                "targetPath": "daily/2026-07-17.md",
+                "targetExists": True,
+                "targetContent": (
+                    "---\ndate: 2026-07-17\n---\n\n- [x] Reviewed yesterday's notes\n\n"
+                    "## 今日计划\n\n<!-- offeragent-plan -->\n\n## 随手记录\n\nKeep this.\n"
+                ),
+                "targetModifiedVersion": "mtime:4:size:180",
+                "targetContentHash": "sha256:" + "5" * 64,
+                "templatePath": "templates/daily.md",
+                "templateContent": "---\ndate: {{date}}\n---\n\n## 今日计划\n",
+                "templateModifiedVersion": "mtime:5:size:50",
+                "templateContentHash": "sha256:" + "6" * 64,
+            }
+        else:
+            assert name == "vault.changes.apply"
+            operations = cast(Sequence[Mapping[str, object]], arguments["operations"])
+            assert [item["path"] for item in operations] == [
+                "daily/2026-07-17.md",
+                "memory/study/agentic-rl.md",
+                "memory/MEMORY.md",
+            ]
+            assert operations[0]["op"] == "replace"
+            assert operations[0]["find"] == "## 今日计划\n\n<!-- offeragent-plan -->"
+            assert "- [x] Reviewed" not in cast(str, operations[0]["replacement"])
+            assert all("- [ ]" in cast(str, item.get("replacement", "")) for item in operations[:1])
+            data = {
+                "batchId": arguments["batchId"],
+                "state": "applied",
+                "checkpointRef": "refs/offeragent/checkpoints/daily-memory",
+                "paths": [item["path"] for item in operations],
+                "beforeStateHash": "sha256:" + "7" * 64,
+                "afterStateHash": "sha256:" + "8" * 64,
+                "undoAvailable": True,
+            }
+            side_effects = [
+                {
+                    "kind": "file_modified",
+                    "resource": cast(str, item["path"]),
+                    "beforeHash": "sha256:" + "9" * 64,
+                    "afterHash": "sha256:" + "a" * 64,
+                    "confirmed": True,
+                }
+                for item in operations
+            ]
+        self._completions.append(
+            asyncio.create_task(
+                self._dispatcher.dispatch(
+                    "plugin-tools/complete",
+                    {
+                        "workspaceId": call["workspaceId"],
+                        "runId": call["runId"],
+                        "definitionFingerprint": call["definitionFingerprint"],
+                        "argsHash": call["argsHash"],
+                        "idempotencyKey": call["idempotencyKey"],
+                        "result": {
+                            "toolCallId": call["toolCallId"],
+                            "status": "succeeded",
+                            "summary": f"Completed {name}.",
+                            "data": data,
+                            "sourceRefs": source_refs,
+                            "sideEffects": side_effects,
+                        },
+                    },
+                    CancellationScope(name=f"completion-{name}"),
+                    context=ApplicationCommandContext(transport="stdio", client_id="obsidian-plugin"),
+                )
+            )
+        )
+
+    async def join(self) -> None:
+        await asyncio.gather(*self._completions)
+
+
+@pytest.mark.asyncio
+async def test_scripted_daily_plan_selects_memory_semantically_and_applies_one_evidence_safe_batch() -> None:
+    from offeragent_harness.runtime.plugin_tools import plugin_tool_definitions
+
+    definitions = {definition.name: definition for definition in plugin_tool_definitions()}
+
+    def call(name: str, arguments: Mapping[str, object], index: int) -> ToolCall:
+        definition = definitions[name]
+        return ToolCall(
+            tool_call_id=f"call_planning_{index}",
+            run_id="run_planning",
+            workspace_id="ws_vault",
+            name=name,
+            version=definition.version,
+            arguments=arguments,
+            args_hash=canonical_json_sha256(arguments),
+            idempotency_key=f"planning-{index}",
+            deadline=datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc),
+            lineage=AgentLineage.root("run_planning"),
+            definition_fingerprint=definition.fingerprint,
+            result_sensitivity=definition.result_sensitivity,
+        )
+
+    calls = (
+        call("agent_contract.read", {}, 1),
+        call("planning_memory.list", {}, 2),
+        call(
+            "planning_memory.read",
+            {
+                "topics": [
+                    {
+                        "path": "memory/feedback/corrections.md",
+                        "expectedModifiedVersion": "mtime:1:size:100",
+                        "expectedContentHash": "sha256:" + "2" * 64,
+                    },
+                    {
+                        "path": "memory/study/agentic-rl.md",
+                        "expectedModifiedVersion": "mtime:2:size:100",
+                        "expectedContentHash": "sha256:" + "3" * 64,
+                    },
+                ]
+            },
+            3,
+        ),
+        call("daily_note.context", {}, 4),
+        call(
+            "vault.changes.apply",
+            {
+                "batchId": "daily_memory_20260717",
+                "task": "Fill today's plan and consolidate its cross-day Study Memory",
+                "operations": [
+                    {
+                        "op": "replace",
+                        "path": "daily/2026-07-17.md",
+                        "find": "## 今日计划\n\n<!-- offeragent-plan -->",
+                        "replacement": "## 今日计划\n\n- [ ] 复习 Reward Model 来源: Agentic RL Study Memory",
+                        "expectedContentHash": "sha256:" + "5" * 64,
+                    },
+                    {
+                        "op": "replace",
+                        "path": "memory/study/agentic-rl.md",
+                        "find": "Continue reward modeling before policy optimization.",
+                        "replacement": "- [ ] Continue reward modeling, then policy optimization across study days.",
+                        "expectedContentHash": "sha256:" + "3" * 64,
+                    },
+                    {
+                        "op": "replace",
+                        "path": "memory/MEMORY.md",
+                        "find": "Agentic RL - old order",
+                        "replacement": "Agentic RL - reward modeling before policy optimization",
+                        "expectedContentHash": "sha256:" + "b" * 64,
+                    },
+                ],
+            },
+            5,
+        ),
+    )
+    executor = PluginToolExecutor()
+
+    async def unused(*args: object) -> Mapping[str, object]:
+        del args
+        return {}
+
+    handlers: dict[str, ApplicationCommandHandler] = {
+        method: cast(ApplicationCommandHandler, unused) for method in COMMAND_REGISTRY
+    }
+    handlers.update(plugin_tool_completion_handlers(executor=executor))
+    recorder = _PlanningProductRecorder(
+        RuntimeApplicationCommandDispatcher(application=_ReadyApplication(), handlers=handlers)
+    )
+    state = RunState("ws_vault", "ses_planning", "turn_planning", "run_planning", AgentLineage.root("run_planning"))
+    budget = BudgetLedger(
+        RunBudget(8, 8, 2, 60, 100, 100, Decimal("1"), 1_000, 1),
+        started_at=datetime.now(timezone.utc),
+    )
+
+    result = await run_agent_loop(
+        state,
+        planner=_SequentialProductPlanner(calls, "今日计划已更新; 所有项目仍未完成, 计划不是 Study Evidence。"),
+        tool_kernel=_PluginDefinitionKernel(definitions, executor),
+        recorder=recorder,
+        budget=budget,
+        cancellation=CancellationScope(name="planning-run"),
+        now=lambda: datetime.now(timezone.utc),
+    )
+    await recorder.join()
+
+    assert result.phase is RunPhase.COMPLETED
+    assert [item["name"] for item in recorder.started_calls] == [item.name for item in calls]
+    assert sum(item["name"] == "vault.changes.apply" for item in recorder.started_calls) == 1
+    assert "计划不是 Study Evidence" in result.assistant_text

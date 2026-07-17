@@ -374,6 +374,9 @@ export class VaultChangeCoordinator {
             if (afterContent !== undefined && Buffer.byteLength(afterContent, "utf8") > MAX_FILE_BYTES) {
                 throw new ChangeValidationError("protocol.message_too_large", "Vault result exceeds the file limit.");
             }
+            if (contentIdentity(afterContent) === beforeHash) {
+                invalid(`Vault Change operation for '${operation.path}' has no effect.`);
+            }
             batchBytes += Buffer.byteLength(afterContent ?? "", "utf8");
             if (batchBytes > MAX_BATCH_BYTES) {
                 throw new ChangeValidationError("protocol.message_too_large", "Vault Change Batch exceeds its byte limit.");

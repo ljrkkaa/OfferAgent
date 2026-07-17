@@ -311,3 +311,95 @@ test("Daily Note Context resolves local configuration and template without creat
     assert.equal(result.data.templatePath, "templates/daily.md");
     assert.equal(result.data.templateContent, "# {{date}}\n\n- [ ]");
 });
+
+test("Planning Memory lists only bounded topic metadata then reads at most five exact topics", async () => {
+    const { VaultToolAdapter } = loadModule();
+    const topic = (path, mtime, content) => ({
+        file: { path, extension: "md", stat: { mtime, size: Buffer.byteLength(content, "utf8") } },
+        content,
+    });
+    const entries = [
+        topic("memory/study/agentic-rl.md", 32,
+            '---\nname: "Agentic RL"\ndescription: "Cross-day study sequence"\ntype: study\n---\n\nContinue reward modeling.\n'),
+        topic("memory/user/collaboration.md", 31,
+            '---\nname: "Collaboration"\ndescription: "Preferred working style"\ntype: user\n---\n\nLead with outcomes.\n'),
+        topic("memory/study/invalid.md", 33, "---\nname: Invalid\ntype: study\n---\n\nmissing description\n"),
+        topic("memory/MEMORY.md", 34, "# Planning Memory\n\nDo not inject this index.\n"),
+    ];
+    const byPath = new Map(entries.map(({ file, content }) => [file.path, { file, content }]));
+    const reads = [];
+    const requests = [];
+    const adapter = new VaultToolAdapter({
+        getFiles: () => entries.map(({ file }) => file),
+        getFileByPath: (target) => byPath.get(target)?.file ?? null,
+        cachedRead: async (file) => { reads.push(file.path); return byPath.get(file.path).content; },
+    }, {
+        request: async (_method, params) => { requests.push(params); return { accepted: true, replayed: false }; },
+    }, "ws_vault");
+
+    await adapter.execute(call({
+        toolCallId: "call_memory_list",
+        name: "planning_memory.list",
+        arguments: {},
+    }));
+    const listed = requests[0].result;
+    assert.equal(listed.status, "succeeded");
+    assert.deepEqual(listed.data.topics.map(({ path }) => path), [
+        "memory/study/agentic-rl.md",
+        "memory/user/collaboration.md",
+    ]);
+    assert.equal(JSON.stringify(listed.data).includes("Continue reward modeling"), false);
+    assert.equal(reads.includes("memory/MEMORY.md"), false);
+    assert.deepEqual(listed.sourceRefs, []);
+
+    await adapter.execute(call({
+        toolCallId: "call_memory_read",
+        name: "planning_memory.read",
+        arguments: {
+            topics: [listed.data.topics[1], listed.data.topics[0]].map((item) => ({
+                path: item.path,
+                expectedModifiedVersion: item.modifiedVersion,
+                expectedContentHash: item.contentHash,
+            })),
+        },
+    }));
+    const recalled = requests[1].result;
+    assert.deepEqual(recalled.data.topics.map(({ path }) => path), [
+        "memory/user/collaboration.md",
+        "memory/study/agentic-rl.md",
+    ]);
+    assert.match(recalled.data.topics[0].content, /Lead with outcomes/);
+    assert.deepEqual(recalled.sourceRefs.map(({ file }) => file.path), [
+        "memory/user/collaboration.md",
+        "memory/study/agentic-rl.md",
+    ]);
+
+    await adapter.execute(call({
+        toolCallId: "call_memory_overflow",
+        name: "planning_memory.read",
+        arguments: {
+            topics: Array.from({ length: 6 }, (_, index) => ({
+                path: `memory/study/topic-${index}.md`,
+                expectedModifiedVersion: `mtime:${index}:size:1`,
+                expectedContentHash: `sha256:${"a".repeat(64)}`,
+            })),
+        },
+    }));
+    assert.equal(requests[2].result.status, "failed");
+    assert.match(requests[2].result.error.userVisibleMessage, /one to five/i);
+
+    byPath.get("memory/study/agentic-rl.md").file.stat.mtime += 1;
+    await adapter.execute(call({
+        toolCallId: "call_memory_stale",
+        name: "planning_memory.read",
+        arguments: {
+            topics: [{
+                path: listed.data.topics[0].path,
+                expectedModifiedVersion: listed.data.topics[0].modifiedVersion,
+                expectedContentHash: listed.data.topics[0].contentHash,
+            }],
+        },
+    }));
+    assert.equal(requests[3].result.status, "failed");
+    assert.equal(requests[3].result.error.code, "resource.conflict");
+});

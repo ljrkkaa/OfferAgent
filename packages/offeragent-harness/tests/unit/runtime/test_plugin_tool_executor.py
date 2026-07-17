@@ -315,6 +315,8 @@ def test_vault_evidence_definitions_preserve_the_plugin_read_boundary() -> None:
         "agent_contract.read",
         "skill.read",
         "daily_note.context",
+        "planning_memory.list",
+        "planning_memory.read",
         "vault.list",
         "vault.search",
         "vault.read",
@@ -327,6 +329,8 @@ def test_vault_evidence_definitions_preserve_the_plugin_read_boundary() -> None:
         "agent_contract.read": "agent_contract.read",
         "skill.read": "skill.read",
         "daily_note.context": "daily_note.read",
+        "planning_memory.list": "vault.read",
+        "planning_memory.read": "vault.read",
         "vault.list": "vault.read",
         "vault.search": "vault.read",
         "vault.read": "vault.read",
@@ -347,6 +351,14 @@ def test_vault_evidence_definitions_preserve_the_plugin_read_boundary() -> None:
         assert definition.retryable is (name != "vault.changes.apply")
     assert definitions["vault.read"].output_limit_bytes == 65_536
     assert definitions["vault.search"].output_limit_bytes == 65_536
+    assert definitions["planning_memory.list"].output_schema["properties"]["topics"]["maxItems"] == 100
+    memory_selection = definitions["planning_memory.read"].input_schema["properties"]["topics"]
+    assert memory_selection["maxItems"] == 5
+    assert memory_selection["items"]["required"] == (
+        "path",
+        "expectedModifiedVersion",
+        "expectedContentHash",
+    )
     write = definitions["vault.changes.apply"]
     operations = write.input_schema["properties"]["operations"]
     assert operations["maxItems"] == 20
