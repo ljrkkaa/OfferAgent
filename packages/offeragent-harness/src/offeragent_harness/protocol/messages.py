@@ -22,6 +22,7 @@ from .common import (
     RunSnapshot,
     SessionSummary,
     SubagentResult,
+    ToolResultDescriptor,
     TurnSnapshot,
 )
 from .content import ArtifactRef, ContentBlock
@@ -1170,6 +1171,20 @@ class ShutdownResult(WireModel):
     active_runs_cancel_requested: list[RunId] = Field(default_factory=list, max_length=10_000)
 
 
+class PluginToolCompleteParams(WireModel):
+    workspace_id: WorkspaceId
+    run_id: RunId
+    definition_fingerprint: Sha256Digest
+    args_hash: Sha256Digest
+    idempotency_key: str = Field(min_length=1, max_length=256)
+    result: ToolResultDescriptor
+
+
+class PluginToolCompleteResult(WireModel):
+    accepted: Literal[True] = True
+    replayed: bool
+
+
 @dataclass(frozen=True)
 class CommandSpec:
     method: str
@@ -1232,6 +1247,7 @@ _COMMAND_SPECS = [
     ),
     _spec("models/list", ModelsListParams, ModelsListResult),
     _spec("models/health", ModelsHealthParams, ModelsHealthResult),
+    _spec("plugin-tools/complete", PluginToolCompleteParams, PluginToolCompleteResult),
     _spec("session/create", SessionCreateParams, SessionCreateResult, capability=CapabilityName.MULTI_SESSION),
     _spec("session/list", SessionListParams, SessionListResult, capability=CapabilityName.MULTI_SESSION),
     _spec("session/get", SessionGetParams, SessionGetResult, capability=CapabilityName.MULTI_SESSION),

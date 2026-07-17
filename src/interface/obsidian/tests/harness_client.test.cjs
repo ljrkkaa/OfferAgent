@@ -287,9 +287,19 @@ test("event notification plus replay converge through one idempotent reducer", a
     const clientPeer = new JsonRpcPeer(clientChannel);
     const serverPeer = new JsonRpcPeer(serverChannel);
     serverPeer.register("initialize", async () => initializeResult());
+    const completed = {
+        ...runEvent(3, ""),
+        type: "assistant.completed",
+        payload: { content: [{ type: "text", text: "hello" }], finishReason: "stop" },
+    };
+    const terminal = {
+        ...runEvent(4, ""),
+        type: "turn.completed",
+        payload: { terminationReason: "completed" },
+    };
     serverPeer.register("events/replay", async (params) => ({
-        events: [runEvent(1, "hel"), runEvent(2, "lo")],
-        lastSequence: 2,
+        events: [runEvent(1, "hel"), runEvent(2, "lo"), completed, terminal],
+        lastSequence: 4,
         runCursors: {},
         hasMore: false,
     }));
@@ -302,9 +312,11 @@ test("event notification plus replay converge through one idempotent reducer", a
     await new Promise((resolve) => setImmediate(resolve));
     const cursor = await client.replay({ runId: "run_01J00000000000000000000000" }, 0);
 
-    assert.equal(cursor, 2);
+    assert.equal(cursor, 4);
+    const replayedRun = client.reducer.state.runs.get("run_01J00000000000000000000000");
+    assert.equal(replayedRun.status, "completed");
     assert.equal(
-        client.reducer.state.runs.get("run_01J00000000000000000000000").timeline
+        replayedRun.timeline
             .find((item) => item.kind === "assistant_message").blocks[0],
         "hello",
     );

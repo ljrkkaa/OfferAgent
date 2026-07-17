@@ -42,10 +42,12 @@ class ToolDispatcher:
         self,
         *,
         local: ToolExecutor | None = None,
+        plugin: ToolExecutor | None = None,
         subagent: ToolExecutor | None = None,
     ) -> None:
         self._executors: Mapping[ExecutorLocation, ToolExecutor | None] = {
             ExecutorLocation.LOCAL: local,
+            ExecutorLocation.PLUGIN: plugin,
             ExecutorLocation.SUBAGENT: subagent,
         }
 

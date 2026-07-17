@@ -189,6 +189,17 @@ class ToolCallDescriptor(WireModel):
     agent_lineage: list[RunId] = Field(min_length=1, max_length=16)
 
 
+class ExecutableToolCallDescriptor(ToolCallDescriptor):
+    """A started call with enough immutable identity for an external executor."""
+
+    workspace_id: WorkspaceId
+    run_id: RunId
+    executor_location: Literal["local", "plugin", "subagent"]
+    definition_fingerprint: Sha256Digest
+    result_sensitivity: Literal["public", "workspace", "private", "secret"]
+    deadline: Rfc3339DateTime | None = None
+
+
 class ToolResultDescriptor(WireModel):
     tool_call_id: ToolCallId
     status: ToolCallStatus

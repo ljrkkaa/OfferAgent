@@ -1911,6 +1911,126 @@
       "title": "EventsReplayResult",
       "type": "object"
     },
+    "ExecutableToolCallDescriptor": {
+      "additionalProperties": false,
+      "description": "A started call with enough immutable identity for an external executor.",
+      "properties": {
+        "agentLineage": {
+          "items": {
+            "$ref": "#/$defs/RunId"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Agentlineage",
+          "type": "array"
+        },
+        "argsHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "arguments": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Arguments",
+          "type": "object"
+        },
+        "deadline": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Rfc3339DateTime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "definitionFingerprint": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "executorLocation": {
+          "enum": [
+            "local",
+            "plugin",
+            "subagent"
+          ],
+          "title": "Executorlocation",
+          "type": "string"
+        },
+        "idempotencyKey": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Idempotencykey",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 256,
+          "minLength": 3,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "title": "Name",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "resultSensitivity": {
+          "enum": [
+            "public",
+            "workspace",
+            "private",
+            "secret"
+          ],
+          "title": "Resultsensitivity",
+          "type": "string"
+        },
+        "risk": {
+          "$ref": "#/$defs/ToolRisk"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "toolCallId": {
+          "$ref": "#/$defs/ToolCallId"
+        },
+        "version": {
+          "maxLength": 32,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "title": "Version",
+          "type": "string"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "toolCallId",
+        "name",
+        "version",
+        "arguments",
+        "argsHash",
+        "idempotencyKey",
+        "risk",
+        "agentLineage",
+        "workspaceId",
+        "runId",
+        "executorLocation",
+        "definitionFingerprint",
+        "resultSensitivity"
+      ],
+      "title": "ExecutableToolCallDescriptor",
+      "type": "object"
+    },
     "FileContentBlock": {
       "additionalProperties": false,
       "properties": {
@@ -3611,6 +3731,62 @@
         "phase"
       ],
       "title": "PhaseChangedPayload",
+      "type": "object"
+    },
+    "PluginToolCompleteParams": {
+      "additionalProperties": false,
+      "properties": {
+        "argsHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "definitionFingerprint": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "idempotencyKey": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Idempotencykey",
+          "type": "string"
+        },
+        "result": {
+          "$ref": "#/$defs/ToolResultDescriptor"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "runId",
+        "definitionFingerprint",
+        "argsHash",
+        "idempotencyKey",
+        "result"
+      ],
+      "title": "PluginToolCompleteParams",
+      "type": "object"
+    },
+    "PluginToolCompleteResult": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "const": true,
+          "default": true,
+          "title": "Accepted",
+          "type": "boolean"
+        },
+        "replayed": {
+          "title": "Replayed",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "replayed"
+      ],
+      "title": "PluginToolCompleteResult",
       "type": "object"
     },
     "ProcessEnvironmentProbeSnapshot": {
@@ -7479,7 +7655,7 @@
           "type": "integer"
         },
         "call": {
-          "$ref": "#/$defs/ToolCallDescriptor"
+          "$ref": "#/$defs/ExecutableToolCallDescriptor"
         }
       },
       "required": [
@@ -8445,6 +8621,14 @@
       },
       "result": {
         "$ref": "#/$defs/ModelsListResult"
+      }
+    },
+    "plugin-tools/complete": {
+      "params": {
+        "$ref": "#/$defs/PluginToolCompleteParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PluginToolCompleteResult"
       }
     },
     "process/registrations/confirm": {

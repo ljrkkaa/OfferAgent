@@ -828,13 +828,15 @@ class RecordingExecutor:
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_routes_local_and_subagent_executors() -> None:
+async def test_dispatcher_routes_local_plugin_and_subagent_executors() -> None:
     local = RecordingExecutor()
+    plugin = RecordingExecutor()
     subagent = RecordingExecutor()
-    dispatcher = ToolDispatcher(local=local, subagent=subagent)
+    dispatcher = ToolDispatcher(local=local, plugin=plugin, subagent=subagent)
     token = ManualCancellationToken()
     definitions = (
         definition("local.read", location=ExecutorLocation.LOCAL),
+        definition("vault.read", location=ExecutorLocation.PLUGIN),
         definition("agent.read", location=ExecutorLocation.SUBAGENT),
     )
     calls = tuple(call(tool, index) for index, tool in enumerate(definitions, start=1))
@@ -842,7 +844,8 @@ async def test_dispatcher_routes_local_and_subagent_executors() -> None:
         assert (await dispatcher.execute(tool, tool_call, token)).status is ToolResultStatus.SUCCEEDED
 
     assert local.calls == [calls[0]]
-    assert subagent.calls == [calls[1]]
+    assert plugin.calls == [calls[1]]
+    assert subagent.calls == [calls[2]]
 
 
 @pytest.mark.asyncio

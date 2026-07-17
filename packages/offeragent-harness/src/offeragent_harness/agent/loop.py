@@ -373,6 +373,12 @@ def _tool_call_descriptor(call: ToolCall, definition: ToolDefinition) -> dict[st
         "risk": definition.risk.value,
         "reason": None,
         "agentLineage": lineage,
+        "workspaceId": call.workspace_id,
+        "runId": call.run_id,
+        "executorLocation": definition.executor_location.value,
+        "definitionFingerprint": call.definition_fingerprint,
+        "resultSensitivity": call.result_sensitivity.value,
+        "deadline": call.deadline.isoformat() if call.deadline is not None else None,
     }
 
 

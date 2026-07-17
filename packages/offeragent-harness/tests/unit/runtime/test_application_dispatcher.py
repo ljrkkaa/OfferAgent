@@ -212,10 +212,11 @@ def test_domain_factory_covers_every_non_identity_command_exactly_once() -> None
         diagnostics_owner_runs=shared,  # type: ignore[arg-type]
         gateway_provider=gateway_provider,
         transport_policy=shared,  # type: ignore[arg-type]
-        extension_management_handlers={
+            extension_management_handlers={
             method: _unused
             for method in COMMAND_REGISTRY
-            if method.startswith(("skills/", "shell/", "hooks/", "process/"))
-        },
-    )
+                if method.startswith(("skills/", "shell/", "hooks/", "process/"))
+            },
+            plugin_tool_handlers={"plugin-tools/complete": _unused},
+        )
     assert set(handlers) == set(COMMAND_REGISTRY) - {"initialize", "runtime/ping", "runtime/status"}

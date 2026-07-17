@@ -164,13 +164,16 @@ test("Subagent protocol support is structural while execution remains configurat
     assert.equal(main.includes("Object.keys(CLIENT_CAPABILITIES)"), false);
 });
 
-test("Obsidian contains no plugin-owned Vault execution authority", async () => {
+test("Obsidian owns only the generated Vault Tool Adapter boundary", async () => {
     const harness = await readFile(path.join(__dirname, "../src/runtime/harness_client.ts"), "utf8");
     const main = await readFile(path.join(__dirname, "../src/main.ts"), "utf8");
     const settings = await readFile(path.join(__dirname, "../src/local/settings.ts"), "utf8");
     for (const source of [harness, main, settings]) {
         assert.doesNotMatch(source, /headlessVaultWrite|vault\/headless|client\/tool|ClientReverseHandlers/);
     }
+    assert.match(main, /new VaultToolAdapter\(this\.app\.vault, client, this\.workspaceId\)/);
+    assert.match(main, /observePluginToolEvents\(client\.reducer/);
+    assert.doesNotMatch(main, /class AgentLoop|class Planner|ModelGateway/);
 });
 
 test("configuration restart drains client ACK windows and unload synchronously initiates teardown", async () => {

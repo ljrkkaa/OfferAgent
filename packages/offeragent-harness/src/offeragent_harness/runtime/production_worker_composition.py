@@ -143,6 +143,11 @@ from offeragent_harness.runtime.loopback_gateway import LoopbackGatewayConfig, L
 from offeragent_harness.runtime.loopback_server import AsyncioLoopbackServer
 from offeragent_harness.runtime.model_management import ProductionModelCommandService
 from offeragent_harness.runtime.network_audit import EntityNetworkAuditSink
+from offeragent_harness.runtime.plugin_tools import (
+    PluginToolExecutor,
+    plugin_tool_completion_handlers,
+    plugin_tool_definitions,
+)
 from offeragent_harness.runtime.policy_audit import EntityPolicyAuditSink
 from offeragent_harness.runtime.process_identity import SupervisedWorkspaceIdentity, WorkerShutdownReceipt
 from offeragent_harness.runtime.process_registration import (
@@ -434,6 +439,7 @@ class ProductionRunComponentsFactory(
         parent_authorities: ParentRunAuthorityProvider,
         optional_definitions: Sequence[ToolDefinition] = (),
         optional_local_executors: Sequence[tuple[Sequence[ToolDefinition], ToolExecutor]] = (),
+        plugin_executor: ToolExecutor | None = None,
         subagent_executor: ToolExecutor | None = None,
         skills: ProductionSkillBundleFactory | None = None,
         shell: ProductionShellBundleFactory | None = None,
@@ -459,6 +465,7 @@ class ProductionRunComponentsFactory(
         self._parent_authorities = parent_authorities
         self._optional_definitions = tuple(optional_definitions)
         self._optional_local_executors = tuple(optional_local_executors)
+        self._plugin_executor = plugin_executor
         self._subagent_executor = subagent_executor
         self._skills = skills
         self._shell = shell
@@ -1090,6 +1097,8 @@ class ProductionRunComponentsFactory(
         context = ContextManager(
             system_rules=(
                 "你是 OfferAgent。只能依据 Harness 提供的上下文和工具结果工作。",
+                "每个根 Agent Run 在依据 Vault 事实行动或给出最终回答前必须先调用 agent_contract.read, "
+                "并遵守返回的 Vault Agent Contract。",
                 "每个 AgentStep 只能提交本地 ToolCall 或 finalResponse, 两者不得同时存在。",
                 "同一 AgentStep 的多调用只能全是相互独立且 concurrency-safe 的只读 ToolCall, "
                 "或全是可按序执行的幂等副作用 ToolCall; 不得混合读写或批量提交非幂等工具。",
@@ -1300,6 +1309,7 @@ class ProductionRunComponentsFactory(
             self._registries[state.run_id] = registry
             dispatcher = ToolDispatcher(
                 local=_CompositeExecutor(active_local_routes),
+                plugin=self._plugin_executor,
                 subagent=self._subagent_executor,
             )
             bound_ledger = budget
@@ -2855,6 +2865,8 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
         from offeragent_harness.subagents.tools import subagent_tool_definitions
 
         subagent_definitions = subagent_tool_definitions()
+        plugin_definitions = plugin_tool_definitions()
+        plugin_executor = PluginToolExecutor()
         late_subagent = _LateToolExecutor()
         late_parent_authorities = _LateParentRunAuthorityProvider()
         configured_user_home = self._overrides.skill_user_home or current_user_profile_directory()
@@ -2906,8 +2918,9 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             local_read=read_executor,
             local_transaction=local_transaction,
             parent_authorities=late_parent_authorities,
-            optional_definitions=(*powershell_executor.definitions, *subagent_definitions),
+            optional_definitions=(*powershell_executor.definitions, *plugin_definitions, *subagent_definitions),
             optional_local_executors=((powershell_executor.definitions, powershell_executor),),
+            plugin_executor=plugin_executor,
             subagent_executor=late_subagent if subagent_definitions else None,
             skills=skill_factory,
             shell=shell_capabilities,
@@ -2953,6 +2966,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             *read_executor.definitions,
             *powershell_executor.definitions,
             vault_transaction_definition(),
+            *plugin_definitions,
             *subagent_definitions,
         )
         base_scope = CapabilityScope(
@@ -3126,6 +3140,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                     builtin_hook_handler_ids=tuple((self._overrides.builtin_hook_handlers or {}).keys()),
                     process_registrations=self._overrides.process_registration_service,
                 ),
+                plugin_tool_handlers=plugin_tool_completion_handlers(executor=plugin_executor),
             )
         )
 

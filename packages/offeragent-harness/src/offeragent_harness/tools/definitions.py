@@ -34,6 +34,7 @@ def _reject_external_references(value: Any, path: str = "$") -> None:
 
 class ExecutorLocation(str, Enum):
     LOCAL = "local"
+    PLUGIN = "plugin"
     SUBAGENT = "subagent"
 
 

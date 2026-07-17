@@ -26,8 +26,7 @@ node_modules/
 src/interface/obsidian/main.js
 *.map
 
-# Only reviewed architecture/baseline documents from the imported repository
-# are tracked here; the outer workspace owns the authoritative project docs.
+# Track reviewed architecture, domain, and repository-agent documents.
 docs/
 !docs/
 docs/*
@@ -36,8 +35,11 @@ docs/*
 !docs/personal-local-plugin-install.md
 !docs/architecture/
 !docs/architecture/**
+!docs/adr/
+!docs/adr/**
+!docs/agents/
+!docs/agents/**
 
-AGENTS.md
 INTERVIEW_PERSONAL_KB_AGENT.md
 demos/
 reference/

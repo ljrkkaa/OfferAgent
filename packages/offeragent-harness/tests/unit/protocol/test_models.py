@@ -39,6 +39,7 @@ from offeragent_harness.protocol.messages import (
     EventsReplayParams,
     EventsReplayResult,
     InitializeParams,
+    PluginToolCompleteParams,
     TurnStartParams,
     validate_command_params,
 )
@@ -70,6 +71,7 @@ EXPECTED_COMMANDS = {
     "hooks/confirm-workspace-command",
     "models/list",
     "models/health",
+    "plugin-tools/complete",
     "session/create",
     "session/list",
     "session/get",
@@ -132,6 +134,35 @@ def test_unknown_command_field_is_rejected_before_dispatch() -> None:
     first_violation = violations[0]
     assert isinstance(first_violation, dict)
     assert first_violation.get("type") == "extra_forbidden"
+
+
+def test_plugin_tool_completion_command_carries_the_exact_execution_binding() -> None:
+    digest = "sha256:" + "a" * 64
+    params = validate_command_params(
+        "plugin-tools/complete",
+        {
+            "workspaceId": "ws_vault",
+            "runId": "run_contract",
+            "definitionFingerprint": digest,
+            "argsHash": digest,
+            "idempotencyKey": "contract-read-1",
+            "result": {
+                "toolCallId": "call_contract",
+                "status": "succeeded",
+                "summary": "Read the Vault Agent Contract.",
+                "data": {"content": "# OfferAgent"},
+                "artifactRefs": [],
+                "sourceRefs": [],
+                "sideEffects": [],
+                "retryable": False,
+                "error": None,
+            },
+        },
+    )
+
+    assert isinstance(params, PluginToolCompleteParams)
+    assert params.workspace_id == "ws_vault"
+    assert params.result.tool_call_id == "call_contract"
 
 
 def test_model_health_requires_an_explicit_admin_request_identity() -> None:

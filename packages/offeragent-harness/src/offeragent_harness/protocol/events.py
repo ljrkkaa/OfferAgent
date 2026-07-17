@@ -20,13 +20,13 @@ from .common import (
     ApprovalDescriptor,
     ApprovalScope,
     BudgetSnapshot,
+    ExecutableToolCallDescriptor,
     RunConfigSnapshot,
     RunPhase,
     RunStatus,
     SessionSummary,
     SubagentResult,
     TerminationReason,
-    ToolCallDescriptor,
     ToolCallStatus,
     ToolResultDescriptor,
     UsageSnapshot,
@@ -125,7 +125,7 @@ class AssistantCompletedPayload(WireModel):
 
 
 class ToolStartedPayload(WireModel):
-    call: ToolCallDescriptor
+    call: ExecutableToolCallDescriptor
     attempt: int = Field(default=1, ge=1, le=100)
 
 

@@ -31,6 +31,7 @@ import { HarnessClient, REQUIRED_RUNTIME_CAPABILITIES } from "./runtime/harness_
 import { JsonObject, JsonValue, requireJsonObject } from "./runtime/json_rpc";
 import { LocalDevelopmentRuntimeInstaller } from "./runtime/local_development_installer";
 import { StdioWorkerTransport } from "./runtime/stdio_worker";
+import { observePluginToolEvents, VaultToolAdapter } from "./runtime/vault_tool_adapter";
 import {
     PROTOCOL_SCHEMA_HASH,
     PROTOCOL_VERSION,
@@ -71,6 +72,8 @@ export default class OfferAgentPlugin extends Plugin {
     private runtime: RuntimeBootstrap | null = null;
     private chatStore: ChatStore | null = null;
     private chatClient: HarnessClient | null = null;
+    private vaultToolClient: HarnessClient | null = null;
+    private vaultToolDisposal: (() => void) | null = null;
     private runtimeStart: Promise<void> | null = null;
     private vaultRoot = "";
     private workspaceId = "";
@@ -116,6 +119,7 @@ export default class OfferAgentPlugin extends Plugin {
         const chatDisposal = this.chatStore?.dispose().catch(() => undefined);
         this.chatStore = null;
         this.chatClient = null;
+        this.disposeVaultToolAdapter();
         // Obsidian ignores a Promise returned from onunload. beginUnload aborts
         // lifecycle work and starts stdio EOF synchronously; its normal stop gate
         // continues tracking the child-process join in the background.
@@ -432,6 +436,7 @@ export default class OfferAgentPlugin extends Plugin {
         await this.chatStore?.dispose().catch(() => undefined);
         this.chatStore = null;
         this.chatClient = null;
+        this.disposeVaultToolAdapter();
         await runtime.stop();
         await Promise.all([
             pendingStart?.catch(() => undefined),
@@ -449,26 +454,46 @@ export default class OfferAgentPlugin extends Plugin {
             schemaHash: PROTOCOL_SCHEMA_HASH,
         });
         return new RuntimeBootstrap(installer, {
-            create: (installed, onDisconnected) => new HarnessClient(
-                new StdioWorkerTransport(
-                    installed.workerExecutable,
-                    this.vaultRoot,
-                    installed.version,
-                ),
-                {
-                    workspaceId: this.workspaceId,
-                    identity: {
-                        protocolVersion: PROTOCOL_VERSION,
-                        minimumProtocolVersion: PROTOCOL_VERSION,
-                        maximumProtocolVersion: PROTOCOL_VERSION,
-                        schemaHash: PROTOCOL_SCHEMA_HASH,
-                        clientVersion: this.manifest.version,
+            create: (installed, onDisconnected) => {
+                const client = new HarnessClient(
+                    new StdioWorkerTransport(
+                        installed.workerExecutable,
+                        this.vaultRoot,
+                        installed.version,
+                    ),
+                    {
+                        workspaceId: this.workspaceId,
+                        identity: {
+                            protocolVersion: PROTOCOL_VERSION,
+                            minimumProtocolVersion: PROTOCOL_VERSION,
+                            maximumProtocolVersion: PROTOCOL_VERSION,
+                            schemaHash: PROTOCOL_SCHEMA_HASH,
+                            clientVersion: this.manifest.version,
+                        },
+                        requiredCapabilities: REQUIRED_RUNTIME_CAPABILITIES,
                     },
-                    requiredCapabilities: REQUIRED_RUNTIME_CAPABILITIES,
-                },
-                { onDisconnected },
-            ),
+                    { onDisconnected },
+                );
+                this.attachVaultToolAdapter(client);
+                return client;
+            },
         });
+    }
+
+    private attachVaultToolAdapter(client: HarnessClient): void {
+        if (this.vaultToolClient === client) return;
+        this.disposeVaultToolAdapter();
+        const adapter = new VaultToolAdapter(this.app.vault, client, this.workspaceId);
+        this.vaultToolDisposal = observePluginToolEvents(client.reducer, adapter, (error) => {
+            if (!this.unloading) new Notice(actionableError(error));
+        });
+        this.vaultToolClient = client;
+    }
+
+    private disposeVaultToolAdapter(): void {
+        this.vaultToolDisposal?.();
+        this.vaultToolDisposal = null;
+        this.vaultToolClient = null;
     }
 
     private async startRuntime(): Promise<void> {
@@ -518,6 +543,7 @@ export default class OfferAgentPlugin extends Plugin {
         await this.chatStore?.dispose().catch(() => undefined);
         this.chatStore = null;
         this.chatClient = null;
+        this.disposeVaultToolAdapter();
         if (this.unloading || this.runtimeExplicitlyStopped) return;
         await this.runtime.stop();
         if (this.unloading || this.runtimeExplicitlyStopped) return;

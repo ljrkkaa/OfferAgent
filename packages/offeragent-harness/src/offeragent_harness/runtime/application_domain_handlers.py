@@ -182,6 +182,7 @@ def compose_domain_command_handlers(
     gateway_provider: Callable[[], LoopbackWebGateway | None],
     transport_policy: ApplicationTransportPolicy,
     extension_management_handlers: Mapping[str, ApplicationCommandHandler],
+    plugin_tool_handlers: Mapping[str, ApplicationCommandHandler],
 ) -> Mapping[str, ApplicationCommandHandler]:
     """Return every non-identity command exactly once or fail composition."""
 
@@ -195,6 +196,7 @@ def compose_domain_command_handlers(
 
     add(_config_handlers(identity=identity, config=config, activation=config_activation))
     add(extension_management_handlers)
+    add(plugin_tool_handlers)
     add(_model_handlers(models=models))
     add(
         _session_handlers(
