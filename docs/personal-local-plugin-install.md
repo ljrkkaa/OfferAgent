@@ -46,6 +46,18 @@ uv run python scripts/build_local_windows_plugin.py `
 脚本会执行静态门禁，构建 Worker/Process Host，调用插件内部 `build:local`，生成并复验 manifest，
 然后写入一个新的输出目录。不要直接调用 esbuild，也不要恢复无 manifest 锚点的 `build`/`dev`。
 
+构建完成后，可在临时 Vault 对该目录执行确定性的融合产品烟测：
+
+```powershell
+cd E:\Projects\offeragent\repo\src\interface\obsidian
+corepack yarn smoke:fused E:\Projects\offeragent\artifacts\offeragent-obsidian-plugin
+```
+
+烟测使用真实冻结 Worker、stdio 协议和本地 Responses Gateway，完成模型配置重启、来源绑定的
+`agent_contract.read`/`vault.search`/`vault.read` 回合、Worker 审批、插件确认的 Vault Change Batch、
+重启恢复、冲突保护的撤销、持久事件回放及进程树清理。它只操作自动创建并删除的临时 Vault，不能
+代替目标 Vault 上另行授权的真实写入验收。
+
 产物结构：
 
 ```text
