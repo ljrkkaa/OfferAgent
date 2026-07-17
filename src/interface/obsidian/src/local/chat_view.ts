@@ -1,4 +1,4 @@
-import { ItemView, MarkdownView, Menu, Notice, WorkspaceLeaf, setIcon } from "obsidian";
+import { Component, ItemView, MarkdownRenderer, MarkdownView, Menu, Notice, WorkspaceLeaf, setIcon } from "obsidian";
 
 import { BootstrapSnapshot } from "../runtime/bootstrap";
 import { ChatStore, ChatStoreSnapshot } from "../runtime/chat_store";
@@ -9,6 +9,7 @@ import type {
     TimelineItem,
     ToolCallTimelineItem,
 } from "../runtime/event_reducer";
+import type { EventEnvelope } from "../runtime/event_reducer";
 import { JsonObject, RemoteRpcError } from "../runtime/json_rpc";
 import {
     VaultReferenceTarget,
@@ -19,6 +20,14 @@ import { LocalOfferAgentSettings, effectivePermissionMode, runConfig } from "./s
 
 export const LOCAL_CHAT_VIEW = "offeragent-local-chat";
 
+export interface ChatModelChoice {
+    readonly provider: string;
+    readonly model: string;
+    readonly displayName: string;
+    readonly supportsStreaming: boolean;
+    readonly supportsStructuredOutput: boolean;
+}
+
 export interface LocalChatHost {
     settings: LocalOfferAgentSettings;
     runtimeSnapshot(): BootstrapSnapshot;
@@ -26,6 +35,9 @@ export interface LocalChatHost {
     ensureChatStore(): Promise<ChatStore>;
     readArtifactText(artifactId: string): Promise<string>;
     listSessions(): Promise<readonly { sessionId: string; title: string }[]>;
+    listModels(): Promise<readonly ChatModelChoice[]>;
+    selectModel(model: string): Promise<void>;
+    openSettings(): void;
     openDiagnostics(): Promise<void>;
     openLocalWeb(): Promise<void>;
 }
@@ -37,6 +49,7 @@ export class LocalChatView extends ItemView {
     private unsubscribeStore: (() => void) | null = null;
     private unsubscribeRuntime: (() => void) | null = null;
     private boundRuntimeAttempt = "";
+    private latestRuntimeAttempt = "";
     private bindingStore = false;
     private renderScheduled = false;
     private renderDeferredForComposition = false;
@@ -44,6 +57,16 @@ export class LocalChatView extends ItemView {
     private composing = false;
     private sendPending = false;
     private clearComposerTabId: string | null = null;
+    private models: readonly ChatModelChoice[] = [];
+    private modelError: string | null = null;
+    private modelsLoaded = false;
+    private markdownComponents = new Map<HTMLElement, Component>();
+    private markdownRenderTasks: Promise<void>[] = [];
+    private renderGeneration = 0;
+    private streamPatchScheduled = false;
+    private pendingStreamRunId: string | null = null;
+    private streamPatchGeneration = 0;
+    private closed = true;
 
     constructor(leaf: WorkspaceLeaf, host: LocalChatHost) {
         super(leaf);
@@ -63,19 +86,23 @@ export class LocalChatView extends ItemView {
     }
 
     async onOpen(): Promise<void> {
+        this.closed = false;
         this.unsubscribeRuntime = this.host.subscribeRuntime((snapshot) => {
             this.scheduleRender();
             const attempt = `${snapshot.generation}:${snapshot.attempt}`;
+            this.latestRuntimeAttempt = attempt;
             if (snapshot.state === "ready" && attempt !== this.boundRuntimeAttempt && !this.bindingStore) {
                 void this.bindCurrentStore(attempt);
             }
         });
         this.scheduleRender();
         const runtime = this.host.runtimeSnapshot();
-        if (runtime.state === "ready") await this.bindCurrentStore(`${runtime.generation}:${runtime.attempt}`);
+        this.latestRuntimeAttempt = `${runtime.generation}:${runtime.attempt}`;
+        if (runtime.state === "ready") await this.bindCurrentStore(this.latestRuntimeAttempt);
     }
 
     async onClose(): Promise<void> {
+        this.closed = true;
         if (this.draftTimer) clearTimeout(this.draftTimer);
         this.draftTimer = null;
         this.composing = false;
@@ -84,29 +111,47 @@ export class LocalChatView extends ItemView {
         this.unsubscribeRuntime?.();
         this.unsubscribeStore = null;
         this.unsubscribeRuntime = null;
+        this.releaseMarkdownComponents();
+        this.renderGeneration += 1;
+        this.streamPatchGeneration += 1;
+        this.pendingStreamRunId = null;
     }
 
     private async bindCurrentStore(runtimeAttempt: string): Promise<void> {
-        if (this.bindingStore) return;
+        if (this.closed || this.bindingStore) return;
         this.bindingStore = true;
         try {
             const store = await this.host.ensureChatStore();
+            if (this.closed || this.latestRuntimeAttempt !== runtimeAttempt) return;
             this.unsubscribeStore?.();
             this.store = store;
             this.boundRuntimeAttempt = runtimeAttempt;
-            this.unsubscribeStore = store.subscribe((snapshot) => {
+            this.models = [];
+            this.modelError = null;
+            this.modelsLoaded = false;
+            this.unsubscribeStore = store.subscribe((snapshot, event) => {
                 this.snapshot = snapshot;
+                if (event?.type === "assistant.delta" && this.scheduleStreamingAssistantPatch(event)) return;
                 this.scheduleRender();
             });
+            void this.refreshModels(runtimeAttempt);
         } catch (error) {
-            new Notice(actionableMessage(error));
-            this.scheduleRender();
+            if (!this.closed && this.latestRuntimeAttempt === runtimeAttempt) {
+                new Notice(actionableMessage(error));
+                this.scheduleRender();
+            }
         } finally {
             this.bindingStore = false;
+            const runtime = this.host.runtimeSnapshot();
+            const latest = `${runtime.generation}:${runtime.attempt}`;
+            this.latestRuntimeAttempt = latest;
+            if (!this.closed && runtime.state === "ready" && latest !== runtimeAttempt &&
+                latest !== this.boundRuntimeAttempt) void this.bindCurrentStore(latest);
         }
     }
 
     private scheduleRender(): void {
+        if (this.closed) return;
         if (this.composing) {
             this.renderDeferredForComposition = true;
             return;
@@ -115,6 +160,7 @@ export class LocalChatView extends ItemView {
         this.renderScheduled = true;
         window.requestAnimationFrame(() => {
             this.renderScheduled = false;
+            if (this.closed) return;
             if (this.composing) {
                 this.renderDeferredForComposition = true;
                 return;
@@ -125,7 +171,16 @@ export class LocalChatView extends ItemView {
     }
 
     private render(): void {
+        const renderGeneration = ++this.renderGeneration;
+        this.streamPatchGeneration += 1;
+        this.releaseMarkdownComponents();
+        this.markdownRenderTasks = [];
         const root = this.contentEl;
+        const previousTimeline = root.querySelector<HTMLElement>(".offeragent-timeline");
+        const previousMarker = previousTimeline?.querySelector<HTMLElement>(".offeragent-new-content");
+        const scroll = previousTimeline === null
+            ? null
+            : timelineScrollIntent(previousTimeline, previousMarker?.getBoundingClientRect().height ?? 0);
         const focused = root.querySelector<HTMLTextAreaElement>(".offeragent-composer-input");
         const clearSubmittedDraft = this.clearComposerTabId !== null &&
             this.clearComposerTabId === this.snapshot?.activeTabId;
@@ -142,8 +197,15 @@ export class LocalChatView extends ItemView {
             return;
         }
         this.renderTabs(root, this.snapshot);
-        this.renderTimeline(root, this.snapshot);
+        const timeline = this.renderTimeline(root, this.snapshot, scroll);
         this.renderComposer(root, this.snapshot, selection);
+        const markdownTasks = [...this.markdownRenderTasks];
+        if (markdownTasks.length > 0) {
+            void Promise.all(markdownTasks).then(() => {
+                if (renderGeneration !== this.renderGeneration || !timeline.isConnected) return;
+                this.restoreTimelineScroll(timeline, scroll);
+            });
+        }
     }
 
     private renderHeader(root: HTMLElement): void {
@@ -159,6 +221,9 @@ export class LocalChatView extends ItemView {
         const diagnostics = actions.createEl("button", { attr: { "aria-label": "运行诊断" } });
         setIcon(diagnostics, "activity");
         diagnostics.onclick = () => void this.host.openDiagnostics().catch((error) => new Notice(actionableMessage(error)));
+        const settings = actions.createEl("button", { attr: { "aria-label": "打开 OfferAgent 设置" } });
+        setIcon(settings, "settings");
+        settings.onclick = () => this.host.openSettings();
     }
 
     private renderRuntimeState(root: HTMLElement, snapshot: BootstrapSnapshot): void {
@@ -211,16 +276,21 @@ export class LocalChatView extends ItemView {
         }
     }
 
-    private renderTimeline(root: HTMLElement, snapshot: ChatStoreSnapshot): void {
+    private renderTimeline(
+        root: HTMLElement,
+        snapshot: ChatStoreSnapshot,
+        scroll: TimelineScrollState | null,
+    ): HTMLElement {
         const timeline = root.createDiv({ cls: "offeragent-timeline" });
         const tab = snapshot.tabs.find((candidate) => candidate.tabId === snapshot.activeTabId);
-        if (!tab) return;
+        if (!tab) return timeline;
         const pending = snapshot.pendingSubmissions.filter((submission) => submission.tabId === tab.tabId);
         if (!tab.sessionId && pending.length === 0) {
             const empty = timeline.createDiv({ cls: "offeragent-empty" });
             empty.createEl("h3", { text: "从本地知识库开始" });
             empty.createEl("p", { text: "可以引用活动笔记、选区和 Vault 内容；写入会显示 Diff 并等待相应审批。" });
-            return;
+            this.restoreTimelineScroll(timeline, scroll);
+            return timeline;
         }
         const runs = tab.sessionId === null
             ? []
@@ -232,7 +302,23 @@ export class LocalChatView extends ItemView {
         }
         for (const run of runs) this.renderRun(timeline, run);
         for (const submission of pending) this.renderPendingSubmission(timeline, submission);
-        timeline.scrollTop = timeline.scrollHeight;
+        this.restoreTimelineScroll(timeline, scroll);
+        return timeline;
+    }
+
+    private restoreTimelineScroll(timeline: HTMLElement, previous: TimelineScrollState | null): void {
+        timeline.querySelector(".offeragent-new-content")?.remove();
+        if (previous === null || previous.follow) {
+            timeline.scrollTop = timeline.scrollHeight;
+            return;
+        }
+        timeline.scrollTop = Math.min(previous.scrollTop, Math.max(0, timeline.scrollHeight - timeline.clientHeight));
+        if (timeline.scrollHeight <= previous.scrollHeight) return;
+        const resume = timeline.createEl("button", { text: "新内容", cls: "offeragent-new-content mod-cta" });
+        resume.onclick = () => {
+            timeline.scrollTop = timeline.scrollHeight;
+            resume.remove();
+        };
     }
 
     private renderPendingSubmission(
@@ -251,7 +337,22 @@ export class LocalChatView extends ItemView {
 
     private renderRun(container: HTMLElement, run: RunViewState): void {
         const article = container.createEl("article", { cls: "offeragent-run", attr: { "data-run-id": run.runId } });
-        for (const item of run.timeline) this.renderTimelineItem(article, item, run.parentRunId !== null);
+        for (let index = 0; index < run.timeline.length;) {
+            const item = run.timeline[index];
+            if (item.kind === "tool_call" && ordinaryToolActivity(item)) {
+                const tools: ToolCallTimelineItem[] = [];
+                while (index < run.timeline.length) {
+                    const candidate = run.timeline[index];
+                    if (candidate.kind !== "tool_call" || !ordinaryToolActivity(candidate)) break;
+                    tools.push(candidate);
+                    index += 1;
+                }
+                this.renderToolGroup(article, tools);
+                continue;
+            }
+            this.renderTimelineItem(article, item, run.parentRunId !== null, run.runId);
+            index += 1;
+        }
         if (!isTerminal(run.status)) article.createDiv({ cls: "offeragent-thinking", text: phaseLabel(run.phase) });
         if (run.references.length > 0) {
             const references = article.createEl("details", { cls: "offeragent-references" });
@@ -277,7 +378,9 @@ export class LocalChatView extends ItemView {
             const snapshot = this.snapshot;
             const blocked = snapshot === null || snapshot.busy || this.sendPending ||
                 activeRunForTab(snapshot, run.sessionId, null) !== undefined;
-            const retry = actions.createEl("button", { text: "重试" });
+            const retry = actions.createEl("button", {
+                text: explicitContinuationStatus(run.status) ? "继续" : "重试",
+            });
             retry.disabled = blocked;
             retry.onclick = () => void this.store?.retry(
                 run.sessionId, run.turnId, run.runId, runConfig(this.host.settings),
@@ -290,6 +393,12 @@ export class LocalChatView extends ItemView {
             compact.disabled = blocked;
             compact.onclick = () => void this.store?.compact(run.sessionId, run.turnId)
                 .catch((error) => new Notice(actionableMessage(error)));
+            const prompt = originalTurnPrompt(run.timeline);
+            if (prompt !== null) {
+                const revise = actions.createEl("button", { text: "放入输入框" });
+                revise.disabled = blocked;
+                revise.onclick = () => void this.replaceDraftWithPrompt(prompt);
+            }
         }
     }
 
@@ -306,7 +415,7 @@ export class LocalChatView extends ItemView {
         view.editor.scrollIntoView({ from, to }, true);
     }
 
-    private renderTimelineItem(container: HTMLElement, item: TimelineItem, childRun: boolean): void {
+    private renderTimelineItem(container: HTMLElement, item: TimelineItem, childRun: boolean, runId: string): void {
         switch (item.kind) {
             case "user_message": {
                 const user = container.createDiv({ cls: "offeragent-message offeragent-user" });
@@ -321,9 +430,12 @@ export class LocalChatView extends ItemView {
                 return;
             }
             case "assistant_message": {
-                const assistant = container.createDiv({ cls: "offeragent-message offeragent-assistant" });
+                const assistant = container.createDiv({
+                    cls: "offeragent-message offeragent-assistant",
+                    attr: { "data-assistant-run-id": runId },
+                });
                 assistant.createDiv({ cls: "offeragent-message-label", text: childRun ? "子任务" : "OfferAgent" });
-                for (const block of item.blocks) assistant.createDiv({ cls: "offeragent-message-body", text: block });
+                for (const block of item.blocks) this.renderMarkdown(assistant, block);
                 if (!item.completed) assistant.createDiv({ cls: "offeragent-thinking", text: "正在生成回答…" });
                 return;
             }
@@ -337,6 +449,96 @@ export class LocalChatView extends ItemView {
                 this.renderSubagent(container, item);
                 return;
         }
+    }
+
+    private renderMarkdown(container: HTMLElement, markdown: string, trackFrame = true): Promise<void> {
+        const body = container.createDiv({ cls: "offeragent-message-body markdown-rendered" });
+        const component = new Component();
+        component.load();
+        this.markdownComponents.set(body, component);
+        const task = MarkdownRenderer.render(this.app, markdown, body, "", component)
+            .catch((error) => {
+                if (body.isConnected) {
+                    body.setText(markdown);
+                    new Notice(actionableMessage(error));
+                }
+            })
+            .finally(() => {
+                if (this.markdownComponents.get(body) !== component) component.unload();
+            });
+        if (trackFrame) this.markdownRenderTasks.push(task);
+        return task;
+    }
+
+    private releaseMarkdownComponents(): void {
+        for (const component of this.markdownComponents.values()) component.unload();
+        this.markdownComponents.clear();
+    }
+
+    private releaseMarkdownBody(body: HTMLElement): void {
+        this.markdownComponents.get(body)?.unload();
+        this.markdownComponents.delete(body);
+        body.remove();
+    }
+
+    private scheduleStreamingAssistantPatch(event: EventEnvelope): boolean {
+        if (this.closed || event.runId === null || !this.renderedRun(event.runId)) return false;
+        this.pendingStreamRunId = event.runId;
+        if (this.streamPatchScheduled) return true;
+        this.streamPatchScheduled = true;
+        window.requestAnimationFrame(() => {
+            this.streamPatchScheduled = false;
+            if (this.closed) return;
+            const runId = this.pendingStreamRunId;
+            this.pendingStreamRunId = null;
+            if (runId !== null) void this.patchStreamingAssistant(runId);
+        });
+        return true;
+    }
+
+    private renderedRun(runId: string): HTMLElement | null {
+        return Array.from(this.contentEl.querySelectorAll<HTMLElement>(".offeragent-run[data-run-id]"))
+            .find((candidate) => candidate.dataset.runId === runId) ?? null;
+    }
+
+    private async patchStreamingAssistant(runId: string): Promise<void> {
+        if (this.closed) return;
+        const patchGeneration = ++this.streamPatchGeneration;
+        const snapshot = this.snapshot;
+        const run = snapshot?.projection.runs.get(runId);
+        const article = this.renderedRun(runId);
+        const assistant = article?.querySelector<HTMLElement>(".offeragent-assistant");
+        const item = run?.timeline.find((candidate) => candidate.kind === "assistant_message");
+        if (!snapshot || !run || !article || !assistant || !item || item.kind !== "assistant_message") {
+            this.scheduleRender();
+            return;
+        }
+        const timeline = article.closest<HTMLElement>(".offeragent-timeline");
+        const marker = timeline?.querySelector<HTMLElement>(".offeragent-new-content");
+        const scroll = timeline === null || timeline === undefined
+            ? null
+            : timelineScrollIntent(timeline, marker?.getBoundingClientRect().height ?? 0);
+        for (const body of Array.from(assistant.querySelectorAll<HTMLElement>(".offeragent-message-body"))) {
+            this.releaseMarkdownBody(body);
+        }
+        assistant.querySelector(".offeragent-thinking")?.remove();
+        const tasks = item.blocks.map((block) => this.renderMarkdown(assistant, block, false));
+        if (!item.completed) assistant.createDiv({ cls: "offeragent-thinking", text: "正在生成回答…" });
+        await Promise.all(tasks);
+        if (patchGeneration === this.streamPatchGeneration && timeline?.isConnected) {
+            this.restoreTimelineScroll(timeline, scroll);
+        }
+    }
+
+    private renderToolGroup(container: HTMLElement, tools: readonly ToolCallTimelineItem[]): void {
+        if (tools.length === 0) return;
+        const group = container.createEl("details", { cls: "offeragent-tool-group" });
+        group.createEl("summary", {
+            text: `${tools.length} 个工具活动`,
+            attr: { "aria-label": `${tools.length} 个工具活动，按回车展开详情` },
+        });
+        const body = group.createDiv({ cls: "offeragent-tool-group-body" });
+        for (const tool of tools) this.renderToolCard(body, tool);
     }
 
     private renderToolCard(container: HTMLElement, tool: ToolCallTimelineItem): void {
@@ -461,8 +663,36 @@ export class LocalChatView extends ItemView {
             }
         };
         const controls = composer.createDiv({ cls: "offeragent-composer-controls" });
+        const modelControl = controls.createDiv({ cls: "offeragent-model-control" });
+        const model = modelControl.createEl("select", { attr: { "aria-label": "选择模型" } });
+        const choices = this.models.some((choice) => choice.model === this.host.settings.model)
+            ? this.models
+            : [{
+                provider: this.host.settings.provider,
+                model: this.host.settings.model,
+                displayName: this.host.settings.model,
+                supportsStreaming: false,
+                supportsStructuredOutput: false,
+            }, ...this.models];
+        for (const choice of choices) {
+            model.createEl("option", { value: choice.model, text: choice.displayName });
+        }
+        model.value = this.host.settings.model;
+        model.disabled = snapshot.busy || this.sendPending || hasActiveRun || !this.modelsLoaded ||
+            this.modelError !== null || choices.length === 0;
+        model.onchange = () => void this.chooseModel(model.value);
+        const selectedModel = choices.find((choice) => choice.model === model.value);
+        model.title = this.modelError ?? (!this.modelsLoaded ? "正在从 Worker 查询模型能力" : selectedModel
+            ? `${selectedModel.provider} · ${selectedModel.supportsStreaming ? "支持流式" : "不支持流式"} · ${selectedModel.supportsStructuredOutput ? "支持结构化输出" : "不支持结构化输出"}`
+            : "模型能力尚不可用");
+        const capability = modelControl.createSpan({ cls: "offeragent-model-capability", attr: { "aria-live": "polite" } });
+        capability.setText(this.modelError ? "模型不可用" : !this.modelsLoaded ? "能力查询中" : selectedModel
+            ? [selectedModel.supportsStreaming ? "流式" : "非流式", selectedModel.supportsStructuredOutput ? "结构化" : "文本"]
+                .join(" · ")
+            : "能力未知");
+        capability.title = model.title;
         if (activeRun) {
-            const cancel = controls.createEl("button", { text: "取消" });
+            const cancel = controls.createEl("button", { text: "停止" });
             cancel.onclick = () => void this.store?.cancel(activeRun.runId, activeRun.sessionId, activeRun.turnId)
                 .catch((error) => new Notice(actionableMessage(error)));
             const steer = controls.createEl("button", { text: "转向" });
@@ -503,6 +733,56 @@ export class LocalChatView extends ItemView {
         }
     }
 
+    private async refreshModels(runtimeAttempt: string): Promise<void> {
+        try {
+            const models = await this.host.listModels();
+            if (this.closed || this.boundRuntimeAttempt !== runtimeAttempt ||
+                this.latestRuntimeAttempt !== runtimeAttempt) return;
+            this.models = [...models];
+            this.modelsLoaded = true;
+            this.modelError = models.length === 0
+                ? "Worker 当前没有可用模型；请在 OfferAgent 设置中检查模型、端点或登录凭据"
+                : null;
+        } catch (error) {
+            if (this.closed || this.boundRuntimeAttempt !== runtimeAttempt ||
+                this.latestRuntimeAttempt !== runtimeAttempt) return;
+            this.models = [];
+            this.modelsLoaded = true;
+            this.modelError = actionableMessage(error);
+        }
+        this.scheduleRender();
+    }
+
+    private async chooseModel(model: string): Promise<void> {
+        if (!model || model === this.host.settings.model) return;
+        try {
+            await this.host.selectModel(model);
+            await this.refreshModels(this.boundRuntimeAttempt);
+        } catch (error) {
+            this.modelError = actionableMessage(error);
+            new Notice(this.modelError);
+            this.scheduleRender();
+        }
+    }
+
+    private async replaceDraftWithPrompt(prompt: string): Promise<void> {
+        const snapshot = this.snapshot;
+        const store = this.store;
+        const tab = snapshot?.tabs.find((candidate) => candidate.tabId === snapshot.activeTabId);
+        if (!snapshot || !store || !tab) return;
+        const input = this.contentEl.querySelector<HTMLTextAreaElement>(".offeragent-composer-input");
+        const current = input?.value ?? tab.draft;
+        if (current.trim() && current !== prompt &&
+            !window.confirm("当前草稿会被该运行的原提示词替换。继续吗？")) return;
+        if (input) {
+            input.value = prompt;
+            input.focus();
+            input.setSelectionRange(prompt.length, prompt.length);
+        }
+        await store.updateDraft(tab.tabId, prompt);
+        this.scheduleRender();
+    }
+
     private scheduleDraftSave(tabId: string, value: string, delayMs = 250): void {
         if (this.draftTimer) clearTimeout(this.draftTimer);
         this.draftTimer = setTimeout(() => {
@@ -528,6 +808,42 @@ export function shouldSendComposerInput(
 ): boolean {
     return event.key === "Enter" && !event.shiftKey && !blocked && !composing &&
         !event.isComposing && event.keyCode !== 229;
+}
+
+export interface TimelineScrollState {
+    readonly follow: boolean;
+    readonly scrollTop: number;
+    readonly scrollHeight: number;
+}
+
+export function timelineScrollIntent(
+    timeline: Pick<HTMLElement, "scrollTop" | "scrollHeight" | "clientHeight">,
+    affordanceHeight = 0,
+): TimelineScrollState {
+    const contentHeight = Math.max(0, timeline.scrollHeight - Math.max(0, affordanceHeight));
+    const remaining = Math.max(0, contentHeight - timeline.clientHeight - timeline.scrollTop);
+    return {
+        follow: remaining <= 48,
+        scrollTop: timeline.scrollTop,
+        scrollHeight: contentHeight,
+    };
+}
+
+export function explicitContinuationStatus(status: string): boolean {
+    return status === "interrupted" || status === "orphaned";
+}
+
+export function originalTurnPrompt(
+    timeline: readonly { readonly kind: string; readonly source?: string; readonly blocks?: readonly string[] }[],
+): string | null {
+    const message = timeline.find((item) => item.kind === "user_message" && item.source === "turn");
+    const text = message?.blocks?.filter((block) => block.trim()).join("\n\n").trim() ?? "";
+    return text || null;
+}
+
+export function ordinaryToolActivity(tool: Pick<ToolCallTimelineItem, "name" | "status">): boolean {
+    return tool.name !== "vault.changes.apply" &&
+        !["failed", "conflict", "unknown_outcome", "timed_out", "denied", "cancelled"].includes(tool.status);
 }
 
 type ProjectedRun = ChatStoreSnapshot["projection"]["runs"] extends Map<string, infer Run> ? Run : never;

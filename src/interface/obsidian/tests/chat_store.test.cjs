@@ -168,6 +168,61 @@ test("history reopen and tab selection hydrate durable events from the reducer c
     assert.deepEqual(client.reducer.state.runs.get(RUN).timeline.find((item) => item.kind === "assistant_message").blocks, ["persisted answer"]);
 });
 
+test("restart preserves interrupted partial output and waits for an explicit continuation command", async () => {
+    const { ChatStore } = loadModule("chat_store.ts");
+    const events = [
+        runEvent(1, "turn.started", { input: [{ type: "text", text: "durable prompt" }] }),
+        runEvent(2, "assistant.delta", { blockIndex: 0, offset: 0, delta: "durable partial" }),
+        runEvent(3, "turn.interrupted", { reason: "worker_restart" }),
+    ];
+    const commandCalls = [];
+    const client = createClient(async (method, params) => {
+        commandCalls.push([method, params]);
+        if (method === "turn/retry") return { accepted: true };
+        throw new Error(`unexpected command ${method}`);
+    }, {
+        sessionGet: async () => durableSessionResult(events, { activeRunId: null }),
+        replaySession: durableReplay(events),
+    });
+    const store = new ChatStore(client, memoryPersistence({
+        schemaVersion: 1,
+        activeTabId: "tab_interrupted",
+        tabs: [{
+            tabId: "tab_interrupted",
+            sessionId: SESSION,
+            title: "Interrupted",
+            draft: "",
+            selectedRunId: RUN,
+        }],
+    }));
+
+    await store.initialize();
+
+    const recovered = client.reducer.state.runs.get(RUN);
+    assert.equal(recovered.status, "interrupted");
+    assert.equal(recovered.timeline.find((item) => item.kind === "assistant_message").blocks[0], "durable partial");
+    assert.deepEqual(commandCalls, []);
+
+    await store.retry(SESSION, TURN, RUN, runConfig);
+    assert.deepEqual(commandCalls.map(([method]) => method), ["turn/retry"]);
+});
+
+test("ChatStore exposes the accepted durable event only as a projection patch hint", async () => {
+    const { ChatStore } = loadModule("chat_store.ts");
+    const client = createClient(async () => ({}));
+    const store = new ChatStore(client, memoryPersistence());
+    await store.initialize();
+    const seen = [];
+    store.subscribe((_snapshot, event) => {
+        if (event) seen.push(event.type);
+    });
+
+    client.reducer.accept(runEvent(1, "assistant.delta", { blockIndex: 0, offset: 0, delta: "hello" }));
+
+    assert.deepEqual(seen, ["assistant.delta"]);
+    assert.equal(client.reducer.state.runs.get(RUN).timeline[0].blocks[0], "hello");
+});
+
 test("Store and client reconstruction replay persisted tabs from their respective applied cursors", async () => {
     const { ChatStore } = loadModule("chat_store.ts");
     const events = [

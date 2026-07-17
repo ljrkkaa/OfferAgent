@@ -12,6 +12,7 @@ import {
 } from "obsidian";
 
 import { LocalChatView, LOCAL_CHAT_VIEW } from "./local/chat_view";
+import type { ChatModelChoice } from "./local/chat_view";
 import type { ExtensionCommandMethod } from "./local/extension_settings";
 import {
     DEFAULT_LOCAL_SETTINGS,
@@ -217,6 +218,57 @@ export default class OfferAgentPlugin extends Plugin {
             if (sessions.length > 10_000) throw new Error("Session 列表超过 UI 上限");
         } while (cursor !== null);
         return sessions;
+    }
+
+    async listModels(): Promise<readonly ChatModelChoice[]> {
+        await this.ensureReady();
+        const settings = snapshotLocalSettings(this.settings);
+        const result = requireJsonObject(await (this.runtime as RuntimeBootstrap).harness.request("models/list", {
+            provider: settings.provider,
+            includeUnavailable: false,
+        }));
+        if (!Array.isArray(result.models) || result.models.length > 256) throw new Error("Worker 模型列表无效");
+        return result.models.map((raw) => {
+            const model = requireJsonObject(raw);
+            const provider = requireText(model.provider, "Model provider");
+            const modelId = requireText(model.model, "Model id");
+            const displayName = requireText(model.displayName, "Model display name");
+            if (provider !== settings.provider || modelId.length > 256 || displayName.length > 512 ||
+                typeof model.supportsStreaming !== "boolean" || typeof model.supportsStructuredOutput !== "boolean") {
+                throw new Error("Worker 返回了与当前 Provider 不一致的模型能力");
+            }
+            return {
+                provider,
+                model: modelId,
+                displayName,
+                supportsStreaming: model.supportsStreaming,
+                supportsStructuredOutput: model.supportsStructuredOutput,
+            };
+        });
+    }
+
+    async selectModel(model: string): Promise<void> {
+        const candidate = model.trim();
+        if (!candidate || candidate.length > 256 || candidate.includes("\0")) throw new Error("模型标识无效");
+        const available = await this.listModels();
+        if (!available.some((item) => item.model === candidate)) throw new Error("所选模型不在 Worker 当前能力列表中");
+        const previous = this.settings.model;
+        this.settings.model = candidate;
+        try {
+            await this.saveLocalSettings();
+            await this.applyRuntimeSettings();
+        } catch (error) {
+            this.settings.model = previous;
+            await this.saveLocalSettings().catch(() => undefined);
+            throw error;
+        }
+    }
+
+    openSettings(): void {
+        const commands = (this.app as unknown as {
+            commands: { executeCommandById(commandId: string): boolean };
+        }).commands;
+        commands.executeCommandById("app:open-settings");
     }
 
     async saveLocalSettings(): Promise<void> {

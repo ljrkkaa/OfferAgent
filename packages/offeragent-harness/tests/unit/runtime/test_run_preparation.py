@@ -379,6 +379,76 @@ async def test_completed_session_turns_are_injected_as_exact_native_role_history
 
 
 @pytest.mark.asyncio
+async def test_cancelled_and_interrupted_partial_answers_remain_replayable_but_never_enter_future_context() -> None:
+    unit_of_work = InMemoryUnitOfWorkFactory()
+    now = datetime(2026, 7, 14, tzinfo=timezone.utc)
+    terminal_cases = (
+        (
+            "cancelled",
+            TurnStatus.CANCELLED,
+            RunStatus.CANCELLED,
+            RunPhase.CANCELLED,
+            TerminationReason.CANCELLED_BY_USER,
+        ),
+        (
+            "interrupted",
+            TurnStatus.INTERRUPTED,
+            RunStatus.INTERRUPTED,
+            RunPhase.INTERRUPTED,
+            TerminationReason.RUNTIME_INTERRUPTED,
+        ),
+    )
+    async with unit_of_work.begin() as work:
+        for ordinal, (suffix, turn_status, run_status, phase, termination) in enumerate(terminal_cases, start=1):
+            turn_id = f"turn_{suffix}"
+            run_id = f"run_{suffix}"
+            turn = Turn(
+                turn_id,
+                "ses_main",
+                ordinal,
+                turn_status,
+                ({"type": "text", "text": f"prompt {suffix}"},),
+                now,
+                now,
+            )
+            run = Run(
+                run_id,
+                "ses_main",
+                turn_id,
+                "ws_main",
+                AgentLineage.root(run_id),
+                RunKind.ROOT,
+                run_status,
+                1,
+                4,
+                {},
+                now,
+                now,
+                None,
+                termination,
+            )
+            state = RunState(
+                "ws_main",
+                "ses_main",
+                turn_id,
+                run_id,
+                AgentLineage.root(run_id),
+                phase=phase,
+                assistant_text=f"visible partial answer {suffix}",
+            )
+            await work.entities.put("turns", turn_id, turn, expected_revision=0)
+            await work.entities.put("runs", run_id, run, expected_revision=0)
+            await work.entities.put("run_states", run_id, state, expected_revision=0)
+        await work.commit()
+
+    adapter = ConversationHistoryRunPreparationAdapter(workspace_id="ws_main", unit_of_work=unit_of_work)
+
+    fragments = await adapter.context_fragments(_request(), RunPhase.LOADING_CONTEXT, ManualCancellationToken())
+
+    assert fragments == ()
+
+
+@pytest.mark.asyncio
 async def test_prepared_context_fails_closed_before_enrichment_on_oversized_or_foreign_state() -> None:
     provider = _Provider((_fragment(text="x" * 100),))
     planner = _Planner()

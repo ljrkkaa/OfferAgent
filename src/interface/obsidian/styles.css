@@ -1877,6 +1877,7 @@ button.reference-button:hover {
 
 .offeragent-reasoning,
 .offeragent-references,
+.offeragent-tool-group,
 .offeragent-tool-card,
 .offeragent-approval,
 .offeragent-subagent {
@@ -1886,9 +1887,41 @@ button.reference-button:hover {
 }
 
 .offeragent-reasoning,
-.offeragent-references {
+.offeragent-references,
+.offeragent-tool-group {
     margin: 7px 0;
     padding: 8px 10px;
+}
+
+.offeragent-tool-group > summary {
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: var(--font-ui-small);
+}
+
+.offeragent-tool-group-body {
+    display: grid;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.offeragent-message-body.markdown-rendered {
+    overflow-x: auto;
+    white-space: normal;
+}
+
+.offeragent-message-body.markdown-rendered > :first-child {
+    margin-top: 0;
+}
+
+.offeragent-message-body.markdown-rendered > :last-child {
+    margin-bottom: 0;
+}
+
+.offeragent-message-body.markdown-rendered pre,
+.offeragent-message-body.markdown-rendered table {
+    overflow-x: auto;
+    max-width: 100%;
 }
 
 .offeragent-reasoning p {
@@ -1992,8 +2025,40 @@ button.reference-button:hover {
 
 .offeragent-composer-controls {
     justify-content: flex-end;
+    flex-wrap: wrap;
     gap: 7px;
     margin-top: 7px;
+}
+
+.offeragent-model-control {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+    margin-right: auto;
+}
+
+.offeragent-model-control select {
+    max-width: min(240px, 42vw);
+    text-overflow: ellipsis;
+}
+
+.offeragent-model-capability {
+    color: var(--text-muted);
+    font-size: var(--font-ui-smaller);
+}
+
+.offeragent-run-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.offeragent-new-content {
+    position: sticky;
+    bottom: 6px;
+    display: block;
+    margin: 10px auto 0;
+    z-index: 2;
 }
 
 .offeragent-settings-description {

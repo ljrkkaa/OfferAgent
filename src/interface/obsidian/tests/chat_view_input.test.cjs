@@ -57,6 +57,52 @@ test("composer wires both composition lifecycle events before its input and key 
     assert.match(source, /event\.keyCode !== 229/);
 });
 
+test("a late Store bind cannot attach an obsolete Worker generation after restart", async () => {
+    const { LocalChatView } = loadModule();
+    const originalWindow = global.window;
+    global.window = { requestAnimationFrame: () => 1 };
+    let runtime = { state: "ready", generation: 1, attempt: 1, error: null };
+    let runtimeListener = null;
+    let releaseFirst;
+    const first = new Promise((resolve) => { releaseFirst = resolve; });
+    const subscriptions = [];
+    const store = (name) => ({
+        subscribe() {
+            subscriptions.push(name);
+            return () => undefined;
+        },
+    });
+    let ensureCalls = 0;
+    const host = {
+        runtimeSnapshot: () => runtime,
+        subscribeRuntime(listener) {
+            runtimeListener = listener;
+            return () => undefined;
+        },
+        async ensureChatStore() {
+            ensureCalls += 1;
+            return ensureCalls === 1 ? await first : store("current");
+        },
+        async listModels() { return []; },
+    };
+    try {
+        const view = new LocalChatView({}, host);
+        const opening = view.onOpen();
+        runtime = { state: "ready", generation: 2, attempt: 1, error: null };
+        runtimeListener(runtime);
+        releaseFirst(store("obsolete"));
+        await opening;
+        await new Promise((resolve) => setImmediate(resolve));
+
+        assert.equal(ensureCalls, 2);
+        assert.deepEqual(subscriptions, ["current"]);
+        await view.onClose();
+    } finally {
+        if (originalWindow === undefined) delete global.window;
+        else global.window = originalWindow;
+    }
+});
+
 test("timeline renders a submitted user message before its durable turn event arrives", () => {
     const source = readFileSync(path.join(__dirname, "../src/local/chat_view.ts"), "utf8");
 
@@ -65,11 +111,63 @@ test("timeline renders a submitted user message before its durable turn event ar
     assert.match(source, /正在提交给 OfferAgent/);
 });
 
-test("timeline renders ordered durable items instead of legacy grouped cards", () => {
+test("timeline preserves durable item order while collapsing only contiguous ordinary tools", () => {
     const source = readFileSync(path.join(__dirname, "../src/local/chat_view.ts"), "utf8");
 
-    assert.match(source, /for \(const item of run\.timeline\)/);
+    assert.match(source, /for \(let index = 0; index < run\.timeline\.length;\)/);
+    assert.match(source, /const candidate = run\.timeline\[index\]/);
     assert.match(source, /case "reasoning"/);
     assert.match(source, /case "tool_call"/);
     assert.match(source, /case "subagent"/);
+});
+
+test("timeline follow intent preserves a reader who scrolled away from streaming output", () => {
+    const { timelineScrollIntent } = loadModule();
+
+    assert.deepEqual(timelineScrollIntent({ scrollTop: 552, scrollHeight: 1000, clientHeight: 400 }), {
+        follow: true, scrollTop: 552, scrollHeight: 1000,
+    });
+    assert.deepEqual(timelineScrollIntent({ scrollTop: 100, scrollHeight: 1000, clientHeight: 400 }), {
+        follow: false, scrollTop: 100, scrollHeight: 1000,
+    });
+});
+
+test("terminal run actions distinguish explicit continuation and stop-and-revise text", () => {
+    const { explicitContinuationStatus, originalTurnPrompt } = loadModule();
+    const timeline = [
+        { kind: "user_message", source: "turn", blocks: ["original", "prompt"] },
+        { kind: "user_message", source: "steer", blocks: ["later steer"] },
+    ];
+
+    assert.equal(originalTurnPrompt(timeline), "original\n\nprompt");
+    assert.equal(explicitContinuationStatus("interrupted"), true);
+    assert.equal(explicitContinuationStatus("orphaned"), true);
+    assert.equal(explicitContinuationStatus("cancelled"), false);
+    assert.equal(explicitContinuationStatus("completed"), false);
+});
+
+test("ordinary tools collapse while Vault changes and failed outcomes remain direct", () => {
+    const { ordinaryToolActivity } = loadModule();
+
+    assert.equal(ordinaryToolActivity({ name: "vault.search", status: "succeeded" }), true);
+    assert.equal(ordinaryToolActivity({ name: "vault.changes.apply", status: "succeeded" }), false);
+    assert.equal(ordinaryToolActivity({ name: "project.read", status: "failed" }), false);
+    assert.equal(ordinaryToolActivity({ name: "vault.read", status: "unknown_outcome" }), false);
+});
+
+test("sidebar uses Obsidian Markdown, Worker model choices, settings, and a frozen-scroll affordance", () => {
+    const source = readFileSync(path.join(__dirname, "../src/local/chat_view.ts"), "utf8");
+
+    assert.match(source, /MarkdownRenderer\.render/);
+    assert.match(source, /new Component\(\)/);
+    assert.match(source, /releaseMarkdownComponents/);
+    assert.match(source, /Promise\.all\(markdownTasks\)/);
+    assert.match(source, /scheduleStreamingAssistantPatch/);
+    assert.match(source, /patchStreamingAssistant/);
+    assert.match(source, /if \(this\.closed\) return/);
+    assert.match(source, /host\.listModels\(\)/);
+    assert.match(source, /host\.selectModel\(/);
+    assert.match(source, /host\.openSettings\(\)/);
+    assert.match(source, /新内容/);
+    assert.match(source, /放入输入框/);
 });

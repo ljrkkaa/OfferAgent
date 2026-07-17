@@ -79,7 +79,7 @@ const MAX_SESSION_HYDRATION_STABILIZATION_PASSES = 8;
 export class ChatStore {
     private readonly client: HarnessClient;
     private readonly persistence: ChatStorePersistence;
-    private readonly listeners = new Set<(snapshot: ChatStoreSnapshot) => void>();
+    private readonly listeners = new Set<(snapshot: ChatStoreSnapshot, event?: EventEnvelope) => void>();
     private tabs: ChatTab[] = [];
     private activeTabId = "";
     private operationCount = 0;
@@ -159,7 +159,7 @@ export class ChatStore {
         }
     }
 
-    subscribe(listener: (snapshot: ChatStoreSnapshot) => void): () => void {
+    subscribe(listener: (snapshot: ChatStoreSnapshot, event?: EventEnvelope) => void): () => void {
         this.listeners.add(listener);
         listener(this.snapshot);
         return () => this.listeners.delete(listener);
@@ -487,7 +487,7 @@ export class ChatStore {
             const title = optionalText(summary, "title");
             if (title) for (const tab of this.tabs) if (tab.sessionId === sessionId) tab.title = title;
         }
-        this.emit();
+        this.emit(event);
     }
 
     private hydrateSession(sessionId: string): Promise<HydratedSession> {
@@ -578,9 +578,9 @@ export class ChatStore {
         });
     }
 
-    private emit(): void {
+    private emit(event?: EventEnvelope): void {
         const snapshot = this.snapshot;
-        for (const listener of this.listeners) listener(snapshot);
+        for (const listener of this.listeners) listener(snapshot, event);
     }
 
     private requireInitialized(): void {
