@@ -34,6 +34,7 @@ import { JsonObject, JsonValue, requireJsonObject } from "./runtime/json_rpc";
 import { LocalDevelopmentRuntimeInstaller } from "./runtime/local_development_installer";
 import { StdioWorkerTransport } from "./runtime/stdio_worker";
 import { observePluginToolEvents, VaultToolAdapter } from "./runtime/vault_tool_adapter";
+import { createHostResearchBrowser, ResearchBrowserAdapter } from "./runtime/research_browser";
 import {
     FileVaultChangeJournal,
     GitCheckpointStore,
@@ -92,6 +93,7 @@ export default class OfferAgentPlugin extends Plugin {
     private vaultToolClient: HarnessClient | null = null;
     private vaultToolDisposal: (() => void) | null = null;
     private vaultChanges: VaultChangeCoordinator | null = null;
+    private researchBrowser: ResearchBrowserAdapter | null = null;
     private runtimeStart: Promise<void> | null = null;
     private vaultRoot = "";
     private workspaceId = "";
@@ -595,6 +597,7 @@ export default class OfferAgentPlugin extends Plugin {
         void changes.beginRecovery().catch((error) => {
             if (!this.unloading) new Notice(actionableError(error));
         });
+        const researchBrowser = createHostResearchBrowser();
         const adapter = new VaultToolAdapter(this.app.vault, client, this.workspaceId, this.app.metadataCache, {
             dailyNotes: {
                 readConfiguration: async () => {
@@ -609,12 +612,13 @@ export default class OfferAgentPlugin extends Plugin {
                 resolveToday: () => localMoment().format("YYYY-MM-DD"),
                 formatDate: (date, format) => localMoment(date, "YYYY-MM-DD", true).format(format),
             },
-        }, changes);
+        }, changes, researchBrowser);
         this.vaultToolDisposal = observePluginToolEvents(client.reducer, adapter, (error) => {
             if (!this.unloading) new Notice(actionableError(error));
         });
         this.vaultToolClient = client;
         this.vaultChanges = changes;
+        this.researchBrowser = researchBrowser;
     }
 
     private authorizeVaultChange(proposal: VaultChangeAuthorizationProposal): boolean {
@@ -636,6 +640,9 @@ export default class OfferAgentPlugin extends Plugin {
         this.vaultToolDisposal = null;
         this.vaultToolClient = null;
         this.vaultChanges = null;
+        const researchBrowser = this.researchBrowser;
+        this.researchBrowser = null;
+        void researchBrowser?.close().catch(() => undefined);
     }
 
     private async startRuntime(): Promise<void> {

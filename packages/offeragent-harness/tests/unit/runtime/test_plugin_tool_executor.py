@@ -317,6 +317,8 @@ def test_vault_evidence_definitions_preserve_the_plugin_read_boundary() -> None:
         "daily_note.context",
         "planning_memory.list",
         "planning_memory.read",
+        "interview_catalog.search",
+        "research_browser.navigate",
         "vault.list",
         "vault.search",
         "vault.read",
@@ -331,6 +333,8 @@ def test_vault_evidence_definitions_preserve_the_plugin_read_boundary() -> None:
         "daily_note.context": "daily_note.read",
         "planning_memory.list": "vault.read",
         "planning_memory.read": "vault.read",
+        "interview_catalog.search": "vault.read",
+        "research_browser.navigate": "research.browser",
         "vault.list": "vault.read",
         "vault.search": "vault.read",
         "vault.read": "vault.read",
@@ -341,14 +345,26 @@ def test_vault_evidence_definitions_preserve_the_plugin_read_boundary() -> None:
     }
     for name, definition in definitions.items():
         assert definition.executor_location is ExecutorLocation.PLUGIN
-        expected_risk = RiskClass.WRITE if name == "vault.changes.apply" else RiskClass.READ
-        expected_effect = SideEffectClass.WRITE if name == "vault.changes.apply" else SideEffectClass.READ
+        expected_risk = (
+            RiskClass.WRITE
+            if name == "vault.changes.apply"
+            else RiskClass.NETWORK
+            if name == "research_browser.navigate"
+            else RiskClass.READ
+        )
+        expected_effect = (
+            SideEffectClass.WRITE
+            if name == "vault.changes.apply"
+            else SideEffectClass.NETWORK
+            if name == "research_browser.navigate"
+            else SideEffectClass.READ
+        )
         assert definition.risk is expected_risk
         assert definition.side_effect_class is expected_effect
         assert definition.required_capabilities == frozenset({capabilities[name]})
         assert definition.result_sensitivity is ResultSensitivity.WORKSPACE
-        assert definition.idempotent
-        assert definition.retryable is (name != "vault.changes.apply")
+        assert definition.idempotent is (name != "research_browser.navigate")
+        assert definition.retryable is (name != "vault.changes.apply" and name != "research_browser.navigate")
     assert definitions["vault.read"].output_limit_bytes == 65_536
     assert definitions["vault.search"].output_limit_bytes == 65_536
     assert definitions["planning_memory.list"].output_schema["properties"]["topics"]["maxItems"] == 100
@@ -359,6 +375,13 @@ def test_vault_evidence_definitions_preserve_the_plugin_read_boundary() -> None:
         "expectedModifiedVersion",
         "expectedContentHash",
     )
+    browser_actions = definitions["research_browser.navigate"].input_schema["oneOf"]
+    assert {variant["properties"]["action"].get("const") for variant in browser_actions} >= {
+        "open",
+        "follow",
+        "paginate",
+    }
+    assert definitions["interview_catalog.search"].output_schema["properties"]["questionCandidates"]["maxItems"] == 100
     write = definitions["vault.changes.apply"]
     operations = write.input_schema["properties"]["operations"]
     assert operations["maxItems"] == 20

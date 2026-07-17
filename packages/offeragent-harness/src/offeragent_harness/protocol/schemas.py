@@ -24,6 +24,7 @@ from .content import (
     ProjectSourceRef,
     TextContentBlock,
     VaultSourceRef,
+    WebSourceRef,
 )
 from .errors import ErrorEnvelope
 from .events import EVENT_REGISTRY, EventEnvelope
@@ -101,6 +102,7 @@ def _schema_models() -> list[type[WireModel]]:
             VaultSourceRef,
             ArtifactSourceRef,
             ProjectSourceRef,
+            WebSourceRef,
         )
     )
     # Preserve first occurrence so generated references and traversal are stable.

@@ -82,19 +82,23 @@ test("plugin tool event observer delegates only plugin-owned started calls", asy
         },
     };
     const observed = [];
+    const cancelled = [];
     const dispose = observePluginToolEvents(events, {
         execute: async (candidate) => {
             observed.push(candidate);
             return { accepted: true, replayed: false };
         },
+        cancelRun: (runId) => cancelled.push(runId),
     }, (error) => { throw error; });
 
     listener({ type: "tool.started", payload: { call: { ...call(), executorLocation: "local" } } });
     listener({ type: "tool.started", payload: { call: call() } });
+    listener({ type: "turn.interrupted", runId: "run_contract", payload: {} });
     await new Promise((resolve) => setImmediate(resolve));
 
     assert.equal(observed.length, 1);
     assert.equal(observed[0].toolCallId, "call_contract");
+    assert.deepEqual(cancelled, ["run_contract"]);
     dispose();
     assert.equal(listener, undefined);
 });

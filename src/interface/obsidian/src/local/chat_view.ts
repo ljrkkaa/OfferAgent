@@ -17,6 +17,7 @@ import {
     VaultReferenceTarget,
     sourceReferenceLabel,
     vaultReferenceTarget,
+    webReferenceTarget,
 } from "../runtime/source_references";
 import { LocalOfferAgentSettings, effectivePermissionMode, runConfig } from "./settings";
 
@@ -379,10 +380,14 @@ export class LocalChatView extends ItemView {
                 const item = list.createEl("li");
                 const label = sourceReferenceLabel(reference);
                 const target = vaultReferenceTarget(reference);
+                const webTarget = webReferenceTarget(reference);
                 if (target && safeVaultPath(target.path)) {
                     const link = item.createEl("button", { text: label, cls: "offeragent-reference-link" });
                     const linkText = target.heading ? `${target.path}#${target.heading}` : target.path;
                     link.onclick = () => void this.openVaultReference(linkText, target);
+                } else if (webTarget) {
+                    const link = item.createEl("button", { text: label, cls: "offeragent-reference-link" });
+                    link.onclick = () => window.open(webTarget, "_blank", "noopener,noreferrer");
                 } else item.setText(label);
             }
         }

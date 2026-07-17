@@ -12,6 +12,8 @@ import { MetadataReadPort, VaultEvidenceAdapter } from "./vault_evidence";
 import { VaultControlAdapter, VaultControlOptions } from "./vault_control";
 import { ProjectEvidenceAdapter } from "./project_evidence";
 import { PlanningMemoryAdapter } from "./planning_memory";
+import { InterviewCatalogAdapter } from "./interview_catalog";
+import type { ResearchBrowserAdapter } from "./research_browser";
 import { VaultChangeCoordinator } from "./vault_changes";
 
 export interface VaultReadPort {
@@ -29,11 +31,16 @@ export interface PluginToolCompletionClient {
 }
 
 export interface PluginToolEventSource {
-    subscribe(listener: (event: { readonly type: string; readonly payload: unknown }) => void): () => void;
+    subscribe(listener: (event: {
+        readonly type: string;
+        readonly payload: unknown;
+        readonly runId?: unknown;
+    }) => void): () => void;
 }
 
 export interface PluginToolExecutionPort {
     execute(call: ExecutableToolCallDescriptor): Promise<PluginToolCompleteResult>;
+    cancelRun?(runId: string): void;
 }
 
 /** The sole Obsidian-API boundary for capabilities owned by the plugin. */
@@ -45,18 +52,25 @@ export class VaultToolAdapter {
         metadata?: MetadataReadPort,
         controls?: VaultControlOptions,
         private readonly changes?: VaultChangeCoordinator,
+        private readonly research?: ResearchBrowserAdapter,
     ) {
         if (!workspaceId) throw new TypeError("workspaceId is required");
         this.evidence = new VaultEvidenceAdapter(vault, workspaceId, metadata);
         this.control = new VaultControlAdapter(vault, workspaceId, controls);
         this.projects = new ProjectEvidenceAdapter(vault);
         this.planningMemory = new PlanningMemoryAdapter(vault, workspaceId);
+        this.interviewCatalog = new InterviewCatalogAdapter(vault);
     }
 
     private readonly evidence: VaultEvidenceAdapter;
     private readonly control: VaultControlAdapter;
     private readonly projects: ProjectEvidenceAdapter;
     private readonly planningMemory: PlanningMemoryAdapter;
+    private readonly interviewCatalog: InterviewCatalogAdapter;
+
+    cancelRun(runId: string): void {
+        this.research?.cancelRun(runId);
+    }
 
     async execute(call: ExecutableToolCallDescriptor): Promise<PluginToolCompleteResult> {
         this.validateBinding(call);
@@ -78,6 +92,7 @@ export class VaultToolAdapter {
         if (![
             "agent_contract.read", "skill.read", "daily_note.context",
             "planning_memory.list", "planning_memory.read",
+            "interview_catalog.search", "research_browser.navigate",
             "vault.list", "vault.search", "vault.read",
             "project.list", "project.search", "project.read",
             "vault.changes.apply",
@@ -98,6 +113,11 @@ export class VaultToolAdapter {
         if (call.name.startsWith("vault.")) return this.evidence.execute(call);
         if (call.name.startsWith("project.")) return this.projects.execute(call);
         if (call.name.startsWith("planning_memory.")) return this.planningMemory.execute(call);
+        if (call.name.startsWith("interview_catalog.")) return this.interviewCatalog.execute(call);
+        if (call.name.startsWith("research_browser.")) {
+            if (this.research === undefined) throw new Error("Research Browser is unavailable");
+            return this.research.execute(call);
+        }
         return this.control.execute(call);
     }
 }
@@ -108,6 +128,10 @@ export function observePluginToolEvents(
     onError: (error: Error) => void,
 ): () => void {
     return source.subscribe((event) => {
+        if (["turn.cancelled", "turn.failed", "turn.interrupted"].includes(event.type)) {
+            if (typeof event.runId === "string") executor.cancelRun?.(event.runId);
+            return;
+        }
         if (event.type !== "tool.started") return;
         try {
             const call = executablePluginCall(event.payload);

@@ -25,6 +25,7 @@ from offeragent_harness.protocol.content import (
     SourceRef,
     TextContentBlock,
     VaultSourceRef,
+    WebSourceRef,
 )
 from offeragent_harness.protocol.errors import ErrorCode, ProtocolViolation
 from offeragent_harness.protocol.events import EVENT_REGISTRY, EventEnvelope, EventType, ToolCompletedPayload
@@ -306,6 +307,22 @@ def test_project_source_ref_preserves_registry_identity_and_precise_lines() -> N
     assert source.project_id == "offeragent"
     assert source.path == "src/agent.py"
     assert source.line_start == 7
+
+
+def test_web_source_ref_preserves_clickable_research_provenance() -> None:
+    source: SourceRef = TypeAdapter(SourceRef).validate_json(
+        """
+        {
+          "type": "web",
+          "url": "https://example.com/interview/42",
+          "contentHash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "title": "Acme backend interview",
+          "freshness": "fresh"
+        }
+        """
+    )
+    assert isinstance(source, WebSourceRef)
+    assert str(source.url) == "https://example.com/interview/42"
 
 
 def test_turn_start_accepts_at_most_eight_safe_pinned_source_locators() -> None:

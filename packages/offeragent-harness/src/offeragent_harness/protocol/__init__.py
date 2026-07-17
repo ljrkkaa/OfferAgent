@@ -38,6 +38,7 @@ from .content import (
     SourceRef,
     TextContentBlock,
     VaultSourceRef,
+    WebSourceRef,
 )
 from .errors import ErrorCode, ErrorEnvelope, ProtocolViolation, protocol_error
 from .events import (
@@ -142,6 +143,7 @@ _PUBLIC_NAMES = [
     "ValidatedRequest",
     "ValidatedResponse",
     "VaultSourceRef",
+    "WebSourceRef",
     "WireModel",
     "canonical_json_bytes",
     "decode_json_document",

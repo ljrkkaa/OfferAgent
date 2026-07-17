@@ -7349,7 +7349,8 @@
         "mapping": {
           "artifact": "#/$defs/ArtifactSourceRef",
           "project": "#/$defs/ProjectSourceRef",
-          "vault": "#/$defs/VaultSourceRef"
+          "vault": "#/$defs/VaultSourceRef",
+          "web": "#/$defs/WebSourceRef"
         },
         "propertyName": "type"
       },
@@ -7362,6 +7363,9 @@
         },
         {
           "$ref": "#/$defs/ProjectSourceRef"
+        },
+        {
+          "$ref": "#/$defs/WebSourceRef"
         }
       ]
     },
@@ -8921,6 +8925,58 @@
         "expiresAt"
       ],
       "title": "WebLaunchResult",
+      "type": "object"
+    },
+    "WebSourceRef": {
+      "additionalProperties": false,
+      "description": "A clickable public-page citation captured by a bounded research tool.",
+      "properties": {
+        "contentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "freshness": {
+          "$ref": "#/$defs/Freshness",
+          "default": "unknown"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "title": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "type": {
+          "const": "web",
+          "title": "Type",
+          "type": "string"
+        },
+        "url": {
+          "format": "uri",
+          "minLength": 1,
+          "title": "Url",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "url",
+        "contentHash",
+        "title"
+      ],
+      "title": "WebSourceRef",
       "type": "object"
     },
     "WorkspaceId": {

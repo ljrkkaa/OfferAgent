@@ -72,3 +72,22 @@ test("Project references keep project identity and exact line ranges", () => {
         lineEnd: 9,
     });
 });
+
+test("Web references retain a safe clickable public URL", () => {
+    const { sourceReferenceArray, sourceReferenceLabel, webReferenceTarget } = loadModule();
+    const references = sourceReferenceArray([{
+        type: "web",
+        url: "https://example.com/interview/42",
+        contentHash: `sha256:${"b".repeat(64)}`,
+        title: "Acme backend interview",
+        freshness: "fresh",
+        label: "Research result",
+    }]);
+
+    assert.equal(sourceReferenceLabel(references[0]), "Research result");
+    assert.equal(webReferenceTarget(references[0]), "https://example.com/interview/42");
+    assert.throws(() => sourceReferenceArray([{
+        ...references[0],
+        url: "file:///C:/secret.txt",
+    }]), /invalid Web source URL/);
+});

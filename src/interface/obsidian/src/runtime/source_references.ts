@@ -1,4 +1,4 @@
-import type { ProjectSourceRef, SourceRef, VaultSourceRef } from "./generated_protocol";
+import type { ProjectSourceRef, SourceRef, VaultSourceRef, WebSourceRef } from "./generated_protocol";
 import type { JsonObject, JsonValue } from "./json_rpc";
 
 const FRESHNESS = new Set(["fresh", "stale", "partial", "stale_partial", "unknown"]);
@@ -51,6 +51,8 @@ export function sourceReferenceKey(reference: SourceRef): string {
                 reference.lineStart ?? "",
                 reference.lineEnd ?? "",
             ].join(":");
+        case "web":
+            return `web:${reference.url}:${reference.contentHash}`;
     }
 }
 
@@ -74,6 +76,8 @@ export function sourceReferenceLabel(reference: SourceRef): string {
                     : `:${reference.lineStart}`;
             return `${reference.label ?? `${reference.projectId}/${reference.path}`}${line}`;
         }
+        case "web":
+            return reference.label ?? reference.title;
     }
 }
 
@@ -97,12 +101,18 @@ export function vaultReferenceTarget(reference: SourceRef): VaultReferenceTarget
     };
 }
 
+export function webReferenceTarget(reference: SourceRef): string | null {
+    if (reference.type !== "web") return null;
+    return safeWebUrl(reference.url);
+}
+
 function sourceReference(value: JsonValue): SourceRef {
     const reference = jsonObject(value, "source reference");
     const type = requiredText(reference, "type");
     optionalText(reference, "label");
     if (type === "vault") return vaultSourceReference(reference);
     if (type === "project") return projectSourceReference(reference);
+    if (type === "web") return webSourceReference(reference);
     if (type === "artifact") {
         const artifact = jsonObject(reference.artifact, "artifact reference");
         requiredText(artifact, "artifactId");
@@ -115,6 +125,25 @@ function sourceReference(value: JsonValue): SourceRef {
         return reference as unknown as SourceRef;
     }
     throw new TypeError(`unsupported source reference type: ${type}`);
+}
+
+function webSourceReference(reference: JsonObject): WebSourceRef {
+    const url = requiredText(reference, "url");
+    if (safeWebUrl(url) === null) throw new TypeError("invalid Web source URL");
+    requiredText(reference, "contentHash");
+    requiredText(reference, "title");
+    const freshness = optionalText(reference, "freshness");
+    if (freshness !== null && !FRESHNESS.has(freshness)) throw new TypeError("invalid source freshness");
+    return reference as unknown as WebSourceRef;
+}
+
+function safeWebUrl(value: string): string | null {
+    try {
+        const url = new URL(value);
+        return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password ? url.href : null;
+    } catch {
+        return null;
+    }
 }
 
 function projectSourceReference(reference: JsonObject): ProjectSourceRef {

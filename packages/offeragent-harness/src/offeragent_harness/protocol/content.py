@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, Field, StringConstraints, field_validator, model_validator
+from pydantic import AfterValidator, AnyHttpUrl, Field, StringConstraints, field_validator, model_validator
 from typing_extensions import TypeAliasType
 
 from ._base import WireModel
@@ -148,10 +148,21 @@ class ProjectSourceRef(WireModel):
         return self
 
 
+class WebSourceRef(WireModel):
+    """A clickable public-page citation captured by a bounded research tool."""
+
+    type: Literal["web"]
+    url: AnyHttpUrl
+    content_hash: Sha256Digest
+    title: str = Field(min_length=1, max_length=512)
+    freshness: Freshness = Freshness.UNKNOWN
+    label: str | None = Field(default=None, min_length=1, max_length=512)
+
+
 SourceRef = TypeAliasType(
     "SourceRef",
     Annotated[
-        VaultSourceRef | ArtifactSourceRef | ProjectSourceRef,
+        VaultSourceRef | ArtifactSourceRef | ProjectSourceRef | WebSourceRef,
         Field(discriminator="type"),
     ],
 )
@@ -267,4 +278,5 @@ __all__ = [
     "SourceRef",
     "TextContentBlock",
     "VaultSourceRef",
+    "WebSourceRef",
 ]
