@@ -115,6 +115,58 @@ test("Vault Tool Adapter rejects a cross-Vault call before reading or completing
     assert.equal(requests, 0);
 });
 
+test("Vault Tool Adapter routes plugin-owned Vault Change completion through the bound coordinator", async () => {
+    const { VaultToolAdapter } = loadModule();
+    const requests = [];
+    const calls = [];
+    const result = {
+        toolCallId: "call_change",
+        status: "succeeded",
+        summary: "Applied one Vault Change Batch.",
+        data: {
+            batchId: "batch_adapter",
+            state: "applied",
+            checkpointRef: "refs/offeragent/checkpoints/batch_adapter",
+            paths: ["notes/a.md"],
+            beforeStateHash: DIGEST,
+            afterStateHash: `sha256:${"b".repeat(64)}`,
+            undoAvailable: true,
+        },
+        sideEffects: [],
+        retryable: false,
+    };
+    const adapter = new VaultToolAdapter({
+        getFiles: () => [],
+        getFileByPath: () => null,
+        cachedRead: async () => "",
+    }, {
+        request: async (method, params) => {
+            requests.push({ method, params });
+            return { accepted: true, replayed: false };
+        },
+    }, "ws_vault", undefined, undefined, {
+        execute: async (candidate) => { calls.push(candidate); return result; },
+    });
+    const writeCall = call({
+        toolCallId: "call_change",
+        name: "vault.changes.apply",
+        risk: "write",
+        arguments: {
+            batchId: "batch_adapter",
+            task: "Append a note",
+            operations: [{ op: "append", path: "notes/a.md", content: "next", expectedContentHash: DIGEST }],
+        },
+    });
+
+    const response = await adapter.execute(writeCall);
+
+    assert.deepEqual(response, { accepted: true, replayed: false });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0], writeCall);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].params.result, result);
+});
+
 test("plugin tool event observer reports malformed plugin calls without executing them", async () => {
     const { observePluginToolEvents } = loadModule();
     let listener;

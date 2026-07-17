@@ -312,6 +312,7 @@ class ProductionWorkerOverrides:
     managed_hook_layer: HookLayer | None = None
     builtin_hook_handlers: Mapping[str, HookHandler] | None = None
     vault_cas_barrier: VaultCasBarrier | None = None
+    legacy_vault_transaction_test_mode: bool = False
 
 
 class _EventHub(EventSink):
@@ -920,18 +921,15 @@ class ProductionRunComponentsFactory(
     ) -> tuple[ToolDefinition, ...]:
         del config
         write_allowed = permission not in {PermissionMode.READ_ONLY, PermissionMode.PLAN}
-        transaction_definitions: tuple[ToolDefinition, ...] = ()
-        if write_allowed:
-            transaction_definitions = (vault_transaction_definition(executor_location=ExecutorLocation.LOCAL),)
         optional_definitions = tuple(
             item
             for item in self._optional_definitions
             if (item.executor_location is not ExecutorLocation.SUBAGENT or effective_config.execution.subagents_enabled)
             and ("shell.execute" not in item.required_capabilities or effective_config.execution.shell_enabled)
+            and (write_allowed or item.risk not in {RiskClass.WRITE, RiskClass.DESTRUCTIVE})
         )
         return (
             *self._local_read.definitions,
-            *transaction_definitions,
             *optional_definitions,
         )
 
@@ -1190,7 +1188,7 @@ class ProductionRunComponentsFactory(
                 PolicyRule(
                     rule_id="workspace-user-approved-vault-writes",
                     effect=RuleEffect.ALLOW,
-                    tool_names=frozenset({"vault.transaction"}),
+                    tool_names=frozenset({"vault.changes.apply"}),
                     permission_modes=frozenset({PermissionMode.NORMAL, PermissionMode.TRUSTED_WORKSPACE}),
                     workspace_trusted=True,
                     reason="用户已在本地受信任 Workspace 中明确关闭 Vault 写入逐次审批。",
@@ -2866,6 +2864,9 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
 
         subagent_definitions = subagent_tool_definitions()
         plugin_definitions = plugin_tool_definitions()
+        legacy_vault_definitions = (
+            (vault_transaction_definition(),) if self._overrides.legacy_vault_transaction_test_mode else ()
+        )
         plugin_executor = PluginToolExecutor()
         late_subagent = _LateToolExecutor()
         late_parent_authorities = _LateParentRunAuthorityProvider()
@@ -2918,7 +2919,12 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             local_read=read_executor,
             local_transaction=local_transaction,
             parent_authorities=late_parent_authorities,
-            optional_definitions=(*powershell_executor.definitions, *plugin_definitions, *subagent_definitions),
+            optional_definitions=(
+                *powershell_executor.definitions,
+                *plugin_definitions,
+                *legacy_vault_definitions,
+                *subagent_definitions,
+            ),
             optional_local_executors=((powershell_executor.definitions, powershell_executor),),
             plugin_executor=plugin_executor,
             subagent_executor=late_subagent if subagent_definitions else None,
@@ -2965,8 +2971,8 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
         base_definitions = (
             *read_executor.definitions,
             *powershell_executor.definitions,
-            vault_transaction_definition(),
             *plugin_definitions,
+            *legacy_vault_definitions,
             *subagent_definitions,
         )
         base_scope = CapabilityScope(

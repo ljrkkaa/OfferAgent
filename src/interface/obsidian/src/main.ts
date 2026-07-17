@@ -34,6 +34,14 @@ import { LocalDevelopmentRuntimeInstaller } from "./runtime/local_development_in
 import { StdioWorkerTransport } from "./runtime/stdio_worker";
 import { observePluginToolEvents, VaultToolAdapter } from "./runtime/vault_tool_adapter";
 import {
+    FileVaultChangeJournal,
+    GitCheckpointStore,
+    ObsidianVaultChangePort,
+    VaultChangeAuthorizationProposal,
+    VaultChangeCoordinator,
+    assertContainedStateDirectory,
+} from "./runtime/vault_changes";
+import {
     PROTOCOL_SCHEMA_HASH,
     PROTOCOL_VERSION,
 } from "./runtime/generated_protocol_identity";
@@ -80,6 +88,7 @@ export default class OfferAgentPlugin extends Plugin {
     private chatClient: HarnessClient | null = null;
     private vaultToolClient: HarnessClient | null = null;
     private vaultToolDisposal: (() => void) | null = null;
+    private vaultChanges: VaultChangeCoordinator | null = null;
     private runtimeStart: Promise<void> | null = null;
     private vaultRoot = "";
     private workspaceId = "";
@@ -489,6 +498,25 @@ export default class OfferAgentPlugin extends Plugin {
     private attachVaultToolAdapter(client: HarnessClient): void {
         if (this.vaultToolClient === client) return;
         this.disposeVaultToolAdapter();
+        const journalDirectory = assertContainedStateDirectory(
+            this.vaultRoot,
+            resolve(pluginInstallDirectory(this, this.vaultRoot), "vault-change-journal"),
+        );
+        const changes = new VaultChangeCoordinator({
+            vault: new ObsidianVaultChangePort(this.app.vault),
+            checkpoints: new GitCheckpointStore(this.vaultRoot),
+            journal: new FileVaultChangeJournal(journalDirectory),
+            permissionMode: () => {
+                if (!this.settings.workspaceTrusted || ["read-only", "plan"].includes(this.settings.permissionMode)) {
+                    return "read_only";
+                }
+                return this.settings.autoApproveVaultWrites ? "trusted_vault" : "ask_every_time";
+            },
+            authorize: async (proposal) => this.authorizeVaultChange(proposal),
+        });
+        void changes.beginRecovery().catch((error) => {
+            if (!this.unloading) new Notice(actionableError(error));
+        });
         const adapter = new VaultToolAdapter(this.app.vault, client, this.workspaceId, this.app.metadataCache, {
             dailyNotes: {
                 readConfiguration: async () => {
@@ -503,17 +531,33 @@ export default class OfferAgentPlugin extends Plugin {
                 resolveToday: () => localMoment().format("YYYY-MM-DD"),
                 formatDate: (date, format) => localMoment(date, "YYYY-MM-DD", true).format(format),
             },
-        });
+        }, changes);
         this.vaultToolDisposal = observePluginToolEvents(client.reducer, adapter, (error) => {
             if (!this.unloading) new Notice(actionableError(error));
         });
         this.vaultToolClient = client;
+        this.vaultChanges = changes;
+    }
+
+    private authorizeVaultChange(proposal: VaultChangeAuthorizationProposal): boolean {
+        const flags = [
+            proposal.controlFiles ? "包含控制文件" : "",
+            proposal.memoryDelete ? "包含 Planning Memory 删除" : "",
+        ].filter(Boolean).join("；");
+        return window.confirm([
+            `OfferAgent 请求应用 Vault Change Batch：${proposal.task}`,
+            `目标：${proposal.paths.join(", ")}`,
+            flags,
+            "",
+            proposal.diff,
+        ].filter((line) => line !== "").join("\n"));
     }
 
     private disposeVaultToolAdapter(): void {
         this.vaultToolDisposal?.();
         this.vaultToolDisposal = null;
         this.vaultToolClient = null;
+        this.vaultChanges = null;
     }
 
     private async startRuntime(): Promise<void> {

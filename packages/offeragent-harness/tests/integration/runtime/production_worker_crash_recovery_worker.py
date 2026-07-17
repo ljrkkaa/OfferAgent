@@ -170,6 +170,7 @@ def _composition(root: Path, barrier: _CrashAndRecoveryBarrier, model: _CrashRec
             model_gateway_factory=lambda _settings: model,
             runtime_config=runtime_config,
             vault_cas_barrier=cast(VaultCasBarrier, barrier),
+            legacy_vault_transaction_test_mode=True,
             ripgrep_path=_ripgrep_executable(),
             powershell_path=_powershell_executable(),
         ),

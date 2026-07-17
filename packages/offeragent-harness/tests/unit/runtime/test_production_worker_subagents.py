@@ -389,7 +389,7 @@ def test_worker_factory_injects_one_gate_and_lock_pool_across_sessions_and_root_
             run_config={
                 "provider": "codex",
                 "model": "gpt-test",
-                "permissionMode": "read-only",
+                "permissionMode": "normal",
                 "budgets": {
                     "maxModelRounds": 8,
                     "maxToolCalls": 8,

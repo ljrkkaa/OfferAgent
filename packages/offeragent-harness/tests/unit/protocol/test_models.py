@@ -279,7 +279,7 @@ def test_vault_source_ref_accepts_combined_stale_partial_freshness() -> None:
 
 
 def test_project_source_ref_preserves_registry_identity_and_precise_lines() -> None:
-    source = TypeAdapter(SourceRef).validate_json(
+    source: SourceRef = TypeAdapter(SourceRef).validate_json(
         """
         {
           "type": "project",
@@ -309,9 +309,7 @@ def test_turn_start_accepts_at_most_eight_safe_pinned_source_locators() -> None:
     assert isinstance(params.pinned_context[1], PinnedSelectionContextReference)
     assert params.pinned_context[1].line_start == 4
 
-    raw["pinnedContext"] = [
-        {"kind": "document", "path": f"notes/{index}.md"} for index in range(9)
-    ]
+    raw["pinnedContext"] = [{"kind": "document", "path": f"notes/{index}.md"} for index in range(9)]
     with pytest.raises(ValidationError):
         TurnStartParams.model_validate_json(json.dumps(raw))
     raw["pinnedContext"] = [{"kind": "document", "path": "../outside.md"}]

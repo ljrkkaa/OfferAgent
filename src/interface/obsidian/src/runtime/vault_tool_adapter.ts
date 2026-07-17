@@ -11,6 +11,7 @@ import type {
 import { MetadataReadPort, VaultEvidenceAdapter } from "./vault_evidence";
 import { VaultControlAdapter, VaultControlOptions } from "./vault_control";
 import { ProjectEvidenceAdapter } from "./project_evidence";
+import { VaultChangeCoordinator } from "./vault_changes";
 
 export interface VaultReadPort {
     getFiles(): TFile[];
@@ -42,6 +43,7 @@ export class VaultToolAdapter {
         private readonly workspaceId: string,
         metadata?: MetadataReadPort,
         controls?: VaultControlOptions,
+        private readonly changes?: VaultChangeCoordinator,
     ) {
         if (!workspaceId) throw new TypeError("workspaceId is required");
         this.evidence = new VaultEvidenceAdapter(vault, workspaceId, metadata);
@@ -74,6 +76,7 @@ export class VaultToolAdapter {
             "agent_contract.read", "skill.read", "daily_note.context",
             "vault.list", "vault.search", "vault.read",
             "project.list", "project.search", "project.read",
+            "vault.changes.apply",
         ].includes(call.name) ||
             call.version !== "1") {
             throw new Error(`unsupported plugin Tool: ${call.name}@${call.version}`);
@@ -84,6 +87,10 @@ export class VaultToolAdapter {
     }
 
     private async executeBound(call: ExecutableToolCallDescriptor): Promise<ToolResultDescriptor> {
+        if (call.name === "vault.changes.apply") {
+            if (this.changes === undefined) throw new Error("Vault Change Coordinator is unavailable");
+            return this.changes.execute(call);
+        }
         if (call.name.startsWith("vault.")) return this.evidence.execute(call);
         if (call.name.startsWith("project.")) return this.projects.execute(call);
         return this.control.execute(call);

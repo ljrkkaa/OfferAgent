@@ -321,6 +321,7 @@ def test_vault_evidence_definitions_preserve_the_plugin_read_boundary() -> None:
         "project.list",
         "project.search",
         "project.read",
+        "vault.changes.apply",
     } <= definitions.keys()
     capabilities = {
         "agent_contract.read": "agent_contract.read",
@@ -332,13 +333,27 @@ def test_vault_evidence_definitions_preserve_the_plugin_read_boundary() -> None:
         "project.list": "project.read",
         "project.search": "project.read",
         "project.read": "project.read",
+        "vault.changes.apply": "vault.write",
     }
     for name, definition in definitions.items():
         assert definition.executor_location is ExecutorLocation.PLUGIN
-        assert definition.risk is RiskClass.READ
-        assert definition.side_effect_class is SideEffectClass.READ
+        expected_risk = RiskClass.WRITE if name == "vault.changes.apply" else RiskClass.READ
+        expected_effect = SideEffectClass.WRITE if name == "vault.changes.apply" else SideEffectClass.READ
+        assert definition.risk is expected_risk
+        assert definition.side_effect_class is expected_effect
         assert definition.required_capabilities == frozenset({capabilities[name]})
         assert definition.result_sensitivity is ResultSensitivity.WORKSPACE
-        assert definition.idempotent and definition.retryable
+        assert definition.idempotent
+        assert definition.retryable is (name != "vault.changes.apply")
     assert definitions["vault.read"].output_limit_bytes == 65_536
     assert definitions["vault.search"].output_limit_bytes == 65_536
+    write = definitions["vault.changes.apply"]
+    operations = write.input_schema["properties"]["operations"]
+    assert operations["maxItems"] == 20
+    assert {item["properties"]["op"]["const"] for item in operations["items"]["oneOf"]} == {
+        "create",
+        "append",
+        "replace",
+        "patch",
+        "delete",
+    }

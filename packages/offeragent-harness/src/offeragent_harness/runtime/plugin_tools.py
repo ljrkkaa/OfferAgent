@@ -142,8 +142,7 @@ class PluginToolExecutor:
             try:
                 await asyncio.wait_for(
                     self._registered.wait_for(
-                        lambda: completion.tool_call_id in self._pending
-                        or completion.tool_call_id in self._completed
+                        lambda: completion.tool_call_id in self._pending or completion.tool_call_id in self._completed
                     ),
                     timeout=self._registration_timeout_seconds,
                 )
@@ -262,9 +261,7 @@ def _domain_tool_result(descriptor: ToolResultDescriptor) -> ToolResult:
     )
 
 
-def plugin_tool_completion_handlers(
-    *, executor: PluginToolExecutor
-) -> Mapping[str, ApplicationCommandHandler]:
+def plugin_tool_completion_handlers(*, executor: PluginToolExecutor) -> Mapping[str, ApplicationCommandHandler]:
     """Expose the single plugin-to-Worker completion command."""
 
     async def complete(
@@ -584,13 +581,143 @@ def plugin_tool_definitions() -> tuple[ToolDefinition, ...]:
                     "truncated": {"type": "boolean"},
                 },
                 "required": [
-                    "projectId", "path", "lineStart", "lineEnd", "modifiedVersion",
-                    "contentHash", "content", "truncated",
+                    "projectId",
+                    "path",
+                    "lineStart",
+                    "lineEnd",
+                    "modifiedVersion",
+                    "contentHash",
+                    "content",
+                    "truncated",
                 ],
                 "additionalProperties": False,
             },
             output_limit_bytes=65_536,
         ),
+        _plugin_write_definition(),
+    )
+
+
+def _plugin_write_definition() -> ToolDefinition:
+    path = {"type": "string", "minLength": 1, "maxLength": 512}
+    digest = {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+    content = {"type": "string", "maxLength": 262_144}
+
+    def operation(properties: Mapping[str, object], required: list[str]) -> dict[str, object]:
+        return {
+            "type": "object",
+            "properties": dict(properties),
+            "required": required,
+            "additionalProperties": False,
+        }
+
+    operations = (
+        operation(
+            {"op": {"const": "create"}, "path": path, "content": content, "expectedContentHash": {"const": "absent"}},
+            ["op", "path", "content", "expectedContentHash"],
+        ),
+        operation(
+            {"op": {"const": "append"}, "path": path, "content": content, "expectedContentHash": digest},
+            ["op", "path", "content", "expectedContentHash"],
+        ),
+        operation(
+            {
+                "op": {"const": "replace"},
+                "path": path,
+                "find": {"type": "string", "minLength": 1, "maxLength": 262_144},
+                "replacement": content,
+                "expectedContentHash": digest,
+            },
+            ["op", "path", "find", "replacement", "expectedContentHash"],
+        ),
+        operation(
+            {
+                "op": {"const": "patch"},
+                "path": path,
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 256,
+                    "items": operation(
+                        {
+                            "startLine": {"type": "integer", "minimum": 1},
+                            "endLine": {"type": "integer", "minimum": 1},
+                            "replacement": content,
+                        },
+                        ["startLine", "endLine", "replacement"],
+                    ),
+                },
+                "expectedContentHash": digest,
+            },
+            ["op", "path", "edits", "expectedContentHash"],
+        ),
+        operation(
+            {"op": {"const": "delete"}, "path": path, "expectedContentHash": digest},
+            ["op", "path", "expectedContentHash"],
+        ),
+    )
+    return ToolDefinition(
+        name="vault.changes.apply",
+        version="1",
+        description=(
+            "Apply one logical, hash-bound Vault Change Batch through the Obsidian plugin. "
+            "Delete is restricted by the plugin to Planning Memory topics."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "batchId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$",
+                },
+                "task": {"type": "string", "minLength": 1, "maxLength": 512},
+                "operations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "items": {"oneOf": list(operations)},
+                },
+            },
+            "required": ["batchId", "task", "operations"],
+            "additionalProperties": False,
+        },
+        output_schema={
+            "type": "object",
+            "properties": {
+                "batchId": {"type": "string"},
+                "state": {"enum": ["applied", "rolled_back", "undone"]},
+                "checkpointRef": {"type": "string", "minLength": 1, "maxLength": 512},
+                "paths": {"type": "array", "minItems": 1, "maxItems": 20, "items": path},
+                "beforeStateHash": digest,
+                "afterStateHash": digest,
+                "undoAvailable": {"type": "boolean"},
+            },
+            "required": [
+                "batchId",
+                "state",
+                "checkpointRef",
+                "paths",
+                "beforeStateHash",
+                "afterStateHash",
+                "undoAvailable",
+            ],
+            "additionalProperties": False,
+        },
+        executor_location=ExecutorLocation.PLUGIN,
+        risk=RiskClass.WRITE,
+        side_effect_class=SideEffectClass.WRITE,
+        required_capabilities=frozenset({"vault.write"}),
+        concurrency_safe=False,
+        idempotent=True,
+        retryable=False,
+        timeout_ms=300_000,
+        output_limit_bytes=131_072,
+        preflight_mode=PreflightMode.NONE,
+        preflight_provider=None,
+        approval_evidence=ApprovalEvidence.NONE,
+        result_sensitivity=ResultSensitivity.WORKSPACE,
     )
 
 
