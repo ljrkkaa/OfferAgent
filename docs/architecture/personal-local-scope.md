@@ -1,68 +1,72 @@
 # OfferAgent 个人本机插件交付范围
 
-## 目标
+## 支持范围
 
-当前只交付给项目所有者本人，在一台 Windows x64 电脑上通过 Obsidian 插件使用。它是本地开发
-安装，不是面向公众的安装包，也不以“已满足公开发行级 Definition of Done”对外宣称。
+当前产品只交付给项目所有者本人，在一台 Windows x64 电脑上通过 Obsidian 使用。它是未签名的
+个人本地开发安装，不是公开安装包。
 
-完整架构继续保留，已经完成的 Host/Worker、Agent Core、Web、Memory、Skills、Hooks、Shell、
-Subagent、升级/卸载等代码不删除。后续只修复会影响个人日常使用、数据正确性或安全边界的
-问题，不再为尚无实际需求的发行矩阵持续扩张实现。
+唯一支持的运行拓扑是：每个 Obsidian 插件实例直接创建一个 `offeragent-worker.exe` 子进程，插件
+只通过继承 stdin/stdout 上的 framed JSON-RPC 与它通信。Worker 拥有唯一 `HarnessService`、Agent
+Loop、SQLite、Session/Run、文件工具和副作用边界。同一交互式 Windows 会话和用户、同一 canonical Vault root 的命名
+互斥锁在 SQLite 打开前排除第二个 Worker。显式停止和插件内部重连会等待 Worker 及其子进程树退出；
+`onunload` 则在同步回调返回前关闭 stdio 并发起后台 join。
 
-## 当前必须完成
+仓库没有常驻 Host、discovery、Named Pipe、后台 Worker、正式签名发布、Setup、自动更新通道或
+ARM64 运行路径。这些不是隐藏开关、兼容模式或等待重新启用的发行设计。
 
-1. **真实插件可用**：源码构建后的插件部署到 `E:\面试胜利！\.obsidian\plugins\offeragent-obsidian-plugin`，
-   保留现有 `data.json`，可在 Obsidian 中加载、打开聊天、查看状态和停止 Runtime。
-2. **本机 Runtime 可用**：当前 Windows x64 上只有一个 Host；该 Vault 只有一个 Worker、一个
-   `HarnessService`、一份 SQLite 和一个活动 Run 权威。插件只通过当前 SID 专属 Named Pipe 连接。
-3. **至少一个模型路径可用**：用户配置的一个 `ModelGateway` Provider 能完成真实对话；模型只推理，
-   不取得文件、Shell、Session、Memory、审批或 Subagent 所有权。凭据由本机 Secret Store
-   管理，不读取或迁移旧 `khojApiKey`。
-4. **真实工作区读取可用**：以 `E:\面试胜利！` 做只读文件搜索、读取、引用/wikilink/backlink 验收；项目源码、
-   构建物和测试报告不得进入工具可见范围。
-5. **安全写闭环可用**：个人运行路径只向模型开放单文件 create/append/replace/patch，并在临时
-   Vault 中覆盖 Diff、审批、`expectedHash`、原子提交、冲突、取消、ACK 丢失、硬崩溃恢复和幂等
-   恢复。多文件批次、rename 和 trash 的已有实现与测试保留，但在具备 durable batch journal 前
-   fail closed，不进入个人运行路径。真实知识库默认不做自动写入验收；需要真实写 smoke 时，由
-   用户另行明确授权并只写专属测试目录。
-6. **本机可靠性可用**：插件重载、断连、Worker 重启和停止不会重复写、伪报成功或遗留本轮启动的
-   子进程树；影响数据正确性的 P0/P1 必须清零。
-7. **可重复构建与回归**：Python 全量测试、插件测试/构建、协议生成、架构/依赖检查通过，并提供一条
-   可重复的个人本机安装/更新命令。
+## 必须满足的产品能力
 
-## 保留但不再扩张
+1. **真实插件可用**：插件能部署到目标 Vault，保留既有 `data.json`，并能加载、聊天、显示状态和
+   停止当前 Runtime。
+2. **Runtime 身份唯一**：一个插件实例只有一个直接子 Worker；同一交互式 Windows 会话和用户内，
+   同一 Vault 同时最多一个 Worker 能持锁并进入 Runtime 校验、SQLite、恢复和运行期；
+   命令只能经 stdio JSON-RPC 进入同一 `HarnessService`，本地 Web 也只连接同一个 Worker。
+3. **模型边界明确**：至少一个用户配置的 `ModelGateway` Provider 能完成真实对话；Provider 不得
+   取得工具、Vault、Session、Memory、审批或 Subagent 所有权。
+4. **真实工作区读取可用**：在只读权限下验证 Glob、Grep、Read、引用和 wikilink/backlink；项目源码、
+   构建物和测试报告不得意外进入工具可见范围。
+5. **安全写闭环可用**：模型面对的写入口只允许单文件 create/append/replace/patch，并覆盖 Diff、
+   审批、`expectedHash`、原子提交、冲突、取消、ACK 丢失、硬崩溃和幂等恢复。真实 Vault 写 smoke
+   必须另获授权并限制到专属测试目录。
+6. **进程工具受控**：Shell/Hook 等通过短生命周期 `offeragent-process-host.exe` 执行；镜像和 catalog
+   固定 hash，进程树归入 Job Object，无网络策略使用 AppContainer，用户注册的可执行文件可要求
+   离线 Authenticode 并始终固定文件身份。
+7. **生命周期可靠**：显式停止、断线和设置重启必须先回收旧 Worker，再由同一插件实例启动替代
+   Worker；`onunload` 必须在同步回调返回前关闭 stdio 并发起后台 join，后续同会话同 Vault Worker 在旧
+   进程释放互斥锁前不得访问状态。任何路径都不得重复写、伪报成功或遗留 Shell、Hook 或 Subagent
+   进程。
+8. **可复现构建**：Harness、协议、架构、插件测试与类型检查通过；本机插件只由
+   `scripts/build_local_windows_plugin.py` 构建，只由 `scripts/update_local_windows_plugin.py` 更新。
 
-以下能力已经实现，因此继续保留并维持现有回归；除非发现会破坏上述主路径的问题，不再以功能
-完善或 UI 抛光作为当前阻塞项：
+## 保留的非阻塞能力
 
-- 本地 Loopback Web UI 与插件的高级界面对齐。
-- Memory、Skills、Hooks、Shell 和 Subagent 的更多配置体验。
-- 多 Vault 并行、复杂 Run tree、旧服务器会话/Memory 导入器的更多边角场景。
-- 更新、回滚、卸载 ledger 和诊断的公开产品级体验。
+以下能力继续接受安全性和正确性修复，但不作为个人版本的 UI 完成阻塞项：
 
-## 当前不做，公开分发前再做
+- 同一 Worker 提供的本地 Loopback Web UI；
+- Memory、Skills、Hooks、Shell 和 Subagent 的高级配置；
+- 复杂 Run tree 和多 Vault 同时打开时的体验优化；
+- 多文件批次、rename/trash 的 durable journal 扩展；
+- 大规模压力、性能和视觉一致性优化。
 
-- Authenticode 证书、SmartScreen/Defender 信誉和公开发布签名仪式。
-- Windows arm64 原生构建与 x64/arm64 双架构矩阵。
-- Inno Setup 安装器、社区商店/自动更新通道和面向第三方的离线完整包。
-- 无 Python/Node 的干净 Windows 10/11 VM 安装、升级、回滚、断电恢复和完整卸载矩阵。
-- 长时间压力、性能 P95、rename storm、大规模多 Vault/多 Windows 用户测试。
-- 网络抓包、第三方许可/SBOM 发布审计、灰度发布和旧服务器迁移演练。
-- 本地 Web UI 与 Obsidian 每一项交互的像素级/全场景一致性。
-- 多文件原子批次、rename/trash 的 durable batch journal 与崩溃恢复。
+## 明确不属于当前产品
 
-这些项目不是从仓库删除，而是移出个人版本的完成判定。将来准备分享给其他用户时，恢复
-`task.md` 第 7 阶段、15.4—15.6 和第 16 节的完整发行门槛。
+- 面向第三方的公开分发、安装器、商店上架或后台更新服务；
+- Authenticode 发布证书、SmartScreen 信誉或 Ed25519 发布签名体系；
+- Windows ARM64 或多架构构建矩阵；
+- 常驻进程协调器、跨插件实例发现或 IPC 复用；
+- 旧服务器、远程 Conversation/Workspace Store、内容同步或远程降级。
 
-## 个人版本完成判定
+这些能力在当前仓库中没有受支持实现，也不属于当前路线图的保留入口。产品范围发生变化时，应先
+建立新的架构决策和威胁模型，而不是恢复已删除代码。
 
-同时满足以下条件即可结束当前项目，而不等待公开发行工作：
+## 完成判定
 
-- 当前机器上的 Obsidian 能从真实插件目录启动并连接本地 x64 Host/Worker。
-- 真实 Vault 只读文件搜索与引用验证通过；临时 Vault 单文件写事务和硬崩溃故障注入通过。
-- 一个真实模型 Provider 可聊天；Session 重开可恢复；显式停止后本轮进程树退出。
-- Python、插件、协议和架构回归全绿，且没有影响个人主路径或数据安全的已知 P0/P1。
-- 文档明确标识为“个人本机开发安装”，未签名产物不冒充正式发行包。
+- 真实 Obsidian 插件能直接启动并通过 stdio 使用本地 x64 Worker。
+- 真实 Vault 只读检索通过；临时 Vault 的单文件事务与故障恢复通过。
+- 一个真实模型 Provider 可聊天；Session 可恢复；停止后本轮进程树退出。
+- Python、协议、依赖、文档、Web asset、插件测试和类型检查门禁实时通过。
+- 从干净输出目录执行个人构建，并由更新脚本原子切换到目标 Vault。
+- 没有影响个人主路径或数据安全的已知 P0/P1。
 
-具体的隔离设计、构建命令、原子安装/回滚和 `data.json` 保护规则见
+构建和更新说明见
 [`docs/personal-local-plugin-install.md`](../personal-local-plugin-install.md)。

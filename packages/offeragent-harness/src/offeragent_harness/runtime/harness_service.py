@@ -402,7 +402,7 @@ class _PreparedRecoveredRun:
 
 
 class HarnessService:
-    """The only application entrypoint shared by Pipe, Loopback and Direct adapters."""
+    """The only application entrypoint shared by stdio and Loopback adapters."""
 
     def __init__(
         self,

@@ -15,7 +15,7 @@ from offeragent_harness.runtime.development_runtime_manifest import (
     canonical_development_manifest_bytes,
     development_runtime_content_digest,
 )
-from offeragent_harness.runtime.release_manifest import ProtocolCompatibility, RuntimeFileRecord
+from offeragent_harness.runtime.runtime_manifest import ProtocolCompatibility, RuntimeFileRecord
 
 
 def _digest(payload: bytes) -> str:
@@ -30,12 +30,11 @@ def _artifact(root: Path) -> Path:
     root.mkdir()
     runtime = root / "runtime" / "windows-x64" / "local-development"
     payloads = {
-        "offeragent-host.exe": b"host",
         "offeragent-process-host.exe": b"process",
-        "offeragent-self-test.exe": b"self-test",
         "offeragent-worker.exe": b"worker",
         "process-catalog.v1.json": b"{}\n",
         "skills/local/SKILL.md": b"# Local\n",
+        "tools/rg.exe": b"ripgrep",
         "web/index.html": b"<!doctype html>\n",
     }
     records: list[RuntimeFileRecord] = []
@@ -172,6 +171,34 @@ def test_installer_rejects_data_json_inside_build_artifact(
     vault.mkdir()
 
     with pytest.raises(RuntimeError, match=r"must not contain data\.json"):
+        install_local_plugin(artifact, vault)
+
+
+@pytest.mark.parametrize(
+    "unexpected_relative",
+    (
+        "runtime/windows-arm64/local-development/retired.exe",
+        "runtime/windows-x64/setup/retired.exe",
+        "runtime/retired-runtime/retired.exe",
+    ),
+)
+def test_installer_rejects_every_runtime_sibling_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unexpected_relative: str,
+) -> None:
+    monkeypatch.setattr(
+        "offeragent_harness.runtime.development_runtime_manifest.native_windows_architecture",
+        lambda: "x64",
+    )
+    artifact = _artifact(tmp_path / "artifact")
+    unexpected = artifact.joinpath(*unexpected_relative.split("/"))
+    unexpected.parent.mkdir(parents=True)
+    unexpected.write_bytes(b"retired")
+    vault = tmp_path / "Vault"
+    vault.mkdir()
+
+    with pytest.raises(RuntimeError, match="Runtime layout is not exact"):
         install_local_plugin(artifact, vault)
 
 

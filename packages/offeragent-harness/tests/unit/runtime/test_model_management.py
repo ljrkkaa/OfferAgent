@@ -111,10 +111,9 @@ class _GatewayFactory:
 def _metadata(
     *,
     scope_id: str = WORKSPACE_ID,
-    kind: SecretKind = SecretKind.MODEL_PROVIDER,
     provider_id: str = "openai",
 ) -> SecretMetadata:
-    return SecretMetadata(HANDLE, scope_id, kind, provider_id, 1, NOW, NOW)
+    return SecretMetadata(HANDLE, scope_id, SecretKind.MODEL_PROVIDER, provider_id, 1, NOW, NOW)
 
 
 def _config(clock: ManualClock) -> ConfigService:
@@ -206,7 +205,6 @@ async def test_model_list_reads_current_config_snapshot_instead_of_frozen_startu
         None,
         RuntimeError("protected secret is missing"),
         _metadata(scope_id="wsi_22345678-1234-4234-8234-123456789abc"),
-        _metadata(kind=SecretKind.UPDATE),
         _metadata(provider_id="codex"),
     ],
 )

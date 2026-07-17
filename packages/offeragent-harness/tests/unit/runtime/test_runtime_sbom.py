@@ -80,8 +80,8 @@ def test_runtime_distribution_closure_fails_closed_on_unsatisfied_or_direct_depe
 def test_real_runtime_closure_contains_runtime_only_dependencies() -> None:
     closure = runtime_distribution_closure()
     names = {item.canonical_name for item in closure}
-    assert {"offeragent-harness", "anyio", "cryptography", "httpx", "jsonschema", "pydantic"} <= names
-    assert names.isdisjoint({"pytest", "ruff", "mypy", "pyinstaller", "semgrep", "import-linter"})
+    assert {"offeragent-harness", "anyio", "httpx", "jsonschema", "pydantic"} <= names
+    assert names.isdisjoint({"cryptography", "pytest", "ruff", "mypy", "pyinstaller", "semgrep", "import-linter"})
     assert runtime_closure_fingerprint(closure).startswith("sha256:")
 
 

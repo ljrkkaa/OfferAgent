@@ -1,8 +1,8 @@
-"""Production composition for the one Vault-owned OfferAgent Worker.
+"""Composition for the one Vault-owned local OfferAgent Worker.
 
 This module is deliberately the only place that knows concrete adapters.  The
-Host starts a process; this root constructs exactly one ``HarnessService`` and
-shares its command dispatcher with both local transports.
+Obsidian plugin starts a direct stdio process; this root constructs exactly one
+``HarnessService`` and shares its dispatcher with stdio and optional Loopback Web.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import secrets
 import sys
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -120,6 +120,11 @@ from offeragent_harness.runtime.conversation_controls import (
     SessionCompactionRunner,
 )
 from offeragent_harness.runtime.conversation_projection import UowConversationProjectionService
+from offeragent_harness.runtime.duplex_json_rpc import (
+    ConnectionRole,
+    DuplexByteStream,
+    DuplexJsonRpcConnection,
+)
 from offeragent_harness.runtime.extension_management_application_handlers import (
     extension_management_command_handlers,
 )
@@ -133,20 +138,13 @@ from offeragent_harness.runtime.harness_service import (
     RunHookBinding,
     StartTurnCommand,
 )
-from offeragent_harness.runtime.host_supervisor import SupervisedWorkspaceIdentity
+from offeragent_harness.runtime.local_process_catalog import load_local_process_catalog
 from offeragent_harness.runtime.loopback_gateway import LoopbackGatewayConfig, LoopbackWebGateway
 from offeragent_harness.runtime.loopback_server import AsyncioLoopbackServer
 from offeragent_harness.runtime.model_management import ProductionModelCommandService
-from offeragent_harness.runtime.named_pipe import (
-    ConnectionRole,
-    DiscoveryMaterialStore,
-    DuplexJsonRpcConnection,
-    HandshakeReplayGuard,
-    PipeByteStream,
-    authenticate_server_stream,
-)
 from offeragent_harness.runtime.network_audit import EntityNetworkAuditSink
 from offeragent_harness.runtime.policy_audit import EntityPolicyAuditSink
+from offeragent_harness.runtime.process_identity import SupervisedWorkspaceIdentity, WorkerShutdownReceipt
 from offeragent_harness.runtime.process_registration import (
     WorkspaceProcessRegistrationService,
     merge_process_registration_snapshot,
@@ -161,7 +159,6 @@ from offeragent_harness.runtime.production_hooks import (
     ProductionHookBundle,
     ProductionHookBundleFactory,
 )
-from offeragent_harness.runtime.production_process_catalog import load_production_process_catalog
 from offeragent_harness.runtime.production_shell import (
     PreparedShellBundle,
     ProductionShellBundleFactory,
@@ -172,7 +169,6 @@ from offeragent_harness.runtime.production_skills import (
 )
 from offeragent_harness.runtime.recovery import RecoveryCoordinator
 from offeragent_harness.runtime.recovery_apply import RecoveryPlanApplier
-from offeragent_harness.runtime.release_trust import InstalledReleaseManifestTrust
 from offeragent_harness.runtime.run_preparation import (
     CompositeRunContextProvider,
     ConversationHistoryRunPreparationAdapter,
@@ -186,18 +182,12 @@ from offeragent_harness.runtime.subagent_runtime import (
     ProtocolSubagentEventFactory,
 )
 from offeragent_harness.runtime.turn_manager import TurnManager
-from offeragent_harness.runtime.windows_named_pipe import (
-    DpapiCurrentUserProtector,
-    Win32NamedPipeListener,
-)
 from offeragent_harness.runtime.windows_process import WindowsAuthenticodeVerifier, current_user_profile_directory
 from offeragent_harness.runtime.windows_process_supervisor import (
     PinnedProcessExecutableVerifier,
-    ProcessReleaseManifestTrust,
     WindowsSupervisedProcessBackend,
 )
 from offeragent_harness.runtime.windows_secrets import WindowsDpapiSecretStore
-from offeragent_harness.runtime.worker_control import WorkerControlHandler, WorkerControlServer
 from offeragent_harness.sessions import Run, Session
 from offeragent_harness.shell import PowerShellToolExecutor, ShellCommandProfile
 from offeragent_harness.skills import SkillAuthority
@@ -254,18 +244,6 @@ from offeragent_harness.workspace.runtime_identity import workspace_database_ide
 
 if TYPE_CHECKING:
     from offeragent_harness.runtime.development_runtime_manifest import InstalledDevelopmentRuntimeTrust
-    from offeragent_harness.runtime.host_supervisor import WorkerShutdownReceipt
-
-PRODUCTION_WORKER_COMPOSITION_COMPLETE = True
-
-_WORKER_ARGUMENTS = (
-    "--offeragent-runtime-mode",
-    "worker",
-    "--transport",
-    "named-pipe",
-    "--workspace-instance-id",
-)
-_INSTANCE_ID = re.compile(r"^wsi_[0-9a-f-]{36}$")
 _LOCAL_PROFILE_ID = "profile_local"
 _LOCAL_MANAGED_ID = "managed_local"
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
@@ -309,14 +287,13 @@ class ModelGatewayFactory(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ProductionWorkerOverrides:
-    """Narrow dependency seam for deterministic production-smoke tests."""
+    """Narrow dependency seam for deterministic local Runtime tests."""
 
     clock: Clock | None = None
     ids: IdGenerator | None = None
     model_gateway_factory: ModelGatewayFactory | None = None
     secret_store: SecretStore | None = None
-    start_native_transports: bool = True
-    host_pid: int | None = None
+    parent_pid: int | None = None
     runtime_config: HarnessConfig | None = None
     skill_runtime_root: Path | None = None
     ripgrep_path: Path | None = None
@@ -325,9 +302,8 @@ class ProductionWorkerOverrides:
     process_supervisor: _WorkerProcessSupervisor | None = None
     process_executable_profiles: tuple[ProcessExecutableProfile, ...] = ()
     process_environment_profiles: tuple[ProcessEnvironmentProfile, ...] = ()
-    process_release_manifest: ProcessReleaseManifestTrust | None = None
     process_registration_service: WorkspaceProcessRegistrationService | None = None
-    signed_shell_profiles: tuple[ShellCommandProfile, ...] = ()
+    builtin_shell_profiles: tuple[ShellCommandProfile, ...] = ()
     managed_hook_layer: HookLayer | None = None
     builtin_hook_handlers: Mapping[str, HookHandler] | None = None
     vault_cas_barrier: VaultCasBarrier | None = None
@@ -2002,13 +1978,13 @@ class _RuntimeDiagnostics:
 
 
 class _ProcessDiagnostics:
-    def __init__(self, host_pid: int, supervisor: _WorkerProcessSupervisor) -> None:
-        self._host_pid = host_pid
+    def __init__(self, parent_pid: int, supervisor: _WorkerProcessSupervisor) -> None:
+        self._parent_pid = parent_pid
         self._supervisor = supervisor
 
     async def processes(self) -> Sequence[DiagnosticProcess]:
         base = (
-            DiagnosticProcess("host", self._host_pid, "running", True),
+            DiagnosticProcess("parent", self._parent_pid, "running", True),
             DiagnosticProcess("worker", os.getpid(), "running", True),
         )
         snapshot = getattr(self._supervisor, "active_processes", None)
@@ -2150,223 +2126,6 @@ class _KernelOnlyVaultTransactions:
         raise PermissionError("Vault transactions must enter through the unified Tool Kernel")
 
 
-class _ProductionNamedPipeServer:
-    def __init__(
-        self,
-        *,
-        state_directory: Path,
-        dispatcher: RuntimeApplicationCommandDispatcher,
-        event_hub: _EventHub,
-        clock: Clock,
-        response_flushed: Callable[[str], None] | None = None,
-        request_finalized: Callable[[str], None] | None = None,
-    ) -> None:
-        self._store = DiscoveryMaterialStore(
-            state_directory / "transport",
-            protector=DpapiCurrentUserProtector(),
-        )
-        self._dispatcher = dispatcher
-        self._event_hub = event_hub
-        self._clock = clock
-        self._response_flushed = response_flushed
-        self._request_finalized = request_finalized
-        self._material: Any = None
-        self._listener: Win32NamedPipeListener | None = None
-        self._accept_task: asyncio.Task[None] | None = None
-        self._connections: set[DuplexJsonRpcConnection] = set()
-        self._client_tasks: set[asyncio.Task[None]] = set()
-        self._replay = HandshakeReplayGuard()
-
-    @property
-    def accept_task(self) -> asyncio.Task[None] | None:
-        return self._accept_task
-
-    @property
-    def healthy(self) -> bool:
-        return self._listener is not None and self._accept_task is not None and not self._accept_task.done()
-
-    async def start(self) -> None:
-        self._material = self._store.issue(now=self._clock.utcnow())
-        self._listener = Win32NamedPipeListener(self._material.pipe_name)
-        self._accept_task = asyncio.create_task(self._accept_loop(), name="offeragent-worker-pipe")
-
-    async def stop(self) -> None:
-        failures: list[BaseException] = []
-        listener = self._listener
-        self._listener = None
-        if listener is not None:
-            try:
-                await listener.close()
-            except BaseException as error:
-                failures.append(error)
-        task = self._accept_task
-        self._accept_task = None
-        if task is not None:
-            task.cancel()
-            # Closing the native listener completes a pending accept with
-            # ERROR_OPERATION_ABORTED on Windows.  That task result is an
-            # expected consequence of revocation, not a cleanup failure.
-            await asyncio.gather(task, return_exceptions=True)
-        connections = tuple(self._connections)
-        self._connections.clear()
-        connection_results = await asyncio.gather(
-            *(connection.close() for connection in connections),
-            return_exceptions=True,
-        )
-        failures.extend(result for result in connection_results if isinstance(result, BaseException))
-        clients = tuple(self._client_tasks)
-        self._client_tasks.clear()
-        current = asyncio.current_task()
-        pending_clients = tuple(client for client in clients if client is not current)
-        for client in pending_clients:
-            client.cancel()
-        await asyncio.gather(*pending_clients, return_exceptions=True)
-        try:
-            # Discovery is an ingress capability.  Revoke it even when an
-            # earlier listener/connection cleanup reports an error so a dead
-            # Worker can never remain discoverable.
-            self._store.remove()
-        except BaseException as error:
-            failures.append(error)
-        if failures:
-            raise ProductionWorkerError("Worker Named Pipe shutdown was incomplete") from failures[0]
-
-    async def _accept_loop(self) -> None:
-        listener = self._listener
-        material = self._material
-        if listener is None or material is None:
-            raise RuntimeError("Named Pipe listener was not composed")
-        while True:
-            stream = await listener.accept()
-            task = asyncio.create_task(self._serve(stream, material), name="offeragent-worker-pipe-client")
-            self._client_tasks.add(task)
-            task.add_done_callback(self._client_finished)
-
-    def _client_finished(self, task: asyncio.Task[None]) -> None:
-        self._client_tasks.discard(task)
-        # Authentication failures and peer disconnects are connection-local,
-        # but their task exceptions must still be observed so they cannot
-        # become process-level "Task exception was never retrieved" noise.
-        if not task.cancelled():
-            task.exception()
-
-    async def _serve(self, stream: Any, material: Any) -> None:
-        connection: DuplexJsonRpcConnection | None = None
-        try:
-            await authenticate_server_stream(
-                stream,
-                material,
-                now=self._clock.utcnow,
-                replay_guard=self._replay,
-            )
-            connection = DuplexJsonRpcConnection(
-                stream,
-                role=ConnectionRole.SERVER,
-                dispatcher=self._dispatcher,
-                command_transport="windows-named-pipe",
-                command_peer="current-windows-sid",
-                response_flushed=self._response_flushed,
-                request_finalized=self._request_finalized,
-            )
-            self._connections.add(connection)
-            await connection.start()
-            await connection.wait_ready()
-            await self._event_hub.add(connection)
-            await connection.wait_closed()
-        finally:
-            if connection is not None:
-                self._connections.discard(connection)
-                await self._event_hub.remove(connection)
-            else:
-                await stream.close()
-
-
-class _WorkerControl(WorkerControlHandler):
-    def __init__(self, application: ProductionWorkerApplication) -> None:
-        self._application = application
-
-    def readiness(self) -> Any:
-        from offeragent_harness.runtime.host_supervisor import WorkerReadiness
-
-        if not self._application.ready:
-            raise ProductionWorkerError("Worker recovery/readiness gate is not open")
-        return WorkerReadiness(
-            pid=os.getpid(),
-            runtime_version=self._application.runtime_version,
-            workspace_instance_id=self._application.workspace_instance_id,
-            canonical_root_identity=self._application.canonical_root_identity,
-            database_identity=self._application.database_identity,
-        )
-
-    async def revalidate(self) -> Any:
-        from offeragent_harness.runtime.approval_manager import ApprovalRecord
-        from offeragent_harness.runtime.host_supervisor import ResumeValidation
-
-        valid_root = identify_workspace_root(self._application.vault_root).identity_hash
-        valid_db = workspace_database_identity(self._application.workspace_instance_id)
-        if valid_db != self._application.database_identity:
-            return ResumeValidation(False, False, False, False, False)
-        active_runs: list[Run] = []
-        approval_records: list[ApprovalRecord] = []
-        async with self._application.unit_of_work.begin() as uow:
-            after_id: str | None = None
-            while True:
-                page = await uow.entities.list("runs", after_id=after_id, limit=100)
-                if not page:
-                    break
-                for record in page:
-                    if isinstance(record.value, Run) and not record.value.status.is_terminal:
-                        active_runs.append(record.value)
-                after_id = page[-1].entity_id
-            after_id = None
-            while True:
-                page = await uow.entities.list("approvals", after_id=after_id, limit=100)
-                if not page:
-                    break
-                approval_records.extend(record.value for record in page if isinstance(record.value, ApprovalRecord))
-                after_id = page[-1].entity_id
-        now = self._application.clock.utcnow()
-        deadlines_valid = all(run.deadline_at is not None and now < run.deadline_at for run in active_runs)
-        approvals_valid = True
-        for run in active_runs:
-            if run.status.value != "awaiting_approval":
-                continue
-            matching = tuple(
-                record
-                for record in approval_records
-                if record.request.binding.run_id == run.run_id
-                and record.request.binding.expires_at > now
-                and record.resolution is None
-            )
-            if not matching:
-                approvals_valid = False
-                break
-        return ResumeValidation(
-            deadlines_valid=deadlines_valid,
-            vault_hash_valid=valid_root == self._application.canonical_root_identity,
-            named_pipe_client_valid=True,
-            # No provider adapter currently exposes a resumable connection
-            # health proof.  Active model work therefore fails closed.
-            model_connection_valid=not active_runs,
-            approvals_valid=approvals_valid,
-        )
-
-    async def reject_new_runs(self) -> None:
-        self._application.reject_new_runs = True
-
-    async def graceful_shutdown(self) -> WorkerShutdownReceipt:
-        from offeragent_harness.runtime.host_supervisor import WorkerShutdownReceipt
-
-        self._application.reject_new_runs = True
-        self._application.begin_shutdown_delivery()
-        receipt = await self._application.commit_shutdown()
-        if not isinstance(receipt, WorkerShutdownReceipt):
-            raise ProductionWorkerError("Worker shutdown did not produce a verified receipt")
-        if not receipt.safely_committed:
-            raise ProductionWorkerError("Worker shutdown receipt does not prove durable state")
-        return receipt
-
-
 @dataclass(slots=True)
 class ProductionWorkerApplication(WorkerApplication):
     workspace_id: str
@@ -2375,7 +2134,7 @@ class ProductionWorkerApplication(WorkerApplication):
     database_identity: str
     vault_root: Path
     state_directory: Path
-    host_pid: int
+    parent_pid: int
     runtime_version: str
     runtime_config: HarnessConfig
     config_service: ConfigService
@@ -2395,10 +2154,6 @@ class ProductionWorkerApplication(WorkerApplication):
     scheduler: ChildRunScheduler
     turn_manager: TurnManager
     process_supervisor: _WorkerProcessSupervisor
-    native_transports: bool
-    _pipe: _ProductionNamedPipeServer | None = None
-    _control: WorkerControlServer | None = None
-    _control_task: asyncio.Task[None] | None = None
     _ready: bool = False
     _shutdown_task: asyncio.Task[None] | None = None
     _shutdown_committed: bool = False
@@ -2416,14 +2171,6 @@ class ProductionWorkerApplication(WorkerApplication):
     @property
     def ready(self) -> bool:
         transport_healthy = self.loopback is None or self.loopback.healthy
-        if self.native_transports:
-            transport_healthy = transport_healthy and (
-                self._pipe is not None
-                and self._pipe.healthy
-                and self._control is not None
-                and self._control_task is not None
-                and not self._control_task.done()
-            )
         return self._ready and not self._stopped and self._fatal_error is None and transport_healthy
 
     @property
@@ -2670,42 +2417,12 @@ class ProductionWorkerApplication(WorkerApplication):
         self.components.bind_worker_read_limit(worker_config.config.budgets.max_parallel_reads)
         report = await self.harness_application.start()
         await self._start_loopback_web(enabled=worker_config.config.ui.loopback_web_enabled)
-        if self.native_transports:
-            self._pipe = _ProductionNamedPipeServer(
-                state_directory=self.state_directory,
-                dispatcher=self.dispatcher,
-                event_hub=self.event_hub,
-                clock=SystemClock(),
-                request_finalized=self._application_request_finalized,
-            )
-            await self._pipe.start()
-            pipe_accept_task = self._pipe.accept_task
-            if pipe_accept_task is None:
-                raise ProductionWorkerError("Worker Named Pipe listener did not start")
-            pipe_accept_task.add_done_callback(
-                lambda completed: self._transport_listener_finished("named_pipe", completed)
-            )
-            protector = DpapiCurrentUserProtector()
-            self._control = WorkerControlServer(
-                store=DiscoveryMaterialStore(self.state_directory / "control", protector=protector),
-                handler=_WorkerControl(self),
-                shutdown_request_finalized=lambda: self._application_request_finalized("shutdown"),
-            )
-            await self._control.start()
-            self._control_task = asyncio.create_task(
-                self._control.serve_forever(),
-                name="offeragent-worker-control",
-            )
-            self._control_task.add_done_callback(
-                lambda completed: self._transport_listener_finished("control", completed)
-            )
         self._ready = True
         await self._emit_runtime_log(
             LogLevel.INFO,
             "runtime.ready",
             "Worker is ready.",
             workerPid=os.getpid(),
-            nativeTransports=self.native_transports,
         )
         return report
 
@@ -2747,7 +2464,7 @@ class ProductionWorkerApplication(WorkerApplication):
             raise commit_error
 
     async def commit_shutdown(self, *, grace_seconds: float = 10.0) -> WorkerShutdownReceipt:
-        """Persist/cancel Runtime state before acknowledging Host shutdown.
+        """Persist/cancel Runtime state before acknowledging shutdown.
 
         The first caller owns the one commit Task.  Every concurrent or later
         caller awaits that exact Task, so both a receipt and a failure remain
@@ -2815,8 +2532,6 @@ class ProductionWorkerApplication(WorkerApplication):
                 if not isinstance(run, Run) or not run.status.is_terminal:
                     persisted = False
                     break
-            from offeragent_harness.runtime.host_supervisor import WorkerShutdownReceipt
-
             receipt = WorkerShutdownReceipt(
                 new_runs_rejected=self.reject_new_runs,
                 active_runs_cancelled=not active_after,
@@ -2849,9 +2564,8 @@ class ProductionWorkerApplication(WorkerApplication):
     def _ensure_transport_shutdown_task(self) -> asyncio.Task[None]:
         task = self._transport_shutdown_task
         if task is None:
-            # Always run teardown in its own task.  A caller can be a Pipe or
-            # control request handler that teardown itself must close; making
-            # that handler the teardown owner would let it cancel itself.
+            # Always run teardown in its own task.  A transport request handler
+            # must not own process-wide teardown that may outlive that request.
             task = asyncio.create_task(
                 self._run_transport_shutdown(),
                 name="offeragent-worker-transport-teardown",
@@ -2863,20 +2577,13 @@ class ProductionWorkerApplication(WorkerApplication):
     def _transport_shutdown_finished(self, task: asyncio.Task[None]) -> None:
         # ``wait_stopped`` will await the same Task and re-raise its result to
         # the process main loop.  Retrieving it here also prevents an
-        # unobserved-task warning if the Host terminates before that waiter runs.
+        # unobserved-task warning if the parent terminates before that waiter runs.
         if not task.cancelled():
             task.exception()
 
     async def _run_transport_shutdown(self) -> None:
         try:
             failures: list[BaseException] = []
-            pipe = self._pipe
-            self._pipe = None
-            if pipe is not None:
-                try:
-                    await pipe.stop()
-                except BaseException as error:
-                    failures.append(error)
             loopback = self.loopback
             self.loopback = None
             self.gateway = None
@@ -2885,26 +2592,6 @@ class ProductionWorkerApplication(WorkerApplication):
                     await loopback.stop()
                 except BaseException as error:
                     failures.append(error)
-            # Keep the Host-owned control plane available until every
-            # application ingress capability has been revoked.  Host stop-all
-            # can then join an in-progress application shutdown instead of
-            # mistaking a disappearing control endpoint for a hung Worker and
-            # killing the Job before discovery cleanup completes.
-            control = self._control
-            self._control = None
-            if control is not None:
-                try:
-                    await control.close()
-                except BaseException as error:
-                    failures.append(error)
-            task = self._control_task
-            self._control_task = None
-            current = asyncio.current_task()
-            if task is not None and task is not current:
-                task.cancel()
-                # Listener close intentionally aborts a pending native accept.
-                # The authoritative cleanup result is control.close() above.
-                await asyncio.gather(task, return_exceptions=True)
             if failures:
                 await self._emit_runtime_log(
                     LogLevel.ERROR,
@@ -2974,10 +2661,10 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
     def _build(self, bootstrap: WorkerBootstrap) -> ProductionWorkerApplication:
         root_identity = identify_workspace_root(bootstrap.canonical_root)
         if root_identity.identity_hash != self._canonical_root_identity:
-            raise ProductionWorkerError("Worker canonical Vault identity differs from Host bootstrap")
+            raise ProductionWorkerError("Worker canonical Vault identity differs from stdio bootstrap")
         expected_database = workspace_database_identity(bootstrap.workspace_instance_id)
         if expected_database != self._database_identity:
-            raise ProductionWorkerError("Worker database identity differs from Host bootstrap")
+            raise ProductionWorkerError("Worker database identity differs from stdio bootstrap")
         portable = read_portable_workspace_config(bootstrap.canonical_root)
         workspace_id = portable.portable_workspace_id
         state_directory = bootstrap.state_directory.resolve(strict=False)
@@ -3003,9 +2690,9 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             correlations=correlations,
         )
         network_audit = EntityNetworkAuditSink(uow.entity_store, ids)
-        host_pid = self._overrides.host_pid or os.getppid()
-        if host_pid < 1 or host_pid == os.getpid():
-            raise ProductionWorkerError("Worker parent Host PID is invalid")
+        parent_pid = self._overrides.parent_pid or os.getppid()
+        if parent_pid < 1 or parent_pid == os.getpid():
+            raise ProductionWorkerError("Worker parent process PID is invalid")
         config = self._overrides.runtime_config or HarnessConfig()
         secret_store = self._overrides.secret_store
         if secret_store is None:
@@ -3093,7 +2780,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                         ),
                         verifier=PinnedProcessExecutableVerifier(
                             authenticode=WindowsAuthenticodeVerifier(),
-                            release_manifest=self._overrides.process_release_manifest,
                         ),
                         sandbox_state_directory=state_directory / "process-sandbox",
                     ),
@@ -3109,7 +2795,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
         )
         executable_by_id = {item.executable_id: item for item in executable_profiles}
         environment_ids = {item.profile_id for item in environment_profiles}
-        for profile in self._overrides.signed_shell_profiles:
+        for profile in self._overrides.builtin_shell_profiles:
             executable = executable_by_id.get(profile.executable_id)
             if (
                 executable is None
@@ -3123,7 +2809,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                 )
         shell_capabilities = ProductionShellBundleFactory(
             workspace_id=workspace_id,
-            signed_builtin_profiles=self._overrides.signed_shell_profiles,
+            builtin_profiles=self._overrides.builtin_shell_profiles,
             unit_of_work=uow,
             processes=process_supervisor,
             clock=clock,
@@ -3378,7 +3064,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
         diagnostics = DiagnosticsService(
             workspace_id=workspace_id,
             runtime=runtime_diagnostics,
-            processes=_ProcessDiagnostics(host_pid, process_supervisor),
+            processes=_ProcessDiagnostics(parent_pid, process_supervisor),
             logger=logger,
             metrics=metrics,
             artifacts=artifacts,
@@ -3487,7 +3173,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             schema_hash=schema_hash(),
             workspace_id=workspace_id,
             workspace_instance_id=bootstrap.workspace_instance_id,
-            host_pid=host_pid,
+            parent_pid=parent_pid,
             worker_pid=os.getpid(),
             runtime_arch=_runtime_arch(),
             capabilities=_protocol_capabilities(),
@@ -3508,7 +3194,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             database_identity=self._database_identity,
             vault_root=bootstrap.canonical_root,
             state_directory=state_directory,
-            host_pid=host_pid,
+            parent_pid=parent_pid,
             runtime_version=self._runtime_version,
             runtime_config=config,
             config_service=config_service,
@@ -3528,7 +3214,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             scheduler=scheduler,
             turn_manager=turn_manager,
             process_supervisor=process_supervisor,
-            native_transports=self._overrides.start_native_transports,
         )
         application_holder["application"] = application
         runtime_diagnostics.application = application
@@ -3553,7 +3238,7 @@ async def _runtime_status(
         state=RuntimeState.READY if application.ready else RuntimeState.STARTING,
         workspace_id=application.workspace_id,
         workspace_instance_id=application.workspace_instance_id,
-        host_pid=application.host_pid,
+        parent_pid=application.parent_pid,
         worker_pid=os.getpid(),
         runtime_version=runtime_version,
         core_version=_semantic_version(__version__),
@@ -3591,13 +3276,11 @@ def _protocol_capabilities() -> CapabilitySet:
 
 
 def _runtime_arch() -> RuntimeArch:
-    from offeragent_harness.runtime.release_manifest import native_windows_architecture
+    from offeragent_harness.runtime.runtime_manifest import native_windows_architecture
 
     architecture = native_windows_architecture()
     if architecture == "x64":
         return RuntimeArch.WIN_X64
-    if architecture == "arm64":
-        return RuntimeArch.WIN_ARM64
     raise ProductionWorkerError("Worker architecture is unsupported")
 
 
@@ -3620,7 +3303,6 @@ class WorkerCommandLine:
     canonical_root_identity: str
     database_identity: str
     runtime_version: str
-    stdio: bool = False
 
 
 def parse_worker_arguments(arguments: Sequence[str]) -> WorkerCommandLine:
@@ -3652,33 +3334,11 @@ def parse_worker_arguments(arguments: Sequence[str]) -> WorkerCommandLine:
             record.root_identity.identity_hash,
             workspace_database_identity(record.workspace_instance_id),
             runtime_version,
-            stdio=True,
         )
-    if len(values) != 12 or values[:5] != list(_WORKER_ARGUMENTS):
-        raise ProductionWorkerError("Worker arguments do not match the direct stdio contract")
-    expected_flags = (
-        "--canonical-root-identity",
-        "--database-identity",
-        "--runtime-version",
-    )
-    if (values[6], values[8], values[10]) != expected_flags:
-        raise ProductionWorkerError("Worker arguments are out of order")
-    instance_id, root_identity, database_identity, runtime_version = (
-        values[5],
-        values[7],
-        values[9],
-        values[11],
-    )
-    if _INSTANCE_ID.fullmatch(instance_id) is None:
-        raise ProductionWorkerError("Worker Workspace instance identity is invalid")
-    digest = re.compile(r"^sha256:[0-9a-f]{64}$")
-    if digest.fullmatch(root_identity) is None or digest.fullmatch(database_identity) is None:
-        raise ProductionWorkerError("Worker Host identity digests are invalid")
-    _semantic_version(runtime_version)
-    return WorkerCommandLine(instance_id, root_identity, database_identity, runtime_version)
+    raise ProductionWorkerError("Worker arguments do not match the direct stdio contract")
 
 
-class _StdioWorkerStream(PipeByteStream):
+class _StdioWorkerStream(DuplexByteStream):
     """The Worker has exactly one parent: the Obsidian plugin that spawned it.
 
     Standard input/output are inherited private handles, so no discoverable
@@ -3689,11 +3349,22 @@ class _StdioWorkerStream(PipeByteStream):
     def __init__(self) -> None:
         self._closed = False
         self._write_lock = asyncio.Lock()
+        set_blocking = getattr(os, "set_blocking", None)
+        if not callable(set_blocking):
+            raise ProductionWorkerError("Worker stdio requires Python non-blocking pipe support")
+        try:
+            set_blocking(0, False)
+            set_blocking(1, False)
+        except OSError as error:
+            raise ProductionWorkerError("Worker stdio handles do not support non-blocking pipe I/O") from error
 
     async def read(self, max_bytes: int) -> bytes:
-        if self._closed:
-            return b""
-        return await asyncio.to_thread(os.read, 0, max_bytes)
+        while not self._closed:
+            try:
+                return os.read(0, max_bytes)
+            except BlockingIOError:
+                await asyncio.sleep(0.005)
+        return b""
 
     async def write(self, data: bytes) -> None:
         if self._closed:
@@ -3701,13 +3372,19 @@ class _StdioWorkerStream(PipeByteStream):
         async with self._write_lock:
             view = memoryview(data)
             while view:
-                written = await asyncio.to_thread(os.write, 1, view)
+                if self._closed:
+                    raise BrokenPipeError("Worker stdio transport is closed")
+                try:
+                    written = os.write(1, view)
+                except BlockingIOError:
+                    await asyncio.sleep(0.005)
+                    continue
+                if written <= 0:
+                    raise BrokenPipeError("Worker stdio write made no progress")
                 view = view[written:]
 
     def cancel_pending_io(self) -> None:
-        # The parent owns the inherited handles. Closing the child process is
-        # the only safe cancellation operation for a blocked standard read.
-        return None
+        self._closed = True
 
     async def close(self) -> None:
         self._closed = True
@@ -3719,17 +3396,49 @@ async def _serve_stdio_connection(application: ProductionWorkerApplication) -> N
         stream,
         role=ConnectionRole.SERVER,
         dispatcher=application.dispatcher,
-        command_transport="stdio-dev",
+        command_transport="stdio",
         command_peer="parent-process",
         request_finalized=application._application_request_finalized,
     )
+    initialized: asyncio.Task[None] | None = None
+    connection_closed: asyncio.Task[None] | None = None
+    application_stopped: asyncio.Task[None] | None = None
+    registered = False
     try:
         await connection.start()
-        await connection.wait_ready()
+        initialized = asyncio.create_task(connection.wait_ready(), name="offeragent-stdio-initialize")
+        connection_closed = asyncio.create_task(connection.wait_closed(), name="offeragent-stdio-closed")
+        application_stopped = asyncio.create_task(application.wait_stopped(), name="offeragent-runtime-stopped")
+        done, _ = await asyncio.wait(
+            (initialized, connection_closed, application_stopped),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if application_stopped in done:
+            await application_stopped
+            return
+        # Preserve the initialization failure as the authoritative process
+        # result when the parent disconnects before a successful initialize.
+        await initialized
         await application.event_hub.add(connection)
-        await connection.wait_closed()
+        registered = True
+        done, _ = await asyncio.wait(
+            (connection_closed, application_stopped),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if application_stopped in done:
+            await application_stopped
+        else:
+            await connection_closed
     finally:
-        await application.event_hub.remove(connection)
+        for task in (initialized, connection_closed, application_stopped):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (initialized, connection_closed, application_stopped) if task is not None),
+            return_exceptions=True,
+        )
+        if registered:
+            await application.event_hub.remove(connection)
         await connection.close()
 
 
@@ -3746,11 +3455,11 @@ def _resolve_worker_bootstrap(command: WorkerCommandLine) -> WorkerBootstrap:
         raise ProductionWorkerError("Workspace instance is absent or duplicated in the current-user registry")
     record = matches[0]
     if record.root_identity.identity_hash != command.canonical_root_identity:
-        raise ProductionWorkerError("Workspace registry identity differs from signed Host launch")
+        raise ProductionWorkerError("Workspace registry identity differs from the stdio bootstrap")
     canonical_root = Path(record.root_identity.canonical_path).resolve(strict=True)
     observed = identify_workspace_root(canonical_root)
     if observed != record.root_identity:
-        raise ProductionWorkerError("Vault identity changed after Host launch")
+        raise ProductionWorkerError("Vault identity changed after the stdio bootstrap")
     if workspace_database_identity(command.workspace_instance_id) != command.database_identity:
         raise ProductionWorkerError("database identity is not derived from this Workspace instance")
     state_parent = local_root / "workspaces"
@@ -3782,12 +3491,12 @@ def _resolve_worker_bootstrap(command: WorkerCommandLine) -> WorkerBootstrap:
 
 
 def _verified_packaged_ripgrep(
-    release: InstalledReleaseManifestTrust | InstalledDevelopmentRuntimeTrust,
+    runtime: InstalledDevelopmentRuntimeTrust,
 ) -> Path:
     """Return the Runtime-pinned ripgrep image used exclusively by ``grep``."""
 
-    executable = release.version_directory / "tools" / "rg.exe"
-    if not release.verify_file(executable):
+    executable = runtime.version_directory / "tools" / "rg.exe"
+    if not runtime.verify_file(executable):
         raise ProductionWorkerError("Runtime ripgrep image is absent or differs from the trusted manifest")
     return executable.resolve(strict=True)
 
@@ -3831,27 +3540,6 @@ def _require_powershell_path(value: Path | None) -> Path:
     return executable
 
 
-def _installed_release_trust() -> InstalledReleaseManifestTrust:
-    from offeragent_harness.runtime.release_manifest import (
-        ReleaseKeyring,
-        ReleaseVerificationError,
-        native_windows_architecture,
-    )
-    from offeragent_harness.runtime.release_trust import InstalledReleaseManifestTrust, load_embedded_release_keys
-
-    version_directory = Path(sys.executable).resolve(strict=True).parent
-    trust = InstalledReleaseManifestTrust(
-        version_directory,
-        keyring=ReleaseKeyring(load_embedded_release_keys()),
-    )
-    if trust.manifest.platform.architecture != native_windows_architecture():
-        raise ReleaseVerificationError(
-            "architecture_mismatch",
-            "signed Worker Runtime architecture does not match native Windows",
-        )
-    return trust
-
-
 def _prepare_process_scratch_root(state_directory: Path) -> Path:
     root = state_directory / "process-workspace"
     working = root / "working"
@@ -3875,24 +3563,17 @@ def _prepare_process_scratch_root(state_directory: Path) -> Path:
 async def _run_worker(
     command: WorkerCommandLine,
     *,
-    development_trust: InstalledDevelopmentRuntimeTrust | None = None,
+    development_trust: InstalledDevelopmentRuntimeTrust,
 ) -> None:
     bootstrap = _resolve_worker_bootstrap(command)
-    release: InstalledReleaseManifestTrust | InstalledDevelopmentRuntimeTrust
-    if development_trust is None:
-        release = _installed_release_trust()
-        catalog = load_production_process_catalog(release.version_directory, manifest_trust=release)
-    else:
-        from offeragent_harness.runtime.production_process_catalog import load_development_process_catalog
-
-        release = development_trust
-        catalog = load_development_process_catalog(
-            release.version_directory,
-            manifest_trust=development_trust,
-        )
-    if release.manifest.runtime_version != command.runtime_version:
-        raise ProductionWorkerError("Runtime version differs from Host launch identity")
-    ripgrep_path = _verified_packaged_ripgrep(release)
+    runtime = development_trust
+    catalog = load_local_process_catalog(
+        runtime.version_directory,
+        manifest_trust=runtime,
+    )
+    if runtime.manifest.runtime_version != command.runtime_version:
+        raise ProductionWorkerError("Runtime version differs from the stdio launch identity")
+    ripgrep_path = _verified_packaged_ripgrep(runtime)
     powershell_path = _trusted_windows_powershell()
     clock = SystemClock()
     ids = SecureIdGenerator()
@@ -3928,19 +3609,17 @@ async def _run_worker(
         canonical_root_identity=command.canonical_root_identity,
         database_identity=command.database_identity,
         runtime_version=command.runtime_version,
-        build_commit=release.manifest.build_commit,
+        build_commit=runtime.manifest.build_commit,
         overrides=ProductionWorkerOverrides(
             clock=clock,
             ids=ids,
             process_executable_profiles=executable_profiles,
             process_environment_profiles=environment_profiles,
-            process_release_manifest=catalog.manifest_trust,
             process_registration_service=process_registrations,
-            signed_shell_profiles=catalog.signed_shell_profiles,
-            skill_runtime_root=release.version_directory,
+            builtin_shell_profiles=catalog.shell_profiles,
+            skill_runtime_root=runtime.version_directory,
             ripgrep_path=ripgrep_path,
             powershell_path=powershell_path,
-            start_native_transports=False,
         ),
     )
     from offeragent_harness.runtime.worker_entrypoint import WorkerEntrypoint, WorkerTransportMode
@@ -3951,28 +3630,12 @@ async def _run_worker(
         await entrypoint.start(bootstrap, transport=WorkerTransportMode.STDIO),
     )
     try:
-        if not command.stdio:
-            raise ProductionWorkerError("Worker requires the direct stdio transport")
         await _serve_stdio_connection(application)
     finally:
         await entrypoint.shutdown()
 
 
-def main(arguments: Sequence[str] | None = None) -> int:
-    try:
-        command = parse_worker_arguments(sys.argv[1:] if arguments is None else arguments)
-        asyncio.run(_run_worker(command))
-    except BaseException:
-        try:
-            os.write(2, b"offeragent-worker: startup failed\n")
-        except OSError:
-            pass
-        return 2
-    return 0
-
-
 __all__ = [
-    "PRODUCTION_WORKER_COMPOSITION_COMPLETE",
     "ProductionRunComponentsFactory",
     "ProductionWorkerApplication",
     "ProductionWorkerCompositionRoot",
@@ -3981,6 +3644,5 @@ __all__ = [
     "SecureIdGenerator",
     "SystemClock",
     "WorkerCommandLine",
-    "main",
     "parse_worker_arguments",
 ]

@@ -22,7 +22,6 @@ export interface LocalOfferAgentSettings {
     shellEnabled: boolean;
     subagentsEnabled: boolean;
     hooksEnabled: boolean;
-    keepWorkerInBackground: boolean;
     telemetryEnabled: false;
 }
 
@@ -41,7 +40,6 @@ export const DEFAULT_LOCAL_SETTINGS: LocalOfferAgentSettings = {
     shellEnabled: false,
     subagentsEnabled: false,
     hooksEnabled: false,
-    keepWorkerInBackground: true,
     telemetryEnabled: false,
 };
 
@@ -260,7 +258,7 @@ export class LocalOfferAgentSettingTab extends PluginSettingTab {
             let credentialValue = "";
             new Setting(containerEl)
                 .setName("Provider 凭据")
-                .setDesc("仅经认证 Named Pipe 写入 Windows DPAPI SecretStore；不会保存到 Vault、插件 data.json 或日志。")
+                .setDesc("仅经当前插件独占的 Worker stdio 通道写入 Windows DPAPI SecretStore；不会保存到 Vault、插件 data.json 或日志。")
                 .addText((text) => {
                     text.setPlaceholder("输入后点击安全保存").onChange((value) => { credentialValue = value; });
                     text.inputEl.type = "password";
@@ -381,17 +379,8 @@ export class LocalOfferAgentSettingTab extends PluginSettingTab {
                     await this.persistAndApply();
                 }));
         new Setting(containerEl)
-            .setName("后台继续运行")
-            .setDesc("关闭标签或热重载插件不会取消活动 Run；无客户端且空闲后由 Host 决定退出。")
-            .addToggle((toggle) => toggle
-                .setValue(this.host.settings.keepWorkerInBackground)
-                .onChange(async (value) => {
-                    this.host.settings.keepWorkerInBackground = value;
-                    await this.host.saveLocalSettings();
-                }));
-        new Setting(containerEl)
             .setName("本地诊断")
-            .setDesc("查看 Runtime、文件工具状态、模型认证、后台进程和脱敏错误。")
+            .setDesc("查看 Runtime、文件工具状态、模型认证、Worker 进程和脱敏错误。")
             .addButton((button) => button.setButtonText("打开诊断").onClick(() => void this.host.openDiagnostics()));
         containerEl.createEl("p", {
             text: "遥测默认关闭且当前发行不可在 UI 中开启；诊断不会自动上传。",
@@ -463,7 +452,6 @@ export function parseLocalSettings(raw: unknown): LocalOfferAgentSettings {
         shellEnabled: value.shellEnabled === true,
         subagentsEnabled: value.subagentsEnabled === true,
         hooksEnabled: value.hooksEnabled === true,
-        keepWorkerInBackground: value.keepWorkerInBackground !== false,
         telemetryEnabled: false,
     };
 }

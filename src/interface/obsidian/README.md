@@ -1,43 +1,51 @@
 # OfferAgent for Obsidian
 
-这是 OfferAgent Windows 本地 Runtime 的桌面端 Obsidian 客户端。插件负责安装和连接签名的
-Host/Worker，并渲染同一 Worker 的 Session、Run、工具、
-审批与诊断事件。
+这是 OfferAgent 个人 Windows x64 Runtime 的 Obsidian 客户端。每个插件实例验证本地 Runtime manifest
+后，直接启动一个 `offeragent-worker.exe` 子进程，并渲染该 Worker 的 Session、Run、工具、审批和
+诊断事件。
 
-插件不连接 OfferAgent/Khoj Server，不上传或同步 Vault 内容，也不实现第二套 Agent Loop。
-磁盘 create/append/patch/rename/trash 全部由 Worker 的单一原子事务协调器执行。插件不注册文件
-执行器、不代理工具调用，也不保存另一份调用状态；它只发送命令并消费 Worker 的可重放事件。
-生产 IPC 使用当前 Windows SID 专属 Named Pipe；“打开本地 Web”只访问同一 Worker 绑定的
-随机 Loopback 端口。模型 Provider URL 仅属于用户选择的推理边界，本地模型可完全断网运行。
+## 边界
 
-个人本机开发安装默认选择 `deepseek-v4-flash`。DeepSeek 只由 Worker 访问固定官方 Chat Completions
-端点；插件不包含端点 URL，也不直接发模型请求。设置页的 Provider 密码框只做一次性提交，经认证
-Named Pipe 写入 Workspace 绑定的 Windows DPAPI SecretStore；插件配置只保存 opaque handle，不保存
-API key 明文。
+- 插件与 Worker 的唯一 IPC 是继承 stdin/stdout 上的 framed JSON-RPC；stderr 只解析稳定诊断码。
+- 没有常驻协调 Host、插件 IPC 中间 Host、discovery、Named Pipe、listener、后台 Worker 或常驻运行模式。
+- 插件不连接 OfferAgent/Khoj Server，不上传或同步 Vault 内容，不实现第二套 Agent Loop。
+- 插件不执行文件写、模型调用、Shell 或 Hook。磁盘事务、工具调用和状态恢复都由 Worker 拥有。
+- “打开本地 Web”只访问同一 Worker 的随机 Loopback 端口。
+- Shell/Hook 等进程工具由 Worker 通过短生命周期 `offeragent-process-host.exe` 执行；插件不直接
+  启动或代理这些进程。
 
-## 停止语义
+Provider secret 输入只作为一次性命令经当前 stdio 通道写入 Workspace 绑定的 Windows DPAPI
+SecretStore。插件配置只保存 opaque handle，不保存 API key 明文；插件自身不包含 Provider 端点逻辑。
 
-插件热重载、禁用或 Obsidian 窗口关闭时，`onunload` 只断开当前客户端，不会把断线误当成
-显式停机；其他 Vault 和已经开始的 Run 可继续由同一 Host/Worker 管理。需要真正停止时，请在
-命令面板执行“一键停止本机所有 OfferAgent Runtime”。该命令会先明确确认，再通过当前 Windows
-SID 专属的认证控制管道拒绝新连接、取消所有 Vault 的活动 Run，并清空 Worker、Shell 与
-Subagent 进程树。它不会删除 Vault 笔记或本地 Runtime 数据。
+## 生命周期
 
-## 开发
+插件热重载、禁用、Obsidian 退出或 `onunload` 会在回调返回前同步关闭 stdio、发起当前子 Worker
+回收并取消其中的活动 Run；Obsidian 不等待 `onunload` 返回的 Promise，因此实际进程 join 在后台继续。
+命令面板的“停止当前 Vault 的 OfferAgent Runtime”会等待同一清理操作完成，并清理该 Worker 本轮创建的
+Shell、Hook 与 Subagent 进程树。显式停止和自动重连都会等待旧 Worker 退出；并发停止共享同一个清理
+操作，停止期间的新启动也必须等待。同一交互式 Windows 会话和用户内，后续同 Vault Worker 在旧进程
+释放互斥锁前不能访问 Runtime 状态。它不影响其他 Vault，也不删除 Vault 笔记或本地 Runtime 状态。
+
+## 开发门禁
 
 在 `src/interface/obsidian` 中执行：
 
 ```powershell
 corepack yarn install --frozen-lockfile
+corepack yarn protocol:check
+corepack yarn typecheck
 corepack yarn test
-corepack yarn build
 ```
 
-构建会生成 `main.js`。正式测试产物应部署到目标 Vault 的插件目录；不要长期手改已编译文件，
-也不要读取、复制或打印旧 `data.json` 中的凭据。插件加载旧设置时只迁移允许的本地字段，并以
-封闭 schema 重写数据，旧 Server URL、API key 与同步字段不会进入新配置。
+插件构建面只保留：
 
-`npm run protocol:generate` 会从 Harness 的权威 JSON Schema 同时生成协议身份以及完整的
-TypeScript DTO、Command/Event 映射。`HarnessClient` 和 `EventReducer` 直接使用
-这份生成映射；不要在插件中另写同名 wire DTO。生成器会复验 Schema 字节哈希，测试会比较完整
-method/event 目录，Schema 漂移必须先重新生成并通过 TypeScript 编译。
+- `protocol:check`：以非修改模式核对 Harness schema 与生成的 identity/types；
+- `typecheck`：先执行协议检查，再运行 TypeScript `--noEmit`；
+- `build:local`：由 Harness 个人构建脚本调用，必须注入 Runtime manifest SHA-256 和输出路径。
+
+不要恢复无 manifest 锚点的 `build`/`dev`，也不要直接调用 esbuild 生成可安装 bundle。完整插件只能由
+`packages/offeragent-harness/scripts/build_local_windows_plugin.py` 构建，并由
+`packages/offeragent-harness/scripts/update_local_windows_plugin.py` 更新。
+
+生成的 `main.js` 是安装产物，不能作为长期维护源码。不要读取、复制或打印目标 Vault 的 `data.json`；
+旧 Server URL、API key 和同步字段也不能进入新配置。

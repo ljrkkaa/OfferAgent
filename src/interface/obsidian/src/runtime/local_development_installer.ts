@@ -18,6 +18,7 @@ const CANONICAL_PATH = /^[^\\\0]+$/;
 const REQUIRED_EXECUTABLES = new Set([
     "offeragent-process-host.exe",
     "offeragent-worker.exe",
+    "tools/rg.exe",
 ]);
 
 declare const __OFFERAGENT_DEVELOPMENT_MANIFEST_SHA256__: string;
@@ -94,14 +95,13 @@ export class LocalDevelopmentRuntimeInstaller implements RuntimeInstaller {
 
     async ensureReady(signal: AbortSignal, onPhase: (phase: InstallerPhase) => void): Promise<InstalledRuntime> {
         signal.throwIfAborted();
-        onPhase("not_installed");
         onPhase("locating_embedded_bundle");
         if (platform() !== "win32" || arch() !== "x64") fail("development_platform_unsupported");
         const runtimeRoot = confinedPath(this.pluginDirectory, "runtime/windows-x64/local-development");
         await requireSafeDirectoryChain(this.pluginDirectory);
         await requireSafeDirectoryChain(runtimeRoot);
         const manifestPath = confinedPath(runtimeRoot, MANIFEST_NAME);
-        onPhase("verifying_manifest_and_signature");
+        onPhase("verifying_manifest");
         const manifestBytes = await readBounded(manifestPath, MAXIMUM_MANIFEST_BYTES);
         const manifestSha256 = sha256Bytes(manifestBytes);
         if (!SHA256.test(__OFFERAGENT_DEVELOPMENT_MANIFEST_SHA256__) ||
@@ -133,8 +133,7 @@ export class LocalDevelopmentRuntimeInstaller implements RuntimeInstaller {
             schemaHash: manifest.protocol.schemaHash,
             beforeWorkerLaunch: async (launchSignal?: AbortSignal): Promise<void> => {
                 // Verify the pinned bundle once at the sole executable launch
-                // boundary.  The plugin never starts a Host or publishes a
-                // discoverable local endpoint.
+                // boundary. The plugin publishes no discoverable local endpoint.
                 await verifyPinnedTree(launchSignal);
                 if (resolve(await fs.realpath(workerExecutable)).toLocaleLowerCase("en-US") !==
                     resolve(workerExecutable).toLocaleLowerCase("en-US")) {

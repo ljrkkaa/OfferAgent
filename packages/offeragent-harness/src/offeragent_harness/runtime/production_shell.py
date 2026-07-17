@@ -64,7 +64,7 @@ class ProductionShellBundleFactory:
         self,
         *,
         workspace_id: str,
-        signed_builtin_profiles: Sequence[ShellCommandProfile],
+        builtin_profiles: Sequence[ShellCommandProfile],
         unit_of_work: UnitOfWorkFactory,
         processes: ProcessSupervisor,
         clock: Clock,
@@ -76,7 +76,7 @@ class ProductionShellBundleFactory:
         self._clock = clock
         self._profiles = ShellProfileService(
             workspace_id=workspace_id,
-            signed_builtin_profiles=signed_builtin_profiles,
+            builtin_profiles=builtin_profiles,
             state_store=EntityShellProfileStateStore(unit_of_work),
         )
         self._factory_nonce = object()

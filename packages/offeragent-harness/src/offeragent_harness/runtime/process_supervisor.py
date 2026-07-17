@@ -91,7 +91,6 @@ class _ProcessArtifactBudgetExhausted(RuntimeError):
 
 
 class ExecutableTrust(str, Enum):
-    SIGNED_RELEASE = "signed_release"
     FIXED_HASH = "fixed_hash"
     OS_AUTHENTICODE = "os_authenticode"
 
@@ -104,7 +103,7 @@ class ProcessFilesystemAccess(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class ProcessFilesystemCapability:
-    """One signed, root-relative AppContainer filesystem grant.
+    """One hash-pinned, root-relative AppContainer filesystem grant.
 
     Empty paths are intentionally forbidden: a no-network process may receive
     a narrow subtree, but it cannot silently turn the whole Vault into an
@@ -216,9 +215,9 @@ class ProcessExecutableProfile:
         captured_content_sha256 = f"sha256:{digest.hexdigest()}"
         if canonical_executable.name.casefold() in _COMMAND_INTERPRETERS:
             raise ProcessProfileError("command interpreters require a separately implemented high-risk profile")
-        if self.trust in {ExecutableTrust.FIXED_HASH, ExecutableTrust.SIGNED_RELEASE}:
+        if self.trust is ExecutableTrust.FIXED_HASH:
             if self.file_sha256 is None or not _SHA256.fullmatch(self.file_sha256):
-                raise ProcessProfileError("fixed and release executables require a pinned SHA-256")
+                raise ProcessProfileError("fixed executables require a pinned SHA-256")
         elif self.file_sha256 is not None and not _SHA256.fullmatch(self.file_sha256):
             raise ProcessProfileError("invalid executable SHA-256")
         if not 0 <= self.minimum_variable_arguments <= self.maximum_variable_arguments <= 128:

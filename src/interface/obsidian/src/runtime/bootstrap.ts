@@ -7,9 +7,7 @@ export type BootstrapState =
     | "uninitialized"
     | "runtime_missing"
     | "verifying"
-    | "installing"
-    | "starting_host"
-    | "attaching_worker"
+    | "starting_worker"
     | "handshaking"
     | "ready"
     | "degraded"
@@ -18,13 +16,8 @@ export type BootstrapState =
     | "stopped";
 
 export type InstallerPhase =
-    | "not_installed"
     | "locating_embedded_bundle"
-    | "verifying_manifest_and_signature"
-    | "extracting_to_staging"
-    | "verifying_each_file"
-    | "atomic_activate"
-    | "runtime_self_test"
+    | "verifying_manifest"
     | "ready";
 
 export interface InstalledRuntime {
@@ -72,14 +65,9 @@ export interface RuntimeBootstrapOptions {
 }
 
 const INSTALLER_STATE: Record<InstallerPhase, BootstrapState> = {
-    not_installed: "runtime_missing",
     locating_embedded_bundle: "runtime_missing",
-    verifying_manifest_and_signature: "verifying",
-    extracting_to_staging: "installing",
-    verifying_each_file: "installing",
-    atomic_activate: "installing",
-    runtime_self_test: "installing",
-    ready: "starting_host",
+    verifying_manifest: "verifying",
+    ready: "starting_worker",
 };
 
 export class RuntimeBootstrap {
@@ -102,6 +90,8 @@ export class RuntimeBootstrap {
     private controller: AbortController | null = null;
     private failure: BootstrapErrorInfo | null = null;
     private operation: Promise<InitializeResult> | null = null;
+    private stopOperation: Promise<void> | null = null;
+    private retiringClient: HarnessClient | null = null;
     private lastClockReading = 0;
 
     constructor(installer: RuntimeInstaller, clients: HarnessClientFactory, options: RuntimeBootstrapOptions = {}) {
@@ -144,6 +134,8 @@ export class RuntimeBootstrap {
     }
 
     start(): Promise<InitializeResult> {
+        const stopping = this.stopOperation;
+        if (stopping) return stopping.then(() => this.start());
         if (this.currentState === "ready" && this.client) return Promise.resolve(this.client.identity);
         if (this.operation) return this.operation;
         if (this.currentState === "stopped" || this.currentState === "failed") {
@@ -163,15 +155,64 @@ export class RuntimeBootstrap {
         return operation;
     }
 
-    async stop(options: { shutdownWorker?: boolean } = {}): Promise<void> {
+    stop(options: { requestShutdown?: boolean } = {}): Promise<void> {
+        if (this.stopOperation) {
+            if (options.requestShutdown === false) {
+                // Unload may race a graceful manual/configuration stop. Escalate
+                // that same client without creating a second stop/join gate.
+                void this.retiringClient?.beginImmediateClose?.().catch(() => undefined);
+            }
+            return this.stopOperation;
+        }
+        const client = this.client;
+        const operation = this.operation;
+        let resolveStopping!: () => void;
+        let rejectStopping!: (error: unknown) => void;
+        const stopping = new Promise<void>((resolvePromise, rejectPromise) => {
+            resolveStopping = resolvePromise;
+            rejectStopping = rejectPromise;
+        });
+        // Publish the stop gate before aborting. Abort listeners run
+        // synchronously and must not be able to re-enter start/stop around it.
+        this.stopOperation = stopping;
+        this.retiringClient = client;
         ++this.generation;
         this.controller?.abort();
         this.controller = null;
-        const client = this.client;
         this.client = null;
         this.operation = null;
-        await client?.close({ shutdown: options.shutdownWorker }).catch(() => undefined);
-        this.transition("stopped");
+        let retirement: Promise<void>;
+        try {
+            // HarnessClient.close synchronously initiates transport close when
+            // requestShutdown is false; its Promise remains the process join.
+            retirement = client?.close({ shutdown: options.requestShutdown ?? true }) ?? Promise.resolve();
+        } catch (error) {
+            retirement = Promise.reject(error);
+        }
+        void (async () => {
+            await retirement.catch(() => undefined);
+            // An automatic reconnect owns the retiring client after clearing
+            // this.client. Join that operation as well so stop/unload cannot
+            // complete while its old Worker is still being terminated.
+            await operation?.catch(() => undefined);
+            this.transition("stopped");
+        })().then(resolveStopping, rejectStopping);
+        void stopping.finally(() => {
+            if (this.stopOperation === stopping) {
+                this.stopOperation = null;
+                this.retiringClient = null;
+            }
+        }).catch(() => undefined);
+        return stopping;
+    }
+
+    /**
+     * Obsidian does not await Plugin.onunload.  This entry point therefore
+     * bypasses the shutdown RPC and synchronously starts stdio EOF/termination;
+     * the returned operation is still the normal stop gate and process join.
+     */
+    beginUnload(): Promise<void> {
+        return this.stop({ requestShutdown: false });
     }
 
     private async installAndConnect(generation: number, signal: AbortSignal): Promise<InitializeResult> {
@@ -193,12 +234,13 @@ export class RuntimeBootstrap {
         while (true) {
             signal.throwIfAborted();
             this.attempt += 1;
-            this.transition(this.attempt === 1 ? "starting_host" : "restarting");
+            this.transition(this.attempt === 1 ? "starting_worker" : "restarting");
+            await (this.runtime as InstalledRuntime).beforeWorkerLaunch?.(signal);
+            signal.throwIfAborted();
             const disconnect = (error: Error) => this.handleDisconnect(generation, error);
             const client = this.clients.create(this.runtime as InstalledRuntime, disconnect);
             this.client = client;
             try {
-                this.transition("attaching_worker");
                 this.transition("handshaking");
                 const identity = await client.connect(signal);
                 if (this.generation !== generation) {
@@ -226,23 +268,33 @@ export class RuntimeBootstrap {
         if (this.generation !== generation || this.currentState !== "ready" || !this.controller) return;
         const client = this.client;
         this.client = null;
-        void client?.close().catch(() => undefined);
+        const retirement = client?.close() ?? Promise.resolve();
         const classified = classifyBootstrapFailure(error);
         this.failure = classified.info;
         this.transition("degraded");
         if (!classified.retryable) {
             this.transition("failed");
+            this.trackTerminalRetirement(generation, retirement, error);
             return;
         }
         if (!this.recordRestart()) {
-            this.failure = classifyBootstrapFailure(new RuntimeBootstrapCircuitOpen(classified.info)).info;
+            const circuitOpen = new RuntimeBootstrapCircuitOpen(classified.info);
+            this.failure = classifyBootstrapFailure(circuitOpen).info;
             this.transition("failed");
+            this.trackTerminalRetirement(generation, retirement, circuitOpen);
             return;
         }
         const signal = this.controller.signal;
-        const operation = this.sleep(this.retryDelay(classified), signal).then(
-            () => this.connectLoop(generation, signal),
-        ).catch((failure) => {
+        const operation = (async () => {
+            // A transport error closes the logical client before the child
+            // process necessarily exits.  Never spawn its replacement until
+            // close has completed the process terminate-and-join contract.
+            await retirement;
+            signal.throwIfAborted();
+            await this.sleep(this.retryDelay(classified), signal);
+            signal.throwIfAborted();
+            return this.connectLoop(generation, signal);
+        })().catch((failure) => {
             if (this.generation === generation && !this.controller?.signal.aborted) {
                 this.failure = classifyBootstrapFailure(failure).info;
                 this.transition("failed");
@@ -255,6 +307,17 @@ export class RuntimeBootstrap {
             () => { if (this.generation === generation && this.operation === operation) this.operation = null; },
         );
         // A background reconnect failure is surfaced through state/listeners.
+        void operation.catch(() => undefined);
+    }
+
+    private trackTerminalRetirement(generation: number, retirement: Promise<void>, failure: Error): void {
+        const operation = retirement.then<InitializeResult>(() => { throw failure; });
+        this.operation = operation;
+        void operation.finally(() => {
+            if (this.generation === generation && this.operation === operation) this.operation = null;
+        }).catch(() => undefined);
+        // Terminal failure is already represented by the state snapshot; this
+        // Promise exists to gate start/stop on the retiring process join.
         void operation.catch(() => undefined);
     }
 

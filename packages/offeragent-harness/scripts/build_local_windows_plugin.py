@@ -1,9 +1,7 @@
-"""Build one unsigned, hash-pinned Windows x64 plugin for personal use.
+"""Build the one hash-pinned Windows x64 plugin for personal use.
 
-This command is intentionally separate from ``build_windows_release.py``.  It
-cannot emit a release ZIP, setup program, signature, keyring, or Authenticode
-claim.  The resulting plugin bundle carries a mandatory development-only
-manifest and is accepted only by the compile-time local plugin installer.
+The resulting plugin bundle carries a mandatory development-only manifest and
+is accepted only by the compile-time local plugin installer.
 """
 
 from __future__ import annotations
@@ -18,6 +16,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from offeragent_harness.protocol.schemas import PROTOCOL_VERSION, schema_hash
@@ -28,43 +28,46 @@ from offeragent_harness.runtime.development_runtime_manifest import (
     canonical_development_manifest_bytes,
     development_runtime_content_digest,
 )
-from offeragent_harness.runtime.production_process_catalog import (
+from offeragent_harness.runtime.local_process_catalog import (
     PROCESS_CATALOG_PATH,
     validate_process_catalog_payload,
 )
-from offeragent_harness.runtime.release_manifest import (
+from offeragent_harness.runtime.runtime_manifest import (
     ProtocolCompatibility,
     RuntimeFileRecord,
     native_windows_architecture,
-    windows_pe_machine_for_architecture,
 )
 from offeragent_harness.storage.migrations import LATEST_SCHEMA_VERSION
 
 try:
-    from scripts.frozen_payload_provenance import (
+    from scripts.frozen_payload import (
         FrozenRuntimeEvidence,
         SourceClassifier,
         capture_pyinstaller_target,
         merge_frozen_evidence,
+        verify_project_source_snapshot,
     )
 except ModuleNotFoundError:
-    from frozen_payload_provenance import (  # type: ignore[import-not-found,no-redef]
+    from frozen_payload import (  # type: ignore[import-not-found,no-redef]
         FrozenRuntimeEvidence,
         SourceClassifier,
         capture_pyinstaller_target,
         merge_frozen_evidence,
+        verify_project_source_snapshot,
     )
 
 try:
-    from scripts.build_windows_release import (
-        add_release_assets,
+    from scripts.local_windows_runtime_build import (
+        WINDOWS_X64_PE_MACHINE,
+        add_local_assets,
         build_one_onedir,
         merge_identical_tree,
         pe_machine,
     )
 except ModuleNotFoundError:
-    from build_windows_release import (  # type: ignore[import-not-found,no-redef]
-        add_release_assets,
+    from local_windows_runtime_build import (  # type: ignore[import-not-found,no-redef]
+        WINDOWS_X64_PE_MACHINE,
+        add_local_assets,
         build_one_onedir,
         merge_identical_tree,
         pe_machine,
@@ -99,10 +102,8 @@ DEVELOPMENT_EXCLUDED_MODULES = (
     "hypothesis",
     "khoj",
     "mypy",
-    "offeragent_harness._release_keys",
     "offeragent_harness.cli",
     "offeragent_harness.migration",
-    "offeragent_harness.runtime.bootstrap_cli",
     "offeragent_harness.testing",
     "psycopg",
     "pytest",
@@ -115,8 +116,6 @@ _FORBIDDEN_FROZEN_PROJECT_PREFIXES = (
     "project:src/offeragent_harness/testing/",
     "project:src/offeragent_harness/migration/",
     "project:src/offeragent_harness/cli.py",
-    "project:src/offeragent_harness/runtime/bootstrap_cli.py",
-    "project:src/offeragent_harness/_release_keys.py",
 )
 _FORBIDDEN_FROZEN_DISTRIBUTIONS = (
     "python-distribution:django/",
@@ -127,34 +126,40 @@ _FORBIDDEN_FROZEN_DISTRIBUTIONS = (
 )
 
 
+@dataclass(frozen=True)
+class SourceTreeIdentity:
+    source_tree_sha256: str
+    schema_tree_sha256: str
+    project_sources: tuple[tuple[str, str], ...]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="构建个人本机开发版 OfferAgent 插件 (仅 Windows x64)")
     parser.add_argument("--output", type=Path, required=True, help="不存在的输出目录")
     parser.add_argument("--ripgrep-executable", type=Path, required=True, help="构建时显式提供的 rg.exe")
     parser.add_argument("--runtime-version", help="可选; 默认由源码指纹生成")
-    parser.add_argument("--skip-static-checks", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     require_local_build_host(args.ripgrep_executable)
     output = args.output.resolve(strict=False)
     if output.exists():
         raise SystemExit("output already exists; local build never overwrites an existing directory")
     output.parent.mkdir(parents=True, exist_ok=True)
-    if not args.skip_static_checks:
-        run_static_gates()
+    run_static_gates()
     commit = _git_output("rev-parse", "HEAD")
     if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
         raise SystemExit("Git HEAD is not a canonical commit identity")
-    source_digest = source_tree_digest()
+    source_identity = source_tree_identity()
+    source_digest = source_identity.source_tree_sha256
     runtime_version = args.runtime_version or f"0.1.0-local.{source_digest.removeprefix('sha256:')[:16]}"
     plugin_version = _plugin_version()
     with tempfile.TemporaryDirectory(prefix="offeragent-local-build-", dir=output.parent) as temporary:
         temporary_root = Path(temporary)
-        runtime = build_development_runtime(temporary_root / "runtime-build")
-        add_release_assets(
-            runtime,
-            architecture="x64",
-            ripgrep_executable=args.ripgrep_executable,
+        runtime = build_development_runtime(
+            temporary_root / "runtime-build",
+            project_source_snapshot=dict(source_identity.project_sources),
         )
+        _require_embedded_schema_identity(runtime, source_identity.schema_tree_sha256)
+        add_local_assets(runtime, ripgrep_executable=args.ripgrep_executable)
         validate_process_catalog_payload((runtime / PROCESS_CATALOG_PATH).read_bytes())
         records = collect_runtime_records(runtime)
         manifest = DevelopmentRuntimeManifest(
@@ -192,10 +197,6 @@ def main() -> int:
             or b"__OFFERAGENT_DEVELOPMENT_MANIFEST_SHA256__" in bundle_bytes
         ):
             raise RuntimeError("local plugin bundle lacks its compiled Runtime manifest anchor")
-        if b"release keyring is empty" in bundle_bytes:
-            raise RuntimeError("local plugin bundle unexpectedly contains the production installer")
-        if source_tree_digest() != source_digest:
-            raise RuntimeError("source tree changed during the local build; refusing a mixed-identity artifact")
         staging = temporary_root / "offeragent-obsidian-plugin"
         staging.mkdir()
         plugin_sources = {
@@ -218,12 +219,16 @@ def main() -> int:
             "sourceTreeSha256": source_digest,
         }
         (staging / "local-development-build.json").write_bytes(_canonical_json(receipt) + b"\n")
+        _require_embedded_schema_identity(runtime, source_identity.schema_tree_sha256)
+        require_source_tree_unchanged(source_identity)
         os.replace(staging, output)
     print(output)
     return 0
 
 
 def require_local_build_host(ripgrep_executable: Path) -> None:
+    if sys.version_info[:2] != (3, 12):
+        raise SystemExit("local development build requires CPython 3.12")
     try:
         architecture = native_windows_architecture()
     except RuntimeError as error:
@@ -245,10 +250,19 @@ def run_static_gates() -> None:
         "check_architecture.py",
     ):
         subprocess.run([sys.executable, f"scripts/{script}"], cwd=ROOT, check=True)
+    subprocess.run(
+        [sys.executable, "-m", "offeragent_harness.protocol.schemas", "check"],
+        cwd=ROOT,
+        check=True,
+    )
     subprocess.run([sys.executable, "scripts/build_web_assets.py", "check"], cwd=ROOT, check=True)
 
 
-def build_development_runtime(destination: Path) -> Path:
+def build_development_runtime(
+    destination: Path,
+    *,
+    project_source_snapshot: Mapping[str, str],
+) -> Path:
     specifications = (
         (DEVELOPMENT_ENTRYPOINTS / "offeragent_worker.py", "offeragent-worker", destination / "worker"),
         (
@@ -286,16 +300,26 @@ def build_development_runtime(destination: Path) -> Path:
     for root in roots:
         merge_identical_tree(root, merged)
     evidence = merge_frozen_evidence(merged_root=merged, targets=target_evidence)
+    verify_project_source_snapshot(evidence, project_source_snapshot)
     audit_development_frozen_evidence(evidence)
     audit_development_pyinstaller_archives(merged)
-    actual = {path.name for path in merged.glob("*.exe")}
-    if not set(LOCAL_RUNTIME_EXES) <= actual:
-        raise RuntimeError("development PyInstaller output is missing a required executable")
-    expected_machine = windows_pe_machine_for_architecture("x64")
+    _require_exact_root_executables(merged)
+    expected_machine = WINDOWS_X64_PE_MACHINE
     for executable in sorted(merged.glob("*.exe")):
         if pe_machine(executable) != expected_machine:
             raise RuntimeError(f"development executable is not native x64: {executable.name}")
     return merged
+
+
+def _require_exact_root_executables(runtime: Path) -> None:
+    expected = set(LOCAL_RUNTIME_EXES)
+    actual = {path.name for path in runtime.glob("*.exe")}
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        raise RuntimeError(
+            f"development Runtime root executable set differs: missing={missing}, unexpected={unexpected}"
+        )
 
 
 def audit_development_frozen_evidence(evidence: FrozenRuntimeEvidence) -> None:
@@ -333,10 +357,8 @@ def audit_development_pyinstaller_archives(runtime: Path) -> None:
         "hypothesis",
         "khoj",
         "mypy",
-        "offeragent_harness._release_keys",
         "offeragent_harness.cli",
         "offeragent_harness.migration",
-        "offeragent_harness.runtime.bootstrap_cli",
         "offeragent_harness.testing",
         "psycopg",
         "pytest",
@@ -406,11 +428,12 @@ def collect_runtime_records(runtime: Path) -> tuple[RuntimeFileRecord, ...]:
     return tuple(records)
 
 
-def source_tree_digest() -> str:
+def source_tree_identity() -> SourceTreeIdentity:
     roots = (
         ROOT / "src" / "offeragent_harness",
         ROOT / "scripts" / "entrypoints" / "development",
         ROOT / "packaging",
+        ROOT / "schema",
         ROOT / "web",
         PLUGIN / "src",
         PLUGIN / "scripts",
@@ -419,30 +442,113 @@ def source_tree_digest() -> str:
     for root in roots:
         if not root.is_dir():
             raise RuntimeError(f"source identity root is missing: {root}")
-        files.extend(path for path in root.rglob("*") if path.is_file() and "__pycache__" not in path.parts)
+        for path in root.rglob("*"):
+            if path.is_symlink():
+                raise RuntimeError("source identity contains a symlink")
+            if path.is_file() and (root == ROOT / "schema" or "__pycache__" not in path.parts):
+                files.append(path)
     files.extend(
         (
             ROOT / "pyproject.toml",
             ROOT / "uv.lock",
             ROOT / "LICENSE",
             ROOT / "scripts" / "build_local_windows_plugin.py",
-            ROOT / "scripts" / "build_windows_release.py",
+            ROOT / "scripts" / "frozen_payload.py",
+            ROOT / "scripts" / "local_windows_runtime_build.py",
+            ROOT / "scripts" / "runtime_sbom.py",
             PLUGIN / "package.json",
+            PLUGIN / "yarn.lock",
             PLUGIN / "esbuild.config.mjs",
             PLUGIN / "manifest.json",
             PLUGIN / "styles.css",
         )
     )
+    return _source_tree_identity_from_files(
+        files,
+        repository_root=REPO,
+        schema_root=ROOT / "schema",
+        project_root=ROOT,
+    )
+
+
+def source_tree_digest() -> str:
+    return source_tree_identity().source_tree_sha256
+
+
+def require_source_tree_unchanged(expected: SourceTreeIdentity) -> None:
+    if source_tree_identity() != expected:
+        raise RuntimeError("source tree changed during the local build; refusing a mixed-identity artifact")
+
+
+def _source_tree_identity_from_files(
+    files: Iterable[Path],
+    *,
+    repository_root: Path,
+    schema_root: Path,
+    project_root: Path,
+) -> SourceTreeIdentity:
     entries: list[dict[str, object]] = []
+    schema_entries: list[dict[str, object]] = []
+    project_sources: list[tuple[str, str]] = []
     seen: set[str] = set()
     for path in sorted(files):
         if path.is_symlink() or not path.is_file():
             raise RuntimeError("source identity contains a symlink or missing file")
-        relative = path.relative_to(REPO).as_posix()
+        relative = path.relative_to(repository_root).as_posix()
         if relative in seen:
             continue
         seen.add(relative)
-        entries.append({"path": relative, "sha256": _digest_file(path), "size": path.stat().st_size})
+        digest, size = _digest_file_and_size(path)
+        entries.append({"path": relative, "sha256": digest, "size": size})
+        try:
+            schema_relative = path.relative_to(schema_root).as_posix()
+        except ValueError:
+            pass
+        else:
+            schema_entries.append({"path": schema_relative, "sha256": digest, "size": size})
+        try:
+            project_relative = path.relative_to(project_root).as_posix()
+        except ValueError:
+            pass
+        else:
+            project_sources.append((f"project:{project_relative}", digest))
+    if not schema_entries:
+        raise RuntimeError("source identity schema tree is empty")
+    return SourceTreeIdentity(
+        source_tree_sha256=_digest_bytes(_canonical_json({"files": entries})),
+        schema_tree_sha256=_digest_bytes(_canonical_json({"files": schema_entries})),
+        project_sources=tuple(project_sources),
+    )
+
+
+def _require_embedded_schema_identity(runtime: Path, expected: str) -> None:
+    schema_root = runtime / "_internal" / "offeragent_harness" / "_schema"
+    actual = _schema_tree_digest(schema_root)
+    if actual != expected:
+        raise RuntimeError("frozen Runtime schema differs from the source identity snapshot")
+
+
+def _schema_tree_digest(schema_root: Path) -> str:
+    if schema_root.is_symlink() or not schema_root.is_dir():
+        raise RuntimeError("schema identity root is unsafe or missing")
+    entries: list[dict[str, object]] = []
+    for path in sorted(schema_root.rglob("*")):
+        if path.is_symlink():
+            raise RuntimeError("schema identity contains a symlink")
+        if path.is_dir():
+            continue
+        if not path.is_file() or path.stat().st_nlink != 1:
+            raise RuntimeError("schema identity contains a missing, hard-linked, or special file")
+        digest, size = _digest_file_and_size(path)
+        entries.append(
+            {
+                "path": path.relative_to(schema_root).as_posix(),
+                "sha256": digest,
+                "size": size,
+            }
+        )
+    if not entries:
+        raise RuntimeError("schema identity tree is empty")
     return _digest_bytes(_canonical_json({"files": entries}))
 
 
@@ -466,11 +572,17 @@ def _git_output(*arguments: str) -> str:
 
 
 def _digest_file(path: Path) -> str:
+    return _digest_file_and_size(path)[0]
+
+
+def _digest_file_and_size(path: Path) -> tuple[str, int]:
     digest = hashlib.sha256()
+    size = 0
     with path.open("rb", buffering=0) as stream:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
-    return f"sha256:{digest.hexdigest()}"
+            size += len(chunk)
+    return f"sha256:{digest.hexdigest()}", size
 
 
 def _digest_bytes(payload: bytes) -> str:

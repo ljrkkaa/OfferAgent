@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from offeragent_harness.runtime.host_supervisor import SupervisedWorkspaceIdentity
+from offeragent_harness.runtime.process_identity import SupervisedWorkspaceIdentity
 from offeragent_harness.runtime.windows_process import WindowsWorkerJob
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="requires Windows Job Objects")
@@ -115,7 +115,7 @@ def _close_handle(handle: int) -> None:
 
 
 @pytest.mark.asyncio
-async def test_closing_host_job_kills_child_and_grandchild_without_leaks(tmp_path: Path) -> None:
+async def test_closing_runtime_job_kills_child_and_grandchild_without_leaks(tmp_path: Path) -> None:
     helper = Path(__file__).parent / "helpers" / "job_tree_child.py"
     trigger = tmp_path / "trigger"
     child_pid_path = tmp_path / "child.pid"
@@ -143,7 +143,7 @@ async def test_closing_host_job_kills_child_and_grandchild_without_leaks(tmp_pat
         assert _pid_is_alive(child_pid)
         assert _pid_is_alive(grandchild_pid)
 
-        # Simulate abrupt Host loss: no graceful terminate call, just close the
+        # Simulate abrupt Runtime loss: no graceful terminate call, just close the
         # last Job handle. KILL_ON_JOB_CLOSE must collect the full descendant tree.
         job.close()
         await wait_for_pid_exit(child_pid)
@@ -157,54 +157,3 @@ async def test_closing_host_job_kills_child_and_grandchild_without_leaks(tmp_pat
             await asyncio.to_thread(process.wait, 5)
         if grandchild_pid is not None and _pid_is_alive(grandchild_pid):
             _terminate_pid(grandchild_pid)
-
-
-@pytest.mark.asyncio
-async def test_atomic_job_list_prevents_orphan_if_host_dies_after_create_returns(tmp_path: Path) -> None:
-    child_pid_path = tmp_path / "atomic-child.pid"
-    script = r"""
-import hashlib
-import os
-import sys
-from pathlib import Path
-from offeragent_harness.runtime.host_supervisor import (
-    SupervisedWorkspaceIdentity, VerifiedWorkerExecutable, WorkerLaunchRequest,
-)
-from offeragent_harness.runtime.windows_process import (
-    PinnedWorkerExecutableVerifier, WindowsWorkerJob, WindowsWorkerProcessBackend,
-)
-class Trust:
-    def authorizes(self, expected):
-        return True
-class Signature:
-    def verify(self, executable):
-        return True
-image = Path(sys.executable).resolve()
-digest = hashlib.sha256(image.read_bytes()).hexdigest()
-release = VerifiedWorkerExecutable(image, image.parent, "atomic-test", "sha256:" + digest)
-workspace = SupervisedWorkspaceIdentity(
-    "wsi_12345678-1234-4234-8234-123456789abc",
-    "sha256:" + "a" * 64,
-    "sha256:" + "b" * 64,
-)
-verifier = PinnedWorkerExecutableVerifier(manifest_trust=Trust(), authenticode=Signature())
-backend = WindowsWorkerProcessBackend(verifier=verifier)
-job = WindowsWorkerJob(workspace)
-child = backend.spawn_suspended(WorkerLaunchRequest(workspace, release), job=job)
-Path(sys.argv[1]).write_text(str(child.pid), encoding="ascii")
-os._exit(55)
-"""
-    host = await asyncio.to_thread(
-        subprocess.Popen,
-        [sys.executable, "-c", script, str(child_pid_path)],
-        cwd=Path(__file__).parents[3],
-        close_fds=True,
-        creationflags=_CREATE_NO_WINDOW,
-    )
-    await wait_for_file(child_pid_path)
-    child_pid = int(await asyncio.to_thread(child_pid_path.read_text, encoding="ascii"))
-    return_code = await asyncio.to_thread(host.wait, 15)
-
-    assert return_code == 55
-    await wait_for_pid_exit(child_pid)
-    assert not _pid_is_alive(child_pid)

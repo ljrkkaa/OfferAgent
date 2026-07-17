@@ -1,10 +1,10 @@
-"""Deterministic logical distribution closure used as release policy input.
+"""Deterministic logical distribution closure for the personal frozen Runtime.
 
-The build environment intentionally contains test, lint, packaging and release
+The build environment intentionally contains test, lint, and packaging
 tools.  This module follows active ``Requires-Dist`` edges to validate the
 declared application graph and records its fingerprint in provenance.  It does
 *not* claim to describe the shipped PyInstaller payload; file-level truth comes
-from ``frozen_payload_provenance.py`` and the five TOCs for each onedir target.
+from ``frozen_payload.py`` and the five TOCs for each local onedir target.
 Every resolved version is still checked against its incoming specifier.
 """
 

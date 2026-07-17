@@ -2746,9 +2746,9 @@
         "coreVersion": {
           "$ref": "#/$defs/SemanticVersion"
         },
-        "hostPid": {
+        "parentPid": {
           "minimum": 1,
-          "title": "Hostpid",
+          "title": "Parentpid",
           "type": "integer"
         },
         "protocolVersion": {
@@ -2789,7 +2789,7 @@
         "schemaHash",
         "workspaceId",
         "workspaceInstanceId",
-        "hostPid",
+        "parentPid",
         "workerPid",
         "transport",
         "runtimeArch",
@@ -4920,8 +4920,7 @@
     },
     "RuntimeArch": {
       "enum": [
-        "win-x64",
-        "win-arm64"
+        "win-x64"
       ],
       "title": "RuntimeArch",
       "type": "string"
@@ -4999,9 +4998,9 @@
         "databaseIdentity": {
           "$ref": "#/$defs/Sha256Digest"
         },
-        "hostPid": {
+        "parentPid": {
           "minimum": 1,
-          "title": "Hostpid",
+          "title": "Parentpid",
           "type": "integer"
         },
         "protocolVersion": {
@@ -5043,7 +5042,7 @@
         "state",
         "workspaceId",
         "workspaceInstanceId",
-        "hostPid",
+        "parentPid",
         "workerPid",
         "runtimeVersion",
         "coreVersion",
@@ -5118,10 +5117,7 @@
           "type": "string"
         },
         "kind": {
-          "enum": [
-            "model-provider",
-            "update"
-          ],
+          "const": "model-provider",
           "title": "Kind",
           "type": "string"
         },
@@ -5200,10 +5196,7 @@
         "kind": {
           "anyOf": [
             {
-              "enum": [
-                "model-provider",
-                "update"
-              ],
+              "const": "model-provider",
               "type": "string"
             },
             {
@@ -5280,10 +5273,7 @@
           "title": "Handle"
         },
         "kind": {
-          "enum": [
-            "model-provider",
-            "update"
-          ],
+          "const": "model-provider",
           "title": "Kind",
           "type": "string"
         },
@@ -7506,10 +7496,9 @@
     },
     "TransportKind": {
       "enum": [
-        "windows-named-pipe",
         "loopback-http",
         "loopback-websocket",
-        "stdio-dev"
+        "stdio"
       ],
       "title": "TransportKind",
       "type": "string"
@@ -8705,7 +8694,7 @@
       }
     }
   },
-  "description": "Canonical DTO schema shared by the Windows Named Pipe and loopback adapters. All object schemas are closed and wire fields use camelCase.",
+  "description": "Canonical DTO schema shared by direct stdio and loopback adapters. All object schemas are closed and wire fields use camelCase.",
   "envelopes": {
     "error": {
       "$ref": "#/$defs/ErrorEnvelope"

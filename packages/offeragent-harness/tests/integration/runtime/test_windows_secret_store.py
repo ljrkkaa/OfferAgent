@@ -163,16 +163,14 @@ def test_consumer_cannot_keep_a_live_plaintext_view(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("kind", "provider_id"),
+    "provider_id",
     [
-        (SecretKind.MODEL_PROVIDER, "openai-compatible.3998a78273bce9bc858e8a81fa76c1ea"),
-        (SecretKind.MODEL_PROVIDER, "codex"),
-        (SecretKind.UPDATE, "openai-compatible.74e02ac9ca3e818e94a4a9a7ed86be3f"),
+        "openai-compatible.3998a78273bce9bc858e8a81fa76c1ea",
+        "codex",
     ],
 )
-def test_consume_rejects_wrong_endpoint_provider_or_kind_before_plaintext(
+def test_consume_rejects_wrong_endpoint_provider_before_plaintext(
     tmp_path: Path,
-    kind: SecretKind,
     provider_id: str,
 ) -> None:
     secrets = store(tmp_path)
@@ -192,7 +190,7 @@ def test_consume_rejects_wrong_endpoint_provider_or_kind_before_plaintext(
         secrets.consume(
             created.handle,
             scope_id="wsi_first",
-            expected_kind=kind,
+            expected_kind=SecretKind.MODEL_PROVIDER,
             expected_provider_id=provider_id,
             consumer=capture,
         )
@@ -233,7 +231,7 @@ def test_corrupt_envelope_fails_closed_without_deletion(tmp_path: Path) -> None:
     secrets = store(tmp_path)
     created = secrets.create(
         scope_id="wsi_first",
-        kind=SecretKind.UPDATE,
+        kind=SecretKind.MODEL_PROVIDER,
         provider_id="search",
         secret=SecretInput("search-token"),
     )

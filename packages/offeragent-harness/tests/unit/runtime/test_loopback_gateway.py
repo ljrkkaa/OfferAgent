@@ -208,7 +208,7 @@ async def test_web_launch_command_uses_bound_gateway_identity_and_fragment_token
     result = await handler(
         WebLaunchParams(),
         ManualCancellationToken(),
-        ApplicationCommandContext(transport="windows-named-pipe", client_id="plugin_1"),
+        ApplicationCommandContext(transport="stdio", client_id="plugin_1"),
     )
     assert isinstance(result, WebLaunchResult)
     assert result.worker_pid == 123 and result.workspace_instance_id == "wsi_test"
@@ -216,7 +216,7 @@ async def test_web_launch_command_uses_bound_gateway_identity_and_fragment_token
     token = result.url.split("#", maxsplit=1)[1]
     cookie, csrf = await _exchange(gateway, token)
     assert cookie and csrf
-    with pytest.raises(PermissionError, match="plugin Pipe"):
+    with pytest.raises(PermissionError, match="plugin stdio"):
         await handler(
             WebLaunchParams(),
             ManualCancellationToken(),
@@ -232,7 +232,7 @@ async def test_web_launch_command_fails_closed_when_loopback_web_is_disabled() -
         await handler(
             WebLaunchParams(),
             ManualCancellationToken(),
-            ApplicationCommandContext(transport="windows-named-pipe", client_id="plugin_1"),
+            ApplicationCommandContext(transport="stdio", client_id="plugin_1"),
         )
 
 

@@ -23,7 +23,7 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
-from .host_supervisor import SupervisedWorkspaceIdentity
+from .process_identity import SupervisedWorkspaceIdentity
 from .process_supervisor import ProcessFilesystemAccess, ResolvedProcessFilesystemGrant
 from .windows_process import WindowsProcessError
 
@@ -448,38 +448,6 @@ def cleanup_workspace_appcontainer(
         profile.close()
 
 
-class WindowsAppContainerRuntimePurge:
-    """Remove every persisted Workspace AppContainer before local state purge.
-
-    RuntimeInstaller invokes this only after the Host/Workers are quiesced and
-    before deleting the workspace state tree.  Keeping the state tree present
-    is essential: its journal is the ownership proof for exact Package-SID ACE
-    removal after a crash.
-    """
-
-    def __init__(self, workspaces_root: Path) -> None:
-        _require_windows()
-        self._workspaces_root = workspaces_root.expanduser().resolve(strict=False)
-
-    def purge_non_vault_data(self) -> None:
-        root = self._workspaces_root
-        if not root.exists():
-            return
-        if not root.is_dir() or _is_reparse_point(root):
-            raise WindowsProcessError("Workspace state root is invalid during AppContainer cleanup")
-        for child in sorted(root.iterdir(), key=lambda item: os.path.normcase(item.name)):
-            if not _WORKSPACE_INSTANCE_ID.fullmatch(child.name):
-                continue
-            if not child.is_dir() or _is_reparse_point(child):
-                raise WindowsProcessError("Workspace state directory is invalid during AppContainer cleanup")
-            workspace = SupervisedWorkspaceIdentity(
-                child.name,
-                "sha256:" + "0" * 64,
-                "sha256:" + "0" * 64,
-            )
-            cleanup_workspace_appcontainer(workspace, child / "process-sandbox")
-
-
 def filesystem_dacl_sddl(path: Path) -> str:
     _require_windows()
     advapi32, kernel32 = _acl_apis()
@@ -866,7 +834,6 @@ __all__ = [
     "AppContainerAclLease",
     "WindowsAppContainerAclManager",
     "WindowsAppContainerProfile",
-    "WindowsAppContainerRuntimePurge",
     "cleanup_workspace_appcontainer",
     "filesystem_dacl_sddl",
 ]

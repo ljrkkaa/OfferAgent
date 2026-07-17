@@ -102,7 +102,7 @@ def _services(
     return (
         ShellProfileService(
             workspace_id=WORKSPACE_ID,
-            signed_builtin_profiles=(),
+            builtin_profiles=(),
             state_store=EntityShellProfileStateStore(durable),
         ),
         HookConfigurationService(
@@ -198,7 +198,7 @@ def _shell_install(executable: ProcessExecutableProfile, *, request_id: str, des
 
 
 @pytest.mark.asyncio
-async def test_shell_admin_is_pipe_only_registered_cas_and_replays_after_restart(tmp_path: Path) -> None:
+async def test_shell_admin_is_direct_stdio_only_registered_cas_and_replays_after_restart(tmp_path: Path) -> None:
     durable = InMemoryUnitOfWorkFactory()
     executable, environment = _process_catalog(tmp_path)
     shell, hooks = _services(durable)
@@ -206,7 +206,7 @@ async def test_shell_admin_is_pipe_only_registered_cas_and_replays_after_restart
     cancellation = ManualCancellationToken()
     params = _shell_install(executable, request_id="req_shell_install")
 
-    with pytest.raises(PermissionError, match="authenticated plugin Pipe"):
+    with pytest.raises(PermissionError, match="direct plugin stdio"):
         await handlers["shell/install"](
             params,
             cancellation,

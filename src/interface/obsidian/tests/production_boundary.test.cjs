@@ -173,22 +173,67 @@ test("Obsidian contains no plugin-owned Vault execution authority", async () => 
     }
 });
 
-test("configuration restart drains client ACK windows and unload aborts before awaiting lifecycle work", async () => {
+test("configuration restart drains client ACK windows and unload synchronously initiates teardown", async () => {
     const main = await readFile(path.join(__dirname, "../src/main.ts"), "utf8");
     const restart = main.slice(
         main.indexOf("private async performRuntimeRestartIfIdle"),
         main.indexOf("private scheduleRuntimeRestartCheck"),
     );
-    const unload = main.slice(main.indexOf("async onunload"), main.indexOf("runtimeSnapshot()"));
+    const unload = main.slice(main.indexOf("onunload(): void"), main.indexOf("runtimeSnapshot()"));
     const startup = main.slice(main.indexOf("private async startRuntime"), main.indexOf("private restartRuntimeIfIdle"));
-    const stopAll = main.slice(main.indexOf("private async stopAllLocalRuntime"), main.indexOf("private createRuntime"));
+    const stopCurrent = main.slice(main.indexOf("private async stopLocalRuntime"), main.indexOf("private createRuntime"));
 
     assert.ok(restart.indexOf("this.chatStore?.snapshot.busy") >= 0);
     assert.ok(restart.indexOf("this.chatStore?.snapshot.busy") < restart.indexOf("this.chatStore?.dispose"));
     assert.ok(restart.indexOf("this.chatStore?.dispose") < restart.indexOf("this.runtime.stop"));
-    assert.ok(unload.indexOf("this.runtime?.stop") < unload.indexOf("await Promise.all"));
+    assert.notEqual(unload.length, 0);
+    assert.doesNotMatch(unload, /async onunload|\bawait\b/);
+    assert.match(unload, /this\.runtime\?\.beginUnload\(\)/);
+    assert.match(unload, /void Promise\.all/);
     assert.match(startup, /enqueueRuntimeSettingsApply/);
     assert.doesNotMatch(startup, /await this\.applyRuntimeSettings\(\)/);
-    assert.ok(stopAll.indexOf("runtimeExplicitlyStopped = true") < stopAll.indexOf("await runtime.stop"));
-    assert.ok(stopAll.indexOf("await runtime.stop") < stopAll.indexOf("await Promise.all"));
+    assert.ok(stopCurrent.indexOf("runtimeExplicitlyStopped = true") < stopCurrent.indexOf("await runtime.stop"));
+    assert.ok(stopCurrent.indexOf("await runtime.stop") < stopCurrent.indexOf("await Promise.all"));
+});
+
+test("personal plugin lifecycle exposes only its direct child Worker", async () => {
+    const main = await readFile(path.join(__dirname, "../src/main.ts"), "utf8");
+    const bootstrap = await readFile(path.join(__dirname, "../src/runtime/bootstrap.ts"), "utf8");
+    const settings = await readFile(path.join(__dirname, "../src/local/settings.ts"), "utf8");
+    const pluginReadme = await readFile(path.join(__dirname, "../README.md"), "utf8");
+
+    for (const source of [main, bootstrap, settings]) {
+        assert.doesNotMatch(source, /starting_host|attaching_worker|keepWorkerInBackground|stop-all-local-runtime/);
+    }
+    assert.match(main, /new StdioWorkerTransport/);
+    assert.match(main, /停止当前 Vault 的 OfferAgent Runtime/);
+    assert.match(
+        pluginReadme,
+        /没有常驻协调 Host、插件 IPC 中间 Host、discovery、Named Pipe、listener、后台 Worker 或常驻运行模式/,
+    );
+    assert.match(
+        pluginReadme,
+        /插件热重载、禁用、Obsidian 退出或 `onunload` 会在回调返回前同步关闭 stdio、发起当前子 Worker/,
+    );
+    assert.match(pluginReadme, /实际进程 join 在后台继续/);
+});
+
+test("plugin build exposes only the pinned local-development Runtime installer", async () => {
+    const main = await readFile(path.join(__dirname, "../src/main.ts"), "utf8");
+    const build = await readFile(path.join(__dirname, "../esbuild.config.mjs"), "utf8");
+    const bootstrap = await readFile(path.join(__dirname, "../src/runtime/bootstrap.ts"), "utf8");
+    const packageJson = JSON.parse(await readFile(path.join(__dirname, "../package.json"), "utf8"));
+    const runtimeFiles = await readdir(path.join(__dirname, "../src/runtime"));
+
+    assert.match(main, /new LocalDevelopmentRuntimeInstaller/);
+    assert.doesNotMatch(main, /RELEASE_PUBLIC_KEYS|releasePublicKeys|generated_release_keyring|installer_mode/);
+    assert.match(build, /process\.argv\[2\] !== 'local-development'/);
+    assert.match(build, /__OFFERAGENT_DEVELOPMENT_MANIFEST_SHA256__/);
+    assert.doesNotMatch(build, /production|installerSelection|onResolve/);
+    assert.equal(packageJson.scripts.build, undefined);
+    assert.equal(packageJson.scripts.dev, undefined);
+    assert.match(packageJson.scripts["build:local"], /local-development/);
+    assert.doesNotMatch(bootstrap, /installing|extracting_to_staging|verifying_each_file|atomic_activate|runtime_self_test/);
+    assert.equal(runtimeFiles.includes("generated_release_keyring.ts"), false);
+    assert.equal(runtimeFiles.some((name) => name.startsWith("installer_mode")), false);
 });

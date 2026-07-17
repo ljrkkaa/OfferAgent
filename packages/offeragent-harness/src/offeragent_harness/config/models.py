@@ -49,12 +49,6 @@ class ModelWireApi(str, Enum):
     OLLAMA_CHAT = "ollama-chat"
 
 
-class UpdateChannel(str, Enum):
-    STABLE = "stable"
-    BETA = "beta"
-    DISABLED = "disabled"
-
-
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
@@ -123,7 +117,6 @@ class ModelSettings(_StrictModel):
 
 class NetworkSettings(_StrictModel):
     model_provider_enabled: StrictBool = True
-    update_network_enabled: StrictBool = False
 
 
 class PolicyApprovalSettings(_StrictModel):
@@ -172,12 +165,6 @@ class TelemetrySettings(_StrictModel):
     include_content: StrictBool = False
 
 
-class UpdateSettings(_StrictModel):
-    channel: UpdateChannel = UpdateChannel.DISABLED
-    automatic_check: StrictBool = False
-    automatic_install: StrictBool = False
-
-
 class HarnessConfig(_StrictModel):
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
     model: ModelSettings = Field(default_factory=ModelSettings)
@@ -189,7 +176,6 @@ class HarnessConfig(_StrictModel):
     budgets: AgentBudgetSettings = Field(default_factory=AgentBudgetSettings)
     ui: UiSettings = Field(default_factory=UiSettings)
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
-    update: UpdateSettings = Field(default_factory=UpdateSettings)
 
     @model_validator(mode="after")
     def _cross_field_safety(self) -> HarnessConfig:
@@ -197,10 +183,6 @@ class HarnessConfig(_StrictModel):
             raise ValueError("persistent Web lease requires loopback Web")
         if self.telemetry.include_content and not self.telemetry.enabled:
             raise ValueError("telemetry content requires telemetry enabled")
-        if self.update.automatic_install and not self.update.automatic_check:
-            raise ValueError("automatic install requires automatic update checks")
-        if self.update.automatic_check and self.update.channel is UpdateChannel.DISABLED:
-            raise ValueError("automatic update checks require a release channel")
         if self.execution.subagents_enabled and self.execution.max_subagents_per_vault < 1:
             raise ValueError("enabled subagents require a positive concurrent-run limit")
         return self
@@ -243,7 +225,6 @@ class ModelPatch(_StrictModel):
 
 class NetworkPatch(_StrictModel):
     model_provider_enabled: StrictBool | None = None
-    update_network_enabled: StrictBool | None = None
 
 
 class PolicyPatch(_StrictModel):
@@ -290,12 +271,6 @@ class TelemetryPatch(_StrictModel):
     include_content: StrictBool | None = None
 
 
-class UpdatePatch(_StrictModel):
-    channel: UpdateChannel | None = None
-    automatic_check: StrictBool | None = None
-    automatic_install: StrictBool | None = None
-
-
 class ConfigPatch(_StrictModel):
     runtime: RuntimePatch | None = None
     model: ModelPatch | None = None
@@ -307,7 +282,6 @@ class ConfigPatch(_StrictModel):
     budgets: AgentBudgetPatch | None = None
     ui: UiPatch | None = None
     telemetry: TelemetryPatch | None = None
-    update: UpdatePatch | None = None
 
     def payload(self) -> dict[str, Any]:
         return self.model_dump(mode="json", exclude_unset=True)
@@ -454,7 +428,4 @@ __all__ = [
     "TelemetrySettings",
     "UiPatch",
     "UiSettings",
-    "UpdateChannel",
-    "UpdatePatch",
-    "UpdateSettings",
 ]

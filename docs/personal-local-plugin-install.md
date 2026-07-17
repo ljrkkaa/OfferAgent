@@ -1,46 +1,52 @@
-# OfferAgent 个人本机开发安装
+# OfferAgent 个人 Windows x64 构建与更新
 
-这条路径只用于项目所有者当前的 Windows x64 电脑。它生成未签名的 PyInstaller onedir Runtime，
-不是公开发行包，也不会绕过正式发行验证器：
+这是仓库唯一支持的插件交付路径，仅用于项目所有者当前的 Windows x64 电脑。产物是未签名的
+PyInstaller onedir 本地开发 Runtime；仓库没有正式签名发布、Setup、自动更新服务或 ARM64 产物。
 
-- 正式 `build_windows_release.py` 仍强制 Ed25519、Authenticode、SignTool 和 Inno Setup。
-- 正式插件在编译期只包含 `EmbeddedRuntimeInstaller`；本机构建在编译期改用独立的
-  `LocalDevelopmentRuntimeInstaller`，正式 bundle 中不存在开发 installer 标记。
-- 本机 manifest 必须是 canonical JSON，并明确包含 `developmentOnly: true`。它固定完整文件集、
-  文件长度、SHA-256、x64 PE 架构、协议版本、Schema hash、Git commit、源码树 hash 和构建身份。
-- 构建脚本把该 manifest 的期望 SHA-256 编译进本机插件 bundle；插件启动前、执行自检前后以及每次
-  实际启动 Host 前都会按该锚点校验完整 Runtime。Host、Worker 和 process-host 各自在冻结进程中
-  再校验自身、Worker、Process catalog、内置进程和 Skill 资产。未签名不等于不校验。
-- PyInstaller 只接收显式 Runtime 模块白名单和最小可信 DLL 搜索路径；构建会同时审计 provenance
-  TOC 与最终 EXE 内的 PYZ 模块名，拒绝 testing/fakes、pytest、迁移 CLI 和旧服务器依赖。
-- Host/Worker 仍使用唯一 production composition、唯一 Agent Loop 和同一 Tool Kernel；开发入口只
-  注入固定哈希 trust，不维护第二套 Agent Runtime。
+## 信任和完整性边界
 
-这里的哈希锚点用于发现构建损坏、局部替换和混合版本，不提供正式代码签名的发布者身份保证。如果同一
-Windows SID 下的恶意进程能同时替换 `main.js`、嵌入的哈希和整套 Runtime，它仍可替换整个本机插件。
-个人本机路径不把这种场景描述为不可替换；需要抵御它时必须使用正式 Authenticode/Ed25519 发行链。
+- `development-runtime-manifest.json` 是 canonical JSON，带 `developmentOnly: true`，并固定完整文件集、
+  长度、SHA-256、x64 PE 架构、协议/schema、Git commit、源码树摘要和构建身份。
+- 构建脚本把 manifest 的期望 SHA-256 编译进 `main.js`。插件初始化和每次启动 Worker 前都会重新
+  校验整棵 Runtime；校验失败不会创建 Worker client。
+- `offeragent-worker.exe` 和短生命周期 `offeragent-process-host.exe` 还会在冻结进程内校验自身、
+  process catalog、内置进程和 Skill 资产。
+- PyInstaller 使用显式模块白名单并审计冻结闭包，拒绝 testing/fakes、pytest、旧服务器和已删除
+  发行模块进入产物。
+- 哈希锚点用于发现损坏、局部替换和混合版本，不提供发布者身份保证；不要把该产物描述成签名包。
 
 ## 一次性准备
 
-在 `E:\Projects\offeragent\repo\packages\offeragent-harness` 中执行：
+在 `packages/offeragent-harness` 中安装锁定依赖：
 
 ```powershell
-uv sync --extra dev --frozen
+uv sync --extra dev --locked --python 3.12
 ```
 
-Node 依赖已经由仓库的插件工作区管理；若 `node_modules` 尚不存在，先在
-`E:\Projects\offeragent\repo\src\interface\obsidian` 执行 `npm install`。
-
-## 只构建，不安装
-
-输出目录必须不存在，构建脚本不会覆盖已有产物：
+在 `src/interface/obsidian` 中安装插件依赖：
 
 ```powershell
+corepack yarn install --frozen-lockfile
+```
+
+构建机必须是 Windows x64，并显式提供一个真实、非 reparse point、非硬链接的 `rg.exe`。脚本不会
+从 PATH、网络或其他机器猜测该文件。
+
+## 构建
+
+输出目录必须不存在；唯一支持的完整构建命令是：
+
+```powershell
+cd E:\Projects\offeragent\repo\packages\offeragent-harness
 uv run python scripts/build_local_windows_plugin.py `
-  --output E:\Projects\offeragent\artifacts\offeragent-obsidian-plugin
+  --output E:\Projects\offeragent\artifacts\offeragent-obsidian-plugin `
+  --ripgrep-executable C:\path\to\rg.exe
 ```
 
-产物入口为：
+脚本会执行静态门禁，构建 Worker/Process Host，调用插件内部 `build:local`，生成并复验 manifest，
+然后写入一个新的输出目录。不要直接调用 esbuild，也不要恢复无 manifest 锚点的 `build`/`dev`。
+
+产物结构：
 
 ```text
 offeragent-obsidian-plugin\
@@ -50,55 +56,56 @@ offeragent-obsidian-plugin\
   local-development-build.json
   runtime\windows-x64\local-development\
     development-runtime-manifest.json
-    offeragent-host.exe
     offeragent-worker.exe
     offeragent-process-host.exe
-    offeragent-self-test.exe
-    ...完整 onedir 依赖和内置资产
+    ...完整 onedir 依赖、rg.exe 和内置资产
 ```
 
-## 一条命令安装或更新
+## 安装或更新
 
-先在 OfferAgent 插件中执行“停止 Runtime”，再完全退出 Obsidian。更新脚本会拒绝在
-`Obsidian.exe`、`offeragent-host.exe` 或 `offeragent-worker.exe` 仍运行时继续：
+先在插件中执行“停止当前 Vault 的 OfferAgent Runtime”，再完全退出 Obsidian。唯一支持的更新命令是：
 
 ```powershell
-uv run python scripts/update_local_windows_plugin.py --vault-root 'E:\面试胜利！'
+cd E:\Projects\offeragent\repo\packages\offeragent-harness
+uv run python scripts/update_local_windows_plugin.py `
+  --vault-root 'E:\面试胜利！' `
+  --ripgrep-executable C:\path\to\rg.exe
 ```
 
-脚本在临时目录从源码重新构建并复验，然后原子切换
-`<Vault>\.obsidian\plugins\offeragent-obsidian-plugin`。现有 `data.json` 只作为不透明文件移动到新目录；
-安装器不会打开、解码、打印或复制其中的旧 `khojApiKey`。任一步失败都会把旧插件和原 `data.json`
-回滚到原位置。如果 Windows 在回滚移动本身发生故障，安装器会保留承载唯一 `data.json` 的
-backup/staging/failed 恢复目录、在错误中给出该本地路径，并拒绝递归清理该目录；它不会为了“清理干净”
-而删除最后一份设置文件。
+更新脚本会拒绝在 `Obsidian.exe`、`offeragent-worker.exe` 或 `offeragent-process-host.exe` 仍运行时继续。
+它从源码在临时目录执行同一构建和验证，再原子切换
+`<Vault>\.obsidian\plugins\offeragent-obsidian-plugin`。
 
-如果已有一个经过验证的构建产物，也可以只执行安装：
+现有 `data.json` 只作为不透明文件移动；脚本不会打开、解码、打印或把其中内容复制到构建目录。
+失败时旧插件与原设置会回滚；若回滚移动本身失败，承载唯一 `data.json` 的恢复目录会保留并在错误中
+报告，清理逻辑不得删除最后一份设置。不要绕过更新脚本手工覆盖插件目录。
 
-```powershell
-uv run python scripts/install_local_windows_plugin.py `
-  --artifact E:\Projects\offeragent\artifacts\offeragent-obsidian-plugin `
-  --vault-root 'E:\面试胜利！'
-```
+## 运行拓扑
 
-## 更新后的检查
+每个 Obsidian 插件实例验证本地 manifest 后，直接启动一个 `offeragent-worker.exe` 子进程。唯一插件
+IPC 是继承 stdin/stdout 上的 framed JSON-RPC；没有常驻协调 Host、插件 IPC 中间 Host、discovery、
+Named Pipe、后台 Worker 或常驻运行模式。
+同一交互式 Windows 会话和用户、同一 canonical Vault root 的命名互斥锁在 SQLite 打开和恢复前排除第二个 Worker。插件
+显式停止会先请求 shutdown，断线重连会直接关闭旧 transport；两者最终都会关闭 stdin 并等待旧
+Worker。stdin 关闭后 15 秒仍未退出才强制终止，且同一插件实例在实际进程退出前不启动替代 Worker。
+Obsidian 不等待 `onunload` Promise；卸载回调会同步关闭 stdio、
+发起回收并在后台继续 join，同会话同 Vault Worker 在旧进程释放互斥锁前不能访问 Runtime 状态。
 
-1. 启动 Obsidian 并启用 OfferAgent。
-2. 状态应经过“定位 → 校验 → Runtime 自检 → 启动 Host → 连接 Worker → ready”。
-   Runtime 第一次从新目录启动时会触发 Windows 对未签名开发文件的冷扫描，自检最多可能等待约 5 分钟；
-   后续启动通常明显更快。校验内容不会因此减少或跳过。
-3. 打开聊天，确认同一 Vault 的 Pipe 连接、索引状态和模型配置可见。
-4. 默认模型为 `deepseek-v4-flash`。首次使用时在设置页输入一枚有效的 DeepSeek API key，点击
-   `安全保存`；明文只经认证 Named Pipe 写入 Windows DPAPI SecretStore。随后点击 `应用并检查`，
-   健康状态必须为 healthy。不要把 key 写入 `data.json`、Vault、环境变量或命令行。
-5. 新 Workspace 默认未信任，界面会明确显示实际有效权限为只读。需要日常写入时，先在设置中
-   显式确认“信任当前 Workspace”，再使用“标准”模式；写操作仍进入 Diff 与逐次审批，信任不等于 Bypass。
-6. 首次验收先做真实 Vault 只读检索；写事务继续只在临时 Vault 验收，除非另有明确授权。
-7. 更新前后若源码或协议有任何变化，必须从一个不存在的干净输出目录重新构建；旧 smoke artifact
-   不能冒充最终候选。
+Shell、Hook 等进程工具由 Worker 通过短生命周期 `offeragent-process-host.exe` 执行。相关进程受
+固定 hash/catalog、Job Object、AppContainer 文件和网络策略约束；用户注册的外部可执行文件可以
+额外要求离线 Authenticode，但无论签名状态如何都必须固定文件身份。
 
-## 与公开发行的边界
+删除自动更新功能后，既有 Runtime 配置仍有一次窄兼容迁移：文件 v3 原子迁移为 v4 并保留备份，
+SQLite 配置层 v2 可读取并在下次写入时使用 v3。迁移只剥离旧 `update` 和
+`network.update_network_enabled`；其他未知或畸形字段仍 fail closed。这不是自动更新代码路径。
 
-本机产物没有 Authenticode/SmartScreen 信誉，不能上传社区商店、不能给第三方使用，也不能改名伪装成
-正式离线包。准备公开分发时，回到 `docs/architecture/windows-runtime-release.md` 的签名构建、独立审计、
-安装器和干净 VM 门槛。
+## 更新后验收
+
+1. 启动 Obsidian 并启用 OfferAgent，状态应经过“定位 → 校验 → 启动 Worker → 协议握手 → ready”。
+2. 打开聊天，确认当前 Vault 的 stdio Worker、文件工具状态和模型配置可见。
+3. Provider 凭据只能通过插件到当前 Worker 的 stdio 命令写入 Windows DPAPI SecretStore；不要写入
+   `data.json`、Vault、环境变量或命令行。
+4. 新 Workspace 默认未信任，实际权限应保持只读；提升信任不等于绕过 Diff 和审批。
+5. 首次验收先做真实 Vault 只读检索；真实写入需另行明确授权。
+6. 源码或协议变化后必须从不存在的输出目录重新构建，旧 artifact 不能冒充当前候选。
+7. 执行 Harness 和插件的实时测试、协议、依赖、文档及类型检查门禁；不要用文档中的历史计数代替。

@@ -82,7 +82,7 @@ class ApplicationRuntimeIdentity:
     schema_hash: str
     workspace_id: str
     workspace_instance_id: str
-    host_pid: int
+    parent_pid: int
     worker_pid: int
     runtime_arch: RuntimeArch
     capabilities: CapabilitySet
@@ -99,9 +99,9 @@ class ApplicationRuntimeIdentity:
             schema_hash=self.schema_hash,
             workspace_id=self.workspace_id,
             workspace_instance_id=self.workspace_instance_id,
-            host_pid=self.host_pid,
+            parent_pid=self.parent_pid,
             worker_pid=self.worker_pid,
-            transport=TransportKind.WINDOWS_NAMED_PIPE,
+            transport=TransportKind.STDIO,
             runtime_arch=self.runtime_arch,
             capabilities=self.capabilities,
             build_commit=self.build_commit,
@@ -220,7 +220,7 @@ def compose_application_command_handlers(
             schema_hash=identity.schema_hash,
             workspace_id=identity.workspace_id,
             workspace_instance_id=identity.workspace_instance_id,
-            host_pid=identity.host_pid,
+            parent_pid=identity.parent_pid,
             worker_pid=identity.worker_pid,
             transport=TransportKind(context.transport),
             runtime_arch=identity.runtime_arch,
@@ -369,8 +369,8 @@ def web_launch_handlers(
     ) -> WireModel:
         if not isinstance(raw, WebLaunchParams):
             raise TypeError("web/launch params were not validated")
-        if context.transport != "windows-named-pipe":
-            raise PermissionError("web/launch is available only to the authenticated plugin Pipe")
+        if context.transport != "stdio":
+            raise PermissionError("web/launch is available only to the direct plugin stdio connection")
         cancellation.checkpoint()
         gateway = gateway_provider()
         if gateway is None:

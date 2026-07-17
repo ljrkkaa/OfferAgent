@@ -28,7 +28,6 @@ class RuntimeCapability(str, Enum):
     HOOKS = "hooks"
     LOOPBACK_WEB = "loopback.web"
     TELEMETRY = "telemetry"
-    UPDATE = "update"
 
 
 class CapabilityDisabledReason(str, Enum):
@@ -224,8 +223,6 @@ def _configured_capabilities(snapshot: RunConfigSnapshot) -> frozenset[RuntimeCa
         enabled.add(RuntimeCapability.LOOPBACK_WEB)
     if config.telemetry.enabled:
         enabled.add(RuntimeCapability.TELEMETRY)
-    if config.update.automatic_check and config.network.update_network_enabled:
-        enabled.add(RuntimeCapability.UPDATE)
     return frozenset(enabled)
 
 

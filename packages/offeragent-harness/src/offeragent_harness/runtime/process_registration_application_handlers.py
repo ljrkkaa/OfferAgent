@@ -1,4 +1,4 @@
-"""Named-Pipe-only application boundary for Workspace Process registrations."""
+"""Direct-stdio application boundary for Workspace Process registrations."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def process_registration_command_handlers(
     """Expose the complete registration surface without ever serving Loopback."""
 
     def require_service(context: ApplicationCommandContext) -> WorkspaceProcessRegistrationService:
-        _require_pipe(context)
+        _require_direct_stdio(context)
         if service is None:
             raise RuntimeError("Workspace Process registration service is unavailable")
         return service
@@ -129,9 +129,9 @@ def process_registration_command_handlers(
     }
 
 
-def _require_pipe(context: ApplicationCommandContext) -> None:
-    if context.transport != "windows-named-pipe":
-        raise PermissionError("Process registration is available only to the authenticated plugin Pipe")
+def _require_direct_stdio(context: ApplicationCommandContext) -> None:
+    if context.transport != "stdio":
+        raise PermissionError("Process registration is available only to the direct plugin stdio connection")
 
 
 def _filesystem(value: ProcessFilesystemRegistrationInput) -> ProcessFilesystemRegistration:
@@ -194,7 +194,7 @@ def _list_result(
                 content_hash=item.content_hash,
                 canonical_path=item.canonical_path,
                 fixed_root=item.fixed_root,
-                trust=cast(Literal["fixed_hash", "os_authenticode"], item.trust.value),
+                trust=item.trust.value,
                 authenticode_verified=item.authenticode_verified,
                 file_sha256=item.file_sha256,
                 file_device=str(item.file_device),
@@ -259,7 +259,7 @@ def _probe_result(value: ProcessRegistrationProbe) -> ProcessRegistrationsProbeR
                 executable_id=executable.executable_id,
                 canonical_path=executable.canonical_path,
                 fixed_root=executable.fixed_root,
-                trust=cast(Literal["fixed_hash", "os_authenticode"], executable.trust.value),
+                trust=executable.trust.value,
                 authenticode_verified=executable.authenticode_verified,
                 file_sha256=executable.file_sha256,
                 file_device=str(executable.file_device),

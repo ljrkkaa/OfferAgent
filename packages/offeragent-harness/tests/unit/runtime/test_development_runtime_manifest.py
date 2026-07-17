@@ -16,7 +16,7 @@ from offeragent_harness.runtime.development_runtime_manifest import (
     development_runtime_content_digest,
     parse_development_manifest,
 )
-from offeragent_harness.runtime.release_manifest import ProtocolCompatibility, RuntimeFileRecord
+from offeragent_harness.runtime.runtime_manifest import ProtocolCompatibility, RuntimeFileRecord
 
 
 def _digest(payload: bytes) -> str:
@@ -25,12 +25,11 @@ def _digest(payload: bytes) -> str:
 
 def _tree(tmp_path: Path) -> tuple[Path, DevelopmentRuntimeManifest]:
     payloads = {
-        "offeragent-host.exe": b"host",
         "offeragent-process-host.exe": b"process",
-        "offeragent-self-test.exe": b"self-test",
         "offeragent-worker.exe": b"worker",
         "process-catalog.v1.json": b"{}\n",
         "skills/local/SKILL.md": b"# Local\n",
+        "tools/rg.exe": b"ripgrep",
         "web/index.html": b"<!doctype html>\n",
     }
     records: list[RuntimeFileRecord] = []
@@ -86,8 +85,8 @@ def test_installed_development_trust_requires_exact_hash_pinned_tree(
 
     trust = InstalledDevelopmentRuntimeTrust(root)
     assert trust.manifest == manifest
-    assert trust.authorizes(trust.worker_executable())
-    assert trust.verify_file(root / "offeragent-host.exe")
+    assert trust.version_directory == root
+    assert trust.verify_file(root / "offeragent-worker.exe")
 
     (root / "offeragent-worker.exe").write_bytes(b"tampered")
     assert not trust.verify_file(root / "offeragent-worker.exe")
@@ -123,6 +122,24 @@ def test_development_manifest_cannot_drop_development_only_marker(tmp_path: Path
         parse_development_manifest(payload)
 
 
+def test_development_manifest_requires_runtime_ripgrep(tmp_path: Path) -> None:
+    _, manifest = _tree(tmp_path)
+    files = tuple(record for record in manifest.files if record.path != "tools/rg.exe")
+
+    with pytest.raises(DevelopmentRuntimeError, match="ripgrep executables are required"):
+        DevelopmentRuntimeManifest(
+            runtime_version=manifest.runtime_version,
+            core_version=manifest.core_version,
+            plugin_version=manifest.plugin_version,
+            build=manifest.build,
+            protocol=manifest.protocol,
+            state_schema_version=manifest.state_schema_version,
+            tool_abi_version=manifest.tool_abi_version,
+            runtime_content_sha256=development_runtime_content_digest(files),
+            files=files,
+        )
+
+
 def test_established_development_trust_rejects_manifest_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -146,6 +163,4 @@ def test_established_development_trust_rejects_manifest_replacement(
     )
     (root / DEVELOPMENT_MANIFEST_NAME).write_bytes(canonical_development_manifest_bytes(replacement))
 
-    assert not trust.verify_file(root / "offeragent-host.exe")
-    with pytest.raises(DevelopmentRuntimeError, match="manifest changed"):
-        trust.worker_executable()
+    assert not trust.verify_file(root / "offeragent-worker.exe")

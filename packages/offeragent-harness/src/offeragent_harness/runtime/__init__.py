@@ -1,4 +1,4 @@
-"""Application runtime primitives shared by Host/Worker adapters."""
+"""Application primitives used by the local Worker Runtime."""
 
 from .approval_manager import ApprovalManager
 from .backpressure import BufferedEventSink
@@ -14,14 +14,11 @@ from .hook_service import (
     HookServiceError,
     StaticHookLayerSource,
 )
-from .lifecycle import HostLifecycle, LifecycleMachine, LifecycleSnapshot, LifecycleWaitTimeout, WorkerLifecycle
 from .process_lock import (
     MutexWaitResult,
     ProcessAlreadyRunning,
     ProcessLock,
     ProcessLockError,
-    host_mutex_name,
-    worker_mutex_name,
 )
 from .process_supervisor import (
     ActiveProcessSnapshot,
@@ -107,7 +104,7 @@ from .subagent_runtime import (
     ProtocolSubagentEventFactory,
 )
 from .turn_manager import ActiveRun, SessionRunConflict, TurnManager
-from .windows_appcontainer import WindowsAppContainerRuntimePurge, cleanup_workspace_appcontainer
+from .windows_appcontainer import cleanup_workspace_appcontainer
 from .windows_process_supervisor import PinnedProcessExecutableVerifier, WindowsSupervisedProcessBackend
 from .windows_security import CurrentWindowsIdentity, WindowsSecurityError, current_windows_identity
 
@@ -131,11 +128,7 @@ __all__ = [
     "HookInvocationConflict",
     "HookService",
     "HookServiceError",
-    "HostLifecycle",
     "LifecycleHookDenied",
-    "LifecycleMachine",
-    "LifecycleSnapshot",
-    "LifecycleWaitTimeout",
     "MutexWaitResult",
     "PinnedProcessExecutableVerifier",
     "PreparedHookBundle",
@@ -213,13 +206,9 @@ __all__ = [
     "StartupFailurePhase",
     "StaticHookLayerSource",
     "TurnManager",
-    "WindowsAppContainerRuntimePurge",
     "WindowsSecurityError",
     "WindowsSupervisedProcessBackend",
-    "WorkerLifecycle",
     "WorkerLifecycleHooks",
     "cleanup_workspace_appcontainer",
     "current_windows_identity",
-    "host_mutex_name",
-    "worker_mutex_name",
 ]

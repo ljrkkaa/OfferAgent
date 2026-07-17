@@ -1,10 +1,4 @@
-"""Worker-only composition boundary.
-
-The Windows Host supervises a process.  It must never import the concrete
-``HarnessApplication`` (or any of the stores, tools, models, or Vault ports
-behind it).  The Worker executable crosses this small port exactly once to
-obtain the one application composition root used by every local transport.
-"""
+"""Worker-only composition boundary for the direct stdio process."""
 
 from __future__ import annotations
 
@@ -15,7 +9,7 @@ from typing import Protocol, runtime_checkable
 
 @dataclass(frozen=True, slots=True)
 class WorkerBootstrap:
-    """Worker-local bootstrap material that is never retained by the Host."""
+    """Worker-local bootstrap material derived from the selected Vault."""
 
     workspace_instance_id: str
     canonical_root: Path

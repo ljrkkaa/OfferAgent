@@ -56,7 +56,7 @@ class WorkerLifecycleHooks:
         cancellation: CancellationToken,
     ) -> HookOutcome:
         # Shutdown cannot be vetoed indefinitely. deny/ask are audited while
-        # the Host retains ownership of process termination.
+        # the direct Worker entry point retains termination ownership.
         return await self._invoke(
             HookEvent.RUNTIME_SHUTDOWN,
             f"runtime-shutdown:{shutdown_id}",

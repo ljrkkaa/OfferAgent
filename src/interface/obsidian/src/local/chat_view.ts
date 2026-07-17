@@ -540,10 +540,8 @@ function runtimeTitle(state: BootstrapSnapshot["state"]): string {
     const labels: Record<BootstrapSnapshot["state"], string> = {
         uninitialized: "正在准备本地 Runtime",
         runtime_missing: "正在定位离线 Runtime",
-        verifying: "正在验证 Runtime 签名",
-        installing: "正在安装本地 Runtime",
-        starting_host: "正在启动 Host",
-        attaching_worker: "正在连接 Vault Worker",
+        verifying: "正在验证 Runtime 完整性",
+        starting_worker: "正在启动 Vault Worker",
         handshaking: "正在验证本地连接",
         ready: "Runtime 已就绪",
         degraded: "Runtime 连接不稳定",
@@ -556,7 +554,6 @@ function runtimeTitle(state: BootstrapSnapshot["state"]): string {
 
 function runtimeDescription(snapshot: BootstrapSnapshot): string {
     if (snapshot.error) return snapshot.error.message;
-    if (snapshot.state === "installing") return "首次启用会从插件内置发行包安装，过程不访问网络。";
     if (snapshot.state === "ready") return `Worker PID ${snapshot.workerPid ?? "-"}`;
     return "Agent Core、Session、工具与知识库均由当前 Windows 用户下的本地 Worker 承载。";
 }

@@ -82,6 +82,15 @@ test("Run config has no per-Skill selection state", () => {
     assert.equal("enabledSkills" in snapshot, false);
 });
 
+test("removed background Worker setting is discarded from persisted snapshots", () => {
+    const { parseLocalSettings, snapshotLocalSettings } = loadModule();
+    const parsed = parseLocalSettings({ schemaVersion: 2, keepWorkerInBackground: true });
+    const snapshot = snapshotLocalSettings(parsed);
+
+    assert.equal("keepWorkerInBackground" in parsed, false);
+    assert.equal("keepWorkerInBackground" in snapshot, false);
+});
+
 test("non-canonical local enum spellings fail closed", () => {
     const { parseLocalSettings } = loadModule();
     const settings = parseLocalSettings({ schemaVersion: 2, reasoningEffort: "none", permissionMode: "auto_edit" });

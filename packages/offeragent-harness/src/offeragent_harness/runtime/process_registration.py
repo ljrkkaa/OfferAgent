@@ -161,8 +161,6 @@ class ProcessExecutableRegistration:
             raise ValueError("executable registration digest is invalid")
         if self.file_device < 0 or self.file_index <= 0 or not 0 < self.file_size <= _MAX_EXECUTABLE_BYTES:
             raise ValueError("executable registration file identity is invalid")
-        if self.trust is ExecutableTrust.SIGNED_RELEASE:
-            raise ValueError("user executable cannot claim signed release trust")
         if self.authenticode_verified != (self.trust is ExecutableTrust.OS_AUTHENTICODE):
             raise ValueError("executable registration Authenticode status and trust differ")
         if self.content_hash != canonical_json_sha256(_executable_content_value(self)):
@@ -307,7 +305,7 @@ class _PendingProbe:
 
 
 class WorkspaceProcessRegistrationService:
-    """Own the durable next-start catalog and current-Pipe confirmation challenges."""
+    """Own the durable next-start catalog and connection-bound confirmation challenges."""
 
     def __init__(
         self,
@@ -497,7 +495,7 @@ class WorkspaceProcessRegistrationService:
             if pending is None or pending.client_id != client_id:
                 raise ProcessRegistrationError(
                     "process_registration_probe_unavailable",
-                    "Process registration probe expired, was consumed, or belongs to another Pipe connection",
+                    "Process registration probe expired, was consumed, or belongs to another stdio connection",
                 )
             self._challenges.pop(challenge_id, None)
             if (
@@ -506,7 +504,7 @@ class WorkspaceProcessRegistrationService:
             ):
                 raise ProcessRegistrationError(
                     "process_registration_probe_unavailable",
-                    "Process registration probe expired, was consumed, or belongs to another Pipe connection",
+                    "Process registration probe expired, was consumed, or belongs to another stdio connection",
                 )
             if pending.executable_proposal is not None:
                 refreshed = await asyncio.to_thread(self._probe_executable_sync, pending.executable_proposal)
@@ -899,7 +897,7 @@ class WorkspaceProcessRegistrationService:
     @staticmethod
     def _validate_client(client_id: str) -> None:
         if not client_id or len(client_id) > 256 or "\x00" in client_id:
-            raise ValueError("Process registration Pipe connection identity is invalid")
+            raise ValueError("Process registration stdio connection identity is invalid")
 
 
 def merge_process_registration_snapshot(

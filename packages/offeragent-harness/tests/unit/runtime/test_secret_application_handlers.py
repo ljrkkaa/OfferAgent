@@ -92,7 +92,7 @@ async def test_secret_commands_return_only_opaque_metadata_and_rotate_with_cas()
     store = Store()
     identity = DomainCommandIdentity("ws_1", "profile_1", "managed", "actor_1")
     handlers = secret_command_handlers(identity=identity, secrets=store)
-    context = ApplicationCommandContext(transport="windows-named-pipe", client_id="plugin_1")
+    context = ApplicationCommandContext(transport="stdio", client_id="plugin_1")
     cancellation = ManualCancellationToken()
 
     created = await handlers["secrets/put"](
@@ -127,7 +127,7 @@ async def test_secret_commands_return_only_opaque_metadata_and_rotate_with_cas()
     assert isinstance(deleted, SecretsDeleteResult)
     assert deleted.deleted and store.value is None
 
-    with pytest.raises(PermissionError, match="plugin Pipe"):
+    with pytest.raises(PermissionError, match="plugin stdio"):
         await handlers["secrets/put"](
             SecretsPutParams(provider_id="openai", kind="model-provider", secret=SecretStr("blocked")),
             cancellation,

@@ -376,7 +376,7 @@ class DurableVaultManifestStore:
         _validate_directory(info, "durable manifest directory")
 
     def _verify_directory_chain(self) -> None:
-        # Host bootstrap owns and ACL-hardens ``trusted_state_root``.  The
+        # The local runtime owns and ACL-hardens ``trusted_state_root``.  The
         # store pins that root plus its one manifest child by identity on every
         # operation; it never follows a tree-internal reparse point.  Recovery
         # paths inside the Vault have an additional WorkspacePathPolicy and

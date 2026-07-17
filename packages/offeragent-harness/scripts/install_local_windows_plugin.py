@@ -163,6 +163,7 @@ def _verify_artifact(root: Path, *, allow_data_json: bool = False) -> None:
     manifest = _strict_canonical_json(root / "manifest.json", allow_pretty=True)
     if manifest.get("isDesktopOnly") is not True or manifest.get("version") != receipt.get("pluginVersion"):
         raise LocalPluginInstallError("Obsidian manifest differs from the local build receipt")
+    _verify_exact_runtime_layout(root / "runtime")
     runtime_root = root / "runtime" / "windows-x64" / "local-development"
     trust = InstalledDevelopmentRuntimeTrust(runtime_root)
     if (
@@ -184,6 +185,22 @@ def _verify_artifact(root: Path, *, allow_data_json: bool = False) -> None:
         or "__OFFERAGENT_DEVELOPMENT_MANIFEST_SHA256__" in bundle
     ):
         raise LocalPluginInstallError("plugin bundle does not embed the verified Runtime manifest anchor")
+
+
+def _verify_exact_runtime_layout(runtime: Path) -> None:
+    """Accept only the single personal Windows x64 Runtime nesting contract."""
+
+    expected_children = (
+        (runtime, {"windows-x64"}),
+        (runtime / "windows-x64", {"local-development"}),
+    )
+    for directory, expected in expected_children:
+        try:
+            actual = {entry.name for entry in directory.iterdir()}
+        except OSError as error:
+            raise LocalPluginInstallError("plugin Runtime layout is unavailable") from error
+        if actual != expected or any(not (directory / name).is_dir() for name in expected):
+            raise LocalPluginInstallError("plugin Runtime layout is not exact")
 
 
 def _strict_canonical_json(path: Path, *, allow_pretty: bool = False) -> dict[str, Any]:

@@ -24,7 +24,6 @@ _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _BLOCKING_PROCESS_NAMES = frozenset(
     {
         "obsidian.exe",
-        "offeragent-host.exe",
         "offeragent-process-host.exe",
         "offeragent-worker.exe",
     }

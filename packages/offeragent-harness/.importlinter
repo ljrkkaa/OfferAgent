@@ -64,25 +64,34 @@ forbidden_modules =
     offeragent_harness.tools
     offeragent_harness.runtime
 
-[importlinter:contract:named-pipe-is-only-a-transport]
-name = Named Pipe transport cannot own Agent, tool, Vault, model, or Harness implementations
+[importlinter:contract:direct-stdio-is-only-a-transport]
+name = Direct stdio transport cannot own Agent, tool, Vault, model, persistence, or Harness implementations
 type = forbidden
 source_modules =
-    offeragent_harness.runtime.named_pipe
-    offeragent_harness.runtime.windows_named_pipe
+    offeragent_harness.runtime.duplex_json_rpc
 forbidden_modules =
     offeragent_harness.agent
     offeragent_harness.models
     offeragent_harness.runtime.harness_service
+    offeragent_harness.sessions
+    offeragent_harness.storage
     offeragent_harness.tools
     offeragent_harness.vault
 
-[importlinter:contract:host-is-process-supervision-only]
-name = Host supervision cannot own Harness, Agent, workspace content, or persistence implementations
+[importlinter:contract:local-process-supervision-is-infrastructure-only]
+name = Local process supervision cannot own Harness, Agent, workspace content, or persistence implementations
 type = forbidden
 source_modules =
-    offeragent_harness.runtime.host_supervisor
+    offeragent_harness.runtime.local_process_host
+    offeragent_harness.runtime.process_identity
+    offeragent_harness.runtime.process_supervisor
     offeragent_harness.runtime.windows_process
+    offeragent_harness.runtime.windows_process_supervisor
+# The supervisor imports the public ports facade for process, artifact,
+# cancellation, and clock interfaces. Ignore that facade edge so its unrelated
+# re-exports do not create false implementation dependencies.
+ignore_imports =
+    offeragent_harness.runtime.process_supervisor -> offeragent_harness.ports
 forbidden_modules =
     offeragent_harness.agent
     offeragent_harness.app
@@ -95,11 +104,6 @@ forbidden_modules =
     offeragent_harness.storage
     offeragent_harness.tools
     offeragent_harness.vault
-    offeragent_harness.ports.events
-    offeragent_harness.ports.model
-    offeragent_harness.ports.storage
-    offeragent_harness.ports.tool
-    offeragent_harness.ports.vault
 
 [importlinter:contract:worker-entrypoint-only-consumes-composition-port]
 name = Worker entrypoint cannot construct a second Agent or Harness implementation

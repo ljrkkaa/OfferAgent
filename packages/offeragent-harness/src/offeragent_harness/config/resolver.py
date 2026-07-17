@@ -21,7 +21,6 @@ _SCOPE_ORDER = {
 _MANAGED_FALSE_LOCKS = frozenset(
     {
         "network.model_provider_enabled",
-        "network.update_network_enabled",
         "memory.memory_enabled",
         "execution.shell_enabled",
         "model.allow_remote_https",
@@ -33,8 +32,6 @@ _MANAGED_FALSE_LOCKS = frozenset(
         "ui.persistent_web_lease",
         "telemetry.enabled",
         "telemetry.include_content",
-        "update.automatic_check",
-        "update.automatic_install",
     }
 )
 _MANAGED_TRUE_LOCKS = frozenset(

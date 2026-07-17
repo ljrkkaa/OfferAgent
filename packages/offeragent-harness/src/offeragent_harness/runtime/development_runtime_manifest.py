@@ -1,8 +1,7 @@
 """Hash-pinned manifest for one explicitly local development Runtime.
 
-This is deliberately not a release-signature fallback.  The format carries a
-mandatory ``developmentOnly`` marker, is rejected by the release verifier, and
-is consumed only by development-specific frozen entry points.  Every consumer
+The format carries a mandatory ``developmentOnly`` marker and is consumed only
+by the personal frozen entry points.  Every consumer
 revalidates the exact tree before it uses an executable or a built-in asset.
 """
 
@@ -21,20 +20,19 @@ from typing import Any, NoReturn
 
 from offeragent_harness.protocol.schemas import PROTOCOL_VERSION, schema_hash
 
-from .host_supervisor import VerifiedWorkerExecutable
-from .release_manifest import (
+from .runtime_manifest import (
     ProtocolCompatibility,
-    ReleaseVerificationError,
     RuntimeFileRecord,
+    RuntimeManifestError,
     native_windows_architecture,
 )
 
 DEVELOPMENT_MANIFEST_NAME = "development-runtime-manifest.json"
-DEVELOPMENT_SIGNING_KEY_ID = "local-development-hash-pin"
 REQUIRED_DEVELOPMENT_EXECUTABLES = frozenset(
     {
         "offeragent-process-host.exe",
         "offeragent-worker.exe",
+        "tools/rg.exe",
     }
 )
 
@@ -114,7 +112,7 @@ class DevelopmentRuntimeManifest:
         if not REQUIRED_DEVELOPMENT_EXECUTABLES <= by_path.keys():
             raise DevelopmentRuntimeError(
                 "development_executable_missing",
-                "Host, Worker, self-test and process-host executables are required",
+                "Worker, process-host, and ripgrep executables are required",
             )
         if any(
             by_path[path].kind != "executable" or by_path[path].authenticode
@@ -122,7 +120,7 @@ class DevelopmentRuntimeManifest:
         ):
             raise DevelopmentRuntimeError(
                 "development_executable_record_invalid",
-                "development executables must be explicit unsigned hash-pinned records",
+                "local executables must be explicit hash-pinned records",
             )
         required_assets = {"process-catalog.v1.json", "web/index.html"}
         if not required_assets <= by_path.keys() or not any(
@@ -144,29 +142,12 @@ class DevelopmentRuntimeManifest:
             )
 
     @property
-    def signing_key_id(self) -> str:
-        """Compatibility view used by the existing built-in Skill verifier."""
-
-        return DEVELOPMENT_SIGNING_KEY_ID
-
-    @property
     def build_commit(self) -> str:
         return self.build.commit
 
     @property
-    def platform(self) -> object:
-        return _DevelopmentPlatform(self.architecture, self.minimum_windows_build)
-
-    @property
     def by_path(self) -> Mapping[str, RuntimeFileRecord]:
         return MappingProxyType({record.path: record for record in self.files})
-
-
-@dataclass(frozen=True, slots=True)
-class _DevelopmentPlatform:
-    architecture: str
-    minimum_windows_build: int
-    os_name: str = "windows"
 
 
 class InstalledDevelopmentRuntimeTrust:
@@ -190,31 +171,6 @@ class InstalledDevelopmentRuntimeTrust:
         self.version_directory = root
         self._verify_platform_and_protocol()
         self._verify_exact_tree()
-
-    def worker_executable(self) -> VerifiedWorkerExecutable:
-        self._verify_manifest()
-        record = self.manifest.by_path["offeragent-worker.exe"]
-        executable = _verify_record(self.version_directory, record)
-        self._verify_manifest()
-        return VerifiedWorkerExecutable(
-            executable=executable,
-            version_directory=self.version_directory,
-            runtime_version=self.manifest.runtime_version,
-            file_sha256=record.sha256,
-        )
-
-    def authorizes(self, expected: VerifiedWorkerExecutable) -> bool:
-        try:
-            authorized = self.worker_executable()
-            return (
-                expected.runtime_version == authorized.runtime_version
-                and expected.file_sha256 == authorized.file_sha256
-                and expected.version_directory.resolve(strict=True) == self.version_directory
-                and expected.executable.resolve(strict=True) == authorized.executable.resolve(strict=True)
-                and self.verify_file(expected.executable)
-            )
-        except (DevelopmentRuntimeError, OSError, ValueError):
-            return False
 
     def verify_file(self, path: Path) -> bool:
         """Re-hash one manifest member through an opened regular-file handle."""
@@ -273,16 +229,6 @@ class InstalledDevelopmentRuntimeTrust:
                 "development_manifest_changed",
                 "development manifest changed after trust establishment",
             )
-
-
-class DevelopmentManifestHashVerifier:
-    """Opened-image verifier injected only by the development Host composition."""
-
-    def __init__(self, trust: InstalledDevelopmentRuntimeTrust) -> None:
-        self._trust = trust
-
-    def verify(self, executable: Path) -> bool:
-        return self._trust.verify_file(executable)
 
 
 def development_runtime_content_digest(files: Sequence[RuntimeFileRecord]) -> str:
@@ -370,7 +316,7 @@ def parse_development_manifest(payload: bytes) -> DevelopmentRuntimeManifest:
                     authenticode=False,
                 )
             )
-        except ReleaseVerificationError as error:
+        except RuntimeManifestError as error:
             raise DevelopmentRuntimeError("development_file_invalid", "development file record is invalid") from error
     if platform["os"] != "windows":
         raise DevelopmentRuntimeError("development_platform_invalid", "development Runtime OS is invalid")
@@ -398,7 +344,7 @@ def parse_development_manifest(payload: bytes) -> DevelopmentRuntimeManifest:
             development_only=value["developmentOnly"] is True,
             schema_version=_integer(value["schemaVersion"], "schemaVersion"),
         )
-    except (ReleaseVerificationError, TypeError, ValueError) as error:
+    except (RuntimeManifestError, TypeError, ValueError) as error:
         raise DevelopmentRuntimeError("development_manifest_invalid", "development manifest is invalid") from error
     if canonical_development_manifest_bytes(manifest) != payload:
         raise DevelopmentRuntimeError(
@@ -582,7 +528,6 @@ def _integer(value: object, label: str) -> int:
 __all__ = [
     "DEVELOPMENT_MANIFEST_NAME",
     "DevelopmentBuildIdentity",
-    "DevelopmentManifestHashVerifier",
     "DevelopmentRuntimeError",
     "DevelopmentRuntimeManifest",
     "InstalledDevelopmentRuntimeTrust",

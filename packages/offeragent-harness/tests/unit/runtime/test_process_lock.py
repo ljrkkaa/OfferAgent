@@ -4,7 +4,9 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 
@@ -14,8 +16,6 @@ from offeragent_harness.runtime.process_lock import (
     ProcessLock,
     ProcessLockError,
     WindowsMutexBackend,
-    host_mutex_name,
-    installation_ledger_mutex_name,
     worker_mutex_name,
 )
 from offeragent_harness.runtime.windows_security import (
@@ -24,6 +24,11 @@ from offeragent_harness.runtime.windows_security import (
     kernel_handle_is_inheritable,
     kernel_object_security_sddl,
 )
+
+_NAME = "Local\\OfferAgent.SecretStore.test"
+_ROOT_IDENTITY_A = "sha256:" + "a" * 64
+_ROOT_IDENTITY_B = "sha256:" + "b" * 64
+_TEST_SID = "S-1-5-21-100-200-300-1001"
 
 
 @dataclass
@@ -52,7 +57,7 @@ class FakeMutexBackend:
 
 def test_process_lock_releases_and_closes_owned_handle() -> None:
     backend = FakeMutexBackend()
-    lock = ProcessLock(host_mutex_name(sid="S-1-5-21-100-200-300-1001"), backend=backend)
+    lock = ProcessLock(_NAME, backend=backend)
 
     with lock:
         assert lock.acquired
@@ -64,7 +69,7 @@ def test_process_lock_releases_and_closes_owned_handle() -> None:
 
 def test_timeout_reports_existing_owner_and_only_closes_handle() -> None:
     backend = FakeMutexBackend(wait_result=MutexWaitResult.TIMEOUT)
-    lock = ProcessLock(host_mutex_name(sid="S-1-5-21-100-200-300-1001"), backend=backend)
+    lock = ProcessLock(_NAME, backend=backend)
 
     with pytest.raises(ProcessAlreadyRunning):
         lock.acquire()
@@ -75,7 +80,7 @@ def test_timeout_reports_existing_owner_and_only_closes_handle() -> None:
 
 def test_abandoned_mutex_is_acquired_for_crash_recovery() -> None:
     backend = FakeMutexBackend(wait_result=MutexWaitResult.ABANDONED)
-    lock = ProcessLock(host_mutex_name(sid="S-1-5-21-100-200-300-1001"), backend=backend)
+    lock = ProcessLock(worker_mutex_name(_ROOT_IDENTITY_A, sid=_TEST_SID), backend=backend)
 
     assert lock.acquire() is MutexWaitResult.ABANDONED
     lock.release()
@@ -84,7 +89,7 @@ def test_abandoned_mutex_is_acquired_for_crash_recovery() -> None:
 
 def test_lock_instance_cannot_be_acquired_twice() -> None:
     backend = FakeMutexBackend()
-    lock = ProcessLock(host_mutex_name(sid="S-1-5-21-100-200-300-1001"), backend=backend)
+    lock = ProcessLock(_NAME, backend=backend)
     lock.acquire()
     try:
         with pytest.raises(ProcessLockError):
@@ -93,17 +98,22 @@ def test_lock_instance_cannot_be_acquired_twice() -> None:
         lock.release()
 
 
-def test_mutex_names_are_current_user_and_workspace_scoped() -> None:
-    sid = "S-1-5-21-100-200-300-1001"
-    first = worker_mutex_name("sha256:" + "a" * 64, sid=sid)
-    second = worker_mutex_name("sha256:" + "b" * 64, sid=sid)
+def test_worker_mutex_names_are_current_user_and_vault_scoped() -> None:
+    first = worker_mutex_name(_ROOT_IDENTITY_A, sid=_TEST_SID)
 
+    assert first == worker_mutex_name(_ROOT_IDENTITY_A, sid=_TEST_SID)
+    assert first != worker_mutex_name(_ROOT_IDENTITY_B, sid=_TEST_SID)
     assert first.startswith("Local\\OfferAgent.Worker.")
-    assert first != second
-    assert sid not in first
-    assert host_mutex_name(sid=sid) == host_mutex_name(sid=sid)
-    assert installation_ledger_mutex_name(sid=sid).startswith("Local\\OfferAgent.InstallationLedger.")
-    assert installation_ledger_mutex_name(sid=sid) != host_mutex_name(sid=sid)
+    assert _TEST_SID not in first
+
+
+@pytest.mark.parametrize(
+    "identity",
+    ("", "a" * 64, "sha256:" + "A" * 64, "sha256:" + "a" * 63),
+)
+def test_worker_mutex_name_rejects_noncanonical_root_identity(identity: str) -> None:
+    with pytest.raises(ValueError, match="canonical root identity"):
+        worker_mutex_name(identity, sid=_TEST_SID)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows token APIs")
@@ -118,7 +128,7 @@ def test_current_identity_and_security_descriptor_are_available() -> None:
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows named mutexes")
 def test_named_mutex_excludes_a_second_process() -> None:
-    name = host_mutex_name()
+    name = worker_mutex_name(_ROOT_IDENTITY_A)
     script = """
 import sys
 from offeragent_harness.runtime.process_lock import ProcessAlreadyRunning, ProcessLock
@@ -143,10 +153,80 @@ else:
     assert completed.returncode == 17, completed.stderr
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows named mutexes")
+def test_distinct_vault_mutexes_can_be_held_concurrently() -> None:
+    first = worker_mutex_name(_ROOT_IDENTITY_A)
+    second = worker_mutex_name(_ROOT_IDENTITY_B)
+    script = """
+import sys
+from offeragent_harness.runtime.process_lock import ProcessLock
+with ProcessLock(sys.argv[1]):
+    pass
+"""
+    with ProcessLock(first):
+        completed = subprocess.run(
+            [sys.executable, "-c", script, second],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows named mutexes")
+def test_worker_mutex_is_abandoned_and_recoverable_after_process_crash(tmp_path: Path) -> None:
+    name = worker_mutex_name(_ROOT_IDENTITY_A)
+    ready = tmp_path / "ready"
+    crash = tmp_path / "crash"
+    script = """
+import os
+import sys
+import time
+from pathlib import Path
+from offeragent_harness.runtime.process_lock import ProcessLock
+lock = ProcessLock(sys.argv[1])
+lock.acquire()
+Path(sys.argv[2]).write_text("ready", encoding="ascii")
+while not Path(sys.argv[3]).exists():
+    time.sleep(0.01)
+os._exit(23)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, name, str(ready), str(crash)],
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    backend = WindowsMutexBackend()
+    handle: int | None = None
+    acquired = False
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not ready.exists():
+            stderr = process.communicate(timeout=1)[1]
+            pytest.fail(f"crash worker did not acquire the mutex: {stderr}")
+        handle = backend.create(name)
+        crash.write_text("crash", encoding="ascii")
+        assert process.wait(timeout=10) == 23
+        assert backend.wait(handle, 10_000) is MutexWaitResult.ABANDONED
+        acquired = True
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+        if handle is not None:
+            if acquired:
+                backend.release(handle)
+            backend.close(handle)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows named mutex security")
 def test_named_mutex_dacl_contains_only_current_sid_and_handle_is_not_inheritable() -> None:
     backend = WindowsMutexBackend()
-    handle = backend.create(host_mutex_name())
+    handle = backend.create(_NAME)
     acquired = False
     try:
         assert backend.wait(handle, 0) is MutexWaitResult.ACQUIRED

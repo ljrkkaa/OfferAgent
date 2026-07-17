@@ -621,8 +621,8 @@ async def _require_mutation_authority(
     profile_id: str,
     managed_owner_id: str,
 ) -> None:
-    if context.transport != "windows-named-pipe":
-        raise PermissionError("extension mutations require the authenticated plugin Pipe")
+    if context.transport != "stdio":
+        raise PermissionError("extension mutations require the direct plugin stdio connection")
     effective = await _effective_config(
         config,
         workspace_id=workspace_id,

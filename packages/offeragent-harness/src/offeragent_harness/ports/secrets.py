@@ -18,7 +18,6 @@ T_co = TypeVar("T_co", covariant=True)
 
 class SecretKind(str, Enum):
     MODEL_PROVIDER = "model-provider"
-    UPDATE = "update"
 
 
 @dataclass(frozen=True, slots=True)

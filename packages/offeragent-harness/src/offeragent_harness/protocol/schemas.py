@@ -140,7 +140,7 @@ def build_schema_bundle() -> dict[str, object]:
         "$id": "urn:offeragent:protocol:1.0",
         "title": "OfferAgent Local Harness Protocol v1",
         "description": (
-            "Canonical DTO schema shared by the Windows Named Pipe and loopback adapters. "
+            "Canonical DTO schema shared by direct stdio and loopback adapters. "
             "All object schemas are closed and wire fields use camelCase."
         ),
         "protocolVersion": PROTOCOL_VERSION,
@@ -199,9 +199,9 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
                 "schemaHash": digest,
                 "workspaceId": "ws_xxx",
                 "workspaceInstanceId": "wsi_xxx",
-                "hostPid": 12000,
+                "parentPid": 12000,
                 "workerPid": 12042,
-                "transport": "windows-named-pipe",
+                "transport": "stdio",
                 "runtimeArch": "win-x64",
                 "buildCommit": "0123456789abcdef0123456789abcdef01234567",
                 "capabilities": {

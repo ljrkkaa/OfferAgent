@@ -2,7 +2,10 @@
 
 ## 权威入口
 
-每个 Vault 只有一个 Worker；Worker 内只有一个带 `@agent_loop_entrypoint` 标记的 Agent Loop 实现。`HarnessService` 是所有 UI Command 的应用入口。Named Pipe、Loopback Web、测试 Direct Adapter 都必须调用这一个服务。
+每个 Obsidian 插件实例直接创建一个 Worker；Worker 内只有一个带 `@agent_loop_entrypoint` 标记的 Agent Loop 实现。
+`HarnessService` 是所有 UI Command 的应用入口。当前插件 direct stdio、Loopback Web、测试 Direct
+Adapter 都只能调用这一个服务。插件 IPC 只有继承 stdin/stdout 上的 framed JSON-RPC；不存在第二个
+transport composition root。
 
 ## 依赖方向
 
@@ -23,6 +26,10 @@ app / cli composition root
 - 插件和本地 Web UI 不得 import 模型 SDK、工具执行器或实现 Planner/Tool Loop。
 - 生产模块不得 import `offeragent_harness.testing`。
 - Core 不读取全局 Vault/Model 环境变量；Workspace 与 RunConfig 通过不可变快照注入。
+- `runtime.duplex_json_rpc` 只负责 direct stdio framing、取消、背压和应用命令分发，不得拥有 Agent、
+  Tool、Vault、Storage 或 `HarnessService` 实现。
+- `local_process_host`、process supervisor 和 Windows process backend 只负责短生命周期进程基础设施，
+  不得拥有 Agent、Session、Vault 或持久化实现。上层 Worker composition 负责把它们接入 Tool Kernel。
 
 ## 主分支闭包
 

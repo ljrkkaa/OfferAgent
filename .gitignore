@@ -26,10 +26,6 @@ node_modules/
 src/interface/obsidian/main.js
 *.map
 
-# Local release outputs are generated from signed inputs and are not source.
-packages/offeragent-harness/release/
-packages/offeragent-harness/release-out/
-
 # Only reviewed architecture/baseline documents from the imported repository
 # are tracked here; the outer workspace owns the authoritative project docs.
 docs/

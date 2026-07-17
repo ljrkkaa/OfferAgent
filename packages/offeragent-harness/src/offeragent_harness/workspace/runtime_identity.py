@@ -1,4 +1,4 @@
-"""Opaque local Runtime identities shared by Host and Worker composition."""
+"""Opaque local Runtime identities used by isolated Worker composition."""
 
 from __future__ import annotations
 

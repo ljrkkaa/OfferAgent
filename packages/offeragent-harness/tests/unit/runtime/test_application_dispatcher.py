@@ -54,7 +54,7 @@ def _identity() -> ApplicationRuntimeIdentity:
         schema_hash="sha256:" + "a" * 64,
         workspace_id="ws_test",
         workspace_instance_id="wsi_test",
-        host_pid=100,
+        parent_pid=100,
         worker_pid=101,
         runtime_arch=RuntimeArch.WIN_X64,
         capabilities=capabilities,
@@ -92,11 +92,11 @@ async def test_initialize_negotiates_identity_and_transport_on_same_dispatcher()
         "requiredCapabilities": ["eventReplay"],
         "schemaHash": identity.schema_hash,
     }
-    pipe = await dispatcher.dispatch(
+    direct = await dispatcher.dispatch(
         "initialize",
         params,
         ManualCancellationToken(),
-        context=ApplicationCommandContext(transport="windows-named-pipe"),
+        context=ApplicationCommandContext(transport="stdio"),
     )
     web = await dispatcher.dispatch(
         "initialize",
@@ -104,10 +104,10 @@ async def test_initialize_negotiates_identity_and_transport_on_same_dispatcher()
         ManualCancellationToken(),
         context=ApplicationCommandContext(transport="loopback-http"),
     )
-    assert pipe["transport"] == "windows-named-pipe"  # type: ignore[index]
+    assert direct["transport"] == "stdio"  # type: ignore[index]
     assert web["transport"] == "loopback-http"  # type: ignore[index]
     for key in ("workerPid", "coreVersion", "schemaHash", "workspaceInstanceId"):
-        assert pipe[key] == web[key]  # type: ignore[index]
+        assert direct[key] == web[key]  # type: ignore[index]
     assert dispatcher.methods == frozenset(COMMAND_REGISTRY)
 
 

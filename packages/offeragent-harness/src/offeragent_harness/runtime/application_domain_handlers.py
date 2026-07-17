@@ -692,16 +692,16 @@ def secret_command_handlers(
     identity: DomainCommandIdentity,
     secrets: SecretStore,
 ) -> Mapping[str, ApplicationCommandHandler]:
-    def require_pipe(context: ApplicationCommandContext) -> None:
-        if context.transport != "windows-named-pipe":
-            raise PermissionError("Secret input is accepted only over the authenticated plugin Pipe")
+    def require_direct_stdio(context: ApplicationCommandContext) -> None:
+        if context.transport != "stdio":
+            raise PermissionError("Secret input is accepted only over the direct plugin stdio connection")
 
     async def list_secrets(
         raw: WireModel,
         cancellation: CancellationToken,
         context: ApplicationCommandContext,
     ) -> WireModel:
-        require_pipe(context)
+        require_direct_stdio(context)
         cancellation.checkpoint()
         params = cast(SecretsListParams, raw)
         values = await asyncio.to_thread(secrets.list_metadata, scope_id=identity.workspace_id)
@@ -718,7 +718,7 @@ def secret_command_handlers(
         cancellation: CancellationToken,
         context: ApplicationCommandContext,
     ) -> WireModel:
-        require_pipe(context)
+        require_direct_stdio(context)
         cancellation.checkpoint()
         params = cast(SecretsPutParams, raw)
         plaintext = bytearray(params.secret.get_secret_value().encode("utf-8"))
@@ -762,7 +762,7 @@ def secret_command_handlers(
         cancellation: CancellationToken,
         context: ApplicationCommandContext,
     ) -> WireModel:
-        require_pipe(context)
+        require_direct_stdio(context)
         cancellation.checkpoint()
         params = cast(SecretsDeleteParams, raw)
         await asyncio.to_thread(

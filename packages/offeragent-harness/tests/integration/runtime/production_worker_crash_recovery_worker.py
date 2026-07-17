@@ -168,7 +168,6 @@ def _composition(root: Path, barrier: _CrashAndRecoveryBarrier, model: _CrashRec
         build_commit="abcdef0",
         overrides=ProductionWorkerOverrides(
             model_gateway_factory=lambda _settings: model,
-            start_native_transports=False,
             runtime_config=runtime_config,
             vault_cas_barrier=cast(VaultCasBarrier, barrier),
             ripgrep_path=_ripgrep_executable(),

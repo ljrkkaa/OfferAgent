@@ -15,7 +15,7 @@ def test_blocking_process_names_uses_exact_case_insensitive_image_names() -> Non
     assert updater._blocking_process_names(
         (
             "Obsidian.EXE",
-            "OfferAgent-Host.exe",
+            "OfferAgent-Helper.exe",
             "OFFERAGENT-PROCESS-HOST.EXE",
             "offeragent-worker.exe",
             "prefix-offeragent-process-host.exe",
@@ -24,7 +24,6 @@ def test_blocking_process_names_uses_exact_case_insensitive_image_names() -> Non
         )
     ) == {
         "obsidian.exe",
-        "offeragent-host.exe",
         "offeragent-process-host.exe",
         "offeragent-worker.exe",
     }

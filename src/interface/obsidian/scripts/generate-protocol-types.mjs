@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const schemaRoot = join(pluginRoot, "..", "..", "..", "packages", "offeragent-harness", "schema");
+const defaultOutputPath = join(pluginRoot, "src", "runtime", "generated_protocol.ts");
+const { check, outputPath } = parseArguments(defaultOutputPath);
 const manifest = JSON.parse(await readFile(join(schemaRoot, "protocol-manifest.json"), "utf8"));
 if (!manifest || typeof manifest !== "object" || Array.isArray(manifest) ||
     typeof manifest.schemaBundle !== "string" || !/^sha256:[0-9a-f]{64}$/.test(manifest.schemaHash)) {
@@ -50,7 +52,47 @@ lines.push(
     "export type ProtocolEventPayload<Type extends ProtocolEventType> = ProtocolEventMap[Type][\"payload\"];",
     "",
 );
-await writeFile(join(pluginRoot, "src", "runtime", "generated_protocol.ts"), `${lines.join("\n").trimEnd()}\n`, "utf8");
+await writeOrCheck(outputPath, `${lines.join("\n").trimEnd()}\n`, check);
+
+function parseArguments(defaultOutput) {
+    let check = false;
+    let outputPath = defaultOutput;
+    for (let index = 2; index < process.argv.length; index += 1) {
+        const argument = process.argv[index];
+        if (argument === "--check") {
+            check = true;
+            continue;
+        }
+        if (argument === "--output") {
+            const value = process.argv[index + 1];
+            if (!value || value.startsWith("--")) throw new Error("--output requires a file path");
+            outputPath = value;
+            index += 1;
+            continue;
+        }
+        throw new Error(`unsupported argument: ${argument}`);
+    }
+    return { check, outputPath };
+}
+
+async function writeOrCheck(outputPath, source, check) {
+    if (!check) {
+        await writeFile(outputPath, source, "utf8");
+        return;
+    }
+    let actual;
+    try {
+        actual = await readFile(outputPath, "utf8");
+    } catch (error) {
+        if (error?.code === "ENOENT") {
+            throw new Error(`generated protocol types are missing: ${outputPath}; run yarn protocol:generate`);
+        }
+        throw error;
+    }
+    if (actual !== source) {
+        throw new Error(`generated protocol types are stale: ${outputPath}; run yarn protocol:generate`);
+    }
+}
 
 function emitMethodMap(output, name, mapping, requestResponse) {
     if (!mapping || typeof mapping !== "object" || Array.isArray(mapping)) throw new Error(`${name} is invalid`);

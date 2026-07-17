@@ -571,7 +571,7 @@ async def test_session_start_deny_soft_aborts_invisibly_and_replays_after_ack_lo
     handler = _session_create_handler(harness)
     params = SessionCreateParams(title="Denied by Hook", client_request_id="req_session_start_deny")
     first_context = ApplicationCommandContext(
-        transport="windows-named-pipe",
+        transport="stdio",
         client_id="pipe-session-start-original",
         peer="current-windows-sid",
     )
@@ -626,7 +626,7 @@ async def test_session_start_allow_activation_ack_loss_restarts_without_invoking
     handler = _session_create_handler(harness)
     params = SessionCreateParams(title="Allowed by Hook", client_request_id="req_session_start_allow")
     context = ApplicationCommandContext(
-        transport="windows-named-pipe",
+        transport="stdio",
         client_id="pipe-session-start-allow",
         peer="current-windows-sid",
     )

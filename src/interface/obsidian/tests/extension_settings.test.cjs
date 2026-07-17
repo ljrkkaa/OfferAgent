@@ -103,7 +103,7 @@ test("Shell and Hook installs remain structured and never emit raw command or se
     assert.match(calls[1][1].clientRequestId, /^req_extension_[0-9a-f]{32}$/);
 });
 
-test("credential-like structured argv is rejected before Pipe dispatch", async () => {
+test("credential-like structured argv is rejected before stdio dispatch", async () => {
     const { ExtensionRuntimeManager } = loadModule();
     const manager = new ExtensionRuntimeManager({ request: async () => {
         throw new Error("must not dispatch");

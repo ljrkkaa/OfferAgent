@@ -97,18 +97,18 @@ def _proposal(path: Path, **overrides: object) -> ExecutableRegistrationProposal
 
 
 @pytest.mark.asyncio
-async def test_application_boundary_is_pipe_only_and_binds_probe_to_connection(tmp_path: Path) -> None:
+async def test_application_boundary_is_direct_stdio_only_and_binds_probe_to_connection(tmp_path: Path) -> None:
     handlers = process_registration_command_handlers(_service(tmp_path))
     cancellation = ManualCancellationToken()
     list_params = validate_command_params("process/registrations/list", {})
-    with pytest.raises(PermissionError, match="plugin Pipe"):
+    with pytest.raises(PermissionError, match="plugin stdio"):
         await handlers["process/registrations/list"](
             list_params,
             cancellation,
             ApplicationCommandContext("loopback-http", "browser", "127.0.0.1"),
         )
 
-    context = ApplicationCommandContext("windows-named-pipe", "pipe-connection-1", "current-user")
+    context = ApplicationCommandContext("stdio", "stdio-connection-1", "parent-process")
     probe = await handlers["process/registrations/probe"](
         validate_command_params(
             "process/registrations/probe",
@@ -252,14 +252,14 @@ async def test_catalogs_and_idempotency_receipts_are_isolated_per_workspace(tmp_
 
 
 @pytest.mark.asyncio
-async def test_probe_is_short_lived_one_time_and_pipe_connection_bound(tmp_path: Path) -> None:
+async def test_probe_is_short_lived_one_time_and_stdio_connection_bound(tmp_path: Path) -> None:
     clock = ManualClock()
     service = _service(tmp_path, clock=clock)
     probe = await service.probe_environment(
         client_id="pipe-owner",
         proposal=EnvironmentRegistrationProposal("user-env", frozenset(), frozenset()),
     )
-    with pytest.raises(ProcessRegistrationError, match="another Pipe"):
+    with pytest.raises(ProcessRegistrationError, match="another stdio"):
         await service.confirm(
             client_id="pipe-other",
             challenge_id=probe.challenge_id,

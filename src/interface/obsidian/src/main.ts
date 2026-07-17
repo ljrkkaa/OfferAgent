@@ -27,10 +27,9 @@ import {
 } from "./local/settings";
 import { canBackgroundStartRuntime, RuntimeBootstrap } from "./runtime/bootstrap";
 import { ChatStore, PersistedChatTabs, parsePersistedTabs } from "./runtime/chat_store";
-import { RELEASE_PUBLIC_KEYS } from "./runtime/generated_release_keyring";
 import { HarnessClient, REQUIRED_RUNTIME_CAPABILITIES } from "./runtime/harness_client";
-import { createRuntimeInstaller } from "./runtime/installer_mode";
 import { JsonObject, JsonValue, requireJsonObject } from "./runtime/json_rpc";
+import { LocalDevelopmentRuntimeInstaller } from "./runtime/local_development_installer";
 import { StdioWorkerTransport } from "./runtime/stdio_worker";
 import {
     PROTOCOL_SCHEMA_HASH,
@@ -99,32 +98,34 @@ export default class OfferAgentPlugin extends Plugin {
         this.addCommand({ id: "open-local-web", name: "打开本地 Web 界面", callback: () => void this.openLocalWeb() });
         this.addCommand({ id: "runtime-diagnostics", name: "查看本地 Runtime 诊断", callback: () => void this.openDiagnostics() });
         this.addCommand({
-            id: "stop-all-local-runtime",
-            name: "一键停止本机所有 OfferAgent Runtime",
-            callback: () => void this.stopAllLocalRuntime(),
+            id: "stop-local-runtime",
+            name: "停止当前 Vault 的 OfferAgent Runtime",
+            callback: () => void this.stopLocalRuntime(),
         });
         this.addSettingTab(new LocalOfferAgentSettingTab(this.app, this));
 
         void this.beginRuntimeStart().catch((error) => new Notice(actionableError(error)));
     }
 
-    async onunload(): Promise<void> {
+    onunload(): void {
         this.unloading = true;
         if (this.runtimeRestartTimer) clearTimeout(this.runtimeRestartTimer);
         this.runtimeRestartTimer = null;
         const pendingStart = this.runtimeStart;
         const pendingRestart = this.runtimeRestartOperation;
-        await this.chatStore?.dispose().catch(() => undefined);
+        const chatDisposal = this.chatStore?.dispose().catch(() => undefined);
         this.chatStore = null;
         this.chatClient = null;
-        await this.runtime?.stop({ shutdownWorker: true }).catch(() => undefined);
-        // stop() aborts an installer, reconnect sleep, or configuration restart.
-        // Await those operations only after the abort boundary, otherwise unload
-        // can wait forever for the very operation it needs to cancel.
-        await Promise.all([
+        // Obsidian ignores a Promise returned from onunload. beginUnload aborts
+        // lifecycle work and starts stdio EOF synchronously; its normal stop gate
+        // continues tracking the child-process join in the background.
+        const retirement = this.runtime?.beginUnload();
+        void Promise.all([
+            chatDisposal,
+            retirement?.catch(() => undefined),
             pendingStart?.catch(() => undefined),
             pendingRestart?.catch(() => undefined),
-        ]);
+        ]).catch(() => undefined);
     }
 
     runtimeSnapshot() {
@@ -226,7 +227,7 @@ export default class OfferAgentPlugin extends Plugin {
                     candidateGeneration = this.settingsGeneration;
                 }
                 if (await this.applyRuntimeSettingsToReadyRuntime(candidate, candidateGeneration)) return;
-                // Settings changed across an awaited Pipe request.  Coalesce to one
+                // Settings changed across an awaited stdio request. Coalesce to one
                 // fresh immutable snapshot rather than allowing the stale patch to win.
                 candidate = snapshotLocalSettings(this.settings);
                 candidateGeneration = this.settingsGeneration;
@@ -413,9 +414,9 @@ export default class OfferAgentPlugin extends Plugin {
         window.open(url, "_blank", "noopener,noreferrer");
     }
 
-    private async stopAllLocalRuntime(): Promise<void> {
+    private async stopLocalRuntime(): Promise<void> {
         const confirmed = window.confirm(
-            "这会停止当前 Windows 用户的所有 OfferAgent Worker，并取消所有 Vault 中正在运行的任务。是否继续？",
+            "这会停止当前 Vault 的 OfferAgent Worker，并取消其中正在运行的任务。是否继续？",
         );
         if (!confirmed) return;
         const runtime = this.runtime;
@@ -431,7 +432,7 @@ export default class OfferAgentPlugin extends Plugin {
         await this.chatStore?.dispose().catch(() => undefined);
         this.chatStore = null;
         this.chatClient = null;
-        await runtime.stop({ shutdownWorker: true });
+        await runtime.stop();
         await Promise.all([
             pendingStart?.catch(() => undefined),
             pendingRestart?.catch(() => undefined),
@@ -441,15 +442,11 @@ export default class OfferAgentPlugin extends Plugin {
 
     private createRuntime(): RuntimeBootstrap {
         const pluginDirectory = pluginInstallDirectory(this, this.vaultRoot);
-        const installer = createRuntimeInstaller({
+        const installer = new LocalDevelopmentRuntimeInstaller({
             pluginDirectory,
-            vaultRoot: this.vaultRoot,
             pluginVersion: this.manifest.version,
             protocolVersion: PROTOCOL_VERSION,
             schemaHash: PROTOCOL_SCHEMA_HASH,
-            releasePublicKeys: RELEASE_PUBLIC_KEYS,
-            ownerId: `workspace:${this.workspaceId}`,
-            legacyOwnerId: `obsidian-${process.pid}`,
         });
         return new RuntimeBootstrap(installer, {
             create: (installed, onDisconnected) => new HarnessClient(
@@ -477,7 +474,7 @@ export default class OfferAgentPlugin extends Plugin {
     private async startRuntime(): Promise<void> {
         await (this.runtime as RuntimeBootstrap).start();
         if (this.unloading || this.runtimeExplicitlyStopped) {
-            await this.runtime?.stop({ shutdownWorker: false }).catch(() => undefined);
+            await this.runtime?.stop().catch(() => undefined);
             return;
         }
         const settings = snapshotLocalSettings(this.settings);
@@ -522,11 +519,11 @@ export default class OfferAgentPlugin extends Plugin {
         this.chatStore = null;
         this.chatClient = null;
         if (this.unloading || this.runtimeExplicitlyStopped) return;
-        await this.runtime.stop({ shutdownWorker: true });
+        await this.runtime.stop();
         if (this.unloading || this.runtimeExplicitlyStopped) return;
         await this.runtime.start();
         if (this.unloading || this.runtimeExplicitlyStopped) {
-            await this.runtime.stop({ shutdownWorker: true }).catch(() => undefined);
+            await this.runtime.stop().catch(() => undefined);
             return;
         }
         const refreshed = requireJsonObject(await this.runtime.harness.request(

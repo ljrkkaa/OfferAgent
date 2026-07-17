@@ -71,9 +71,8 @@ class WorkspaceRegistry:
     """Atomic registry mapping a canonical local Vault to a random instance ID.
 
     Every read/modify/write cycle is protected by both a process-local lock and
-    an operating-system byte-range lock.  This is intentionally independent of
-    the Host singleton: bootstrap tools and concurrent Host candidates must not
-    be able to lose a workspace registration.
+    an operating-system byte-range lock. Concurrent local processes therefore
+    cannot lose a workspace registration.
     """
 
     def __init__(

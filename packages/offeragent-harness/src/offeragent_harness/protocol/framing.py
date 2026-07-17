@@ -61,7 +61,7 @@ def encode_frame(
 
 
 class LengthPrefixedJsonRpcDecoder:
-    """Incremental decoder supporting arbitrary split and coalesced pipe reads.
+    """Incremental decoder supporting arbitrary split and coalesced stream reads.
 
     A malformed frame poisons the decoder because production transports must close
     the connection after a protocol violation.  ``reset`` is only intended for a

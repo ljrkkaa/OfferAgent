@@ -1,16 +1,16 @@
-"""Bootstrap adapter from the path-bearing registry to the opaque Host DTO."""
+"""Adapter from the path-bearing registry to an opaque process identity."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from offeragent_harness.runtime.host_supervisor import SupervisedWorkspaceIdentity
+from offeragent_harness.runtime.process_identity import SupervisedWorkspaceIdentity
 
 from .identity import WorkspaceRegistry
 
 
 class WorkspaceRegistrationBoundary:
-    """Resolve a real root outside the Host and discard its path immediately."""
+    """Resolve a real root before crossing the process-isolation boundary."""
 
     def __init__(self, registry: WorkspaceRegistry) -> None:
         self._registry = registry

@@ -74,10 +74,10 @@ export interface InitializeResult {
     readonly schemaHash: string;
     readonly workspaceId: string;
     readonly workspaceInstanceId: string;
-    readonly hostPid: number;
+    readonly parentPid: number;
     readonly workerPid: number;
-    readonly transport: "stdio-dev";
-    readonly runtimeArch: "win-x64" | "win-arm64";
+    readonly transport: "stdio";
+    readonly runtimeArch: "win-x64";
     readonly capabilities: JsonObject;
     readonly buildCommit: string;
 }
@@ -117,6 +117,8 @@ export class HarnessClient {
     private state: ClientState = "disconnected";
     private pingTimer: ReturnType<typeof setInterval> | null = null;
     private pingActive = false;
+    private closeOperation: Promise<void> | null = null;
+    private retiringPeer: JsonRpcPeer | null = null;
 
     constructor(
         transport: RpcTransport,
@@ -250,16 +252,39 @@ export class HarnessClient {
         return cursors;
     }
 
-    async close(options: {
+    close(options: {
         shutdown?: boolean;
         reason?: ProtocolCommandParams<"shutdown">["reason"];
         gracePeriodMs?: number;
     } = {}): Promise<void> {
-        if (this.state === "closed" || this.state === "closing") return;
+        if (this.closeOperation === null) {
+            // closeOnce runs synchronously through its first await.  In the
+            // non-RPC unload path this reaches peer.close/stdio EOF before the
+            // Obsidian onunload callback returns.
+            this.closeOperation = this.closeOnce(options);
+        }
+        return this.closeOperation;
+    }
+
+    /** Escalate an in-flight graceful close to immediate transport teardown. */
+    beginImmediateClose(): Promise<void> {
+        if (this.closeOperation === null) return this.close({ shutdown: false });
+        const peer = this.retiringPeer ?? this.peer;
+        if (peer) void peer.close().catch(() => undefined);
+        return this.closeOperation;
+    }
+
+    private async closeOnce(options: {
+        shutdown?: boolean;
+        reason?: ProtocolCommandParams<"shutdown">["reason"];
+        gracePeriodMs?: number;
+    }): Promise<void> {
+        if (this.state === "closed") return;
         this.state = "closing";
         this.stopPing();
         const peer = this.peer;
         this.peer = null;
+        this.retiringPeer = peer;
         if (peer && options.shutdown) {
             await this.requestOnPeer(peer, "shutdown", {
                 reason: options.reason ?? "plugin_disabled",
@@ -267,6 +292,7 @@ export class HarnessClient {
             }, { timeoutMs: (options.gracePeriodMs ?? 30_000) + 5_000 }).catch(() => undefined);
         }
         await peer?.close().catch(() => undefined);
+        if (this.retiringPeer === peer) this.retiringPeer = null;
         this.state = "closed";
     }
 
@@ -296,12 +322,14 @@ export class HarnessClient {
             }
             timestampField(result, "timestamp");
         } catch (error) {
-            this.stopPing();
-            this.state = "disconnected";
-            const peer = this.peer;
-            this.peer = null;
-            await peer?.close().catch(() => undefined);
-            this.onDisconnected?.(safeConnectionError(error));
+            // A ping failure owns disconnect notification only when it wins the
+            // race to close this client. Register the peer retirement in the
+            // same single-flight gate used by explicit stop/unload before
+            // awaiting its process join; those callers must never observe an
+            // empty/complete close while this peer is still retiring.
+            const notifyDisconnect = this.closeOperation === null && this.state === "ready";
+            await this.close({ shutdown: false }).catch(() => undefined);
+            if (notifyDisconnect) this.onDisconnected?.(safeConnectionError(error));
         } finally {
             this.pingActive = false;
         }
@@ -348,13 +376,13 @@ function validateInitializeResultShape(raw: JsonValue, context: HarnessClientCon
     if (textField(value, "workspaceId") !== context.workspaceId) {
         throw new HarnessCompatibilityError("Runtime attached a different Workspace");
     }
-    if (value.transport !== "stdio-dev") throw new HarnessCompatibilityError("local plugin requires direct stdio");
+    if (value.transport !== "stdio") throw new HarnessCompatibilityError("local plugin requires direct stdio");
     const capabilities = validateCapabilitySet(value.capabilities);
     for (const required of context.requiredCapabilities) {
         if (capabilities[required] !== true) throw new HarnessCompatibilityError(`Runtime lacks required capability: ${required}`);
     }
     const runtimeArch = textField(value, "runtimeArch");
-    if (runtimeArch !== "win-x64" && runtimeArch !== "win-arm64") {
+    if (runtimeArch !== "win-x64") {
         throw new HarnessCompatibilityError("Runtime architecture is unsupported");
     }
     const buildCommit = textField(value, "buildCommit");
@@ -366,9 +394,9 @@ function validateInitializeResultShape(raw: JsonValue, context: HarnessClientCon
         schemaHash,
         workspaceId: context.workspaceId,
         workspaceInstanceId: textField(value, "workspaceInstanceId"),
-        hostPid: integerField(value, "hostPid", 1),
+        parentPid: integerField(value, "parentPid", 1),
         workerPid: integerField(value, "workerPid", 1),
-        transport: "stdio-dev",
+        transport: "stdio",
         runtimeArch,
         capabilities,
         buildCommit,

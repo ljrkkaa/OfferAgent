@@ -16,9 +16,9 @@ import threading
 from collections.abc import Mapping
 from ctypes import wintypes
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
-from .host_supervisor import SupervisedWorkspaceIdentity, WorkerJob
+from .process_identity import SupervisedWorkspaceIdentity, WorkerJob
 from .process_supervisor import (
     ExecutableTrust,
     ManagedSupervisedProcess,
@@ -74,10 +74,6 @@ _TOKEN_QUERY = 0x0008
 _TOKEN_IS_APP_CONTAINER = 29
 _TOKEN_CAPABILITIES = 30
 _TOKEN_APP_CONTAINER_SID = 31
-
-
-class ProcessReleaseManifestTrust(Protocol):
-    def authorizes(self, profile: ProcessExecutableProfile) -> bool: ...
 
 
 class _SecurityCapabilities(ctypes.Structure):
@@ -225,11 +221,9 @@ class PinnedProcessExecutableVerifier:
         self,
         *,
         authenticode: AuthenticodeVerifier | None = None,
-        release_manifest: ProcessReleaseManifestTrust | None = None,
     ) -> None:
         _require_windows()
         self._authenticode = authenticode
-        self._release_manifest = release_manifest
         self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         self._configure_api()
 
@@ -241,10 +235,7 @@ class PinnedProcessExecutableVerifier:
         except (OSError, ValueError) as error:
             raise ExecutableVerificationError("process executable escaped its fixed installation root") from error
         if executable.suffix.casefold() != ".exe" or not executable.is_file():
-            raise ExecutableVerificationError("production process profiles require an existing .exe")
-        if profile.trust is ExecutableTrust.SIGNED_RELEASE:
-            if self._release_manifest is None or not self._release_manifest.authorizes(profile):
-                raise ExecutableVerificationError("process executable is not authorized by the signed release manifest")
+            raise ExecutableVerificationError("local process profiles require an existing .exe")
         if profile.trust is ExecutableTrust.OS_AUTHENTICODE:
             if self._authenticode is None or not self._authenticode.verify(executable):
                 raise ExecutableVerificationError("process executable failed offline Authenticode verification")
@@ -1037,7 +1028,6 @@ def _error_code(operation: str, code: int) -> WindowsProcessError:
 
 __all__ = [
     "PinnedProcessExecutableVerifier",
-    "ProcessReleaseManifestTrust",
     "WindowsManagedSupervisedProcess",
     "WindowsSupervisedProcessBackend",
 ]

@@ -29,7 +29,7 @@ from offeragent_harness.runtime.cancellation import (
     CancellationScope,
     RunCancelled,
 )
-from offeragent_harness.runtime.host_supervisor import SupervisedWorkspaceIdentity
+from offeragent_harness.runtime.process_identity import SupervisedWorkspaceIdentity
 from offeragent_harness.runtime.process_supervisor import (
     ExecutableTrust,
     ProcessEnvironmentProfile,

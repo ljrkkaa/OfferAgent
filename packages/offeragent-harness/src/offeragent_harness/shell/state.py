@@ -129,13 +129,13 @@ class ShellProfileService:
         self,
         *,
         workspace_id: str,
-        signed_builtin_profiles: Sequence[ShellCommandProfile],
+        builtin_profiles: Sequence[ShellCommandProfile],
         state_store: EntityShellProfileStateStore,
     ) -> None:
         if not workspace_id or "\x00" in workspace_id:
             raise ValueError("Shell profile service requires a Workspace ID")
-        builtins = {profile.profile_id: profile for profile in signed_builtin_profiles}
-        if len(builtins) != len(signed_builtin_profiles) or len(builtins) > _MAX_PROFILES:
+        builtins = {profile.profile_id: profile for profile in builtin_profiles}
+        if len(builtins) != len(builtin_profiles) or len(builtins) > _MAX_PROFILES:
             raise ValueError("signed builtin Shell profile IDs must be bounded and unique")
         self.workspace_id = workspace_id
         self._builtins = builtins

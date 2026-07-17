@@ -6,11 +6,10 @@ from typing import Any, cast
 
 import pytest
 
-from offeragent_harness.runtime.host_supervisor import WorkerShutdownReceipt
+from offeragent_harness.runtime.process_identity import WorkerShutdownReceipt
 from offeragent_harness.runtime.production_worker_composition import (
     ProductionWorkerApplication,
     ProductionWorkerError,
-    _WorkerControl,
 )
 
 
@@ -329,57 +328,3 @@ async def test_shutdown_delivery_unsafe_receipt_still_tears_down_and_fails_wait_
 
     assert teardown_calls == 1
     assert application.reject_new_runs
-
-
-class _RecoveryReport:
-    manual_review_paths: tuple[str, ...] = ()
-
-
-class _RecoveryStore:
-    async def recover_after_restart(self) -> _RecoveryReport:
-        return _RecoveryReport()
-
-
-class _ControlApplication:
-    def __init__(self, receipt: object) -> None:
-        self.receipt = receipt
-        self.reject_new_runs = False
-        self.delivery_started = False
-
-    def begin_shutdown_delivery(self) -> None:
-        self.delivery_started = True
-
-    async def commit_shutdown(self) -> object:
-        return self.receipt
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("receipt", "message"),
-    [
-        (object(), "verified receipt"),
-        (WorkerShutdownReceipt(True, False, True, True), "durable state"),
-    ],
-)
-async def test_worker_control_rejects_invalid_or_unsafe_receipt(
-    receipt: object,
-    message: str,
-) -> None:
-    application = _ControlApplication(receipt)
-    control = _WorkerControl(cast(Any, application))
-
-    with pytest.raises(ProductionWorkerError, match=message):
-        await control.graceful_shutdown()
-    assert application.reject_new_runs
-    assert application.delivery_started
-
-
-@pytest.mark.asyncio
-async def test_worker_control_returns_only_a_safe_receipt_without_starting_transport_teardown() -> None:
-    receipt = WorkerShutdownReceipt(True, True, True, True)
-    application = _ControlApplication(receipt)
-    control = _WorkerControl(cast(Any, application))
-
-    assert await control.graceful_shutdown() is receipt
-    assert application.reject_new_runs
-    assert application.delivery_started

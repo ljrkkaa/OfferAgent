@@ -13,12 +13,12 @@ from .cancellation import CancellationToken
 class ApplicationCommandContext:
     """Authenticated local-transport facts, never supplied by request JSON."""
 
-    transport: str = "windows-named-pipe"
+    transport: str = "stdio"
     client_id: str = "local-client"
     peer: str = "local"
 
     def __post_init__(self) -> None:
-        if self.transport not in {"windows-named-pipe", "loopback-http", "loopback-websocket", "stdio-dev"}:
+        if self.transport not in {"stdio", "loopback-http", "loopback-websocket"}:
             raise ValueError("application command transport is invalid")
         if not self.client_id or not self.peer:
             raise ValueError("application command client identity must not be empty")
@@ -26,7 +26,7 @@ class ApplicationCommandContext:
 
 @runtime_checkable
 class ApplicationCommandDispatcher(Protocol):
-    """The only application surface a Pipe/Loopback transport may invoke.
+    """The only application surface a stdio/Loopback transport may invoke.
 
     Concrete composition roots are responsible for adapting this port to the one
     ready ``HarnessApplication``.  A transport never owns a Harness, Agent Loop,

@@ -20,7 +20,6 @@ from .models import (
     RuntimeSettings,
     TelemetrySettings,
     UiSettings,
-    UpdateSettings,
 )
 
 __all__ = [
@@ -43,5 +42,4 @@ __all__ = [
     "RuntimeSettings",
     "TelemetrySettings",
     "UiSettings",
-    "UpdateSettings",
 ]

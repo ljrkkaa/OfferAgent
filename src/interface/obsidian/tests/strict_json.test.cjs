@@ -44,7 +44,7 @@ test("strict JSON rejects malformed, unbounded and non-finite documents", () => 
     assert.throws(() => parseStrictJson("[1,2]", { maximumNodes: 2 }), /node/);
 });
 
-test("Pipe frame decoder rejects duplicate members before JSON-RPC dispatch", () => {
+test("stream frame decoder rejects duplicate members before JSON-RPC dispatch", () => {
     const { FrameDecoder } = loadModule("framing.ts");
     const payload = Buffer.from('{"jsonrpc":"2.0","id":1,"id":2,"result":null}', "utf8");
     const frame = Buffer.alloc(payload.length + 4);

@@ -76,7 +76,7 @@ export class ExtensionSettingsPanel {
         this.root.empty();
         this.root.createEl("h3", { text: "Skills、Processes、Shell 与 Hooks" });
         this.root.createEl("p", {
-            text: "读取同一 Worker 的持久目录；所有变更均经 Named Pipe、Workspace trust、revision/contentHash 与 clientRequestId 回执。命令参数逐项填写，不接受 raw shell command 或 secret。",
+            text: "读取同一 Worker 的持久目录；所有变更均经私有 stdio RPC、Workspace trust、revision/contentHash 与 clientRequestId 回执。命令参数逐项填写，不接受 raw shell command 或 secret。",
             cls: "setting-item-description",
         });
         const toolbar = this.root.createDiv({ cls: "offeragent-extension-actions" });

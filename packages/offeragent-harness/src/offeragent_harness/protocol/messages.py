@@ -45,15 +45,13 @@ from .ids import (
 
 
 class TransportKind(str, Enum):
-    WINDOWS_NAMED_PIPE = "windows-named-pipe"
     LOOPBACK_HTTP = "loopback-http"
     LOOPBACK_WEBSOCKET = "loopback-websocket"
-    STDIO_DEV = "stdio-dev"
+    STDIO = "stdio"
 
 
 class RuntimeArch(str, Enum):
     WIN_X64 = "win-x64"
-    WIN_ARM64 = "win-arm64"
 
 
 class RuntimeState(str, Enum):
@@ -91,7 +89,7 @@ class InitializeResult(WireModel):
     schema_hash: Sha256Digest
     workspace_id: WorkspaceId
     workspace_instance_id: WorkspaceInstanceId
-    host_pid: int = Field(ge=1)
+    parent_pid: int = Field(ge=1)
     worker_pid: int = Field(ge=1)
     transport: TransportKind
     runtime_arch: RuntimeArch
@@ -140,7 +138,7 @@ class RuntimeStatusResult(WireModel):
     state: RuntimeState
     workspace_id: WorkspaceId
     workspace_instance_id: WorkspaceInstanceId
-    host_pid: int = Field(ge=1)
+    parent_pid: int = Field(ge=1)
     worker_pid: int = Field(ge=1)
     runtime_version: SemanticVersion
     core_version: SemanticVersion
@@ -184,7 +182,7 @@ class WebLaunchResult(WireModel):
         return self
 
 
-SecretKindValue = Literal["model-provider", "update"]
+SecretKindValue = Literal["model-provider"]
 
 
 class SecretMetadataSnapshot(WireModel):

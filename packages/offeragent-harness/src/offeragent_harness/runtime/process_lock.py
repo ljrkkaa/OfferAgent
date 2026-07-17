@@ -1,4 +1,4 @@
-"""Current-user Host and per-workspace Worker single-instance locks."""
+"""Current-session, current-user named mutex used by local Runtime state stores."""
 
 from __future__ import annotations
 
@@ -59,8 +59,8 @@ class WindowsMutexBackend:
         self._kernel32.CloseHandle.restype = wintypes.BOOL
 
     def create(self, name: str) -> int:
-        # Host/Worker ownership is deliberately narrower than a service-style
-        # object: only the interactive Windows SID may open the mutex.
+        # Ownership is narrower than a service-style object: only the
+        # interactive Windows SID may open the mutex.
         with current_user_security_attributes(allow_system=False) as attributes:
             handle = self._kernel32.CreateMutexW(ctypes.byref(attributes), False, name)
         if not handle:
@@ -136,35 +136,17 @@ class ProcessLock:
         self.release()
 
 
-def host_mutex_name(*, sid: str | None = None) -> str:
-    return _mutex_name("Host", sid=sid)
+def worker_mutex_name(canonical_root_identity: str, *, sid: str | None = None) -> str:
+    """Return the current-session/user mutex name shared by Workers for one Vault."""
 
-
-def installer_mutex_name(*, sid: str | None = None) -> str:
-    """Return the current-user mutex shared by plugin and Setup installs."""
-
-    return _mutex_name("Installer", sid=sid)
-
-
-def installation_ledger_mutex_name(*, sid: str | None = None) -> str:
-    """Return the current-user mutex serializing installer ledger operations."""
-
-    return _mutex_name("InstallationLedger", sid=sid)
-
-
-def worker_mutex_name(workspace_identity_hash: str, *, sid: str | None = None) -> str:
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", workspace_identity_hash):
-        raise ValueError("workspace identity must be a canonical sha256 digest")
-    workspace_fragment = workspace_identity_hash.removeprefix("sha256:")[:32]
-    return _mutex_name(f"Worker.{workspace_fragment}", sid=sid)
-
-
-def _mutex_name(role: str, *, sid: str | None) -> str:
+    match = re.fullmatch(r"sha256:([0-9a-f]{64})", canonical_root_identity)
+    if match is None:
+        raise ValueError("canonical root identity must be a canonical sha256 digest")
     actual_sid = sid or current_windows_identity().sid
     if not re.fullmatch(r"S-\d-(?:\d+-)+\d+", actual_sid):
         raise ValueError("invalid Windows SID")
     sid_hash = hashlib.sha256(actual_sid.encode("ascii")).hexdigest()[:24]
-    return f"Local\\OfferAgent.{role}.{sid_hash}"
+    return f"Local\\OfferAgent.Worker.{match.group(1)}.{sid_hash}"
 
 
 def _mutex_error(operation: str) -> ProcessLockError:
@@ -179,8 +161,5 @@ __all__ = [
     "ProcessLock",
     "ProcessLockError",
     "WindowsMutexBackend",
-    "host_mutex_name",
-    "installation_ledger_mutex_name",
-    "installer_mutex_name",
     "worker_mutex_name",
 ]

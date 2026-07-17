@@ -21,13 +21,16 @@ from offeragent_harness.config import (
     RunConfigSnapshot,
 )
 from offeragent_harness.config.files import ConfigFileLoad, ConfigFileStore
+from offeragent_harness.config.migrations import strip_retired_update_fields
 from offeragent_harness.config.resolver import changed_paths, merge_patch, resolve_config
 from offeragent_harness.error_codes import ResourceConflictCause
 from offeragent_harness.ports import Clock, EventSink, IdGenerator, NewEvent, StoredEvent, UnitOfWorkFactory
 
 _CONFIG_COLLECTION = "config_layers"
 _RECEIPT_COLLECTION = "config_receipts"
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
+_LEGACY_SCHEMA_VERSION = 2
+_LAYER_FIELDS = frozenset({"config", "eventSequence", "ownerId", "revision", "schemaVersion", "scope", "updatedAt"})
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}")
 
 
@@ -410,7 +413,10 @@ def _decode_layer(raw: Any, scope: ConfigScope, owner_id: str) -> ConfigLayer:
     if not isinstance(raw, Mapping):
         raise ConfigCorrupt("configuration layer is not an object")
     try:
-        if raw.get("schemaVersion") != _SCHEMA_VERSION or raw.get("scope") != scope.value:
+        if set(raw) != _LAYER_FIELDS:
+            raise ValueError("configuration layer fields are incompatible")
+        schema_version = raw.get("schemaVersion")
+        if schema_version not in {_LEGACY_SCHEMA_VERSION, _SCHEMA_VERSION} or raw.get("scope") != scope.value:
             raise ValueError("incompatible configuration layer")
         if raw.get("ownerId") != owner_id:
             raise ValueError("configuration owner mismatch")
@@ -418,11 +424,14 @@ def _decode_layer(raw: Any, scope: ConfigScope, owner_id: str) -> ConfigLayer:
         event_sequence = raw["eventSequence"]
         if type(revision) is not int or type(event_sequence) is not int or revision < 1 or event_sequence < 1:
             raise ValueError("configuration revision is invalid")
+        config = raw["config"]
+        if schema_version == _LEGACY_SCHEMA_VERSION:
+            config = strip_retired_update_fields(config)
         return ConfigLayer(
             scope,
             owner_id,
             revision,
-            ConfigPatch.model_validate(raw["config"]),
+            ConfigPatch.model_validate(config),
             event_sequence,
         )
     except (KeyError, TypeError, ValueError) as error:

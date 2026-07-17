@@ -70,7 +70,7 @@ class HarnessApplication:
             return report
 
     def require_ready(self) -> HarnessService:
-        """Readiness gate every Pipe/Loopback/Direct adapter must cross."""
+        """Readiness gate every stdio or Loopback adapter must cross."""
 
         if not self.ready:
             raise ApplicationNotReady("Worker startup recovery has not completed")

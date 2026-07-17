@@ -47,6 +47,44 @@ FORBIDDEN_PATHS = (
     "src/interface/obsidian/src/similar_view.ts",
     "src/interface/obsidian/tests/server_runtime.test.cjs",
     "src/interface/obsidian/tests/vault_actions.test.cjs",
+    "docs/architecture/windows-runtime-release.md",
+    "packages/offeragent-harness/packaging/OfferAgent.iss",
+    "packages/offeragent-harness/release",
+    "packages/offeragent-harness/release-out",
+    "packages/offeragent-harness/scripts/audit_windows_release.py",
+    "packages/offeragent-harness/scripts/build_windows_release.py",
+    "packages/offeragent-harness/scripts/entrypoints/development/offeragent_host.py",
+    "packages/offeragent-harness/scripts/entrypoints/development/offeragent_self_test.py",
+    "packages/offeragent-harness/scripts/entrypoints/offeragent_bootstrap.py",
+    "packages/offeragent-harness/scripts/entrypoints/offeragent_host.py",
+    "packages/offeragent-harness/scripts/entrypoints/offeragent_process_host.py",
+    "packages/offeragent-harness/scripts/entrypoints/offeragent_self_test.py",
+    "packages/offeragent-harness/scripts/entrypoints/offeragent_worker.py",
+    "packages/offeragent-harness/scripts/frozen_payload_provenance.py",
+    "packages/offeragent-harness/scripts/release_dependency_policy.py",
+    "packages/offeragent-harness/src/offeragent_harness/_release_keys.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/bootstrap_cli.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/development_self_test.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/host_cli.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/host_supervisor.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/installation_ledger.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/lifecycle.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/named_pipe.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/production_host_composition.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/production_process_catalog.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/release_manifest.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/release_privileges.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/release_trust.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/runtime_installer.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/self_test.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/windows_authenticode.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/windows_named_pipe.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/windows_fixed_fd.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/windows_secure_tree.py",
+    "packages/offeragent-harness/src/offeragent_harness/runtime/worker_control.py",
+    "src/interface/obsidian/src/runtime/generated_release_keyring.ts",
+    "src/interface/obsidian/src/runtime/installer_mode.local_development.ts",
+    "src/interface/obsidian/src/runtime/installer_mode.ts",
 )
 
 REQUIRED_PATHS = (
@@ -54,7 +92,9 @@ REQUIRED_PATHS = (
     "packages/offeragent-harness/uv.lock",
     "packages/offeragent-harness/src/offeragent_harness/agent/loop.py",
     "packages/offeragent-harness/src/offeragent_harness/runtime/production_worker_composition.py",
-    "packages/offeragent-harness/scripts/build_windows_release.py",
+    "packages/offeragent-harness/scripts/build_local_windows_plugin.py",
+    "packages/offeragent-harness/scripts/frozen_payload.py",
+    "packages/offeragent-harness/scripts/local_windows_runtime_build.py",
     "packages/offeragent-harness/web/index.html",
     "src/interface/obsidian/manifest.json",
     "src/interface/obsidian/package.json",
@@ -319,9 +359,9 @@ def _ui_boundary_problems(repository_root: Path) -> list[str]:
     return problems
 
 
-def _sbom_gate_problems(repository_root: Path) -> list[str]:
+def _local_build_gate_problems(repository_root: Path) -> list[str]:
     scripts_root = repository_root / "packages" / "offeragent-harness" / "scripts"
-    build_script = scripts_root / "build_windows_release.py"
+    build_script = scripts_root / "build_local_windows_plugin.py"
     build_tree = ast.parse(build_script.read_text(encoding="utf-8"), filename=str(build_script))
 
     def calls_by_function(tree: ast.Module) -> dict[str, set[str]]:
@@ -335,41 +375,92 @@ def _sbom_gate_problems(repository_root: Path) -> list[str]:
     callers = calls_by_function(build_tree)
     problems: list[str] = []
     required = {
-        "add_release_metadata": {
-            "assert_sbom_packages_allowed",
-            "build_payload_provenance",
-            "build_spdx_document",
+        "build_development_runtime": {
+            "_require_exact_root_executables",
+            "audit_development_frozen_evidence",
+            "audit_development_pyinstaller_archives",
+            "capture_pyinstaller_target",
+            "merge_frozen_evidence",
+            "verify_project_source_snapshot",
         },
-        "audit_runtime_archive": {
-            "assert_payload_provenance",
-            "assert_runtime_spdx_document",
-            "assert_sbom_packages_allowed",
+        "main": {
+            "_require_embedded_schema_identity",
+            "add_local_assets",
+            "build_development_runtime",
+            "collect_runtime_records",
+            "require_source_tree_unchanged",
+            "run_static_gates",
+            "source_tree_identity",
         },
     }
     problems.extend(
-        f"release {caller} must invoke {callee} for SBOM dependency closure"
+        f"local build {caller} must invoke {callee} for frozen Runtime closure"
         for caller, callees in required.items()
         for callee in sorted(callees)
         if callee not in callers.get(caller, set())
     )
-    release_gate = next(
+    main_function = next(
         (
             node
             for node in build_tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "require_release_host"
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "main"
         ),
         None,
     )
-    release_literals = set(_literal_strings(release_gate)) if release_gate is not None else set()
-    if "scripts/audit_repository_closure.py" not in release_literals:
-        problems.append("signed release gate does not run the repository closure audit")
-
-    audit_script = scripts_root / "audit_windows_release.py"
-    audit_tree = ast.parse(audit_script.read_text(encoding="utf-8"), filename=str(audit_script))
-    independent_calls = calls_by_function(audit_tree).get("main", set())
-    for callee in ("assert_payload_provenance", "assert_runtime_spdx_document", "assert_sbom_packages_allowed"):
-        if callee not in independent_calls:
-            problems.append(f"independent Windows release audit does not invoke {callee}")
+    unconditional_static_gate = main_function is not None and any(
+        isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Call)
+        and _call_name(statement.value.func) == "run_static_gates"
+        for statement in main_function.body
+    )
+    if not unconditional_static_gate:
+        problems.append("local build must run static gates without a command-line bypass")
+    if any(
+        (isinstance(node, ast.Constant) and node.value == "--skip-static-checks")
+        or (isinstance(node, ast.Attribute) and node.attr == "skip_static_checks")
+        for node in ast.walk(build_tree)
+    ):
+        problems.append("local build exposes the retired --skip-static-checks bypass")
+    static_gates = next(
+        (
+            node
+            for node in build_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run_static_gates"
+        ),
+        None,
+    )
+    protocol_schema_check = static_gates is not None and any(
+        _call_name(node.func) == "run"
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+        and "offeragent_harness.protocol.schemas" in _literal_strings(node)
+        and "check" in _literal_strings(node)
+        for node in ast.walk(static_gates)
+        if isinstance(node, ast.Call)
+    )
+    if not protocol_schema_check:
+        problems.append("local build static gates omit the Python protocol schema freshness check")
+    source_identity = next(
+        (
+            node
+            for node in build_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "source_tree_identity"
+        ),
+        None,
+    )
+    digest_literals = set(_literal_strings(source_identity)) if source_identity is not None else set()
+    for helper in (
+        "frozen_payload.py",
+        "local_windows_runtime_build.py",
+        "runtime_sbom.py",
+    ):
+        if helper not in digest_literals:
+            problems.append(f"local build source identity omits scripts/{helper}")
+    if "yarn.lock" not in digest_literals:
+        problems.append("local build source identity omits the Obsidian yarn.lock")
+    if "schema" not in digest_literals:
+        problems.append("local build source identity omits the complete schema tree")
 
     workflow = repository_root / ".github" / "workflows" / "windows-local-runtime.yml"
     try:
@@ -379,6 +470,58 @@ def _sbom_gate_problems(repository_root: Path) -> list[str]:
     else:
         if "scripts/audit_repository_closure.py" not in workflow_text:
             problems.append("Windows-local CI does not run the repository closure audit")
+    return problems
+
+
+def _worker_lock_problems(repository_root: Path) -> list[str]:
+    composition = (
+        repository_root
+        / "packages"
+        / "offeragent-harness"
+        / "src"
+        / "offeragent_harness"
+        / "runtime"
+        / "development_composition.py"
+    )
+    tree = ast.parse(composition.read_text(encoding="utf-8"), filename=str(composition))
+    worker_main = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "worker_main"
+        ),
+        None,
+    )
+    if worker_main is None:
+        return ["local Worker entrypoint composition is missing worker_main"]
+    lock_scope = next(
+        (
+            node
+            for node in ast.walk(worker_main)
+            if isinstance(node, ast.With)
+            and any(
+                isinstance(item.context_expr, ast.Call) and _call_name(item.context_expr.func) == "ProcessLock"
+                for item in node.items
+            )
+        ),
+        None,
+    )
+    if lock_scope is None:
+        return ["local Worker entrypoint does not hold a Vault-scoped ProcessLock"]
+    calls = {_call_name(node.func) for node in ast.walk(lock_scope) if isinstance(node, ast.Call)}
+    problems: list[str] = []
+    for required in ("ProcessLock", "_run_worker", "load_development_trust", "worker_mutex_name"):
+        if required not in calls:
+            problems.append(f"local Worker ProcessLock scope must invoke {required}")
+    if not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "asyncio"
+        and node.func.attr == "run"
+        for node in ast.walk(lock_scope)
+    ):
+        problems.append("local Worker ProcessLock scope must cover asyncio event-loop shutdown")
     return problems
 
 
@@ -396,7 +539,8 @@ def check(repository_root: Path) -> list[str]:
     problems.extend(_metadata_problems(repository_root))
     problems.extend(_single_loop_problems(repository_root))
     problems.extend(_ui_boundary_problems(repository_root))
-    problems.extend(_sbom_gate_problems(repository_root))
+    problems.extend(_local_build_gate_problems(repository_root))
+    problems.extend(_worker_lock_problems(repository_root))
     return problems
 
 

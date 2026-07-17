@@ -130,7 +130,7 @@ async def test_subagent_commands_use_only_public_service_boundary() -> None:
         authorities=Authority(),
         artifacts=Artifacts(),
     )
-    context = ApplicationCommandContext(transport="windows-named-pipe", client_id="client_1")
+    context = ApplicationCommandContext(transport="stdio", client_id="client_1")
     cancellation = ManualCancellationToken()
 
     status = await handlers["agent/status"](AgentStatusParams(run_id="run_child"), cancellation, context)

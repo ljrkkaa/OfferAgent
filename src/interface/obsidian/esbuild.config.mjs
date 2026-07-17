@@ -10,8 +10,9 @@ if you want to view the source, please visit the github repository of this plugi
 */
 `;
 
-const localDevelopment = (process.argv[2] === 'local-development');
-const prod = (process.argv[2] === 'production') || localDevelopment;
+if (process.argv[2] !== 'local-development') {
+    throw new Error('only the pinned local-development plugin build is supported');
+}
 const extraArguments = process.argv.slice(3);
 const outputArguments = extraArguments.filter((value) => value.startsWith('--outfile='));
 const manifestArguments = extraArguments.filter((value) => value.startsWith('--development-manifest-sha256='));
@@ -25,20 +26,9 @@ const outfile = path.resolve(requestedOutput);
 const developmentManifestSha256 = manifestArguments.length === 1
     ? manifestArguments[0].slice('--development-manifest-sha256='.length)
     : '';
-if (localDevelopment && !/^sha256:[0-9a-f]{64}$/.test(developmentManifestSha256)) {
+if (!/^sha256:[0-9a-f]{64}$/.test(developmentManifestSha256)) {
     throw new Error('local development build requires a canonical manifest SHA-256 anchor');
 }
-if (!localDevelopment && developmentManifestSha256) {
-    throw new Error('production build rejects the local development manifest anchor');
-}
-const installerSelection = localDevelopment ? [{
-    name: "offeragent-local-development-installer",
-    setup(build) {
-        build.onResolve({ filter: /^\.\/runtime\/installer_mode$/ }, () => ({
-            path: path.resolve("src/runtime/installer_mode.local_development.ts"),
-        }));
-    },
-}] : [];
 
 esbuild.build({
     banner: {
@@ -73,14 +63,12 @@ esbuild.build({
         'node:*',
         ...builtins],
     format: 'cjs',
-    watch: !prod,
     target: 'es2018',
     logLevel: "info",
-    sourcemap: prod ? false : 'inline',
+    sourcemap: false,
     treeShaking: true,
-    plugins: installerSelection,
-    define: localDevelopment ? {
+    define: {
         __OFFERAGENT_DEVELOPMENT_MANIFEST_SHA256__: JSON.stringify(developmentManifestSha256),
-    } : {},
+    },
     outfile,
 }).catch(() => process.exit(1));

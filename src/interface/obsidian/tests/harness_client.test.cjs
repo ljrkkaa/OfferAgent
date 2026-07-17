@@ -50,6 +50,16 @@ function pair() {
     return [left, right];
 }
 
+function deferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
+}
+
 const SCHEMA_HASH = `sha256:${"a".repeat(64)}`;
 const WORKSPACE = "wsi_01J00000000000000000000000";
 
@@ -76,9 +86,9 @@ function initializeResult(overrides = {}) {
         schemaHash: SCHEMA_HASH,
         workspaceId: WORKSPACE,
         workspaceInstanceId: "wsi_01J00000000000000000000001",
-        hostPid: 123,
+        parentPid: 123,
         workerPid: 456,
-        transport: "stdio-dev",
+        transport: "stdio",
         runtimeArch: "win-x64",
         capabilities: {
             eventReplay: true,
@@ -163,6 +173,70 @@ test("client performs strict initialize and subscribes to Worker events", async 
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(client.reducer.state.runs.get("run_01J00000000000000000000000").timeline.length, 1);
     await client.close();
+});
+
+test("non-RPC Harness close starts transport teardown synchronously and tracks its join", async () => {
+    const { HarnessClient } = loadModule("harness_client.ts");
+    const joined = deferred();
+    let closeCalls = 0;
+    const peer = {
+        onNotification: () => () => undefined,
+        request: async (method) => {
+            assert.equal(method, "initialize");
+            return initializeResult();
+        },
+        close: () => {
+            closeCalls += 1;
+            return joined.promise;
+        },
+    };
+    const client = new HarnessClient({ connect: async () => peer }, context());
+    await client.connect();
+
+    let closed = false;
+    const closing = client.close().then(() => { closed = true; });
+    assert.equal(closeCalls, 1);
+    assert.equal(closed, false);
+
+    joined.resolve();
+    await closing;
+    assert.equal(closed, true);
+});
+
+test("immediate Harness close escalates an in-flight shutdown RPC without replacing its join gate", async () => {
+    const { HarnessClient } = loadModule("harness_client.ts");
+    const shutdown = deferred();
+    const joined = deferred();
+    let closeCalls = 0;
+    let peerCloseOperation = null;
+    const peer = {
+        onNotification: () => () => undefined,
+        request: async (method) => {
+            if (method === "initialize") return initializeResult();
+            if (method === "shutdown") return shutdown.promise;
+            throw new Error(`unexpected method: ${method}`);
+        },
+        close: () => {
+            if (peerCloseOperation === null) {
+                closeCalls += 1;
+                shutdown.reject(new Error("transport closed"));
+                peerCloseOperation = joined.promise;
+            }
+            return peerCloseOperation;
+        },
+    };
+    const client = new HarnessClient({ connect: async () => peer }, context());
+    await client.connect();
+
+    const graceful = client.close({ shutdown: true });
+    assert.equal(closeCalls, 0);
+    const immediate = client.beginImmediateClose();
+    assert.equal(immediate, graceful);
+    assert.equal(closeCalls, 1);
+
+    joined.resolve();
+    await graceful;
+    assert.equal(closeCalls, 1);
 });
 
 test("schema mismatch fails closed and never becomes ready", async () => {
@@ -271,6 +345,56 @@ test("Session replay keeps one monotonic cursor per Run and never invents an agg
         "ab",
     );
     await client.close();
+});
+
+test("ping retirement shares the explicit close gate until the old peer join completes", async () => {
+    const { HarnessClient } = loadModule("harness_client.ts");
+    const closeStarted = deferred();
+    const joined = deferred();
+    let peerCloseOperation = null;
+    let closeCalls = 0;
+    let disconnectCalls = 0;
+    const peer = {
+        onNotification: () => () => undefined,
+        request: async (method) => {
+            if (method === "initialize") return initializeResult();
+            if (method === "runtime/ping") throw new Error("ping transport failed");
+            throw new Error(`unexpected method: ${method}`);
+        },
+        close: () => {
+            if (peerCloseOperation === null) {
+                closeCalls += 1;
+                closeStarted.resolve();
+                peerCloseOperation = joined.promise;
+            }
+            return peerCloseOperation;
+        },
+    };
+    const client = new HarnessClient(
+        { connect: async () => peer },
+        context(),
+        { pingIntervalMs: 60_000, onDisconnected: () => { disconnectCalls += 1; } },
+    );
+    await client.connect();
+
+    const pinging = client.ping();
+    await closeStarted.promise;
+    const closing = client.close();
+    const immediate = client.beginImmediateClose();
+    assert.equal(closing, immediate);
+    let closed = false;
+    void closing.then(() => { closed = true; });
+    await new Promise((resolvePromise) => setImmediate(resolvePromise));
+
+    assert.equal(closeCalls, 1);
+    assert.equal(closed, false);
+    assert.equal(disconnectCalls, 0);
+
+    joined.resolve();
+    await Promise.all([pinging, closing]);
+    assert.equal(closed, true);
+    assert.equal(disconnectCalls, 1);
+    assert.equal(client.ready, false);
 });
 
 test("ping identity change disconnects and reports an actionable local error", async () => {

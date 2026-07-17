@@ -9,7 +9,7 @@ from offeragent_harness.workspace.identity import WorkspaceRegistry
 from offeragent_harness.workspace.supervision import WorkspaceRegistrationBoundary
 
 
-def test_registration_boundary_discards_vault_path_before_host_attach(tmp_path: Path) -> None:
+def test_registration_boundary_discards_vault_path_before_process_isolation(tmp_path: Path) -> None:
     vault = tmp_path / "真实 Vault"
     vault.mkdir()
     registry = WorkspaceRegistry(

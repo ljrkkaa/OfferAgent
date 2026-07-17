@@ -122,6 +122,7 @@ export class JsonRpcPeer {
     private writeTail: Promise<void> = Promise.resolve();
     private queuedWrites = 0;
     private state: PeerState = "open";
+    private closeOperation: Promise<void> | null = null;
 
     constructor(channel: ByteChannel, options: JsonRpcPeerOptions = {}) {
         this.channel = channel;
@@ -229,16 +230,16 @@ export class JsonRpcPeer {
         await this.send({ jsonrpc: "2.0", method, params });
     }
 
-    async close(): Promise<void> {
-        if (this.closed || this.state === "closing") return;
-        this.state = "closing";
-        this.finish(new RpcDisconnectedError());
-        // Closing is the escape hatch for a blocked transport write.  Never wait
-        // for writeTail before destroying the channel that can unblock it.
-        await settleWithin(
-            Promise.resolve().then(() => this.channel.close()),
-            this.writeTimeoutMs,
-        );
+    close(): Promise<void> {
+        if (!this.closed && this.state !== "closing") {
+            this.state = "closing";
+            this.finish(new RpcDisconnectedError());
+        }
+        // A remote channel error may have made the peer terminal before its
+        // child process exited.  Always await ByteChannel.close so a process-
+        // backed channel can finish its terminate-and-join operation.  The RPC
+        // write deadline is deliberately unrelated to that process boundary.
+        return this.beginChannelClose();
     }
 
     private acceptChunk(chunk: Uint8Array): void {
@@ -405,7 +406,7 @@ export class JsonRpcPeer {
         const write = rejectAfter(
             rawWrite,
             this.writeTimeoutMs,
-            () => new RpcDisconnectedError("OfferAgent Named Pipe write deadline exceeded"),
+            () => new RpcDisconnectedError("OfferAgent local RPC write deadline exceeded"),
             this.writeCancellation.signal,
             () => new RpcDisconnectedError(),
         );
@@ -424,8 +425,22 @@ export class JsonRpcPeer {
     private poison(error: Error): void {
         if (this.closed) return;
         this.state = "poisoned";
-        void Promise.resolve().then(() => this.channel.close()).catch(() => undefined);
+        void this.beginChannelClose().catch(() => undefined);
         this.finish(error, "poisoned");
+    }
+
+    private beginChannelClose(): Promise<void> {
+        if (this.closeOperation === null) {
+            try {
+                // Invoke close synchronously.  ChildStdioChannel uses this call
+                // to close stdin immediately while its returned Promise tracks
+                // the subsequent process join.
+                this.closeOperation = Promise.resolve(this.channel.close());
+            } catch (error) {
+                this.closeOperation = Promise.reject(error);
+            }
+        }
+        return this.closeOperation;
     }
 
     private finish(error: Error, terminal: PeerState = "closed"): void {
@@ -630,20 +645,6 @@ function rejectAfter<T>(
             fail,
         );
         if (signal.aborted) onAbort();
-    });
-}
-
-function settleWithin(promise: Promise<unknown>, timeoutMs: number): Promise<void> {
-    return new Promise((resolve) => {
-        let terminal = false;
-        const finish = () => {
-            if (terminal) return;
-            terminal = true;
-            clearTimeout(timer);
-            resolve();
-        };
-        const timer = setTimeout(finish, timeoutMs);
-        void promise.then(finish, finish);
     });
 }
 
