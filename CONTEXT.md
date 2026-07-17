@@ -142,6 +142,10 @@ _Avoid_: 部分流式文本、临时 UI 状态、自动重跑
 为保存 Conversation、Agent Run 和恢复进度而产生的本地内部状态；它不构成学习事实，也不能用于推进 Learning State。
 _Avoid_: Study Evidence、Vault 内容、学习记录
 
+**Legacy State Migration**:
+将旧 TypeScript Runtime 的只读 schema-v19 快照转换为 Python Harness 权威状态的一次性离线操作；dry-run 与执行共享同一个封闭计划，只导入完成的 Conversation Turn、已保留的有序附件和映射后的插件权限设置，并以 source hash receipt、只读备份、staging 与可回滚 authority switch 保证幂等。活动或中断 Run、工具检查点、Vault Change Batch、凭据、Token、Secret 与未知设置只进入不含值的排除清单。迁移同时安装与 Python 工具语言一致的 `agent.md` 和兼容名 `obsidian-cli` Skill；自定义控制文件冲突时拒绝覆盖。
+_Avoid_: 机械数据库复制、恢复旧 Run、重放旧副作用、导入秘密、静默覆盖自定义 Contract
+
 **Python Harness**:
 由 Obsidian 插件为当前 Vault 启动的唯一隐藏 Python Worker；它拥有 Agent Loop、Tool Kernel、模型、Run Event、Conversation、恢复和 Runtime State，但不拥有 Vault API 能力。
 _Avoid_: TypeScript Agent Runtime、常驻 Host、第二个 Agent Loop、Vault 文件系统权威

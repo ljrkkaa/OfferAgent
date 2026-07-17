@@ -71,5 +71,22 @@ uv run python scripts/update_local_windows_plugin.py `
   --ripgrep-executable C:\path\to\rg.exe
 ```
 
+检测到标准旧插件目录和只读 schema-v19 State 时，更新器会在插件切换内自动执行一次 source-hash 幂等迁移。需要先审查迁移范围或使用非标准旧路径时，可显式运行同一个 Python 计划：
+
+```powershell
+uv run python -m offeragent_harness.migration `
+  --source-state "$env:LOCALAPPDATA\OfferAgent\state.db" `
+  --source-attachments 'C:\path\to\legacy-attachments' `
+  --source-plugin-data 'E:\Vault\.obsidian\plugins\offeragent\data.json' `
+  --target-state-directory 'C:\path\to\OfferAgent\workspaces\wsi_...' `
+  --target-plugin-data 'E:\Vault\.obsidian\plugins\offeragent-obsidian-plugin\data.json' `
+  --vault-root 'E:\Vault' `
+  --target-templates 'E:\artifact\migration\target-vault' `
+  --workspace-id 'ws_...' `
+  --dry-run
+```
+
+去掉 `--dry-run` 才会执行。迁移拒绝未知 schema、活动 SQLite sidecar、损坏或超容量图片、身份碰撞和未识别的控制文件；旧来源始终只读，旧 Run、工具/Vault 副作用和秘密不会进入新 State。
+
 工程约束见仓库的 `docs/GENERAL_ENGINEERING_REFACTOR_CONSTRAINTS.md`，当前范围见
 `docs/architecture/personal-local-scope.md`。

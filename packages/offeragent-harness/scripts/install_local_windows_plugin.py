@@ -1,8 +1,14 @@
-"""Atomically install a verified personal-development plugin without reading data.json."""
+"""Atomically install a verified personal-development plugin.
+
+Ordinary updates still move ``data.json`` opaquely.  A separate, known legacy
+plugin plus the closed v19 State snapshot enables the explicit Python-harness
+migration before the old plugin backup is retired.
+"""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -12,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from offeragent_harness.runtime.development_runtime_manifest import InstalledDevelopmentRuntimeTrust
+from offeragent_harness.workspace import WorkspaceRegistry
+from offeragent_harness.workspace.portable_config import ensure_portable_workspace_config
 
 PLUGIN_DIRECTORY_NAME = "offeragent-obsidian-plugin"
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
@@ -69,6 +77,7 @@ def install_local_plugin(artifact: Path, vault_root: Path) -> Path:
         _replace(staging, target)
         activated = True
         _verify_artifact(target, allow_data_json=True)
+        _migrate_known_legacy_install(target, vault)
         if backed_up:
             _remove_tree_without_settings(backup)
         return target
@@ -132,6 +141,7 @@ def _verify_artifact(root: Path, *, allow_data_json: bool = False) -> None:
         "local-development-build.json",
         "main.js",
         "manifest.json",
+        "migration",
         "runtime",
         "styles.css",
     }
@@ -145,6 +155,7 @@ def _verify_artifact(root: Path, *, allow_data_json: bool = False) -> None:
         raise LocalPluginInstallError("plugin artifact top-level file set is not exact")
     for name in ("main.js", "manifest.json", "styles.css", "local-development-build.json"):
         _regular_file(root / name)
+    _verify_migration_templates(root / "migration")
     receipt = _strict_canonical_json(root / "local-development-build.json")
     if (
         set(receipt)
@@ -155,6 +166,7 @@ def _verify_artifact(root: Path, *, allow_data_json: bool = False) -> None:
             "runtimeVersion",
             "schemaVersion",
             "sourceTreeSha256",
+            "targetVaultTemplateSha256",
         }
         or receipt.get("developmentOnly") is not True
         or receipt.get("schemaVersion") != 1
@@ -164,6 +176,8 @@ def _verify_artifact(root: Path, *, allow_data_json: bool = False) -> None:
     if manifest.get("isDesktopOnly") is not True or manifest.get("version") != receipt.get("pluginVersion"):
         raise LocalPluginInstallError("Obsidian manifest differs from the local build receipt")
     _verify_exact_runtime_layout(root / "runtime")
+    if receipt.get("targetVaultTemplateSha256") != _target_vault_template_digest(root / "migration" / "target-vault"):
+        raise LocalPluginInstallError("target Vault migration templates differ from the local build receipt")
     runtime_root = root / "runtime" / "windows-x64" / "local-development"
     trust = InstalledDevelopmentRuntimeTrust(runtime_root)
     if (
@@ -201,6 +215,77 @@ def _verify_exact_runtime_layout(runtime: Path) -> None:
             raise LocalPluginInstallError("plugin Runtime layout is unavailable") from error
         if actual != expected or any(not (directory / name).is_dir() for name in expected):
             raise LocalPluginInstallError("plugin Runtime layout is not exact")
+
+
+def _verify_migration_templates(root: Path) -> None:
+    expected = {
+        "target-vault/agent.md",
+        "target-vault/obsidian-cli/SKILL.md",
+    }
+    actual = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
+    if actual != expected:
+        raise LocalPluginInstallError("plugin migration template layout is not exact")
+    for relative in expected:
+        _regular_file(root.joinpath(*relative.split("/")))
+
+
+def _target_vault_template_digest(root: Path) -> str:
+    entries: list[dict[str, Any]] = []
+    for path in sorted(
+        (item for item in root.rglob("*") if item.is_file()), key=lambda item: item.relative_to(root).as_posix()
+    ):
+        _regular_file(path)
+        payload = path.read_bytes()
+        entries.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "sha256": f"sha256:{hashlib.sha256(payload).hexdigest()}",
+                "size": len(payload),
+            }
+        )
+    canonical = json.dumps(
+        {"files": entries},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+
+
+def _migrate_known_legacy_install(target: Path, vault: Path) -> None:
+    """Migrate only the standard legacy plugin; never decode ordinary update data."""
+
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        return
+    local_root = Path(local_app_data).resolve(strict=False) / "OfferAgent"
+    source_state = local_root / "state.db"
+    legacy_plugin_data = vault / ".obsidian" / "plugins" / "offeragent" / "data.json"
+    if not source_state.is_file() or not legacy_plugin_data.is_file():
+        return
+    from offeragent_harness.migration import LegacyMigrationRequest, migrate_legacy_obsidian
+
+    portable = ensure_portable_workspace_config(vault)
+    record = WorkspaceRegistry(local_root / "workspace-registry.json").register(
+        vault,
+        portable_workspace_id=portable.portable_workspace_id,
+    )
+    normalized_state = str(source_state.resolve(strict=True)).lower()
+    namespace = hashlib.sha256(normalized_state.encode("utf-8")).hexdigest()[:24]
+    source_attachments = local_root / "attachments" / namespace
+    migrate_legacy_obsidian(
+        LegacyMigrationRequest(
+            source_state=source_state,
+            source_attachments=source_attachments,
+            source_plugin_data=legacy_plugin_data,
+            target_state_directory=local_root / "workspaces" / record.workspace_instance_id,
+            target_plugin_data=target / "data.json",
+            vault_root=vault,
+            target_templates=target / "migration" / "target-vault",
+            workspace_id=portable.portable_workspace_id,
+        )
+    )
 
 
 def _strict_canonical_json(path: Path, *, allow_pretty: bool = False) -> dict[str, Any]:

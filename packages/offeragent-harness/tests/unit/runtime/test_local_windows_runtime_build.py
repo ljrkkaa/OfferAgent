@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from scripts import build_local_windows_plugin, local_windows_runtime_build
+from scripts import build_local_windows_plugin, install_local_windows_plugin, local_windows_runtime_build
 from scripts.local_windows_runtime_build import merge_identical_tree, normalize_pyinstaller_base_library
 
 
@@ -126,6 +126,41 @@ def test_source_tree_identity_covers_the_complete_schema_tree() -> None:
     assert identity.schema_tree_sha256 == build_local_windows_plugin._schema_tree_digest(
         build_local_windows_plugin.ROOT / "schema"
     )
+
+
+def test_builder_and_installer_share_the_target_vault_template_identity() -> None:
+    templates = build_local_windows_plugin.ROOT / "packaging" / "target-vault"
+
+    assert build_local_windows_plugin.target_vault_template_digest(
+        templates
+    ) == install_local_windows_plugin._target_vault_template_digest(templates)
+
+
+def test_target_vault_templates_use_only_the_python_harness_tool_language() -> None:
+    templates = build_local_windows_plugin.ROOT / "packaging" / "target-vault"
+    contract = (templates / "agent.md").read_text(encoding="utf-8")
+    skill = (templates / "obsidian-cli" / "SKILL.md").read_text(encoding="utf-8")
+    required = {
+        "agent_contract.read",
+        "skill.read",
+        "daily_note.context",
+        "planning_memory.list",
+        "planning_memory.read",
+        "interview_catalog.search",
+        "research_browser.navigate",
+        "vault.list",
+        "vault.search",
+        "vault.read",
+        "project.list",
+        "project.search",
+        "project.read",
+        "vault.changes.apply",
+    }
+
+    assert all(name in contract for name in required)
+    assert "旧名称" in contract and "unknown outcome" in contract and "Resume" in contract
+    assert "vault.changes.apply" in skill
+    assert "`obsidian " not in skill and "PowerShell" in skill
 
 
 def test_nested_schema_change_updates_both_source_and_schema_identity(tmp_path: Path) -> None:

@@ -5,8 +5,10 @@ import json
 from pathlib import Path
 
 import pytest
+from scripts import install_local_windows_plugin as installer
 from scripts.install_local_windows_plugin import install_local_plugin
 
+from offeragent_harness import migration
 from offeragent_harness.protocol.schemas import PROTOCOL_VERSION, schema_hash
 from offeragent_harness.runtime.development_runtime_manifest import (
     DEVELOPMENT_MANIFEST_NAME,
@@ -72,6 +74,10 @@ def _artifact(root: Path) -> Path:
         encoding="utf-8",
     )
     (root / "styles.css").write_text("/* local */\n", encoding="utf-8")
+    templates = root / "migration" / "target-vault"
+    (templates / "obsidian-cli").mkdir(parents=True)
+    (templates / "agent.md").write_text("# Agent\n", encoding="utf-8")
+    (templates / "obsidian-cli" / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
     (root / "manifest.json").write_text(
         json.dumps(
             {
@@ -92,6 +98,7 @@ def _artifact(root: Path) -> Path:
         "runtimeVersion": manifest.runtime_version,
         "schemaVersion": 1,
         "sourceTreeSha256": source_hash,
+        "targetVaultTemplateSha256": installer._target_vault_template_digest(templates),
     }
     (root / "local-development-build.json").write_bytes(_canonical(receipt))
     return root
@@ -157,6 +164,68 @@ def test_installer_rolls_back_old_plugin_and_data_on_post_activation_failure(
     assert (target / "data.json").read_bytes() == secret
 
 
+def test_legacy_migration_failure_is_inside_plugin_activation_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "offeragent_harness.runtime.development_runtime_manifest.native_windows_architecture",
+        lambda: "x64",
+    )
+    artifact = _artifact(tmp_path / "artifact")
+    vault = tmp_path / "Vault"
+    target = vault / ".obsidian" / "plugins" / "offeragent-obsidian-plugin"
+    target.mkdir(parents=True)
+    (target / "main.js").write_text("old", encoding="utf-8")
+    (target / "data.json").write_bytes(b"opaque-old-settings")
+
+    from scripts import install_local_windows_plugin as module
+
+    def fail_migration(installed: Path, root: Path) -> None:
+        assert installed == target
+        assert root == vault.resolve()
+        assert "OFFERAGENT_LOCAL_DEVELOPMENT_RUNTIME_V1" in (installed / "main.js").read_text(encoding="utf-8")
+        raise RuntimeError("injected legacy migration failure")
+
+    monkeypatch.setattr(module, "_migrate_known_legacy_install", fail_migration)
+    with pytest.raises(RuntimeError, match="legacy migration"):
+        install_local_plugin(artifact, vault)
+
+    assert (target / "main.js").read_text(encoding="utf-8") == "old"
+    assert (target / "data.json").read_bytes() == b"opaque-old-settings"
+
+
+def test_standard_legacy_install_is_discovered_as_one_explicit_migration_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local = tmp_path / "Local"
+    source_state = local / "OfferAgent" / "state.db"
+    source_state.parent.mkdir(parents=True)
+    source_state.write_bytes(b"legacy-snapshot")
+    vault = tmp_path / "Vault"
+    legacy_data = vault / ".obsidian" / "plugins" / "offeragent" / "data.json"
+    legacy_data.parent.mkdir(parents=True)
+    legacy_data.write_text('{"vaultPermissionMode":"read_only"}', encoding="utf-8")
+    target = vault / ".obsidian" / "plugins" / "offeragent-obsidian-plugin"
+    (target / "migration" / "target-vault").mkdir(parents=True)
+    captured: list[migration.LegacyMigrationRequest] = []
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    monkeypatch.setattr(migration, "migrate_legacy_obsidian", lambda request: captured.append(request))
+
+    installer._migrate_known_legacy_install(target, vault)
+
+    assert len(captured) == 1
+    request = captured[0]
+    assert request.source_state == source_state
+    assert request.source_plugin_data == legacy_data
+    assert request.target_plugin_data == target / "data.json"
+    assert request.target_templates == target / "migration" / "target-vault"
+    assert request.workspace_id.startswith("ws_")
+    assert request.target_state_directory.parent == local / "OfferAgent" / "workspaces"
+    assert request.source_attachments.parent == local / "OfferAgent" / "attachments"
+
+
 def test_installer_rejects_data_json_inside_build_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -171,6 +240,23 @@ def test_installer_rejects_data_json_inside_build_artifact(
     vault.mkdir()
 
     with pytest.raises(RuntimeError, match=r"must not contain data\.json"):
+        install_local_plugin(artifact, vault)
+
+
+def test_installer_rejects_target_vault_template_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "offeragent_harness.runtime.development_runtime_manifest.native_windows_architecture",
+        lambda: "x64",
+    )
+    artifact = _artifact(tmp_path / "artifact")
+    (artifact / "migration" / "target-vault" / "agent.md").write_text("# Replaced after build\n", encoding="utf-8")
+    vault = tmp_path / "Vault"
+    vault.mkdir()
+
+    with pytest.raises(RuntimeError, match="templates differ"):
         install_local_plugin(artifact, vault)
 
 

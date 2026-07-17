@@ -114,7 +114,7 @@ LOCAL_RUNTIME_EXES = (
 )
 _FORBIDDEN_FROZEN_PROJECT_PREFIXES = (
     "project:src/offeragent_harness/testing/",
-    "project:src/offeragent_harness/migration/",
+    "project:src/offeragent_harness/migration",
     "project:src/offeragent_harness/cli.py",
 )
 _FORBIDDEN_FROZEN_DISTRIBUTIONS = (
@@ -208,6 +208,8 @@ def main() -> int:
             if not source.is_file() or source.is_symlink():
                 raise RuntimeError(f"local plugin build is missing {name}")
             shutil.copy2(source, staging / name)
+        target_vault_templates = staging / "migration" / "target-vault"
+        shutil.copytree(ROOT / "packaging" / "target-vault", target_vault_templates)
         runtime_target = staging / "runtime" / "windows-x64" / "local-development"
         shutil.copytree(runtime, runtime_target)
         receipt = {
@@ -217,6 +219,7 @@ def main() -> int:
             "runtimeVersion": runtime_version,
             "schemaVersion": 1,
             "sourceTreeSha256": source_digest,
+            "targetVaultTemplateSha256": target_vault_template_digest(target_vault_templates),
         }
         (staging / "local-development-build.json").write_bytes(_canonical_json(receipt) + b"\n")
         _require_embedded_schema_identity(runtime, source_identity.schema_tree_sha256)
@@ -426,6 +429,20 @@ def collect_runtime_records(runtime: Path) -> tuple[RuntimeFileRecord, ...]:
             )
         )
     return tuple(records)
+
+
+def target_vault_template_digest(root: Path) -> str:
+    expected = {"agent.md", "obsidian-cli/SKILL.md"}
+    files = {path.relative_to(root).as_posix(): path for path in root.rglob("*") if path.is_file()}
+    if set(files) != expected:
+        raise RuntimeError("target Vault migration template set is not exact")
+    entries = []
+    for relative, path in sorted(files.items()):
+        if path.is_symlink() or path.stat().st_nlink != 1:
+            raise RuntimeError("target Vault migration template is not a unique regular file")
+        digest, size = _digest_file_and_size(path)
+        entries.append({"path": relative, "sha256": digest, "size": size})
+    return _digest_bytes(_canonical_json({"files": entries}))
 
 
 def source_tree_identity() -> SourceTreeIdentity:
