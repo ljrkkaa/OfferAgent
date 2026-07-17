@@ -1223,3 +1223,421 @@ async def test_scripted_interview_submission_deduplicates_questions_in_one_atomi
     assert [item["name"] for item in recorder.started_calls] == [item.name for item in calls]
     assert sum(item["name"] == "vault.changes.apply" for item in recorder.started_calls) == 1
     assert "未保存原始素材" in result.assistant_text
+
+
+class _ProjectTrainingRecorder:
+    def __init__(self, dispatcher: RuntimeApplicationCommandDispatcher) -> None:
+        self.started_calls: list[Mapping[str, object]] = []
+        self._dispatcher = dispatcher
+        self._completions: list[asyncio.Task[object]] = []
+
+    async def commit(
+        self,
+        state: RunState,
+        *,
+        event_type: str,
+        payload: Mapping[str, object],
+        terminal: bool = False,
+    ) -> None:
+        del state, terminal
+        if event_type != "tool.started":
+            return
+        call = cast(Mapping[str, object], payload["call"])
+        self.started_calls.append(call)
+        name = cast(str, call["name"])
+        arguments = cast(Mapping[str, object], call["arguments"])
+        source_refs: list[Mapping[str, object]] = []
+        side_effects: list[Mapping[str, object]] = []
+        if name == "agent_contract.read":
+            data: Mapping[str, object] = {
+                "path": "agent.md",
+                "content": "# OfferAgent\n\nGround Project Interview Training in registered evidence.",
+                "contentHash": "sha256:" + "1" * 64,
+            }
+        elif name == "interview_catalog.search":
+            data = {
+                "experienceCandidates": [],
+                "questionCandidates": [
+                    {
+                        "path": "interviews/questions/stale-cache-invalidation.md",
+                        "questionId": "question_stale_cache",
+                        "title": "How do you prevent stale cache invalidation?",
+                        "answerState": "needs-research",
+                        "frequency": 2,
+                        "matchedTerms": ["cache invalidation project risk"],
+                        "modifiedVersion": "mtime:20:size:240",
+                        "contentHash": "sha256:" + "2" * 64,
+                    }
+                ],
+                "truncated": False,
+            }
+        elif name == "project.search":
+            assert arguments["projectId"] == "offeragent"
+            data = {
+                "projectId": "offeragent",
+                "entries": [
+                    {
+                        "path": "src/cache.py",
+                        "modifiedVersion": "mtime:21:size:500",
+                        "contentHash": "sha256:" + "3" * 64,
+                        "snippets": [
+                            {
+                                "lineStart": 10,
+                                "lineEnd": 18,
+                                "content": "if current.version == expected_version: cache.delete(key)",
+                            }
+                        ],
+                    }
+                ],
+                "truncated": False,
+            }
+        elif name == "project.read":
+            assert arguments["projectId"] == "offeragent"
+            assert arguments["path"] == "src/cache.py"
+            data = {
+                "projectId": "offeragent",
+                "path": "src/cache.py",
+                "lineStart": 10,
+                "lineEnd": 18,
+                "modifiedVersion": "mtime:21:size:500",
+                "contentHash": "sha256:" + "3" * 64,
+                "content": (
+                    "# A delayed invalidation is a no-op after refresh.\n"
+                    "if current.version == expected_version:\n    cache.delete(key)"
+                ),
+                "truncated": False,
+            }
+            source_refs = [
+                {
+                    "type": "project",
+                    "projectId": "offeragent",
+                    "path": "src/cache.py",
+                    "contentHash": "sha256:" + "3" * 64,
+                    "modifiedVersion": "mtime:21:size:500",
+                    "lineStart": 10,
+                    "lineEnd": 18,
+                    "freshness": "fresh",
+                }
+            ]
+        elif name == "vault.read":
+            path = cast(str, arguments["path"])
+            if path == "interviews/questions/stale-cache-invalidation.md":
+                content = "# How do you prevent stale cache invalidation?\n"
+                digest = "sha256:" + "2" * 64
+                version = "mtime:20:size:240"
+            elif path == "projects/offeragent/profile.md":
+                content = (
+                    "---\nproject-id: offeragent\nownership: solo\n---\n"
+                    "# Project Interview Profile\n\n<!-- training-outcomes -->\n\n## Unrelated\nKeep me.\n"
+                )
+                digest = "sha256:" + "4" * 64
+                version = "mtime:22:size:180"
+            else:
+                assert path == "projects/offeragent/index.md"
+                content = "# Project Answers\n\n- Existing answer\n"
+                digest = "sha256:" + "5" * 64
+                version = "mtime:23:size:40"
+            data = {
+                "path": path,
+                "modifiedVersion": version,
+                "contentHash": digest,
+                "content": content,
+                "lineStart": 1,
+                "lineEnd": len(content.splitlines()),
+                "truncated": False,
+            }
+        else:
+            assert name == "vault.changes.apply"
+            operations = cast(Sequence[Mapping[str, object]], arguments["operations"])
+            assert [operation["path"] for operation in operations] == [
+                "projects/offeragent/profile.md",
+                "projects/offeragent/answers/stale-cache-invalidation.md",
+                "projects/offeragent/index.md",
+            ]
+            assert operations[0]["op"] == "replace"
+            assert operations[0]["find"] == "<!-- training-outcomes -->"
+            assert "## Unrelated\nKeep me." not in cast(str, operations[0]["replacement"])
+            assert operations[1]["op"] == "create"
+            answer = cast(str, operations[1]["content"])
+            assert "project://offeragent/src/cache.py#L10-L18" in answer
+            assert "production latency: unknown" in answer
+            assert "general-answer" not in answer
+            assert operations[2]["op"] == "append"
+            data = {
+                "batchId": arguments["batchId"],
+                "state": "applied",
+                "checkpointRef": "refs/offeragent/checkpoints/project-training",
+                "paths": [operation["path"] for operation in operations],
+                "beforeStateHash": "sha256:" + "6" * 64,
+                "afterStateHash": "sha256:" + "7" * 64,
+                "undoAvailable": True,
+            }
+            side_effects = [
+                {
+                    "kind": "file_created" if operation["op"] == "create" else "file_modified",
+                    "resource": cast(str, operation["path"]),
+                    "beforeHash": None if operation["op"] == "create" else "sha256:" + "8" * 64,
+                    "afterHash": "sha256:" + "9" * 64,
+                    "confirmed": True,
+                }
+                for operation in operations
+            ]
+        self._completions.append(
+            asyncio.create_task(
+                self._dispatcher.dispatch(
+                    "plugin-tools/complete",
+                    {
+                        "workspaceId": call["workspaceId"],
+                        "runId": call["runId"],
+                        "definitionFingerprint": call["definitionFingerprint"],
+                        "argsHash": call["argsHash"],
+                        "idempotencyKey": call["idempotencyKey"],
+                        "result": {
+                            "toolCallId": call["toolCallId"],
+                            "status": "succeeded",
+                            "summary": f"Completed {name}.",
+                            "data": data,
+                            "sourceRefs": source_refs,
+                            "sideEffects": side_effects,
+                        },
+                    },
+                    CancellationScope(name=f"completion-{name}"),
+                    context=ApplicationCommandContext(transport="stdio", client_id="obsidian-plugin"),
+                )
+            )
+        )
+
+    async def join(self) -> None:
+        await asyncio.gather(*self._completions)
+
+
+@pytest.mark.asyncio
+async def test_project_training_stays_in_conversation_until_confirmed_outcome_batch() -> None:
+    from offeragent_harness.runtime.plugin_tools import plugin_tool_definitions
+
+    definitions = {definition.name: definition for definition in plugin_tool_definitions()}
+    executor = PluginToolExecutor()
+
+    async def unused(*args: object) -> Mapping[str, object]:
+        del args
+        return {}
+
+    handlers: dict[str, ApplicationCommandHandler] = {
+        method: cast(ApplicationCommandHandler, unused) for method in COMMAND_REGISTRY
+    }
+    handlers.update(plugin_tool_completion_handlers(executor=executor))
+    recorder = _ProjectTrainingRecorder(
+        RuntimeApplicationCommandDispatcher(application=_ReadyApplication(), handlers=handlers)
+    )
+
+    def call(run_id: str, name: str, arguments: Mapping[str, object], index: int) -> ToolCall:
+        definition = definitions[name]
+        return ToolCall(
+            tool_call_id=f"call_{run_id}_{index}",
+            run_id=run_id,
+            workspace_id="ws_vault",
+            name=name,
+            version=definition.version,
+            arguments=arguments,
+            args_hash=canonical_json_sha256(arguments),
+            idempotency_key=f"{run_id}-{index}",
+            deadline=datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc),
+            lineage=AgentLineage.root(run_id),
+            definition_fingerprint=definition.fingerprint,
+            result_sensitivity=definition.result_sensitivity,
+        )
+
+    def evidence_calls(run_id: str, offset: int) -> tuple[ToolCall, ToolCall]:
+        return (
+            call(
+                run_id,
+                "project.search",
+                {
+                    "projectId": "offeragent",
+                    "query": "stale cache invalidation expected version",
+                    "limit": 5,
+                },
+                offset,
+            ),
+            call(
+                run_id,
+                "project.read",
+                {
+                    "projectId": "offeragent",
+                    "path": "src/cache.py",
+                    "lineStart": 10,
+                    "lineEnd": 18,
+                    "expectedModifiedVersion": "mtime:21:size:500",
+                    "expectedContentHash": "sha256:" + "3" * 64,
+                },
+                offset + 1,
+            ),
+        )
+
+    async def run_turn(run_id: str, calls: Sequence[ToolCall], response: str) -> RunState:
+        result = await run_agent_loop(
+            RunState("ws_vault", "ses_training", f"turn_{run_id}", run_id, AgentLineage.root(run_id)),
+            planner=_SequentialProductPlanner(calls, response),
+            tool_kernel=_PluginDefinitionKernel(definitions, executor),
+            recorder=recorder,
+            budget=BudgetLedger(
+                RunBudget(12, 12, 2, 60, 100, 100, Decimal("1"), 1_000, 1),
+                started_at=datetime.now(timezone.utc),
+            ),
+            cancellation=CancellationScope(name=run_id),
+            now=lambda: datetime.now(timezone.utc),
+        )
+        await recorder.join()
+        return result
+
+    selected_run = "run_training_selected"
+    selected = await run_turn(
+        selected_run,
+        (call(selected_run, "agent_contract.read", {}, 1), *evidence_calls(selected_run, 2)),
+        "[Project Interview Question]\nFor the selected stale-invalidation question, what invariant did you enforce?",
+    )
+    assert selected.assistant_text.count("?") == 1
+    assert not any(
+        item["runId"] == selected_run and item["name"] == "interview_catalog.search" for item in recorder.started_calls
+    )
+
+    question_run = "run_training_question"
+    question_calls = (
+        call(question_run, "agent_contract.read", {}, 1),
+        call(
+            question_run,
+            "interview_catalog.search",
+            {
+                "company": "Acme",
+                "role": "Backend Engineer",
+                "questionTerms": ["cache invalidation project risk"],
+            },
+            2,
+        ),
+        call(
+            question_run,
+            "vault.read",
+            {
+                "path": "interviews/questions/stale-cache-invalidation.md",
+                "expectedModifiedVersion": "mtime:20:size:240",
+                "expectedContentHash": "sha256:" + "2" * 64,
+            },
+            3,
+        ),
+        *evidence_calls(question_run, 4),
+    )
+    question = await run_turn(
+        question_run,
+        question_calls,
+        "[Project Interview Question]\nHow did you prevent a stale request from invalidating a newer cache value?",
+    )
+    assert question.assistant_text.count("?") == 1
+
+    followup_run = "run_training_followup"
+    followup = await run_turn(
+        followup_run,
+        (call(followup_run, "agent_contract.read", {}, 1), *evidence_calls(followup_run, 2)),
+        (
+            "Your claim that every invalidation deletes the key contradicts the version guard at "
+            "project://offeragent/src/cache.py#L10-L18. What happens after a newer refresh?"
+        ),
+    )
+    assert "contradicts" in followup.assistant_text
+    assert followup.assistant_text.count("?") == 1
+
+    feedback_run = "run_training_feedback"
+    feedback = await run_turn(
+        feedback_run,
+        (call(feedback_run, "agent_contract.read", {}, 1), *evidence_calls(feedback_run, 2)),
+        (
+            "Training Feedback: facts grounded; responsibility stated; trade-off is stale no-op; "
+            "metrics remain unknown; failure case covered; follow-up readiness needs rehearsal; duration was concise. "
+            "Confirm saving this refined outcome?"
+        ),
+    )
+    assert all(
+        label in feedback.assistant_text
+        for label in (
+            "facts",
+            "responsibility",
+            "trade-off",
+            "metrics",
+            "failure case",
+            "follow-up",
+            "duration",
+        )
+    )
+    assert not any(token in feedback.assistant_text for token in ("/10", "/100", "total score"))
+    assert not any(item["name"] == "vault.changes.apply" for item in recorder.started_calls)
+
+    save_run = "run_training_save"
+    save_calls = (
+        call(save_run, "agent_contract.read", {}, 1),
+        *evidence_calls(save_run, 2),
+        call(
+            save_run,
+            "vault.read",
+            {
+                "path": "projects/offeragent/profile.md",
+                "expectedModifiedVersion": "mtime:22:size:180",
+                "expectedContentHash": "sha256:" + "4" * 64,
+            },
+            4,
+        ),
+        call(
+            save_run,
+            "vault.read",
+            {
+                "path": "projects/offeragent/index.md",
+                "expectedModifiedVersion": "mtime:23:size:40",
+                "expectedContentHash": "sha256:" + "5" * 64,
+            },
+            5,
+        ),
+        call(
+            save_run,
+            "vault.changes.apply",
+            {
+                "batchId": "project_training_stale_cache_v1",
+                "task": "Save the user-confirmed Project Interview Training Outcome",
+                "operations": [
+                    {
+                        "op": "replace",
+                        "path": "projects/offeragent/profile.md",
+                        "find": "<!-- training-outcomes -->",
+                        "replacement": (
+                            "<!-- training-outcomes -->\n\n## Stale cache invalidation\n"
+                            "- Stable fact: expected-version guard prevents stale deletion.\n"
+                            "- Weak point: production metrics are unknown.\n"
+                            "- Likely follow-up: delayed invalidation after refresh.\n"
+                            "- Retrain: explain race, invariant, guard, and evidence gap."
+                        ),
+                        "expectedContentHash": "sha256:" + "4" * 64,
+                    },
+                    {
+                        "op": "create",
+                        "path": "projects/offeragent/answers/stale-cache-invalidation.md",
+                        "content": (
+                            "---\ntype: project-answer\nproject-id: offeragent\n"
+                            "question: stale-cache-invalidation\n---\n# Stale cache invalidation\n\n"
+                            "The expected-version guard makes delayed invalidation a no-op.\n\n"
+                            "Evidence: project://offeragent/src/cache.py#L10-L18 sha256:"
+                            + "3" * 64
+                            + "\n\nEvidence gaps: production latency: unknown.\n"
+                        ),
+                        "expectedContentHash": "absent",
+                    },
+                    {
+                        "op": "append",
+                        "path": "projects/offeragent/index.md",
+                        "content": "\n- [[answers/stale-cache-invalidation]]",
+                        "expectedContentHash": "sha256:" + "5" * 64,
+                    },
+                ],
+            },
+            6,
+        ),
+    )
+    saved = await run_turn(save_run, save_calls, "Confirmed Training Outcome saved with exact Project Evidence.")
+    assert saved.phase is RunPhase.COMPLETED
+    assert sum(item["name"] == "vault.changes.apply" for item in recorder.started_calls) == 1
