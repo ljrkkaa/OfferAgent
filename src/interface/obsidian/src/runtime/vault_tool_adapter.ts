@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-
 import type { TFile } from "obsidian";
 
 import type {
@@ -10,8 +8,12 @@ import type {
     ProtocolCommandResult,
     ToolResultDescriptor,
 } from "./generated_protocol";
+import { MetadataReadPort, VaultEvidenceAdapter } from "./vault_evidence";
+import { VaultControlAdapter, VaultControlOptions } from "./vault_control";
+import { ProjectEvidenceAdapter } from "./project_evidence";
 
 export interface VaultReadPort {
+    getFiles(): TFile[];
     getFileByPath(path: string): TFile | null;
     cachedRead(file: TFile): Promise<string>;
 }
@@ -38,9 +40,18 @@ export class VaultToolAdapter {
         private readonly vault: VaultReadPort,
         private readonly client: PluginToolCompletionClient,
         private readonly workspaceId: string,
+        metadata?: MetadataReadPort,
+        controls?: VaultControlOptions,
     ) {
         if (!workspaceId) throw new TypeError("workspaceId is required");
+        this.evidence = new VaultEvidenceAdapter(vault, workspaceId, metadata);
+        this.control = new VaultControlAdapter(vault, workspaceId, controls);
+        this.projects = new ProjectEvidenceAdapter(vault);
     }
+
+    private readonly evidence: VaultEvidenceAdapter;
+    private readonly control: VaultControlAdapter;
+    private readonly projects: ProjectEvidenceAdapter;
 
     async execute(call: ExecutableToolCallDescriptor): Promise<PluginToolCompleteResult> {
         this.validateBinding(call);
@@ -59,52 +70,23 @@ export class VaultToolAdapter {
     private validateBinding(call: ExecutableToolCallDescriptor): void {
         if (call.workspaceId !== this.workspaceId) throw new Error("plugin Tool call belongs to another Vault");
         if (call.executorLocation !== "plugin") throw new Error("Vault Tool Adapter accepts only plugin calls");
-        if (call.name !== "agent_contract.read" || call.version !== "1") {
+        if (![
+            "agent_contract.read", "skill.read", "daily_note.context",
+            "vault.list", "vault.search", "vault.read",
+            "project.list", "project.search", "project.read",
+        ].includes(call.name) ||
+            call.version !== "1") {
             throw new Error(`unsupported plugin Tool: ${call.name}@${call.version}`);
         }
-        if (Object.keys(call.arguments).length !== 0) throw new Error("agent_contract.read accepts no arguments");
+        if (call.name === "agent_contract.read" && Object.keys(call.arguments).length !== 0) {
+            throw new Error("agent_contract.read accepts no arguments");
+        }
     }
 
     private async executeBound(call: ExecutableToolCallDescriptor): Promise<ToolResultDescriptor> {
-        const path = "agent.md";
-        const file = this.vault.getFileByPath(path);
-        if (file === null) {
-            return failedResult(
-                call.toolCallId,
-                "resource.not_found",
-                "当前 Vault 中没有 agent.md Agent Contract。",
-                false,
-                { path },
-            );
-        }
-        try {
-            const content = await this.vault.cachedRead(file);
-            const contentHash = `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
-            return {
-                toolCallId: call.toolCallId,
-                status: "succeeded",
-                summary: "Read the Vault Agent Contract.",
-                data: { path, content, contentHash },
-                artifactRefs: [],
-                sourceRefs: [{
-                    type: "vault",
-                    file: { workspaceId: this.workspaceId, path, contentHash },
-                    freshness: "fresh",
-                    label: "Vault Agent Contract",
-                }],
-                sideEffects: [],
-                retryable: false,
-                error: null,
-            };
-        } catch {
-            return failedResult(
-                call.toolCallId,
-                "tool.failed",
-                "无法通过 Obsidian Vault API 读取 agent.md。",
-                true,
-                { path },
-            );
-        }
+        if (call.name.startsWith("vault.")) return this.evidence.execute(call);
+        if (call.name.startsWith("project.")) return this.projects.execute(call);
+        return this.control.execute(call);
     }
 }
 
@@ -157,32 +139,4 @@ function record(value: unknown, label: string): Record<string, unknown> {
 
 function asError(value: unknown): Error {
     return value instanceof Error ? value : new Error(String(value));
-}
-
-function failedResult(
-    toolCallId: string,
-    code: "resource.not_found" | "tool.failed",
-    message: string,
-    retryable: boolean,
-    details: Readonly<Record<string, string>>,
-): ToolResultDescriptor {
-    return {
-        toolCallId,
-        status: "failed",
-        summary: message,
-        data: {},
-        artifactRefs: [],
-        sourceRefs: [],
-        sideEffects: [],
-        retryable,
-        error: {
-            code,
-            retryable,
-            cancelled: false,
-            userVisibleMessage: message,
-            details,
-            retryAfterMs: null,
-            traceId: null,
-        },
-    };
 }

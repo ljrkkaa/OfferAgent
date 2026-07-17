@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, Field, StringConstraints, model_validator
+from pydantic import AfterValidator, Field, StringConstraints, field_validator, model_validator
 from typing_extensions import TypeAliasType
 
 from ._base import WireModel
@@ -126,10 +126,32 @@ class ArtifactSourceRef(WireModel):
     label: str | None = Field(default=None, min_length=1, max_length=512)
 
 
+class ProjectSourceRef(WireModel):
+    """A precise source inside a Vault-registered external project root."""
+
+    type: Literal["project"]
+    project_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    path: RelativeVaultPath
+    content_hash: Sha256Digest
+    modified_version: str = Field(min_length=1, max_length=128)
+    line_start: int | None = Field(default=None, ge=1)
+    line_end: int | None = Field(default=None, ge=1)
+    freshness: Freshness = Freshness.UNKNOWN
+    label: str | None = Field(default=None, min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def _line_range_is_ordered(self) -> ProjectSourceRef:
+        if self.line_end is not None and self.line_start is None:
+            raise ValueError("lineEnd requires lineStart")
+        if self.line_start is not None and self.line_end is not None and self.line_end < self.line_start:
+            raise ValueError("lineEnd must be greater than or equal to lineStart")
+        return self
+
+
 SourceRef = TypeAliasType(
     "SourceRef",
     Annotated[
-        VaultSourceRef | ArtifactSourceRef,
+        VaultSourceRef | ArtifactSourceRef | ProjectSourceRef,
         Field(discriminator="type"),
     ],
 )
@@ -167,6 +189,46 @@ class ArtifactContentBlock(WireModel):
     preview: str | None = Field(default=None, max_length=32_768)
 
 
+def _validate_pinned_evidence_path(value: str) -> str:
+    lowered = value.lower()
+    if lowered == "agent.md" or any(segment.startswith(".") for segment in value.split("/")):
+        raise ValueError("pinned context must identify discoverable Vault evidence")
+    if not lowered.endswith((".md", ".txt")):
+        raise ValueError("pinned context must identify Markdown or text evidence")
+    return value
+
+
+class PinnedDocumentContextReference(WireModel):
+    kind: Literal["document"]
+    path: RelativeVaultPath
+
+    _path_is_discoverable_evidence = field_validator("path")(_validate_pinned_evidence_path)
+
+
+class PinnedSelectionContextReference(WireModel):
+    kind: Literal["selection"]
+    path: RelativeVaultPath
+    line_start: int = Field(ge=1)
+    line_end: int = Field(ge=1)
+
+    _path_is_discoverable_evidence = field_validator("path")(_validate_pinned_evidence_path)
+
+    @model_validator(mode="after")
+    def _line_range_is_ordered(self) -> PinnedSelectionContextReference:
+        if self.line_end < self.line_start:
+            raise ValueError("lineEnd must be greater than or equal to lineStart")
+        return self
+
+
+PinnedContextReference = TypeAliasType(
+    "PinnedContextReference",
+    Annotated[
+        PinnedDocumentContextReference | PinnedSelectionContextReference,
+        Field(discriminator="kind"),
+    ],
+)
+
+
 ContentBlock = TypeAliasType(
     "ContentBlock",
     Annotated[
@@ -189,6 +251,10 @@ __all__ = [
     "Freshness",
     "ImageContentBlock",
     "NonEmptyText",
+    "PinnedContextReference",
+    "PinnedDocumentContextReference",
+    "PinnedSelectionContextReference",
+    "ProjectSourceRef",
     "RelativeVaultPath",
     "SourceRef",
     "TextContentBlock",

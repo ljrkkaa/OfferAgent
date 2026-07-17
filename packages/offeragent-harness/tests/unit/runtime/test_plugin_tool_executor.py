@@ -17,6 +17,7 @@ from offeragent_harness.runtime.plugin_tools import (
     PluginToolExecutor,
     PluginToolNotPending,
     plugin_tool_completion_handlers,
+    plugin_tool_definitions,
 )
 from offeragent_harness.sessions import AgentLineage
 from offeragent_harness.testing import FakeRunCancelled, ManualCancellationCode, ManualCancellationToken
@@ -251,6 +252,34 @@ async def test_conflicting_duplicate_plugin_completion_is_rejected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_completed_plugin_call_reexecutes_only_as_an_exact_local_replay() -> None:
+    definition = _definition()
+    call = _call(definition)
+    result = ToolResult(
+        call.tool_call_id,
+        ToolResultStatus.SUCCEEDED,
+        {"content": "# OfferAgent"},
+        "Read the Vault Agent Contract.",
+        (),
+        (),
+        (),
+        False,
+        None,
+        None,
+        None,
+    )
+    executor = PluginToolExecutor()
+    execution = asyncio.create_task(executor.execute(call, ManualCancellationToken()))
+    await asyncio.sleep(0)
+    await executor.complete(PluginToolCompletion.from_call(call, result))
+    assert await execution == result
+
+    assert await executor.execute(call, ManualCancellationToken()) == result
+    with pytest.raises(PluginToolBindingMismatch):
+        await executor.execute(replace(call, workspace_id="ws_other"), ManualCancellationToken())
+
+
+@pytest.mark.asyncio
 async def test_shutdown_cancels_disconnected_read_and_rejects_its_late_completion() -> None:
     definition = _definition()
     call = _call(definition)
@@ -277,3 +306,39 @@ async def test_shutdown_cancels_disconnected_read_and_rejects_its_late_completio
         await execution
     with pytest.raises(PluginToolNotPending):
         await executor.complete(PluginToolCompletion.from_call(call, result))
+
+
+def test_vault_evidence_definitions_preserve_the_plugin_read_boundary() -> None:
+    definitions = {definition.name: definition for definition in plugin_tool_definitions()}
+
+    assert {
+        "agent_contract.read",
+        "skill.read",
+        "daily_note.context",
+        "vault.list",
+        "vault.search",
+        "vault.read",
+        "project.list",
+        "project.search",
+        "project.read",
+    } <= definitions.keys()
+    capabilities = {
+        "agent_contract.read": "agent_contract.read",
+        "skill.read": "skill.read",
+        "daily_note.context": "daily_note.read",
+        "vault.list": "vault.read",
+        "vault.search": "vault.read",
+        "vault.read": "vault.read",
+        "project.list": "project.read",
+        "project.search": "project.read",
+        "project.read": "project.read",
+    }
+    for name, definition in definitions.items():
+        assert definition.executor_location is ExecutorLocation.PLUGIN
+        assert definition.risk is RiskClass.READ
+        assert definition.side_effect_class is SideEffectClass.READ
+        assert definition.required_capabilities == frozenset({capabilities[name]})
+        assert definition.result_sensitivity is ResultSensitivity.WORKSPACE
+        assert definition.idempotent and definition.retryable
+    assert definitions["vault.read"].output_limit_bytes == 65_536
+    assert definitions["vault.search"].output_limit_bytes == 65_536

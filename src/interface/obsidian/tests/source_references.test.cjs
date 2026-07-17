@@ -50,3 +50,25 @@ test("Vault reference helpers use protocol file.path and preserve line targets",
     assert.equal(merged[0].freshness, "fresh");
     assert.equal(sourceReferenceLabel(merged[0]), "已刷新:4-8");
 });
+
+test("Project references keep project identity and exact line ranges", () => {
+    const { sourceReferenceArray, sourceReferenceLabel, projectReferenceTarget } = loadModule();
+    const references = sourceReferenceArray([{
+        type: "project",
+        projectId: "offeragent",
+        path: "src/agent.py",
+        contentHash: `sha256:${"a".repeat(64)}`,
+        modifiedVersion: "mtime:17:size:41",
+        lineStart: 7,
+        lineEnd: 9,
+        freshness: "fresh",
+    }]);
+
+    assert.equal(sourceReferenceLabel(references[0]), "offeragent/src/agent.py:7-9");
+    assert.deepEqual(projectReferenceTarget(references[0]), {
+        projectId: "offeragent",
+        path: "src/agent.py",
+        lineStart: 7,
+        lineEnd: 9,
+    });
+});

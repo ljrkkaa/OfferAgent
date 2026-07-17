@@ -14,7 +14,7 @@ from offeragent_harness.permissions import RiskClass
 from offeragent_harness.ports import ApplicationCommandContext, CancellationToken
 from offeragent_harness.protocol._base import WireModel
 from offeragent_harness.protocol.common import ToolCallStatus, ToolResultDescriptor
-from offeragent_harness.protocol.content import ArtifactSourceRef, VaultSourceRef
+from offeragent_harness.protocol.content import ArtifactSourceRef, ProjectSourceRef, VaultSourceRef
 from offeragent_harness.protocol.messages import PluginToolCompleteParams, PluginToolCompleteResult
 from offeragent_harness.runtime.application_dispatcher import ApplicationCommandHandler
 from offeragent_harness.tools import (
@@ -108,6 +108,12 @@ class PluginToolExecutor:
         async with self._registered:
             if call.tool_call_id in self._pending:
                 raise PluginToolExecutionError(f"plugin tool call {call.tool_call_id!r} is already pending")
+            prior = self._completed.get(call.tool_call_id)
+            if prior is not None:
+                if prior != PluginToolCompletion.from_call(call, prior.result):
+                    raise PluginToolBindingMismatch(call.tool_call_id)
+                self._completed.move_to_end(call.tool_call_id)
+                return prior.result
             self._pending[call.tool_call_id] = _PendingCompletion(call, future)
             self._registered.notify_all()
         cancel_wait = asyncio.create_task(cancellation.wait())
@@ -203,10 +209,12 @@ _SIDE_EFFECT_KIND = {
 }
 
 
-def _source_reference_id(reference: VaultSourceRef | ArtifactSourceRef) -> str:
+def _source_reference_id(reference: VaultSourceRef | ArtifactSourceRef | ProjectSourceRef) -> str:
     if isinstance(reference, VaultSourceRef):
         revision = reference.file.content_hash or "current"
         return f"vault:{reference.file.workspace_id}:{reference.file.path}:{revision}"
+    if isinstance(reference, ProjectSourceRef):
+        return f"project:{reference.project_id}:{reference.path}:{reference.content_hash}"
     return f"artifact:{reference.artifact.artifact_id}"
 
 
@@ -292,9 +300,9 @@ def plugin_tool_definitions() -> tuple[ToolDefinition, ...]:
     """Definitions implemented only by the connected Obsidian plugin."""
 
     return (
-        ToolDefinition(
+        _plugin_read_definition(
             name="agent_contract.read",
-            version="1",
+            required_capability="agent_contract.read",
             description="Read the current Vault's agent.md Agent Contract through the Obsidian Vault API.",
             input_schema={"type": "object", "properties": {}, "additionalProperties": False},
             output_schema={
@@ -307,20 +315,313 @@ def plugin_tool_definitions() -> tuple[ToolDefinition, ...]:
                 "required": ["path", "content", "contentHash"],
                 "additionalProperties": False,
             },
-            executor_location=ExecutorLocation.PLUGIN,
-            risk=RiskClass.READ,
-            side_effect_class=SideEffectClass.READ,
-            required_capabilities=frozenset({"vault.read"}),
-            concurrency_safe=True,
-            idempotent=True,
-            retryable=True,
-            timeout_ms=10_000,
-            output_limit_bytes=1_048_576,
-            preflight_mode=PreflightMode.NONE,
-            preflight_provider=None,
-            approval_evidence=ApprovalEvidence.NONE,
-            result_sensitivity=ResultSensitivity.WORKSPACE,
+            output_limit_bytes=65_536,
         ),
+        _plugin_read_definition(
+            name="skill.read",
+            required_capability="skill.read",
+            description=(
+                "Read SKILL.md or one directly referenced resource from an explicitly selected "
+                "Vault-local Skill; paths cannot traverse outside that Skill."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "skill": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64,
+                        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$",
+                    },
+                    "resource": {"type": "string", "minLength": 1, "maxLength": 512},
+                },
+                "required": ["skill"],
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "skill": {"type": "string"},
+                    "resource": {"type": "string"},
+                    "path": {"type": "string"},
+                    "modifiedVersion": {"type": "string"},
+                    "contentHash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                    "content": {"type": "string", "maxLength": 32_768},
+                },
+                "required": [
+                    "skill",
+                    "resource",
+                    "path",
+                    "modifiedVersion",
+                    "contentHash",
+                    "content",
+                ],
+                "additionalProperties": False,
+            },
+            output_limit_bytes=65_536,
+        ),
+        _plugin_read_definition(
+            name="daily_note.context",
+            required_capability="daily_note.read",
+            description=(
+                "Resolve the current Vault's Daily Notes configuration, local date, existing note, "
+                "and template without creating or modifying a note."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+                },
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "resolvedDate": {"type": "string"},
+                    "dateFormat": {"type": "string"},
+                    "targetPath": {"type": "string"},
+                    "targetExists": {"type": "boolean"},
+                    "targetContent": {"type": ["string", "null"], "maxLength": 32_768},
+                    "targetModifiedVersion": {"type": ["string", "null"]},
+                    "targetContentHash": {
+                        "type": ["string", "null"],
+                        "pattern": "^sha256:[0-9a-f]{64}$",
+                    },
+                    "templatePath": {"type": ["string", "null"]},
+                    "templateContent": {"type": ["string", "null"], "maxLength": 32_768},
+                    "templateModifiedVersion": {"type": ["string", "null"]},
+                    "templateContentHash": {
+                        "type": ["string", "null"],
+                        "pattern": "^sha256:[0-9a-f]{64}$",
+                    },
+                },
+                "required": [
+                    "resolvedDate",
+                    "dateFormat",
+                    "targetPath",
+                    "targetExists",
+                    "targetContent",
+                    "targetModifiedVersion",
+                    "targetContentHash",
+                    "templatePath",
+                    "templateContent",
+                    "templateModifiedVersion",
+                    "templateContentHash",
+                ],
+                "additionalProperties": False,
+            },
+            output_limit_bytes=65_536,
+        ),
+        _plugin_read_definition(
+            name="vault.list",
+            description="List bounded current Markdown and text files from the Obsidian Vault.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "directory": {"type": "string", "maxLength": 512},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "entries": {"type": "array", "maxItems": 100, "items": {"type": "object"}},
+                    "truncated": {"type": "boolean"},
+                },
+                "required": ["entries", "truncated"],
+                "additionalProperties": False,
+            },
+            output_limit_bytes=131_072,
+        ),
+        _plugin_read_definition(
+            name="vault.search",
+            description="Locate bounded current Vault candidates by keyword; follow with vault.read before answering.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "minLength": 1, "maxLength": 512},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "snippetsPerFile": {"type": "integer", "minimum": 1, "maximum": 3},
+                    "snippetMaxBytes": {"type": "integer", "minimum": 16, "maximum": 512},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "entries": {"type": "array", "maxItems": 20, "items": {"type": "object"}},
+                    "truncated": {"type": "boolean"},
+                },
+                "required": ["entries", "truncated"],
+                "additionalProperties": False,
+            },
+            output_limit_bytes=65_536,
+        ),
+        _plugin_read_definition(
+            name="vault.read",
+            description="Read an exact bounded line range from current Vault evidence with optional version binding.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "minLength": 1, "maxLength": 512},
+                    "lineStart": {"type": "integer", "minimum": 1},
+                    "lineEnd": {"type": "integer", "minimum": 1},
+                    "expectedContentHash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                    "expectedModifiedVersion": {"type": "string", "minLength": 1, "maxLength": 128},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "lineStart": {"type": "integer", "minimum": 1},
+                    "lineEnd": {"type": "integer", "minimum": 1},
+                    "modifiedVersion": {"type": "string"},
+                    "contentHash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                    "content": {"type": "string", "maxLength": 32_768},
+                    "truncated": {"type": "boolean"},
+                },
+                "required": [
+                    "path",
+                    "lineStart",
+                    "lineEnd",
+                    "modifiedVersion",
+                    "contentHash",
+                    "content",
+                    "truncated",
+                ],
+                "additionalProperties": False,
+            },
+            output_limit_bytes=65_536,
+        ),
+        _plugin_read_definition(
+            name="project.list",
+            required_capability="project.read",
+            description="List bounded text sources from a Vault-registered external Project root.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "projectId": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "directory": {"type": "string", "maxLength": 512},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+                "required": ["projectId"],
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "projectId": {"type": "string"},
+                    "entries": {"type": "array", "maxItems": 100, "items": {"type": "object"}},
+                    "truncated": {"type": "boolean"},
+                },
+                "required": ["projectId", "entries", "truncated"],
+                "additionalProperties": False,
+            },
+            output_limit_bytes=131_072,
+        ),
+        _plugin_read_definition(
+            name="project.search",
+            required_capability="project.read",
+            description=(
+                "Locate bounded candidates in a Vault-registered Project; follow with project.read "
+                "using the returned version before answering."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "projectId": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "query": {"type": "string", "minLength": 1, "maxLength": 512},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "snippetMaxBytes": {"type": "integer", "minimum": 16, "maximum": 512},
+                },
+                "required": ["projectId", "query"],
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "projectId": {"type": "string"},
+                    "entries": {"type": "array", "maxItems": 20, "items": {"type": "object"}},
+                    "truncated": {"type": "boolean"},
+                },
+                "required": ["projectId", "entries", "truncated"],
+                "additionalProperties": False,
+            },
+            output_limit_bytes=65_536,
+        ),
+        _plugin_read_definition(
+            name="project.read",
+            required_capability="project.read",
+            description="Read an exact bounded line range from a registered Project with optional version binding.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "projectId": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "path": {"type": "string", "minLength": 1, "maxLength": 512},
+                    "lineStart": {"type": "integer", "minimum": 1},
+                    "lineEnd": {"type": "integer", "minimum": 1},
+                    "expectedContentHash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                    "expectedModifiedVersion": {"type": "string", "minLength": 1, "maxLength": 128},
+                },
+                "required": ["projectId", "path"],
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "projectId": {"type": "string"},
+                    "path": {"type": "string"},
+                    "lineStart": {"type": "integer", "minimum": 1},
+                    "lineEnd": {"type": "integer", "minimum": 1},
+                    "modifiedVersion": {"type": "string"},
+                    "contentHash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                    "content": {"type": "string", "maxLength": 32_768},
+                    "truncated": {"type": "boolean"},
+                },
+                "required": [
+                    "projectId", "path", "lineStart", "lineEnd", "modifiedVersion",
+                    "contentHash", "content", "truncated",
+                ],
+                "additionalProperties": False,
+            },
+            output_limit_bytes=65_536,
+        ),
+    )
+
+
+def _plugin_read_definition(
+    *,
+    name: str,
+    description: str,
+    input_schema: Mapping[str, object],
+    output_schema: Mapping[str, object],
+    output_limit_bytes: int,
+    required_capability: str = "vault.read",
+) -> ToolDefinition:
+    return ToolDefinition(
+        name=name,
+        version="1",
+        description=description,
+        input_schema=input_schema,
+        output_schema=output_schema,
+        executor_location=ExecutorLocation.PLUGIN,
+        risk=RiskClass.READ,
+        side_effect_class=SideEffectClass.READ,
+        required_capabilities=frozenset({required_capability}),
+        concurrency_safe=True,
+        idempotent=True,
+        retryable=True,
+        timeout_ms=10_000,
+        output_limit_bytes=output_limit_bytes,
+        preflight_mode=PreflightMode.NONE,
+        preflight_provider=None,
+        approval_evidence=ApprovalEvidence.NONE,
+        result_sensitivity=ResultSensitivity.WORKSPACE,
     )
 
 

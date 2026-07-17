@@ -2,7 +2,7 @@
   "use strict";
 
   const PROTOCOL_VERSION = "1.0";
-  const SCHEMA_HASH = "sha256:8158d53ca4cf5fa15dad078f4b1de864342747a9ab0bca949b590e2642e2c175";
+  const SCHEMA_HASH = "sha256:27023f8a8e469bdfb50fed22b98aeb50d085800a75cbc78dfe561daf9e45b40c";
   const CLIENT_VERSION = "0.1.0";
   const ARTIFACT_PAGE_BYTES = 65_536;
   const ARTIFACT_TOTAL_BYTES = 524_288;

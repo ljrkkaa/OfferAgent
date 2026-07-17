@@ -195,3 +195,241 @@ async def test_agent_contract_round_trips_from_started_event_to_the_same_agent_l
     assert result.phase is RunPhase.COMPLETED, list(zip(recorder.events, recorder.payloads, strict=True))
     assert recorder.events.index("tool.started") < recorder.events.index("tool.completed")
     assert recorder.events.index("tool.completed") < recorder.events.index("assistant.completed")
+
+
+class _PreciseEvidencePlanner:
+    def __init__(self, search: ToolCall, read: ToolCall) -> None:
+        self._search = search
+        self._read = read
+        self._round = 0
+
+    async def plan(self, state: RunState, cancellation: CancellationToken) -> PlanningStep:
+        cancellation.checkpoint()
+        self._round += 1
+        if self._round == 1:
+            step = PlanningStep((self._search,), False, None)
+        elif self._round == 2:
+            assert len(state.tool_results) == 1
+            candidate = state.tool_results[0].data["entries"][0]
+            assert candidate["contentHash"] == "sha256:" + "c" * 64
+            assert not state.tool_results[0].source_references
+            step = PlanningStep((self._read,), False, None)
+        else:
+            assert len(state.tool_results) == 2
+            precise = state.tool_results[-1]
+            assert precise.data["content"] == "Precise current evidence"
+            assert precise.source_references[0]["file"]["lineStart"] == 7
+            step = PlanningStep((), False, "依据精确读取的当前来源: Precise current evidence")
+        return replace(
+            step,
+            attempts=(
+                PlanningAttempt(
+                    request_id=f"evidence-request-{self._round}",
+                    repair_index=0,
+                    outcome=PlanningAttemptOutcome.SUCCEEDED,
+                    usage=ModelUsage(1, 1, 0, 0),
+                ),
+            ),
+        )
+
+
+class _PluginDefinitionKernel:
+    def __init__(self, definitions: Mapping[str, ToolDefinition], executor: PluginToolExecutor) -> None:
+        self._definitions = definitions
+        self._executor = executor
+
+    async def execute_batch(
+        self,
+        calls: Sequence[ToolCall],
+        cancellation: CancellationToken,
+        observer: ToolLifecycleObserver | None = None,
+    ) -> tuple[ToolExecution, ...]:
+        assert len(calls) == 1 and observer is not None
+        call = calls[0]
+        definition = self._definitions[call.name]
+        await observer.execution_started(call, definition)
+        result = await self._executor.execute(call, cancellation)
+        await observer.result_available(call, definition, result)
+        return (ToolExecution(call, definition, result),)
+
+
+class _EvidenceRoundTripRecorder:
+    def __init__(self, dispatcher: RuntimeApplicationCommandDispatcher) -> None:
+        self.events: list[str] = []
+        self.payloads: list[Mapping[str, object]] = []
+        self._dispatcher = dispatcher
+        self._completions: list[asyncio.Task[object]] = []
+
+    async def commit(
+        self,
+        state: RunState,
+        *,
+        event_type: str,
+        payload: Mapping[str, object],
+        terminal: bool = False,
+    ) -> None:
+        del state, terminal
+        self.events.append(event_type)
+        self.payloads.append(payload)
+        if event_type != "tool.started":
+            return
+        call = payload["call"]
+        assert isinstance(call, Mapping)
+        name = call["name"]
+        if name == "vault.search":
+            data: Mapping[str, object] = {
+                "entries": [
+                    {
+                        "path": "notes/source.md",
+                        "modifiedVersion": "mtime:17:size:81",
+                        "contentHash": "sha256:" + "c" * 64,
+                        "matchTier": "body",
+                        "snippets": [{"content": "locator only", "lineStart": 7, "lineEnd": 7}],
+                    }
+                ],
+                "truncated": False,
+            }
+            source_refs: list[Mapping[str, object]] = []
+            summary = "Located a candidate; precise read required."
+        else:
+            assert name == "vault.read"
+            assert call["arguments"] == {
+                "path": "notes/source.md",
+                "lineStart": 7,
+                "lineEnd": 7,
+                "expectedContentHash": "sha256:" + "c" * 64,
+                "expectedModifiedVersion": "mtime:17:size:81",
+            }
+            data = {
+                "path": "notes/source.md",
+                "lineStart": 7,
+                "lineEnd": 7,
+                "modifiedVersion": "mtime:17:size:81",
+                "contentHash": "sha256:" + "c" * 64,
+                "content": "Precise current evidence",
+                "truncated": False,
+            }
+            source_refs = [
+                {
+                    "type": "vault",
+                    "file": {
+                        "workspaceId": call["workspaceId"],
+                        "path": "notes/source.md",
+                        "contentHash": "sha256:" + "c" * 64,
+                        "lineStart": 7,
+                        "lineEnd": 7,
+                    },
+                    "freshness": "fresh",
+                }
+            ]
+            summary = "Read precise current evidence."
+        self._completions.append(
+            asyncio.create_task(
+                self._dispatcher.dispatch(
+                    "plugin-tools/complete",
+                    {
+                        "workspaceId": call["workspaceId"],
+                        "runId": call["runId"],
+                        "definitionFingerprint": call["definitionFingerprint"],
+                        "argsHash": call["argsHash"],
+                        "idempotencyKey": call["idempotencyKey"],
+                        "result": {
+                            "toolCallId": call["toolCallId"],
+                            "status": "succeeded",
+                            "summary": summary,
+                            "data": data,
+                            "sourceRefs": source_refs,
+                        },
+                    },
+                    CancellationScope(name=f"completion-{name}"),
+                    context=ApplicationCommandContext(transport="stdio", client_id="obsidian-plugin"),
+                )
+            )
+        )
+
+    async def join(self) -> None:
+        await asyncio.gather(*self._completions)
+
+
+@pytest.mark.asyncio
+async def test_scripted_vault_answer_uses_locator_then_version_bound_precise_read() -> None:
+    from offeragent_harness.runtime.plugin_tools import plugin_tool_definitions
+
+    definitions = {definition.name: definition for definition in plugin_tool_definitions()}
+
+    def call(name: str, arguments: Mapping[str, object], suffix: str) -> ToolCall:
+        definition = definitions[name]
+        return ToolCall(
+            tool_call_id=f"call_{suffix}",
+            run_id="run_evidence",
+            workspace_id="ws_vault",
+            name=name,
+            version=definition.version,
+            arguments=arguments,
+            args_hash=canonical_json_sha256(arguments),
+            idempotency_key=f"evidence-{suffix}",
+            deadline=datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc),
+            lineage=AgentLineage.root("run_evidence"),
+            definition_fingerprint=definition.fingerprint,
+            result_sensitivity=definition.result_sensitivity,
+        )
+
+    search = call("vault.search", {"query": "current evidence", "limit": 10}, "search")
+    read = call(
+        "vault.read",
+        {
+            "path": "notes/source.md",
+            "lineStart": 7,
+            "lineEnd": 7,
+            "expectedContentHash": "sha256:" + "c" * 64,
+            "expectedModifiedVersion": "mtime:17:size:81",
+        },
+        "read",
+    )
+    executor = PluginToolExecutor()
+
+    async def unused(*args: object) -> Mapping[str, object]:
+        del args
+        return {}
+
+    handlers = {method: unused for method in COMMAND_REGISTRY}
+    handlers.update(plugin_tool_completion_handlers(executor=executor))
+    dispatcher = RuntimeApplicationCommandDispatcher(application=_ReadyApplication(), handlers=handlers)
+    recorder = _EvidenceRoundTripRecorder(dispatcher)
+    state = RunState(
+        "ws_vault",
+        "ses_evidence",
+        "turn_evidence",
+        "run_evidence",
+        AgentLineage.root("run_evidence"),
+    )
+    budget = BudgetLedger(
+        RunBudget(5, 4, 2, 60, 100, 100, Decimal("1"), 1_000, 1),
+        started_at=datetime.now(timezone.utc),
+    )
+
+    result = await run_agent_loop(
+        state,
+        planner=_PreciseEvidencePlanner(search, read),
+        tool_kernel=_PluginDefinitionKernel(definitions, executor),
+        recorder=recorder,
+        budget=budget,
+        cancellation=CancellationScope(name="evidence-run"),
+        now=lambda: datetime.now(timezone.utc),
+    )
+    await recorder.join()
+
+    started_names = [
+        payload["call"]["name"]
+        for event, payload in zip(recorder.events, recorder.payloads, strict=True)
+        if event == "tool.started"
+    ]
+    assert result.phase is RunPhase.COMPLETED
+    assert started_names == ["vault.search", "vault.read"]
+    completed = recorder.payloads[recorder.events.index("assistant.completed")]
+    assert completed["content"] == [{
+        "type": "text",
+        "text": "依据精确读取的当前来源: Precise current evidence",
+        "format": "markdown",
+        "references": [],
+    }]

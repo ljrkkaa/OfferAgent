@@ -1,4 +1,4 @@
-import type { SourceRef, VaultSourceRef } from "./generated_protocol";
+import type { ProjectSourceRef, SourceRef, VaultSourceRef } from "./generated_protocol";
 import type { JsonObject, JsonValue } from "./json_rpc";
 
 const FRESHNESS = new Set(["fresh", "stale", "partial", "stale_partial", "unknown"]);
@@ -8,6 +8,13 @@ export interface VaultReferenceTarget {
     readonly lineStart: number | null;
     readonly lineEnd: number | null;
     readonly heading: string | null;
+}
+
+export interface ProjectReferenceTarget {
+    readonly projectId: string;
+    readonly path: string;
+    readonly lineStart: number | null;
+    readonly lineEnd: number | null;
 }
 
 export function sourceReferenceArray(value: JsonValue | undefined): SourceRef[] {
@@ -36,6 +43,14 @@ export function sourceReferenceKey(reference: SourceRef): string {
             ].join(":");
         case "artifact":
             return `artifact:${reference.artifact.artifactId}`;
+        case "project":
+            return [
+                "project",
+                reference.projectId,
+                reference.path,
+                reference.lineStart ?? "",
+                reference.lineEnd ?? "",
+            ].join(":");
     }
 }
 
@@ -51,7 +66,25 @@ export function sourceReferenceLabel(reference: SourceRef): string {
         }
         case "artifact":
             return reference.label ?? reference.artifact.title ?? reference.artifact.artifactId;
+        case "project": {
+            const line = reference.lineStart === undefined || reference.lineStart === null
+                ? ""
+                : reference.lineEnd && reference.lineEnd !== reference.lineStart
+                    ? `:${reference.lineStart}-${reference.lineEnd}`
+                    : `:${reference.lineStart}`;
+            return `${reference.label ?? `${reference.projectId}/${reference.path}`}${line}`;
+        }
     }
+}
+
+export function projectReferenceTarget(reference: SourceRef): ProjectReferenceTarget | null {
+    if (reference.type !== "project") return null;
+    return {
+        projectId: reference.projectId,
+        path: reference.path,
+        lineStart: reference.lineStart ?? null,
+        lineEnd: reference.lineEnd ?? null,
+    };
 }
 
 export function vaultReferenceTarget(reference: SourceRef): VaultReferenceTarget | null {
@@ -69,6 +102,7 @@ function sourceReference(value: JsonValue): SourceRef {
     const type = requiredText(reference, "type");
     optionalText(reference, "label");
     if (type === "vault") return vaultSourceReference(reference);
+    if (type === "project") return projectSourceReference(reference);
     if (type === "artifact") {
         const artifact = jsonObject(reference.artifact, "artifact reference");
         requiredText(artifact, "artifactId");
@@ -81,6 +115,21 @@ function sourceReference(value: JsonValue): SourceRef {
         return reference as unknown as SourceRef;
     }
     throw new TypeError(`unsupported source reference type: ${type}`);
+}
+
+function projectSourceReference(reference: JsonObject): ProjectSourceRef {
+    requiredText(reference, "projectId");
+    requiredText(reference, "path");
+    requiredText(reference, "contentHash");
+    requiredText(reference, "modifiedVersion");
+    const lineStart = optionalPositiveInteger(reference, "lineStart");
+    const lineEnd = optionalPositiveInteger(reference, "lineEnd");
+    if (lineEnd !== null && (lineStart === null || lineEnd < lineStart)) {
+        throw new TypeError("invalid Project source line range");
+    }
+    const freshness = optionalText(reference, "freshness");
+    if (freshness !== null && !FRESHNESS.has(freshness)) throw new TypeError("invalid source freshness");
+    return reference as unknown as ProjectSourceRef;
 }
 
 function vaultSourceReference(reference: JsonObject): VaultSourceRef {

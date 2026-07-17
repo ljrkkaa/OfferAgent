@@ -8,6 +8,7 @@ import {
     Notice,
     Plugin,
     WorkspaceLeaf,
+    moment,
 } from "obsidian";
 
 import { LocalChatView, LOCAL_CHAT_VIEW } from "./local/chat_view";
@@ -42,6 +43,11 @@ import type {
     SecretsPutParams,
 } from "./runtime/generated_protocol";
 import { loadOrCreatePortableWorkspaceIdentity } from "./runtime/workspace_identity";
+
+const localMoment = moment as unknown as {
+    (): { format(format: string): string };
+    (date: string, format: string, strict: boolean): { format(format: string): string };
+};
 
 interface LocalPluginData {
     readonly schemaVersion: 2;
@@ -483,7 +489,21 @@ export default class OfferAgentPlugin extends Plugin {
     private attachVaultToolAdapter(client: HarnessClient): void {
         if (this.vaultToolClient === client) return;
         this.disposeVaultToolAdapter();
-        const adapter = new VaultToolAdapter(this.app.vault, client, this.workspaceId);
+        const adapter = new VaultToolAdapter(this.app.vault, client, this.workspaceId, this.app.metadataCache, {
+            dailyNotes: {
+                readConfiguration: async () => {
+                    const path = `${this.app.vault.configDir}/daily-notes.json`;
+                    if (!(await this.app.vault.adapter.exists(path))) return undefined;
+                    return JSON.parse(await this.app.vault.adapter.read(path)) as {
+                        folder?: string;
+                        format?: string;
+                        template?: string;
+                    };
+                },
+                resolveToday: () => localMoment().format("YYYY-MM-DD"),
+                formatDate: (date, format) => localMoment(date, "YYYY-MM-DD", true).format(format),
+            },
+        });
         this.vaultToolDisposal = observePluginToolEvents(client.reducer, adapter, (error) => {
             if (!this.unloading) new Notice(actionableError(error));
         });

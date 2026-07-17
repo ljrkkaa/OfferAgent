@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 
 import { EventEnvelope, ProjectionState } from "./event_reducer";
-import type { ContentBlock } from "./generated_protocol";
+import type { ContentBlock, PinnedContextReference } from "./generated_protocol";
 import { HarnessClient } from "./harness_client";
 import { JsonObject, JsonValue, requireJsonObject } from "./json_rpc";
 
@@ -39,6 +39,7 @@ export interface TurnRunConfig {
 
 export interface SendTurnOptions {
     readonly attachments?: readonly ContentBlock[];
+    readonly pinnedContext?: readonly PinnedContextReference[];
     readonly runConfig: TurnRunConfig;
     readonly deadline?: string | null;
 }
@@ -289,6 +290,7 @@ export class ChatStore {
                     turnId,
                     idempotencyKey,
                     input,
+                    ...(options.pinnedContext?.length ? { pinnedContext: [...options.pinnedContext] } : {}),
                     runConfig: {
                         provider: options.runConfig.provider,
                         model: options.runConfig.model,

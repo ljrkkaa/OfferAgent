@@ -21,6 +21,7 @@ from .content import (
     FileContentBlock,
     FileRef,
     ImageContentBlock,
+    ProjectSourceRef,
     TextContentBlock,
     VaultSourceRef,
 )
@@ -99,6 +100,7 @@ def _schema_models() -> list[type[WireModel]]:
             ArtifactContentBlock,
             VaultSourceRef,
             ArtifactSourceRef,
+            ProjectSourceRef,
         )
     )
     # Preserve first occurrence so generated references and traversal are stable.

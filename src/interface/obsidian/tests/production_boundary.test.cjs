@@ -102,6 +102,8 @@ test("chat citations render and navigate through typed SourceRef helpers", async
     assert.match(view, /sourceReferenceLabel\(reference\)/);
     assert.match(view, /vaultReferenceTarget\(reference\)/);
     assert.match(view, /openLinkText\(linkText/);
+    assert.match(view, /editor\.setSelection/);
+    assert.match(view, /target\.lineStart/);
     assert.doesNotMatch(view, /reference\.(?:path|sourceId)/);
 });
 
@@ -171,7 +173,7 @@ test("Obsidian owns only the generated Vault Tool Adapter boundary", async () =>
     for (const source of [harness, main, settings]) {
         assert.doesNotMatch(source, /headlessVaultWrite|vault\/headless|client\/tool|ClientReverseHandlers/);
     }
-    assert.match(main, /new VaultToolAdapter\(this\.app\.vault, client, this\.workspaceId\)/);
+    assert.match(main, /new VaultToolAdapter\(this\.app\.vault, client, this\.workspaceId,/);
     assert.match(main, /observePluginToolEvents\(client\.reducer/);
     assert.doesNotMatch(main, /class AgentLoop|class Planner|ModelGateway/);
 });

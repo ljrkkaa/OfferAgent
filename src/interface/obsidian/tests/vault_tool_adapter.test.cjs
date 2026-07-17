@@ -19,7 +19,7 @@ function loadModule() {
 
 const DIGEST = `sha256:${"a".repeat(64)}`;
 
-function call() {
+function call(overrides = {}) {
     return {
         toolCallId: "call_contract",
         workspaceId: "ws_vault",
@@ -36,13 +36,14 @@ function call() {
         definitionFingerprint: DIGEST,
         resultSensitivity: "workspace",
         deadline: "2026-07-17T12:00:00+00:00",
+        ...overrides,
     };
 }
 
 test("Vault Tool Adapter reads agent.md and completes the bound plugin call", async () => {
     const { VaultToolAdapter } = loadModule();
     const requests = [];
-    const file = { path: "agent.md" };
+    const file = { path: "agent.md", extension: "md", stat: { mtime: 16, size: 37 } };
     const vault = {
         getFileByPath: (target) => target === "agent.md" ? file : null,
         cachedRead: async (target) => {
@@ -128,4 +129,133 @@ test("plugin tool event observer reports malformed plugin calls without executin
     assert.equal(executions, 0);
     assert.equal(errors.length, 1);
     assert.match(errors[0].message, /toolCallId/);
+});
+
+test("Vault Tool Adapter lists, searches, then precisely reads current bounded evidence", async () => {
+    const { VaultToolAdapter } = loadModule();
+    const source = {
+        path: "notes/source.md",
+        extension: "md",
+        stat: { mtime: 17, size: 31 },
+    };
+    const excluded = {
+        path: ".obsidian/private.md",
+        extension: "md",
+        stat: { mtime: 18, size: 10 },
+    };
+    const contract = {
+        path: "agent.md",
+        extension: "md",
+        stat: { mtime: 19, size: 10 },
+    };
+    const content = "heading\nPrecise evidence line\ntail";
+    const files = [source, excluded, contract];
+    const requests = [];
+    const adapter = new VaultToolAdapter({
+        getFiles: () => files,
+        getFileByPath: (target) => files.find((file) => file.path === target) ?? null,
+        cachedRead: async (file) => file === source ? content : "private",
+    }, {
+        request: async (method, params) => {
+            requests.push({ method, params });
+            return { accepted: true, replayed: false };
+        },
+    }, "ws_vault", {
+        getFileCache: (file) => file === source ? { headings: [{ heading: "Evidence", level: 1 }], tags: [] } : null,
+    });
+
+    await adapter.execute(call({
+        toolCallId: "call_list",
+        name: "vault.list",
+        arguments: { directory: "notes", limit: 10 },
+    }));
+    await adapter.execute(call({
+        toolCallId: "call_search",
+        name: "vault.search",
+        arguments: { query: "evidence", limit: 10, snippetsPerFile: 2, snippetMaxBytes: 128 },
+    }));
+    const search = requests[1].params.result;
+    await adapter.execute(call({
+        toolCallId: "call_read",
+        name: "vault.read",
+        arguments: {
+            path: "notes/source.md",
+            lineStart: 2,
+            lineEnd: 2,
+            expectedContentHash: search.data.entries[0].contentHash,
+            expectedModifiedVersion: search.data.entries[0].modifiedVersion,
+        },
+    }));
+
+    assert.deepEqual(requests[0].params.result.data.entries.map((entry) => entry.path), ["notes/source.md"]);
+    assert.equal(search.data.entries[0].snippets[0].lineStart, 2);
+    assert.equal(requests[2].params.result.data.content, "Precise evidence line");
+    assert.equal(requests[2].params.result.sourceRefs[0].file.path, "notes/source.md");
+    assert.equal(requests[2].params.result.sourceRefs[0].file.lineStart, 2);
+    assert.equal(requests[2].params.result.sourceRefs[0].file.lineEnd, 2);
+});
+
+test("Local Skill resources stay inside the selected Skill and must be directly referenced", async () => {
+    const { VaultToolAdapter } = loadModule();
+    const skill = { path: ".codex/skills/review/SKILL.md", extension: "md", stat: { mtime: 20, size: 40 } };
+    const resource = { path: ".codex/skills/review/references/checks.md", extension: "md", stat: { mtime: 21, size: 12 } };
+    const files = [skill, resource];
+    const requests = [];
+    const adapter = new VaultToolAdapter({
+        getFiles: () => files,
+        getFileByPath: (target) => files.find((file) => file.path === target) ?? null,
+        cachedRead: async (file) => file === skill
+            ? "# Review\n\n[Checks](references/checks.md)"
+            : "Use evidence.",
+    }, {
+        request: async (_method, params) => { requests.push(params); return { accepted: true, replayed: false }; },
+    }, "ws_vault");
+
+    await adapter.execute(call({
+        toolCallId: "call_skill",
+        name: "skill.read",
+        arguments: { skill: "review", resource: "references/checks.md" },
+    }));
+    await adapter.execute(call({
+        toolCallId: "call_skill_escape",
+        name: "skill.read",
+        arguments: { skill: "review", resource: "../secret.md" },
+    }));
+
+    assert.equal(requests[0].result.status, "succeeded");
+    assert.equal(requests[0].result.data.content, "Use evidence.");
+    assert.equal(requests[1].result.status, "failed");
+});
+
+test("Daily Note Context resolves local configuration and template without creating the target", async () => {
+    const { VaultToolAdapter } = loadModule();
+    const template = { path: "templates/daily.md", extension: "md", stat: { mtime: 22, size: 18 } };
+    const requests = [];
+    const adapter = new VaultToolAdapter({
+        getFiles: () => [template],
+        getFileByPath: (target) => target === template.path ? template : null,
+        cachedRead: async () => "# {{date}}\n\n- [ ]",
+    }, {
+        request: async (_method, params) => { requests.push(params); return { accepted: true, replayed: false }; },
+    }, "ws_vault", undefined, {
+        dailyNotes: {
+            resolveToday: () => "2026-07-17",
+            readConfiguration: async () => ({ folder: "daily", format: "YYYY-MM-DD", template: "templates/daily" }),
+            formatDate: (date) => date,
+        },
+    });
+
+    await adapter.execute(call({
+        toolCallId: "call_daily",
+        name: "daily_note.context",
+        arguments: {},
+    }));
+
+    const result = requests[0].result;
+    assert.equal(result.status, "succeeded");
+    assert.equal(result.data.resolvedDate, "2026-07-17");
+    assert.equal(result.data.targetPath, "daily/2026-07-17.md");
+    assert.equal(result.data.targetExists, false);
+    assert.equal(result.data.templatePath, "templates/daily.md");
+    assert.equal(result.data.templateContent, "# {{date}}\n\n- [ ]");
 });

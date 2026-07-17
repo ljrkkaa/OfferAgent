@@ -3733,6 +3733,73 @@
       "title": "PhaseChangedPayload",
       "type": "object"
     },
+    "PinnedContextReference": {
+      "discriminator": {
+        "mapping": {
+          "document": "#/$defs/PinnedDocumentContextReference",
+          "selection": "#/$defs/PinnedSelectionContextReference"
+        },
+        "propertyName": "kind"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/PinnedDocumentContextReference"
+        },
+        {
+          "$ref": "#/$defs/PinnedSelectionContextReference"
+        }
+      ]
+    },
+    "PinnedDocumentContextReference": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "document",
+          "title": "Kind",
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/RelativeVaultPath"
+        }
+      },
+      "required": [
+        "kind",
+        "path"
+      ],
+      "title": "PinnedDocumentContextReference",
+      "type": "object"
+    },
+    "PinnedSelectionContextReference": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "selection",
+          "title": "Kind",
+          "type": "string"
+        },
+        "lineEnd": {
+          "minimum": 1,
+          "title": "Lineend",
+          "type": "integer"
+        },
+        "lineStart": {
+          "minimum": 1,
+          "title": "Linestart",
+          "type": "integer"
+        },
+        "path": {
+          "$ref": "#/$defs/RelativeVaultPath"
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "lineStart",
+        "lineEnd"
+      ],
+      "title": "PinnedSelectionContextReference",
+      "type": "object"
+    },
     "PluginToolCompleteParams": {
       "additionalProperties": false,
       "properties": {
@@ -4689,6 +4756,89 @@
         "expiresAt"
       ],
       "title": "ProcessRegistrationsProbeResult",
+      "type": "object"
+    },
+    "ProjectSourceRef": {
+      "additionalProperties": false,
+      "description": "A precise source inside a Vault-registered external project root.",
+      "properties": {
+        "contentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "freshness": {
+          "$ref": "#/$defs/Freshness",
+          "default": "unknown"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "lineEnd": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lineend"
+        },
+        "lineStart": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Linestart"
+        },
+        "modifiedVersion": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Modifiedversion",
+          "type": "string"
+        },
+        "path": {
+          "$ref": "#/$defs/RelativeVaultPath"
+        },
+        "projectId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$",
+          "title": "Projectid",
+          "type": "string"
+        },
+        "type": {
+          "const": "project",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "projectId",
+        "path",
+        "contentHash",
+        "modifiedVersion"
+      ],
+      "title": "ProjectSourceRef",
       "type": "object"
     },
     "ProposedAction": {
@@ -6865,6 +7015,7 @@
       "discriminator": {
         "mapping": {
           "artifact": "#/$defs/ArtifactSourceRef",
+          "project": "#/$defs/ProjectSourceRef",
           "vault": "#/$defs/VaultSourceRef"
         },
         "propertyName": "type"
@@ -6875,6 +7026,9 @@
         },
         {
           "$ref": "#/$defs/ArtifactSourceRef"
+        },
+        {
+          "$ref": "#/$defs/ProjectSourceRef"
         }
       ]
     },
@@ -8055,6 +8209,14 @@
           "maxItems": 256,
           "minItems": 1,
           "title": "Input",
+          "type": "array"
+        },
+        "pinnedContext": {
+          "items": {
+            "$ref": "#/$defs/PinnedContextReference"
+          },
+          "maxItems": 8,
+          "title": "Pinnedcontext",
           "type": "array"
         },
         "runConfig": {

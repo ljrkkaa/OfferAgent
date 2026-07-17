@@ -25,7 +25,7 @@ from .common import (
     ToolResultDescriptor,
     TurnSnapshot,
 )
-from .content import ArtifactRef, ContentBlock
+from .content import ArtifactRef, ContentBlock, PinnedContextReference
 from .errors import ErrorCode, ErrorEnvelope, protocol_error
 from .events import EventEnvelope, EventType
 from .ids import (
@@ -941,8 +941,15 @@ class TurnStartParams(WireModel):
     turn_id: TurnId
     idempotency_key: str = Field(min_length=1, max_length=256)
     input: list[ContentBlock] = Field(min_length=1, max_length=256)
+    pinned_context: list[PinnedContextReference] = Field(default_factory=list, max_length=8)
     run_config: RunConfigSnapshot
     deadline: Rfc3339DateTime | None = None
+
+    @model_validator(mode="after")
+    def _pins_fit_the_turn_context(self) -> TurnStartParams:
+        if self.pinned_context and len(self.input) >= 256:
+            raise ValueError("pinned context requires one available input block")
+        return self
 
 
 class TurnStartResult(WireModel):

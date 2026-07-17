@@ -351,15 +351,17 @@ test("send creates a Session then submits one typed turn/start command", async (
     const store = new ChatStore(client, memoryPersistence());
     await store.initialize();
     await store.updateDraft(store.activeTab.tabId, "draft");
-    const result = await store.send("  hello  ", { runConfig });
+    const pinnedContext = [{ kind: "selection", path: "notes/preferred.md", lineStart: 4, lineEnd: 8 }];
+    const result = await store.send("  hello  ", { runConfig, pinnedContext });
 
     assert.equal(result.runId, "run_01J00000000000000000000000");
     assert.deepEqual(calls.map(([method]) => method), ["session/create", "turn/start"]);
     assert.equal(calls[1][1].input[0].text, "hello");
     assert.equal(calls[1][1].runConfig.provider, "local");
+    assert.deepEqual(calls[1][1].pinnedContext, pinnedContext);
     assert.deepEqual(
         Object.keys(calls[1][1]).sort(),
-        ["deadline", "idempotencyKey", "input", "runConfig", "sessionId", "turnId"],
+        ["deadline", "idempotencyKey", "input", "pinnedContext", "runConfig", "sessionId", "turnId"],
     );
     assert.match(calls[1][1].turnId, /^turn_[0-9a-f]{32}$/);
     assert.equal(store.activeTab.draft, "");

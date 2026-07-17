@@ -18,7 +18,10 @@ from offeragent_harness.protocol.capabilities import (
 from offeragent_harness.protocol.content import (
     ContentBlock,
     FileRef,
+    PinnedSelectionContextReference,
+    ProjectSourceRef,
     RelativeVaultPath,
+    SourceRef,
     TextContentBlock,
     VaultSourceRef,
 )
@@ -273,6 +276,47 @@ def test_vault_source_ref_accepts_combined_stale_partial_freshness() -> None:
         '{"type":"vault","file":{"workspaceId":"ws_main","path":"notes/source.md"},"freshness":"stale_partial"}'
     )
     assert source.freshness.value == "stale_partial"
+
+
+def test_project_source_ref_preserves_registry_identity_and_precise_lines() -> None:
+    source = TypeAdapter(SourceRef).validate_json(
+        """
+        {
+          "type": "project",
+          "projectId": "offeragent",
+          "path": "src/agent.py",
+          "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "modifiedVersion": "mtime:17:size:41",
+          "lineStart": 7,
+          "lineEnd": 9,
+          "freshness": "fresh"
+        }
+        """
+    )
+    assert isinstance(source, ProjectSourceRef)
+    assert source.project_id == "offeragent"
+    assert source.path == "src/agent.py"
+    assert source.line_start == 7
+
+
+def test_turn_start_accepts_at_most_eight_safe_pinned_source_locators() -> None:
+    raw = copy.deepcopy(_object(build_examples()["turn-start.request.json"]["params"]))
+    raw["pinnedContext"] = [
+        {"kind": "document", "path": "notes/preferred.md"},
+        {"kind": "selection", "path": "notes/range.md", "lineStart": 4, "lineEnd": 8},
+    ]
+    params = TurnStartParams.model_validate_json(json.dumps(raw))
+    assert isinstance(params.pinned_context[1], PinnedSelectionContextReference)
+    assert params.pinned_context[1].line_start == 4
+
+    raw["pinnedContext"] = [
+        {"kind": "document", "path": f"notes/{index}.md"} for index in range(9)
+    ]
+    with pytest.raises(ValidationError):
+        TurnStartParams.model_validate_json(json.dumps(raw))
+    raw["pinnedContext"] = [{"kind": "document", "path": "../outside.md"}]
+    with pytest.raises(ValidationError):
+        TurnStartParams.model_validate_json(json.dumps(raw))
 
 
 def test_event_registry_is_complete_concrete_and_immutable() -> None:

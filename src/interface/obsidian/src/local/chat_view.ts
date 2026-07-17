@@ -1,4 +1,4 @@
-import { ItemView, Menu, Notice, WorkspaceLeaf, setIcon } from "obsidian";
+import { ItemView, MarkdownView, Menu, Notice, WorkspaceLeaf, setIcon } from "obsidian";
 
 import { BootstrapSnapshot } from "../runtime/bootstrap";
 import { ChatStore, ChatStoreSnapshot } from "../runtime/chat_store";
@@ -10,7 +10,11 @@ import type {
     ToolCallTimelineItem,
 } from "../runtime/event_reducer";
 import { JsonObject, RemoteRpcError } from "../runtime/json_rpc";
-import { sourceReferenceLabel, vaultReferenceTarget } from "../runtime/source_references";
+import {
+    VaultReferenceTarget,
+    sourceReferenceLabel,
+    vaultReferenceTarget,
+} from "../runtime/source_references";
 import { LocalOfferAgentSettings, effectivePermissionMode, runConfig } from "./settings";
 
 export const LOCAL_CHAT_VIEW = "offeragent-local-chat";
@@ -260,7 +264,7 @@ export class LocalChatView extends ItemView {
                 if (target && safeVaultPath(target.path)) {
                     const link = item.createEl("button", { text: label, cls: "offeragent-reference-link" });
                     const linkText = target.heading ? `${target.path}#${target.heading}` : target.path;
-                    link.onclick = () => void this.app.workspace.openLinkText(linkText, "", false);
+                    link.onclick = () => void this.openVaultReference(linkText, target);
                 } else item.setText(label);
             }
         }
@@ -287,6 +291,19 @@ export class LocalChatView extends ItemView {
             compact.onclick = () => void this.store?.compact(run.sessionId, run.turnId)
                 .catch((error) => new Notice(actionableMessage(error)));
         }
+    }
+
+    private async openVaultReference(linkText: string, target: VaultReferenceTarget): Promise<void> {
+        await this.app.workspace.openLinkText(linkText, "", false);
+        if (target.lineStart === null) return;
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (view?.file?.path !== target.path) return;
+        const lineStart = Math.max(0, target.lineStart - 1);
+        const lineEnd = Math.max(lineStart, (target.lineEnd ?? target.lineStart) - 1);
+        const from = { line: lineStart, ch: 0 };
+        const to = { line: lineEnd, ch: view.editor.getLine(lineEnd).length };
+        view.editor.setSelection(from, to);
+        view.editor.scrollIntoView({ from, to }, true);
     }
 
     private renderTimelineItem(container: HTMLElement, item: TimelineItem, childRun: boolean): void {

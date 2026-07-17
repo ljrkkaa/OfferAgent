@@ -37,7 +37,7 @@ OfferAgent 根据用户的学习安排意图，使用 Vault 已配置的 Daily N
 _Avoid_: 学习日记、关键词路由、Study-State Synchronization
 
 **Daily Note Context**:
-Obsidian 插件通过专用 `daily_note_context` 工具为指定日期解析 Daily Notes 配置；未指定日期时按插件所在本地时区确定“今天”。它返回解析后的日期、目标路径、文件是否存在及其版本、模板路径与模板正文及其版本、日期格式。它不创建文件、不选择学习内容，也不向普通 Vault 读取开放 `.obsidian/**`。
+Obsidian 插件通过专用 `daily_note.context` 工具为指定日期解析 Daily Notes 配置；未指定日期时按插件所在本地时区确定“今天”。它返回解析后的日期、目标路径、文件是否存在及其版本、模板路径与模板正文及其版本、日期格式。它不创建文件、不选择学习内容，也不向普通 Vault 读取开放 `.obsidian/**`。
 _Avoid_: agent.md 硬编码模板路径、vault_read 读取 Obsidian 配置、插件替模型规划内容
 
 **Interview Experience**:
@@ -159,7 +159,7 @@ _Avoid_: 完整文件副本、Vault 缓存、永久知识副本
 _Avoid_: 上下文白名单、仅限所选文档、Evidence Snapshot
 
 **Project Evidence**:
-Agent 从 `projects/` 中的项目文档、文本源码和配置里精确读取的有界证据，用于核对项目事实并生成特化面试回答；它不包含密钥、依赖、构建产物或版本控制内部文件，也不授权执行或修改项目代码。
+Agent 通过 `projects/index.md` 明确登记的项目描述文件，从其外部项目根中的文档、文本源码和配置里精确读取的有界证据，用于核对项目事实并生成特化面试回答；它不包含密钥、依赖、构建产物或版本控制内部文件，也不授权执行或修改项目代码。
 _Avoid_: README 推测、完整项目副本、Shell 输出、代码执行结果、用户已掌握的证明
 
 **Project Interview Training**:
@@ -217,7 +217,7 @@ Vault 内 `.codex/skills/*/SKILL.md` 描述的按需工作流。Local Skill 是�
 _Avoid_: 子 Agent、插件命令、额外权限
 
 **Vault Tool Adapter**:
-Obsidian 插件中通过官方 Obsidian TypeScript API 实现 Vault 工具协议的模块。它执行 `vault_search`、`vault_read` 和已授权的 Vault Change Batch，不通过 Shell 或 Obsidian CLI 间接访问 Vault。
+Obsidian 插件中通过官方 Obsidian TypeScript API 实现 Vault 工具协议的模块。它执行 `vault.search`、`vault.read`、受 Registry 约束的 `project.*` 和已授权的 Vault Change Batch，不通过 Shell 或 Obsidian CLI 间接访问 Vault。
 _Avoid_: CLI 包装器、Runtime 直接文件访问、模型执行 Shell
 
 **Provider Capability**:
@@ -246,4 +246,4 @@ _Avoid_: high/medium/low 可信度打分、固定站点权重、忽略用户需�
 
 目标 Vault 当前 `agent.md` 及仓库内对应部署模板必须从单一“学习状态维护”契约改为按用户意图工作的 OfferAgent 契约：创建和改写是覆盖整个 Vault 普通 `.md`、`.txt` 文件的通用能力。用户要求创建内容时，应在确认目标缺失后直接创建；用户要求整体或局部改写时，应先读取当前版本再执行。用户未要求重写时仍保留无关内容。不得用“daily 缺失”“默认文件范围”或固定状态检查输出阻止明确的创建、填充或重写请求；控制文件确认、插件权限、版本校验和 Git Checkpoint 仍保持不变。Daily Study Plan 与 Study-State Synchronization 继续按各自证据边界独立工作。
 
-目标 Vault 的 `obsidian-cli` Skill 也必须改写为 OfferAgent Vault 工具说明，不能继续要求 Agent 执行本机不存在且未授权的 `obsidian ...` Shell 命令。`skill_read` 必须支持读取对应 Skill 目录内被 `SKILL.md` 直接引用的资源文件，同时拒绝目录越界。
+目标 Vault 的 `obsidian-cli` Skill 也必须改写为 OfferAgent Vault 工具说明，不能继续要求 Agent 执行本机不存在且未授权的 `obsidian ...` Shell 命令。`skill.read` 必须支持读取对应 Skill 目录内被 `SKILL.md` 直接引用的资源文件，同时拒绝目录越界。

@@ -94,6 +94,7 @@ from .conversation_controls import ConversationControlService
 from .harness_service import HarnessService, StartTurnCommand
 from .hook_lifecycle import LifecycleHookDenied
 from .loopback_gateway import LoopbackWebGateway
+from .pinned_context import pinned_context_block
 from .session_service import (
     SessionCreateCommand as LifecycleSessionCreateCommand,
 )
@@ -549,13 +550,17 @@ def _turn_handlers(
                 "permission_mode": route.permission_mode,
             }
         )
+        pinned = pinned_context_block(params.pinned_context)
+        input_blocks = tuple(item.to_wire() for item in params.input)
+        if pinned is not None:
+            input_blocks = (*input_blocks, pinned)
         receipt = await harness.start_turn(
             StartTurnCommand(
                 workspace_id=identity.workspace_id,
                 session_id=params.session_id,
                 turn_id=params.turn_id,
                 idempotency_key=params.idempotency_key,
-                input_blocks=tuple(item.to_wire() for item in params.input),
+                input_blocks=input_blocks,
                 run_config=run_config.to_wire(),
                 effective_config=snapshot.config,
                 effective_config_fingerprint=snapshot.fingerprint,
