@@ -1,8 +1,10 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import { EventEnvelope, EventReducer } from "./event_reducer";
 import type {
     CapabilityName,
+    ArtifactRef,
+    ImageContentBlock,
     ProtocolCommandMethod,
     ProtocolCommandParams,
     ProtocolCommandResult,
@@ -96,6 +98,14 @@ export interface HarnessClientOptions {
     onDisconnected?: (error: Error) => void;
 }
 
+export interface AttachmentUpload {
+    readonly fileName: string;
+    readonly mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+    readonly bytes: Uint8Array;
+    readonly clientRequestId?: string;
+    readonly altText?: string;
+}
+
 type ClientState = "disconnected" | "connecting" | "ready" | "closing" | "closed";
 
 export class HarnessCompatibilityError extends Error {
@@ -119,6 +129,8 @@ export class HarnessClient {
     private pingActive = false;
     private closeOperation: Promise<void> | null = null;
     private retiringPeer: JsonRpcPeer | null = null;
+    private readonly visionSupported = new Set<string>();
+    private readonly attachmentUploads = new Map<string, { sessionId: string; uploadId: string }>();
 
     constructor(
         transport: RpcTransport,
@@ -186,6 +198,140 @@ export class HarnessClient {
         options?: { signal?: AbortSignal; timeoutMs?: number },
     ): Promise<ProtocolCommandResult<Method>> {
         return this.requestOnPeer(this.requirePeer(), method, params, options);
+    }
+
+    /** Upload one immutable Conversation-owned image through bounded commands. */
+    async uploadAttachment(
+        sessionId: string,
+        value: AttachmentUpload,
+        options: { signal?: AbortSignal } = {},
+    ): Promise<ImageContentBlock> {
+        requireIdentifier(sessionId, "sessionId");
+        if (!value.fileName || value.fileName.length > 255 || /[\\/\0\r\n]/.test(value.fileName)) {
+            throw new TypeError("attachment file name must be a safe leaf name");
+        }
+        if (value.bytes.byteLength < 1 || value.bytes.byteLength > 10 * 1024 * 1024) {
+            throw new RangeError("image attachment must be between 1 byte and 10 MiB");
+        }
+        const contentHash = sha256(value.bytes);
+        const clientRequestId = value.clientRequestId ?? `req_${randomBytes(16).toString("hex")}`;
+        const begun = await this.request("attachments/begin", {
+            sessionId,
+            clientRequestId,
+            fileName: value.fileName,
+            mediaType: value.mediaType,
+            byteLength: value.bytes.byteLength,
+            contentHash,
+        }, { signal: options.signal });
+        let committed = false;
+        try {
+            let offset = begun.nextOffset;
+            if (!Number.isSafeInteger(offset) || offset < 0 || offset > value.bytes.byteLength) {
+                throw new Error("Worker returned an invalid attachment resume offset");
+            }
+            const chunkSize = Math.min(65_536, begun.maxChunkBytes);
+            if (!Number.isSafeInteger(chunkSize) || chunkSize < 1) {
+                throw new Error("Worker returned an invalid attachment chunk limit");
+            }
+            while (offset < value.bytes.byteLength) {
+                const chunk = value.bytes.subarray(offset, Math.min(offset + chunkSize, value.bytes.byteLength));
+                const result = await this.request("attachments/chunk", {
+                    sessionId,
+                    uploadId: begun.uploadId,
+                    offset,
+                    contentBase64: Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength).toString("base64"),
+                    contentHash: sha256(chunk),
+                }, { signal: options.signal });
+                if (result.receivedBytes <= offset || result.receivedBytes > value.bytes.byteLength) {
+                    throw new Error("Worker returned a non-advancing attachment offset");
+                }
+                offset = result.receivedBytes;
+            }
+            const result = await this.request("attachments/commit", {
+                sessionId,
+                uploadId: begun.uploadId,
+            }, { signal: options.signal });
+            requireCommittedAttachment(result.artifact, begun.artifactId, contentHash, value);
+            committed = true;
+            this.attachmentUploads.set(result.artifact.artifactId, { sessionId, uploadId: begun.uploadId });
+            return {
+                type: "image",
+                artifact: result.artifact,
+                ...(value.altText ? { altText: value.altText } : {}),
+            };
+        } finally {
+            if (!committed) {
+                await this.request("attachments/abort", {
+                    sessionId,
+                    uploadId: begun.uploadId,
+                }).catch(() => undefined);
+            }
+        }
+    }
+
+    /** Read retained bytes for history preview or an explicit later reuse. */
+    async readAttachment(
+        sessionId: string,
+        artifact: ArtifactRef,
+        options: { signal?: AbortSignal } = {},
+    ): Promise<Uint8Array> {
+        requireIdentifier(sessionId, "sessionId");
+        const chunks: Buffer[] = [];
+        let offset = 0;
+        do {
+            const result = await this.request("attachments/read", {
+                sessionId,
+                artifactId: artifact.artifactId,
+                offset,
+                maxBytes: 65_536,
+            }, { signal: options.signal });
+            if (result.offset !== offset || result.nextOffset < offset || result.nextOffset > artifact.sizeBytes) {
+                throw new Error("Worker returned an invalid attachment read range");
+            }
+            const content = Buffer.from(result.contentBase64, "base64");
+            if (offset + content.byteLength !== result.nextOffset || (!result.eof && content.byteLength === 0)) {
+                throw new Error("Worker returned inconsistent attachment bytes");
+            }
+            chunks.push(content);
+            offset = result.nextOffset;
+            if (result.eof) break;
+        } while (true);
+        const content = Buffer.concat(chunks);
+        if (content.byteLength !== artifact.sizeBytes || sha256(content) !== artifact.contentHash) {
+            throw new Error("Retained attachment no longer matches its immutable metadata");
+        }
+        return new Uint8Array(content.buffer, content.byteOffset, content.byteLength);
+    }
+
+    /** Probe the selected model with fixed runtime-owned image content before a user image Run. */
+    async requireVision(provider: string, model: string, signal?: AbortSignal): Promise<void> {
+        if (!provider || !model) throw new TypeError("vision probe requires a provider and model");
+        const key = `${provider}\0${model}`;
+        if (this.visionSupported.has(key)) return;
+        const result = await this.request("models/health", {
+            provider,
+            model,
+            clientRequestId: `req_${randomBytes(16).toString("hex")}`,
+            deadline: new Date(Date.now() + 30_000).toISOString(),
+            capability: "vision",
+        }, { signal, timeoutMs: 35_000 });
+        if (result.capability !== "vision") throw new Error("Worker returned the wrong model capability probe");
+        if (result.status === "healthy") {
+            this.visionSupported.add(key);
+            return;
+        }
+        if (result.status === "unsupported") {
+            throw new Error("当前模型不支持图片输入；请改用文字描述或选择支持视觉的模型");
+        }
+        throw new Error("暂时无法确认当前模型的图片能力；请检查模型连接后重试，或改用文字描述");
+    }
+
+    async discardUploadedAttachment(sessionId: string, artifactId: string): Promise<boolean> {
+        const upload = this.attachmentUploads.get(artifactId);
+        if (!upload || upload.sessionId !== sessionId) return false;
+        await this.request("attachments/abort", { sessionId, uploadId: upload.uploadId });
+        this.attachmentUploads.delete(artifactId);
+        return true;
     }
 
     async replay(
@@ -348,6 +494,23 @@ export class HarnessClient {
     private requirePeer(): JsonRpcPeer {
         if (!this.ready || !this.peer) throw new Error("Harness client is not ready");
         return this.peer;
+    }
+}
+
+function sha256(value: Uint8Array): string {
+    return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function requireCommittedAttachment(
+    artifact: ArtifactRef,
+    artifactId: string,
+    contentHash: string,
+    upload: AttachmentUpload,
+): void {
+    if (artifact.artifactId !== artifactId || artifact.contentHash !== contentHash ||
+        artifact.mediaType !== upload.mediaType || artifact.sizeBytes !== upload.bytes.byteLength ||
+        artifact.state !== "complete") {
+        throw new Error("Worker committed attachment metadata that differs from the upload");
     }
 }
 

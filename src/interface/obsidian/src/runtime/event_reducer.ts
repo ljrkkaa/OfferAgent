@@ -1,5 +1,10 @@
 import { PROTOCOL_EVENT_TYPES } from "./generated_protocol";
-import type { EventEnvelope as GeneratedEventEnvelope, SourceRef } from "./generated_protocol";
+import type {
+    ArtifactRef,
+    EventEnvelope as GeneratedEventEnvelope,
+    PinnedContextReference,
+    SourceRef,
+} from "./generated_protocol";
 import { JsonObject, JsonValue, requireJsonObject, requireJsonValue } from "./json_rpc";
 import { mergeSourceReferences, sourceReferenceArray } from "./source_references";
 
@@ -24,6 +29,8 @@ export interface UserMessageTimelineItem extends TimelineItemBase {
     readonly kind: "user_message";
     readonly source: "turn" | "steer";
     blocks: string[];
+    images: { artifact: ArtifactRef; altText: string | null }[];
+    pinnedContext: PinnedContextReference[];
 }
 
 export interface ReasoningTimelineItem extends TimelineItemBase {
@@ -306,21 +313,27 @@ export class EventReducer {
         const { type, payload } = event;
         switch (type) {
             case "turn.started":
+                const turnContent = projectUserContent(arrayField(payload, "input"));
                 appendTimelineItem(run, {
                     kind: "user_message",
                     itemId: `turn:${run.turnId}`,
                     sequence: event.sequence,
                     source: "turn",
-                    blocks: contentText(arrayField(payload, "input")),
+                    blocks: turnContent.text,
+                    images: turnContent.images,
+                    pinnedContext: turnContent.pinnedContext,
                 });
                 return;
             case "turn.steered":
+                const steerContent = projectUserContent(arrayField(payload, "input"));
                 appendTimelineItem(run, {
                     kind: "user_message",
                     itemId: `steer:${textField(payload, "messageId")}`,
                     sequence: event.sequence,
                     source: "steer",
-                    blocks: contentText(arrayField(payload, "input")),
+                    blocks: steerContent.text,
+                    images: steerContent.images,
+                    pinnedContext: steerContent.pinnedContext,
                 });
                 return;
             case "phase.changed":
@@ -668,10 +681,68 @@ function contentText(content: JsonValue[]): string[] {
         const block = objectValue(raw);
         const type = textField(block, "type");
         if (type === "text") return textField(block, "text");
-        if (type === "artifact") return `[Artifact: ${textField(block, "artifactId")}]`;
-        if (type === "image") return `[Image: ${optionalText(block, "alt") ?? "image"}]`;
+        if (type === "artifact") return `[Artifact: ${textField(objectValue(block.artifact), "artifactId")}]`;
+        if (type === "image") return `[Image: ${optionalText(block, "altText") ?? "image"}]`;
         return `[${type}]`;
     });
+}
+
+function projectUserContent(content: JsonValue[]): {
+    text: string[];
+    images: { artifact: ArtifactRef; altText: string | null }[];
+    pinnedContext: PinnedContextReference[];
+} {
+    const text: string[] = [];
+    const images: { artifact: ArtifactRef; altText: string | null }[] = [];
+    const pinnedContext: PinnedContextReference[] = [];
+    for (const raw of content) {
+        const block = objectValue(raw);
+        const type = textField(block, "type");
+        if (type === "text") {
+            text.push(textField(block, "text"));
+        } else if (type === "image") {
+            images.push({ artifact: artifactRef(block.artifact), altText: optionalText(block, "altText") });
+        } else if (type === "pinnedContext") {
+            for (const reference of arrayField(block, "references")) {
+                const value = objectValue(reference);
+                const kind = textField(value, "kind");
+                const path = textField(value, "path");
+                if (kind === "document") pinnedContext.push({ kind, path });
+                else if (kind === "selection") pinnedContext.push({
+                    kind,
+                    path,
+                    lineStart: integerField(value, "lineStart", 1),
+                    lineEnd: integerField(value, "lineEnd", 1),
+                });
+                else throw new EventProjectionError("pinned context kind is invalid");
+            }
+        }
+    }
+    return { text, images, pinnedContext };
+}
+
+function artifactRef(raw: JsonValue | undefined): ArtifactRef {
+    if (raw === undefined) throw new EventProjectionError("artifact metadata is missing");
+    const value = objectValue(raw);
+    const artifactId = textField(value, "artifactId");
+    const contentHash = textField(value, "contentHash");
+    const mediaType = textField(value, "mediaType");
+    const sizeBytes = integerField(value, "sizeBytes", 0);
+    const sensitivity = textField(value, "sensitivity");
+    const state = textField(value, "state");
+    if (!["public", "workspace", "private", "secret"].includes(sensitivity) ||
+        !["complete", "partial", "unverified", "cancelled", "failed"].includes(state)) {
+        throw new EventProjectionError("artifact metadata enum is invalid");
+    }
+    return {
+        artifactId,
+        contentHash,
+        mediaType,
+        sizeBytes,
+        sensitivity: sensitivity as ArtifactRef["sensitivity"],
+        state: state as ArtifactRef["state"],
+        ...(optionalText(value, "title") ? { title: optionalText(value, "title") as string } : {}),
+    };
 }
 
 function textField(value: JsonObject, key: string): string {

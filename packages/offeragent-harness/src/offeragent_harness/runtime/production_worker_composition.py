@@ -40,7 +40,7 @@ from offeragent_harness.agent.state import RunState
 from offeragent_harness.app import ApplicationIdentity, HarnessApplication
 from offeragent_harness.config import ConfigPatch, ConfigScope, HarnessConfig, ModelProvider, ModelSettings
 from offeragent_harness.hooks import HookDecision, HookEvent, HookInvocation, HookLayer, HookScope
-from offeragent_harness.models import thaw_json
+from offeragent_harness.models import ModelContentBlock, thaw_json
 from offeragent_harness.observability import (
     DiagnosticsService,
     InstrumentedModelGateway,
@@ -88,6 +88,7 @@ from offeragent_harness.protocol._base import validate_wire
 from offeragent_harness.protocol.capabilities import CapabilitySet, ProtocolRange
 from offeragent_harness.protocol.common import PermissionMode as WirePermissionMode
 from offeragent_harness.protocol.common import RunConfigSnapshot as WireRunConfigSnapshot
+from offeragent_harness.protocol.content import ImageContentBlock
 from offeragent_harness.protocol.events import stored_event_to_envelope
 from offeragent_harness.protocol.messages import RuntimeArch, RuntimeStatusResult, ShutdownResult
 from offeragent_harness.protocol.schemas import PROTOCOL_VERSION, schema_hash
@@ -114,6 +115,7 @@ from offeragent_harness.runtime.backpressure import BufferedEventSink
 from offeragent_harness.runtime.cancellation import CancellationScope
 from offeragent_harness.runtime.codex_credentials import CodexFileCredentialSource
 from offeragent_harness.runtime.config_service import ConfigService, ConfigUpdateCommand, WorkerConfigActivation
+from offeragent_harness.runtime.conversation_attachments import ConversationAttachmentStore
 from offeragent_harness.runtime.conversation_controls import (
     CompactionExecution,
     ConversationControlService,
@@ -193,7 +195,7 @@ from offeragent_harness.runtime.windows_process_supervisor import (
     WindowsSupervisedProcessBackend,
 )
 from offeragent_harness.runtime.windows_secrets import WindowsDpapiSecretStore
-from offeragent_harness.sessions import Run, Session
+from offeragent_harness.sessions import Run, Session, SessionStatus, Turn
 from offeragent_harness.shell import PowerShellToolExecutor, ShellCommandProfile
 from offeragent_harness.skills import SkillAuthority
 from offeragent_harness.skills.tools import skill_tool_definitions
@@ -284,6 +286,59 @@ class SecureIdGenerator:
         aliases = {"event": "evt", "model-request": "req", "artifact": "art", "idempotency": "idem"}
         prefix = aliases.get(namespace, namespace)
         return f"{prefix}_{secrets.token_hex(16)}"
+
+
+class _NeverCancelled:
+    cancelled = False
+    reason = None
+
+    async def wait(self) -> Any:
+        await asyncio.Future()
+
+    def checkpoint(self) -> None:
+        return
+
+
+class _AttachmentStartupRecovery:
+    def __init__(self, unit_of_work: UnitOfWorkFactory, attachments: ConversationAttachmentStore) -> None:
+        self._unit_of_work = unit_of_work
+        self._attachments = attachments
+
+    async def recover(self) -> tuple[str, ...]:
+        records: dict[str, list[Any]] = {"sessions": [], "turns": []}
+        async with self._unit_of_work.begin() as transaction:
+            for collection in records:
+                output = records[collection]
+                after_id: str | None = None
+                while True:
+                    page = await transaction.entities.list(collection, after_id=after_id, limit=1_000)
+                    if not page:
+                        break
+                    output.extend(record.value for record in page)
+                    if len(output) > 100_000:
+                        raise ValueError("attachment startup recovery exceeds the durable entity scan limit")
+                    after_id = page[-1].entity_id
+        sessions = tuple(item for item in records["sessions"] if isinstance(item, Session))
+        turns = tuple(item for item in records["turns"] if isinstance(item, Turn))
+        await self._attachments.recover(
+            tuple(item.session_id for item in sessions if item.status is SessionStatus.DELETED),
+            _NeverCancelled(),
+            existing_turn_ids=tuple(item.turn_id for item in turns),
+        )
+        return ()
+
+
+class _CompositeStartupRecovery:
+    def __init__(self, *recoveries: Any) -> None:
+        self._recoveries = recoveries
+
+    async def recover(self) -> tuple[str, ...]:
+        recovered: tuple[str, ...] = ()
+        for recovery in self._recoveries:
+            current = await recovery.recover()
+            if current:
+                recovered = tuple(current)
+        return recovered
 
 
 class ModelGatewayFactory(Protocol):
@@ -438,6 +493,7 @@ class ProductionRunComponentsFactory(
         local_read: CodeToolExecutor,
         local_transaction: VaultTransactionCoordinator,
         parent_authorities: ParentRunAuthorityProvider,
+        attachments: ConversationAttachmentStore | None = None,
         optional_definitions: Sequence[ToolDefinition] = (),
         optional_local_executors: Sequence[tuple[Sequence[ToolDefinition], ToolExecutor]] = (),
         plugin_executor: ToolExecutor | None = None,
@@ -464,6 +520,7 @@ class ProductionRunComponentsFactory(
         self._local_read = local_read
         self._local_transaction = local_transaction
         self._parent_authorities = parent_authorities
+        self._attachments = attachments
         self._optional_definitions = tuple(optional_definitions)
         self._optional_local_executors = tuple(optional_local_executors)
         self._plugin_executor = plugin_executor
@@ -569,10 +626,16 @@ class ProductionRunComponentsFactory(
             *shell_definitions,
         )
         scope = _effective_capability_scope(definitions, config, effective_config, permission)
+        inputs = await _resolved_context_inputs(
+            command.input_blocks,
+            session_id=state.session_id,
+            attachments=self._attachments,
+            cancellation=cancellation,
+        )
         prepared = _PreparedProductionCapabilities(
             run_id=state.run_id,
             config=config,
-            inputs=_with_skill_prompt_context(_context_inputs(command.input_blocks), skills),
+            inputs=_with_skill_prompt_context(inputs, skills),
             effective_config=effective_config,
             budget=_run_budget(
                 config,
@@ -1590,6 +1653,84 @@ def _context_inputs(blocks: Sequence[Mapping[str, Any]]) -> ContextInputs:
                 ContextLayer.USER_INPUT,
                 text,
                 sensitivity=_workspace_sensitivity(),
+            ),
+        )
+    )
+
+
+async def _resolved_context_inputs(
+    blocks: Sequence[Mapping[str, Any]],
+    *,
+    session_id: str,
+    attachments: ConversationAttachmentStore | None,
+    cancellation: CancellationToken,
+) -> ContextInputs:
+    metadata: list[dict[str, Any]] = []
+    images: list[ModelContentBlock] = []
+    artifact_ids: list[str] = []
+    for raw in blocks:
+        cancellation.checkpoint()
+        block = dict(raw)
+        if block.get("type") == "pinnedContext":
+            block["guidance"] = (
+                "Pinned Context is additive preferred context, not a whitelist and not evidence. "
+                "Use vault.read to read the exact current version before relying on a pin, then cite only "
+                "the evidence actually used."
+            )
+        metadata.append(block)
+        if block.get("type") != "image":
+            continue
+        if attachments is None:
+            raise ValueError("production image attachment resolver is unavailable")
+        image = validate_wire(ImageContentBlock, block)
+        artifact = image.artifact
+        content = bytearray()
+        offset = 0
+        while offset < artifact.size_bytes:
+            receipt = await attachments.read_for_conversation(
+                session_id,
+                artifact.artifact_id,
+                offset,
+                min(65_536, artifact.size_bytes - offset),
+                cancellation,
+            )
+            if receipt.offset != offset or receipt.next_offset <= offset:
+                raise ValueError("Conversation attachment read did not advance")
+            content.extend(receipt.content)
+            offset = receipt.next_offset
+        payload = bytes(content)
+        if (
+            len(payload) != artifact.size_bytes
+            or f"sha256:{hashlib.sha256(payload).hexdigest()}" != artifact.content_hash
+        ):
+            raise ValueError("Conversation attachment bytes differ from durable Turn metadata")
+        images.append(
+            ModelContentBlock(
+                "image",
+                {
+                    "artifactId": artifact.artifact_id,
+                    "mediaType": artifact.media_type,
+                    "contentHash": artifact.content_hash,
+                    "sizeBytes": artifact.size_bytes,
+                    "altText": image.alt_text,
+                },
+                binary_data=payload,
+            )
+        )
+        artifact_ids.append(artifact.artifact_id)
+    text = canonical_json_bytes(metadata).decode("utf-8")
+    from offeragent_harness.ports import Sensitivity
+
+    return ContextInputs(
+        (
+            ContextFragment(
+                "turn:user-input",
+                ContextLayer.USER_INPUT,
+                text,
+                sensitivity=Sensitivity.PRIVATE if images else Sensitivity.WORKSPACE,
+                artifact_ids=tuple(artifact_ids),
+                content_hash=canonical_json_sha256(metadata),
+                model_blocks=tuple(images),
             ),
         )
     )
@@ -2860,6 +3001,12 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             ids=ids,
         )
         config_activation = WorkerConfigActivation()
+        attachments = ConversationAttachmentStore(
+            state_directory / "conversation-attachments",
+            workspace_id=workspace_id,
+            clock=clock,
+            ids=ids,
+        )
         from offeragent_harness.subagents.tools import subagent_tool_definitions
 
         subagent_definitions = subagent_tool_definitions()
@@ -2919,6 +3066,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             local_read=read_executor,
             local_transaction=local_transaction,
             parent_authorities=late_parent_authorities,
+            attachments=attachments,
             optional_definitions=(
                 *powershell_executor.definitions,
                 *plugin_definitions,
@@ -3055,7 +3203,10 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             ),
             applier=RecoveryPlanApplier(unit_of_work=uow, clock=clock, ids=ids),
             harness=harness,
-            subagent_recovery=RunRecoverySupervisor(subagents, cancellations),
+            subagent_recovery=_CompositeStartupRecovery(
+                _AttachmentStartupRecovery(uow, attachments),
+                RunRecoverySupervisor(subagents, cancellations),
+            ),
         )
         identity = ApplicationIdentity(
             runtime_version=self._runtime_version,
@@ -3122,6 +3273,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                 ),
                 projections=projections,
                 artifacts=artifacts,
+                attachments=attachments,
                 secrets=secret_store,
                 controls=controls,
                 subagents=subagents,

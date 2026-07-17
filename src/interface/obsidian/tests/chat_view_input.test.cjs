@@ -171,3 +171,15 @@ test("sidebar uses Obsidian Markdown, Worker model choices, settings, and a froz
     assert.match(source, /新内容/);
     assert.match(source, /放入输入框/);
 });
+
+test("composer supports bounded image paste drop reuse and distinct pinned-context chips", () => {
+    const source = readFileSync(path.join(__dirname, "../src/local/chat_view.ts"), "utf8");
+
+    assert.match(source, /input\.onpaste/);
+    assert.match(source, /input\.ondrop/);
+    assert.match(source, /uploadConversationAttachment/);
+    assert.match(source, /再次使用/);
+    assert.match(source, /固定当前上下文/);
+    assert.match(source, /偏好，不是已用证据/);
+    assert.match(source, /本轮实际使用的证据/);
+});

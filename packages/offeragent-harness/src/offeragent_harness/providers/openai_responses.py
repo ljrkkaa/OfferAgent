@@ -8,6 +8,7 @@ encoded into the provider request.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import queue
@@ -1179,10 +1180,24 @@ def _encode_message(message: ModelMessage) -> dict[str, Any]:
     role = message.role.value
     if message.role is ModelRole.TOOL:
         role = ModelRole.USER.value
-    blocks: list[dict[str, str]] = []
+    blocks: list[dict[str, Any]] = []
     for block in message.content:
         if block.kind == "text" and set(block.data) == {"text"} and isinstance(block.data.get("text"), str):
             text = str(block.data["text"])
+        elif block.kind == "image":
+            if message.role is not ModelRole.USER or block.binary_data is None:
+                raise ModelProviderConfigurationError("provider image blocks require user-owned ephemeral bytes")
+            media_type = block.data.get("mediaType")
+            if media_type not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+                raise ModelProviderConfigurationError("provider image block media type is unsupported")
+            blocks.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{media_type};base64,{base64.b64encode(block.binary_data).decode('ascii')}",
+                    "detail": "auto",
+                }
+            )
+            continue
         elif block.kind in _STRUCTURED_CONTENT_BLOCKS:
             serialized = json.dumps(
                 thaw_json(block.data),

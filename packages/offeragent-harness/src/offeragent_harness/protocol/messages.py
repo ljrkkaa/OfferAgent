@@ -40,6 +40,7 @@ from .ids import (
     SessionId,
     Sha256Digest,
     TurnId,
+    UploadId,
     WorkspaceId,
     WorkspaceInstanceId,
 )
@@ -823,6 +824,7 @@ class ModelDescriptor(WireModel):
     local: bool
     supports_streaming: bool
     supports_structured_output: bool
+    vision_status: Literal["supported", "unsupported", "unverified"] = "unverified"
     max_context_tokens: int | None = Field(default=None, ge=1)
     available: bool
 
@@ -842,6 +844,7 @@ class ModelsHealthParams(WireModel):
     client_request_id: RequestId
     model: str | None = Field(default=None, min_length=1, max_length=256)
     deadline: Rfc3339DateTime | None = None
+    capability: Literal["text", "vision"] = "text"
 
 
 class ModelsHealthResult(WireModel):
@@ -851,6 +854,7 @@ class ModelsHealthResult(WireModel):
     checked_at: Rfc3339DateTime
     latency_ms: int | None = Field(default=None, ge=0)
     error: ErrorEnvelope | None = None
+    capability: Literal["text", "vision"] = "text"
 
 
 class SessionCreateParams(WireModel):
@@ -1118,6 +1122,80 @@ class ArtifactReadResult(WireModel):
     eof: bool
 
 
+class AttachmentBeginParams(WireModel):
+    session_id: SessionId
+    client_request_id: RequestId
+    file_name: str = Field(min_length=1, max_length=255)
+    media_type: str = Field(pattern=r"^image/(png|jpeg|gif|webp)$")
+    byte_length: int = Field(ge=1, le=10 * 1024 * 1024)
+    content_hash: Sha256Digest
+
+    @field_validator("file_name")
+    @classmethod
+    def _file_name_is_leaf_only(cls, value: str) -> str:
+        if any(character in value for character in "/\\\x00\r\n") or value in {".", ".."}:
+            raise ValueError("attachment fileName must be a safe leaf name")
+        return value
+
+
+class AttachmentBeginResult(WireModel):
+    upload_id: UploadId
+    artifact_id: ArtifactId
+    max_chunk_bytes: int = Field(ge=1, le=65_536)
+    next_offset: int = Field(ge=0)
+    duplicate: bool
+
+
+class AttachmentChunkParams(WireModel):
+    session_id: SessionId
+    upload_id: UploadId
+    offset: int = Field(ge=0)
+    content_base64: str = Field(min_length=4, max_length=87_384, pattern=r"^[A-Za-z0-9+/]*={0,2}$")
+    content_hash: Sha256Digest
+
+
+class AttachmentChunkResult(WireModel):
+    upload_id: UploadId
+    received_bytes: int = Field(ge=0)
+    duplicate: bool
+
+
+class AttachmentCommitParams(WireModel):
+    session_id: SessionId
+    upload_id: UploadId
+
+
+class AttachmentCommitResult(WireModel):
+    upload_id: UploadId
+    artifact: ArtifactRef
+    duplicate: bool
+
+
+class AttachmentAbortParams(WireModel):
+    session_id: SessionId
+    upload_id: UploadId
+
+
+class AttachmentAbortResult(WireModel):
+    upload_id: UploadId
+    aborted: bool
+
+
+class AttachmentReadParams(WireModel):
+    session_id: SessionId
+    artifact_id: ArtifactId
+    offset: int = Field(default=0, ge=0)
+    max_bytes: int = Field(default=65_536, ge=1, le=65_536)
+
+
+class AttachmentReadResult(WireModel):
+    artifact: ArtifactRef
+    offset: int = Field(ge=0)
+    next_offset: int = Field(ge=0)
+    content_base64: str = Field(max_length=87_384)
+    eof: bool
+
+
 class DiagnosticsGetParams(WireModel):
     include_recent_errors: bool = True
     include_paths: Literal[False] = False
@@ -1273,6 +1351,11 @@ _COMMAND_SPECS = [
     _spec("agent/cancel", AgentCancelParams, AgentCancelResult, capability=CapabilityName.SUBAGENTS),
     _spec("events/replay", EventsReplayParams, EventsReplayResult, capability=CapabilityName.EVENT_REPLAY),
     _spec("artifact/read", ArtifactReadParams, ArtifactReadResult, capability=CapabilityName.ARTIFACTS),
+    _spec("attachments/begin", AttachmentBeginParams, AttachmentBeginResult, capability=CapabilityName.ARTIFACTS),
+    _spec("attachments/chunk", AttachmentChunkParams, AttachmentChunkResult, capability=CapabilityName.ARTIFACTS),
+    _spec("attachments/commit", AttachmentCommitParams, AttachmentCommitResult, capability=CapabilityName.ARTIFACTS),
+    _spec("attachments/abort", AttachmentAbortParams, AttachmentAbortResult, capability=CapabilityName.ARTIFACTS),
+    _spec("attachments/read", AttachmentReadParams, AttachmentReadResult, capability=CapabilityName.ARTIFACTS),
     _spec("diagnostics/get", DiagnosticsGetParams, DiagnosticsGetResult, capability=CapabilityName.DIAGNOSTICS),
     _spec(
         "diagnostics/snapshot",

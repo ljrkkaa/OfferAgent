@@ -41,6 +41,10 @@ function createClient(handler, options = {}) {
             for (const event of page.events ?? []) reducer.accept(event);
             return structuredClone(page.runCursors ?? runCursors);
         },
+        async requireVision(provider, model) {
+            options.onVisionProbe?.(provider, model);
+            if (options.visionError) throw options.visionError;
+        },
     };
 }
 
@@ -421,6 +425,50 @@ test("send creates a Session then submits one typed turn/start command", async (
     assert.match(calls[1][1].turnId, /^turn_[0-9a-f]{32}$/);
     assert.equal(store.activeTab.draft, "");
     assert.equal(store.activeTab.sessionId, "ses_01J00000000000000000000000");
+});
+
+test("ordered images remain in one submission after a vision capability probe", async () => {
+    const { ChatStore } = loadModule("chat_store.ts");
+    const calls = [];
+    const probes = [];
+    const client = createClient(async (method, params) => {
+        calls.push([method, params]);
+        if (method === "session/create") return {
+            session: { sessionId: "ses_01J00000000000000000000090", title: "Images" },
+            created: true,
+        };
+        if (method === "turn/start") return {
+            sessionId: params.sessionId,
+            turnId: params.turnId,
+            runId: "run_01J00000000000000000000090",
+            accepted: true,
+            duplicate: false,
+        };
+        throw new Error(`unexpected method: ${method}`);
+    }, { onVisionProbe: (provider, model) => probes.push([provider, model]) });
+    const store = new ChatStore(client, memoryPersistence());
+    await store.initialize();
+    const artifact = (id) => ({
+        type: "image",
+        artifact: {
+            artifactId: id,
+            contentHash: `sha256:${id === "art_one" ? "1" : "2"}`.padEnd(71, id === "art_one" ? "1" : "2"),
+            mediaType: "image/png",
+            sizeBytes: 10,
+            sensitivity: "private",
+            state: "complete",
+        },
+    });
+
+    await store.send("compare", {
+        runConfig: { ...runConfig, provider: "openai", model: "gpt-vision" },
+        attachments: [artifact("art_one"), artifact("art_two")],
+    });
+
+    assert.deepEqual(probes, [["openai", "gpt-vision"]]);
+    const start = calls.find(([method]) => method === "turn/start")[1];
+    assert.deepEqual(start.input.map((item) => item.type), ["text", "image", "image"]);
+    assert.deepEqual(start.input.slice(1).map((item) => item.artifact.artifactId), ["art_one", "art_two"]);
 });
 
 test("send immediately exposes a transient user submission and reconciles it by exact Turn id", async () => {

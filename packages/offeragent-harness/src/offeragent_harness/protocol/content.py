@@ -229,10 +229,17 @@ PinnedContextReference = TypeAliasType(
 )
 
 
+class PinnedContextContentBlock(WireModel):
+    """Replayable user intent that remains distinct from evidence."""
+
+    type: Literal["pinnedContext"]
+    references: list[PinnedContextReference] = Field(min_length=1, max_length=8)
+
+
 ContentBlock = TypeAliasType(
     "ContentBlock",
     Annotated[
-        TextContentBlock | FileContentBlock | ImageContentBlock | ArtifactContentBlock,
+        TextContentBlock | FileContentBlock | ImageContentBlock | ArtifactContentBlock | PinnedContextContentBlock,
         Field(discriminator="type"),
     ],
 )
@@ -251,6 +258,7 @@ __all__ = [
     "Freshness",
     "ImageContentBlock",
     "NonEmptyText",
+    "PinnedContextContentBlock",
     "PinnedContextReference",
     "PinnedDocumentContextReference",
     "PinnedSelectionContextReference",

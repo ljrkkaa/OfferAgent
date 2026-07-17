@@ -2,12 +2,14 @@ import { Component, ItemView, MarkdownRenderer, MarkdownView, Menu, Notice, Work
 
 import { BootstrapSnapshot } from "../runtime/bootstrap";
 import { ChatStore, ChatStoreSnapshot } from "../runtime/chat_store";
+import type { ArtifactRef, ImageContentBlock, PinnedContextReference } from "../runtime/generated_protocol";
 import type {
     ApprovalTimelineItem,
     RunViewState,
     SubagentTimelineItem,
     TimelineItem,
     ToolCallTimelineItem,
+    UserMessageTimelineItem,
 } from "../runtime/event_reducer";
 import type { EventEnvelope } from "../runtime/event_reducer";
 import { JsonObject, RemoteRpcError } from "../runtime/json_rpc";
@@ -26,6 +28,7 @@ export interface ChatModelChoice {
     readonly displayName: string;
     readonly supportsStreaming: boolean;
     readonly supportsStructuredOutput: boolean;
+    readonly visionStatus: "supported" | "unsupported" | "unverified";
 }
 
 export interface LocalChatHost {
@@ -34,6 +37,9 @@ export interface LocalChatHost {
     subscribeRuntime(listener: (snapshot: BootstrapSnapshot) => void): () => void;
     ensureChatStore(): Promise<ChatStore>;
     readArtifactText(artifactId: string): Promise<string>;
+    uploadConversationAttachment(sessionId: string, file: File): Promise<ImageContentBlock>;
+    readConversationAttachment(sessionId: string, artifact: ArtifactRef): Promise<Uint8Array>;
+    discardConversationAttachment(sessionId: string, artifactId: string): Promise<boolean>;
     listSessions(): Promise<readonly { sessionId: string; title: string }[]>;
     listModels(): Promise<readonly ChatModelChoice[]>;
     selectModel(model: string): Promise<void>;
@@ -67,6 +73,14 @@ export class LocalChatView extends ItemView {
     private pendingStreamRunId: string | null = null;
     private streamPatchGeneration = 0;
     private closed = true;
+    private attachmentPending = false;
+    private readonly composerAttachments = new Map<
+        string,
+        { block: ImageContentBlock; previewUrl: string | null }[]
+    >();
+    private readonly composerPins = new Map<string, PinnedContextReference[]>();
+    private readonly objectUrls = new Set<string>();
+    private readonly renderObjectUrls = new Set<string>();
 
     constructor(leaf: WorkspaceLeaf, host: LocalChatHost) {
         super(leaf);
@@ -115,6 +129,8 @@ export class LocalChatView extends ItemView {
         this.renderGeneration += 1;
         this.streamPatchGeneration += 1;
         this.pendingStreamRunId = null;
+        this.revokeUrls(this.objectUrls);
+        this.revokeUrls(this.renderObjectUrls);
     }
 
     private async bindCurrentStore(runtimeAttempt: string): Promise<void> {
@@ -174,6 +190,7 @@ export class LocalChatView extends ItemView {
         const renderGeneration = ++this.renderGeneration;
         this.streamPatchGeneration += 1;
         this.releaseMarkdownComponents();
+        this.revokeUrls(this.renderObjectUrls);
         this.markdownRenderTasks = [];
         const root = this.contentEl;
         const previousTimeline = root.querySelector<HTMLElement>(".offeragent-timeline");
@@ -356,7 +373,7 @@ export class LocalChatView extends ItemView {
         if (!isTerminal(run.status)) article.createDiv({ cls: "offeragent-thinking", text: phaseLabel(run.phase) });
         if (run.references.length > 0) {
             const references = article.createEl("details", { cls: "offeragent-references" });
-            references.createEl("summary", { text: `引用 ${run.references.length}` });
+            references.createEl("summary", { text: `本轮实际使用的证据 ${run.references.length}` });
             const list = references.createEl("ul");
             for (const reference of run.references) {
                 const item = list.createEl("li");
@@ -421,6 +438,14 @@ export class LocalChatView extends ItemView {
                 const user = container.createDiv({ cls: "offeragent-message offeragent-user" });
                 user.createDiv({ cls: "offeragent-message-label", text: item.source === "steer" ? "你（追加）" : "你" });
                 for (const block of item.blocks) user.createDiv({ cls: "offeragent-message-body", text: block });
+                if (item.pinnedContext.length > 0) {
+                    const pins = user.createDiv({ cls: "offeragent-pinned-context" });
+                    pins.createSpan({ text: "固定上下文（偏好，不是已用证据）" });
+                    for (const reference of item.pinnedContext) {
+                        pins.createSpan({ cls: "offeragent-context-chip", text: pinnedContextLabel(reference) });
+                    }
+                }
+                for (const image of item.images) this.renderHistoryImage(user, item, image);
                 return;
             }
             case "reasoning": {
@@ -633,6 +658,36 @@ export class LocalChatView extends ItemView {
                 text: `当前有效权限：${permissionModeLabel(effectiveMode)}`,
             });
         }
+        const draftAttachments = this.composerAttachments.get(tab.tabId) ?? [];
+        const draftPins = this.composerPins.get(tab.tabId) ?? [];
+        if (draftAttachments.length > 0) {
+            const previews = composer.createDiv({ cls: "offeragent-attachment-previews" });
+            for (const attachment of draftAttachments) {
+                const card = previews.createDiv({ cls: "offeragent-attachment-preview" });
+                if (attachment.previewUrl) card.createEl("img", {
+                    attr: { src: attachment.previewUrl, alt: attachment.block.altText ?? "待发送图片" },
+                });
+                card.createSpan({ text: attachment.block.artifact.title ?? "图片" });
+                const remove = card.createEl("button", { attr: { "aria-label": "移除图片" } });
+                setIcon(remove, "x");
+                remove.disabled = this.attachmentPending || this.sendPending;
+                remove.onclick = () => void this.removeComposerAttachment(tab.tabId, attachment);
+            }
+        }
+        if (draftPins.length > 0) {
+            const pins = composer.createDiv({ cls: "offeragent-composer-pins" });
+            pins.createSpan({ text: "固定上下文" });
+            for (const reference of draftPins) {
+                const chip = pins.createDiv({ cls: "offeragent-context-chip" });
+                chip.createSpan({ text: pinnedContextLabel(reference) });
+                const remove = chip.createEl("button", { attr: { "aria-label": "移除固定上下文" } });
+                setIcon(remove, "x");
+                remove.onclick = () => {
+                    this.composerPins.set(tab.tabId, draftPins.filter((item) => item !== reference));
+                    this.scheduleRender();
+                };
+            }
+        }
         const input = composer.createEl("textarea", {
             cls: "offeragent-composer-input",
             attr: { placeholder: "询问你的笔记，或交给 OfferAgent 一个任务…", rows: "3" },
@@ -655,8 +710,23 @@ export class LocalChatView extends ItemView {
         input.oninput = () => {
             if (!this.composing) this.scheduleDraftSave(tab.tabId, input.value);
         };
+        input.ondragover = (event) => {
+            if (imageFiles(event.dataTransfer?.files).length > 0) event.preventDefault();
+        };
+        input.ondrop = (event) => {
+            const files = imageFiles(event.dataTransfer?.files);
+            if (files.length === 0) return;
+            event.preventDefault();
+            void this.addAttachmentFiles(tab.tabId, files);
+        };
+        input.onpaste = (event) => {
+            const files = imageFiles(event.clipboardData?.files);
+            if (files.length === 0) return;
+            event.preventDefault();
+            void this.addAttachmentFiles(tab.tabId, files);
+        };
         input.onkeydown = (event) => {
-            const blocked = snapshot.busy || this.sendPending || hasActiveRun;
+            const blocked = snapshot.busy || this.sendPending || this.attachmentPending || hasActiveRun;
             if (shouldSendComposerInput(event, this.composing, blocked)) {
                 event.preventDefault();
                 void this.send(input.value);
@@ -673,6 +743,7 @@ export class LocalChatView extends ItemView {
                 displayName: this.host.settings.model,
                 supportsStreaming: false,
                 supportsStructuredOutput: false,
+                visionStatus: "unverified" as const,
             }, ...this.models];
         for (const choice of choices) {
             model.createEl("option", { value: choice.model, text: choice.displayName });
@@ -683,11 +754,11 @@ export class LocalChatView extends ItemView {
         model.onchange = () => void this.chooseModel(model.value);
         const selectedModel = choices.find((choice) => choice.model === model.value);
         model.title = this.modelError ?? (!this.modelsLoaded ? "正在从 Worker 查询模型能力" : selectedModel
-            ? `${selectedModel.provider} · ${selectedModel.supportsStreaming ? "支持流式" : "不支持流式"} · ${selectedModel.supportsStructuredOutput ? "支持结构化输出" : "不支持结构化输出"}`
+            ? `${selectedModel.provider} · ${selectedModel.supportsStreaming ? "支持流式" : "不支持流式"} · ${selectedModel.supportsStructuredOutput ? "支持结构化输出" : "不支持结构化输出"} · ${visionStatusLabel(selectedModel.visionStatus)}`
             : "模型能力尚不可用");
         const capability = modelControl.createSpan({ cls: "offeragent-model-capability", attr: { "aria-live": "polite" } });
         capability.setText(this.modelError ? "模型不可用" : !this.modelsLoaded ? "能力查询中" : selectedModel
-            ? [selectedModel.supportsStreaming ? "流式" : "非流式", selectedModel.supportsStructuredOutput ? "结构化" : "文本"]
+            ? [selectedModel.supportsStreaming ? "流式" : "非流式", selectedModel.supportsStructuredOutput ? "结构化" : "文本", visionStatusLabel(selectedModel.visionStatus)]
                 .join(" · ")
             : "能力未知");
         capability.title = model.title;
@@ -702,8 +773,24 @@ export class LocalChatView extends ItemView {
                 void this.store?.steer(activeRun.runId, text).catch((error) => new Notice(actionableMessage(error)));
             };
         }
+        const attach = controls.createEl("button", { attr: { "aria-label": "添加图片" } });
+        setIcon(attach, "paperclip");
+        attach.disabled = snapshot.busy || this.sendPending || this.attachmentPending || hasActiveRun;
+        const fileInput = composer.createEl("input", {
+            cls: "offeragent-hidden-file-input",
+            attr: { type: "file", accept: "image/png,image/jpeg,image/webp,image/gif", multiple: "true" },
+        });
+        attach.onclick = () => fileInput.click();
+        fileInput.onchange = () => {
+            const files = imageFiles(fileInput.files);
+            fileInput.value = "";
+            if (files.length > 0) void this.addAttachmentFiles(tab.tabId, files);
+        };
+        const pin = controls.createEl("button", { text: "固定当前上下文" });
+        pin.disabled = snapshot.busy || this.sendPending || hasActiveRun || draftPins.length >= 8;
+        pin.onclick = () => this.pinCurrentContext(tab.tabId);
         const send = controls.createEl("button", { text: "发送", cls: "mod-cta" });
-        send.disabled = snapshot.busy || this.sendPending || hasActiveRun;
+        send.disabled = snapshot.busy || this.sendPending || this.attachmentPending || hasActiveRun;
         send.onclick = () => void this.send(input.value);
     }
 
@@ -712,7 +799,7 @@ export class LocalChatView extends ItemView {
         const store = this.store;
         const snapshot = this.snapshot;
         const tab = snapshot?.tabs.find((candidate) => candidate.tabId === snapshot.activeTabId);
-        if (!message || !store || !snapshot || !tab || this.sendPending || snapshot.busy ||
+        if (!message || !store || !snapshot || !tab || this.sendPending || this.attachmentPending || snapshot.busy ||
             activeRunForTab(snapshot, tab.sessionId, tab.selectedRunId) !== undefined) return;
         // Set this before the first await so Enter and click in the same frame
         // cannot start two Turns.
@@ -721,9 +808,16 @@ export class LocalChatView extends ItemView {
         this.draftTimer = null;
         this.scheduleRender();
         try {
+            const attachments = this.composerAttachments.get(tab.tabId) ?? [];
+            const pinnedContext = this.composerPins.get(tab.tabId) ?? [];
             await store.send(message, {
                 runConfig: runConfig(this.host.settings),
+                ...(attachments.length ? { attachments: attachments.map((item) => item.block) } : {}),
+                ...(pinnedContext.length ? { pinnedContext } : {}),
             });
+            for (const attachment of attachments) this.releaseComposerPreview(attachment.previewUrl);
+            this.composerAttachments.delete(tab.tabId);
+            this.composerPins.delete(tab.tabId);
             this.clearComposerTabId = tab.tabId;
         } catch (error) {
             new Notice(actionableMessage(error));
@@ -731,6 +825,144 @@ export class LocalChatView extends ItemView {
             this.sendPending = false;
             this.scheduleRender();
         }
+    }
+
+    private async addAttachmentFiles(tabId: string, files: readonly File[]): Promise<void> {
+        const store = this.store;
+        if (!store || this.attachmentPending || files.length === 0) return;
+        const existing = this.composerAttachments.get(tabId) ?? [];
+        if (existing.length + files.length > 20) {
+            new Notice("一次最多添加 20 张图片");
+            return;
+        }
+        const total = existing.reduce((size, item) => size + item.block.artifact.sizeBytes, 0) +
+            files.reduce((size, file) => size + file.size, 0);
+        if (files.some((file) => file.size < 1 || file.size > 10 * 1024 * 1024) || total > 50 * 1024 * 1024) {
+            new Notice("每张图片不得超过 10 MiB，一次提交合计不得超过 50 MiB");
+            return;
+        }
+        this.attachmentPending = true;
+        this.scheduleRender();
+        try {
+            const sessionId = await store.ensureSessionForTab(tabId);
+            const selected = [...existing];
+            for (const file of files) {
+                const block = await this.host.uploadConversationAttachment(sessionId, file);
+                const previewUrl = URL.createObjectURL(file);
+                this.objectUrls.add(previewUrl);
+                selected.push({ block, previewUrl });
+                this.composerAttachments.set(tabId, selected);
+                this.scheduleRender();
+            }
+        } catch (error) {
+            new Notice(actionableMessage(error));
+        } finally {
+            this.attachmentPending = false;
+            this.scheduleRender();
+        }
+    }
+
+    private async removeComposerAttachment(
+        tabId: string,
+        attachment: { block: ImageContentBlock; previewUrl: string | null },
+    ): Promise<void> {
+        const tab = this.snapshot?.tabs.find((candidate) => candidate.tabId === tabId);
+        try {
+            if (tab?.sessionId) {
+                await this.host.discardConversationAttachment(tab.sessionId, attachment.block.artifact.artifactId);
+            }
+            const current = this.composerAttachments.get(tabId) ?? [];
+            this.composerAttachments.set(tabId, current.filter((item) => item !== attachment));
+            this.releaseComposerPreview(attachment.previewUrl);
+            this.scheduleRender();
+        } catch (error) {
+            new Notice(actionableMessage(error));
+        }
+    }
+
+    private pinCurrentContext(tabId: string): void {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        const path = view?.file?.path;
+        if (!view || !path || !isPinnableVaultPath(path)) {
+            new Notice("请先打开一篇可发现的 Markdown 或文本笔记（不支持隐藏路径和 AGENT.md）");
+            return;
+        }
+        const from = view.editor.getCursor("from");
+        const to = view.editor.getCursor("to");
+        const reference: PinnedContextReference = view.editor.getSelection().trim()
+            ? { kind: "selection", path, lineStart: from.line + 1, lineEnd: to.line + 1 }
+            : { kind: "document", path };
+        const current = this.composerPins.get(tabId) ?? [];
+        const identity = JSON.stringify(reference);
+        if (!current.some((item) => JSON.stringify(item) === identity)) {
+            this.composerPins.set(tabId, [...current, reference]);
+            this.scheduleRender();
+        }
+    }
+
+    private renderHistoryImage(
+        container: HTMLElement,
+        message: UserMessageTimelineItem,
+        image: UserMessageTimelineItem["images"][number],
+    ): void {
+        const run = [...(this.snapshot?.projection.runs.values() ?? [])].find(
+            (candidate) => candidate.timeline.includes(message),
+        );
+        if (!run) return;
+        const card = container.createDiv({ cls: "offeragent-history-image" });
+        const preview = card.createEl("img", { attr: { alt: image.altText ?? image.artifact.title ?? "历史图片" } });
+        card.createSpan({ text: image.artifact.title ?? "图片附件" });
+        const reuse = card.createEl("button", { text: "再次使用" });
+        reuse.onclick = () => void this.reuseHistoryAttachment(run.sessionId, image);
+        void this.host.readConversationAttachment(run.sessionId, image.artifact)
+            .then((content) => {
+                if (!preview.isConnected) return;
+                const url = URL.createObjectURL(new Blob([content], { type: image.artifact.mediaType }));
+                this.renderObjectUrls.add(url);
+                preview.src = url;
+            })
+            .catch((error) => {
+                if (card.isConnected) card.createSpan({ cls: "offeragent-attachment-error", text: actionableMessage(error) });
+            });
+    }
+
+    private async reuseHistoryAttachment(
+        sessionId: string,
+        image: UserMessageTimelineItem["images"][number],
+    ): Promise<void> {
+        const snapshot = this.snapshot;
+        const tab = snapshot?.tabs.find((candidate) => candidate.tabId === snapshot.activeTabId);
+        if (!tab || tab.sessionId !== sessionId) return;
+        const current = this.composerAttachments.get(tab.tabId) ?? [];
+        if (current.some((item) => item.block.artifact.artifactId === image.artifact.artifactId)) return;
+        if (current.length >= 20 || current.reduce((size, item) => size + item.block.artifact.sizeBytes, 0) +
+            image.artifact.sizeBytes > 50 * 1024 * 1024) {
+            new Notice("再次使用会超过本次提交的图片限制");
+            return;
+        }
+        try {
+            const content = await this.host.readConversationAttachment(sessionId, image.artifact);
+            const url = URL.createObjectURL(new Blob([content], { type: image.artifact.mediaType }));
+            this.objectUrls.add(url);
+            this.composerAttachments.set(tab.tabId, [
+                ...current,
+                { block: { type: "image", artifact: image.artifact, ...(image.altText ? { altText: image.altText } : {}) }, previewUrl: url },
+            ]);
+            this.scheduleRender();
+        } catch (error) {
+            new Notice(actionableMessage(error));
+        }
+    }
+
+    private releaseComposerPreview(url: string | null): void {
+        if (!url) return;
+        URL.revokeObjectURL(url);
+        this.objectUrls.delete(url);
+    }
+
+    private revokeUrls(values: Set<string>): void {
+        for (const url of values) URL.revokeObjectURL(url);
+        values.clear();
     }
 
     private async refreshModels(runtimeAttempt: string): Promise<void> {
@@ -839,6 +1071,26 @@ export function originalTurnPrompt(
     const message = timeline.find((item) => item.kind === "user_message" && item.source === "turn");
     const text = message?.blocks?.filter((block) => block.trim()).join("\n\n").trim() ?? "";
     return text || null;
+}
+
+function imageFiles(files: FileList | null | undefined): File[] {
+    return files ? Array.from(files).filter((file) => file.type.startsWith("image/")) : [];
+}
+
+function pinnedContextLabel(pin: PinnedContextReference): string {
+    return pin.kind === "selection"
+        ? `${pin.path}:${pin.lineStart}-${pin.lineEnd}`
+        : pin.path;
+}
+
+function isPinnableVaultPath(path: string): boolean {
+    const lowered = path.toLowerCase();
+    return safeVaultPath(path) && lowered !== "agent.md" && !path.split("/").some((segment) => segment.startsWith(".")) &&
+        (lowered.endsWith(".md") || lowered.endsWith(".txt"));
+}
+
+function visionStatusLabel(value: ChatModelChoice["visionStatus"]): string {
+    return value === "supported" ? "视觉已验证" : value === "unsupported" ? "不支持视觉" : "视觉待探测";
 }
 
 export function ordinaryToolActivity(tool: Pick<ToolCallTimelineItem, "name" | "status">): boolean {

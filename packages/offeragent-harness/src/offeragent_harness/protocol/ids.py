@@ -33,6 +33,7 @@ ToolCallId = TypeAliasType("ToolCallId", Annotated[str, _id_constraints("call_")
 InvocationId = TypeAliasType("InvocationId", Annotated[str, _id_constraints("inv_")])
 ApprovalId = TypeAliasType("ApprovalId", Annotated[str, _id_constraints("apr_")])
 ArtifactId = TypeAliasType("ArtifactId", Annotated[str, _id_constraints("art_")])
+UploadId = TypeAliasType("UploadId", Annotated[str, _id_constraints("upload_")])
 TraceId = TypeAliasType("TraceId", Annotated[str, _id_constraints("trace_")])
 TransactionId = TypeAliasType("TransactionId", Annotated[str, _id_constraints("tx_")])
 DocumentId = TypeAliasType("DocumentId", Annotated[str, _id_constraints("doc_")])
@@ -164,6 +165,7 @@ __all__ = [
     "TraceId",
     "TransactionId",
     "TurnId",
+    "UploadId",
     "WorkspaceId",
     "WorkspaceInstanceId",
     "split_protocol_version",

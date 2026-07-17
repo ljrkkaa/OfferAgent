@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from datetime import datetime, timedelta
@@ -66,6 +68,7 @@ class ProductionModelCommandService:
         self._gateway_factory = gateway_factory
         self._clock = clock
         self._ids = ids
+        self._vision_status: dict[tuple[str, str], Literal["supported", "unsupported", "unverified"]] = {}
 
     async def list_models(
         self,
@@ -88,6 +91,7 @@ class ProductionModelCommandService:
             local=settings.provider is ModelProvider.LOCAL,
             supports_streaming=True,
             supports_structured_output=True,
+            vision_status=self._vision_status.get((provider, settings.model), "unverified"),
             max_context_tokens=None,
             available=available,
         )
@@ -106,7 +110,14 @@ class ProductionModelCommandService:
         settings = snapshot.config.model
         model = params.model or settings.model or None
         if params.provider != settings.provider.value or not settings.model or model != settings.model:
-            return self._result(params.provider, model, "unsupported", None, "model_selection_unavailable")
+            return self._result(
+                params.provider,
+                model,
+                "unsupported",
+                None,
+                "model_selection_unavailable",
+                capability=params.capability,
+            )
         available, availability_code = await self._availability(
             settings,
             snapshot.config.network.model_provider_enabled,
@@ -116,7 +127,15 @@ class ProductionModelCommandService:
                 "auth_required" if availability_code == "credential_unavailable" else "unreachable"
             )
             code = ErrorCode.AUTH_REQUIRED if status == "auth_required" else ErrorCode.PROVIDER_UNREACHABLE
-            return self._result(params.provider, model, status, None, availability_code, code=code)
+            return self._result(
+                params.provider,
+                model,
+                status,
+                None,
+                availability_code,
+                code=code,
+                capability=params.capability,
+            )
 
         now = self._clock.utcnow()
         deadline = _deadline(params.deadline, now)
@@ -128,12 +147,23 @@ class ProductionModelCommandService:
                 0,
                 "health_deadline_expired",
                 code=ErrorCode.REQUEST_DEADLINE_EXCEEDED,
+                capability=params.capability,
             )
         try:
             gateway = self._gateway_factory(settings, snapshot.config.network.model_provider_enabled)
         except Exception:
-            return self._result(params.provider, model, "unsupported", None, "provider_configuration_invalid")
+            return self._result(
+                params.provider,
+                model,
+                "unsupported",
+                None,
+                "provider_configuration_invalid",
+                capability=params.capability,
+            )
 
+        probe_content = [ModelContentBlock.text("OfferAgent provider health probe. Reply exactly OK.")]
+        if params.capability == "vision":
+            probe_content.append(_vision_probe_block())
         request = ModelRequest(
             request_id=self._ids.new_id("model-health"),
             model=settings.model,
@@ -141,7 +171,7 @@ class ProductionModelCommandService:
             messages=(
                 ModelMessage(
                     ModelRole.SYSTEM,
-                    (ModelContentBlock.text("OfferAgent provider health probe. Reply exactly OK."),),
+                    tuple(probe_content),
                     name="offeragent-health-probe",
                 ),
             ),
@@ -156,6 +186,7 @@ class ProductionModelCommandService:
                 "operation": "model_health",
                 "clientRequestId": params.client_request_id,
                 "contentSource": "fixed_runtime_probe",
+                "capability": params.capability,
             },
         )
         started = self._clock.monotonic()
@@ -176,6 +207,7 @@ class ProductionModelCommandService:
                 "degraded",
                 _latency_ms(started, self._clock.monotonic()),
                 "provider_probe_failed",
+                capability=params.capability,
             )
         latency = _latency_ms(started, self._clock.monotonic())
         if timed_out:
@@ -186,17 +218,54 @@ class ProductionModelCommandService:
                 latency,
                 "health_deadline_exceeded",
                 code=ErrorCode.REQUEST_DEADLINE_EXCEEDED,
+                capability=params.capability,
             )
         if terminal is None:
-            return self._result(params.provider, model, "degraded", latency, "provider_stream_missing_terminal")
+            return self._result(
+                params.provider,
+                model,
+                "degraded",
+                latency,
+                "provider_stream_missing_terminal",
+                capability=params.capability,
+            )
         if terminal.kind is ModelEventKind.COMPLETED:
-            return self._result(params.provider, model, "healthy", latency, None)
+            if params.capability == "vision" and model is not None:
+                self._vision_status[(params.provider, model)] = "supported"
+            return self._result(
+                params.provider,
+                model,
+                "healthy",
+                latency,
+                None,
+                capability=params.capability,
+            )
         if terminal.kind is ModelEventKind.CANCELLED:
             cancellation.checkpoint()
-            return self._result(params.provider, model, "degraded", latency, "provider_cancelled_probe")
+            return self._result(
+                params.provider,
+                model,
+                "degraded",
+                latency,
+                "provider_cancelled_probe",
+                capability=params.capability,
+            )
         assert terminal.kind is ModelEventKind.ERROR and terminal.error is not None
         status, code = _error_status(terminal.error.code)
-        return self._result(params.provider, model, status, latency, terminal.error.code, code=code)
+        reason = terminal.error.code
+        if params.capability == "vision" and status in {"degraded", "unsupported"}:
+            status, reason = "unsupported", "vision_unsupported"
+            if model is not None:
+                self._vision_status[(params.provider, model)] = "unsupported"
+        return self._result(
+            params.provider,
+            model,
+            status,
+            latency,
+            reason,
+            code=code,
+            capability=params.capability,
+        )
 
     async def _snapshot(self) -> RunConfigSnapshot:
         return await self._config.snapshot(
@@ -239,6 +308,7 @@ class ProductionModelCommandService:
         reason: str | None,
         *,
         code: ErrorCode | None = None,
+        capability: Literal["text", "vision"] = "text",
     ) -> ModelsHealthResult:
         error = None
         if reason is not None:
@@ -256,7 +326,25 @@ class ProductionModelCommandService:
             checked_at=self._clock.utcnow().isoformat(),
             latency_ms=latency_ms,
             error=error,
+            capability=capability,
         )
+
+
+def _vision_probe_block() -> ModelContentBlock:
+    content = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        validate=True,
+    )
+    return ModelContentBlock(
+        "image",
+        {
+            "artifactId": "art_runtime_vision_probe",
+            "mediaType": "image/png",
+            "contentHash": f"sha256:{hashlib.sha256(content).hexdigest()}",
+            "fixedRuntimeProbe": True,
+        },
+        binary_data=content,
+    )
 
 
 async def _consume_probe(

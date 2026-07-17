@@ -53,6 +53,7 @@ class ContextFragment:
     artifact_ids: tuple[str, ...] = ()
     content_hash: str | None = None
     role: ModelRole = ModelRole.USER
+    model_blocks: tuple[ModelContentBlock, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.fragment_id or not self.text:
@@ -76,6 +77,11 @@ class ContextFragment:
             raise ValueError("artifact_ids must be unique non-empty identifiers")
         if self.content_hash is not None and not _SHA256.fullmatch(self.content_hash):
             raise ValueError("content_hash must be a canonical sha256 digest")
+        if self.model_blocks and (
+            self.layer is not ContextLayer.USER_INPUT
+            or any(block.kind != "image" or block.binary_data is None for block in self.model_blocks)
+        ):
+            raise ValueError("ephemeral model blocks are supported only for user-input images")
 
 
 @dataclass(frozen=True, slots=True)
@@ -733,7 +739,7 @@ class ContextManager:
         )
         return ModelMessage(
             role=ModelRole.USER,
-            content=(block,),
+            content=(block, *fragment.model_blocks),
             name=f"offeragent-{fragment.layer.value}",
         )
 

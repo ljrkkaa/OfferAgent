@@ -25,7 +25,7 @@ from offeragent_harness.agent.state import (
     RunPhase,
     RunState,
 )
-from offeragent_harness.models import ModelPurpose, ModelRole, thaw_json
+from offeragent_harness.models import ModelContentBlock, ModelPurpose, ModelRole, thaw_json
 from offeragent_harness.ports import Sensitivity
 from offeragent_harness.sessions import AgentLineage
 from offeragent_harness.tools import ResultSensitivity, ToolResult, ToolResultStatus
@@ -411,6 +411,34 @@ def test_system_snapshot_is_never_silently_truncated_to_fit_an_impossible_budget
 
     with pytest.raises(ContextBudgetExceeded, match="system rules"):
         manager.build(_state(), purpose=ModelPurpose.PLANNING)
+
+
+def test_user_input_keeps_ephemeral_image_bytes_out_of_projection_identity() -> None:
+    metadata = {
+        "artifactId": "art_one",
+        "mediaType": "image/png",
+        "contentHash": "sha256:" + "1" * 64,
+    }
+    image = ModelContentBlock("image", metadata, binary_data=b"\x89PNG\r\n\x1a\nimage")
+    fragment = ContextFragment(
+        "user",
+        ContextLayer.USER_INPUT,
+        '{"type":"image","artifactId":"art_one"}',
+        Sensitivity.PRIVATE,
+        model_blocks=(image,),
+    )
+    manager = ContextManager(
+        system_rules=("rule",),
+        inputs=ContextInputs(user_input=(fragment,)),
+        visibility=ContextVisibilityPolicy.local_model(),
+        budget=ContextBudget.generous_default(),
+    )
+
+    window = manager.build(_state(), purpose=ModelPurpose.PLANNING)
+    message = next(item for item in window.messages if item.name == "offeragent-user_input")
+    assert message.content[-1].kind == "image"
+    assert message.content[-1].binary_data == b"\x89PNG\r\n\x1a\nimage"
+    assert "binary_data" not in repr(message)
 
 
 def test_overflow_reference_projection_preserves_control_and_structural_tool_evidence() -> None:

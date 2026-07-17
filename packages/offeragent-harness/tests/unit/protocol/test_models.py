@@ -18,6 +18,7 @@ from offeragent_harness.protocol.capabilities import (
 from offeragent_harness.protocol.content import (
     ContentBlock,
     FileRef,
+    PinnedContextContentBlock,
     PinnedSelectionContextReference,
     ProjectSourceRef,
     RelativeVaultPath,
@@ -39,6 +40,9 @@ from offeragent_harness.protocol.jsonrpc import (
 from offeragent_harness.protocol.messages import (
     ALL_METHOD_REGISTRY,
     COMMAND_REGISTRY,
+    AttachmentBeginParams,
+    AttachmentChunkParams,
+    AttachmentReadParams,
     EventsReplayParams,
     EventsReplayResult,
     InitializeParams,
@@ -93,6 +97,11 @@ EXPECTED_COMMANDS = {
     "agent/cancel",
     "events/replay",
     "artifact/read",
+    "attachments/begin",
+    "attachments/chunk",
+    "attachments/commit",
+    "attachments/abort",
+    "attachments/read",
     "diagnostics/get",
     "diagnostics/snapshot",
     "diagnostics/export-preview",
@@ -315,6 +324,61 @@ def test_turn_start_accepts_at_most_eight_safe_pinned_source_locators() -> None:
     raw["pinnedContext"] = [{"kind": "document", "path": "../outside.md"}]
     with pytest.raises(ValidationError):
         TurnStartParams.model_validate_json(json.dumps(raw))
+
+
+def test_pinned_context_is_a_distinct_replayable_content_block() -> None:
+    value: ContentBlock = TypeAdapter(ContentBlock).validate_python(
+        {
+            "type": "pinnedContext",
+            "references": [
+                {"kind": "document", "path": "notes/preferred.md"},
+                {"kind": "selection", "path": "notes/range.md", "lineStart": 4, "lineEnd": 8},
+            ],
+        }
+    )
+
+    assert isinstance(value, PinnedContextContentBlock)
+    assert len(value.references) == 2
+
+
+def test_attachment_commands_bound_transfer_without_exposing_paths() -> None:
+    sha = "sha256:" + "a" * 64
+    begun = AttachmentBeginParams.model_validate(
+        {
+            "sessionId": "ses_one",
+            "clientRequestId": "req_upload",
+            "fileName": "evidence.png",
+            "mediaType": "image/png",
+            "byteLength": 1024,
+            "contentHash": sha,
+        }
+    )
+    chunk = AttachmentChunkParams.model_validate(
+        {
+            "sessionId": "ses_one",
+            "uploadId": "upload_one",
+            "offset": 0,
+            "contentBase64": "aGVsbG8=",
+            "contentHash": "sha256:" + "2" * 64,
+        }
+    )
+    read = AttachmentReadParams.model_validate(
+        {"sessionId": "ses_one", "artifactId": "art_one", "offset": 0, "maxBytes": 65_536}
+    )
+
+    assert begun.file_name == "evidence.png"
+    assert chunk.content_base64 == "aGVsbG8="
+    assert read.max_bytes == 65_536
+    with pytest.raises(ValidationError):
+        AttachmentChunkParams.model_validate(
+            {
+                "sessionId": "ses_one",
+                "uploadId": "upload_one",
+                "offset": 0,
+                "contentBase64": "A" * 100_000,
+                "contentHash": sha,
+            }
+        )
 
 
 def test_event_registry_is_complete_concrete_and_immutable() -> None:

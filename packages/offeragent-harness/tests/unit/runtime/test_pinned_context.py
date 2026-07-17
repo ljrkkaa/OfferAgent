@@ -21,10 +21,10 @@ def test_pins_are_preferred_locators_not_a_search_whitelist_or_evidence() -> Non
     )
 
     assert block is not None
-    text = block["text"]
-    assert isinstance(text, str)
-    assert "preferred source locators, not a whitelist" in text
-    assert "notes/range.md:4-8" in text
-    assert "A pin is not evidence" in text
-    assert "vault.read" in text
-    assert block["references"] == []
+    assert block == {
+        "type": "pinnedContext",
+        "references": [
+            {"kind": "document", "path": "notes/preferred.md"},
+            {"kind": "selection", "path": "notes/range.md", "lineStart": 4, "lineEnd": 8},
+        ],
+    }

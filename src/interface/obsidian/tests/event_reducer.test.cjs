@@ -151,6 +151,39 @@ test("timeline preserves semantic item order and accepts only real tool lifecycl
     assert.equal(approval.scope, "once");
 });
 
+test("turn history keeps nested image metadata and pins distinct from text and used evidence", () => {
+    const { EventReducer } = loadModule();
+    const reducer = new EventReducer(WORKSPACE);
+    reducer.accept(event(1, "turn.started", { input: [
+        { type: "text", text: "compare these" },
+        {
+            type: "image",
+            artifact: {
+                artifactId: "art_image",
+                contentHash: SHA,
+                mediaType: "image/png",
+                sizeBytes: 42,
+                sensitivity: "private",
+                state: "complete",
+                title: "offer.png",
+            },
+            altText: "offer screenshot",
+        },
+        {
+            type: "pinnedContext",
+            references: [{ kind: "selection", path: "notes/offer.md", lineStart: 3, lineEnd: 8 }],
+        },
+    ] }));
+
+    const message = item(reducer.state.runs.get(RUN), "user_message");
+    assert.deepEqual(message.blocks, ["compare these"]);
+    assert.equal(message.images[0].artifact.artifactId, "art_image");
+    assert.equal(message.images[0].altText, "offer screenshot");
+    assert.deepEqual(message.pinnedContext, [
+        { kind: "selection", path: "notes/offer.md", lineStart: 3, lineEnd: 8 },
+    ]);
+});
+
 test("tool events without the accepted durable call are rejected", () => {
     const { EventReducer, EventProjectionError } = loadModule();
     const reducer = new EventReducer(WORKSPACE);

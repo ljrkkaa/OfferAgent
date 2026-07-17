@@ -254,6 +254,15 @@ export class ChatStore {
         return this.operation(async () => await this.createSessionForTab(tabId, title));
     }
 
+    async ensureSessionForTab(tabId: string): Promise<string> {
+        this.requireInitialized();
+        requireId(tabId, "tab_");
+        const tab = this.tabs.find((candidate) => candidate.tabId === tabId);
+        if (!tab) throw new Error("OfferAgent tab does not exist");
+        if (tab.sessionId !== null) return tab.sessionId;
+        return this.operation(async () => await this.createSessionForTab(tabId));
+    }
+
     async send(message: string, options: SendTurnOptions): Promise<{ turnId: string; runId: string }> {
         this.requireInitialized();
         const normalized = message.trim();
@@ -284,6 +293,9 @@ export class ChatStore {
                 sessionSendKey = `session:${sessionId}`;
                 this.sendsInFlight.add(sessionSendKey);
                 const idempotencyKey = opaqueId("turn_");
+                if (options.attachments?.some((item) => item.type === "image")) {
+                    await this.client.requireVision(options.runConfig.provider, options.runConfig.model);
+                }
                 const input: ContentBlock[] = [{ type: "text", text: normalized }, ...(options.attachments ?? [])];
                 const result = requireJsonObject(await this.client.request("turn/start", {
                     sessionId,

@@ -21,6 +21,8 @@ from offeragent_harness.error_codes import (
 from offeragent_harness.ports.cancellation import OperationCancelled
 from offeragent_harness.protocol.errors import ErrorEnvelope, ProtocolViolation, protocol_error
 
+from .attachment_errors import AttachmentError
+
 
 def map_application_exception(error: BaseException) -> ProtocolViolation:
     """Return the stable, sanitized protocol representation of ``error``.
@@ -32,6 +34,32 @@ def map_application_exception(error: BaseException) -> ProtocolViolation:
 
     if isinstance(error, ProtocolViolation):
         return error
+    if isinstance(error, AttachmentError):
+        if error.code == "attachment_unavailable":
+            return protocol_error(
+                ErrorCode.RESOURCE_NOT_FOUND,
+                "Conversation attachment is unavailable",
+                details={"reason": error.code},
+            )
+        if error.code in {
+            "attachment_claimed",
+            "attachment_committed",
+            "capacity_exceeded",
+            "chunk_conflict",
+            "commit_conflict",
+            "idempotency_conflict",
+            "upload_incomplete",
+        }:
+            return protocol_error(
+                ErrorCode.RESOURCE_CONFLICT,
+                str(error),
+                details={"reason": error.code},
+            )
+        return protocol_error(
+            ErrorCode.PROTOCOL_INVALID_PARAMS,
+            str(error),
+            details={"reason": error.code},
+        )
     if isinstance(error, (OperationCancelled, asyncio.CancelledError)):
         reason = error.reason if isinstance(error, OperationCancelled) else None
         reason_code = getattr(getattr(reason, "code", None), "value", None)

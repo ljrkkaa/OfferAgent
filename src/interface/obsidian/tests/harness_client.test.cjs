@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const path = require("node:path");
 const test = require("node:test");
 const { buildSync } = require("esbuild");
+const { createHash } = require("node:crypto");
 
 function loadModule(entry) {
     const output = buildSync({
@@ -172,6 +173,110 @@ test("client performs strict initialize and subscribes to Worker events", async 
     await serverPeer.notify("event", runEvent(1, "hel"));
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(client.reducer.state.runs.get("run_01J00000000000000000000000").timeline.length, 1);
+    await client.close();
+});
+
+test("attachment helper keeps ordered bytes behind bounded commands and verifies replay", async () => {
+    const { HarnessClient } = loadModule("harness_client.ts");
+    const bytes = Buffer.concat([Buffer.from("\x89PNG\r\n\x1a\n"), Buffer.alloc(70_000, 7)]);
+    const contentHash = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+    const uploaded = [];
+    const methods = [];
+    const peer = {
+        onNotification: () => () => undefined,
+        request: async (method, params) => {
+            methods.push(method);
+            if (method === "initialize") return initializeResult();
+            if (method === "attachments/begin") {
+                assert.equal(params.byteLength, bytes.length);
+                assert.equal(params.contentHash, contentHash);
+                return { uploadId: "upload_one", artifactId: "art_one", maxChunkBytes: 65_536, nextOffset: 0, duplicate: false };
+            }
+            if (method === "attachments/chunk") {
+                const chunk = Buffer.from(params.contentBase64, "base64");
+                assert.equal(params.offset, uploaded.reduce((size, item) => size + item.length, 0));
+                assert.equal(params.contentHash, `sha256:${createHash("sha256").update(chunk).digest("hex")}`);
+                uploaded.push(chunk);
+                return { uploadId: "upload_one", receivedBytes: params.offset + chunk.length, duplicate: false };
+            }
+            if (method === "attachments/commit") {
+                assert.deepEqual(Buffer.concat(uploaded), bytes);
+                return {
+                    uploadId: "upload_one",
+                    duplicate: false,
+                    artifact: {
+                        artifactId: "art_one",
+                        contentHash,
+                        mediaType: "image/png",
+                        sizeBytes: bytes.length,
+                        sensitivity: "private",
+                        state: "complete",
+                        title: "evidence.png",
+                    },
+                };
+            }
+            if (method === "attachments/read") {
+                const content = bytes.subarray(params.offset, Math.min(params.offset + params.maxBytes, bytes.length));
+                return {
+                    artifact: {
+                        artifactId: "art_one", contentHash, mediaType: "image/png", sizeBytes: bytes.length,
+                        sensitivity: "private", state: "complete", title: "evidence.png",
+                    },
+                    offset: params.offset,
+                    nextOffset: params.offset + content.length,
+                    contentBase64: content.toString("base64"),
+                    eof: params.offset + content.length === bytes.length,
+                };
+            }
+            throw new Error(`unexpected method: ${method}`);
+        },
+        close: async () => undefined,
+    };
+    const client = new HarnessClient({ connect: async () => peer }, context(), { pingIntervalMs: 60_000 });
+    await client.connect();
+    const image = await client.uploadAttachment("ses_one", {
+        fileName: "evidence.png",
+        mediaType: "image/png",
+        bytes,
+        clientRequestId: "req_upload",
+    });
+    assert.equal(image.artifact.artifactId, "art_one");
+    assert.equal(methods.filter((method) => method === "attachments/chunk").length, 2);
+    assert.deepEqual(Buffer.from(await client.readAttachment("ses_one", image.artifact)), bytes);
+    assert.equal(methods.includes("attachments/abort"), false);
+    await client.close();
+});
+
+test("vision capability is probed once and unsupported models get an actionable choice", async () => {
+    const { HarnessClient } = loadModule("harness_client.ts");
+    let probes = 0;
+    const peer = {
+        onNotification: () => () => undefined,
+        request: async (method, params) => {
+            if (method === "initialize") return initializeResult();
+            if (method === "models/health") {
+                probes += 1;
+                assert.equal(params.capability, "vision");
+                return {
+                    provider: params.provider,
+                    model: params.model,
+                    status: params.model === "gpt-vision" ? "healthy" : "unsupported",
+                    checkedAt: "2026-07-17T00:00:00+00:00",
+                    latencyMs: 1,
+                    error: null,
+                    capability: "vision",
+                };
+            }
+            throw new Error(`unexpected method: ${method}`);
+        },
+        close: async () => undefined,
+    };
+    const client = new HarnessClient({ connect: async () => peer }, context(), { pingIntervalMs: 60_000 });
+    await client.connect();
+    await client.requireVision("openai", "gpt-vision");
+    await client.requireVision("openai", "gpt-vision");
+    await assert.rejects(client.requireVision("openai", "text-only"), /文字描述|支持视觉/);
+    assert.equal(probes, 2);
     await client.close();
 });
 

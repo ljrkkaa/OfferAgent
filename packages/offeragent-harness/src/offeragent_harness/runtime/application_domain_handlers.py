@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from offeragent_harness.config import ConfigPatch
 from offeragent_harness.config import ConfigScope as DomainConfigScope
@@ -28,6 +29,7 @@ from offeragent_harness.ports import (
 )
 from offeragent_harness.protocol._base import WireModel
 from offeragent_harness.protocol.common import PermissionMode, TurnSnapshot
+from offeragent_harness.protocol.content import ImageContentBlock
 from offeragent_harness.protocol.messages import (
     COMMAND_REGISTRY,
     ApprovalResolveParams,
@@ -35,6 +37,16 @@ from offeragent_harness.protocol.messages import (
     ArtifactEncoding,
     ArtifactReadParams,
     ArtifactReadResult,
+    AttachmentAbortParams,
+    AttachmentAbortResult,
+    AttachmentBeginParams,
+    AttachmentBeginResult,
+    AttachmentChunkParams,
+    AttachmentChunkResult,
+    AttachmentCommitParams,
+    AttachmentCommitResult,
+    AttachmentReadParams,
+    AttachmentReadResult,
     ConfigGetParams,
     ConfigScope,
     ConfigSnapshot,
@@ -90,6 +102,11 @@ from .application_handlers import (
 )
 from .approval_manager import ApprovalManager, ApprovalNotFound
 from .config_service import ConfigService, ConfigUpdateCommand, WorkerConfigActivation
+from .conversation_attachments import (
+    AttachmentClaim,
+    AttachmentUploadRequest,
+    ConversationAttachmentStore,
+)
 from .conversation_controls import ConversationControlService
 from .harness_service import HarnessService, StartTurnCommand
 from .hook_lifecycle import LifecycleHookDenied
@@ -173,6 +190,7 @@ def compose_domain_command_handlers(
     models: ModelCommandService,
     projections: ConversationProjectionService,
     artifacts: ArtifactStore,
+    attachments: ConversationAttachmentStore,
     secrets: SecretStore,
     controls: ConversationControlService,
     subagents: SubagentService,
@@ -205,6 +223,7 @@ def compose_domain_command_handlers(
             harness=harness,
             projections=projections,
             config=config,
+            attachments=attachments,
         )
     )
     add(
@@ -214,6 +233,7 @@ def compose_domain_command_handlers(
             projections=projections,
             config=config,
             transport_policy=transport_policy,
+            attachments=attachments,
         )
     )
     add(
@@ -224,6 +244,7 @@ def compose_domain_command_handlers(
         )
     )
     add(_artifact_handlers(identity=identity, artifacts=artifacts))
+    add(_attachment_handlers(workspace_id=identity.workspace_id, harness=harness, attachments=attachments))
     add(secret_command_handlers(identity=identity, secrets=secrets))
     add(_shutdown_handlers(harness=harness, projections=projections))
     add(
@@ -365,6 +386,7 @@ def _session_handlers(
     harness: HarnessService,
     projections: ConversationProjectionService,
     config: ConfigService,
+    attachments: ConversationAttachmentStore | None = None,
 ) -> Mapping[str, ApplicationCommandHandler]:
     async def create(raw: WireModel, cancellation: CancellationToken, context: ApplicationCommandContext) -> WireModel:
         cancellation.checkpoint()
@@ -470,6 +492,9 @@ def _session_handlers(
                 _derived_idempotency("delete", params.to_wire()),
             )
         )
+        if attachments is None:
+            raise CommandHandlerConfigurationError("Session deletion requires Conversation attachment storage")
+        await attachments.delete_conversation(params.session_id, cancellation)
         return SessionDeleteResult(
             session_id=value.session_id,
             deleted=value.deleted,
@@ -515,6 +540,7 @@ def _turn_handlers(
     projections: ConversationProjectionService,
     config: ConfigService,
     transport_policy: ApplicationTransportPolicy,
+    attachments: ConversationAttachmentStore,
 ) -> Mapping[str, ApplicationCommandHandler]:
     async def start(raw: WireModel, cancellation: CancellationToken, context: ApplicationCommandContext) -> WireModel:
         cancellation.checkpoint()
@@ -554,19 +580,44 @@ def _turn_handlers(
         input_blocks = tuple(item.to_wire() for item in params.input)
         if pinned is not None:
             input_blocks = (*input_blocks, pinned)
-        receipt = await harness.start_turn(
-            StartTurnCommand(
-                workspace_id=identity.workspace_id,
-                session_id=params.session_id,
-                turn_id=params.turn_id,
-                idempotency_key=params.idempotency_key,
-                input_blocks=input_blocks,
-                run_config=run_config.to_wire(),
-                effective_config=snapshot.config,
-                effective_config_fingerprint=snapshot.fingerprint,
-                deadline_at=None if params.deadline is None else _timestamp(params.deadline),
+        attachment_claims = tuple(
+            AttachmentClaim(
+                artifact_id=block.artifact.artifact_id,
+                order=order,
+                content_hash=block.artifact.content_hash,
+                media_type=block.artifact.media_type,
+                byte_length=block.artifact.size_bytes,
             )
+            for order, block in enumerate(item for item in params.input if isinstance(item, ImageContentBlock))
         )
+        attachment_claim_created = False
+        if attachment_claims:
+            attachment_claim_created = (
+                await attachments.claim_submission_with_receipt(
+                    params.session_id,
+                    params.turn_id,
+                    attachment_claims,
+                    cancellation,
+                )
+            ).created
+        try:
+            receipt = await harness.start_turn(
+                StartTurnCommand(
+                    workspace_id=identity.workspace_id,
+                    session_id=params.session_id,
+                    turn_id=params.turn_id,
+                    idempotency_key=params.idempotency_key,
+                    input_blocks=input_blocks,
+                    run_config=run_config.to_wire(),
+                    effective_config=snapshot.config,
+                    effective_config_fingerprint=snapshot.fingerprint,
+                    deadline_at=None if params.deadline is None else _timestamp(params.deadline),
+                )
+            )
+        except BaseException:
+            if attachment_claim_created:
+                await attachments.release_turn_claim(params.turn_id, _NeverCancelled())
+            raise
         return TurnStartResult(
             session_id=receipt.session_id,
             turn_id=receipt.turn_id,
@@ -694,6 +745,109 @@ def _artifact_handlers(
     return {"artifact/read": read}
 
 
+def _attachment_handlers(
+    *,
+    workspace_id: str,
+    harness: HarnessService,
+    attachments: ConversationAttachmentStore,
+) -> Mapping[str, ApplicationCommandHandler]:
+    async def require_session(session_id: str, cancellation: CancellationToken) -> None:
+        cancellation.checkpoint()
+        await harness.sessions.get(LifecycleSessionGetCommand(workspace_id, session_id))
+
+    async def begin(raw: WireModel, cancellation: CancellationToken, context: ApplicationCommandContext) -> WireModel:
+        del context
+        params = cast(AttachmentBeginParams, raw)
+        await require_session(params.session_id, cancellation)
+        receipt = await attachments.begin(
+            AttachmentUploadRequest(
+                session_id=params.session_id,
+                client_request_id=params.client_request_id,
+                file_name=params.file_name,
+                media_type=params.media_type,
+                byte_length=params.byte_length,
+                content_hash=params.content_hash,
+            ),
+            cancellation,
+        )
+        return AttachmentBeginResult(
+            upload_id=receipt.upload_id,
+            artifact_id=receipt.artifact_id,
+            max_chunk_bytes=65_536,
+            next_offset=receipt.next_offset,
+            duplicate=receipt.duplicate,
+        )
+
+    async def chunk(raw: WireModel, cancellation: CancellationToken, context: ApplicationCommandContext) -> WireModel:
+        del context
+        params = cast(AttachmentChunkParams, raw)
+        await require_session(params.session_id, cancellation)
+        try:
+            content = base64.b64decode(params.content_base64, validate=True)
+        except ValueError as error:
+            raise ValueError("attachment chunk is not canonical base64") from error
+        content_hash = f"sha256:{hashlib.sha256(content).hexdigest()}"
+        if content_hash != params.content_hash:
+            raise ValueError("attachment chunk hash does not match its bytes")
+        receipt = await attachments.append(
+            params.upload_id,
+            params.offset,
+            content,
+            cancellation,
+            session_id=params.session_id,
+        )
+        return AttachmentChunkResult(
+            upload_id=receipt.upload_id,
+            received_bytes=receipt.next_offset,
+            duplicate=receipt.duplicate,
+        )
+
+    async def commit(raw: WireModel, cancellation: CancellationToken, context: ApplicationCommandContext) -> WireModel:
+        del context
+        params = cast(AttachmentCommitParams, raw)
+        await require_session(params.session_id, cancellation)
+        receipt = await attachments.commit(params.upload_id, cancellation, session_id=params.session_id)
+        return AttachmentCommitResult(
+            upload_id=receipt.upload_id,
+            artifact=receipt.artifact,
+            duplicate=receipt.duplicate,
+        )
+
+    async def abort(raw: WireModel, cancellation: CancellationToken, context: ApplicationCommandContext) -> WireModel:
+        del context
+        params = cast(AttachmentAbortParams, raw)
+        await require_session(params.session_id, cancellation)
+        await attachments.abort(params.upload_id, cancellation, session_id=params.session_id)
+        return AttachmentAbortResult(upload_id=params.upload_id, aborted=True)
+
+    async def read(raw: WireModel, cancellation: CancellationToken, context: ApplicationCommandContext) -> WireModel:
+        del context
+        params = cast(AttachmentReadParams, raw)
+        await require_session(params.session_id, cancellation)
+        receipt = await attachments.read_for_conversation(
+            params.session_id,
+            params.artifact_id,
+            params.offset,
+            params.max_bytes,
+            cancellation,
+        )
+        return AttachmentReadResult(
+            artifact=receipt.artifact,
+            offset=receipt.offset,
+            next_offset=receipt.next_offset,
+            content_base64=base64.b64encode(receipt.content).decode("ascii"),
+            eof=receipt.complete,
+        )
+
+    return {
+        "attachments/begin": begin,
+        "attachments/chunk": chunk,
+        "attachments/commit": commit,
+        "attachments/abort": abort,
+        "attachments/read": read,
+    }
+
+
 def secret_command_handlers(
     *,
     identity: DomainCommandIdentity,
@@ -816,6 +970,17 @@ def _shutdown_handlers(
 
 def _derived_idempotency(operation: str, value: Mapping[str, object]) -> str:
     return f"application-{operation}-{canonical_json_sha256(value).removeprefix('sha256:')}"
+
+
+class _NeverCancelled:
+    cancelled = False
+    reason = None
+
+    async def wait(self) -> Any:
+        await asyncio.Future()
+
+    def checkpoint(self) -> None:
+        return
 
 
 def _timestamp(value: object) -> datetime:

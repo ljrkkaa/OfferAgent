@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import threading
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TypeVar
 
 import httpx
@@ -401,6 +404,56 @@ async def test_schema_invalid_object_is_emitted_for_canonical_agent_step_validat
         ModelEventKind.COMPLETED,
     ]
     assert events[1].data == {"unexpected": "private payload"}
+
+
+@pytest.mark.asyncio
+async def test_image_block_is_encoded_as_an_ephemeral_responses_data_url() -> None:
+    captured: dict[str, object] = {}
+    png = b"\x89PNG\r\n\x1a\n" + b"offeragent-image"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                _completed("ok"),
+            ),
+        )
+
+    request = replace(
+        _request(),
+        messages=(
+            ModelMessage(ModelRole.SYSTEM, (ModelContentBlock.text("system boundary"),)),
+            ModelMessage(
+                ModelRole.USER,
+                (
+                    ModelContentBlock.text("inspect this image"),
+                    ModelContentBlock(
+                        "image",
+                        {
+                            "artifactId": "art_one",
+                            "mediaType": "image/png",
+                            "contentHash": "sha256:" + hashlib.sha256(png).hexdigest(),
+                        },
+                        binary_data=png,
+                    ),
+                ),
+            ),
+        ),
+    )
+    await _collect(_gateway(httpx.MockTransport(handler)), request)
+
+    inputs = captured["input"]
+    assert isinstance(inputs, list)
+    content = inputs[-1]["content"]
+    assert content[1] == {
+        "type": "input_image",
+        "image_url": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
+        "detail": "auto",
+    }
+    assert "binary_data" not in repr(request.messages)
 
 
 @pytest.mark.asyncio

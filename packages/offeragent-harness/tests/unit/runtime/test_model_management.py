@@ -346,10 +346,47 @@ async def test_health_probe_has_fixed_runtime_content_and_no_vault_session_or_to
         "operation": "model_health",
         "clientRequestId": CLIENT_REQUEST_ID,
         "contentSource": "fixed_runtime_probe",
+        "capability": "text",
     }
     serialized = repr(request)
     assert WORKSPACE_ID not in serialized
     assert all(marker not in serialized.lower() for marker in ("vault", "session", "tool_result"))
+
+
+@pytest.mark.asyncio
+async def test_vision_probe_uses_a_fixed_image_and_updates_model_capability() -> None:
+    clock = ManualClock(NOW)
+    config = _config(clock)
+    await _update(
+        config,
+        {
+            "model": {
+                "provider": "openai",
+                "model": "gpt-vision",
+                "credential_handle": HANDLE.opaque_id,
+            }
+        },
+    )
+    gateway = _Gateway()
+    service = _service(config, clock, _SecretStore(_metadata()), _GatewayFactory(gateway))
+
+    before = await service.list_models(ModelsListParams(), ManualCancellationToken())
+    result = await service.health(
+        ModelsHealthParams(
+            provider="openai",
+            client_request_id=CLIENT_REQUEST_ID,
+            capability="vision",
+        ),
+        ManualCancellationToken(),
+    )
+    after = await service.list_models(ModelsListParams(), ManualCancellationToken())
+
+    assert before.models[0].vision_status == "unverified"
+    assert result.status == "healthy" and result.capability == "vision"
+    image = gateway.requests[0].messages[0].content[1]
+    assert image.kind == "image" and image.binary_data is not None
+    assert "binary_data" not in repr(gateway.requests[0])
+    assert after.models[0].vision_status == "supported"
 
 
 @pytest.mark.asyncio
@@ -390,6 +427,38 @@ async def test_health_maps_terminal_provider_errors(
     assert result.status == expected_status
     assert result.error is not None and result.error.code is expected_code
     assert result.error.details == {"reason": provider_error}
+
+
+@pytest.mark.asyncio
+async def test_rejected_vision_probe_is_actionable_and_cached_as_unsupported() -> None:
+    clock = ManualClock(NOW)
+    config = _config(clock)
+    await _update(
+        config,
+        {
+            "model": {
+                "provider": "openai",
+                "model": "text-only",
+                "credential_handle": HANDLE.opaque_id,
+            }
+        },
+    )
+    gateway = _Gateway(terminal=ModelEventKind.ERROR, error_code="provider_configuration")
+    service = _service(config, clock, _SecretStore(_metadata()), _GatewayFactory(gateway))
+
+    result = await service.health(
+        ModelsHealthParams(
+            provider="openai",
+            client_request_id=CLIENT_REQUEST_ID,
+            capability="vision",
+        ),
+        ManualCancellationToken(),
+    )
+    listed = await service.list_models(ModelsListParams(), ManualCancellationToken())
+
+    assert result.status == "unsupported"
+    assert result.error is not None and result.error.details == {"reason": "vision_unsupported"}
+    assert listed.models[0].vision_status == "unsupported"
 
 
 @pytest.mark.asyncio

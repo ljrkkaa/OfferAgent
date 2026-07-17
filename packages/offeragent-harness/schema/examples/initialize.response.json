@@ -19,7 +19,7 @@
     "protocolVersion": "1.0",
     "runtimeArch": "win-x64",
     "runtimeVersion": "2.0.0",
-    "schemaHash": "sha256:27023f8a8e469bdfb50fed22b98aeb50d085800a75cbc78dfe561daf9e45b40c",
+    "schemaHash": "sha256:8632f14d882301d4ef4bb9f779ed4fb1052967fa9834249060c13b617c239f93",
     "supportedProtocolRange": {
       "maximum": "1.0",
       "minimum": "1.0"

@@ -71,6 +71,7 @@ class ModelContentBlock:
 
     kind: str
     data: Mapping[str, Any]
+    binary_data: bytes | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.kind:
@@ -79,6 +80,13 @@ class ModelContentBlock:
         if not isinstance(frozen, FrozenJsonObject):
             raise TypeError("content block data must be a JSON object")
         object.__setattr__(self, "data", frozen)
+        if self.binary_data is not None:
+            content = bytes(self.binary_data)
+            if self.kind != "image" or not content or len(content) > 10 * 1024 * 1024:
+                raise ValueError("binary model content must be a bounded non-empty image")
+            if not isinstance(frozen.get("mediaType"), str) or not str(frozen["mediaType"]).startswith("image/"):
+                raise ValueError("binary image content requires image mediaType metadata")
+            object.__setattr__(self, "binary_data", content)
 
     @classmethod
     def text(cls, text: str) -> ModelContentBlock:

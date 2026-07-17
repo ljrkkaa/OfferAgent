@@ -741,6 +741,281 @@
       "title": "AssistantDeltaPayload",
       "type": "object"
     },
+    "AttachmentAbortParams": {
+      "additionalProperties": false,
+      "properties": {
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "uploadId": {
+          "$ref": "#/$defs/UploadId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "uploadId"
+      ],
+      "title": "AttachmentAbortParams",
+      "type": "object"
+    },
+    "AttachmentAbortResult": {
+      "additionalProperties": false,
+      "properties": {
+        "aborted": {
+          "title": "Aborted",
+          "type": "boolean"
+        },
+        "uploadId": {
+          "$ref": "#/$defs/UploadId"
+        }
+      },
+      "required": [
+        "uploadId",
+        "aborted"
+      ],
+      "title": "AttachmentAbortResult",
+      "type": "object"
+    },
+    "AttachmentBeginParams": {
+      "additionalProperties": false,
+      "properties": {
+        "byteLength": {
+          "maximum": 10485760,
+          "minimum": 1,
+          "title": "Bytelength",
+          "type": "integer"
+        },
+        "clientRequestId": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "contentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "fileName": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Filename",
+          "type": "string"
+        },
+        "mediaType": {
+          "pattern": "^image/(png|jpeg|gif|webp)$",
+          "title": "Mediatype",
+          "type": "string"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "clientRequestId",
+        "fileName",
+        "mediaType",
+        "byteLength",
+        "contentHash"
+      ],
+      "title": "AttachmentBeginParams",
+      "type": "object"
+    },
+    "AttachmentBeginResult": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactId": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "duplicate": {
+          "title": "Duplicate",
+          "type": "boolean"
+        },
+        "maxChunkBytes": {
+          "maximum": 65536,
+          "minimum": 1,
+          "title": "Maxchunkbytes",
+          "type": "integer"
+        },
+        "nextOffset": {
+          "minimum": 0,
+          "title": "Nextoffset",
+          "type": "integer"
+        },
+        "uploadId": {
+          "$ref": "#/$defs/UploadId"
+        }
+      },
+      "required": [
+        "uploadId",
+        "artifactId",
+        "maxChunkBytes",
+        "nextOffset",
+        "duplicate"
+      ],
+      "title": "AttachmentBeginResult",
+      "type": "object"
+    },
+    "AttachmentChunkParams": {
+      "additionalProperties": false,
+      "properties": {
+        "contentBase64": {
+          "maxLength": 87384,
+          "minLength": 4,
+          "pattern": "^[A-Za-z0-9+/]*={0,2}$",
+          "title": "Contentbase64",
+          "type": "string"
+        },
+        "contentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "offset": {
+          "minimum": 0,
+          "title": "Offset",
+          "type": "integer"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "uploadId": {
+          "$ref": "#/$defs/UploadId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "uploadId",
+        "offset",
+        "contentBase64",
+        "contentHash"
+      ],
+      "title": "AttachmentChunkParams",
+      "type": "object"
+    },
+    "AttachmentChunkResult": {
+      "additionalProperties": false,
+      "properties": {
+        "duplicate": {
+          "title": "Duplicate",
+          "type": "boolean"
+        },
+        "receivedBytes": {
+          "minimum": 0,
+          "title": "Receivedbytes",
+          "type": "integer"
+        },
+        "uploadId": {
+          "$ref": "#/$defs/UploadId"
+        }
+      },
+      "required": [
+        "uploadId",
+        "receivedBytes",
+        "duplicate"
+      ],
+      "title": "AttachmentChunkResult",
+      "type": "object"
+    },
+    "AttachmentCommitParams": {
+      "additionalProperties": false,
+      "properties": {
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        },
+        "uploadId": {
+          "$ref": "#/$defs/UploadId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "uploadId"
+      ],
+      "title": "AttachmentCommitParams",
+      "type": "object"
+    },
+    "AttachmentCommitResult": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "duplicate": {
+          "title": "Duplicate",
+          "type": "boolean"
+        },
+        "uploadId": {
+          "$ref": "#/$defs/UploadId"
+        }
+      },
+      "required": [
+        "uploadId",
+        "artifact",
+        "duplicate"
+      ],
+      "title": "AttachmentCommitResult",
+      "type": "object"
+    },
+    "AttachmentReadParams": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactId": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "maxBytes": {
+          "default": 65536,
+          "maximum": 65536,
+          "minimum": 1,
+          "title": "Maxbytes",
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Offset",
+          "type": "integer"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/SessionId"
+        }
+      },
+      "required": [
+        "sessionId",
+        "artifactId"
+      ],
+      "title": "AttachmentReadParams",
+      "type": "object"
+    },
+    "AttachmentReadResult": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "contentBase64": {
+          "maxLength": 87384,
+          "title": "Contentbase64",
+          "type": "string"
+        },
+        "eof": {
+          "title": "Eof",
+          "type": "boolean"
+        },
+        "nextOffset": {
+          "minimum": 0,
+          "title": "Nextoffset",
+          "type": "integer"
+        },
+        "offset": {
+          "minimum": 0,
+          "title": "Offset",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "artifact",
+        "offset",
+        "nextOffset",
+        "contentBase64",
+        "eof"
+      ],
+      "title": "AttachmentReadResult",
+      "type": "object"
+    },
     "BudgetSnapshot": {
       "additionalProperties": false,
       "properties": {
@@ -1082,6 +1357,7 @@
           "artifact": "#/$defs/ArtifactContentBlock",
           "file": "#/$defs/FileContentBlock",
           "image": "#/$defs/ImageContentBlock",
+          "pinnedContext": "#/$defs/PinnedContextContentBlock",
           "text": "#/$defs/TextContentBlock"
         },
         "propertyName": "type"
@@ -1098,6 +1374,9 @@
         },
         {
           "$ref": "#/$defs/ArtifactContentBlock"
+        },
+        {
+          "$ref": "#/$defs/PinnedContextContentBlock"
         }
       ]
     },
@@ -3303,6 +3582,16 @@
         "supportsStructuredOutput": {
           "title": "Supportsstructuredoutput",
           "type": "boolean"
+        },
+        "visionStatus": {
+          "default": "unverified",
+          "enum": [
+            "supported",
+            "unsupported",
+            "unverified"
+          ],
+          "title": "Visionstatus",
+          "type": "string"
         }
       },
       "required": [
@@ -3320,6 +3609,15 @@
     "ModelsHealthParams": {
       "additionalProperties": false,
       "properties": {
+        "capability": {
+          "default": "text",
+          "enum": [
+            "text",
+            "vision"
+          ],
+          "title": "Capability",
+          "type": "string"
+        },
         "clientRequestId": {
           "$ref": "#/$defs/RequestId"
         },
@@ -3365,6 +3663,15 @@
     "ModelsHealthResult": {
       "additionalProperties": false,
       "properties": {
+        "capability": {
+          "default": "text",
+          "enum": [
+            "text",
+            "vision"
+          ],
+          "title": "Capability",
+          "type": "string"
+        },
         "checkedAt": {
           "$ref": "#/$defs/Rfc3339DateTime"
         },
@@ -3731,6 +4038,32 @@
         "phase"
       ],
       "title": "PhaseChangedPayload",
+      "type": "object"
+    },
+    "PinnedContextContentBlock": {
+      "additionalProperties": false,
+      "description": "Replayable user intent that remains distinct from evidence.",
+      "properties": {
+        "references": {
+          "items": {
+            "$ref": "#/$defs/PinnedContextReference"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "title": "References",
+          "type": "array"
+        },
+        "type": {
+          "const": "pinnedContext",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "references"
+      ],
+      "title": "PinnedContextContentBlock",
       "type": "object"
     },
     "PinnedContextReference": {
@@ -8410,6 +8743,12 @@
       "title": "TurnSteeredPayload",
       "type": "object"
     },
+    "UploadId": {
+      "maxLength": 128,
+      "minLength": 8,
+      "pattern": "^upload_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
     "UsageSnapshot": {
       "additionalProperties": false,
       "properties": {
@@ -8662,6 +9001,51 @@
       "requiredCapability": "artifacts",
       "result": {
         "$ref": "#/$defs/ArtifactReadResult"
+      }
+    },
+    "attachments/abort": {
+      "params": {
+        "$ref": "#/$defs/AttachmentAbortParams"
+      },
+      "requiredCapability": "artifacts",
+      "result": {
+        "$ref": "#/$defs/AttachmentAbortResult"
+      }
+    },
+    "attachments/begin": {
+      "params": {
+        "$ref": "#/$defs/AttachmentBeginParams"
+      },
+      "requiredCapability": "artifacts",
+      "result": {
+        "$ref": "#/$defs/AttachmentBeginResult"
+      }
+    },
+    "attachments/chunk": {
+      "params": {
+        "$ref": "#/$defs/AttachmentChunkParams"
+      },
+      "requiredCapability": "artifacts",
+      "result": {
+        "$ref": "#/$defs/AttachmentChunkResult"
+      }
+    },
+    "attachments/commit": {
+      "params": {
+        "$ref": "#/$defs/AttachmentCommitParams"
+      },
+      "requiredCapability": "artifacts",
+      "result": {
+        "$ref": "#/$defs/AttachmentCommitResult"
+      }
+    },
+    "attachments/read": {
+      "params": {
+        "$ref": "#/$defs/AttachmentReadParams"
+      },
+      "requiredCapability": "artifacts",
+      "result": {
+        "$ref": "#/$defs/AttachmentReadResult"
       }
     },
     "config/get": {

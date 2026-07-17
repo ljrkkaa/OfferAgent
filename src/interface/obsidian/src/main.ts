@@ -47,6 +47,8 @@ import {
     PROTOCOL_VERSION,
 } from "./runtime/generated_protocol_identity";
 import type {
+    ArtifactRef,
+    ImageContentBlock,
     ProtocolCommandParams,
     ProtocolCommandResult,
     SecretsPutParams,
@@ -198,6 +200,28 @@ export default class OfferAgentPlugin extends Plugin {
         return chunks.join("");
     }
 
+    async uploadConversationAttachment(sessionId: string, file: File): Promise<ImageContentBlock> {
+        await this.ensureReady();
+        const mediaTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+        if (!mediaTypes.has(file.type)) throw new Error("仅支持 PNG、JPEG、WebP 或静态 GIF 图片");
+        return (this.runtime as RuntimeBootstrap).harness.uploadAttachment(sessionId, {
+            fileName: file.name,
+            mediaType: file.type as "image/png" | "image/jpeg" | "image/gif" | "image/webp",
+            bytes: new Uint8Array(await file.arrayBuffer()),
+            altText: file.name,
+        });
+    }
+
+    async readConversationAttachment(sessionId: string, artifact: ArtifactRef): Promise<Uint8Array> {
+        await this.ensureReady();
+        return (this.runtime as RuntimeBootstrap).harness.readAttachment(sessionId, artifact);
+    }
+
+    async discardConversationAttachment(sessionId: string, artifactId: string): Promise<boolean> {
+        await this.ensureReady();
+        return (this.runtime as RuntimeBootstrap).harness.discardUploadedAttachment(sessionId, artifactId);
+    }
+
     async listSessions(): Promise<readonly { sessionId: string; title: string }[]> {
         await this.ensureReady();
         const sessions: { sessionId: string; title: string }[] = [];
@@ -234,7 +258,8 @@ export default class OfferAgentPlugin extends Plugin {
             const modelId = requireText(model.model, "Model id");
             const displayName = requireText(model.displayName, "Model display name");
             if (provider !== settings.provider || modelId.length > 256 || displayName.length > 512 ||
-                typeof model.supportsStreaming !== "boolean" || typeof model.supportsStructuredOutput !== "boolean") {
+                typeof model.supportsStreaming !== "boolean" || typeof model.supportsStructuredOutput !== "boolean" ||
+                !["supported", "unsupported", "unverified"].includes(String(model.visionStatus))) {
                 throw new Error("Worker 返回了与当前 Provider 不一致的模型能力");
             }
             return {
@@ -243,6 +268,7 @@ export default class OfferAgentPlugin extends Plugin {
                 displayName,
                 supportsStreaming: model.supportsStreaming,
                 supportsStructuredOutput: model.supportsStructuredOutput,
+                visionStatus: model.visionStatus as ChatModelChoice["visionStatus"],
             };
         });
     }

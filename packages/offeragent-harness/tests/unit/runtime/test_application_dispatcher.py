@@ -26,6 +26,7 @@ from offeragent_harness.runtime.application_handlers import (
     compose_application_command_handlers,
 )
 from offeragent_harness.runtime.config_service import ConfigRevisionConflict
+from offeragent_harness.runtime.conversation_attachments import AttachmentError
 from offeragent_harness.runtime.loopback_gateway import LoopbackWebGateway
 from offeragent_harness.testing import ManualCancellationToken, ManualClock
 
@@ -135,6 +136,11 @@ async def test_dispatcher_checks_readiness_before_command_validation() -> None:
             ErrorCode.RESOURCE_CONFLICT,
             {"reason": "resource_state_conflict"},
         ),
+        (
+            lambda: AttachmentError("capacity_exceeded", "delete old images or start a new Conversation"),
+            ErrorCode.RESOURCE_CONFLICT,
+            {"reason": "capacity_exceeded"},
+        ),
         (lambda: asyncio.CancelledError("private cancellation reason"), ErrorCode.REQUEST_CANCELLED, {}),
         (lambda: RuntimeError("private internal failure"), ErrorCode.INTERNAL_ERROR, {}),
     ],
@@ -203,6 +209,7 @@ def test_domain_factory_covers_every_non_identity_command_exactly_once() -> None
         models=shared,  # type: ignore[arg-type]
         projections=shared,  # type: ignore[arg-type]
         artifacts=shared,  # type: ignore[arg-type]
+        attachments=shared,  # type: ignore[arg-type]
         secrets=shared,  # type: ignore[arg-type]
         controls=shared,  # type: ignore[arg-type]
         subagents=shared,  # type: ignore[arg-type]
