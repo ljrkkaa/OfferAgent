@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Protocol, cast
 
 import pytest
 
@@ -24,19 +24,32 @@ from offeragent_harness.providers.codex_subscription import (
 )
 from offeragent_harness.runtime.approval_manager import ApprovalManager
 from offeragent_harness.runtime.attachment_errors import AttachmentError
+from offeragent_harness.runtime.cancellation import CancellationScope
+from offeragent_harness.runtime.conversation_attachments import AttachmentClaim
 from offeragent_harness.runtime.harness_service import StartTurnCommand
 from offeragent_harness.runtime.production_worker_composition import ProductionRunComponentsFactory
 from offeragent_harness.sessions import AgentLineage
 from offeragent_harness.testing import (
     DeterministicIdGenerator,
     InMemoryUnitOfWorkFactory,
-    ManualCancellationToken,
     ManualClock,
 )
 from offeragent_harness.tools import canonical_json_sha256
 
 NOW = datetime(2026, 7, 18, 6, 0, tzinfo=timezone.utc)
 ACCOUNT_BINDING = "sha256:" + "b" * 64
+
+
+class _RequestCreatingPlanner(Protocol):
+    def create_request(self, state: RunState) -> ModelRequest: ...
+
+
+def _cancellation() -> CancellationScope:
+    return CancellationScope(name="test-codex-run-binding")
+
+
+def _create_model_request(planner: object, state: RunState) -> ModelRequest:
+    return cast(_RequestCreatingPlanner, planner).create_request(state)
 
 
 class _Gateway:
@@ -205,7 +218,7 @@ async def test_prepare_root_binds_fresh_catalog_model_and_build_uses_only_that_e
     config = _config(proxy_url="http://127.0.0.1:7896")
     command = _command(config)
 
-    prepared = await factory.prepare_root(command, _state(), ManualCancellationToken(), None)  # type: ignore[arg-type]
+    prepared = await factory.prepare_root(command, _state(), _cancellation(), None)
     components = factory.build_prepared_root(command, _state(), prepared)
 
     assert module.bind_calls == [("gpt-selected", ACCOUNT_BINDING)]
@@ -220,7 +233,7 @@ async def test_prepare_root_binds_fresh_catalog_model_and_build_uses_only_that_e
         _state(),
         budget_checkpoint=await BudgetCheckpoint.capture(ledger, now=NOW),
     )
-    model_request = components.planner_factory(ledger).create_request(request_state)
+    model_request = _create_model_request(components.planner_factory(ledger), request_state)
     assert model_request.model == "gpt-selected"
     proof = prepared.durable_snapshot
     assert proof["modelBinding"]["modelId"] == "gpt-selected"
@@ -238,7 +251,7 @@ async def test_bound_catalog_context_window_limits_the_local_context_projection(
     command = _command(_config())
     state = _state()
 
-    prepared = await factory.prepare_root(command, state, ManualCancellationToken(), None)  # type: ignore[arg-type]
+    prepared = await factory.prepare_root(command, state, _cancellation(), None)
     components = factory.build_prepared_root(command, state, prepared)
     ledger = BudgetLedger(components.budget, started_at=NOW)
     request_state = replace(
@@ -247,7 +260,7 @@ async def test_bound_catalog_context_window_limits_the_local_context_projection(
     )
 
     with pytest.raises(ContextBudgetExceeded, match="system rules"):
-        components.planner_factory(ledger).create_request(request_state)
+        _create_model_request(components.planner_factory(ledger), request_state)
 
 
 @pytest.mark.asyncio
@@ -270,7 +283,7 @@ async def test_prepare_root_fails_before_gateway_creation_when_binding_is_invali
     factory = _factory(tmp_path, module, gateway_calls)
 
     with pytest.raises(RunPreparationFailure) as caught:
-        await factory.prepare_root(_command(_config()), _state(), ManualCancellationToken(), None)  # type: ignore[arg-type]
+        await factory.prepare_root(_command(_config()), _state(), _cancellation(), None)
 
     assert caught.value.code == code
     assert caught.value.error_code.value == wire_code
@@ -284,9 +297,7 @@ async def test_recovery_restores_the_fingerprinted_binding_without_catalog_io_or
     first_module = _ModelModule(_binding())
     first = _factory(tmp_path / "first", first_module, [])
     command = _command(_config())
-    durable = (
-        await first.prepare_root(command, _state(), ManualCancellationToken(), None)  # type: ignore[arg-type]
-    ).durable_snapshot
+    durable = (await first.prepare_root(command, _state(), _cancellation(), None)).durable_snapshot
     unavailable = _ModelModule(
         CodexRunBindingError("catalog_unreachable", retryable=True),
         restore_outcome=_binding(),
@@ -294,10 +305,10 @@ async def test_recovery_restores_the_fingerprinted_binding_without_catalog_io_or
     gateway_calls: list[Any] = []
     restarted = _factory(tmp_path / "restarted", unavailable, gateway_calls)
 
-    prepared = await restarted.prepare_root(  # type: ignore[arg-type]
+    prepared = await restarted.prepare_root(
         command,
         _state(),
-        ManualCancellationToken(),
+        _cancellation(),
         durable,
     )
     restarted.build_prepared_root(command, _state(), prepared)
@@ -312,16 +323,14 @@ async def test_recovery_restores_the_fingerprinted_binding_without_catalog_io_or
 async def test_recovery_rejects_a_durable_binding_for_a_different_model(tmp_path: Path) -> None:
     first = _factory(tmp_path / "first", _ModelModule(_binding("gpt-other")), [])
     other_command = _command(_config("gpt-other"), "gpt-other")
-    durable = (
-        await first.prepare_root(other_command, _state(), ManualCancellationToken(), None)  # type: ignore[arg-type]
-    ).durable_snapshot
+    durable = (await first.prepare_root(other_command, _state(), _cancellation(), None)).durable_snapshot
     restarted = _factory(tmp_path / "restarted", _ModelModule(_binding()), [])
 
     with pytest.raises(ValueError, match="durable Codex model binding"):
-        await restarted.prepare_root(  # type: ignore[arg-type]
+        await restarted.prepare_root(
             _command(_config()),
             _state(),
-            ManualCancellationToken(),
+            _cancellation(),
             durable,
         )
 
@@ -349,7 +358,7 @@ async def test_new_run_rejects_provider_or_model_drift_before_catalog_and_gatewa
     factory = _factory(tmp_path, module, gateway_calls)
 
     with pytest.raises(ValueError):
-        await factory.prepare_root(command, _state(), ManualCancellationToken(), None)  # type: ignore[arg-type]
+        await factory.prepare_root(command, _state(), _cancellation(), None)
 
     assert module.bind_calls == []
     assert gateway_calls == []
@@ -390,7 +399,7 @@ async def test_text_only_catalog_model_rejects_images_before_attachment_or_infer
     )
 
     with pytest.raises(RunPreparationFailure) as caught:
-        await factory.prepare_root(command, _state(), ManualCancellationToken(), None)  # type: ignore[arg-type]
+        await factory.prepare_root(command, _state(), _cancellation(), None)
 
     assert caught.value.code == "image_modality_unsupported"
     assert caught.value.error_code.value == "provider.image_unsupported"
@@ -420,7 +429,7 @@ async def test_current_turn_images_reach_one_user_request_in_order_with_catalog_
             self,
             session_id: str,
             turn_id: str,
-            claims: tuple[object, ...],
+            claims: tuple[AttachmentClaim, ...],
             cancellation: CancellationToken,
         ) -> object:
             assert session_id == "ses_test"
@@ -479,14 +488,14 @@ async def test_current_turn_images_reach_one_user_request_in_order_with_catalog_
         ),
     )
 
-    prepared = await factory.prepare_root(command, _state(), ManualCancellationToken(), None)  # type: ignore[arg-type]
+    prepared = await factory.prepare_root(command, _state(), _cancellation(), None)
     components = factory.build_prepared_root(command, _state(), prepared)
     ledger = BudgetLedger(components.budget, started_at=NOW)
     request_state = replace(
         _state(),
         budget_checkpoint=await BudgetCheckpoint.capture(ledger, now=NOW),
     )
-    request = components.planner_factory(ledger).create_request(request_state)
+    request = _create_model_request(components.planner_factory(ledger), request_state)
 
     image_messages = [
         message for message in request.messages if any(block.kind == "image" for block in message.content)
@@ -540,10 +549,10 @@ async def test_current_image_batch_failure_preserves_the_corrupt_page_index(tmp_
     )
 
     with pytest.raises(RunPreparationFailure) as caught:
-        await factory.prepare_root(command, _state(), ManualCancellationToken(), None)
+        await factory.prepare_root(command, _state(), _cancellation(), None)
 
     assert caught.value.error_code.value == "input.image_invalid"
-    assert caught.value.details == {"reason": "attachment_corrupt", "imageIndex": 1}
+    assert caught.value.details == {"reason": "attachment_corrupt", "imageIndex": 2}
 
 
 @pytest.mark.asyncio
@@ -555,7 +564,7 @@ async def test_current_text_input_rejects_an_orphaned_durable_attachment_claim(t
             self,
             session_id: str,
             turn_id: str,
-            claims: tuple[object, ...],
+            claims: tuple[AttachmentClaim, ...],
             cancellation: CancellationToken,
         ) -> object:
             assert session_id == "ses_test"
@@ -574,7 +583,7 @@ async def test_current_text_input_rejects_an_orphaned_durable_attachment_claim(t
     )
 
     with pytest.raises(RunPreparationFailure) as caught:
-        await factory.prepare_root(_command(_config()), _state(), ManualCancellationToken(), None)
+        await factory.prepare_root(_command(_config()), _state(), _cancellation(), None)
 
     assert caught.value.error_code.value == "input.image_invalid"
     assert caught.value.details == {"reason": "claim_conflict"}

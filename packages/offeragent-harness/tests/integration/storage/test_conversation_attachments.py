@@ -8,6 +8,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -75,10 +76,13 @@ def test_decode_attestation_cache_is_bounded_lru(tmp_path: Path) -> None:
     maximum = attachment_module._MAX_DECODE_ATTESTATIONS
 
     for index in range(maximum + 3):
-        store._remember_verified(  # type: ignore[arg-type]
-            SimpleNamespace(
-                artifact_id=f"art_{index:04d}",
-                content_hash=f"sha256:{index:064x}",
+        store._remember_verified(
+            cast(
+                attachment_module._StoredAttachment,
+                SimpleNamespace(
+                    artifact_id=f"art_{index:04d}",
+                    content_hash=f"sha256:{index:064x}",
+                ),
             ),
             1,
             1,
@@ -547,15 +551,15 @@ async def test_claimed_batch_blocks_cross_instance_claim_release_until_materiali
     release_reader = threading.Event()
     original_verify = first._verify_ready_with_dimensions
 
-    def blocking_verify(record: object) -> object:
+    def blocking_verify(
+        record: attachment_module._StoredAttachment,
+    ) -> tuple[bytes, int, int]:
         started.set()
         assert release_reader.wait(timeout=2)
-        return original_verify(record)  # type: ignore[arg-type]
+        return original_verify(record)
 
     first._verify_ready_with_dimensions = blocking_verify  # type: ignore[method-assign]
-    materializing = asyncio.create_task(
-        first.materialize_claimed_submission("ses_one", "turn_atomic", claims, token)
-    )
+    materializing = asyncio.create_task(first.materialize_claimed_submission("ses_one", "turn_atomic", claims, token))
     assert await asyncio.to_thread(started.wait, 1)
     releasing = asyncio.create_task(second.release_turn_claim("turn_atomic", token))
     try:
@@ -594,7 +598,10 @@ async def test_repeatedly_cancelled_claimed_batch_waits_for_worker_and_preserves
     await store.claim_submission("ses_one", "turn_cancelled", claims, token)
     started = threading.Event()
     release_reader = threading.Event()
-    def blocking_verify(record: object) -> object:
+
+    def blocking_verify(
+        record: attachment_module._StoredAttachment,
+    ) -> tuple[bytes, int, int]:
         del record
         started.set()
         assert release_reader.wait(timeout=2)

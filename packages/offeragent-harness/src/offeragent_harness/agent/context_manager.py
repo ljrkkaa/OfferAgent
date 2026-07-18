@@ -651,9 +651,7 @@ class ContextManager:
                 ordinal += 1
 
         if rejected_conversation_groups:
-            conversation_group_order = [
-                fragment.conversation_turn_id for fragment in self._inputs.conversation[::2]
-            ]
+            conversation_group_order = [fragment.conversation_turn_id for fragment in self._inputs.conversation[::2]]
             rejected_cutoff = max(
                 index
                 for index, group_id in enumerate(conversation_group_order)
@@ -661,9 +659,7 @@ class ContextManager:
             )
             excluded_conversation_groups = set(conversation_group_order[: rejected_cutoff + 1])
             candidates = [
-                candidate
-                for candidate in candidates
-                if candidate.atomic_group_id not in excluded_conversation_groups
+                candidate for candidate in candidates if candidate.atomic_group_id not in excluded_conversation_groups
             ]
             omitted_ids = {item.context_id for item in omitted}
             for fragment in self._inputs.conversation:
@@ -1114,8 +1110,7 @@ def estimate_conversation_turn_tokens(
         name="offeragent-conversation-history",
     )
     image_tokens = sum(
-        estimate_vision_image_tokens(width, height, detail=detail) + 128
-        for width, height in image_dimensions
+        estimate_vision_image_tokens(width, height, detail=detail) + 128 for width, height in image_dimensions
     )
     return _message_estimated_tokens(user) + _message_estimated_tokens(assistant) + image_tokens
 

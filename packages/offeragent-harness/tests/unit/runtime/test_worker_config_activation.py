@@ -10,9 +10,7 @@ def test_worker_activation_exposes_only_the_frozen_codex_proxy_to_runtime_transp
     with pytest.raises(ConfigServiceError, match="not been frozen"):
         activation.codex_proxy_url()
 
-    activation.freeze(
-        HarnessConfig(model=ModelSettings(proxy_url="http://127.0.0.1:7896"))
-    )
+    activation.freeze(HarnessConfig(model=ModelSettings(proxy_url="http://127.0.0.1:7896")))
 
     assert activation.codex_proxy_url() == "http://127.0.0.1:7896"
     with pytest.raises(ConfigServiceError, match="already frozen"):
@@ -20,9 +18,7 @@ def test_worker_activation_exposes_only_the_frozen_codex_proxy_to_runtime_transp
 
 
 def test_pending_proxy_change_cannot_split_catalog_and_inference_routes() -> None:
-    activation = WorkerConfigActivation(
-        HarnessConfig(model=ModelSettings(proxy_url="http://127.0.0.1:7896"))
-    )
+    activation = WorkerConfigActivation(HarnessConfig(model=ModelSettings(proxy_url="http://127.0.0.1:7896")))
     desired = ModelSettings(
         model="gpt-selected",
         account_binding="sha256:" + "a" * 64,

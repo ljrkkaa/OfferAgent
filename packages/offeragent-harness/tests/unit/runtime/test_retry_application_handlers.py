@@ -121,5 +121,7 @@ async def test_retry_preserves_the_exact_current_codex_model() -> None:
     )
 
     assert harness.command is not None
-    assert harness.command.run_config["provider"] == CODEX_SUBSCRIPTION_PROVIDER
-    assert harness.command.run_config["model"] == "gpt-current"
+    run_config = harness.command.run_config
+    assert run_config is not None
+    assert run_config["provider"] == CODEX_SUBSCRIPTION_PROVIDER
+    assert run_config["model"] == "gpt-current"

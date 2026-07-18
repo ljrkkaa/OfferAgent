@@ -48,8 +48,6 @@ def test_model_selection_updates_are_atomic(model_patch: dict[str, object]) -> N
 
 
 def test_model_selection_can_be_atomically_cleared() -> None:
-    patch = validate_current_codex_config(
-        {"model": {"model": "", "account_binding": None}}
-    )
+    patch = validate_current_codex_config({"model": {"model": "", "account_binding": None}})
 
     assert patch.payload()["model"] == {"model": "", "account_binding": None}

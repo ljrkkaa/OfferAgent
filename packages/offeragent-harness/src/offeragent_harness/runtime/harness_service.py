@@ -1717,10 +1717,15 @@ class HarnessService:
                     terminal=True,
                 )
                 return terminal
-            should_interrupt = reason is None or code in {
-                CancellationCode.SHUTDOWN.value,
-                CancellationCode.START_FAILED.value,
-            } or (code == CancellationCode.PARENT.value and state.lineage.depth == 0)
+            should_interrupt = (
+                reason is None
+                or code
+                in {
+                    CancellationCode.SHUTDOWN.value,
+                    CancellationCode.START_FAILED.value,
+                }
+                or (code == CancellationCode.PARENT.value and state.lineage.depth == 0)
+            )
             target = RunPhase.INTERRUPTED if should_interrupt else RunPhase.CANCELLED
             if target not in ALLOWED_PHASE_TRANSITIONS[state.phase]:
                 previous = state.phase

@@ -421,9 +421,7 @@ class ProductionModelCommandService:
                 latency_ms,
                 "image_unsupported" if capability == "vision" else "text_unsupported",
                 code=(
-                    ErrorCode.PROVIDER_IMAGE_UNSUPPORTED
-                    if capability == "vision"
-                    else ErrorCode.PROVIDER_UNSUPPORTED
+                    ErrorCode.PROVIDER_IMAGE_UNSUPPORTED if capability == "vision" else ErrorCode.PROVIDER_UNSUPPORTED
                 ),
                 capability=capability,
             )
@@ -501,9 +499,7 @@ async def _refresh_catalog(
 ) -> tuple[CodexModelCatalogSnapshot | None, bool]:
     if timeout_seconds <= 0:
         return None, True
-    refresh = asyncio.create_task(
-        asyncio.to_thread(catalog.refresh, timeout_seconds=min(timeout_seconds, 60.0))
-    )
+    refresh = asyncio.create_task(asyncio.to_thread(catalog.refresh, timeout_seconds=min(timeout_seconds, 60.0)))
     cancel_wait = asyncio.create_task(cancellation.wait())
     try:
         done, _ = await asyncio.wait(

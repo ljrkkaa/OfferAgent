@@ -7,9 +7,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from types import MappingProxyType
 
+import httpx
 import pytest
 
-from offeragent_harness.providers import codex_subscription as codex_subscription_module
 from offeragent_harness.providers.codex_subscription import (
     CODEX_SUBSCRIPTION_MODELS_ENDPOINT,
     CodexCatalogHttpRequest,
@@ -111,7 +111,7 @@ def test_catalog_http_ignores_ambient_proxy_when_runtime_config_selects_direct(
             return _Response()
 
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:4567")
-    monkeypatch.setattr(codex_subscription_module.httpx, "Client", _Client)
+    monkeypatch.setattr(httpx, "Client", _Client)
 
     result = HttpxCodexCatalogHttpAdapter().get(
         CodexCatalogHttpRequest(CODEX_SUBSCRIPTION_MODELS_ENDPOINT, {"Accept": "application/json"})

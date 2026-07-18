@@ -96,7 +96,7 @@ async def test_turn_start_rejects_request_and_persisted_exact_model_mismatch_bef
     handlers = _handlers(config=_Config(model="gpt-persisted"))
 
     with pytest.raises(ValueError, match="Run model differs from the effective persisted configuration"):
-        await handlers["turn/start"](  # type: ignore[index]
+        await handlers["turn/start"](
             _params(model="gpt-requested"),
             ManualCancellationToken(),
             ApplicationCommandContext(transport="stdio"),
@@ -108,7 +108,7 @@ async def test_turn_start_rejects_a_matching_retired_provider_before_run_creatio
     handlers = _handlers(config=_Config(provider="codex"))
 
     with pytest.raises(ValueError, match="New Runs require the internal Codex Subscription provider"):
-        await handlers["turn/start"](  # type: ignore[index]
+        await handlers["turn/start"](
             _params(provider="codex"),
             ManualCancellationToken(),
             ApplicationCommandContext(transport="stdio"),
