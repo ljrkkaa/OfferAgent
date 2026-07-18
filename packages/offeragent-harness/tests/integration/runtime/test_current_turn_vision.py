@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -15,6 +16,7 @@ import httpx
 import pytest
 
 from offeragent_harness.adapters.local_artifacts import LocalArtifactStore
+from offeragent_harness.adapters.sqlite_stores import SqliteUnitOfWorkFactory
 from offeragent_harness.agent import BudgetCheckpoint, BudgetLedger
 from offeragent_harness.agent.loop import run_agent_loop
 from offeragent_harness.agent.state import RunPhase, RunState
@@ -34,14 +36,17 @@ from offeragent_harness.runtime.conversation_attachments import (
     AttachmentUploadRequest,
     ConversationAttachmentStore,
 )
-from offeragent_harness.runtime.harness_service import StartTurnCommand
+from offeragent_harness.runtime.harness_service import CreateSessionCommand, HarnessService, StartTurnCommand
 from offeragent_harness.runtime.production_worker_composition import ProductionRunComponentsFactory
-from offeragent_harness.sessions import AgentLineage
+from offeragent_harness.runtime.run_preparation import ConversationHistoryRunPreparationAdapter
+from offeragent_harness.runtime.turn_manager import TurnManager
+from offeragent_harness.sessions import AgentLineage, RunStatus
 from offeragent_harness.testing import (
     DeterministicIdGenerator,
     InMemoryUnitOfWorkFactory,
     ManualCancellationToken,
     ManualClock,
+    RecordingEventSink,
 )
 from offeragent_harness.tools import canonical_json_sha256
 
@@ -195,18 +200,18 @@ def _sse(*events: Mapping[str, object]) -> bytes:
     )
 
 
-def _response() -> bytes:
+def _response(answer: str = ANSWER, *, response_id: str = "resp_vision") -> bytes:
     structured = json.dumps(
         {
             "requiresWriteOutcome": False,
             "calls": [],
-            "finalResponse": ANSWER,
+            "finalResponse": answer,
         },
         ensure_ascii=False,
         separators=(",", ":"),
     )
     return _sse(
-        {"type": "response.created", "sequence_number": 0, "response": {"id": "resp_vision"}},
+        {"type": "response.created", "sequence_number": 0, "response": {"id": response_id}},
         {
             "type": "response.output_text.delta",
             "sequence_number": 1,
@@ -249,10 +254,11 @@ async def _upload(
     *,
     index: int,
     payload: bytes,
+    session_id: str = "ses_test",
 ) -> Any:
     begun = await store.begin(
         AttachmentUploadRequest(
-            session_id="ses_test",
+            session_id=session_id,
             client_request_id=f"req_upload_{index}",
             file_name=f"page-{index}.png",
             media_type="image/png",
@@ -426,3 +432,197 @@ async def test_current_turn_images_produce_one_locally_validated_answer_without_
     assert [block["detail"] for block in encoded_user_images] == ["original", "original"]
     assert transport_bodies[0]["store"] is False
     assert "previous_response_id" not in transport_bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_text_follow_up_rematerializes_historical_user_images_after_runtime_restart(tmp_path: Path) -> None:
+    state_path = tmp_path / "runtime.sqlite"
+    attachment_root = tmp_path / "attachments"
+    transport_bodies: list[dict[str, Any]] = []
+    credential_source = _CredentialSource()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert isinstance(body, dict)
+        transport_bodies.append(body)
+        index = len(transport_bodies)
+        answer = ANSWER if index == 1 else "The follow-up answer used both retained historical screenshots."
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_response(answer, response_id=f"resp_history_{index}"),
+            request=request,
+        )
+
+    def gateway_factory(settings: Any) -> _CapturingGateway:
+        return _CapturingGateway(
+            compose_model_gateway(
+                settings,
+                secret_scope_id="workspace:ws_test",
+                secrets=_UnusedSecrets(),  # type: ignore[arg-type]
+                network_enabled=True,
+                responses_transport=httpx.MockTransport(handler),
+                codex_credential_source=credential_source,
+            )
+        )
+
+    config = _config()
+    config_fingerprint = canonical_json_sha256(config.model_dump(mode="json"))
+    codex_models = _CodexModels()
+
+    def runtime(start: int) -> tuple[HarnessService, ConversationAttachmentStore]:
+        uow = SqliteUnitOfWorkFactory(state_path)
+        clock = ManualClock(NOW)
+        attachments = ConversationAttachmentStore(
+            attachment_root,
+            workspace_id="ws_test",
+            clock=clock,
+            ids=DeterministicIdGenerator(start=start + 500),
+        )
+        approvals = ApprovalManager(unit_of_work=uow, clock=clock)
+        history = ConversationHistoryRunPreparationAdapter(
+            workspace_id="ws_test",
+            unit_of_work=uow,
+            attachments=attachments,
+        )
+        components = ProductionRunComponentsFactory(
+            workspace_id="ws_test",
+            clock=clock,
+            ids=DeterministicIdGenerator(start=start + 100),
+            gateway_factory=gateway_factory,
+            codex_models=codex_models,  # type: ignore[arg-type]
+            default_config=config,
+            approvals=approvals,
+            policy_audit=_PolicyAudit(),  # type: ignore[arg-type]
+            journal=object(),
+            artifacts=LocalArtifactStore(tmp_path / "artifacts", workspace_id="ws_test"),
+            attachments=attachments,
+            conversation_history=history,
+            local_transaction=None,
+            parent_authorities=object(),  # type: ignore[arg-type]
+        )
+        harness = HarnessService(
+            unit_of_work=uow,
+            event_sink=RecordingEventSink(),
+            clock=clock,
+            ids=DeterministicIdGenerator(start=start),
+            components=components,
+            async_components=components,
+            turn_manager=TurnManager(),
+            approval_manager=approvals,
+        )
+        return harness, attachments
+
+    async def wait_completed(harness: HarnessService, run_id: str) -> None:
+        for _ in range(1_000):
+            run = await harness.get_run(run_id)
+            if run.status is RunStatus.COMPLETED:
+                return
+            if run.status in {RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.INTERRUPTED}:
+                pytest.fail(f"Run terminated as {run.status.value}")
+            await asyncio.sleep(0)
+        pytest.fail("Run did not complete")
+
+    harness, attachments = runtime(1_000)
+    created = await harness.create_session(
+        CreateSessionCommand("ws_test", "profile_test", "Historical vision", "create-history")
+    )
+    token = ManualCancellationToken()
+    artifacts = [
+        await _upload(attachments, token, index=1, payload=FIRST_IMAGE, session_id=created.session_id),
+        await _upload(attachments, token, index=2, payload=SECOND_IMAGE, session_id=created.session_id),
+    ]
+    await attachments.claim_submission(
+        created.session_id,
+        "turn_image",
+        tuple(
+            AttachmentClaim(
+                artifact.artifact_id,
+                index,
+                artifact.content_hash,
+                artifact.media_type,
+                artifact.size_bytes,
+            )
+            for index, artifact in enumerate(artifacts)
+        ),
+        token,
+    )
+    first = await harness.start_turn(
+        StartTurnCommand(
+            workspace_id="ws_test",
+            session_id=created.session_id,
+            turn_id="turn_image",
+            idempotency_key="image-first",
+            input_blocks=(
+                {"type": "text", "text": "Summarize both interview pages.", "format": "markdown", "references": []},
+                *(
+                    {"type": "image", "artifact": artifact.to_wire(), "altText": f"page {index}"}
+                    for index, artifact in enumerate(artifacts, start=1)
+                ),
+            ),
+            run_config={
+                "provider": ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL.value,
+                "model": MODEL_ID,
+                "reasoningEffort": "medium",
+                "permissionMode": "read-only",
+            },
+            effective_config=config,
+            effective_config_fingerprint=config_fingerprint,
+        )
+    )
+    await wait_completed(harness, first.run_id)
+    await harness.shutdown()
+
+    restarted, _ = runtime(10_000)
+    follow_up = await restarted.start_turn(
+        StartTurnCommand(
+            workspace_id="ws_test",
+            session_id=created.session_id,
+            turn_id="turn_followup",
+            idempotency_key="text-follow-up",
+            input_blocks=(
+                {
+                    "type": "text",
+                    "text": "Correct the summary using the exact facts in those screenshots.",
+                    "format": "markdown",
+                    "references": [],
+                },
+            ),
+            run_config={
+                "provider": ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL.value,
+                "model": MODEL_ID,
+                "reasoningEffort": "medium",
+                "permissionMode": "read-only",
+            },
+            effective_config=config,
+            effective_config_fingerprint=config_fingerprint,
+        )
+    )
+    await wait_completed(restarted, follow_up.run_id)
+    await restarted.shutdown()
+
+    assert len(transport_bodies) == 2
+    follow_up_input = transport_bodies[1]["input"]
+    image_messages = [
+        message
+        for message in follow_up_input
+        if message["role"] == "user" and any(block["type"] == "input_image" for block in message["content"])
+    ]
+    assert len(image_messages) == 1
+    retained_images = [block for block in image_messages[0]["content"] if block["type"] == "input_image"]
+    assert [block["image_url"] for block in retained_images] == [
+        "data:image/png;base64," + base64.b64encode(FIRST_IMAGE).decode("ascii"),
+        "data:image/png;base64," + base64.b64encode(SECOND_IMAGE).decode("ascii"),
+    ]
+    assert any(message["role"] == "assistant" for message in follow_up_input)
+    current_messages = [message for message in follow_up_input if message["role"] == "user"]
+    assert all(block["type"] != "input_image" for block in current_messages[-1]["content"])
+    assert (await restarted.get_run_state(follow_up.run_id)).assistant_text == (
+        "The follow-up answer used both retained historical screenshots."
+    )
+
+    durable_state = state_path.read_bytes()
+    assert FIRST_IMAGE not in durable_state
+    assert SECOND_IMAGE not in durable_state
+    assert base64.b64encode(FIRST_IMAGE) not in durable_state
+    assert base64.b64encode(SECOND_IMAGE) not in durable_state

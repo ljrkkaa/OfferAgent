@@ -12,7 +12,7 @@ import threading
 import warnings
 from collections import OrderedDict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -155,6 +155,39 @@ class ClaimedAttachment:
 
 
 @dataclass(frozen=True, slots=True)
+class MaterializedClaimedAttachment:
+    """One Store-attested member of an all-or-nothing Turn image batch."""
+
+    attachment: ClaimedAttachment
+    content: bytes = field(repr=False)
+    width: int
+    height: int
+
+    def __post_init__(self) -> None:
+        if len(self.content) != self.attachment.byte_length:
+            raise ValueError("materialized attachment content length differs from its claim")
+        if self.width < 1 or self.height < 1 or self.width * self.height > _MAX_IMAGE_PIXELS:
+            raise ValueError("materialized attachment dimensions are invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class InspectedClaimedAttachment:
+    """Claim metadata plus header-inspected dimensions, without materialized bytes."""
+
+    attachment: ClaimedAttachment
+    width: int
+    height: int
+
+    def __post_init__(self) -> None:
+        if self.width < 1 or self.height < 1 or self.width * self.height > _MAX_IMAGE_PIXELS:
+            raise ValueError("inspected attachment dimensions are invalid")
+
+
+class _MaterializationAborted(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
 class AttachmentClaimReceipt:
     attachments: tuple[ClaimedAttachment, ...]
     created: bool
@@ -209,7 +242,7 @@ class ConversationAttachmentStore:
         self._ids = ids
         self._limits = limits or AttachmentLimits()
         self._lock = threading.RLock()
-        self._verified_files: OrderedDict[str, str] = OrderedDict()
+        self._verified_files: OrderedDict[str, tuple[str, int, int]] = OrderedDict()
         self._ensure_layout()
 
     @property
@@ -313,6 +346,70 @@ class ConversationAttachmentStore:
         cancellation.checkpoint()
         _require_match(_SESSION_ID, session_id, "Session ID")
         result = await asyncio.to_thread(self._read_all_sync, artifact_id, session_id)
+        cancellation.checkpoint()
+        return result
+
+    async def materialize_claimed_submission(
+        self,
+        session_id: str,
+        turn_id: str,
+        expected_claims: Sequence[AttachmentClaim],
+        cancellation: CancellationToken,
+    ) -> tuple[MaterializedClaimedAttachment, ...]:
+        """Return an exact claimed Turn batch only after every member verifies.
+
+        The Turn claim, order, Conversation ownership, immutable metadata, bytes,
+        hash, and image decode are checked behind one Store boundary.  Callers
+        therefore cannot accidentally rebuild history from a reordered subset.
+        """
+
+        cancellation.checkpoint()
+        stop = threading.Event()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._materialize_claimed_submission_sync,
+                session_id,
+                turn_id,
+                tuple(expected_claims),
+                cancellation,
+                stop,
+            )
+        )
+        try:
+            result = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            stop.set()
+            await _settle_worker_after_cancellation(worker)
+            raise
+        except _MaterializationAborted:
+            cancellation.checkpoint()
+            raise RuntimeError("attachment materialization stopped without cancellation") from None
+        cancellation.checkpoint()
+        return result
+
+    async def inspect_claimed_submission(
+        self,
+        session_id: str,
+        turn_id: str,
+        expected_claims: Sequence[AttachmentClaim],
+        cancellation: CancellationToken,
+    ) -> tuple[InspectedClaimedAttachment, ...]:
+        """Inspect exact claimed metadata and image headers without loading image bodies."""
+
+        cancellation.checkpoint()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._inspect_claimed_submission_sync,
+                session_id,
+                turn_id,
+                tuple(expected_claims),
+            )
+        )
+        try:
+            result = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            await _settle_worker_after_cancellation(worker)
+            raise
         cancellation.checkpoint()
         return result
 
@@ -520,7 +617,8 @@ class ConversationAttachmentStore:
                     f"Attachment upload is incomplete at offset {record.received_bytes}",
                 )
             source = staging if staging.exists() else final
-            self._verify_image(source, record, hash_error_code="invalid_image")
+            _, width, height = self._verify_image(source, record, hash_error_code="invalid_image")
+            assert width is not None and height is not None
             if staging.exists():
                 if final.exists():
                     self._verify_image(final, record)
@@ -544,7 +642,7 @@ class ConversationAttachmentStore:
                 record = self._by_upload(connection, upload_id)
                 if record is None:
                     raise AttachmentError("attachment_corrupt", "Committed attachment metadata disappeared")
-            self._remember_verified(record)
+            self._remember_verified(record, width, height)
         return AttachmentCommitReceipt(upload_id, _artifact_ref(record), False)
 
     def _abort_sync(self, upload_id: str, session_id: str | None = None) -> None:
@@ -611,6 +709,141 @@ class ConversationAttachmentStore:
                 content,
                 True,
             )
+
+    def _materialize_claimed_submission_sync(
+        self,
+        session_id: str,
+        turn_id: str,
+        expected_claims: tuple[AttachmentClaim, ...],
+        cancellation: CancellationToken,
+        stop: threading.Event,
+    ) -> tuple[MaterializedClaimedAttachment, ...]:
+        _require_match(_SESSION_ID, session_id, "Session ID")
+        _require_match(_TURN_ID, turn_id, "Turn ID")
+        _validate_expected_claims(expected_claims, self._limits)
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            observed = [
+                (str(row["artifact_id"]), int(row["item_order"]))
+                for row in connection.execute(
+                    "SELECT artifact_id, item_order FROM claims WHERE turn_id = ? ORDER BY item_order",
+                    (turn_id,),
+                ).fetchall()
+            ]
+            expected = [(item.artifact_id, item.order) for item in expected_claims]
+            if observed != expected:
+                raise AttachmentError("claim_conflict", "Turn attachment claim differs from durable input metadata")
+
+            verified: list[tuple[_StoredAttachment, AttachmentClaim, bytes, int, int]] = []
+            for claim in expected_claims:
+                if stop.is_set() or cancellation.cancelled:
+                    raise _MaterializationAborted
+                try:
+                    record = self._by_artifact(connection, claim.artifact_id)
+                    if record is None or record.status != "ready":
+                        raise AttachmentError(
+                            "attachment_unavailable",
+                            "Claimed Conversation attachment is unavailable",
+                        )
+                    self._require_conversation(record, session_id)
+                    if (
+                        record.content_hash != claim.content_hash
+                        or record.media_type != claim.media_type
+                        or record.byte_length != claim.byte_length
+                    ):
+                        raise AttachmentError(
+                            "metadata_conflict",
+                            "Claimed attachment metadata differs from durable Turn input",
+                        )
+                    content, width, height = self._verify_ready_with_dimensions(record)
+                except AttachmentError as error:
+                    if error.item_order is not None:
+                        raise
+                    raise AttachmentError(error.code, str(error), item_order=claim.order) from error
+                verified.append((record, claim, content, width, height))
+
+            if stop.is_set() or cancellation.cancelled:
+                raise _MaterializationAborted
+            return tuple(
+                MaterializedClaimedAttachment(
+                    ClaimedAttachment(
+                        artifact_id=record.artifact_id,
+                        order=claim.order,
+                        file_name=record.file_name,
+                        media_type=record.media_type,
+                        byte_length=record.byte_length,
+                        content_hash=record.content_hash,
+                    ),
+                    content,
+                    width,
+                    height,
+                )
+                for record, claim, content, width, height in verified
+            )
+
+    def _inspect_claimed_submission_sync(
+        self,
+        session_id: str,
+        turn_id: str,
+        expected_claims: tuple[AttachmentClaim, ...],
+    ) -> tuple[InspectedClaimedAttachment, ...]:
+        _validate_expected_claims(expected_claims, self._limits)
+        _require_match(_SESSION_ID, session_id, "Session ID")
+        _require_match(_TURN_ID, turn_id, "Turn ID")
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            observed = [
+                (str(row["artifact_id"]), int(row["item_order"]))
+                for row in connection.execute(
+                    "SELECT artifact_id, item_order FROM claims WHERE turn_id = ? ORDER BY item_order",
+                    (turn_id,),
+                ).fetchall()
+            ]
+            expected = [(item.artifact_id, item.order) for item in expected_claims]
+            if observed != expected:
+                raise AttachmentError("claim_conflict", "Turn attachment claim differs from durable input metadata")
+            inspected: list[InspectedClaimedAttachment] = []
+            for claim in expected_claims:
+                try:
+                    record = self._by_artifact(connection, claim.artifact_id)
+                    if record is None or record.status != "ready":
+                        raise AttachmentError(
+                            "attachment_unavailable",
+                            "Claimed Conversation attachment is unavailable",
+                        )
+                    self._require_conversation(record, session_id)
+                    if (
+                        record.content_hash != claim.content_hash
+                        or record.media_type != claim.media_type
+                        or record.byte_length != claim.byte_length
+                    ):
+                        raise AttachmentError(
+                            "metadata_conflict",
+                            "Claimed attachment metadata differs from durable Turn input",
+                        )
+                    width, height = _inspect_static_image_dimensions(
+                        self._final_path(record.artifact_id),
+                        record.media_type,
+                    )
+                except AttachmentError as error:
+                    if error.item_order is not None:
+                        raise
+                    raise AttachmentError(error.code, str(error), item_order=claim.order) from error
+                inspected.append(
+                    InspectedClaimedAttachment(
+                        ClaimedAttachment(
+                            record.artifact_id,
+                            claim.order,
+                            record.file_name,
+                            record.media_type,
+                            record.byte_length,
+                            record.content_hash,
+                        ),
+                        width,
+                        height,
+                    )
+                )
+            return tuple(inspected)
 
     def _claim_submission_sync(
         self,
@@ -904,16 +1137,24 @@ class ConversationAttachmentStore:
                 os.fsync(stream.fileno())
 
     def _verify_ready(self, record: _StoredAttachment) -> bytes:
-        content = self._verify_image(
-            self._final_path(record.artifact_id),
-            record,
-            decode=self._verified_files.get(record.artifact_id) != record.content_hash,
-        )
-        self._remember_verified(record)
+        content, _, _ = self._verify_ready_with_dimensions(record)
         return content
 
-    def _remember_verified(self, record: _StoredAttachment) -> None:
-        self._verified_files[record.artifact_id] = record.content_hash
+    def _verify_ready_with_dimensions(self, record: _StoredAttachment) -> tuple[bytes, int, int]:
+        cached = self._verified_files.get(record.artifact_id)
+        content, width, height = self._verify_image(
+            self._final_path(record.artifact_id),
+            record,
+            decode=cached is None or cached[0] != record.content_hash,
+        )
+        if width is None or height is None:
+            assert cached is not None and cached[0] == record.content_hash
+            _, width, height = cached
+        self._remember_verified(record, width, height)
+        return content, width, height
+
+    def _remember_verified(self, record: _StoredAttachment, width: int, height: int) -> None:
+        self._verified_files[record.artifact_id] = (record.content_hash, width, height)
         self._verified_files.move_to_end(record.artifact_id)
         while len(self._verified_files) > _MAX_DECODE_ATTESTATIONS:
             self._verified_files.popitem(last=False)
@@ -925,7 +1166,7 @@ class ConversationAttachmentStore:
         *,
         hash_error_code: str = "attachment_corrupt",
         decode: bool = True,
-    ) -> bytes:
+    ) -> tuple[bytes, int | None, int | None]:
         try:
             content = path.read_bytes()
         except FileNotFoundError as error:
@@ -937,9 +1178,8 @@ class ConversationAttachmentStore:
             raise AttachmentError("invalid_image", "Attachment bytes do not match the claimed image signature")
         if actual_hash != record.content_hash:
             raise AttachmentError(hash_error_code, "Attachment content hash differs from committed metadata")
-        if decode:
-            _verify_decodable_static_image(content, record.media_type)
-        return content
+        dimensions = _verify_decodable_static_image(content, record.media_type) if decode else None
+        return content, *(dimensions or (None, None))
 
     @staticmethod
     def _read_range(path: Path, offset: int, length: int) -> bytes:
@@ -1013,6 +1253,36 @@ def _request_identity(value: _StoredAttachment | AttachmentUploadRequest) -> tup
     )
 
 
+async def _settle_worker_after_cancellation(worker: asyncio.Task[object]) -> None:
+    """Drain a shielded thread worker despite repeated cancellation requests."""
+
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:
+            return
+    try:
+        worker.result()
+    except BaseException:
+        pass
+
+
+def _validate_expected_claims(
+    expected_claims: tuple[AttachmentClaim, ...],
+    limits: AttachmentLimits,
+) -> None:
+    if len(expected_claims) > limits.max_submission_images:
+        raise AttachmentError("claim_conflict", "Expected attachment claims are invalid")
+    if [item.order for item in expected_claims] != list(range(len(expected_claims))):
+        raise AttachmentError("claim_conflict", "Expected attachment claim order is invalid")
+    if len({item.artifact_id for item in expected_claims}) != len(expected_claims):
+        raise AttachmentError("claim_conflict", "Expected attachment claims repeat an Artifact")
+    if sum(item.byte_length for item in expected_claims) > limits.max_submission_bytes:
+        raise AttachmentError("claim_conflict", "Expected attachment claims exceed the submission limit")
+
+
 def _artifact_ref(record: _StoredAttachment) -> ArtifactRef:
     return ArtifactRef(
         artifact_id=record.artifact_id,
@@ -1037,7 +1307,7 @@ def _has_image_signature(content: bytes, media_type: str) -> bool:
     return False
 
 
-def _verify_decodable_static_image(content: bytes, media_type: str) -> None:
+def _verify_decodable_static_image(content: bytes, media_type: str) -> tuple[int, int]:
     expected_format = _PIL_FORMATS[media_type]
     try:
         with warnings.catch_warnings():
@@ -1053,12 +1323,39 @@ def _verify_decodable_static_image(content: bytes, media_type: str) -> None:
                 image.verify()
             with Image.open(io.BytesIO(content)) as decoded:
                 decoded.load()
+            return width, height
     except AttachmentError:
         raise
     except (Image.DecompressionBombError, Image.DecompressionBombWarning) as error:
         raise AttachmentError("invalid_image", "Attachment image dimensions exceed the safe decode limit") from error
     except (OSError, SyntaxError, ValueError) as error:
         raise AttachmentError("invalid_image", "Attachment image format cannot be decoded safely") from error
+
+
+def _inspect_static_image_dimensions(path: Path, media_type: str) -> tuple[int, int]:
+    expected_format = _PIL_FORMATS[media_type]
+    if path.is_symlink():
+        raise AttachmentError("unsafe_storage", "Attachment object cannot use a symlink")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(path) as image:
+                if image.format != expected_format:
+                    raise AttachmentError("invalid_image", "Attachment container does not match its media type")
+                width, height = image.size
+                if width < 1 or height < 1 or width * height > _MAX_IMAGE_PIXELS:
+                    raise AttachmentError("invalid_image", "Attachment image dimensions exceed the safe decode limit")
+                if getattr(image, "is_animated", False) or getattr(image, "n_frames", 1) != 1:
+                    raise AttachmentError("invalid_image", "Animated image attachments are not supported")
+                return width, height
+    except AttachmentError:
+        raise
+    except FileNotFoundError as error:
+        raise AttachmentError("attachment_corrupt", "Attachment bytes are missing") from error
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as error:
+        raise AttachmentError("invalid_image", "Attachment image dimensions exceed the safe decode limit") from error
+    except (OSError, SyntaxError, ValueError) as error:
+        raise AttachmentError("invalid_image", "Attachment image format cannot be inspected safely") from error
 
 
 def _require_match(pattern: re.Pattern[str], value: str, label: str) -> None:
@@ -1079,4 +1376,6 @@ __all__ = [
     "AttachmentUploadRequest",
     "ClaimedAttachment",
     "ConversationAttachmentStore",
+    "InspectedClaimedAttachment",
+    "MaterializedClaimedAttachment",
 ]

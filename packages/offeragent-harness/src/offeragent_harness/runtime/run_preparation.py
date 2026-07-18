@@ -9,13 +9,20 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Protocol, cast, runtime_checkable
+from typing import Any, Literal, Protocol, cast, runtime_checkable
 
-from offeragent_harness.agent.context_manager import ContextFragment, ContextLayer
+from offeragent_harness.agent.context_manager import (
+    ContextFragment,
+    ContextLayer,
+    UserImageProvenance,
+    estimate_conversation_turn_tokens,
+)
 from offeragent_harness.agent.planner import Planner
 from offeragent_harness.agent.preparation import RunPreparationFailure, RunPreparationPort
 from offeragent_harness.agent.state import RunPhase, RunState
-from offeragent_harness.models import ModelRole
+from offeragent_harness.error_codes import ErrorCode
+from offeragent_harness.models import ModelContentBlock, ModelRole
+from offeragent_harness.models.json_types import thaw_json
 from offeragent_harness.ports import (
     EntityRecord,
     Sensitivity,
@@ -25,9 +32,27 @@ from offeragent_harness.ports import (
     VaultRead,
 )
 from offeragent_harness.ports.cancellation import CancellationToken, OperationCancelled
-from offeragent_harness.sessions import AgentLineage, Run, RunKind, RunStatus, Turn, TurnStatus
+from offeragent_harness.protocol._base import validate_wire
+from offeragent_harness.protocol.content import ArtifactSensitivity, ArtifactState, ImageContentBlock
+from offeragent_harness.sessions import (
+    AgentLineage,
+    Run,
+    RunKind,
+    RunStatus,
+    TerminationReason,
+    Turn,
+    TurnStatus,
+)
 from offeragent_harness.tools import canonical_json_bytes, canonical_json_sha256
 from offeragent_harness.workspace.filesystem import VaultFilesystemError
+
+from .attachment_errors import AttachmentError
+from .conversation_attachments import (
+    AttachmentClaim,
+    ConversationAttachmentStore,
+    InspectedClaimedAttachment,
+    MaterializedClaimedAttachment,
+)
 
 _INSTRUCTION_IMPORT = re.compile(r"^[ \t]*@(?P<path>[A-Za-z0-9][A-Za-z0-9._/-]*)[ \t]*$")
 _VAULT_MEMORY_PATH = ".offeragent/memory/MEMORY.md"
@@ -218,12 +243,59 @@ class ConversationHistoryLimits:
     max_turn_bytes: int = 64 * 1024
     max_total_bytes: int = 512 * 1024
     max_scanned_entities: int = 100_000
+    timeout_seconds: float = 5.0
+    max_attempts: int = 2
 
     def __post_init__(self) -> None:
-        if min(self.max_turns, self.max_turn_bytes, self.max_total_bytes, self.max_scanned_entities) < 1:
+        if min(
+            self.max_turns,
+            self.max_turn_bytes,
+            self.max_total_bytes,
+            self.max_scanned_entities,
+            self.max_attempts,
+        ) < 1:
             raise ValueError("conversation history limits must be positive")
         if self.max_turn_bytes > self.max_total_bytes:
             raise ValueError("conversation history turn limit cannot exceed total limit")
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise ValueError("conversation history timeout must be finite and positive")
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationImagePolicy:
+    """Catalog-derived image policy for rebuilding one Run's local history."""
+
+    supports_images: bool
+    detail: Literal["high", "original"] = "high"
+    max_images: int = 20
+    max_image_bytes: int = 50 * 1024 * 1024
+    max_estimated_tokens: int = 400_000
+
+    def __post_init__(self) -> None:
+        if type(self.supports_images) is not bool:
+            raise TypeError("Conversation image support must be a boolean")
+        if self.detail not in {"high", "original"}:
+            raise ValueError("Conversation image detail must be high or original")
+        if self.max_images < 0 or self.max_image_bytes < 0 or self.max_estimated_tokens < 0:
+            raise ValueError("Conversation image budgets cannot be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoricalTurnCandidate:
+    turn: Turn
+    run: Run
+    state: RunState
+    input_value: tuple[dict[str, Any], ...]
+    input_text: str
+    images: tuple[ImageContentBlock, ...]
+    claims: tuple[AttachmentClaim, ...]
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
+class _InspectedHistoricalTurnCandidate:
+    candidate: _HistoricalTurnCandidate
+    attachments: tuple[InspectedClaimedAttachment, ...]
 
 
 class ConversationHistoryRunPreparationAdapter:
@@ -240,12 +312,14 @@ class ConversationHistoryRunPreparationAdapter:
         *,
         workspace_id: str,
         unit_of_work: UnitOfWorkFactory,
+        attachments: ConversationAttachmentStore | None = None,
         limits: ConversationHistoryLimits | None = None,
     ) -> None:
         if not workspace_id or workspace_id.strip() != workspace_id or "\x00" in workspace_id:
             raise ValueError("Conversation history requires a canonical Workspace ID")
         self._workspace_id = workspace_id
         self._unit_of_work = unit_of_work
+        self._attachments = attachments
         self._limits = limits or ConversationHistoryLimits()
 
     async def context_fragments(
@@ -263,11 +337,89 @@ class ConversationHistoryRunPreparationAdapter:
             )
         if phase is not RunPhase.LOADING_CONTEXT:
             return ()
+        return await self.load_for_run(
+            session_id=request.session_id,
+            current_turn_id=request.turn_id,
+            image_policy=None,
+            cancellation=cancellation,
+        )
+
+    async def load_for_run(
+        self,
+        *,
+        session_id: str,
+        current_turn_id: str,
+        image_policy: ConversationImagePolicy | None,
+        cancellation: CancellationToken,
+        timeout_seconds: float | None = None,
+    ) -> tuple[ContextFragment, ...]:
+        """Load completed Turn pairs and optionally rematerialize claimed images."""
+
+        timeout = self._limits.timeout_seconds if timeout_seconds is None else timeout_seconds
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Conversation history timeout must be finite and positive")
+        last: RunPreparationFailure | None = None
+        for attempt in range(1, self._limits.max_attempts + 1):
+            cancellation.checkpoint()
+            try:
+                return await asyncio.wait_for(
+                    self._load_for_run_once(
+                        session_id=session_id,
+                        current_turn_id=current_turn_id,
+                        image_policy=image_policy,
+                        cancellation=cancellation,
+                    ),
+                    timeout=timeout,
+                )
+            except OperationCancelled:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError as error:
+                last = RunPreparationFailure(
+                    "conversation_history_timeout",
+                    "Conversation history preparation exceeded its local deadline",
+                    retryable=True,
+                )
+                last.__cause__ = error
+                raise last from error
+            except RunPreparationFailure as error:
+                last = error
+            if not last.retryable or attempt == self._limits.max_attempts:
+                raise last
+            await asyncio.sleep(0)
+        assert last is not None
+        raise last
+
+    async def _load_for_run_once(
+        self,
+        *,
+        session_id: str,
+        current_turn_id: str,
+        image_policy: ConversationImagePolicy | None,
+        cancellation: CancellationToken,
+    ) -> tuple[ContextFragment, ...]:
+        cancellation.checkpoint()
         try:
             async with self._unit_of_work.begin() as uow:
-                turns = await _scan_entities(uow.entities, "turns", self._limits.max_scanned_entities)
-                runs = await _scan_entities(uow.entities, "runs", self._limits.max_scanned_entities)
-                states = await _scan_entities(uow.entities, "run_states", self._limits.max_scanned_entities)
+                turns = await _scan_entities(
+                    uow.entities,
+                    "turns",
+                    self._limits.max_scanned_entities,
+                    cancellation,
+                )
+                runs = await _scan_entities(
+                    uow.entities,
+                    "runs",
+                    self._limits.max_scanned_entities,
+                    cancellation,
+                )
+                states = await _scan_entities(
+                    uow.entities,
+                    "run_states",
+                    self._limits.max_scanned_entities,
+                    cancellation,
+                )
         except RunPreparationFailure:
             raise
         except Exception as error:
@@ -277,21 +429,32 @@ class ConversationHistoryRunPreparationAdapter:
                 retryable=True,
             ) from error
         cancellation.checkpoint()
-        return self._fragments(request, turns, runs, states)
+        return await self._fragments(
+            session_id,
+            current_turn_id,
+            turns,
+            runs,
+            states,
+            image_policy,
+            cancellation,
+        )
 
-    def _fragments(
+    async def _fragments(
         self,
-        request: RunPreparationRequest,
+        session_id: str,
+        current_turn_id: str,
         turn_records: Sequence[EntityRecord],
         run_records: Sequence[EntityRecord],
         state_records: Sequence[EntityRecord],
+        image_policy: ConversationImagePolicy | None,
+        cancellation: CancellationToken,
     ) -> tuple[ContextFragment, ...]:
         turns = tuple(
             record.value
             for record in turn_records
             if isinstance(record.value, Turn)
-            and record.value.session_id == request.session_id
-            and record.value.turn_id != request.turn_id
+            and record.value.session_id == session_id
+            and record.value.turn_id != current_turn_id
             and record.value.status is TurnStatus.COMPLETED
         )
         runs_by_turn: dict[str, list[Run]] = {}
@@ -301,7 +464,7 @@ class ConversationHistoryRunPreparationAdapter:
                 continue
             if (
                 run.workspace_id != self._workspace_id
-                or run.session_id != request.session_id
+                or run.session_id != session_id
                 or run.kind is not RunKind.ROOT
                 or run.status is not RunStatus.COMPLETED
             ):
@@ -322,10 +485,12 @@ class ConversationHistoryRunPreparationAdapter:
             if (
                 state is None
                 or state.workspace_id != self._workspace_id
-                or state.session_id != request.session_id
+                or state.session_id != session_id
                 or state.turn_id != turn.turn_id
                 or state.run_id != run.run_id
-                or not state.phase.terminal
+                or state.lineage != run.lineage
+                or state.phase is not RunPhase.COMPLETED
+                or run.termination_reason is not TerminationReason.COMPLETED
                 or not state.assistant_text
             ):
                 raise RunPreparationFailure(
@@ -335,44 +500,220 @@ class ConversationHistoryRunPreparationAdapter:
                 )
             selected.append((turn, run, state))
         selected = selected[-self._limits.max_turns :]
-        pairs: list[tuple[ContextFragment, ContextFragment, int]] = []
-        for turn, run, state in selected:
-            input_value = [dict(block) for block in turn.input_blocks]
-            input_text = canonical_json_bytes(input_value).decode("utf-8")
-            user = ContextFragment(
-                fragment_id=f"conversation:{turn.turn_id}:user",
-                layer=ContextLayer.CONVERSATION,
-                text=input_text,
-                sensitivity=Sensitivity.WORKSPACE,
-                source_refs=(f"session:{request.session_id}:turn:{turn.turn_id}:input",),
-                content_hash=canonical_json_sha256(input_value),
-            )
-            assistant = ContextFragment(
-                fragment_id=f"conversation:{turn.turn_id}:assistant",
-                layer=ContextLayer.CONVERSATION,
-                text=state.assistant_text,
-                sensitivity=Sensitivity.WORKSPACE,
-                source_refs=(f"session:{request.session_id}:run:{run.run_id}:assistant",),
-                content_hash=canonical_json_sha256({"text": state.assistant_text}),
-                role=ModelRole.ASSISTANT,
-            )
-            size = len(canonical_json_bytes({"user": input_value, "assistant": state.assistant_text}))
-            if size > self._limits.max_turn_bytes:
+
+        image_limit = image_policy.max_images if image_policy is not None else 20
+        image_byte_limit = image_policy.max_image_bytes if image_policy is not None else 50 * 1024 * 1024
+        retained_reversed: list[_HistoricalTurnCandidate] = []
+        used = 0
+        used_images = 0
+        used_image_bytes = 0
+        for turn, run, state in reversed(selected):
+            cancellation.checkpoint()
+            raw_input = thaw_json(turn.input_blocks)
+            if not isinstance(raw_input, (list, tuple)) or not all(isinstance(block, dict) for block in raw_input):
                 raise RunPreparationFailure(
-                    "conversation_history_turn_compaction_required",
-                    f"Turn {turn.turn_id!r} exceeds the exact conversation context limit",
+                    "conversation_history_input_invalid",
+                    f"Completed Turn {turn.turn_id!r} has invalid durable input",
                     retryable=False,
                 )
-            pairs.append((user, assistant, size))
-        retained: list[tuple[ContextFragment, ContextFragment]] = []
-        used = 0
-        for user, assistant, size in reversed(pairs):
-            if used + size > self._limits.max_total_bytes:
+            input_value = tuple(dict(block) for block in raw_input)
+            input_text = canonical_json_bytes(input_value).decode("utf-8")
+            size = len(canonical_json_bytes({"user": input_value, "assistant": state.assistant_text}))
+            if size > self._limits.max_turn_bytes or used + size > self._limits.max_total_bytes:
                 break
-            retained.append((user, assistant))
+            raw_images = [block for block in input_value if block.get("type") == "image"]
+            validated: list[ImageContentBlock] = []
+            claims: list[AttachmentClaim] = []
+            try:
+                for image_index, raw in enumerate(raw_images):
+                    image = validate_wire(ImageContentBlock, raw)
+                    artifact = image.artifact
+                    if (
+                        artifact.sensitivity is not ArtifactSensitivity.PRIVATE
+                        or artifact.state is not ArtifactState.COMPLETE
+                    ):
+                        raise ValueError("Conversation image must be a complete private attachment")
+                    validated.append(image)
+                    claims.append(
+                        AttachmentClaim(
+                            artifact.artifact_id,
+                            image_index,
+                            artifact.content_hash,
+                            artifact.media_type,
+                            artifact.size_bytes,
+                        )
+                    )
+            except (TypeError, ValueError) as error:
+                raise RunPreparationFailure(
+                    "conversation_history_image_invalid",
+                    "Retained Conversation image metadata is invalid",
+                    retryable=False,
+                    error_code=ErrorCode.INPUT_IMAGE_INVALID,
+                    failure_category="model",
+                    details={"reason": "metadata_invalid"},
+                ) from error
+            turn_image_bytes = sum(claim.byte_length for claim in claims)
+            if (
+                used_images + len(claims) > image_limit
+                or used_image_bytes + turn_image_bytes > image_byte_limit
+            ):
+                break
+            retained_reversed.append(
+                _HistoricalTurnCandidate(
+                    turn,
+                    run,
+                    state,
+                    input_value,
+                    input_text,
+                    tuple(validated),
+                    tuple(claims),
+                    size,
+                )
+            )
             used += size
-        retained.reverse()
-        return tuple(fragment for pair in retained for fragment in pair)
+            used_images += len(claims)
+            used_image_bytes += turn_image_bytes
+
+        preliminary = tuple(retained_reversed)
+        if any(candidate.claims for candidate in preliminary):
+            if image_policy is None or not image_policy.supports_images:
+                raise RunPreparationFailure(
+                    "conversation_history_image_unsupported",
+                    "The selected model cannot receive retained Conversation images",
+                    retryable=False,
+                    error_code=ErrorCode.PROVIDER_IMAGE_UNSUPPORTED,
+                    failure_category="model",
+                )
+            if self._attachments is None:
+                raise RunPreparationFailure(
+                    "conversation_history_attachment_unavailable",
+                    "Conversation image storage is unavailable",
+                    retryable=False,
+                    error_code=ErrorCode.INPUT_IMAGE_INVALID,
+                    failure_category="model",
+                )
+
+        inspected_reversed: list[_InspectedHistoricalTurnCandidate] = []
+        used_estimated_tokens = 0
+        for candidate in preliminary:
+            cancellation.checkpoint()
+            inspected: tuple[InspectedClaimedAttachment, ...] = ()
+            if self._attachments is not None:
+                try:
+                    inspected = await self._attachments.inspect_claimed_submission(
+                        session_id,
+                        candidate.turn.turn_id,
+                        candidate.claims,
+                        cancellation,
+                    )
+                except AttachmentError as error:
+                    inspection_details: dict[str, Any] = {"reason": error.code}
+                    if error.item_order is not None:
+                        inspection_details["imageIndex"] = error.item_order
+                    raise RunPreparationFailure(
+                        "conversation_history_image_invalid",
+                        "A retained Conversation image is unavailable or invalid",
+                        retryable=False,
+                        error_code=ErrorCode.INPUT_IMAGE_INVALID,
+                        failure_category="model",
+                        details=inspection_details,
+                    ) from error
+            detail = image_policy.detail if image_policy is not None else "high"
+            turn_tokens = estimate_conversation_turn_tokens(
+                candidate.input_text,
+                candidate.state.assistant_text,
+                tuple((item.width, item.height) for item in inspected),
+                detail=detail,
+            )
+            token_limit = image_policy.max_estimated_tokens if image_policy is not None else 400_000
+            if used_estimated_tokens + turn_tokens > token_limit:
+                break
+            inspected_reversed.append(_InspectedHistoricalTurnCandidate(candidate, inspected))
+            used_estimated_tokens += turn_tokens
+
+        retained = tuple(reversed(inspected_reversed))
+        pairs: list[tuple[ContextFragment, ContextFragment]] = []
+        for retained_candidate in retained:
+            candidate = retained_candidate.candidate
+            cancellation.checkpoint()
+            materialized: tuple[MaterializedClaimedAttachment, ...] = ()
+            if self._attachments is not None:
+                try:
+                    materialized = await self._attachments.materialize_claimed_submission(
+                        session_id,
+                        candidate.turn.turn_id,
+                        candidate.claims,
+                        cancellation,
+                    )
+                except AttachmentError as error:
+                    details: dict[str, Any] = {"reason": error.code}
+                    if error.item_order is not None:
+                        details["imageIndex"] = error.item_order
+                    raise RunPreparationFailure(
+                        "conversation_history_image_invalid",
+                        "A retained Conversation image is unavailable or invalid",
+                        retryable=False,
+                        error_code=ErrorCode.INPUT_IMAGE_INVALID,
+                        failure_category="model",
+                        details=details,
+                    ) from error
+            if tuple(
+                (item.attachment.artifact_id, item.width, item.height) for item in materialized
+            ) != tuple(
+                (item.attachment.artifact_id, item.width, item.height)
+                for item in retained_candidate.attachments
+            ):
+                raise RunPreparationFailure(
+                    "conversation_history_image_invalid",
+                    "Retained Conversation image inspection changed before materialization",
+                    retryable=False,
+                    error_code=ErrorCode.INPUT_IMAGE_INVALID,
+                    failure_category="model",
+                    details={"reason": "inspection_conflict"},
+                )
+            assert not candidate.claims or image_policy is not None
+            images = tuple(
+                ModelContentBlock(
+                    "image",
+                    {
+                        "artifactId": item.attachment.artifact_id,
+                        "mediaType": item.attachment.media_type,
+                        "contentHash": item.attachment.content_hash,
+                        "sizeBytes": item.attachment.byte_length,
+                        "width": item.width,
+                        "height": item.height,
+                        "altText": image.alt_text,
+                        "detail": image_policy.detail if image_policy is not None else "high",
+                    },
+                    binary_data=item.content,
+                )
+                for image, item in zip(candidate.images, materialized, strict=True)
+            )
+            artifact_ids = tuple(item.attachment.artifact_id for item in materialized)
+            user = ContextFragment(
+                fragment_id=f"conversation:{candidate.turn.turn_id}:user",
+                layer=ContextLayer.CONVERSATION,
+                text=candidate.input_text,
+                sensitivity=Sensitivity.PRIVATE if images else Sensitivity.WORKSPACE,
+                source_refs=(f"session:{session_id}:turn:{candidate.turn.turn_id}:input",),
+                artifact_ids=artifact_ids,
+                content_hash=canonical_json_sha256(candidate.input_value),
+                model_blocks=images,
+                image_provenance=(UserImageProvenance.RETAINED_CONVERSATION if images else None),
+                conversation_turn_id=candidate.turn.turn_id,
+            )
+            assistant = ContextFragment(
+                fragment_id=f"conversation:{candidate.turn.turn_id}:assistant",
+                layer=ContextLayer.CONVERSATION,
+                text=candidate.state.assistant_text,
+                sensitivity=Sensitivity.WORKSPACE,
+                source_refs=(f"session:{session_id}:run:{candidate.run.run_id}:assistant",),
+                content_hash=canonical_json_sha256({"text": candidate.state.assistant_text}),
+                role=ModelRole.ASSISTANT,
+                conversation_turn_id=candidate.turn.turn_id,
+            )
+            pairs.append((user, assistant))
+        return tuple(fragment for pair in pairs for fragment in pair)
 
 
 @dataclass(frozen=True, slots=True)
@@ -857,9 +1198,8 @@ def _bounded_fragments(
     fragments: Sequence[ContextFragment],
     limits: RunPreparationLimits,
 ) -> tuple[ContextFragment, ...]:
-    selected: list[ContextFragment] = []
+    bounded: list[tuple[ContextFragment, int]] = []
     seen: dict[str, ContextFragment] = {}
-    used = 0
     for fragment in fragments:
         if not isinstance(fragment, ContextFragment) or fragment.layer not in {
             ContextLayer.CONVERSATION,
@@ -900,11 +1240,55 @@ def _bounded_fragments(
                 retryable=False,
             )
         seen[fragment.fragment_id] = fragment
-        if len(selected) >= limits.max_fragments or used + size > limits.max_total_bytes:
+        bounded.append((fragment, size))
+
+    units: list[tuple[tuple[ContextFragment, int], ...]] = []
+    index = 0
+    while index < len(bounded):
+        item = bounded[index]
+        fragment = item[0]
+        if fragment.layer is not ContextLayer.CONVERSATION:
+            units.append((item,))
+            index += 1
+            continue
+        pair = tuple(bounded[index : index + 2])
+        if (
+            len(pair) != 2
+            or pair[0][0].role is not ModelRole.USER
+            or pair[1][0].role is not ModelRole.ASSISTANT
+            or pair[0][0].conversation_turn_id != pair[1][0].conversation_turn_id
+        ):
+            raise RunPreparationFailure(
+                "conversation_history_pair_invalid",
+                "Conversation context must contain contiguous complete Turn pairs",
+                retryable=False,
+            )
+        units.append(pair)
+        index += 2
+
+    selected_units: list[tuple[int, tuple[tuple[ContextFragment, int], ...]]] = []
+    used = 0
+    selected_count = 0
+    indexed_units = list(enumerate(units))
+    conversation_units = [
+        item for item in indexed_units if item[1][0][0].layer is ContextLayer.CONVERSATION
+    ]
+    other_units = [item for item in indexed_units if item[1][0][0].layer is not ContextLayer.CONVERSATION]
+    for unit_index, unit in reversed(conversation_units):
+        unit_size = sum(item[1] for item in unit)
+        if selected_count + len(unit) > limits.max_fragments or used + unit_size > limits.max_total_bytes:
             break
-        selected.append(fragment)
-        used += size
-    return tuple(selected)
+        selected_units.append((unit_index, unit))
+        selected_count += len(unit)
+        used += unit_size
+    for unit_index, unit in other_units:
+        unit_size = sum(item[1] for item in unit)
+        if selected_count + len(unit) > limits.max_fragments or used + unit_size > limits.max_total_bytes:
+            continue
+        selected_units.append((unit_index, unit))
+        selected_count += len(unit)
+        used += unit_size
+    return tuple(item[0] for _, unit in sorted(selected_units) for item in unit)
 
 
 def _bounded_utf8(value: str, max_bytes: int) -> str:
@@ -1131,10 +1515,12 @@ async def _scan_entities(
     entities: object,
     collection: str,
     maximum: int,
+    cancellation: CancellationToken,
 ) -> tuple[EntityRecord, ...]:
     records: list[EntityRecord] = []
     after_id: str | None = None
     while True:
+        cancellation.checkpoint()
         page = await entities.list(collection, after_id=after_id, limit=min(1_000, maximum))  # type: ignore[attr-defined]
         if not page:
             return tuple(records)
@@ -1156,6 +1542,7 @@ __all__ = [
     "ContextSkillConsumer",
     "ConversationHistoryLimits",
     "ConversationHistoryRunPreparationAdapter",
+    "ConversationImagePolicy",
     "PreparedRunContext",
     "RunContextProvider",
     "RunPreparationLimits",

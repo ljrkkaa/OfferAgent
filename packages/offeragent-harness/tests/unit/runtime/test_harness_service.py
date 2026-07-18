@@ -19,7 +19,8 @@ from offeragent_harness.error_codes import ErrorCode
 from offeragent_harness.models import ModelUsage
 from offeragent_harness.ports import CancellationToken, Sensitivity, StoredEvent, ToolLifecycleObserver
 from offeragent_harness.protocol.events import TurnFailedPayload, parse_event, stored_event_to_envelope
-from offeragent_harness.runtime import TurnManager
+from offeragent_harness.runtime import CancellationReason, RunCancelled, TurnManager
+from offeragent_harness.runtime.cancellation import CancellationCode
 from offeragent_harness.runtime.harness_service import (
     CreateSessionCommand,
     HarnessService,
@@ -387,6 +388,41 @@ async def test_async_components_failure_uses_one_durable_terminal_commit() -> No
     ]
     assert await uow.get_entity("run_capability_snapshots", receipt.run_id) is None
     assert await uow.get_entity("active_root_runs", session.session_id) is None
+    assert deferred.released == [receipt.run_id]
+
+
+@pytest.mark.asyncio
+async def test_async_component_preparation_cancellation_uses_the_normal_cancelled_terminal() -> None:
+    clock = ManualClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    uow = InMemoryUnitOfWorkFactory()
+    manager = TurnManager()
+    reason = CancellationReason(CancellationCode.USER, "cancel during history preparation", clock.utcnow())
+    deferred = DeferredComponents(StopPlanner(), uow, failure=RunCancelled(reason))
+    harness = HarnessService(
+        unit_of_work=uow,
+        event_sink=RecordingEventSink(),
+        clock=clock,
+        ids=DeterministicIdGenerator(),
+        components=deferred,
+        async_components=deferred,
+        turn_manager=manager,
+    )
+    session = await create_session(harness)
+
+    receipt = await harness.start_turn(turn_command(session.session_id))
+    active = await manager.get(receipt.run_id)
+    assert active is not None
+    result = await active.task
+
+    assert result.phase is RunPhase.CANCELLED
+    assert (await harness.get_run(receipt.run_id)).status is RunStatus.CANCELLED
+    assert (await harness.get_turn(receipt.turn_id)).status is TurnStatus.CANCELLED
+    events = await harness.replay_events(receipt.run_id)
+    assert [(item.event_type, item.terminal) for item in events] == [
+        ("turn.started", False),
+        ("phase.changed", False),
+        ("turn.cancelled", True),
+    ]
     assert deferred.released == [receipt.run_id]
 
 

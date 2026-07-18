@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from offeragent_harness.agent.context_manager import ContextFragment, ContextLayer
+from offeragent_harness.agent.context_manager import (
+    ContextFragment,
+    ContextLayer,
+    UserImageProvenance,
+)
 from offeragent_harness.agent.planner import PlanningStep
 from offeragent_harness.agent.preparation import RunPreparationFailure
 from offeragent_harness.agent.state import RunPhase, RunState
@@ -18,9 +25,16 @@ from offeragent_harness.ports import (
     VaultEntryKind,
     VaultRead,
 )
+from offeragent_harness.runtime.conversation_attachments import (
+    AttachmentClaim,
+    AttachmentUploadRequest,
+    ConversationAttachmentStore,
+)
 from offeragent_harness.runtime.run_preparation import (
     CompositeRunContextProvider,
+    ConversationHistoryLimits,
     ConversationHistoryRunPreparationAdapter,
+    ConversationImagePolicy,
     PreparedRunContext,
     RunPreparationLimits,
     RunPreparationRequest,
@@ -29,7 +43,19 @@ from offeragent_harness.runtime.run_preparation import (
     WorkspaceInstructionRunPreparationAdapter,
 )
 from offeragent_harness.sessions import AgentLineage, Run, RunKind, RunStatus, TerminationReason, Turn, TurnStatus
-from offeragent_harness.testing import InMemoryUnitOfWorkFactory, ManualCancellationToken
+from offeragent_harness.testing import (
+    DeterministicIdGenerator,
+    InMemoryUnitOfWorkFactory,
+    ManualCancellationToken,
+    ManualClock,
+)
+
+FIRST_IMAGE = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+)
+SECOND_IMAGE = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC"
+)
 
 
 def _fragment(*, scope: str = "workspace", text: str = "remember local evidence") -> ContextFragment:
@@ -324,7 +350,7 @@ async def test_completed_session_turns_are_injected_as_exact_native_role_history
     turn = Turn(
         "turn_previous",
         "ses_main",
-        1,
+        2,
         TurnStatus.COMPLETED,
         ({"type": "text", "text": "请记住我有两年 Python 经验"},),
         now,
@@ -355,13 +381,54 @@ async def test_completed_session_turns_are_injected_as_exact_native_role_history
         phase=RunPhase.COMPLETED,
         assistant_text="已记住: 你有两年 Python 经验。",
     )
+    oversized_turn = Turn(
+        "turn_oversized_old",
+        "ses_main",
+        1,
+        TurnStatus.COMPLETED,
+        ({"type": "text", "text": "x" * 2_000},),
+        now,
+        now,
+    )
+    oversized_run = Run(
+        "run_oversized_old",
+        "ses_main",
+        oversized_turn.turn_id,
+        "ws_main",
+        AgentLineage.root("run_oversized_old"),
+        RunKind.ROOT,
+        RunStatus.COMPLETED,
+        1,
+        4,
+        {},
+        now,
+        now,
+        None,
+        TerminationReason.COMPLETED,
+    )
+    oversized_state = RunState(
+        "ws_main",
+        "ses_main",
+        oversized_turn.turn_id,
+        oversized_run.run_id,
+        oversized_run.lineage,
+        phase=RunPhase.COMPLETED,
+        assistant_text="old oversized answer",
+    )
     async with unit_of_work.begin() as work:
+        await work.entities.put("turns", oversized_turn.turn_id, oversized_turn, expected_revision=0)
+        await work.entities.put("runs", oversized_run.run_id, oversized_run, expected_revision=0)
+        await work.entities.put("run_states", oversized_state.run_id, oversized_state, expected_revision=0)
         await work.entities.put("turns", turn.turn_id, turn, expected_revision=0)
         await work.entities.put("runs", run.run_id, run, expected_revision=0)
         await work.entities.put("run_states", state.run_id, state, expected_revision=0)
         await work.commit()
 
-    adapter = ConversationHistoryRunPreparationAdapter(workspace_id="ws_main", unit_of_work=unit_of_work)
+    adapter = ConversationHistoryRunPreparationAdapter(
+        workspace_id="ws_main",
+        unit_of_work=unit_of_work,
+        limits=ConversationHistoryLimits(max_turn_bytes=512, max_total_bytes=1_024),
+    )
     planner = _Planner()
     prepared = PreparedRunContext(request=_request(), provider=adapter, planner=planner)
     token = ManualCancellationToken()
@@ -376,6 +443,381 @@ async def test_completed_session_turns_are_injected_as_exact_native_role_history
     ]
     assert "Python" in planner.conversation[0].text
     assert planner.conversation[1].text == "已记住: 你有两年 Python 经验。"
+
+
+@pytest.mark.asyncio
+async def test_completed_historical_turn_rematerializes_ordered_images_on_user_only_after_restart(
+    tmp_path: Path,
+) -> None:
+    unit_of_work = InMemoryUnitOfWorkFactory()
+    now = datetime(2026, 7, 18, tzinfo=timezone.utc)
+    root = tmp_path / "attachments"
+    token = ManualCancellationToken()
+    store = ConversationAttachmentStore(
+        root,
+        workspace_id="ws_main",
+        clock=ManualClock(now),
+        ids=DeterministicIdGenerator(),
+    )
+    artifacts = []
+    for index, payload in enumerate((FIRST_IMAGE, SECOND_IMAGE)):
+        content_hash = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+        begun = await store.begin(
+            AttachmentUploadRequest(
+                "ses_main",
+                f"req_history_{index}",
+                f"page-{index}.png",
+                "image/png",
+                len(payload),
+                content_hash,
+            ),
+            token,
+        )
+        await store.append(begun.upload_id, 0, payload, token)
+        artifacts.append((await store.commit(begun.upload_id, token)).artifact)
+    claims = tuple(
+        AttachmentClaim(
+            artifact.artifact_id,
+            index,
+            artifact.content_hash,
+            artifact.media_type,
+            artifact.size_bytes,
+        )
+        for index, artifact in enumerate(artifacts)
+    )
+    await store.claim_submission("ses_main", "turn_previous", claims, token)
+    turn = Turn(
+        "turn_previous",
+        "ses_main",
+        2,
+        TurnStatus.COMPLETED,
+        (
+            {"type": "text", "text": "请按顺序读取两页面经"},
+            *(
+                {"type": "image", "artifact": artifact.to_wire(), "altText": f"page {index}"}
+                for index, artifact in enumerate(artifacts, start=1)
+            ),
+        ),
+        now,
+        now,
+    )
+    run = Run(
+        "run_previous",
+        "ses_main",
+        "turn_previous",
+        "ws_main",
+        AgentLineage.root("run_previous"),
+        RunKind.ROOT,
+        RunStatus.COMPLETED,
+        1,
+        4,
+        {},
+        now,
+        now,
+        None,
+        TerminationReason.COMPLETED,
+    )
+    state = RunState(
+        "ws_main",
+        "ses_main",
+        "turn_previous",
+        "run_previous",
+        AgentLineage.root("run_previous"),
+        phase=RunPhase.COMPLETED,
+        assistant_text="两页属于同一场面试。",
+    )
+    text_turn = Turn(
+        "turn_text_before_image",
+        "ses_main",
+        1,
+        TurnStatus.COMPLETED,
+        ({"type": "text", "text": "Earlier text-only question."},),
+        now,
+        now,
+    )
+    text_run = Run(
+        "run_text_before_image",
+        "ses_main",
+        "turn_text_before_image",
+        "ws_main",
+        AgentLineage.root("run_text_before_image"),
+        RunKind.ROOT,
+        RunStatus.COMPLETED,
+        1,
+        4,
+        {},
+        now,
+        now,
+        None,
+        TerminationReason.COMPLETED,
+    )
+    text_state = RunState(
+        "ws_main",
+        "ses_main",
+        "turn_text_before_image",
+        "run_text_before_image",
+        AgentLineage.root("run_text_before_image"),
+        phase=RunPhase.COMPLETED,
+        assistant_text="Earlier text-only answer.",
+    )
+    async with unit_of_work.begin() as work:
+        await work.entities.put("turns", text_turn.turn_id, text_turn, expected_revision=0)
+        await work.entities.put("runs", text_run.run_id, text_run, expected_revision=0)
+        await work.entities.put("run_states", text_state.run_id, text_state, expected_revision=0)
+        await work.entities.put("turns", turn.turn_id, turn, expected_revision=0)
+        await work.entities.put("runs", run.run_id, run, expected_revision=0)
+        await work.entities.put("run_states", state.run_id, state, expected_revision=0)
+        await work.commit()
+
+    class _MustNotReadAttachments:
+        calls = 0
+
+        async def materialize_claimed_submission(self, *args: object) -> object:
+            del args
+            self.calls += 1
+            raise AssertionError("text-only model gate must run before historical attachment I/O")
+
+    unread = _MustNotReadAttachments()
+    text_only = ConversationHistoryRunPreparationAdapter(
+        workspace_id="ws_main",
+        unit_of_work=unit_of_work,
+        attachments=unread,  # type: ignore[arg-type]
+    )
+    with pytest.raises(RunPreparationFailure) as unsupported:
+        await text_only.load_for_run(
+            session_id="ses_main",
+            current_turn_id="turn_main",
+            image_policy=ConversationImagePolicy(supports_images=False),
+            cancellation=token,
+        )
+    assert unsupported.value.error_code.value == "provider.image_unsupported"
+    assert unread.calls == 0
+
+    bounded_images = await text_only.load_for_run(
+        session_id="ses_main",
+        current_turn_id="turn_main",
+        image_policy=ConversationImagePolicy(
+            supports_images=True,
+            max_images=1,
+            max_image_bytes=len(FIRST_IMAGE) + len(SECOND_IMAGE),
+        ),
+        cancellation=token,
+    )
+    assert bounded_images == ()
+    assert unread.calls == 0
+
+    class _InspectOnlyAttachments:
+        def __init__(self) -> None:
+            self.inspections = 0
+            self.materializations = 0
+
+        async def inspect_claimed_submission(
+            self,
+            session_id: str,
+            turn_id: str,
+            expected_claims: tuple[AttachmentClaim, ...],
+            cancellation: ManualCancellationToken,
+        ) -> object:
+            assert session_id == "ses_main"
+            assert turn_id == "turn_previous"
+            cancellation.checkpoint()
+            self.inspections += 1
+            return tuple(
+                SimpleNamespace(
+                    attachment=SimpleNamespace(artifact_id=claim.artifact_id),
+                    width=1_920,
+                    height=1_080,
+                )
+                for claim in expected_claims
+            )
+
+        async def materialize_claimed_submission(self, *args: object) -> object:
+            del args
+            self.materializations += 1
+            raise AssertionError("a token-omitted historical Turn must not materialize image bodies")
+
+    inspect_only = _InspectOnlyAttachments()
+    token_bounded = ConversationHistoryRunPreparationAdapter(
+        workspace_id="ws_main",
+        unit_of_work=unit_of_work,
+        attachments=inspect_only,  # type: ignore[arg-type]
+    )
+    token_bounded_fragments = await token_bounded.load_for_run(
+        session_id="ses_main",
+        current_turn_id="turn_main",
+        image_policy=ConversationImagePolicy(
+            supports_images=True,
+            max_estimated_tokens=1,
+        ),
+        cancellation=token,
+    )
+    assert token_bounded_fragments == ()
+    assert inspect_only.inspections == 1
+    assert inspect_only.materializations == 0
+
+    reopened = ConversationAttachmentStore(
+        root,
+        workspace_id="ws_main",
+        clock=ManualClock(now),
+        ids=DeterministicIdGenerator(start=100),
+    )
+    adapter = ConversationHistoryRunPreparationAdapter(
+        workspace_id="ws_main",
+        unit_of_work=unit_of_work,
+        attachments=reopened,
+    )
+
+    fragments = await adapter.load_for_run(
+        session_id="ses_main",
+        current_turn_id="turn_main",
+        image_policy=ConversationImagePolicy(supports_images=True, detail="original"),
+        cancellation=token,
+    )
+
+    assert [fragment.role for fragment in fragments] == [
+        ModelRole.USER,
+        ModelRole.ASSISTANT,
+        ModelRole.USER,
+        ModelRole.ASSISTANT,
+    ]
+    assert [fragment.conversation_turn_id for fragment in fragments] == [
+        "turn_text_before_image",
+        "turn_text_before_image",
+        "turn_previous",
+        "turn_previous",
+    ]
+    assert fragments[2].image_provenance is UserImageProvenance.RETAINED_CONVERSATION
+    assert [block.binary_data for block in fragments[2].model_blocks] == [FIRST_IMAGE, SECOND_IMAGE]
+    assert [block.data["detail"] for block in fragments[2].model_blocks] == ["original", "original"]
+    assert fragments[1].model_blocks == ()
+    assert fragments[3].model_blocks == ()
+
+    second_path = root / "objects" / artifacts[1].artifact_id
+    second_path.write_bytes(b"x" * len(SECOND_IMAGE))
+    with pytest.raises(RunPreparationFailure) as corrupt_history:
+        await adapter.load_for_run(
+            session_id="ses_main",
+            current_turn_id="turn_main",
+            image_policy=ConversationImagePolicy(supports_images=True),
+            cancellation=token,
+        )
+    assert corrupt_history.value.error_code.value == "input.image_invalid"
+    assert corrupt_history.value.details["imageIndex"] == 1
+    second_path.write_bytes(SECOND_IMAGE)
+
+    await reopened.claim_submission("ses_main", "turn_orphan_claim", (claims[0],), token)
+    orphan_turn = Turn(
+        "turn_orphan_claim",
+        "ses_main",
+        3,
+        TurnStatus.COMPLETED,
+        ({"type": "text", "text": "This durable Turn declares no image."},),
+        now,
+        now,
+    )
+    orphan_run = Run(
+        "run_orphan_claim",
+        "ses_main",
+        "turn_orphan_claim",
+        "ws_main",
+        AgentLineage.root("run_orphan_claim"),
+        RunKind.ROOT,
+        RunStatus.COMPLETED,
+        1,
+        4,
+        {},
+        now,
+        now,
+        None,
+        TerminationReason.COMPLETED,
+    )
+    orphan_state = RunState(
+        "ws_main",
+        "ses_main",
+        "turn_orphan_claim",
+        "run_orphan_claim",
+        AgentLineage.root("run_orphan_claim"),
+        phase=RunPhase.COMPLETED,
+        assistant_text="This result must not make the orphaned claim trustworthy.",
+    )
+    async with unit_of_work.begin() as work:
+        await work.entities.put("turns", orphan_turn.turn_id, orphan_turn, expected_revision=0)
+        await work.entities.put("runs", orphan_run.run_id, orphan_run, expected_revision=0)
+        await work.entities.put("run_states", orphan_state.run_id, orphan_state, expected_revision=0)
+        await work.commit()
+
+    with pytest.raises(RunPreparationFailure) as orphaned:
+        await adapter.load_for_run(
+            session_id="ses_main",
+            current_turn_id="turn_main",
+            image_policy=ConversationImagePolicy(supports_images=True),
+            cancellation=token,
+        )
+    assert orphaned.value.error_code.value == "input.image_invalid"
+    assert orphaned.value.details["reason"] == "claim_conflict"
+
+
+@pytest.mark.asyncio
+async def test_generic_run_preparation_never_splits_a_conversation_turn_pair_at_its_fragment_limit() -> None:
+    pair = (
+        ContextFragment(
+            "conversation:previous:user",
+            ContextLayer.CONVERSATION,
+            "question",
+            Sensitivity.WORKSPACE,
+            conversation_turn_id="turn_previous",
+        ),
+        ContextFragment(
+            "conversation:previous:assistant",
+            ContextLayer.CONVERSATION,
+            "answer",
+            Sensitivity.WORKSPACE,
+            role=ModelRole.ASSISTANT,
+            conversation_turn_id="turn_previous",
+        ),
+    )
+    planner = _Planner()
+    prepared = PreparedRunContext(
+        request=_request(),
+        provider=_Provider(pair),
+        planner=planner,
+        limits=RunPreparationLimits(max_fragments=1),
+    )
+    token = ManualCancellationToken()
+
+    await prepared.prepare(_state(RunPhase.LOADING_CONTEXT), RunPhase.LOADING_CONTEXT, token)
+    await prepared.prepare(_state(RunPhase.SELECTING_MEMORY), RunPhase.SELECTING_MEMORY, token)
+
+    assert planner.conversation == []
+
+
+@pytest.mark.asyncio
+async def test_generic_run_preparation_keeps_the_newest_complete_conversation_suffix() -> None:
+    pairs = tuple(
+        ContextFragment(
+            f"conversation:{turn_id}:{role.value}",
+            ContextLayer.CONVERSATION,
+            f"{role.value} {turn_id}",
+            Sensitivity.WORKSPACE,
+            role=role,
+            conversation_turn_id=turn_id,
+        )
+        for turn_id in ("turn_old", "turn_new")
+        for role in (ModelRole.USER, ModelRole.ASSISTANT)
+    )
+    planner = _Planner()
+    prepared = PreparedRunContext(
+        request=_request(),
+        provider=_Provider(pairs),
+        planner=planner,
+        limits=RunPreparationLimits(max_fragments=2),
+    )
+    token = ManualCancellationToken()
+
+    await prepared.prepare(_state(RunPhase.LOADING_CONTEXT), RunPhase.LOADING_CONTEXT, token)
+    await prepared.prepare(_state(RunPhase.SELECTING_MEMORY), RunPhase.SELECTING_MEMORY, token)
+
+    assert [fragment.conversation_turn_id for fragment in planner.conversation] == ["turn_new", "turn_new"]
 
 
 @pytest.mark.asyncio
@@ -446,6 +888,56 @@ async def test_cancelled_and_interrupted_partial_answers_remain_replayable_but_n
     fragments = await adapter.context_fragments(_request(), RunPhase.LOADING_CONTEXT, ManualCancellationToken())
 
     assert fragments == ()
+
+
+@pytest.mark.asyncio
+async def test_completed_run_with_noncompleted_run_state_fails_closed_during_history_recovery() -> None:
+    unit_of_work = InMemoryUnitOfWorkFactory()
+    now = datetime(2026, 7, 14, tzinfo=timezone.utc)
+    turn = Turn(
+        "turn_divergent",
+        "ses_main",
+        1,
+        TurnStatus.COMPLETED,
+        ({"type": "text", "text": "prompt"},),
+        now,
+        now,
+    )
+    run = Run(
+        "run_divergent",
+        "ses_main",
+        turn.turn_id,
+        "ws_main",
+        AgentLineage.root("run_divergent"),
+        RunKind.ROOT,
+        RunStatus.COMPLETED,
+        1,
+        4,
+        {},
+        now,
+        now,
+        None,
+        TerminationReason.COMPLETED,
+    )
+    state = RunState(
+        "ws_main",
+        "ses_main",
+        turn.turn_id,
+        run.run_id,
+        run.lineage,
+        phase=RunPhase.FAILED,
+        assistant_text="partial answer that must not become future context",
+    )
+    async with unit_of_work.begin() as work:
+        await work.entities.put("turns", turn.turn_id, turn, expected_revision=0)
+        await work.entities.put("runs", run.run_id, run, expected_revision=0)
+        await work.entities.put("run_states", state.run_id, state, expected_revision=0)
+        await work.commit()
+
+    adapter = ConversationHistoryRunPreparationAdapter(workspace_id="ws_main", unit_of_work=unit_of_work)
+
+    with pytest.raises(RunPreparationFailure, match="coherent assistant result"):
+        await adapter.context_fragments(_request(), RunPhase.LOADING_CONTEXT, ManualCancellationToken())
 
 
 @pytest.mark.asyncio

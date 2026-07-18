@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -77,7 +79,9 @@ def test_decode_attestation_cache_is_bounded_lru(tmp_path: Path) -> None:
             SimpleNamespace(
                 artifact_id=f"art_{index:04d}",
                 content_hash=f"sha256:{index:064x}",
-            )
+            ),
+            1,
+            1,
         )
 
     assert len(store._verified_files) == maximum
@@ -149,10 +153,10 @@ async def test_range_reads_decode_an_unchanged_committed_image_only_once(
     original = attachment_module._verify_decodable_static_image
     decode_calls = 0
 
-    def count_decode(content: bytes, media_type: str) -> None:
+    def count_decode(content: bytes, media_type: str) -> tuple[int, int]:
         nonlocal decode_calls
         decode_calls += 1
-        original(content, media_type)
+        return original(content, media_type)
 
     monkeypatch.setattr(attachment_module, "_verify_decodable_static_image", count_decode)
 
@@ -197,10 +201,10 @@ async def test_claim_and_materialization_rehash_but_do_not_repeat_expensive_deco
     original = attachment_module._verify_decodable_static_image
     decode_calls = 0
 
-    def count_decode(content: bytes, media_type: str) -> None:
+    def count_decode(content: bytes, media_type: str) -> tuple[int, int]:
         nonlocal decode_calls
         decode_calls += 1
-        original(content, media_type)
+        return original(content, media_type)
 
     monkeypatch.setattr(attachment_module, "_verify_decodable_static_image", count_decode)
     store = ConversationAttachmentStore(
@@ -392,6 +396,226 @@ async def test_claims_preserve_order_support_reuse_and_delete_only_with_the_conv
     await store.delete_conversation("ses_one", token)
     with pytest.raises(AttachmentError, match="unavailable"):
         await store.read(claimed[1].artifact_id, 0, 1024, token)
+
+
+@pytest.mark.asyncio
+async def test_claimed_submission_materializes_atomically_in_turn_order_across_restart(tmp_path: Path) -> None:
+    root = tmp_path / "attachments"
+    clock = ManualClock(datetime(2026, 7, 17, tzinfo=timezone.utc))
+    token = ManualCancellationToken()
+    store = ConversationAttachmentStore(
+        root,
+        workspace_id="ws_one",
+        clock=clock,
+        ids=DeterministicIdGenerator(),
+    )
+    committed = []
+    for index, (payload, media_type, name) in enumerate(
+        ((PNG, "image/png", "first.png"), (JPEG, "image/jpeg", "second.jpg"))
+    ):
+        begun = await store.begin(
+            request(
+                payload,
+                client_request_id=f"req_materialize_{index}",
+                file_name=name,
+                media_type=media_type,
+            ),
+            token,
+        )
+        await store.append(begun.upload_id, 0, payload, token)
+        committed.append(await store.commit(begun.upload_id, token))
+    claims = tuple(
+        AttachmentClaim(
+            artifact_id=item.artifact.artifact_id,
+            order=index,
+            content_hash=item.artifact.content_hash,
+            media_type=item.artifact.media_type,
+            byte_length=item.artifact.size_bytes,
+        )
+        for index, item in enumerate(committed)
+    )
+    await store.claim_submission("ses_one", "turn_images", claims, token)
+
+    reopened = ConversationAttachmentStore(
+        root,
+        workspace_id="ws_one",
+        clock=clock,
+        ids=DeterministicIdGenerator(start=100),
+    )
+    materialized = await reopened.materialize_claimed_submission(
+        "ses_one",
+        "turn_images",
+        claims,
+        token,
+    )
+
+    assert [item.attachment.order for item in materialized] == [0, 1]
+    assert [item.attachment.artifact_id for item in materialized] == [claim.artifact_id for claim in claims]
+    assert [item.content for item in materialized] == [PNG, JPEG]
+    assert [(item.width, item.height) for item in materialized] == [(2, 2), (2, 2)]
+    assert all("content=" not in repr(item) for item in materialized)
+    inspected = await reopened.inspect_claimed_submission("ses_one", "turn_images", claims, token)
+    assert [(item.attachment.order, item.width, item.height) for item in inspected] == [
+        (0, 2, 2),
+        (1, 2, 2),
+    ]
+    assert all(not hasattr(item, "content") for item in inspected)
+
+    assert (
+        await reopened.materialize_claimed_submission(
+            "ses_one",
+            "turn_without_images",
+            (),
+            token,
+        )
+        == ()
+    )
+    with pytest.raises(AttachmentError, match="claim"):
+        await reopened.materialize_claimed_submission(
+            "ses_one",
+            "turn_images",
+            (),
+            token,
+        )
+
+    (root / "objects" / claims[1].artifact_id).write_bytes(b"x" * len(JPEG))
+    with pytest.raises(AttachmentError) as corrupt_batch:
+        await reopened.materialize_claimed_submission(
+            "ses_one",
+            "turn_images",
+            claims,
+            token,
+        )
+    assert corrupt_batch.value.item_order == 1
+
+    with pytest.raises(AttachmentError, match="claim"):
+        await reopened.materialize_claimed_submission(
+            "ses_one",
+            "turn_images",
+            tuple(reversed(claims)),
+            token,
+        )
+    with pytest.raises(AttachmentError, match="Conversation"):
+        await reopened.materialize_claimed_submission(
+            "ses_other",
+            "turn_images",
+            claims,
+            token,
+        )
+
+    await reopened.delete_conversation("ses_one", token)
+    with pytest.raises(AttachmentError, match=r"claim|unavailable"):
+        await reopened.materialize_claimed_submission(
+            "ses_one",
+            "turn_images",
+            claims,
+            token,
+        )
+
+
+@pytest.mark.asyncio
+async def test_claimed_batch_blocks_cross_instance_claim_release_until_materialization_returns(tmp_path: Path) -> None:
+    root = tmp_path / "attachments"
+    clock = ManualClock(datetime(2026, 7, 17, tzinfo=timezone.utc))
+    token = ManualCancellationToken()
+    first = ConversationAttachmentStore(
+        root,
+        workspace_id="ws_one",
+        clock=clock,
+        ids=DeterministicIdGenerator(),
+    )
+    begun = await first.begin(request(PNG, client_request_id="req_atomic_batch"), token)
+    await first.append(begun.upload_id, 0, PNG, token)
+    artifact = (await first.commit(begun.upload_id, token)).artifact
+    claims = (
+        AttachmentClaim(
+            artifact.artifact_id,
+            0,
+            artifact.content_hash,
+            artifact.media_type,
+            artifact.size_bytes,
+        ),
+    )
+    await first.claim_submission("ses_one", "turn_atomic", claims, token)
+    second = ConversationAttachmentStore(
+        root,
+        workspace_id="ws_one",
+        clock=clock,
+        ids=DeterministicIdGenerator(start=100),
+    )
+    started = threading.Event()
+    release_reader = threading.Event()
+    original_verify = first._verify_ready_with_dimensions
+
+    def blocking_verify(record: object) -> object:
+        started.set()
+        assert release_reader.wait(timeout=2)
+        return original_verify(record)  # type: ignore[arg-type]
+
+    first._verify_ready_with_dimensions = blocking_verify  # type: ignore[method-assign]
+    materializing = asyncio.create_task(
+        first.materialize_claimed_submission("ses_one", "turn_atomic", claims, token)
+    )
+    assert await asyncio.to_thread(started.wait, 1)
+    releasing = asyncio.create_task(second.release_turn_claim("turn_atomic", token))
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(releasing), timeout=0.1)
+    finally:
+        release_reader.set()
+
+    assert [item.content for item in await materializing] == [PNG]
+    await releasing
+
+
+@pytest.mark.asyncio
+async def test_repeatedly_cancelled_claimed_batch_waits_for_worker_and_preserves_cancellation(tmp_path: Path) -> None:
+    root = tmp_path / "attachments"
+    clock = ManualClock(datetime(2026, 7, 17, tzinfo=timezone.utc))
+    token = ManualCancellationToken()
+    store = ConversationAttachmentStore(
+        root,
+        workspace_id="ws_one",
+        clock=clock,
+        ids=DeterministicIdGenerator(),
+    )
+    begun = await store.begin(request(PNG, client_request_id="req_cancelled_batch"), token)
+    await store.append(begun.upload_id, 0, PNG, token)
+    artifact = (await store.commit(begun.upload_id, token)).artifact
+    claims = (
+        AttachmentClaim(
+            artifact.artifact_id,
+            0,
+            artifact.content_hash,
+            artifact.media_type,
+            artifact.size_bytes,
+        ),
+    )
+    await store.claim_submission("ses_one", "turn_cancelled", claims, token)
+    started = threading.Event()
+    release_reader = threading.Event()
+    def blocking_verify(record: object) -> object:
+        del record
+        started.set()
+        assert release_reader.wait(timeout=2)
+        raise AttachmentError("attachment_corrupt", "worker failure must not replace cancellation")
+
+    store._verify_ready_with_dimensions = blocking_verify  # type: ignore[method-assign]
+    materializing = asyncio.create_task(
+        store.materialize_claimed_submission("ses_one", "turn_cancelled", claims, token)
+    )
+    assert await asyncio.to_thread(started.wait, 1)
+    materializing.cancel()
+    await asyncio.sleep(0)
+    assert not materializing.done()
+    materializing.cancel()
+    await asyncio.sleep(0)
+    assert not materializing.done()
+
+    release_reader.set()
+    with pytest.raises(asyncio.CancelledError):
+        await materializing
+    await asyncio.wait_for(store.release_turn_claim("turn_cancelled", token), timeout=1)
 
 
 @pytest.mark.parametrize(

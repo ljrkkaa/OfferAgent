@@ -12,6 +12,7 @@ import pytest
 
 from offeragent_harness.adapters.local_artifacts import LocalArtifactStore
 from offeragent_harness.agent import BudgetCheckpoint, BudgetLedger, RunPreparationFailure
+from offeragent_harness.agent.context_manager import ContextBudgetExceeded
 from offeragent_harness.agent.state import RunState
 from offeragent_harness.config import HarnessConfig, ModelProvider
 from offeragent_harness.models import ModelEvent, ModelRequest, ModelRole
@@ -22,6 +23,7 @@ from offeragent_harness.providers.codex_subscription import (
     CodexRunBindingError,
 )
 from offeragent_harness.runtime.approval_manager import ApprovalManager
+from offeragent_harness.runtime.attachment_errors import AttachmentError
 from offeragent_harness.runtime.harness_service import StartTurnCommand
 from offeragent_harness.runtime.production_worker_composition import ProductionRunComponentsFactory
 from offeragent_harness.sessions import AgentLineage
@@ -96,6 +98,8 @@ def _binding(
     *,
     input_modalities: tuple[str, ...] = ("text",),
     supports_image_detail_original: bool = False,
+    context_window: int = 128_000,
+    effective_context_window_percent: int = 95,
 ) -> CodexRunBinding:
     return CodexRunBinding(
         model=CodexCatalogModel(
@@ -106,9 +110,9 @@ def _binding(
             supports_image_detail_original=supports_image_detail_original,
             supports_hosted_search=True,
             web_search_tool_type="text",
-            context_window=128_000,
-            max_context_window=128_000,
-            effective_context_window_percent=95,
+            context_window=context_window,
+            max_context_window=context_window,
+            effective_context_window_percent=effective_context_window_percent,
             additional_speed_tiers=(),
             service_tiers=(),
             default_service_tier=None,
@@ -224,6 +228,26 @@ async def test_prepare_root_binds_fresh_catalog_model_and_build_uses_only_that_e
     assert proof["modelBinding"]["boundAt"] == NOW.isoformat()
     assert proof["modelBinding"]["accountBinding"] == ACCOUNT_BINDING
     assert tuple(proof["modelBinding"]["modelCapabilities"]["inputModalities"]) == ("text",)
+
+
+@pytest.mark.asyncio
+async def test_bound_catalog_context_window_limits_the_local_context_projection(tmp_path: Path) -> None:
+    module = _ModelModule(_binding(context_window=512, effective_context_window_percent=100))
+    gateway_calls: list[Any] = []
+    factory = _factory(tmp_path, module, gateway_calls)
+    command = _command(_config())
+    state = _state()
+
+    prepared = await factory.prepare_root(command, state, ManualCancellationToken(), None)  # type: ignore[arg-type]
+    components = factory.build_prepared_root(command, state, prepared)
+    ledger = BudgetLedger(components.budget, started_at=NOW)
+    request_state = replace(
+        state,
+        budget_checkpoint=await BudgetCheckpoint.capture(ledger, now=NOW),
+    )
+
+    with pytest.raises(ContextBudgetExceeded, match="system rules"):
+        components.planner_factory(ledger).create_request(request_state)
 
 
 @pytest.mark.asyncio
@@ -392,22 +416,36 @@ async def test_current_turn_images_reach_one_user_request_in_order_with_catalog_
             self.blobs = {"art_one": first, "art_two": second}
             self.calls: list[str] = []
 
-        async def read_all_for_conversation(
+        async def materialize_claimed_submission(
             self,
             session_id: str,
-            artifact_id: str,
+            turn_id: str,
+            claims: tuple[object, ...],
             cancellation: CancellationToken,
         ) -> object:
             assert session_id == "ses_test"
+            assert turn_id == "turn_test"
             cancellation.checkpoint()
-            blob = self.blobs[artifact_id]
-            self.calls.append(artifact_id)
-            return SimpleNamespace(
-                offset=0,
-                next_offset=len(blob),
-                content=blob,
-                complete=True,
-            )
+            result = []
+            for claim in claims:
+                artifact_id = claim.artifact_id
+                blob = self.blobs[artifact_id]
+                self.calls.append(artifact_id)
+                result.append(
+                    SimpleNamespace(
+                        attachment=SimpleNamespace(
+                            artifact_id=artifact_id,
+                            order=claim.order,
+                            media_type=claim.media_type,
+                            content_hash=claim.content_hash,
+                            byte_length=claim.byte_length,
+                        ),
+                        content=blob,
+                        width=1,
+                        height=1,
+                    )
+                )
+            return tuple(result)
 
     def image_block(artifact_id: str, payload: bytes, alt_text: str) -> dict[str, object]:
         return {
@@ -461,3 +499,83 @@ async def test_current_turn_images_reach_one_user_request_in_order_with_catalog_
     assert [block.data["detail"] for block in images] == [expected_detail, expected_detail]
     assert attachments.calls == ["art_one", "art_two"]
     assert len(gateway_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_current_image_batch_failure_preserves_the_corrupt_page_index(tmp_path: Path) -> None:
+    first = b"first-image"
+    second = b"second-image"
+
+    class _Attachments:
+        async def materialize_claimed_submission(self, *args: object) -> object:
+            del args
+            raise AttachmentError("attachment_corrupt", "second page is corrupt", item_order=1)
+
+    def image_block(artifact_id: str, payload: bytes) -> dict[str, object]:
+        return {
+            "type": "image",
+            "artifact": {
+                "artifactId": artifact_id,
+                "contentHash": "sha256:" + hashlib.sha256(payload).hexdigest(),
+                "mediaType": "image/png",
+                "sizeBytes": len(payload),
+                "sensitivity": "private",
+                "state": "complete",
+            },
+        }
+
+    factory = _factory(
+        tmp_path,
+        _ModelModule(_binding(input_modalities=("text", "image"))),
+        [],
+        attachments=_Attachments(),
+    )
+    command = replace(
+        _command(_config()),
+        input_blocks=(
+            {"type": "text", "text": "compare", "format": "markdown", "references": []},
+            image_block("art_one", first),
+            image_block("art_two", second),
+        ),
+    )
+
+    with pytest.raises(RunPreparationFailure) as caught:
+        await factory.prepare_root(command, _state(), ManualCancellationToken(), None)
+
+    assert caught.value.error_code.value == "input.image_invalid"
+    assert caught.value.details == {"reason": "attachment_corrupt", "imageIndex": 1}
+
+
+@pytest.mark.asyncio
+async def test_current_text_input_rejects_an_orphaned_durable_attachment_claim(tmp_path: Path) -> None:
+    class _Attachments:
+        calls = 0
+
+        async def materialize_claimed_submission(
+            self,
+            session_id: str,
+            turn_id: str,
+            claims: tuple[object, ...],
+            cancellation: CancellationToken,
+        ) -> object:
+            assert session_id == "ses_test"
+            assert turn_id == "turn_test"
+            assert claims == ()
+            cancellation.checkpoint()
+            self.calls += 1
+            raise AttachmentError("claim_conflict", "text metadata omits a durable attachment claim")
+
+    attachments = _Attachments()
+    factory = _factory(
+        tmp_path,
+        _ModelModule(_binding(input_modalities=("text", "image"))),
+        [],
+        attachments=attachments,
+    )
+
+    with pytest.raises(RunPreparationFailure) as caught:
+        await factory.prepare_root(_command(_config()), _state(), ManualCancellationToken(), None)
+
+    assert caught.value.error_code.value == "input.image_invalid"
+    assert caught.value.details == {"reason": "claim_conflict"}
+    assert attachments.calls == 1

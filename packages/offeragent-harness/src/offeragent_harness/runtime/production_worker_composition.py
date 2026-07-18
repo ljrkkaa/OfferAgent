@@ -33,6 +33,8 @@ from offeragent_harness.agent.context_manager import (
     ContextLayer,
     ContextManager,
     ContextVisibilityPolicy,
+    UserImageProvenance,
+    estimate_context_fragment_tokens,
 )
 from offeragent_harness.agent.loop import ToolKernel
 from offeragent_harness.agent.model_planner import AgentStepCatalog, ModelPlanner, PlannerModelConfig
@@ -134,7 +136,11 @@ from offeragent_harness.runtime.backpressure import BufferedEventSink
 from offeragent_harness.runtime.cancellation import CancellationScope
 from offeragent_harness.runtime.codex_credentials import CodexFileCredentialSource
 from offeragent_harness.runtime.config_service import ConfigService, ConfigUpdateCommand, WorkerConfigActivation
-from offeragent_harness.runtime.conversation_attachments import ConversationAttachmentStore
+from offeragent_harness.runtime.conversation_attachments import (
+    AttachmentClaim,
+    ConversationAttachmentStore,
+    MaterializedClaimedAttachment,
+)
 from offeragent_harness.runtime.conversation_controls import (
     CompactionExecution,
     ConversationControlService,
@@ -195,7 +201,10 @@ from offeragent_harness.runtime.production_skills import (
 )
 from offeragent_harness.runtime.recovery import RecoveryCoordinator
 from offeragent_harness.runtime.recovery_apply import RecoveryPlanApplier
-from offeragent_harness.runtime.run_preparation import ConversationHistoryRunPreparationAdapter
+from offeragent_harness.runtime.run_preparation import (
+    ConversationHistoryRunPreparationAdapter,
+    ConversationImagePolicy,
+)
 from offeragent_harness.runtime.startup import RuntimeStartupCoordinator
 from offeragent_harness.runtime.subagent_runtime import (
     HarnessChildCancellationFactory,
@@ -265,6 +274,7 @@ if TYPE_CHECKING:
 _LOCAL_PROFILE_ID = "profile_local"
 _LOCAL_MANAGED_ID = "managed_local"
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+_HISTORY_CONTEXT_BASE_RESERVE_TOKENS = 16_384
 _ROOT_PRODUCT_RULES = (
     "Agent Contract 加载后, 先调用 planning_memory.list 取得主题元数据, 再依据当前请求与 Conversation "
     "语义选择最多五个相关主题并用 planning_memory.read 精读; 不得把 memory/MEMORY.md、完整索引或"
@@ -562,6 +572,7 @@ class ProductionRunComponentsFactory(
         local_transaction: VaultTransactionCoordinator | None,
         parent_authorities: ParentRunAuthorityProvider,
         attachments: ConversationAttachmentStore | None = None,
+        conversation_history: ConversationHistoryRunPreparationAdapter | None = None,
         optional_definitions: Sequence[ToolDefinition] = (),
         optional_local_executors: Sequence[tuple[Sequence[ToolDefinition], ToolExecutor]] = (),
         plugin_executor: ToolExecutor | None = None,
@@ -589,6 +600,7 @@ class ProductionRunComponentsFactory(
         self._local_transaction = local_transaction
         self._parent_authorities = parent_authorities
         self._attachments = attachments
+        self._conversation_history = conversation_history
         self._optional_definitions = tuple(optional_definitions)
         self._optional_local_executors = tuple(optional_local_executors)
         self._plugin_executor = plugin_executor
@@ -730,23 +742,66 @@ class ProductionRunComponentsFactory(
             *shell_definitions,
         )
         scope = _effective_capability_scope(definitions, config, effective_config, permission)
+        prepared_budget = _run_budget(
+            config,
+            effective_config,
+            worker_max_parallel_reads=self._effect_gate.max_readers,
+        )
+        context_budget = _model_context_budget(model_binding, prepared_budget)
         inputs = await _resolved_context_inputs(
             command.input_blocks,
             session_id=state.session_id,
+            turn_id=state.turn_id,
             attachments=self._attachments,
             cancellation=cancellation,
             model_binding=model_binding,
         )
+        if self._conversation_history is not None:
+            current_images = tuple(
+                block
+                for fragment in inputs.user_input
+                for block in fragment.model_blocks
+                if block.kind == "image" and block.binary_data is not None
+            )
+            current_image_bytes = sum(len(block.binary_data or b"") for block in current_images)
+            current_estimated_tokens = sum(
+                estimate_context_fragment_tokens(fragment) for fragment in inputs.user_input
+            )
+            conversation = await self._conversation_history.load_for_run(
+                session_id=state.session_id,
+                current_turn_id=state.turn_id,
+                image_policy=ConversationImagePolicy(
+                    supports_images=(model_binding is not None and "image" in model_binding.model.input_modalities),
+                    detail=(
+                        "original"
+                        if model_binding is not None and model_binding.model.supports_image_detail_original
+                        else "high"
+                    ),
+                    max_images=max(0, context_budget.max_images - len(current_images)),
+                    max_image_bytes=max(0, context_budget.max_image_bytes - current_image_bytes),
+                    max_estimated_tokens=max(
+                        0,
+                        context_budget.max_estimated_tokens
+                        - _HISTORY_CONTEXT_BASE_RESERVE_TOKENS
+                        - current_estimated_tokens,
+                    ),
+                ),
+                cancellation=cancellation,
+                timeout_seconds=min(5.0, prepared_budget.max_wall_seconds),
+            )
+            inputs = ContextInputs(
+                user_input=inputs.user_input,
+                conversation=conversation,
+                memories=inputs.memories,
+                skills=inputs.skills,
+                hook_hints=inputs.hook_hints,
+            )
         prepared = _PreparedProductionCapabilities(
             run_id=state.run_id,
             config=config,
             inputs=_with_skill_prompt_context(inputs, skills),
             effective_config=effective_config,
-            budget=_run_budget(
-                config,
-                effective_config,
-                worker_max_parallel_reads=self._effect_gate.max_readers,
-            ),
+            budget=prepared_budget,
             model_binding=model_binding,
             permission=permission,
             scope=scope,
@@ -1241,8 +1296,10 @@ class ProductionRunComponentsFactory(
         if not effective_config.network.model_provider_enabled:
             raise ValueError("Model provider is disabled by the effective persisted configuration")
         selected_model = config.model
+        context_binding: CodexRunBinding | None = None
         if prepared_capabilities is not None and prepared_capabilities.model_binding is not None:
             binding = prepared_capabilities.model_binding
+            context_binding = binding
             if binding.model.model_id != selected_model:
                 raise ValueError("prepared Codex model binding differs from the immutable Run model")
             settings = effective_config.model.model_copy(
@@ -1301,7 +1358,7 @@ class ProductionRunComponentsFactory(
             ),
             inputs=inputs,
             visibility=visibility,
-            budget=ContextBudget.generous_default(),
+            budget=_model_context_budget(context_binding, budget),
             local_timezone=self._clock.utcnow().astimezone().tzinfo,
         )
         permission = permission_override or _effective_permission(config, effective_config)
@@ -1812,6 +1869,7 @@ async def _resolved_context_inputs(
     blocks: Sequence[Mapping[str, Any]],
     *,
     session_id: str,
+    turn_id: str,
     attachments: ConversationAttachmentStore | None,
     cancellation: CancellationToken,
     model_binding: CodexRunBinding | None = None,
@@ -1840,8 +1898,8 @@ async def _resolved_context_inputs(
         "original" if model_binding is not None and model_binding.model.supports_image_detail_original else "high"
     )
     metadata: list[dict[str, Any]] = []
-    images: list[ModelContentBlock] = []
-    artifact_ids: list[str] = []
+    validated_images: list[ImageContentBlock] = []
+    claims: list[AttachmentClaim] = []
     for raw in blocks:
         cancellation.checkpoint()
         thawed = thaw_json(raw)
@@ -1865,25 +1923,22 @@ async def _resolved_context_inputs(
             continue
         if attachments is None:
             raise ValueError("production image attachment resolver is unavailable")
-        image_index = len(images)
+        image_index = len(validated_images)
         try:
             image = validate_wire(ImageContentBlock, block)
             artifact = image.artifact
             if artifact.sensitivity is not ArtifactSensitivity.PRIVATE or artifact.state is not ArtifactState.COMPLETE:
                 raise ValueError("Conversation image must be a complete private attachment")
-            receipt = await attachments.read_all_for_conversation(
-                session_id,
-                artifact.artifact_id,
-                cancellation,
+            validated_images.append(image)
+            claims.append(
+                AttachmentClaim(
+                    artifact.artifact_id,
+                    image_index,
+                    artifact.content_hash,
+                    artifact.media_type,
+                    artifact.size_bytes,
+                )
             )
-            if receipt.offset != 0 or receipt.next_offset != artifact.size_bytes or not receipt.complete:
-                raise ValueError("Conversation attachment materialization is incomplete")
-            payload = receipt.content
-            if (
-                len(payload) != artifact.size_bytes
-                or f"sha256:{hashlib.sha256(payload).hexdigest()}" != artifact.content_hash
-            ):
-                raise ValueError("Conversation attachment bytes differ from durable Turn metadata")
         except AttachmentError as error:
             raise RunPreparationFailure(
                 "image_input_invalid",
@@ -1902,21 +1957,45 @@ async def _resolved_context_inputs(
                 failure_category="model",
                 details={"imageIndex": image_index, "reason": "metadata_or_bytes_invalid"},
             ) from error
-        images.append(
-            ModelContentBlock(
-                "image",
-                {
-                    "artifactId": artifact.artifact_id,
-                    "mediaType": artifact.media_type,
-                    "contentHash": artifact.content_hash,
-                    "sizeBytes": artifact.size_bytes,
-                    "altText": image.alt_text,
-                    "detail": image_detail,
-                },
-                binary_data=payload,
+    materialized: tuple[MaterializedClaimedAttachment, ...] = ()
+    if attachments is not None:
+        try:
+            materialized = await attachments.materialize_claimed_submission(
+                session_id,
+                turn_id,
+                tuple(claims),
+                cancellation,
             )
+        except AttachmentError as error:
+            details: dict[str, Any] = {"reason": error.code}
+            if error.item_order is not None:
+                details["imageIndex"] = error.item_order
+            raise RunPreparationFailure(
+                "image_input_invalid",
+                "A Conversation image batch is unavailable or invalid",
+                retryable=False,
+                error_code=ErrorCode.INPUT_IMAGE_INVALID,
+                failure_category="model",
+                details=details,
+            ) from error
+    images = tuple(
+        ModelContentBlock(
+            "image",
+            {
+                "artifactId": item.attachment.artifact_id,
+                "mediaType": item.attachment.media_type,
+                "contentHash": item.attachment.content_hash,
+                "sizeBytes": item.attachment.byte_length,
+                "width": item.width,
+                "height": item.height,
+                "altText": image.alt_text,
+                "detail": image_detail,
+            },
+            binary_data=item.content,
         )
-        artifact_ids.append(artifact.artifact_id)
+        for image, item in zip(validated_images, materialized, strict=True)
+    )
+    artifact_ids = tuple(item.attachment.artifact_id for item in materialized)
     text = canonical_json_bytes(metadata).decode("utf-8")
     from offeragent_harness.ports import Sensitivity
 
@@ -1927,10 +2006,10 @@ async def _resolved_context_inputs(
                 ContextLayer.USER_INPUT,
                 text,
                 sensitivity=Sensitivity.PRIVATE if images else Sensitivity.WORKSPACE,
-                artifact_ids=tuple(artifact_ids),
+                artifact_ids=artifact_ids,
                 content_hash=canonical_json_sha256(metadata),
-                model_blocks=tuple(images),
-                verified_current_images=bool(images),
+                model_blocks=images,
+                image_provenance=(UserImageProvenance.CURRENT_SUBMISSION if images else None),
             ),
         )
     )
@@ -1975,6 +2054,21 @@ def _with_skill_prompt_context(
         skills=(*inputs.skills, *fragments),
         hook_hints=inputs.hook_hints,
     )
+
+
+def _model_context_budget(binding: CodexRunBinding | None, run_budget: RunBudget) -> ContextBudget:
+    """Clamp the local projection to the immutable catalog window for this Run."""
+
+    budget = ContextBudget.generous_default()
+    input_ceiling = min(budget.max_estimated_tokens, run_budget.max_input_tokens)
+    if binding is not None:
+        catalog_window = binding.model.context_window or binding.model.max_context_window
+        if catalog_window is not None:
+            percent = binding.model.effective_context_window_percent or 100
+            effective_window = max(1, catalog_window * percent // 100)
+            output_reserve = min(16_384, run_budget.max_output_tokens)
+            input_ceiling = min(input_ceiling, max(1, effective_window - output_reserve))
+    return replace(budget, max_estimated_tokens=max(1, input_ceiling))
 
 
 def _run_budget(
@@ -3243,6 +3337,11 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             clock=clock,
             ids=ids,
         )
+        conversation_history = ConversationHistoryRunPreparationAdapter(
+            workspace_id=workspace_id,
+            unit_of_work=uow,
+            attachments=attachments,
+        )
         components = ProductionRunComponentsFactory(
             workspace_id=workspace_id,
             clock=clock,
@@ -3257,6 +3356,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             local_transaction=local_transaction,
             parent_authorities=late_parent_authorities,
             attachments=attachments,
+            conversation_history=conversation_history,
             optional_definitions=(
                 *powershell_executor.definitions,
                 *plugin_definitions,
@@ -3290,10 +3390,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             child_components=components,
             root_cancellations=cancellations,
             subagent_tree=late_tree,
-            run_context_provider=ConversationHistoryRunPreparationAdapter(
-                workspace_id=workspace_id,
-                unit_of_work=uow,
-            ),
             lifecycle_hooks=components,
             required_root_initial_tool="agent_contract.read",
         )

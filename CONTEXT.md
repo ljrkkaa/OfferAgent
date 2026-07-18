@@ -119,7 +119,7 @@ _Avoid_: Daily Study Plan、计划生成、推测完成
 _Avoid_: 单次请求、单次模型调用、Agent Run
 
 **Conversation Context**:
-新 Agent Run 可见的同一 Conversation 中有限、按序的用户与 Agent 消息及其 Conversation Attachment；它不继承旧工具结果或 Evidence Snapshot，接近模型上限时从最旧的完整对话轮次开始裁剪。
+新 Agent Run 可见的同一 Conversation 中有限、按序的用户与 Agent 消息及其 Conversation Attachment。已完成 Turn 的输入元数据与 Agent 回答保存在 Runtime State，附件 claim、顺序和字节由 Conversation Attachment Store 唯一拥有；组装器按当前目录模型能力从 Store 临时重建 USER 图片，不复制图片状态。它不继承旧工具结果或 Evidence Snapshot，接近模型上限时只保留最近完整对话轮次的连续后缀，绝不拆散 USER 图片批次与对应 Agent 回答。
 _Avoid_: 完整运行日志、旧证据缓存、单轮输入
 
 **Agent Run**:

@@ -24,7 +24,7 @@ from offeragent_harness.agent import (
 )
 from offeragent_harness.agent.loop import AgentLoopFailure, RecoveredToolBatch, ToolKernel, run_agent_loop
 from offeragent_harness.agent.planner import Planner
-from offeragent_harness.agent.state import RunPhase, RunState
+from offeragent_harness.agent.state import ALLOWED_PHASE_TRANSITIONS, RunPhase, RunState
 from offeragent_harness.config import HarnessConfig
 from offeragent_harness.error_codes import ErrorCode, ResourceConflictCause, ResourceNotFoundCause
 from offeragent_harness.hooks import HookExecutionContext
@@ -40,6 +40,7 @@ from offeragent_harness.ports import (
     HookLifecyclePort,
     IdGenerator,
     NewEvent,
+    OperationCancelled,
     StoredEvent,
     UnitOfWorkFactory,
 )
@@ -619,6 +620,15 @@ class HarnessService:
                             raise HarnessServiceError(
                                 "prepared root component budget differs from its pure budget_root result"
                             )
+                    except (OperationCancelled, asyncio.CancelledError) as error:
+                        terminal = await self._terminalize_component_preparation_failure(
+                            current_state,
+                            recorder,
+                            budget,
+                            error,
+                        )
+                        await self._release_prepared_components(current_state.run_id)
+                        return terminal
                     except BaseException as error:
                         terminal = await self._terminalize_component_preparation_failure(
                             current_state,
@@ -1673,6 +1683,84 @@ class HarnessService:
     ) -> RunState:
         if state.phase.terminal:
             return state
+        if isinstance(cause, (OperationCancelled, asyncio.CancelledError)):
+            snapshot = await budget.snapshot(now=self._clock.utcnow())
+            usage = {
+                "inputTokens": snapshot.used.input_tokens,
+                "outputTokens": snapshot.used.output_tokens,
+                "modelCalls": state.model_rounds,
+                "toolCalls": state.tool_calls,
+                "wallTimeMs": max(0, int(snapshot.elapsed_seconds * 1_000)),
+                "costMicros": int(snapshot.used.cost * Decimal(1_000_000)),
+            }
+            reason = cause.reason if isinstance(cause, OperationCancelled) else None
+            code = reason.code.value if reason is not None else "runtime"
+            message = reason.message if reason is not None else "Run capability preparation was interrupted"
+            if code == CancellationCode.DEADLINE.value:
+                terminal = state.transition(RunPhase.FAILED)
+                await recorder.commit(
+                    terminal,
+                    event_type="turn.failed",
+                    payload={
+                        "error": {
+                            "code": ErrorCode.REQUEST_DEADLINE_EXCEEDED.value,
+                            "retryable": False,
+                            "cancelled": True,
+                            "userVisibleMessage": message,
+                            "details": {"cancellationCode": code, "failureCategory": "budget"},
+                            "retryAfterMs": None,
+                            "traceId": None,
+                        },
+                        "usage": usage,
+                        "partialContent": [],
+                    },
+                    terminal=True,
+                )
+                return terminal
+            should_interrupt = reason is None or code in {
+                CancellationCode.SHUTDOWN.value,
+                CancellationCode.START_FAILED.value,
+            } or (code == CancellationCode.PARENT.value and state.lineage.depth == 0)
+            target = RunPhase.INTERRUPTED if should_interrupt else RunPhase.CANCELLED
+            if target not in ALLOWED_PHASE_TRANSITIONS[state.phase]:
+                previous = state.phase
+                state = state.transition(RunPhase.CANCELLING)
+                await recorder.commit(
+                    state,
+                    event_type="phase.changed",
+                    payload={
+                        "previousPhase": previous.value,
+                        "phase": RunPhase.CANCELLING.value,
+                        "reason": "cancelled during Run capability preparation",
+                    },
+                )
+            terminal = state.transition(target)
+            if terminal.phase is RunPhase.CANCELLED:
+                event_type = "turn.cancelled"
+                payload: Mapping[str, Any] = {
+                    "reason": message,
+                    "code": code,
+                    "usage": usage,
+                    "partialContent": [],
+                }
+            else:
+                event_type = "turn.interrupted"
+                payload = {
+                    "error": {
+                        "code": ErrorCode.RUNTIME_INTERRUPTED.value,
+                        "retryable": True,
+                        "cancelled": True,
+                        "userVisibleMessage": message,
+                        "details": {"cancellationCode": code},
+                        "retryAfterMs": None,
+                        "traceId": None,
+                    },
+                    "usage": usage,
+                    "partialContent": [],
+                    "safeCheckpointAvailable": state.pending.empty,
+                }
+            await recorder.commit(terminal, event_type=event_type, payload=payload, terminal=True)
+            return terminal
         terminal = state.transition(RunPhase.FAILED)
         snapshot = await budget.snapshot(now=self._clock.utcnow())
         if isinstance(cause, RunPreparationFailure):

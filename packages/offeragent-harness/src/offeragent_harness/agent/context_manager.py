@@ -8,8 +8,9 @@ those sources can promote itself into a system instruction.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta, timezone, tzinfo
 from enum import Enum
@@ -23,6 +24,7 @@ from offeragent_harness.tools import ResultSensitivity, ToolResult, canonical_js
 from .state import RunState
 
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+_MAX_IMAGE_PIXELS = 40_000_000
 
 
 class ContextLayer(str, Enum):
@@ -43,6 +45,13 @@ class ContextProjection(str, Enum):
     OVERFLOW_REFERENCES = "overflow_references"
 
 
+class UserImageProvenance(str, Enum):
+    """Store-attested authority for ephemeral USER image bytes."""
+
+    CURRENT_SUBMISSION = "current_submission"
+    RETAINED_CONVERSATION = "retained_conversation"
+
+
 @dataclass(frozen=True, slots=True)
 class ContextFragment:
     fragment_id: str
@@ -54,7 +63,8 @@ class ContextFragment:
     content_hash: str | None = None
     role: ModelRole = ModelRole.USER
     model_blocks: tuple[ModelContentBlock, ...] = ()
-    verified_current_images: bool = False
+    image_provenance: UserImageProvenance | None = None
+    conversation_turn_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.fragment_id or not self.text:
@@ -70,25 +80,81 @@ class ContextFragment:
         if self.layer is ContextLayer.CONVERSATION:
             if self.role not in {ModelRole.USER, ModelRole.ASSISTANT}:
                 raise ValueError("conversation context fragments must have a user or assistant role")
+            if (
+                self.conversation_turn_id is None
+                or not self.conversation_turn_id
+                or len(self.conversation_turn_id) > 256
+                or self.conversation_turn_id.strip() != self.conversation_turn_id
+                or "\x00" in self.conversation_turn_id
+            ):
+                raise ValueError("conversation context fragments require a canonical Turn identity")
         elif self.role is not ModelRole.USER:
             raise ValueError("only conversation context fragments may use a non-user role")
+        elif self.conversation_turn_id is not None:
+            raise ValueError("only conversation context fragments may declare a Turn identity")
         if len(self.source_refs) != len(set(self.source_refs)) or any(not ref for ref in self.source_refs):
             raise ValueError("source_refs must be unique non-empty identifiers")
         if len(self.artifact_ids) != len(set(self.artifact_ids)) or any(not ref for ref in self.artifact_ids):
             raise ValueError("artifact_ids must be unique non-empty identifiers")
         if self.content_hash is not None and not _SHA256.fullmatch(self.content_hash):
             raise ValueError("content_hash must be a canonical sha256 digest")
-        if self.model_blocks and (
-            self.layer is not ContextLayer.USER_INPUT
-            or any(block.kind != "image" or block.binary_data is None for block in self.model_blocks)
-        ):
-            raise ValueError("ephemeral model blocks are supported only for user-input images")
-        if self.verified_current_images and (
-            not self.model_blocks
-            or self.layer is not ContextLayer.USER_INPUT
-            or self.sensitivity is not Sensitivity.PRIVATE
-        ):
-            raise ValueError("verified current images require private user-input image blocks")
+        if self.model_blocks:
+            if self.image_provenance is None:
+                raise ValueError("ephemeral USER image blocks require Store-attested provenance")
+            if (
+                self.layer not in {ContextLayer.USER_INPUT, ContextLayer.CONVERSATION}
+                or self.role is not ModelRole.USER
+                or any(block.kind != "image" or block.binary_data is None for block in self.model_blocks)
+            ):
+                raise ValueError("ephemeral image blocks are supported only on USER input or Conversation messages")
+            if self.sensitivity is not Sensitivity.PRIVATE:
+                raise ValueError("Store-attested USER image blocks must remain private")
+            image_artifact_ids: list[str] = []
+            for block in self.model_blocks:
+                assert block.binary_data is not None
+                data = thaw_json(block.data)
+                if not isinstance(data, Mapping):
+                    raise ValueError("Store-attested USER image metadata must be an object")
+                artifact_id = data.get("artifactId")
+                content_hash = data.get("contentHash")
+                size_bytes = data.get("sizeBytes")
+                media_type = data.get("mediaType")
+                width = data.get("width")
+                height = data.get("height")
+                detail = data.get("detail")
+                if (
+                    not isinstance(artifact_id, str)
+                    or not artifact_id
+                    or not isinstance(content_hash, str)
+                    or _SHA256.fullmatch(content_hash) is None
+                    or content_hash != "sha256:" + hashlib.sha256(block.binary_data).hexdigest()
+                    or type(size_bytes) is not int
+                    or size_bytes != len(block.binary_data)
+                    or media_type not in {"image/png", "image/jpeg", "image/gif", "image/webp"}
+                    or type(width) is not int
+                    or type(height) is not int
+                    or width < 1
+                    or height < 1
+                    or width * height > _MAX_IMAGE_PIXELS
+                    or detail not in {"high", "original"}
+                ):
+                    raise ValueError("Store-attested USER image metadata differs from its immutable bytes")
+                image_artifact_ids.append(artifact_id)
+            if tuple(image_artifact_ids) != self.artifact_ids:
+                raise ValueError("Store-attested USER image order must match its Artifact references")
+        if self.image_provenance is not None:
+            if not self.model_blocks or self.sensitivity is not Sensitivity.PRIVATE:
+                raise ValueError("verified USER images require private ephemeral image blocks")
+            if (
+                self.image_provenance is UserImageProvenance.CURRENT_SUBMISSION
+                and self.layer is not ContextLayer.USER_INPUT
+            ):
+                raise ValueError("current submission image provenance requires USER_INPUT context")
+            if (
+                self.image_provenance is UserImageProvenance.RETAINED_CONVERSATION
+                and self.layer is not ContextLayer.CONVERSATION
+            ):
+                raise ValueError("retained image provenance requires Conversation context")
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,9 +170,21 @@ class ContextBudget:
     max_total_bytes: int
     max_estimated_tokens: int
     max_item_bytes: int
+    max_images: int = 20
+    max_image_bytes: int = 50 * 1024 * 1024
 
     def __post_init__(self) -> None:
-        if min(self.max_messages, self.max_total_bytes, self.max_estimated_tokens, self.max_item_bytes) < 1:
+        if (
+            min(
+                self.max_messages,
+                self.max_total_bytes,
+                self.max_estimated_tokens,
+                self.max_item_bytes,
+                self.max_images,
+                self.max_image_bytes,
+            )
+            < 1
+        ):
             raise ValueError("context budget limits must be positive")
         if self.max_messages < 2:
             raise ValueError("context budget must allow the system rules and run snapshot")
@@ -118,6 +196,8 @@ class ContextBudget:
             max_total_bytes=1_000_000,
             max_estimated_tokens=400_000,
             max_item_bytes=256_000,
+            max_images=20,
+            max_image_bytes=50 * 1024 * 1024,
         )
 
 
@@ -156,6 +236,20 @@ class ContextInputs:
             raise ValueError("context inputs require at least one user input fragment")
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("context fragment IDs must be unique across all layers")
+        conversation_turn_ids: list[str] = []
+        for index in range(0, len(self.conversation), 2):
+            pair = self.conversation[index : index + 2]
+            if (
+                len(pair) != 2
+                or pair[0].role is not ModelRole.USER
+                or pair[1].role is not ModelRole.ASSISTANT
+                or pair[0].conversation_turn_id != pair[1].conversation_turn_id
+            ):
+                raise ValueError("conversation context must contain contiguous USER/ASSISTANT Turn pairs")
+            assert pair[0].conversation_turn_id is not None
+            conversation_turn_ids.append(pair[0].conversation_turn_id)
+        if len(conversation_turn_ids) != len(set(conversation_turn_ids)):
+            raise ValueError("conversation context must contain unique Turn pairs")
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +290,8 @@ class ContextWindow:
     omitted: tuple[OmittedContext, ...]
     used_bytes: int
     estimated_tokens: int
+    used_images: int
+    used_image_bytes: int
     budget: ContextBudget
     projection: ContextProjection
     projection_hash: str
@@ -209,12 +305,18 @@ class ContextWindow:
             raise ValueError("included context IDs must be unique")
         if self.used_bytes < 1 or self.estimated_tokens < 1:
             raise ValueError("context usage must be positive")
+        if self.used_images < 0 or self.used_image_bytes < 0:
+            raise ValueError("context image usage cannot be negative")
         if self.used_bytes > self.budget.max_total_bytes:
             raise ValueError("context window exceeds max_total_bytes")
         if self.estimated_tokens > self.budget.max_estimated_tokens:
             raise ValueError("context window exceeds max_estimated_tokens")
         if len(self.messages) > self.budget.max_messages:
             raise ValueError("context window exceeds max_messages")
+        if self.used_images > self.budget.max_images:
+            raise ValueError("context window exceeds max_images")
+        if self.used_image_bytes > self.budget.max_image_bytes:
+            raise ValueError("context window exceeds max_image_bytes")
         if not _SHA256.fullmatch(self.projection_hash):
             raise ValueError("projection_hash must be a canonical sha256 digest")
         if self.compaction_required != bool(self.compaction_reasons):
@@ -235,6 +337,7 @@ class _Candidate:
     ordinal: int
     projected_to_reference: bool = False
     required: bool = False
+    atomic_group_id: str | None = None
 
 
 _UNTRUSTED_DATA_RULE = (
@@ -406,7 +509,9 @@ class ContextManager:
             ),
         ]
         used_bytes = sum(_message_size(message) for message in base_messages)
-        estimated_tokens = _estimate_tokens(used_bytes)
+        estimated_tokens = sum(_message_estimated_tokens(message) for message in base_messages)
+        used_images = 0
+        used_image_bytes = 0
         if (
             len(base_messages) > self._budget.max_messages
             or used_bytes > self._budget.max_total_bytes
@@ -418,6 +523,11 @@ class ContextManager:
         omitted: list[OmittedContext] = []
         candidates: list[_Candidate] = []
         compaction_reasons: list[str] = []
+        rejected_conversation_groups: dict[str, str] = {}
+        if projection is ContextProjection.OVERFLOW_REFERENCES and self._inputs.conversation:
+            oldest_turn_id = self._inputs.conversation[0].conversation_turn_id
+            assert oldest_turn_id is not None
+            rejected_conversation_groups[oldest_turn_id] = "overflow_projection"
         ordinal = 0
 
         fragment_priorities = {
@@ -436,13 +546,12 @@ class ContextManager:
         ):
             for fragment in fragments:
                 required = fragment.layer is ContextLayer.USER_INPUT
-                explicit_user_image = (
-                    required
-                    and fragment.sensitivity is Sensitivity.PRIVATE
+                verified_user_images = (
+                    fragment.sensitivity is Sensitivity.PRIVATE
                     and bool(fragment.model_blocks)
-                    and fragment.verified_current_images
+                    and fragment.image_provenance is not None
                 )
-                if not self._visibility.allows(fragment.sensitivity) and not explicit_user_image:
+                if not self._visibility.allows(fragment.sensitivity) and not verified_user_images:
                     omitted.append(
                         OmittedContext(
                             fragment.fragment_id,
@@ -453,9 +562,18 @@ class ContextManager:
                     )
                     if required:
                         compaction_reasons.append(f"{fragment.fragment_id}:sensitivity_policy")
+                    if fragment.conversation_turn_id is not None:
+                        rejected_conversation_groups.setdefault(
+                            fragment.conversation_turn_id,
+                            "sensitivity_policy",
+                        )
                     continue
                 can_reference = bool(fragment.artifact_ids or fragment.source_refs or fragment.content_hash)
-                if projection is ContextProjection.OVERFLOW_REFERENCES and not required:
+                if (
+                    projection is ContextProjection.OVERFLOW_REFERENCES
+                    and not required
+                    and fragment.layer is not ContextLayer.CONVERSATION
+                ):
                     if not can_reference:
                         omitted.append(
                             OmittedContext(
@@ -475,7 +593,8 @@ class ContextManager:
                 if _message_size(message) > self._budget.max_item_bytes:
                     if (
                         can_reference
-                        and not explicit_user_image
+                        and not verified_user_images
+                        and fragment.layer is not ContextLayer.CONVERSATION
                         and (not required or projection is ContextProjection.NORMAL)
                     ):
                         message = self._fragment_reference_message(fragment, reason="item_budget")
@@ -491,6 +610,11 @@ class ContextManager:
                         )
                         if required:
                             compaction_reasons.append(f"{fragment.fragment_id}:artifactization_required")
+                        if fragment.conversation_turn_id is not None:
+                            rejected_conversation_groups.setdefault(
+                                fragment.conversation_turn_id,
+                                "artifactization_required",
+                            )
                         ordinal += 1
                         continue
                 if _message_size(message) > self._budget.max_item_bytes:
@@ -504,6 +628,11 @@ class ContextManager:
                     )
                     if required:
                         compaction_reasons.append(f"{fragment.fragment_id}:reference_exceeds_item_budget")
+                    if fragment.conversation_turn_id is not None:
+                        rejected_conversation_groups.setdefault(
+                            fragment.conversation_turn_id,
+                            "reference_exceeds_item_budget",
+                        )
                     ordinal += 1
                     continue
                 candidates.append(
@@ -516,9 +645,40 @@ class ContextManager:
                         ordinal,
                         projected,
                         required,
+                        fragment.conversation_turn_id,
                     )
                 )
                 ordinal += 1
+
+        if rejected_conversation_groups:
+            conversation_group_order = [
+                fragment.conversation_turn_id for fragment in self._inputs.conversation[::2]
+            ]
+            rejected_cutoff = max(
+                index
+                for index, group_id in enumerate(conversation_group_order)
+                if group_id in rejected_conversation_groups
+            )
+            excluded_conversation_groups = set(conversation_group_order[: rejected_cutoff + 1])
+            candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.atomic_group_id not in excluded_conversation_groups
+            ]
+            omitted_ids = {item.context_id for item in omitted}
+            for fragment in self._inputs.conversation:
+                group_id = fragment.conversation_turn_id
+                assert group_id is not None
+                if group_id in excluded_conversation_groups and fragment.fragment_id not in omitted_ids:
+                    omitted.append(
+                        OmittedContext(
+                            fragment.fragment_id,
+                            fragment.layer,
+                            fragment.sensitivity,
+                            rejected_conversation_groups.get(group_id, "context_budget"),
+                        )
+                    )
+                    omitted_ids.add(fragment.fragment_id)
 
         for control in state.control_messages:
             message = ModelMessage(
@@ -620,28 +780,59 @@ class ContextManager:
             )
             ordinal += 1
 
-        selected: list[_Candidate] = []
-        for candidate in sorted(candidates, key=lambda item: (item.priority, item.ordinal)):
-            message_bytes = _message_size(candidate.message)
-            next_bytes = used_bytes + message_bytes
-            if (
-                len(base_messages) + len(selected) + 1 > self._budget.max_messages
-                or next_bytes > self._budget.max_total_bytes
-                or _estimate_tokens(next_bytes) > self._budget.max_estimated_tokens
-            ):
-                omitted.append(
-                    OmittedContext(
-                        candidate.context_id,
-                        candidate.layer,
-                        candidate.sensitivity,
-                        "context_budget",
-                    )
-                )
-                if candidate.required:
-                    compaction_reasons.append(f"{candidate.context_id}:context_budget")
+        grouped: dict[str, list[_Candidate]] = {}
+        units: list[tuple[_Candidate, ...]] = []
+        for candidate in candidates:
+            if candidate.atomic_group_id is None:
+                units.append((candidate,))
                 continue
-            selected.append(candidate)
+            grouped.setdefault(candidate.atomic_group_id, []).append(candidate)
+        units.extend(tuple(items) for items in grouped.values())
+
+        def selection_key(unit: tuple[_Candidate, ...]) -> tuple[int, int]:
+            first = unit[0]
+            if first.layer is ContextLayer.CONVERSATION:
+                return first.priority, -max(item.ordinal for item in unit)
+            return first.priority, min(item.ordinal for item in unit)
+
+        selected: list[_Candidate] = []
+        conversation_cutoff = False
+        for unit in sorted(units, key=selection_key):
+            unit_bytes = sum(_message_size(item.message) for item in unit)
+            unit_tokens = sum(_message_estimated_tokens(item.message) for item in unit)
+            unit_images, unit_image_bytes = _messages_image_usage(item.message for item in unit)
+            next_bytes = used_bytes + unit_bytes
+            next_tokens = estimated_tokens + unit_tokens
+            next_images = used_images + unit_images
+            next_image_bytes = used_image_bytes + unit_image_bytes
+            is_conversation = unit[0].layer is ContextLayer.CONVERSATION
+            over_budget = (
+                len(base_messages) + len(selected) + len(unit) > self._budget.max_messages
+                or next_bytes > self._budget.max_total_bytes
+                or next_tokens > self._budget.max_estimated_tokens
+                or next_images > self._budget.max_images
+                or next_image_bytes > self._budget.max_image_bytes
+            )
+            if (is_conversation and conversation_cutoff) or over_budget:
+                for candidate in unit:
+                    omitted.append(
+                        OmittedContext(
+                            candidate.context_id,
+                            candidate.layer,
+                            candidate.sensitivity,
+                            "context_budget",
+                        )
+                    )
+                    if candidate.required:
+                        compaction_reasons.append(f"{candidate.context_id}:context_budget")
+                if is_conversation:
+                    conversation_cutoff = True
+                continue
+            selected.extend(unit)
             used_bytes = next_bytes
+            estimated_tokens = next_tokens
+            used_images = next_images
+            used_image_bytes = next_image_bytes
 
         layer_order = {
             ContextLayer.CONVERSATION: 0,
@@ -660,7 +851,9 @@ class ContextManager:
             tuple(included),
             tuple(omitted),
             used_bytes,
-            _estimate_tokens(used_bytes),
+            estimated_tokens,
+            used_images,
+            used_image_bytes,
             self._budget,
             projection,
             projection_hash,
@@ -738,7 +931,7 @@ class ContextManager:
         if fragment.layer is ContextLayer.CONVERSATION:
             return ModelMessage(
                 role=fragment.role,
-                content=(ModelContentBlock.text(fragment.text),),
+                content=(ModelContentBlock.text(fragment.text), *fragment.model_blocks),
                 name="offeragent-conversation-history",
             )
         block = ModelContentBlock(
@@ -871,6 +1064,74 @@ def _message_size(message: ModelMessage) -> int:
     return len(canonical_json_bytes(_message_payload(message)))
 
 
+def _message_estimated_tokens(message: ModelMessage) -> int:
+    tokens = _estimate_tokens(_message_size(message))
+    for block in message.content:
+        if block.kind != "image" or block.binary_data is None:
+            continue
+        data = thaw_json(block.data)
+        if not isinstance(data, Mapping):
+            continue
+        width = data.get("width")
+        height = data.get("height")
+        detail = data.get("detail")
+        if type(width) is not int or type(height) is not int or width < 1 or height < 1:
+            continue
+        tokens += estimate_vision_image_tokens(width, height, detail="original" if detail == "original" else "high")
+    return tokens
+
+
+def estimate_vision_image_tokens(width: int, height: int, *, detail: str) -> int:
+    """Return the provider-neutral conservative cost of one attested image."""
+
+    if width < 1 or height < 1 or width * height > _MAX_IMAGE_PIXELS:
+        raise ValueError("vision token estimate requires safe positive image dimensions")
+    if detail not in {"high", "original"}:
+        raise ValueError("vision token estimate detail must be high or original")
+    patches = math.ceil(width / 32) * math.ceil(height / 32)
+    return (512 + 3 * patches) if detail == "original" else (256 + 2 * patches)
+
+
+def estimate_context_fragment_tokens(fragment: ContextFragment) -> int:
+    """Estimate one fragment exactly as ContextManager will encode it."""
+
+    return _message_estimated_tokens(ContextManager._fragment_message(fragment))
+
+
+def estimate_conversation_turn_tokens(
+    user_text: str,
+    assistant_text: str,
+    image_dimensions: Sequence[tuple[int, int]],
+    *,
+    detail: str,
+) -> int:
+    """Estimate a complete historical Turn before its image bodies are loaded."""
+
+    user = ModelMessage(ModelRole.USER, (ModelContentBlock.text(user_text),), name="offeragent-conversation-history")
+    assistant = ModelMessage(
+        ModelRole.ASSISTANT,
+        (ModelContentBlock.text(assistant_text),),
+        name="offeragent-conversation-history",
+    )
+    image_tokens = sum(
+        estimate_vision_image_tokens(width, height, detail=detail) + 128
+        for width, height in image_dimensions
+    )
+    return _message_estimated_tokens(user) + _message_estimated_tokens(assistant) + image_tokens
+
+
+def _messages_image_usage(messages: Iterable[ModelMessage]) -> tuple[int, int]:
+    images = 0
+    image_bytes = 0
+    for message in messages:
+        for block in message.content:
+            if block.kind != "image" or block.binary_data is None:
+                continue
+            images += 1
+            image_bytes += len(block.binary_data)
+    return images, image_bytes
+
+
 def _message_payload(message: ModelMessage) -> dict[str, object]:
     return {
         "role": message.role.value,
@@ -947,4 +1208,8 @@ __all__ = [
     "ContextVisibilityPolicy",
     "ContextWindow",
     "OmittedContext",
+    "UserImageProvenance",
+    "estimate_context_fragment_tokens",
+    "estimate_conversation_turn_tokens",
+    "estimate_vision_image_tokens",
 ]

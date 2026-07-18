@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -18,6 +19,7 @@ from offeragent_harness.agent.context_manager import (
     ContextManager,
     ContextProjection,
     ContextVisibilityPolicy,
+    UserImageProvenance,
 )
 from offeragent_harness.agent.state import (
     PendingWork,
@@ -46,6 +48,29 @@ def _fragment(
         sensitivity=sensitivity,
         source_refs=source_refs,
         content_hash="sha256:" + "a" * 64,
+    )
+
+
+def _image_block(
+    artifact_id: str,
+    content: bytes,
+    *,
+    width: int = 1,
+    height: int = 1,
+    detail: str = "high",
+) -> ModelContentBlock:
+    return ModelContentBlock(
+        "image",
+        {
+            "artifactId": artifact_id,
+            "mediaType": "image/png",
+            "contentHash": "sha256:" + hashlib.sha256(content).hexdigest(),
+            "sizeBytes": len(content),
+            "width": width,
+            "height": height,
+            "detail": detail,
+        },
+        binary_data=content,
     )
 
 
@@ -202,18 +227,28 @@ def test_run_snapshot_exposes_authoritative_local_date_and_iso_week() -> None:
 
 
 def test_current_user_input_is_never_displaced_by_optional_conversation_history() -> None:
-    history = ContextFragment(
-        "conversation:previous:assistant",
-        ContextLayer.CONVERSATION,
-        "previous answer " * 100,
-        Sensitivity.WORKSPACE,
-        role=ModelRole.ASSISTANT,
+    history = (
+        ContextFragment(
+            "conversation:previous:user",
+            ContextLayer.CONVERSATION,
+            "previous request",
+            Sensitivity.WORKSPACE,
+            conversation_turn_id="turn_previous",
+        ),
+        ContextFragment(
+            "conversation:previous:assistant",
+            ContextLayer.CONVERSATION,
+            "previous answer " * 100,
+            Sensitivity.WORKSPACE,
+            role=ModelRole.ASSISTANT,
+            conversation_turn_id="turn_previous",
+        ),
     )
     manager = ContextManager(
         system_rules=("system",),
         inputs=ContextInputs(
             user_input=(_fragment("user", ContextLayer.USER_INPUT, "current request", Sensitivity.PUBLIC),),
-            conversation=(history,),
+            conversation=history,
         ),
         visibility=ContextVisibilityPolicy.local_model(),
         budget=ContextBudget(
@@ -227,9 +262,10 @@ def test_current_user_input_is_never_displaced_by_optional_conversation_history(
     window = manager.build(_state(), purpose=ModelPurpose.PLANNING)
 
     assert "user" in window.included_context_ids
-    assert ("conversation:previous:assistant", "context_budget") in {
-        (item.context_id, item.reason) for item in window.omitted
-    }
+    assert {
+        ("conversation:previous:user", "context_budget"),
+        ("conversation:previous:assistant", "context_budget"),
+    }.issubset({(item.context_id, item.reason) for item in window.omitted})
     assert not any(reason.startswith("user:") for reason in window.compaction_reasons)
 
 
@@ -414,19 +450,16 @@ def test_system_snapshot_is_never_silently_truncated_to_fit_an_impossible_budget
 
 
 def test_user_input_keeps_ephemeral_image_bytes_out_of_projection_identity() -> None:
-    metadata = {
-        "artifactId": "art_one",
-        "mediaType": "image/png",
-        "contentHash": "sha256:" + "1" * 64,
-    }
-    image = ModelContentBlock("image", metadata, binary_data=b"\x89PNG\r\n\x1a\nimage")
+    content = b"\x89PNG\r\n\x1a\nimage"
+    image = _image_block("art_one", content)
     fragment = ContextFragment(
         "user",
         ContextLayer.USER_INPUT,
         '{"type":"image","artifactId":"art_one"}',
         Sensitivity.PRIVATE,
+        artifact_ids=("art_one",),
         model_blocks=(image,),
-        verified_current_images=True,
+        image_provenance=UserImageProvenance.CURRENT_SUBMISSION,
     )
     manager = ContextManager(
         system_rules=("rule",),
@@ -442,51 +475,56 @@ def test_user_input_keeps_ephemeral_image_bytes_out_of_projection_identity() -> 
     assert "binary_data" not in repr(message)
 
 
+def test_image_dimensions_and_detail_consume_catalog_token_budget() -> None:
+    content = b"attested-image"
+
+    def estimated(detail: str) -> int:
+        image = _image_block("art_dimensioned", content, width=1_920, height=1_080, detail=detail)
+        fragment = ContextFragment(
+            f"user-{detail}",
+            ContextLayer.USER_INPUT,
+            "inspect",
+            Sensitivity.PRIVATE,
+            artifact_ids=("art_dimensioned",),
+            model_blocks=(image,),
+            image_provenance=UserImageProvenance.CURRENT_SUBMISSION,
+        )
+        manager = ContextManager(
+            system_rules=("rule",),
+            inputs=ContextInputs(user_input=(fragment,)),
+            visibility=ContextVisibilityPolicy.cloud_model(),
+            budget=ContextBudget.generous_default(),
+        )
+        window = manager.build(
+            replace(_state(), tool_results=(), tool_result_sensitivities={}),
+            purpose=ModelPurpose.PLANNING,
+        )
+        return window.estimated_tokens
+
+    high = estimated("high")
+    original = estimated("original")
+
+    assert high >= 4_000
+    assert original > high
+
+
 def test_private_user_image_without_verified_current_attachment_provenance_is_denied() -> None:
-    image = ModelContentBlock(
-        "image",
-        {
-            "artifactId": "art_unverified",
-            "mediaType": "image/png",
-            "contentHash": "sha256:" + "5" * 64,
-        },
-        binary_data=b"\x89PNG\r\n\x1a\nunverified",
-    )
-    fragment = ContextFragment(
-        "unverified-private-image",
-        ContextLayer.USER_INPUT,
-        '{"type":"image"}',
-        Sensitivity.PRIVATE,
-        model_blocks=(image,),
-    )
-    manager = ContextManager(
-        system_rules=("rule",),
-        inputs=ContextInputs(user_input=(fragment,)),
-        visibility=ContextVisibilityPolicy.cloud_model(),
-        budget=ContextBudget.generous_default(),
-    )
+    content = b"\x89PNG\r\n\x1a\nunverified"
+    image = _image_block("art_unverified", content)
 
-    window = manager.build(
-        replace(_state(), tool_results=(), tool_result_sensitivities={}),
-        purpose=ModelPurpose.PLANNING,
-    )
-
-    assert "unverified-private-image" not in window.included_context_ids
-    assert all(block.kind != "image" for message in window.messages for block in message.content)
-    with pytest.raises(ContextCompactionRequired):
-        window.ensure_model_ready()
+    with pytest.raises(ValueError, match="provenance"):
+        ContextFragment(
+            "unverified-private-image",
+            ContextLayer.USER_INPUT,
+            '{"type":"image"}',
+            Sensitivity.PRIVATE,
+            artifact_ids=("art_unverified",),
+            model_blocks=(image,),
+        )
 
 
 def test_oversized_current_user_image_requires_compaction_without_reference_downgrade() -> None:
-    image = ModelContentBlock(
-        "image",
-        {
-            "artifactId": "art_large",
-            "mediaType": "image/png",
-            "contentHash": "sha256:" + "3" * 64,
-        },
-        binary_data=b"\x89PNG\r\n\x1a\nimage",
-    )
+    image = _image_block("art_large", b"\x89PNG\r\n\x1a\nimage")
     fragment = ContextFragment(
         "large-user-image",
         ContextLayer.USER_INPUT,
@@ -495,7 +533,7 @@ def test_oversized_current_user_image_requires_compaction_without_reference_down
         artifact_ids=("art_large",),
         content_hash="sha256:" + "4" * 64,
         model_blocks=(image,),
-        verified_current_images=True,
+        image_provenance=UserImageProvenance.CURRENT_SUBMISSION,
     )
     manager = ContextManager(
         system_rules=("rule",),
@@ -509,8 +547,7 @@ def test_oversized_current_user_image_requires_compaction_without_reference_down
 
     assert "large-user-image" not in window.included_context_ids
     assert any(
-        item.context_id == "large-user-image" and item.reason == "artifactization_required"
-        for item in window.omitted
+        item.context_id == "large-user-image" and item.reason == "artifactization_required" for item in window.omitted
     )
     assert all(block.kind != "context_reference" for message in window.messages for block in message.content)
     with pytest.raises(ContextCompactionRequired):
@@ -518,36 +555,309 @@ def test_oversized_current_user_image_requires_compaction_without_reference_down
 
 
 def test_secret_user_image_never_bypasses_cloud_visibility() -> None:
-    image = ModelContentBlock(
-        "image",
-        {
-            "artifactId": "art_secret",
-            "mediaType": "image/png",
-            "contentHash": "sha256:" + "2" * 64,
-        },
-        binary_data=b"\x89PNG\r\n\x1a\nsecret",
-    )
-    fragment = ContextFragment(
-        "secret-user-image",
-        ContextLayer.USER_INPUT,
-        '{"type":"image","artifactId":"art_secret"}',
-        Sensitivity.SECRET,
-        model_blocks=(image,),
+    content = b"\x89PNG\r\n\x1a\nsecret"
+    image = _image_block("art_secret", content)
+
+    with pytest.raises(ValueError, match="private"):
+        ContextFragment(
+            "secret-user-image",
+            ContextLayer.USER_INPUT,
+            '{"type":"image","artifactId":"art_secret"}',
+            Sensitivity.SECRET,
+            artifact_ids=("art_secret",),
+            model_blocks=(image,),
+            image_provenance=UserImageProvenance.CURRENT_SUBMISSION,
+        )
+
+
+def test_conversation_history_keeps_the_newest_complete_turn_and_its_user_images() -> None:
+    historical_image = _image_block("art_history", b"history-png")
+    conversation = (
+        ContextFragment(
+            "conversation:old:user",
+            ContextLayer.CONVERSATION,
+            "old question",
+            Sensitivity.WORKSPACE,
+            conversation_turn_id="turn_old",
+        ),
+        ContextFragment(
+            "conversation:old:assistant",
+            ContextLayer.CONVERSATION,
+            "old answer",
+            Sensitivity.WORKSPACE,
+            role=ModelRole.ASSISTANT,
+            conversation_turn_id="turn_old",
+        ),
+        ContextFragment(
+            "conversation:new:user",
+            ContextLayer.CONVERSATION,
+            "new image question",
+            Sensitivity.PRIVATE,
+            artifact_ids=("art_history",),
+            model_blocks=(historical_image,),
+            image_provenance=UserImageProvenance.RETAINED_CONVERSATION,
+            conversation_turn_id="turn_new",
+        ),
+        ContextFragment(
+            "conversation:new:assistant",
+            ContextLayer.CONVERSATION,
+            "new image answer",
+            Sensitivity.WORKSPACE,
+            role=ModelRole.ASSISTANT,
+            conversation_turn_id="turn_new",
+        ),
     )
     manager = ContextManager(
-        system_rules=("rule",),
-        inputs=ContextInputs(user_input=(fragment,)),
+        system_rules=("system",),
+        inputs=ContextInputs(
+            user_input=(_fragment("current", ContextLayer.USER_INPUT, "follow up", Sensitivity.PUBLIC),),
+            conversation=conversation,
+        ),
         visibility=ContextVisibilityPolicy.cloud_model(),
+        budget=ContextBudget(
+            max_messages=5,
+            max_total_bytes=10_000,
+            max_estimated_tokens=10_000,
+            max_item_bytes=4_000,
+            max_images=2,
+            max_image_bytes=1_024,
+        ),
+    )
+
+    state = replace(_state(), tool_results=(), tool_result_sensitivities={})
+    window = manager.build(state, purpose=ModelPurpose.PLANNING)
+
+    assert window.included_context_ids == (
+        "system:rules",
+        "run:run:snapshot",
+        "conversation:new:user",
+        "conversation:new:assistant",
+        "current",
+    )
+    assert {
+        ("conversation:old:user", "context_budget"),
+        ("conversation:old:assistant", "context_budget"),
+    }.issubset({(item.context_id, item.reason) for item in window.omitted})
+    history_user = next(
+        message
+        for message in window.messages
+        if message.role is ModelRole.USER and any(block.kind == "image" for block in message.content)
+    )
+    assert [block.binary_data for block in history_user.content if block.kind == "image"] == [b"history-png"]
+    assert window.used_images == 1
+    assert window.used_image_bytes == len(b"history-png")
+
+
+def test_conversation_context_rejects_duplicate_turn_groups() -> None:
+    conversation = tuple(
+        ContextFragment(
+            f"conversation:{pair_index}:{role.value}",
+            ContextLayer.CONVERSATION,
+            f"{role.value} {pair_index}",
+            Sensitivity.WORKSPACE,
+            role=role,
+            conversation_turn_id="turn_duplicate",
+        )
+        for pair_index in range(2)
+        for role in (ModelRole.USER, ModelRole.ASSISTANT)
+    )
+
+    with pytest.raises(ValueError, match="unique Turn"):
+        ContextInputs(
+            user_input=(_fragment("current", ContextLayer.USER_INPUT, "follow up", Sensitivity.PUBLIC),),
+            conversation=conversation,
+        )
+
+
+def test_rejected_conversation_turn_cuts_off_every_older_turn() -> None:
+    conversation = (
+        ContextFragment(
+            "conversation:old:user",
+            ContextLayer.CONVERSATION,
+            "old question",
+            Sensitivity.WORKSPACE,
+            conversation_turn_id="turn_old",
+        ),
+        ContextFragment(
+            "conversation:old:assistant",
+            ContextLayer.CONVERSATION,
+            "old answer",
+            Sensitivity.WORKSPACE,
+            role=ModelRole.ASSISTANT,
+            conversation_turn_id="turn_old",
+        ),
+        ContextFragment(
+            "conversation:oversized:user",
+            ContextLayer.CONVERSATION,
+            "x" * 1_000,
+            Sensitivity.WORKSPACE,
+            conversation_turn_id="turn_oversized",
+        ),
+        ContextFragment(
+            "conversation:oversized:assistant",
+            ContextLayer.CONVERSATION,
+            "oversized answer",
+            Sensitivity.WORKSPACE,
+            role=ModelRole.ASSISTANT,
+            conversation_turn_id="turn_oversized",
+        ),
+        ContextFragment(
+            "conversation:new:user",
+            ContextLayer.CONVERSATION,
+            "new question",
+            Sensitivity.WORKSPACE,
+            conversation_turn_id="turn_new",
+        ),
+        ContextFragment(
+            "conversation:new:assistant",
+            ContextLayer.CONVERSATION,
+            "new answer",
+            Sensitivity.WORKSPACE,
+            role=ModelRole.ASSISTANT,
+            conversation_turn_id="turn_new",
+        ),
+    )
+    manager = ContextManager(
+        system_rules=("system",),
+        inputs=ContextInputs(
+            user_input=(_fragment("current", ContextLayer.USER_INPUT, "follow up", Sensitivity.PUBLIC),),
+            conversation=conversation,
+        ),
+        visibility=ContextVisibilityPolicy.local_model(),
+        budget=ContextBudget(
+            max_messages=12,
+            max_total_bytes=20_000,
+            max_estimated_tokens=20_000,
+            max_item_bytes=500,
+        ),
+    )
+
+    window = manager.build(
+        replace(_state(), tool_results=(), tool_result_sensitivities={}),
+        purpose=ModelPurpose.PLANNING,
+    )
+
+    assert "conversation:new:user" in window.included_context_ids
+    assert "conversation:new:assistant" in window.included_context_ids
+    assert "conversation:old:user" not in window.included_context_ids
+    assert "conversation:old:assistant" not in window.included_context_ids
+    assert {
+        "conversation:old:user",
+        "conversation:old:assistant",
+        "conversation:oversized:user",
+        "conversation:oversized:assistant",
+    }.issubset({item.context_id for item in window.omitted})
+
+
+def test_conversation_budget_cutoff_does_not_suppress_smaller_non_conversation_context() -> None:
+    conversation = (
+        ContextFragment(
+            "conversation:previous:user",
+            ContextLayer.CONVERSATION,
+            "previous question",
+            Sensitivity.WORKSPACE,
+            conversation_turn_id="turn_previous",
+        ),
+        ContextFragment(
+            "conversation:previous:assistant",
+            ContextLayer.CONVERSATION,
+            "previous answer",
+            Sensitivity.WORKSPACE,
+            role=ModelRole.ASSISTANT,
+            conversation_turn_id="turn_previous",
+        ),
+    )
+    manager = ContextManager(
+        system_rules=("system",),
+        inputs=ContextInputs(
+            user_input=(_fragment("current", ContextLayer.USER_INPUT, "follow up", Sensitivity.PUBLIC),),
+            conversation=conversation,
+            skills=(_fragment("small-skill", ContextLayer.SKILLS, "small skill", Sensitivity.PUBLIC),),
+        ),
+        visibility=ContextVisibilityPolicy.local_model(),
+        budget=ContextBudget(
+            max_messages=4,
+            max_total_bytes=20_000,
+            max_estimated_tokens=20_000,
+            max_item_bytes=4_000,
+        ),
+    )
+
+    window = manager.build(
+        replace(_state(), tool_results=(), tool_result_sensitivities={}),
+        purpose=ModelPurpose.PLANNING,
+    )
+
+    assert "small-skill" in window.included_context_ids
+    assert "conversation:previous:user" not in window.included_context_ids
+    assert "conversation:previous:assistant" not in window.included_context_ids
+
+
+def test_provider_overflow_projection_drops_at_least_the_oldest_complete_conversation_turn() -> None:
+    conversation = tuple(
+        ContextFragment(
+            f"conversation:{turn_id}:{role.value}",
+            ContextLayer.CONVERSATION,
+            f"{role.value} {turn_id}",
+            Sensitivity.WORKSPACE,
+            role=role,
+            conversation_turn_id=turn_id,
+        )
+        for turn_id in ("turn_old", "turn_new")
+        for role in (ModelRole.USER, ModelRole.ASSISTANT)
+    )
+    manager = ContextManager(
+        system_rules=("system",),
+        inputs=ContextInputs(
+            user_input=(_fragment("current", ContextLayer.USER_INPUT, "follow up", Sensitivity.PUBLIC),),
+            conversation=conversation,
+        ),
+        visibility=ContextVisibilityPolicy.local_model(),
         budget=ContextBudget.generous_default(),
+    )
+
+    window = manager.build(
+        replace(_state(), tool_results=(), tool_result_sensitivities={}),
+        purpose=ModelPurpose.PLANNING,
+        projection=ContextProjection.OVERFLOW_REFERENCES,
+    )
+
+    assert "conversation:turn_old:user" not in window.included_context_ids
+    assert "conversation:turn_old:assistant" not in window.included_context_ids
+    assert "conversation:turn_new:user" in window.included_context_ids
+    assert "conversation:turn_new:assistant" in window.included_context_ids
+
+
+def test_current_multi_image_batch_is_all_or_context_overflow_when_image_budget_cannot_fit() -> None:
+    images = tuple(_image_block(f"art_{index}", f"image-{index}".encode()) for index in (1, 2))
+    current = ContextFragment(
+        "current-images",
+        ContextLayer.USER_INPUT,
+        "two ordered pages",
+        Sensitivity.PRIVATE,
+        artifact_ids=("art_1", "art_2"),
+        model_blocks=images,
+        image_provenance=UserImageProvenance.CURRENT_SUBMISSION,
+    )
+    manager = ContextManager(
+        system_rules=("system",),
+        inputs=ContextInputs(user_input=(current,)),
+        visibility=ContextVisibilityPolicy.cloud_model(),
+        budget=ContextBudget(
+            max_messages=8,
+            max_total_bytes=10_000,
+            max_estimated_tokens=10_000,
+            max_item_bytes=4_000,
+            max_images=1,
+            max_image_bytes=1_024,
+        ),
     )
 
     window = manager.build(_state(), purpose=ModelPurpose.PLANNING)
 
-    assert "secret-user-image" not in window.included_context_ids
-    assert any(
-        item.context_id == "secret-user-image" and item.reason == "sensitivity_policy" for item in window.omitted
-    )
+    assert "current-images" not in window.included_context_ids
     assert all(block.kind != "image" for message in window.messages for block in message.content)
+    assert any(item.context_id == "current-images" and item.reason == "context_budget" for item in window.omitted)
     with pytest.raises(ContextCompactionRequired):
         window.ensure_model_ready()
 

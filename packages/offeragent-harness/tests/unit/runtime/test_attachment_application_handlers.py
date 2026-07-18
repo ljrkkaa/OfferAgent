@@ -10,6 +10,7 @@ from typing import Any, cast
 import pytest
 
 from offeragent_harness.agent import RunPreparationFailure
+from offeragent_harness.agent.context_manager import UserImageProvenance
 from offeragent_harness.ports import ApplicationCommandContext
 from offeragent_harness.protocol.messages import (
     AttachmentAbortParams,
@@ -29,6 +30,7 @@ from offeragent_harness.runtime.application_domain_handlers import (
     _turn_handlers,
 )
 from offeragent_harness.runtime.conversation_attachments import (
+    AttachmentClaim,
     AttachmentClaimReceipt,
     AttachmentError,
     AttachmentUploadRequest,
@@ -152,6 +154,20 @@ async def test_run_context_resolves_claimed_image_bytes_and_explicit_pin_guidanc
     )
     await store.append(begun.upload_id, 0, PNG, token)
     artifact = (await store.commit(begun.upload_id, token)).artifact
+    await store.claim_submission(
+        "ses_one",
+        "turn_one",
+        (
+            AttachmentClaim(
+                artifact.artifact_id,
+                0,
+                artifact.content_hash,
+                artifact.media_type,
+                artifact.size_bytes,
+            ),
+        ),
+        token,
+    )
 
     inputs = await _resolved_context_inputs(
         (
@@ -163,6 +179,7 @@ async def test_run_context_resolves_claimed_image_bytes_and_explicit_pin_guidanc
             },
         ),
         session_id="ses_one",
+        turn_id="turn_one",
         attachments=store,
         cancellation=token,
         model_binding=cast(
@@ -178,7 +195,7 @@ async def test_run_context_resolves_claimed_image_bytes_and_explicit_pin_guidanc
 
     fragment = inputs.user_input[0]
     assert fragment.model_blocks[0].binary_data == PNG
-    assert fragment.verified_current_images is True
+    assert fragment.image_provenance is UserImageProvenance.CURRENT_SUBMISSION
     assert fragment.artifact_ids == (artifact.artifact_id,)
     assert "read the exact current version before relying" in fragment.text
 
@@ -210,6 +227,7 @@ async def test_run_context_rejects_images_without_verified_model_binding_before_
                 },
             ),
             session_id="ses_one",
+            turn_id="turn_one",
             attachments=cast(Any, attachments),
             cancellation=ManualCancellationToken(),
             model_binding=None,
