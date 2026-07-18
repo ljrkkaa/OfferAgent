@@ -3,6 +3,8 @@ from __future__ import annotations
 # ruff: noqa: RUF001 -- Chinese punctuation is expected semantic evidence.
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from scripts.live_codex_vision_qualification import (
@@ -14,10 +16,12 @@ from scripts.live_codex_vision_qualification import (
     SyntheticInterviewFixture,
     SyntheticInterviewFixtureGenerator,
     TextModelGateEvidence,
+    _count_sent_responses,
     _missing_semantic_facts,
     _qualification_prompt,
 )
 
+from offeragent_harness.foundation import NetworkAuditRecord
 from offeragent_harness.providers.codex_subscription import (
     CodexCatalogModel,
     CodexModelCatalogSnapshot,
@@ -99,6 +103,19 @@ def test_semantic_contract_rejects_extra_or_missing_fields() -> None:
 
     assert _missing_semantic_facts(extra) == ("semanticSchema",)
     assert _missing_semantic_facts(missing) == ("semanticSchema", "pageOrder")
+
+
+def test_send_count_requires_a_completed_audit_record_with_positive_sent_bytes() -> None:
+    records = cast(
+        tuple[NetworkAuditRecord, ...],
+        (
+            SimpleNamespace(stage="intent", sent_bytes=0),
+            SimpleNamespace(stage="result", sent_bytes=0),
+            SimpleNamespace(stage="result", sent_bytes=1024),
+        ),
+    )
+
+    assert _count_sent_responses(records) == 1
 
 
 class _MatrixEnvironment:

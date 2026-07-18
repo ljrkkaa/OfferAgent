@@ -26,6 +26,7 @@ from offeragent_harness.agent.loop import run_agent_loop
 from offeragent_harness.agent.preparation import RunPreparationFailure
 from offeragent_harness.agent.state import RunPhase, RunState
 from offeragent_harness.config import HarnessConfig, ModelSettings
+from offeragent_harness.foundation import NetworkAuditRecord
 from offeragent_harness.models import ModelEvent, ModelRequest, ModelRole
 from offeragent_harness.ports import CancellationToken
 from offeragent_harness.protocol.content import ArtifactRef
@@ -467,6 +468,10 @@ def _qualification_prompt() -> str:
     )
 
 
+def _count_sent_responses(records: Sequence[NetworkAuditRecord]) -> int:
+    return sum(record.stage == "result" and record.sent_bytes > 0 for record in records)
+
+
 @dataclass(frozen=True, slots=True)
 class _AuthFileSnapshot:
     device: int
@@ -898,7 +903,7 @@ class LiveOfferAgentQualificationEnvironment:
 
         def execution_counts() -> _ExecutionCounts:
             return _ExecutionCounts(
-                response_send_count=sum(record.stage == "intent" for record in network_audit.records),
+                response_send_count=_count_sent_responses(network_audit.records),
                 attachment_materialization_count=attachments.materialization_count,
                 gateway_factory_count=len(gateways),
             )
