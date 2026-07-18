@@ -188,7 +188,7 @@ async function smoke(): Promise<void> {
     })}\n`);
 }
 
-type ControlRequest = {
+type DriverRequest = {
     readonly id: string;
     readonly command: string;
     readonly params: Record<string, unknown>;
@@ -210,7 +210,7 @@ type ProductState = {
 let product: ProductState | null = null;
 const reviews = new Map<string, PendingReview>();
 
-function controlRequest(value: unknown): ControlRequest {
+function driverRequest(value: unknown): DriverRequest {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
         throw new TypeError("qualification control request must be an object");
     }
@@ -220,10 +220,10 @@ function controlRequest(value: unknown): ControlRequest {
         candidate.params === null || typeof candidate.params !== "object" || Array.isArray(candidate.params)) {
         throw new TypeError("qualification control request shape is invalid");
     }
-    return candidate as unknown as ControlRequest;
+    return candidate as unknown as DriverRequest;
 }
 
-function writeControl(value: unknown): void {
+function writeDriver(value: unknown): void {
     process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
@@ -260,7 +260,7 @@ async function startProduct(params: Record<string, unknown>): Promise<Record<str
         authorize: proposal => new Promise<VaultChangeAuthorizationDecision>((resolve) => {
             const reviewId = `review_${randomBytes(16).toString("hex")}`;
             reviews.set(reviewId, { proposal, resolve });
-            writeControl({ event: "review.proposed", reviewId, proposal });
+            writeDriver({ event: "review.proposed", reviewId, proposal });
         }),
     });
     const transport = new StdioWorkerTransport(
@@ -286,7 +286,7 @@ async function startProduct(params: Record<string, unknown>): Promise<Record<str
         },
         {
             beforeConnect: async () => fence?.ready(),
-            onDisconnected: error => writeControl({ event: "product.disconnected", error: error.message }),
+            onDisconnected: error => writeDriver({ event: "product.disconnected", error: error.message }),
         },
     );
     const adapter = new VaultToolAdapter(vault, client, input.workspaceId, undefined, undefined, changes);
@@ -295,10 +295,10 @@ async function startProduct(params: Record<string, unknown>): Promise<Record<str
         await journal.markRecoveryReady(recoveryToken);
     });
     const observer = observePluginToolEvents(client.reducer, fence, error => {
-        writeControl({ event: "adapter.error", error: error.message });
+        writeDriver({ event: "adapter.error", error: error.message });
     });
     const unsubscribeEvents = client.reducer.subscribe(event => {
-        writeControl({ event: "runtime.event", value: event });
+        writeDriver({ event: "runtime.event", value: event });
     });
     try {
         const initialized = await client.connect();
@@ -338,7 +338,7 @@ async function stopProduct(): Promise<Record<string, unknown>> {
     return { stopped: true, workerPid: current.workerPid };
 }
 
-async function executeControl(request: ControlRequest): Promise<Record<string, unknown>> {
+async function executeDriverCommand(request: DriverRequest): Promise<Record<string, unknown>> {
     if (request.command === "hello") {
         return {
             driverProtocolVersion: 2,
@@ -358,7 +358,7 @@ async function executeControl(request: ControlRequest): Promise<Record<string, u
         const genericClient = product.client as unknown as {
             request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
         };
-        return genericClient.request(method, params as Record<string, unknown>);
+        return genericClient["request"](method, params as Record<string, unknown>);
     }
     if (request.command === "attachment/upload") {
         if (product === null) throw new Error("qualification product is not started");
@@ -401,11 +401,11 @@ async function serve(): Promise<void> {
     const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
     for await (const line of input) {
         if (line.trim().length === 0) continue;
-        let request: ControlRequest;
+        let request: DriverRequest;
         try {
-            request = controlRequest(JSON.parse(line));
+            request = driverRequest(JSON.parse(line));
         } catch (error) {
-            writeControl({
+            writeDriver({
                 id: null,
                 ok: false,
                 error: error instanceof Error ? error.message : String(error),
@@ -414,14 +414,14 @@ async function serve(): Promise<void> {
         }
         if (request.command === "stop") {
             const result = await stopProduct();
-            writeControl({ id: request.id, ok: true, result });
+            writeDriver({ id: request.id, ok: true, result });
             input.close();
             break;
         }
         try {
-            writeControl({ id: request.id, ok: true, result: await executeControl(request) });
+            writeDriver({ id: request.id, ok: true, result: await executeDriverCommand(request) });
         } catch (error) {
-            writeControl({ id: request.id, ok: false, error: errorMessage(error) });
+            writeDriver({ id: request.id, ok: false, error: errorMessage(error) });
         }
     }
 }
