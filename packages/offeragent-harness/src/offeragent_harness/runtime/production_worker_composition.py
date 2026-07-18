@@ -176,11 +176,7 @@ from offeragent_harness.runtime.production_skills import (
 )
 from offeragent_harness.runtime.recovery import RecoveryCoordinator
 from offeragent_harness.runtime.recovery_apply import RecoveryPlanApplier
-from offeragent_harness.runtime.run_preparation import (
-    CompositeRunContextProvider,
-    ConversationHistoryRunPreparationAdapter,
-    WorkspaceInstructionRunPreparationAdapter,
-)
+from offeragent_harness.runtime.run_preparation import ConversationHistoryRunPreparationAdapter
 from offeragent_harness.runtime.startup import RuntimeStartupCoordinator
 from offeragent_harness.runtime.subagent_runtime import (
     HarnessChildCancellationFactory,
@@ -237,9 +233,6 @@ from offeragent_harness.vault import (
     vault_transaction_definition,
 )
 from offeragent_harness.workspace import (
-    CodeToolExecutor,
-    VaultFileSystem,
-    VaultReadPolicy,
     WorkspacePathPolicy,
     WorkspaceRegistry,
     WorkspaceRoot,
@@ -527,8 +520,7 @@ class ProductionRunComponentsFactory(
         policy_audit: PolicyAuditSink,
         journal: Any,
         artifacts: LocalArtifactStore,
-        local_read: CodeToolExecutor,
-        local_transaction: VaultTransactionCoordinator,
+        local_transaction: VaultTransactionCoordinator | None,
         parent_authorities: ParentRunAuthorityProvider,
         attachments: ConversationAttachmentStore | None = None,
         optional_definitions: Sequence[ToolDefinition] = (),
@@ -554,7 +546,6 @@ class ProductionRunComponentsFactory(
         self._policy_audit = policy_audit
         self._journal = journal
         self._artifacts = artifacts
-        self._local_read = local_read
         self._local_transaction = local_transaction
         self._parent_authorities = parent_authorities
         self._attachments = attachments
@@ -1028,10 +1019,7 @@ class ProductionRunComponentsFactory(
             and ("shell.execute" not in item.required_capabilities or effective_config.execution.shell_enabled)
             and (write_allowed or item.risk not in {RiskClass.WRITE, RiskClass.DESTRUCTIVE})
         )
-        return (
-            *self._local_read.definitions,
-            *optional_definitions,
-        )
+        return optional_definitions
 
     def build(self, command: StartTurnCommand, state: RunState) -> RunComponents:
         config = validate_wire(WireRunConfigSnapshot, thaw_json(command.run_config))
@@ -1203,7 +1191,7 @@ class ProductionRunComponentsFactory(
                 "仅在证据充分且没有未完成义务时提交 finalResponse。",
                 "run_snapshot.time 是本轮唯一权威日期与时区来源。",
                 "不得从模型知识、文件时间或用户未明确提供的信息猜测当前日期。",
-                "Skill 目录只提供元数据。任务匹配某个 Skill 描述时先调用 skill 读取正文。",
+                "Vault Local Skill 目录只提供元数据。任务匹配时先调用插件拥有的 skill.read 精读正文。",
                 "run_snapshot.activeContexts 中已激活的 Skill 不得重复调用。",
                 "工具结果会进入下一 AgentStep。读取、写入或校验未真实完成时不得用 finalResponse 替代工具动作。",
                 "不得声称未执行、未审批、冲突或结果未知的写操作已经完成。",
@@ -1247,19 +1235,14 @@ class ProductionRunComponentsFactory(
         base_selected = {(item.name, item.version, item.fingerprint) for item in base_definitions}
         if not base_selected <= selected:
             raise ValueError("prepared base Tool definitions exceed the immutable Run definition snapshot")
-        read_definitions = tuple(
-            item
-            for item in self._local_read.definitions
-            if (item.name, item.version, item.fingerprint) in base_selected
-        )
         local_routes: list[tuple[Sequence[ToolDefinition], ToolExecutor]] = []
-        if read_definitions:
-            local_routes.append((read_definitions, self._local_read))
         local_transactions = tuple(
             item
             for item in base_definitions
             if item.name == "vault.transaction" and item.executor_location is ExecutorLocation.LOCAL
         )
+        if local_transactions and self._local_transaction is None:
+            raise ValueError("legacy Vault transaction Tool has no explicit test executor")
         for route_definitions, executor in self._optional_local_executors:
             narrowed = tuple(
                 item for item in route_definitions if (item.name, item.version, item.fingerprint) in base_selected
@@ -1362,6 +1345,7 @@ class ProductionRunComponentsFactory(
             preflight_providers: list[Any] = []
             active_local_routes = list(local_routes)
             if local_transactions:
+                assert self._local_transaction is not None
                 preflight_providers.append(self._local_transaction)
                 active_local_routes.append((local_transactions, self._local_transaction))
             artifacts = ToolArtifactManager(self._artifacts, self._clock, self._ids, budget)
@@ -1399,7 +1383,11 @@ class ProductionRunComponentsFactory(
             registry = ToolRegistry(
                 f"run-{state.run_id}",
                 definitions,
-                preflight_provider_ids=frozenset({self._local_transaction.provider_id}),
+                preflight_provider_ids=(
+                    frozenset({self._local_transaction.provider_id})
+                    if self._local_transaction is not None
+                    else frozenset()
+                ),
             )
             existing_registry = self._registries.get(state.run_id)
             if existing_registry is not None and existing_registry.snapshot_hash != registry.snapshot_hash:
@@ -2303,15 +2291,6 @@ class _LosslessCompactionRunner(SessionCompactionRunner):
         )
 
 
-class _KernelOnlyVaultTransactions:
-    """Deny the legacy VaultPort write surface; ToolKernel owns all writes."""
-
-    async def execute(self, transaction: Any, cancellation: CancellationToken) -> ToolResult:
-        del transaction
-        cancellation.checkpoint()
-        raise PermissionError("Vault transactions must enter through the unified Tool Kernel")
-
-
 @dataclass(slots=True)
 class ProductionWorkerApplication(WorkerApplication):
     workspace_id: str
@@ -2332,7 +2311,7 @@ class ProductionWorkerApplication(WorkerApplication):
     dispatcher: RuntimeApplicationCommandDispatcher
     gateway: LoopbackWebGateway | None
     loopback: AsyncioLoopbackServer | None
-    local_vault_transaction: VaultTransactionCoordinator
+    local_vault_transaction: VaultTransactionCoordinator | None
     event_hub: _EventHub
     unit_of_work: SqliteUnitOfWorkFactory
     subagents: SubagentService
@@ -2569,16 +2548,20 @@ class ProductionWorkerApplication(WorkerApplication):
             "Worker startup began.",
             workerPid=os.getpid(),
         )
-        # File-CAS manifests are reconciled before any component can expose or mutate the Vault.
-        vault_recovery = await self.local_vault_transaction.recover_after_restart()
-        if vault_recovery.manual_review_paths:
-            await self._emit_runtime_log(
-                LogLevel.ERROR,
-                "runtime.vault_recovery_blocked",
-                "Worker readiness is blocked by unresolved durable Vault transactions.",
-                blockedPathCount=len(vault_recovery.manual_review_paths),
-            )
-            raise ProductionWorkerError("Worker readiness is blocked by unresolved durable Vault transaction manifests")
+        # The retired Worker-owned Vault transaction path exists only for its
+        # explicit crash-recovery fixture, never in the fused product.
+        if self.local_vault_transaction is not None:
+            vault_recovery = await self.local_vault_transaction.recover_after_restart()
+            if vault_recovery.manual_review_paths:
+                await self._emit_runtime_log(
+                    LogLevel.ERROR,
+                    "runtime.vault_recovery_blocked",
+                    "Worker readiness is blocked by unresolved durable Vault transactions.",
+                    blockedPathCount=len(vault_recovery.manual_review_paths),
+                )
+                raise ProductionWorkerError(
+                    "Worker readiness is blocked by unresolved durable Vault transaction manifests"
+                )
         layer = await self.config_service.layer(ConfigScope.WORKSPACE, self.workspace_id)
         if layer.revision == 0:
             await self.config_service.update(
@@ -2932,16 +2915,20 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             ),
             started_at=clock.utcnow(),
         )
-        local_transaction = VaultTransactionCoordinator(
-            workspace_id=workspace_id,
-            vault_root=bootstrap.canonical_root,
-            artifacts=artifacts,
-            artifact_budget=runtime_budget,
-            clock=clock,
-            manifest_directory=state_directory / "vault-transactions",
-            manifest_state_root=state_directory,
-            journal=uow.invocation_journal,
-            cas_barrier=self._overrides.vault_cas_barrier,
+        local_transaction = (
+            VaultTransactionCoordinator(
+                workspace_id=workspace_id,
+                vault_root=bootstrap.canonical_root,
+                artifacts=artifacts,
+                artifact_budget=runtime_budget,
+                clock=clock,
+                manifest_directory=state_directory / "vault-transactions",
+                manifest_state_root=state_directory,
+                journal=uow.invocation_journal,
+                cas_barrier=self._overrides.vault_cas_barrier,
+            )
+            if self._overrides.legacy_vault_transaction_test_mode
+            else None
         )
         process_scratch_root = _prepare_process_scratch_root(state_directory)
         paths = WorkspacePathPolicy(
@@ -2999,25 +2986,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             unit_of_work=uow,
             processes=process_supervisor,
             clock=clock,
-        )
-        vault_fs = VaultFileSystem(
-            workspace_id=workspace_id,
-            paths=paths,
-            read_policy=VaultReadPolicy(
-                None,
-                16 * 1024 * 1024,
-                16 * 1024 * 1024,
-                10_000,
-                100_000,
-                allowed_hidden_prefixes=(".claude", ".offeragent/memory"),
-            ),
-            transaction_executor=_KernelOnlyVaultTransactions(),
-        )
-        read_executor = CodeToolExecutor(
-            workspace_id=workspace_id,
-            source=vault_fs,
-            workspace_root=bootstrap.canonical_root,
-            ripgrep_path=_require_ripgrep_path(self._overrides.ripgrep_path),
         )
         powershell_executor = PowerShellToolExecutor(
             workspace_id=workspace_id,
@@ -3100,7 +3068,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             policy_audit=EntityPolicyAuditSink(uow),
             journal=uow.invocation_journal,
             artifacts=artifacts,
-            local_read=read_executor,
             local_transaction=local_transaction,
             parent_authorities=late_parent_authorities,
             attachments=attachments,
@@ -3113,7 +3080,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             optional_local_executors=((powershell_executor.definitions, powershell_executor),),
             plugin_executor=plugin_executor,
             subagent_executor=late_subagent if subagent_definitions else None,
-            skills=skill_factory,
+            skills=None,
             shell=shell_capabilities,
             process_root_ids=tuple(sorted(allowed_cwd_roots)),
             hooks=hook_capabilities,
@@ -3137,21 +3104,14 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             child_components=components,
             root_cancellations=cancellations,
             subagent_tree=late_tree,
-            run_context_provider=CompositeRunContextProvider(
-                ConversationHistoryRunPreparationAdapter(
-                    workspace_id=workspace_id,
-                    unit_of_work=uow,
-                ),
-                WorkspaceInstructionRunPreparationAdapter(
-                    workspace_id=workspace_id,
-                    vault=vault_fs,
-                ),
+            run_context_provider=ConversationHistoryRunPreparationAdapter(
+                workspace_id=workspace_id,
+                unit_of_work=uow,
             ),
             lifecycle_hooks=components,
             required_root_initial_tool="agent_contract.read",
         )
         base_definitions = (
-            *read_executor.definitions,
             *powershell_executor.definitions,
             *plugin_definitions,
             *legacy_vault_definitions,
@@ -3226,7 +3186,9 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
         recovery_registry = ToolRegistry(
             "worker-recovery",
             base_definitions,
-            preflight_provider_ids=frozenset({local_transaction.provider_id}),
+            preflight_provider_ids=(
+                frozenset({local_transaction.provider_id}) if local_transaction is not None else frozenset()
+            ),
         )
         startup = RuntimeStartupCoordinator(
             recovery=RecoveryCoordinator(
@@ -3700,24 +3662,12 @@ def _resolve_worker_bootstrap(command: WorkerCommandLine) -> WorkerBootstrap:
 def _verified_packaged_ripgrep(
     runtime: InstalledDevelopmentRuntimeTrust,
 ) -> Path:
-    """Return the Runtime-pinned ripgrep image used exclusively by ``grep``."""
+    """Verify the bundled ripgrep image remains inside the frozen Runtime closure."""
 
     executable = runtime.version_directory / "tools" / "rg.exe"
     if not runtime.verify_file(executable):
         raise ProductionWorkerError("Runtime ripgrep image is absent or differs from the trusted manifest")
     return executable.resolve(strict=True)
-
-
-def _require_ripgrep_path(value: Path | None) -> Path:
-    if value is None:
-        raise ProductionWorkerError("Worker composition has no Runtime-pinned ripgrep image")
-    try:
-        executable = value.resolve(strict=True)
-    except OSError as error:
-        raise ProductionWorkerError("Runtime ripgrep image is unavailable") from error
-    if not executable.is_file() or executable.name.casefold() != "rg.exe":
-        raise ProductionWorkerError("Runtime ripgrep image is invalid")
-    return executable
 
 
 def _trusted_windows_powershell() -> Path:

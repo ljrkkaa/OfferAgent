@@ -1,5 +1,5 @@
 const assert = require("node:assert/strict");
-const { mkdir, mkdtemp, rm, writeFile } = require("node:fs/promises");
+const { link, mkdir, mkdtemp, rm, writeFile } = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
@@ -125,4 +125,31 @@ test("Project Evidence rejects stale selections and excluded or escaping sources
         const result = await adapter.execute(call("project.read", { projectId: "offeragent", path: candidate }));
         assert.equal(result.status, "failed", candidate);
     }
+});
+
+test("Project Evidence rejects an allowed-name hard link to an external secret", async (t) => {
+    const { ProjectEvidenceAdapter } = loadModule();
+    const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-project-hardlink-"));
+    const external = await mkdtemp(path.join(os.tmpdir(), "offeragent-project-secret-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    t.after(() => rm(external, { recursive: true, force: true }));
+    await mkdir(path.join(root, "src"), { recursive: true });
+    const secret = path.join(external, "credentials.txt");
+    await writeFile(secret, "API_TOKEN=must-not-leak\n");
+    await link(secret, path.join(root, "src", "notes.txt"));
+    const adapter = new ProjectEvidenceAdapter(registeredVault(root));
+
+    const listed = await adapter.execute(call("project.list", { projectId: "offeragent", limit: 10 }));
+    const searched = await adapter.execute(call("project.search", {
+        projectId: "offeragent", query: "must-not-leak", limit: 10,
+    }));
+    const read = await adapter.execute(call("project.read", {
+        projectId: "offeragent", path: "src/notes.txt", lineStart: 1, lineEnd: 1,
+    }));
+
+    assert.deepEqual(listed.data.entries, []);
+    assert.deepEqual(searched.data.entries, []);
+    assert.equal(read.status, "failed");
+    assert.equal(read.error.code, "resource.conflict");
+    assert.equal(JSON.stringify([listed, searched, read]).includes("must-not-leak"), false);
 });

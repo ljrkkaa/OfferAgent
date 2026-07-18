@@ -69,7 +69,10 @@ export type VaultChangeCrashPoint =
     | "after-applying-journal"
     | "after-target-write"
     | "after-target-journal"
-    | "after-applied-journal";
+    | "after-applied-journal"
+    | "after-undoing-journal"
+    | "after-undo-target-write"
+    | "after-undo-target-journal";
 
 type Operation =
     | { readonly op: "create"; readonly path: string; readonly content: string; readonly expectedContentHash: "absent" }
@@ -118,6 +121,7 @@ export type VaultChangeJournalState =
     | "prepared"
     | "applying"
     | "applied"
+    | "undoing"
     | "rolled_back"
     | "undone"
     | "recovery_failed";
@@ -139,7 +143,7 @@ export interface VaultChangeJournalRecord {
 
 export interface VaultChangeReconciliation {
     readonly batchId: string;
-    readonly state: "applied" | "rolled_back" | "recovery_failed";
+    readonly state: "applied" | "rolled_back" | "undone" | "recovery_failed";
     readonly manualReviewPaths: readonly string[];
 }
 
@@ -162,6 +166,13 @@ class ChangeValidationError extends Error {
     }
 }
 
+class UndoConflictError extends Error {
+    constructor(readonly paths: readonly string[]) {
+        super(`Vault targets changed during guarded undo: ${paths.join(", ")}`);
+        this.name = "UndoConflictError";
+    }
+}
+
 export class VaultChangeCoordinator {
     private recoveryGate: Promise<void> | null = null;
 
@@ -169,8 +180,12 @@ export class VaultChangeCoordinator {
 
     beginRecovery(): Promise<void> {
         this.recoveryGate = this.reconcile().then((reports) => {
-            const manual = reports.flatMap((report) => report.state === "recovery_failed" ? report.manualReviewPaths : []);
-            if (manual.length > 0) throw new Error(`Vault Change recovery requires manual review: ${manual.join(", ")}`);
+            const blocked = reports.filter((report) => report.state === "recovery_failed");
+            if (blocked.length > 0) {
+                const details = blocked.flatMap((report) => report.manualReviewPaths).join(", ") ||
+                    blocked.map((report) => report.batchId).join(", ");
+                throw new Error(`Vault Change recovery requires manual review: ${details}`);
+            }
         });
         return this.recoveryGate;
     }
@@ -249,10 +264,18 @@ export class VaultChangeCoordinator {
             record = { ...record, checkpointRef };
             await this.options.journal.save(record);
             this.inject("after-checkpoint");
+            try {
+                await this.revalidate(prepared);
+            } catch (error) {
+                record = { ...record, state: "rolled_back" };
+                await this.options.journal.save(record);
+                return validationFailure(call, error);
+            }
             record = { ...record, state: "applying" };
             await this.options.journal.save(record);
             this.inject("after-applying-journal");
             for (const target of prepared.targets) {
+                await this.revalidateTarget(target);
                 if (target.afterContent === undefined) await this.options.vault.remove(target.path);
                 else await this.options.vault.write(target.path, target.afterContent);
                 this.inject("after-target-write", target.path);
@@ -270,7 +293,9 @@ export class VaultChangeCoordinator {
                 await this.rollback(record);
                 record = { ...record, state: "rolled_back", appliedPaths: [] };
                 await this.options.journal.save(record);
-                return failed(call, "tool.failed", "Vault Change Batch failed and was rolled back.");
+                return error instanceof ChangeValidationError
+                    ? validationFailure(call, error)
+                    : failed(call, "tool.failed", "Vault Change Batch failed and was rolled back.");
             } catch {
                 const manualReviewPaths = await this.unexpectedPaths(record);
                 record = { ...record, state: "recovery_failed", manualReviewPaths };
@@ -289,6 +314,28 @@ export class VaultChangeCoordinator {
     async reconcile(): Promise<VaultChangeReconciliation[]> {
         const reports: VaultChangeReconciliation[] = [];
         for (let record of await this.options.journal.listUnresolved()) {
+            if (record.state === "prepared") {
+                record = { ...record, state: "rolled_back", appliedPaths: [], manualReviewPaths: [] };
+                await this.options.journal.save(record);
+                reports.push({ batchId: record.batchId, state: "rolled_back", manualReviewPaths: [] });
+                continue;
+            }
+            if (record.state === "undoing") {
+                try {
+                    record = await this.completeUndo(record);
+                    reports.push({ batchId: record.batchId, state: "undone", manualReviewPaths: [] });
+                    continue;
+                } catch (error) {
+                    if (error instanceof VaultChangeCrashInjectionError) throw error;
+                    const manualReviewPaths = error instanceof UndoConflictError
+                        ? [...error.paths]
+                        : await this.unexpectedPaths(record);
+                    record = { ...record, manualReviewPaths };
+                    await this.options.journal.save(record);
+                    reports.push({ batchId: record.batchId, state: "recovery_failed", manualReviewPaths });
+                    continue;
+                }
+            }
             const states = await this.observedTargetStates(record);
             const allAfter = states.every((state) => state === "after");
             const allKnown = states.every((state) => state === "before" || state === "after");
@@ -320,7 +367,7 @@ export class VaultChangeCoordinator {
     }
 
     async undo(batchId: string): Promise<VaultUndoResult> {
-        const record = await this.options.journal.load(batchId);
+        let record = await this.options.journal.load(batchId);
         if (record === undefined || record.state !== "applied" || record.checkpointRef === null) {
             return { status: "not_found", batchId };
         }
@@ -337,9 +384,33 @@ export class VaultChangeCoordinator {
         if (conflicts.length > 0) {
             return { status: "conflict", batchId, paths: conflicts, diff: truncateUtf8(diffs.join("\n"), MAX_DIFF_BYTES) };
         }
-        await this.rollback(record, true);
-        await this.options.journal.save({ ...record, state: "undone", appliedPaths: [] });
-        return { status: "undone", batchId, paths: record.targets.map((target) => target.path) };
+        record = { ...record, state: "undoing", appliedPaths: record.targets.map((target) => target.path) };
+        await this.options.journal.save(record);
+        this.inject("after-undoing-journal");
+        try {
+            record = await this.completeUndo(record);
+            return { status: "undone", batchId, paths: record.targets.map((target) => target.path) };
+        } catch (error) {
+            if (error instanceof VaultChangeCrashInjectionError) throw error;
+            if (!(error instanceof UndoConflictError)) throw error;
+            if (record === undefined || record.checkpointRef === null) throw new Error("undo journal identity was lost");
+            const checkpointRef = record.checkpointRef;
+            const targets = record.targets;
+            const conflictDiffs = await Promise.all(error.paths.map(async (path) => {
+                const target = targets.find((candidate) => candidate.path === path);
+                const current = await this.options.vault.read(path);
+                const before = await this.options.checkpoints.read(checkpointRef, path);
+                return conflictDiff(target?.path ?? path, current, before);
+            }));
+            record = { ...record, manualReviewPaths: [...error.paths] };
+            await this.options.journal.save(record);
+            return {
+                status: "conflict",
+                batchId,
+                paths: error.paths,
+                diff: truncateUtf8(conflictDiffs.join("\n"), MAX_DIFF_BYTES),
+            };
+        }
     }
 
     private async prepare(input: Readonly<Record<string, unknown>>): Promise<PreparedBatch> {
@@ -405,9 +476,13 @@ export class VaultChangeCoordinator {
 
     private async revalidate(prepared: PreparedBatch): Promise<void> {
         for (const target of prepared.targets) {
-            if (contentIdentity(await this.options.vault.read(target.path)) !== target.beforeHash) {
-                throw new ChangeValidationError("resource.conflict", `Vault target '${target.path}' changed during approval.`);
-            }
+            await this.revalidateTarget(target);
+        }
+    }
+
+    private async revalidateTarget(target: Pick<PreparedTarget, "path" | "beforeHash">): Promise<void> {
+        if (contentIdentity(await this.options.vault.read(target.path)) !== target.beforeHash) {
+            throw new ChangeValidationError("resource.conflict", `Vault target '${target.path}' changed before apply.`);
         }
     }
 
@@ -418,7 +493,7 @@ export class VaultChangeCoordinator {
             return failed(call, "resource.conflict", "Vault Change Batch identity conflicts with a durable record.");
         }
         if (record.state === "applied") return success(call, record);
-        if (record.state === "prepared" || record.state === "applying" || record.state === "recovery_failed") {
+        if (["prepared", "applying", "undoing", "recovery_failed"].includes(record.state)) {
             return failed(
                 call,
                 "tool.unknown_outcome",
@@ -430,17 +505,56 @@ export class VaultChangeCoordinator {
         return failed(call, "resource.conflict", `Vault Change Batch is already ${record.state}.`);
     }
 
-    private async rollback(record: VaultChangeJournalRecord, undo = false): Promise<void> {
+    private async completeUndo(record: VaultChangeJournalRecord): Promise<VaultChangeJournalRecord> {
+        if (record.state !== "undoing" || record.checkpointRef === null) throw new Error("undo journal is not recoverable");
+        let currentRecord = record;
+        for (const target of [...record.targets].reverse()) {
+            const current = await this.options.vault.read(target.path);
+            const identity = contentIdentity(current);
+            if (identity !== target.beforeHash && identity !== target.afterHash) {
+                throw new UndoConflictError([target.path]);
+            }
+            if (identity === target.afterHash) {
+                const before = await this.options.checkpoints.read(record.checkpointRef, target.path);
+                if (target.beforeHash === "absent") await this.options.vault.remove(target.path);
+                else {
+                    if (before === undefined || contentIdentity(before) !== target.beforeHash) {
+                        throw new Error(`checkpoint mismatch: ${target.path}`);
+                    }
+                    await this.options.vault.write(target.path, before);
+                }
+                this.inject("after-undo-target-write", target.path);
+                if (contentIdentity(await this.options.vault.read(target.path)) !== target.beforeHash) {
+                    throw new Error(`undo verification failed: ${target.path}`);
+                }
+            }
+            currentRecord = {
+                ...currentRecord,
+                appliedPaths: currentRecord.appliedPaths.filter((path) => path !== target.path),
+            };
+            await this.options.journal.save(currentRecord);
+            this.inject("after-undo-target-journal", target.path);
+        }
+        currentRecord = { ...currentRecord, state: "undone", appliedPaths: [], manualReviewPaths: [] };
+        await this.options.journal.save(currentRecord);
+        return currentRecord;
+    }
+
+    private async rollback(record: VaultChangeJournalRecord): Promise<void> {
         if (record.checkpointRef === null) {
             const states = await this.observedTargetStates(record);
             if (states.some((state) => state !== "before")) throw new Error("checkpoint missing after mutation");
             return;
         }
+        const applied = new Set(record.appliedPaths.map((path) => path.toLocaleLowerCase()));
         for (const target of [...record.targets].reverse()) {
             const current = await this.options.vault.read(target.path);
             const identity = contentIdentity(current);
             if (identity === target.beforeHash) continue;
-            if (identity !== target.afterHash) throw new Error(`unexpected target state: ${target.path}`);
+            if (identity !== target.afterHash) {
+                if (!applied.has(target.path.toLocaleLowerCase())) continue;
+                throw new Error(`unexpected target state: ${target.path}`);
+            }
             const before = await this.options.checkpoints.read(record.checkpointRef, target.path);
             if (target.beforeHash === "absent") await this.options.vault.remove(target.path);
             else {
@@ -449,7 +563,7 @@ export class VaultChangeCoordinator {
                 }
                 await this.options.vault.write(target.path, before);
             }
-            if (!undo && contentIdentity(await this.options.vault.read(target.path)) !== target.beforeHash) {
+            if (contentIdentity(await this.options.vault.read(target.path)) !== target.beforeHash) {
                 throw new Error(`rollback verification failed: ${target.path}`);
             }
         }
@@ -841,7 +955,9 @@ export class FileVaultChangeJournal implements VaultChangeJournalStore {
         for (const name of names.sort()) {
             if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.json$/u.test(name)) continue;
             const record = await this.load(name.slice(0, -5));
-            if (record !== undefined && ["prepared", "applying", "recovery_failed"].includes(record.state)) records.push(record);
+            if (record !== undefined && ["prepared", "applying", "undoing", "recovery_failed"].includes(record.state)) {
+                records.push(record);
+            }
         }
         return records;
     }
@@ -857,7 +973,7 @@ function parseJournal(value: unknown): VaultChangeJournalRecord {
     ]) || record.version !== 1 || typeof record.batchId !== "string" || !BATCH_ID.test(record.batchId) ||
         !boundedIdentifier(record.toolCallId) || !boundedIdentifier(record.workspaceId) || !boundedIdentifier(record.runId) ||
         typeof record.argsHash !== "string" || !DIGEST.test(record.argsHash) || !boundedIdentifier(record.idempotencyKey) ||
-        !["prepared", "applying", "applied", "rolled_back", "undone", "recovery_failed"].includes(String(record.state)) ||
+        !["prepared", "applying", "applied", "undoing", "rolled_back", "undone", "recovery_failed"].includes(String(record.state)) ||
         (record.checkpointRef !== null && (typeof record.checkpointRef !== "string" ||
             !/^refs\/offeragent\/checkpoints\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(record.checkpointRef))) ||
         !Array.isArray(record.targets) || record.targets.length < 1 || record.targets.length > MAX_ACTIONS ||
@@ -895,7 +1011,7 @@ function parseJournal(value: unknown): VaultChangeJournalRecord {
         });
     };
     if (!validJournalPaths(record.appliedPaths as unknown[]) || !validJournalPaths(record.manualReviewPaths as unknown[]) ||
-        (["applying", "applied", "undone"].includes(String(record.state)) && record.checkpointRef === null)) malformed();
+        (["applying", "applied", "undoing", "undone"].includes(String(record.state)) && record.checkpointRef === null)) malformed();
     return record as unknown as VaultChangeJournalRecord;
 }
 

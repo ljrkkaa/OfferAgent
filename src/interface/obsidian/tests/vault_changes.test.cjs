@@ -80,7 +80,7 @@ class MemoryJournal {
     async load(batchId) { return structuredClone(this.records.get(batchId)); }
     async save(record) { this.records.set(record.batchId, structuredClone(record)); }
     async listUnresolved() {
-        return [...this.records.values()].filter((record) => ["prepared", "applying", "recovery_failed"].includes(record.state))
+        return [...this.records.values()].filter((record) => ["prepared", "applying", "undoing", "recovery_failed"].includes(record.state))
             .map((record) => structuredClone(record));
     }
 }
@@ -115,6 +115,57 @@ test("Vault Change Batch validates every target before mutation and rolls back a
     assert.equal(vault.entries.get("notes/a.md"), "alpha\n");
     assert.equal(vault.entries.get("notes/b.md"), "beta\n");
     assert.equal((await journal.load("batch_failure")).state, "rolled_back");
+});
+
+test("Vault Change Batch revalidates after checkpoint and never overwrites a racing user edit", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const vault = new MemoryVault({ "notes/a.md": "alpha\n" });
+    const journal = new MemoryJournal();
+    const checkpoints = new MemoryCheckpoints(vault);
+    const originalCreate = checkpoints.create.bind(checkpoints);
+    checkpoints.create = async (...arguments_) => {
+        const checkpoint = await originalCreate(...arguments_);
+        vault.entries.set("notes/a.md", "manual edit\n");
+        return checkpoint;
+    };
+    const coordinator = new VaultChangeCoordinator({
+        vault, journal, checkpoints, permissionMode: () => "trusted_vault",
+    });
+
+    const result = await coordinator.execute(call("batch_checkpoint_race", [
+        { op: "append", path: "notes/a.md", content: "agent edit\n", expectedContentHash: digest("alpha\n") },
+    ]));
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "resource.conflict");
+    assert.equal(vault.entries.get("notes/a.md"), "manual edit\n");
+    assert.equal((await journal.load("batch_checkpoint_race")).state, "rolled_back");
+});
+
+test("Vault Change Batch revalidates each target and rolls back earlier writes around a later user edit", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const vault = new MemoryVault({ "notes/a.md": "alpha\n", "notes/b.md": "beta\n" });
+    const originalWrite = vault.write.bind(vault);
+    vault.write = async (target, content) => {
+        await originalWrite(target, content);
+        if (target === "notes/a.md") vault.entries.set("notes/b.md", "manual beta\n");
+    };
+    const journal = new MemoryJournal();
+    const checkpoints = new MemoryCheckpoints(vault);
+    const coordinator = new VaultChangeCoordinator({
+        vault, journal, checkpoints, permissionMode: () => "trusted_vault",
+    });
+
+    const result = await coordinator.execute(call("batch_target_race", [
+        { op: "append", path: "notes/a.md", content: "agent alpha\n", expectedContentHash: digest("alpha\n") },
+        { op: "append", path: "notes/b.md", content: "agent beta\n", expectedContentHash: digest("beta\n") },
+    ]));
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "resource.conflict");
+    assert.equal(vault.entries.get("notes/a.md"), "alpha\n");
+    assert.equal(vault.entries.get("notes/b.md"), "manual beta\n");
+    assert.equal((await journal.load("batch_target_race")).state, "rolled_back");
 });
 
 test("plugin permission is fail-closed and control or memory-delete batches always ask", async () => {
@@ -442,6 +493,40 @@ test("guarded undo restores only an unchanged applied batch", async () => {
     const undone = await coordinator.undo("batch_undo");
     assert.equal(undone.status, "undone");
     assert.equal(vault.entries.get("notes/a.md"), "alpha\n");
+});
+
+test("guarded undo journals progress and completes safely after a crash", async () => {
+    const { VaultChangeCoordinator, VaultChangeCrashInjectionError } = loadModule();
+    const vault = new MemoryVault({ "notes/a.md": "alpha\n", "notes/b.md": "beta\n" });
+    const journal = new MemoryJournal();
+    const checkpoints = new MemoryCheckpoints(vault);
+    let crashed = false;
+    const coordinator = new VaultChangeCoordinator({
+        vault, journal, checkpoints, permissionMode: () => "trusted_vault",
+        injectCrash(point) {
+            if (point === "after-undo-target-write" && !crashed) {
+                crashed = true;
+                throw new VaultChangeCrashInjectionError(point);
+            }
+        },
+    });
+    await coordinator.execute(call("batch_undo_crash", [
+        { op: "append", path: "notes/a.md", content: "A2\n", expectedContentHash: digest("alpha\n") },
+        { op: "append", path: "notes/b.md", content: "B2\n", expectedContentHash: digest("beta\n") },
+    ]));
+
+    await assert.rejects(coordinator.undo("batch_undo_crash"), VaultChangeCrashInjectionError);
+    assert.equal((await journal.load("batch_undo_crash")).state, "undoing");
+
+    const recovered = new VaultChangeCoordinator({
+        vault, journal, checkpoints, permissionMode: () => "trusted_vault",
+    });
+    assert.deepEqual(await recovered.reconcile(), [
+        { batchId: "batch_undo_crash", state: "undone", manualReviewPaths: [] },
+    ]);
+    assert.equal(vault.entries.get("notes/a.md"), "alpha\n");
+    assert.equal(vault.entries.get("notes/b.md"), "beta\n");
+    assert.equal((await journal.load("batch_undo_crash")).state, "undone");
 });
 
 test("Git checkpoints use an independent index and preserve staged and unstaged state", async (t) => {

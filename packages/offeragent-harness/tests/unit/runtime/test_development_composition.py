@@ -23,6 +23,19 @@ def test_production_worker_enables_the_root_agent_contract_gate() -> None:
     assert 'required_root_initial_tool="agent_contract.read"' in source
 
 
+def test_fused_production_worker_has_no_worker_local_vault_evidence_adapter() -> None:
+    source = Path(production_worker_composition.__file__).read_text(encoding="utf-8")
+    composition = source[source.index("class ProductionWorkerCompositionRoot") :]
+    run_components = composition[
+        composition.index("components = ProductionRunComponentsFactory(") : composition.index("cancellations =")
+    ]
+
+    assert "VaultFileSystem(" not in composition
+    assert "WorkspaceInstructionRunPreparationAdapter(" not in composition
+    assert "*read_executor.definitions" not in composition
+    assert "skills=skill_factory" not in run_components
+
+
 def test_worker_failure_code_exposes_only_stable_startup_phase() -> None:
     blocked = RuntimeStartupBlocked(
         phase=StartupFailurePhase.SCAN,

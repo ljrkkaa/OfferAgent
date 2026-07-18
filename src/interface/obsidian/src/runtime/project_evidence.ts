@@ -309,11 +309,12 @@ async function stableExternalRead(path: string, maximumBytes: number): Promise<{
     modifiedVersion: string;
 } | undefined> {
     try {
-        const before = await stat(path);
-        if (!before.isFile() || before.size > maximumBytes) return undefined;
+        const before = await lstat(path);
+        if (!before.isFile() || before.nlink !== 1 || before.size > maximumBytes) return undefined;
         const buffer = await readFile(path);
-        const after = await stat(path);
-        if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || buffer.byteLength > maximumBytes) return undefined;
+        const after = await lstat(path);
+        if (!after.isFile() || after.nlink !== 1 || before.dev !== after.dev || before.ino !== after.ino ||
+            before.size !== after.size || before.mtimeMs !== after.mtimeMs || buffer.byteLength > maximumBytes) return undefined;
         let content: string;
         try { content = new TextDecoder("utf-8", { fatal: true }).decode(buffer); } catch { return undefined; }
         if (content.includes("\0")) return undefined;
