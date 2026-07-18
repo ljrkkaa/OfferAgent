@@ -21,6 +21,11 @@ from offeragent_harness.models import (
 from offeragent_harness.ports import CancellationToken
 from offeragent_harness.ports.secrets import SecretHandle, SecretKind, SecretMetadata
 from offeragent_harness.protocol.messages import ModelsHealthParams, ModelsListParams
+from offeragent_harness.providers.codex_subscription import (
+    CodexCatalogModel,
+    CodexModelCatalogSnapshot,
+    CodexModelServiceTier,
+)
 from offeragent_harness.runtime.config_service import ConfigService, ConfigUpdateCommand
 from offeragent_harness.runtime.model_management import ProductionModelCommandService
 from offeragent_harness.testing import (
@@ -159,6 +164,8 @@ def _service(
     clock: ManualClock,
     secrets: _SecretStore,
     factory: _GatewayFactory,
+    *,
+    catalog: Any | None = None,
 ) -> ProductionModelCommandService:
     return ProductionModelCommandService(
         config=config,
@@ -169,7 +176,70 @@ def _service(
         gateway_factory=factory,
         clock=clock,
         ids=DeterministicIdGenerator(),
+        catalog=catalog,
     )
+
+
+class _Catalog:
+    def __init__(self, snapshot: CodexModelCatalogSnapshot) -> None:
+        self.snapshot = snapshot
+        self.calls = 0
+
+    def refresh(self) -> CodexModelCatalogSnapshot:
+        self.calls += 1
+        return self.snapshot
+
+
+@pytest.mark.asyncio
+async def test_model_list_projects_the_live_codex_catalog_through_the_public_protocol() -> None:
+    clock = ManualClock(NOW)
+    config = _config(clock)
+    catalog = _Catalog(
+        CodexModelCatalogSnapshot(
+            models=(
+                CodexCatalogModel(
+                    model_id="gpt-catalog",
+                    display_name="GPT Catalog",
+                    description="Catalog-backed model",
+                    input_modalities=("text", "image"),
+                    supports_image_detail_original=True,
+                    supports_hosted_search=True,
+                    web_search_tool_type="text_and_image",
+                    context_window=272_000,
+                    max_context_window=1_000_000,
+                    effective_context_window_percent=95,
+                    additional_speed_tiers=("fast",),
+                    service_tiers=(CodexModelServiceTier("priority", "Fast", "1.5x speed"),),
+                    default_service_tier=None,
+                ),
+            ),
+            freshness="fresh",
+            catalog_revision="sha256:" + "a" * 64,
+            fetched_at=NOW,
+            error=None,
+        )
+    )
+    factory = _GatewayFactory(_Gateway())
+    service = _service(config, clock, _SecretStore(None), factory, catalog=catalog)
+
+    result = await service.list_models(ModelsListParams(), ManualCancellationToken())
+
+    assert catalog.calls == 1
+    assert result.catalog_freshness == "fresh"
+    assert result.catalog_revision == "sha256:" + "a" * 64
+    assert result.fetched_at == NOW.isoformat()
+    assert result.error is None
+    assert len(result.models) == 1
+    descriptor = result.models[0]
+    assert descriptor.provider == "codex-subscription-experimental"
+    assert descriptor.model == "gpt-catalog"
+    assert descriptor.input_modalities == ["text", "image"]
+    assert descriptor.supports_image_detail_original is True
+    assert descriptor.supports_hosted_search is True
+    assert descriptor.supports_fast_mode is True
+    assert descriptor.service_tiers[0].id == "priority"
+    assert descriptor.available is True
+    assert factory.calls == []
 
 
 @pytest.mark.asyncio
@@ -381,12 +451,12 @@ async def test_vision_probe_uses_a_fixed_image_and_updates_model_capability() ->
     )
     after = await service.list_models(ModelsListParams(), ManualCancellationToken())
 
-    assert before.models[0].vision_status == "unverified"
+    assert before.models[0].input_modalities == ["text"]
     assert result.status == "healthy" and result.capability == "vision"
     image = gateway.requests[0].messages[0].content[1]
     assert image.kind == "image" and image.binary_data is not None
     assert "binary_data" not in repr(gateway.requests[0])
-    assert after.models[0].vision_status == "supported"
+    assert after.models[0].input_modalities == ["text", "image"]
 
 
 @pytest.mark.asyncio
@@ -458,7 +528,7 @@ async def test_rejected_vision_probe_is_actionable_and_cached_as_unsupported() -
 
     assert result.status == "unsupported"
     assert result.error is not None and result.error.details == {"reason": "vision_unsupported"}
-    assert listed.models[0].vision_status == "unsupported"
+    assert listed.models[0].input_modalities == ["text"]
 
 
 @pytest.mark.asyncio

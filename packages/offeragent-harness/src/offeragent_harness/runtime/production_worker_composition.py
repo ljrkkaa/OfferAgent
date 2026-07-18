@@ -93,6 +93,12 @@ from offeragent_harness.protocol.events import stored_event_to_envelope
 from offeragent_harness.protocol.messages import RuntimeArch, RuntimeStatusResult, ShutdownResult
 from offeragent_harness.protocol.schemas import PROTOCOL_VERSION, schema_hash
 from offeragent_harness.providers import compose_model_gateway
+from offeragent_harness.providers.codex_subscription import (
+    CodexCatalogHttpAdapter,
+    CodexSubscriptionModelModule,
+    HttpxCodexCatalogHttpAdapter,
+)
+from offeragent_harness.providers.openai_responses import ModelCredentialSource
 from offeragent_harness.runtime.application_dispatcher import (
     RuntimeApplicationCommandDispatcher,
 )
@@ -382,6 +388,8 @@ class ProductionWorkerOverrides:
     clock: Clock | None = None
     ids: IdGenerator | None = None
     model_gateway_factory: ModelGatewayFactory | None = None
+    codex_credential_source: ModelCredentialSource | None = None
+    codex_catalog_http: CodexCatalogHttpAdapter | None = None
     secret_store: SecretStore | None = None
     parent_pid: int | None = None
     runtime_config: HarnessConfig | None = None
@@ -2869,6 +2877,13 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                 raise ProductionWorkerError("production SecretStore requires Windows DPAPI")
             secret_store = WindowsDpapiSecretStore(state_directory / "secrets")
 
+        codex_credentials = self._overrides.codex_credential_source or CodexFileCredentialSource()
+        codex_models = CodexSubscriptionModelModule(
+            credentials=codex_credentials,
+            http=self._overrides.codex_catalog_http or HttpxCodexCatalogHttpAdapter(),
+            now=clock.utcnow,
+        )
+
         def configured_gateway_factory(settings: ModelSettings, network_enabled: bool) -> ModelGateway:
             custom = self._overrides.model_gateway_factory
             if custom is not None:
@@ -2882,7 +2897,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                     network_audit=network_audit,
                     clock=clock,
                     codex_credential_source=(
-                        CodexFileCredentialSource()
+                        codex_credentials
                         if settings.provider is ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL
                         else None
                     ),
@@ -3266,6 +3281,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                     gateway_factory=configured_gateway_factory,
                     clock=clock,
                     ids=ids,
+                    catalog=codex_models,
                 ),
                 projections=projections,
                 artifacts=artifacts,

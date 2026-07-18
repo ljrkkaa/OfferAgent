@@ -57,6 +57,27 @@ test("composer wires both composition lifecycle events before its input and key 
     assert.match(source, /event\.keyCode !== 229/);
 });
 
+test("model capability labels come from the live catalog instead of a vision probe", () => {
+    const { modelCapabilityLabel } = loadModule();
+
+    assert.equal(modelCapabilityLabel({
+        inputModalities: ["text", "image"],
+        supportsImageDetailOriginal: true,
+        supportsHostedSearch: true,
+        supportsFastMode: true,
+        supportsStreaming: true,
+        supportsStructuredOutput: true,
+    }), "流式 · 结构化 · 图文（原图） · 托管搜索 · Fast Mode");
+    assert.equal(modelCapabilityLabel({
+        inputModalities: ["text"],
+        supportsImageDetailOriginal: false,
+        supportsHostedSearch: false,
+        supportsFastMode: false,
+        supportsStreaming: true,
+        supportsStructuredOutput: true,
+    }), "流式 · 结构化 · 文本 · 无托管搜索 · 标准速度");
+});
+
 test("a late Store bind cannot attach an obsolete Worker generation after restart", async () => {
     const { LocalChatView } = loadModule();
     const originalWindow = global.window;

@@ -28,12 +28,18 @@ from offeragent_harness.ports.secrets import SecretHandle, SecretKind, SecretSto
 from offeragent_harness.protocol.errors import ErrorEnvelope
 from offeragent_harness.protocol.messages import (
     ModelDescriptor,
+    ModelServiceTierDescriptor,
     ModelsHealthParams,
     ModelsHealthResult,
     ModelsListParams,
     ModelsListResult,
 )
 from offeragent_harness.providers import model_secret_provider_id
+from offeragent_harness.providers.codex_subscription import (
+    CODEX_SUBSCRIPTION_PROVIDER_ID,
+    CodexCatalogError,
+    CodexSubscriptionModelModule,
+)
 
 from .config_service import ConfigService
 
@@ -57,6 +63,7 @@ class ProductionModelCommandService:
         gateway_factory: ModelGatewayFactory,
         clock: Clock,
         ids: IdGenerator,
+        catalog: CodexSubscriptionModelModule | None = None,
     ) -> None:
         if not all((managed_owner_id, profile_id, workspace_id)):
             raise ValueError("model management identities must be non-empty")
@@ -68,6 +75,7 @@ class ProductionModelCommandService:
         self._gateway_factory = gateway_factory
         self._clock = clock
         self._ids = ids
+        self._catalog = catalog
         self._vision_status: dict[tuple[str, str], Literal["supported", "unsupported", "unverified"]] = {}
 
     async def list_models(
@@ -76,8 +84,50 @@ class ProductionModelCommandService:
         cancellation: CancellationToken,
     ) -> ModelsListResult:
         cancellation.checkpoint()
-        snapshot = await self._snapshot()
         layer = await self._config.layer(ConfigScope.WORKSPACE, self._workspace_id)
+        if self._catalog is not None:
+            catalog = await asyncio.to_thread(self._catalog.refresh)
+            cancellation.checkpoint()
+            available = catalog.freshness == "fresh"
+            return ModelsListResult(
+                models=[
+                    ModelDescriptor(
+                        provider=CODEX_SUBSCRIPTION_PROVIDER_ID,
+                        model=model.model_id,
+                        display_name=model.display_name,
+                        local=False,
+                        supports_streaming=True,
+                        supports_structured_output=True,
+                        input_modalities=list(model.input_modalities),
+                        supports_image_detail_original=model.supports_image_detail_original,
+                        supports_hosted_search=model.supports_hosted_search,
+                        web_search_tool_type=model.web_search_tool_type,
+                        context_window=model.context_window,
+                        max_context_window=model.max_context_window,
+                        effective_context_window_percent=model.effective_context_window_percent,
+                        additional_speed_tiers=list(model.additional_speed_tiers),
+                        service_tiers=[
+                            ModelServiceTierDescriptor(
+                                id=tier.id,
+                                name=tier.name,
+                                description=tier.description,
+                            )
+                            for tier in model.service_tiers
+                        ],
+                        default_service_tier=model.default_service_tier,
+                        supports_fast_mode=model.supports_fast_mode,
+                        max_context_tokens=model.context_window,
+                        available=available,
+                    )
+                    for model in catalog.models
+                ],
+                config_revision=layer.revision,
+                catalog_freshness=catalog.freshness,
+                catalog_revision=catalog.catalog_revision,
+                fetched_at=None if catalog.fetched_at is None else catalog.fetched_at.isoformat(),
+                error=None if catalog.error is None else _catalog_error(catalog.error),
+            )
+        snapshot = await self._snapshot()
         settings = snapshot.config.model
         provider = settings.provider.value
         if params.provider not in {None, provider} or not settings.model:
@@ -91,7 +141,13 @@ class ProductionModelCommandService:
             local=settings.provider is ModelProvider.LOCAL,
             supports_streaming=True,
             supports_structured_output=True,
-            vision_status=self._vision_status.get((provider, settings.model), "unverified"),
+            input_modalities=[
+                "text",
+                *(("image",) if self._vision_status.get((provider, settings.model)) == "supported" else ()),
+            ],
+            supports_image_detail_original=False,
+            supports_hosted_search=False,
+            supports_fast_mode=False,
             max_context_tokens=None,
             available=available,
         )
@@ -430,6 +486,21 @@ def _health_message(status: ModelHealthStatus) -> str:
         "auth_required": "模型 Provider 需要有效的 API 凭据或本机 Codex 登录。",
         "unsupported": "当前模型或 Provider 配置不受支持。",
     }[status]
+
+
+def _catalog_error(error: CodexCatalogError) -> ErrorEnvelope:
+    auth = error.code in {"auth_account_changed", "auth_required"}
+    return ErrorEnvelope(
+        code=ErrorCode.AUTH_REQUIRED if auth else ErrorCode.PROVIDER_UNREACHABLE,
+        retryable=error.retryable,
+        cancelled=False,
+        user_visible_message=(
+            "本机 Codex 登录已失效或账户发生变化, 请重新登录后重试。"
+            if auth
+            else "暂时无法验证 Codex 模型目录; 仍可浏览本地内容。"
+        ),
+        details={"reason": error.code},
+    )
 
 
 __all__ = ["ModelGatewayFactory", "ProductionModelCommandService"]

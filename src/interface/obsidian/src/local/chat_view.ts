@@ -29,7 +29,13 @@ export interface ChatModelChoice {
     readonly displayName: string;
     readonly supportsStreaming: boolean;
     readonly supportsStructuredOutput: boolean;
-    readonly visionStatus: "supported" | "unsupported" | "unverified";
+    readonly inputModalities: readonly string[];
+    readonly supportsImageDetailOriginal: boolean;
+    readonly supportsHostedSearch: boolean;
+    readonly supportsFastMode: boolean;
+    readonly contextWindow: number | null;
+    readonly available: boolean;
+    readonly catalogFreshness: "fresh" | "stale";
 }
 
 export interface LocalChatHost {
@@ -776,16 +782,7 @@ export class LocalChatView extends ItemView {
         const controls = composer.createDiv({ cls: "offeragent-composer-controls" });
         const modelControl = controls.createDiv({ cls: "offeragent-model-control" });
         const model = modelControl.createEl("select", { attr: { "aria-label": "选择模型" } });
-        const choices = this.models.some((choice) => choice.model === this.host.settings.model)
-            ? this.models
-            : [{
-                provider: this.host.settings.provider,
-                model: this.host.settings.model,
-                displayName: this.host.settings.model,
-                supportsStreaming: false,
-                supportsStructuredOutput: false,
-                visionStatus: "unverified" as const,
-            }, ...this.models];
+        const choices = this.models;
         for (const choice of choices) {
             model.createEl("option", { value: choice.model, text: choice.displayName });
         }
@@ -794,13 +791,13 @@ export class LocalChatView extends ItemView {
             this.modelError !== null || choices.length === 0;
         model.onchange = () => void this.chooseModel(model.value);
         const selectedModel = choices.find((choice) => choice.model === model.value);
+        const modelReady = selectedModel?.available === true && selectedModel.catalogFreshness === "fresh";
         model.title = this.modelError ?? (!this.modelsLoaded ? "正在从 Worker 查询模型能力" : selectedModel
-            ? `${selectedModel.provider} · ${selectedModel.supportsStreaming ? "支持流式" : "不支持流式"} · ${selectedModel.supportsStructuredOutput ? "支持结构化输出" : "不支持结构化输出"} · ${visionStatusLabel(selectedModel.visionStatus)}`
+            ? `${selectedModel.provider} · ${modelCapabilityLabel(selectedModel)}`
             : "模型能力尚不可用");
         const capability = modelControl.createSpan({ cls: "offeragent-model-capability", attr: { "aria-live": "polite" } });
         capability.setText(this.modelError ? "模型不可用" : !this.modelsLoaded ? "能力查询中" : selectedModel
-            ? [selectedModel.supportsStreaming ? "流式" : "非流式", selectedModel.supportsStructuredOutput ? "结构化" : "文本", visionStatusLabel(selectedModel.visionStatus)]
-                .join(" · ")
+            ? modelCapabilityLabel(selectedModel)
             : "能力未知");
         capability.title = model.title;
         if (activeRun) {
@@ -816,7 +813,8 @@ export class LocalChatView extends ItemView {
         }
         const attach = controls.createEl("button", { attr: { "aria-label": "添加图片" } });
         setIcon(attach, "paperclip");
-        attach.disabled = snapshot.busy || this.sendPending || this.attachmentPending || hasActiveRun;
+        attach.disabled = snapshot.busy || this.sendPending || this.attachmentPending || hasActiveRun ||
+            !modelReady || !selectedModel.inputModalities.includes("image");
         const fileInput = composer.createEl("input", {
             cls: "offeragent-hidden-file-input",
             attr: { type: "file", accept: "image/png,image/jpeg,image/webp,image/gif", multiple: "true" },
@@ -831,7 +829,7 @@ export class LocalChatView extends ItemView {
         pin.disabled = snapshot.busy || this.sendPending || hasActiveRun || draftPins.length >= 8;
         pin.onclick = () => this.pinCurrentContext(tab.tabId);
         const send = controls.createEl("button", { text: "发送", cls: "mod-cta" });
-        send.disabled = snapshot.busy || this.sendPending || this.attachmentPending || hasActiveRun;
+        send.disabled = snapshot.busy || this.sendPending || this.attachmentPending || hasActiveRun || !modelReady;
         send.onclick = () => void this.send(input.value);
     }
 
@@ -1014,8 +1012,10 @@ export class LocalChatView extends ItemView {
             this.models = [...models];
             this.modelsLoaded = true;
             this.modelError = models.length === 0
-                ? "Worker 当前没有可用模型；请在 OfferAgent 设置中检查模型、端点或登录凭据"
-                : null;
+                ? "当前 Codex 订阅账户没有可见模型"
+                : models.some((model) => model.catalogFreshness !== "fresh" || !model.available)
+                    ? "Codex 模型目录已陈旧，仅供展示；刷新成功前不能开始新运行"
+                    : null;
         } catch (error) {
             if (this.closed || this.boundRuntimeAttempt !== runtimeAttempt ||
                 this.latestRuntimeAttempt !== runtimeAttempt) return;
@@ -1130,8 +1130,17 @@ function isPinnableVaultPath(path: string): boolean {
         (lowered.endsWith(".md") || lowered.endsWith(".txt"));
 }
 
-function visionStatusLabel(value: ChatModelChoice["visionStatus"]): string {
-    return value === "supported" ? "视觉已验证" : value === "unsupported" ? "不支持视觉" : "视觉待探测";
+export function modelCapabilityLabel(model: ChatModelChoice): string {
+    const inputs = model.inputModalities.includes("image")
+        ? `图文${model.supportsImageDetailOriginal ? "（原图）" : "（高清）"}`
+        : "文本";
+    return [
+        model.supportsStreaming ? "流式" : "非流式",
+        model.supportsStructuredOutput ? "结构化" : "文本输出",
+        inputs,
+        model.supportsHostedSearch ? "托管搜索" : "无托管搜索",
+        model.supportsFastMode ? "Fast Mode" : "标准速度",
+    ].join(" · ");
 }
 
 export function ordinaryToolActivity(tool: Pick<ToolCallTimelineItem, "name" | "status">): boolean {

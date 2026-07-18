@@ -3536,15 +3536,73 @@
     "ModelDescriptor": {
       "additionalProperties": false,
       "properties": {
+        "additionalSpeedTiers": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "title": "Additionalspeedtiers",
+          "type": "array"
+        },
         "available": {
           "title": "Available",
           "type": "boolean"
+        },
+        "contextWindow": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Contextwindow"
+        },
+        "defaultServiceTier": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Defaultservicetier"
         },
         "displayName": {
           "maxLength": 512,
           "minLength": 1,
           "title": "Displayname",
           "type": "string"
+        },
+        "effectiveContextWindowPercent": {
+          "anyOf": [
+            {
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effectivecontextwindowpercent"
+        },
+        "inputModalities": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Inputmodalities",
+          "type": "array"
         },
         "local": {
           "title": "Local",
@@ -3563,6 +3621,19 @@
           "default": null,
           "title": "Maxcontexttokens"
         },
+        "maxContextWindow": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maxcontextwindow"
+        },
         "model": {
           "maxLength": 256,
           "minLength": 1,
@@ -3575,6 +3646,26 @@
           "title": "Provider",
           "type": "string"
         },
+        "serviceTiers": {
+          "items": {
+            "$ref": "#/$defs/ModelServiceTierDescriptor"
+          },
+          "maxItems": 32,
+          "title": "Servicetiers",
+          "type": "array"
+        },
+        "supportsFastMode": {
+          "title": "Supportsfastmode",
+          "type": "boolean"
+        },
+        "supportsHostedSearch": {
+          "title": "Supportshostedsearch",
+          "type": "boolean"
+        },
+        "supportsImageDetailOriginal": {
+          "title": "Supportsimagedetailoriginal",
+          "type": "boolean"
+        },
         "supportsStreaming": {
           "title": "Supportsstreaming",
           "type": "boolean"
@@ -3583,15 +3674,19 @@
           "title": "Supportsstructuredoutput",
           "type": "boolean"
         },
-        "visionStatus": {
-          "default": "unverified",
-          "enum": [
-            "supported",
-            "unsupported",
-            "unverified"
+        "webSearchToolType": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
           ],
-          "title": "Visionstatus",
-          "type": "string"
+          "default": null,
+          "title": "Websearchtooltype"
         }
       },
       "required": [
@@ -3601,9 +3696,44 @@
         "local",
         "supportsStreaming",
         "supportsStructuredOutput",
+        "inputModalities",
+        "supportsImageDetailOriginal",
+        "supportsHostedSearch",
+        "supportsFastMode",
         "available"
       ],
       "title": "ModelDescriptor",
+      "type": "object"
+    },
+    "ModelServiceTierDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "id": {
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "description"
+      ],
+      "title": "ModelServiceTierDescriptor",
       "type": "object"
     },
     "ModelsHealthParams": {
@@ -3768,10 +3898,53 @@
     "ModelsListResult": {
       "additionalProperties": false,
       "properties": {
+        "catalogFreshness": {
+          "default": "unavailable",
+          "enum": [
+            "fresh",
+            "stale",
+            "unavailable"
+          ],
+          "title": "Catalogfreshness",
+          "type": "string"
+        },
+        "catalogRevision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "configRevision": {
           "minimum": 0,
           "title": "Configrevision",
           "type": "integer"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorEnvelope"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "fetchedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Rfc3339DateTime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "models": {
           "items": {

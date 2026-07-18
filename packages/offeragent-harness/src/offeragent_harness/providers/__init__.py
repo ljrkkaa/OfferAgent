@@ -1,8 +1,20 @@
 """Model-provider adapters behind the sole ModelGateway port."""
 
 from .codex_subscription import (
+    CODEX_CATALOG_CLIENT_VERSION,
     CODEX_SUBSCRIPTION_BASE_URL,
+    CODEX_SUBSCRIPTION_MODELS_ENDPOINT,
     CODEX_SUBSCRIPTION_PROVIDER_ID,
+    CodexCatalogError,
+    CodexCatalogHttpAdapter,
+    CodexCatalogHttpRequest,
+    CodexCatalogHttpResponse,
+    CodexCatalogModel,
+    CodexCatalogTransportError,
+    CodexModelCatalogSnapshot,
+    CodexModelServiceTier,
+    CodexSubscriptionModelModule,
+    HttpxCodexCatalogHttpAdapter,
 )
 from .composition import compose_model_gateway
 from .deepseek_chat import (
@@ -37,13 +49,25 @@ from .openai_responses import (
 )
 
 __all__ = [
+    "CODEX_CATALOG_CLIENT_VERSION",
     "CODEX_SUBSCRIPTION_BASE_URL",
+    "CODEX_SUBSCRIPTION_MODELS_ENDPOINT",
     "CODEX_SUBSCRIPTION_PROVIDER_ID",
     "DEEPSEEK_BASE_URL",
     "DEEPSEEK_PROVIDER_ID",
+    "CodexCatalogError",
+    "CodexCatalogHttpAdapter",
+    "CodexCatalogHttpRequest",
+    "CodexCatalogHttpResponse",
+    "CodexCatalogModel",
+    "CodexCatalogTransportError",
+    "CodexModelCatalogSnapshot",
+    "CodexModelServiceTier",
     "CodexResponsesProvider",
+    "CodexSubscriptionModelModule",
     "CodexSubscriptionProvider",
     "DeepSeekChatGateway",
+    "HttpxCodexCatalogHttpAdapter",
     "LocalModelProvider",
     "ModelCredentialLease",
     "ModelCredentialSource",

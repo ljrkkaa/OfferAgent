@@ -274,21 +274,29 @@ export default class OfferAgentPlugin extends Plugin {
 
     async listModels(): Promise<readonly ChatModelChoice[]> {
         await this.ensureReady();
-        const settings = snapshotLocalSettings(this.settings);
         const result = requireJsonObject(await (this.runtime as RuntimeBootstrap).harness.request("models/list", {
-            provider: settings.provider,
             includeUnavailable: false,
         }));
         if (!Array.isArray(result.models) || result.models.length > 256) throw new Error("Worker 模型列表无效");
+        const freshness = String(result.catalogFreshness);
+        if (!["fresh", "stale", "unavailable"].includes(freshness)) throw new Error("Worker 模型目录状态无效");
+        if (freshness === "unavailable") {
+            const error = result.error === null || result.error === undefined ? null : requireJsonObject(result.error);
+            const message = error === null ? "Codex 模型目录当前不可用" : requireText(error.userVisibleMessage, "目录错误");
+            throw new Error(message);
+        }
         return result.models.map((raw) => {
             const model = requireJsonObject(raw);
             const provider = requireText(model.provider, "Model provider");
             const modelId = requireText(model.model, "Model id");
             const displayName = requireText(model.displayName, "Model display name");
-            if (provider !== settings.provider || modelId.length > 256 || displayName.length > 512 ||
+            const inputModalities = requireBoundedTextArray(model.inputModalities, "Model input modalities", 16);
+            if (provider !== "codex-subscription-experimental" || modelId.length > 256 || displayName.length > 512 ||
                 typeof model.supportsStreaming !== "boolean" || typeof model.supportsStructuredOutput !== "boolean" ||
-                !["supported", "unsupported", "unverified"].includes(String(model.visionStatus))) {
-                throw new Error("Worker 返回了与当前 Provider 不一致的模型能力");
+                typeof model.supportsImageDetailOriginal !== "boolean" ||
+                typeof model.supportsHostedSearch !== "boolean" || typeof model.supportsFastMode !== "boolean" ||
+                typeof model.available !== "boolean") {
+                throw new Error("Worker 返回了无效的 Codex 模型能力");
             }
             return {
                 provider,
@@ -296,7 +304,14 @@ export default class OfferAgentPlugin extends Plugin {
                 displayName,
                 supportsStreaming: model.supportsStreaming,
                 supportsStructuredOutput: model.supportsStructuredOutput,
-                visionStatus: model.visionStatus as ChatModelChoice["visionStatus"],
+                inputModalities,
+                supportsImageDetailOriginal: model.supportsImageDetailOriginal,
+                supportsHostedSearch: model.supportsHostedSearch,
+                supportsFastMode: model.supportsFastMode,
+                contextWindow: model.contextWindow === null || model.contextWindow === undefined
+                    ? null : requireInteger(model.contextWindow, "Model context window"),
+                available: model.available,
+                catalogFreshness: freshness as ChatModelChoice["catalogFreshness"],
             };
         });
     }
@@ -916,6 +931,16 @@ function requireText(value: JsonValue | undefined, label: string): string {
 function requireInteger(value: JsonValue | undefined, label: string): number {
     if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error(`${label} 无效`);
     return value;
+}
+
+function requireBoundedTextArray(value: JsonValue | undefined, label: string, maximum: number): readonly string[] {
+    if (!Array.isArray(value) || value.length === 0 || value.length > maximum ||
+        value.some((item) => typeof item !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/u.test(item))) {
+        throw new Error(`${label} 无效`);
+    }
+    const result = value as string[];
+    if (new Set(result).size !== result.length) throw new Error(`${label} 无效`);
+    return result;
 }
 
 function requireRunIds(value: JsonValue | undefined): readonly string[] {

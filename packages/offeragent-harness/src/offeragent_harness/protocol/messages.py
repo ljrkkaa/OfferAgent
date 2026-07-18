@@ -817,6 +817,12 @@ class HooksMutationResult(WireModel):
     layer: HookLayerSnapshot
 
 
+class ModelServiceTierDescriptor(WireModel):
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    name: str = Field(min_length=1, max_length=128)
+    description: str = Field(min_length=1, max_length=1024)
+
+
 class ModelDescriptor(WireModel):
     provider: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=256)
@@ -824,9 +830,35 @@ class ModelDescriptor(WireModel):
     local: bool
     supports_streaming: bool
     supports_structured_output: bool
-    vision_status: Literal["supported", "unsupported", "unverified"] = "unverified"
+    input_modalities: list[str] = Field(min_length=1, max_length=16)
+    supports_image_detail_original: bool
+    supports_hosted_search: bool
+    web_search_tool_type: str | None = Field(default=None, min_length=1, max_length=64)
+    context_window: int | None = Field(default=None, ge=1)
+    max_context_window: int | None = Field(default=None, ge=1)
+    effective_context_window_percent: int | None = Field(default=None, ge=1, le=100)
+    additional_speed_tiers: list[str] = Field(default_factory=list, max_length=32)
+    service_tiers: list[ModelServiceTierDescriptor] = Field(default_factory=list, max_length=32)
+    default_service_tier: str | None = Field(default=None, min_length=1, max_length=64)
+    supports_fast_mode: bool
     max_context_tokens: int | None = Field(default=None, ge=1)
     available: bool
+
+    @field_validator("input_modalities", "additional_speed_tiers")
+    @classmethod
+    def _capability_ids_are_unique_and_safe(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("model capability IDs must be unique")
+        if any(re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", item) is None for item in value):
+            raise ValueError("model capability ID is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def _service_tier_ids_are_unique(self) -> ModelDescriptor:
+        ids = [tier.id for tier in self.service_tiers]
+        if len(set(ids)) != len(ids):
+            raise ValueError("model service tier IDs must be unique")
+        return self
 
 
 class ModelsListParams(WireModel):
@@ -837,6 +869,10 @@ class ModelsListParams(WireModel):
 class ModelsListResult(WireModel):
     models: list[ModelDescriptor] = Field(max_length=4096)
     config_revision: int = Field(ge=0)
+    catalog_freshness: Literal["fresh", "stale", "unavailable"] = "unavailable"
+    catalog_revision: Sha256Digest | None = None
+    fetched_at: Rfc3339DateTime | None = None
+    error: ErrorEnvelope | None = None
 
 
 class ModelsHealthParams(WireModel):
