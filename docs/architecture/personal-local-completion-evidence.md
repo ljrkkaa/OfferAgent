@@ -86,10 +86,13 @@ corepack yarn test
 更新必须由 `scripts/update_local_windows_plugin.py` 执行。它应在 Obsidian 和 Runtime 进程退出后重新
 构建、复验并原子切换插件目录，同时把 `data.json` 当作不可读取的不透明文件保护和回滚。
 
-完整产物还应运行 `src/interface/obsidian/scripts/smoke-fused-product.cjs <artifact>`。该烟测不是 mock
-composition：它启动 manifest 固定的冻结 Worker，通过真实 stdio JSON-RPC 和本地 Responses HTTP
-adapter 执行两个 Run，并由真实插件 Vault Change coordinator 完成确认、checkpoint、journal、重启
-恢复和受保护撤销。成功输出必须同时证明来源引用、持久事件重放及 Worker/Process Host 零泄漏。
+完整产物还应运行 `src/interface/obsidian/scripts/smoke-fused-product.cjs <artifact>`。该烟测启动 manifest
+固定的真实冻结 Worker，通过 stdio JSON-RPC 验证 Codex-only 配置形状、策略更新、Session 跨 Worker
+重启持久化和进程回收；同时以真实插件 Vault Change coordinator 验证完整 Review hash、来源绑定、
+checkpoint、journal、条件 CAS，以及公开 Obsidian API 无法 compare-delete 时保留文件并进入人工复核。
+它不会给安装版 Worker 注入隐藏模型后门，也不伪装成真实订阅模型验收。确定性 Codex 目录绑定、
+Responses 编解码与 Agent Loop 由 Python production-composition 集成测试覆盖；目标账户上的真实模型 Run
+仍属于下文的已安装插件 E2E。成功输出必须证明 Worker/Process Host 零泄漏。
 
 ## 已安装插件 E2E
 

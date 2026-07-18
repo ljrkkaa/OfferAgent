@@ -346,6 +346,39 @@ def _semantic_unreadable_script() -> tuple[dict[str, object], ...]:
     )
 
 
+def _attachment_authority_mismatch_script() -> tuple[dict[str, object], ...]:
+    return (
+        _agent_step(
+            _tool_call(
+                "agent_contract.read",
+                {},
+                "Read the Vault Agent Contract before taking action.",
+            )
+        ),
+        _agent_step(
+            _tool_call(
+                "planning_memory.list",
+                {},
+                "Check bounded Planning Memory metadata before planning the ingestion.",
+            )
+        ),
+        _agent_step(
+            _tool_call(
+                "interview_catalog.search",
+                {
+                    "sourceUrls": [RAW_SOURCE_URL],
+                    "orderedImageContentHashes": [PAGE_ONE_HASH],
+                    "company": "unknown",
+                    "role": "unknown",
+                    "questionTerms": ["Node.js event loop"],
+                },
+                "Attempt to omit the second Store-authoritative page.",
+            )
+        ),
+        _agent_step(final_response="附件权威校验拒绝了不完整的图片清单；未产生任何变更。"),  # noqa: RUF001
+    )
+
+
 class _DeterministicScriptedGateway:
     """A request-recording Model boundary with an exact AgentStep script."""
 
@@ -434,6 +467,7 @@ class _FakePluginToolAdapter(RecordingEventSink):
         self._handled_event_ids: set[str] = set()
         self._completion_tasks: list[asyncio.Task[object]] = []
         self.started_calls: list[dict[str, Any]] = []
+        self.executed_calls: list[dict[str, Any]] = []
         self.catalog_result: dict[str, object] | None = None
 
     async def publish(self, events: Sequence[StoredEvent]) -> None:
@@ -448,6 +482,7 @@ class _FakePluginToolAdapter(RecordingEventSink):
             self._completion_tasks.append(asyncio.create_task(self._complete(call)))
 
     async def _complete(self, call: Mapping[str, Any]) -> None:
+        self.executed_calls.append(dict(call))
         result = self._result_for(call)
         await self._executor.complete(
             PluginToolCompletion(
@@ -840,6 +875,18 @@ async def test_public_turn_atomically_ingests_one_ordered_multi_image_interview_
         await harness.shutdown()
 
     gateway.assert_exhausted()
+    capability_record = await SqliteUnitOfWorkFactory(state_path).get_entity(
+        "run_capability_snapshots",
+        run_id,
+    )
+    assert isinstance(capability_record, Mapping)
+    capability_snapshot = cast(dict[str, Any], capability_record["snapshot"])
+    assert capability_snapshot["interviewSubmissionAuthority"] == {
+        "schemaVersion": 1,
+        "capturedOn": "2026-07-18",
+        "orderedImageContentHashes": [PAGE_ONE_HASH, PAGE_TWO_HASH],
+        "sourceFingerprint": SOURCE_FINGERPRINT,
+    }
     _assert_user_owned_ordered_images(
         gateway.requests[0],
         (PAGE_ONE, PAGE_TWO),
@@ -982,3 +1029,35 @@ async def test_public_turn_rejects_semantically_unreadable_second_page_without_p
     assert "未产生任何变更" in state.assistant_text
     assert "interview_catalog.search" not in started_names
     assert "vault.changes.apply" not in started_names
+
+
+@pytest.mark.asyncio
+async def test_public_turn_rejects_model_dropped_attachment_before_plugin_tool_started(
+    tmp_path: Path,
+) -> None:
+    gateway = _DeterministicScriptedGateway(_attachment_authority_mismatch_script(), (0, 1, 2, 3))
+    harness, dispatcher, attachments, adapter, _, _ = _runtime(tmp_path, gateway)
+    try:
+        run_id = await _start_submission(
+            harness,
+            dispatcher,
+            attachments,
+            (PAGE_ONE, PAGE_TWO),
+            turn_id="turn_interview_authority_mismatch",
+        )
+        status = await _wait_terminal(harness, run_id)
+        await adapter.join()
+        state = await harness.get_run_state(run_id)
+    finally:
+        await harness.shutdown()
+
+    gateway.assert_exhausted()
+    assert status is RunStatus.COMPLETED
+    started_names = [cast(str, call["name"]) for call in adapter.started_calls]
+    executed_names = [cast(str, call["name"]) for call in adapter.executed_calls]
+    assert started_names == ["agent_contract.read", "planning_memory.list"]
+    assert executed_names == ["agent_contract.read", "planning_memory.list"]
+    assert "interview_catalog.search" not in started_names
+    assert "interview_catalog.search" not in executed_names
+    assert "vault.changes.apply" not in started_names
+    assert state.assistant_text == "附件权威校验拒绝了不完整的图片清单；未产生任何变更。"  # noqa: RUF001

@@ -2,7 +2,6 @@ import { Buffer } from "node:buffer";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
-import { isIP } from "node:net";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual, promisify } from "node:util";
 import * as os from "node:os";
@@ -15,6 +14,7 @@ import type {
     SideEffect,
     ToolResultDescriptor,
 } from "./generated_protocol";
+import { validateCanonicalInterviewSourceIdentity } from "./interview_source_identity";
 import { failed, hasExtraKeys } from "./plugin_tool_results";
 
 const execFileAsync = promisify(execFile);
@@ -73,7 +73,7 @@ export type ConditionalVaultMutation =
     };
 
 export type ConditionalMutationOutcome =
-    | { readonly status: "applied" }
+    | { readonly status: "applied"; readonly applied: VaultIdentity }
     | { readonly status: "conflict"; readonly observed: VaultIdentity }
     | { readonly status: "unknown"; readonly observed: VaultIdentity | null }
     | { readonly status: "unsupported"; readonly operation: "delete" };
@@ -82,7 +82,6 @@ export interface VaultChangePort {
     read(path: string): Promise<string | undefined>;
     snapshot(path: string): Promise<VaultChangeSnapshot>;
     applyConditional(mutation: ConditionalVaultMutation): Promise<ConditionalMutationOutcome>;
-    restore(path: string, content: string | undefined): Promise<void>;
 }
 
 export interface VaultCheckpointStore {
@@ -94,6 +93,7 @@ export interface VaultChangeJournalStore {
     load(batchId: string): Promise<VaultChangeJournalRecord | undefined>;
     save(record: VaultChangeJournalRecord): Promise<void>;
     listUnresolved(): Promise<VaultChangeJournalRecord[]>;
+    findInterviewSubmissionByRootRun(rootRunId: string): Promise<VaultChangeJournalRecord | undefined>;
 }
 
 export interface VaultChangeAuthorizationProposal {
@@ -104,10 +104,27 @@ export interface VaultChangeAuthorizationProposal {
     readonly paths: readonly string[];
     readonly categorizedTargets: readonly VaultChangeCategorizedTarget[];
     readonly sourceBindings: readonly VaultChangeSourceBinding[];
-    readonly diff: string;
+    readonly interviewSubmission: VaultChangeInterviewSubmissionReceipt | null;
+    readonly reviewTargets: readonly VaultChangeReviewTarget[];
+    readonly reviewHash: string;
     readonly controlFiles: boolean;
     readonly memoryDelete: boolean;
 }
+
+export interface VaultChangeReviewTarget {
+    readonly operation: Operation["op"];
+    readonly path: string;
+    readonly beforeContent: string | null;
+    readonly afterContent: string | null;
+    readonly beforeContentHash: string;
+    readonly afterContentHash: string;
+    readonly beforeModifiedVersion: string;
+}
+
+export type VaultChangeAuthorizationDecision = {
+    readonly decision: "accept" | "reject";
+    readonly reviewHash: string;
+};
 
 export interface VaultChangeCategorizedTarget {
     readonly path: string;
@@ -123,7 +140,7 @@ export interface VaultChangeSourceBinding {
     readonly expectedContentHash: string;
 }
 
-interface InterviewSubmissionMetadata {
+export interface VaultChangeInterviewSubmissionReceipt {
     readonly sourceKind: "text" | "public_url" | "ordered_images" | "mixed";
     readonly capturedOn: string;
     readonly canonicalUrls: readonly string[];
@@ -136,7 +153,9 @@ export interface VaultChangeCoordinatorOptions {
     readonly checkpoints: VaultCheckpointStore;
     readonly journal: VaultChangeJournalStore;
     readonly permissionMode: () => VaultPermissionMode;
-    readonly authorize?: (proposal: VaultChangeAuthorizationProposal) => Promise<boolean>;
+    readonly authorize?: (
+        proposal: VaultChangeAuthorizationProposal,
+    ) => Promise<VaultChangeAuthorizationDecision>;
     readonly injectCrash?: (point: VaultChangeCrashPoint, path?: string) => void;
 }
 
@@ -206,8 +225,7 @@ interface PreparedBatch {
     readonly targets: readonly PreparedTarget[];
     readonly categorizedTargets: readonly VaultChangeCategorizedTarget[];
     readonly sourceBindings: readonly VaultChangeSourceBinding[];
-    readonly interviewSubmission?: InterviewSubmissionMetadata;
-    readonly diff: string;
+    readonly interviewSubmission?: VaultChangeInterviewSubmissionReceipt;
     readonly controlFiles: boolean;
     readonly memoryDelete: boolean;
 }
@@ -217,6 +235,8 @@ export interface VaultChangeJournalTarget {
     readonly path: string;
     readonly beforeHash: string;
     readonly afterHash: string;
+    readonly beforeModifiedVersion?: string;
+    readonly afterModifiedVersion?: string | null;
 }
 
 export type VaultChangeJournalState =
@@ -225,15 +245,19 @@ export type VaultChangeJournalState =
     | "applied"
     | "undoing"
     | "rolled_back"
+    | "rejected"
     | "undone"
     | "recovery_failed";
 
 export interface VaultChangeJournalRecord {
-    readonly version: 1;
+    readonly version: 1 | 2;
     readonly batchId: string;
     readonly toolCallId: string;
     readonly workspaceId: string;
     readonly runId: string;
+    readonly rootRunId?: string;
+    readonly changeKind?: VaultChangeKind;
+    readonly reviewHash?: string;
     readonly argsHash: string;
     readonly idempotencyKey: string;
     readonly state: VaultChangeJournalState;
@@ -338,47 +362,77 @@ export class VaultChangeCoordinator {
         } catch (error) {
             return validationFailure(call, error);
         }
-        const confirmationRequired = this.options.permissionMode() === "ask_every_time" ||
-            prepared.changeKind === "interview_submission" || prepared.controlFiles || prepared.memoryDelete;
-        if (confirmationRequired) {
-            const accepted = this.options.authorize === undefined ? false : await this.options.authorize({
-                batchId: prepared.batchId,
-                argsHash: call.argsHash,
-                changeKind: prepared.changeKind,
-                task: prepared.task,
-                paths: prepared.targets.map((target) => target.path),
-                categorizedTargets: prepared.categorizedTargets,
-                sourceBindings: prepared.sourceBindings,
-                diff: prepared.diff,
-                controlFiles: prepared.controlFiles,
-                memoryDelete: prepared.memoryDelete,
-            });
-            if (!accepted) return failed(call, "policy.denied", "Vault Change Batch was not approved by the plugin.", false, "denied");
-            try {
-                await this.revalidate(prepared);
-            } catch (error) {
-                return validationFailure(call, error);
+        const rootRunId = call.agentLineage[0];
+        if (!boundedIdentifier(rootRunId)) {
+            return failed(call, "protocol.invalid_params", "Vault Change root Run identity is invalid.");
+        }
+        const proposal = authorizationProposal(prepared, call.argsHash);
+        if (prepared.changeKind === "interview_submission") {
+            const reserved = await this.options.journal.findInterviewSubmissionByRootRun(rootRunId);
+            if (reserved !== undefined) {
+                return failed(
+                    call,
+                    "resource.conflict",
+                    "This root Agent Run already proposed an Interview Submission batch.",
+                );
             }
         }
-
         let record: VaultChangeJournalRecord = {
-            version: 1,
+            version: 2,
             batchId,
             toolCallId: call.toolCallId,
             workspaceId: call.workspaceId,
             runId: call.runId,
+            rootRunId,
+            changeKind: prepared.changeKind,
+            reviewHash: proposal.reviewHash,
             argsHash: call.argsHash,
             idempotencyKey: call.idempotencyKey,
             state: "prepared",
             checkpointRef: null,
-            targets: prepared.targets.map(({ operation, path, beforeHash, afterHash }) => ({
-                operation, path, beforeHash, afterHash,
+            targets: prepared.targets.map(({
+                operation, path, beforeHash, afterHash, beforeModifiedVersion,
+            }) => ({
+                operation,
+                path,
+                beforeHash,
+                afterHash,
+                beforeModifiedVersion,
+                afterModifiedVersion: null,
             })),
             appliedPaths: [],
             manualReviewPaths: [],
         };
         await this.options.journal.save(record);
         this.inject("after-prepared-journal");
+        const confirmationRequired = this.options.permissionMode() === "ask_every_time" ||
+            prepared.changeKind === "interview_submission" || prepared.controlFiles || prepared.memoryDelete;
+        if (confirmationRequired) {
+            const decision = this.options.authorize === undefined
+                ? { decision: "reject" as const, reviewHash: proposal.reviewHash }
+                : await this.options.authorize(proposal);
+            if (decision.reviewHash !== proposal.reviewHash) {
+                record = { ...record, state: "rejected" };
+                await this.options.journal.save(record);
+                return failed(
+                    call,
+                    "resource.conflict",
+                    "Vault Change authorization does not match the exact reviewed batch.",
+                );
+            }
+            if (decision.decision !== "accept") {
+                record = { ...record, state: "rejected" };
+                await this.options.journal.save(record);
+                return failed(call, "policy.denied", "Vault Change Batch was not approved by the plugin.", false, "denied");
+            }
+            try {
+                await this.revalidate(prepared);
+            } catch (error) {
+                record = { ...record, state: "rolled_back" };
+                await this.options.journal.save(record);
+                return validationFailure(call, error);
+            }
+        }
         try {
             const checkpointRef = await this.options.checkpoints.create(
                 batchId,
@@ -400,7 +454,14 @@ export class VaultChangeCoordinator {
             for (const target of prepared.targets) {
                 await this.revalidateSources(prepared, new Set(record.appliedPaths.map((path) => path.toLocaleLowerCase())));
                 await this.revalidateTarget(target);
-                await this.applyConditional(target);
+                const appliedIdentity = await this.applyConditional(target);
+                record = {
+                    ...record,
+                    targets: record.targets.map((candidate) => candidate.path === target.path
+                        ? { ...candidate, afterModifiedVersion: appliedIdentity.modifiedVersion }
+                        : candidate),
+                };
+                await this.options.journal.save(record);
                 this.inject("after-target-write", target.path);
                 record = { ...record, appliedPaths: [...record.appliedPaths, target.path] };
                 await this.options.journal.save(record);
@@ -420,10 +481,10 @@ export class VaultChangeCoordinator {
                 try {
                     await this.rollback(record, true);
                     record = { ...record, appliedPaths: [] };
-                } catch {
+                } catch (rollbackError) {
                     manualReviewPaths = [...new Set([
                         error.path,
-                        ...record.appliedPaths,
+                        ...(rollbackError instanceof UndoConflictError ? rollbackError.paths : record.appliedPaths),
                         ...await this.unexpectedPaths(record),
                     ])];
                 }
@@ -445,9 +506,12 @@ export class VaultChangeCoordinator {
                 return error instanceof ChangeValidationError
                     ? validationFailure(call, error)
                     : failed(call, "tool.failed", "Vault Change Batch failed and was rolled back.");
-            } catch {
+            } catch (rollbackError) {
                 this.writesLatched = true;
-                const manualReviewPaths = await this.unexpectedPaths(record);
+                const manualReviewPaths = [...new Set([
+                    ...(rollbackError instanceof UndoConflictError ? rollbackError.paths : []),
+                    ...await this.unexpectedPaths(record),
+                ])];
                 record = { ...record, state: "recovery_failed", manualReviewPaths };
                 await this.options.journal.save(record);
                 return failed(
@@ -503,6 +567,7 @@ export class VaultChangeCoordinator {
                 reports.push({ batchId: record.batchId, state: "applied", manualReviewPaths: [] });
                 continue;
             }
+            let rollbackConflicts: readonly string[] = [];
             if (allKnown) {
                 try {
                     await this.rollback(record);
@@ -510,13 +575,13 @@ export class VaultChangeCoordinator {
                     await this.options.journal.save(record);
                     reports.push({ batchId: record.batchId, state: "rolled_back", manualReviewPaths: [] });
                     continue;
-                } catch {
-                    // Fall through to a bounded manual-review report.
+                } catch (error) {
+                    rollbackConflicts = error instanceof UndoConflictError ? error.paths : [];
                 }
             }
-            const manualReviewPaths = record.targets
+            const manualReviewPaths = [...new Set([...rollbackConflicts, ...record.targets
                 .filter((_target, index) => states[index] === "unexpected")
-                .map((target) => target.path);
+                .map((target) => target.path)])];
             record = { ...record, state: "recovery_failed", manualReviewPaths };
             await this.options.journal.save(record);
             reports.push({ batchId: record.batchId, state: "recovery_failed", manualReviewPaths });
@@ -536,11 +601,13 @@ export class VaultChangeCoordinator {
         const conflicts: string[] = [];
         const diffs: string[] = [];
         for (const target of record.targets) {
-            const current = await this.options.vault.read(target.path);
-            if (contentIdentity(current) !== target.afterHash) {
+            const current = await this.options.vault.snapshot(target.path);
+            if (contentIdentity(current.content) !== target.afterHash ||
+                target.afterModifiedVersion === null || target.afterModifiedVersion === undefined ||
+                current.modifiedVersion !== target.afterModifiedVersion) {
                 conflicts.push(target.path);
                 const before = await this.options.checkpoints.read(record.checkpointRef, target.path);
-                diffs.push(conflictDiff(target.path, current, before));
+                diffs.push(conflictDiff(target.path, current.content, before));
             }
         }
         if (conflicts.length > 0) {
@@ -654,11 +721,10 @@ export class VaultChangeCoordinator {
         }
         validatePlanningMemoryDeletes(targets);
         if (changeKind === "interview_submission") {
-            assertInterviewSubmission(targets, interviewSubmission as InterviewSubmissionMetadata);
+            assertInterviewSubmission(targets, interviewSubmission as VaultChangeInterviewSubmissionReceipt);
         } else if (targets.some(isInterviewExperienceTarget)) {
             invalid("Interview Experience ingestion must use changeKind 'interview_submission'.");
         }
-        const diff = batchDiff(targets);
         return {
             batchId,
             changeKind,
@@ -673,7 +739,6 @@ export class VaultChangeCoordinator {
             })),
             sourceBindings,
             interviewSubmission,
-            diff,
             controlFiles: paths.some(isControlPath),
             memoryDelete: deletes.length > 0,
         };
@@ -712,7 +777,7 @@ export class VaultChangeCoordinator {
         );
     }
 
-    private async applyConditional(target: PreparedTarget): Promise<void> {
+    private async applyConditional(target: PreparedTarget): Promise<VaultIdentity> {
         const expected = {
             contentHash: target.beforeHash,
             modifiedVersion: target.beforeModifiedVersion,
@@ -733,7 +798,13 @@ export class VaultChangeCoordinator {
         } catch (error) {
             return this.classifyMutationFailure(target, error);
         }
-        if (outcome.status === "applied") return;
+        if (outcome.status === "applied") {
+            if (outcome.applied.contentHash !== target.afterHash ||
+                !MODIFIED_VERSION.test(outcome.applied.modifiedVersion)) {
+                throw new AmbiguousWriteOutcomeError(target.path);
+            }
+            return outcome.applied;
+        }
         if (outcome.status === "unknown") throw new AmbiguousWriteOutcomeError(target.path);
         if (outcome.status === "unsupported") {
             throw new ChangeValidationError(
@@ -783,6 +854,9 @@ export class VaultChangeCoordinator {
             return failed(call, "resource.conflict", "Vault Change Batch identity conflicts with a durable record.");
         }
         if (record.state === "applied") return success(call, record);
+        if (record.state === "rejected") {
+            return failed(call, "policy.denied", "Vault Change Batch was not approved by the plugin.", false, "denied");
+        }
         if (["prepared", "applying", "undoing", "recovery_failed"].includes(record.state)) {
             return failed(
                 call,
@@ -799,22 +873,23 @@ export class VaultChangeCoordinator {
         if (record.state !== "undoing" || record.checkpointRef === null) throw new Error("undo journal is not recoverable");
         let currentRecord = record;
         for (const target of [...record.targets].reverse()) {
-            const current = await this.options.vault.read(target.path);
-            const identity = contentIdentity(current);
+            const current = await this.options.vault.snapshot(target.path);
+            const identity = contentIdentity(current.content);
             if (identity !== target.beforeHash && identity !== target.afterHash) {
                 throw new UndoConflictError([target.path]);
             }
             if (identity === target.afterHash) {
+                if (target.afterModifiedVersion === null || target.afterModifiedVersion === undefined ||
+                    current.modifiedVersion !== target.afterModifiedVersion) {
+                    throw new UndoConflictError([target.path]);
+                }
                 const before = await this.options.checkpoints.read(record.checkpointRef, target.path);
                 if (target.beforeHash !== "absent" &&
                     (before === undefined || contentIdentity(before) !== target.beforeHash)) {
                     throw new Error(`checkpoint mismatch: ${target.path}`);
                 }
-                await this.options.vault.restore(target.path, before);
+                await this.reverseConditional(target, before);
                 this.inject("after-undo-target-write", target.path);
-                if (contentIdentity(await this.options.vault.read(target.path)) !== target.beforeHash) {
-                    throw new Error(`undo verification failed: ${target.path}`);
-                }
             }
             currentRecord = {
                 ...currentRecord,
@@ -836,30 +911,61 @@ export class VaultChangeCoordinator {
         }
         const applied = new Set(record.appliedPaths.map((path) => path.toLocaleLowerCase()));
         for (const target of [...record.targets].reverse()) {
-            const current = await this.options.vault.read(target.path);
-            const identity = contentIdentity(current);
+            const current = await this.options.vault.snapshot(target.path);
+            const identity = contentIdentity(current.content);
             if (identity === target.beforeHash) continue;
             if (identity !== target.afterHash) {
                 if (!applied.has(target.path.toLocaleLowerCase())) continue;
-                throw new Error(`unexpected target state: ${target.path}`);
+                throw new UndoConflictError([target.path]);
             }
             if (recordedOnly && !applied.has(target.path.toLocaleLowerCase())) continue;
+            if (target.afterModifiedVersion === null || target.afterModifiedVersion === undefined ||
+                current.modifiedVersion !== target.afterModifiedVersion) {
+                throw new UndoConflictError([target.path]);
+            }
             const before = await this.options.checkpoints.read(record.checkpointRef, target.path);
             if (target.beforeHash !== "absent" &&
                 (before === undefined || contentIdentity(before) !== target.beforeHash)) {
                 throw new Error(`checkpoint mismatch: ${target.path}`);
             }
-            await this.options.vault.restore(target.path, before);
-            if (contentIdentity(await this.options.vault.read(target.path)) !== target.beforeHash) {
-                throw new Error(`rollback verification failed: ${target.path}`);
-            }
+            await this.reverseConditional(target, before);
+        }
+    }
+
+    private async reverseConditional(target: VaultChangeJournalTarget, before: string | undefined): Promise<void> {
+        if (target.afterModifiedVersion === null || target.afterModifiedVersion === undefined) {
+            throw new UndoConflictError([target.path]);
+        }
+        const expected = { contentHash: target.afterHash, modifiedVersion: target.afterModifiedVersion };
+        const mutation: ConditionalVaultMutation = target.beforeHash === "absent"
+            ? { kind: "delete", path: target.path, expected }
+            : target.afterHash === "absent"
+                ? {
+                    kind: "create",
+                    path: target.path,
+                    expected: { contentHash: "absent", modifiedVersion: "missing" },
+                    afterContent: before as string,
+                }
+                : { kind: "modify", path: target.path, expected, afterContent: before as string };
+        let outcome: ConditionalMutationOutcome;
+        try {
+            outcome = await this.options.vault.applyConditional(mutation);
+        } catch {
+            throw new UndoConflictError([target.path]);
+        }
+        if (outcome.status !== "applied" || outcome.applied.contentHash !== target.beforeHash) {
+            throw new UndoConflictError([target.path]);
         }
     }
 
     private async observedTargetStates(record: VaultChangeJournalRecord): Promise<("before" | "after" | "unexpected")[]> {
         return Promise.all(record.targets.map(async (target) => {
-            const identity = contentIdentity(await this.options.vault.read(target.path));
-            return identity === target.beforeHash ? "before" : identity === target.afterHash ? "after" : "unexpected";
+            const snapshot = await this.options.vault.snapshot(target.path);
+            const identity = contentIdentity(snapshot.content);
+            if (identity === target.beforeHash) return "before";
+            return identity === target.afterHash && target.afterModifiedVersion !== null &&
+                target.afterModifiedVersion !== undefined && snapshot.modifiedVersion === target.afterModifiedVersion
+                ? "after" : "unexpected";
         }));
     }
 
@@ -965,125 +1071,43 @@ function parseSourceBinding(value: unknown): VaultChangeSourceBinding {
     };
 }
 
-function parseInterviewSubmission(value: unknown): InterviewSubmissionMetadata {
+function parseInterviewSubmission(value: unknown): VaultChangeInterviewSubmissionReceipt {
     if (!isRecord(value) || hasExtraKeys(value, [
         "sourceKind", "capturedOn", "canonicalUrls", "orderedImageContentHashes", "sourceFingerprint",
     ])) invalid("Interview Submission metadata is invalid.");
     const sourceKind = value.sourceKind;
     if (!["text", "public_url", "ordered_images", "mixed"].includes(String(sourceKind)) ||
-        typeof value.capturedOn !== "string" || !calendarDate(value.capturedOn) ||
-        !Array.isArray(value.canonicalUrls) || value.canonicalUrls.length > 20 ||
-        !Array.isArray(value.orderedImageContentHashes) || value.orderedImageContentHashes.length > 20 ||
-        value.canonicalUrls.some((url) => !canonicalPublicUrl(url)) ||
-        value.orderedImageContentHashes.some((hash) => typeof hash !== "string" || !DIGEST.test(hash)) ||
-        new Set(value.canonicalUrls).size !== value.canonicalUrls.length ||
-        (value.sourceFingerprint !== null &&
-            (typeof value.sourceFingerprint !== "string" || !DIGEST.test(value.sourceFingerprint)))) {
+        typeof value.capturedOn !== "string" || !calendarDate(value.capturedOn)) {
         invalid("Interview Submission source manifest is invalid.");
     }
-    const canonicalUrls = value.canonicalUrls as string[];
-    const orderedImageContentHashes = value.orderedImageContentHashes as string[];
+    const identity = validateCanonicalInterviewSourceIdentity({
+        canonicalUrls: value.canonicalUrls,
+        orderedImageContentHashes: value.orderedImageContentHashes,
+        sourceFingerprint: value.sourceFingerprint,
+    });
+    if (identity === null) {
+        invalid("Interview Submission source manifest is invalid.");
+    }
+    const { canonicalUrls, orderedImageContentHashes, sourceFingerprint } = identity;
     if ((sourceKind === "text" && (canonicalUrls.length > 0 || orderedImageContentHashes.length > 0)) ||
         (sourceKind === "public_url" && (canonicalUrls.length < 1 || orderedImageContentHashes.length > 0)) ||
         (sourceKind === "ordered_images" && (canonicalUrls.length > 0 || orderedImageContentHashes.length < 1 ||
-            value.sourceFingerprint === null)) ||
+            sourceFingerprint === null)) ||
         (sourceKind === "mixed" && canonicalUrls.length + orderedImageContentHashes.length < 1)) {
         invalid("Interview Submission source kind does not match its manifest.");
     }
-    if ((orderedImageContentHashes.length === 0 && value.sourceFingerprint !== null) ||
-        (orderedImageContentHashes.length > 0 &&
-            value.sourceFingerprint !== orderedImageFingerprint(orderedImageContentHashes))) {
-        invalid("Interview Submission image fingerprint does not match its ordered image manifest.");
-    }
     return {
-        sourceKind: sourceKind as InterviewSubmissionMetadata["sourceKind"],
+        sourceKind: sourceKind as VaultChangeInterviewSubmissionReceipt["sourceKind"],
         capturedOn: value.capturedOn,
         canonicalUrls,
         orderedImageContentHashes,
-        sourceFingerprint: value.sourceFingerprint as string | null,
+        sourceFingerprint,
     };
-}
-
-function orderedImageFingerprint(contentHashes: readonly string[]): string {
-    const hash = createHash("sha256");
-    contentHashes.forEach((contentHash, order) => {
-        hash.update(`${order}\0${contentHash}\n`, "utf8");
-    });
-    return `sha256:${hash.digest("hex")}`;
-}
-
-function canonicalPublicUrl(value: unknown): boolean {
-    if (typeof value !== "string" || !value || Buffer.byteLength(value, "utf8") > 2_048) return false;
-    try {
-        const url = new URL(value);
-        if (!["http:", "https:"].includes(url.protocol) || url.username || url.password ||
-            !publicHostname(url.hostname)) return false;
-        url.hash = "";
-        url.hostname = url.hostname.toLocaleLowerCase();
-        const retained = [...url.searchParams.entries()]
-            .map(([key, item], index) => ({ key, item, index }))
-            .filter(({ key }) => !isDiscardedQueryParameter(key))
-            .sort((left, right) => compareCodePoints(left.key, right.key) ||
-                compareCodePoints(left.item, right.item) || left.index - right.index);
-        url.search = "";
-        for (const { key, item } of retained) url.searchParams.append(key, item);
-        return url.href === value;
-    } catch {
-        return false;
-    }
-}
-
-function compareCodePoints(left: string, right: string): number {
-    return left < right ? -1 : left > right ? 1 : 0;
-}
-
-function publicHostname(value: string): boolean {
-    const hostname = value.toLocaleLowerCase().replace(/^\[|\]$/gu, "");
-    const version = isIP(hostname);
-    if (version === 4) return publicIpv4(hostname);
-    if (version === 6) return publicIpv6(hostname);
-    if (!hostname.includes(".") || hostname.startsWith(".") || hostname.endsWith(".")) return false;
-    return !/\.(?:home|internal|invalid|lan|local|localhost|test|example)$/iu.test(hostname);
-}
-
-function publicIpv4(value: string): boolean {
-    const [first, second, third] = value.split(".").map(Number);
-    return first !== 0 && first !== 10 && first !== 127 && first < 224 &&
-        !(first === 100 && second >= 64 && second <= 127) &&
-        !(first === 169 && second === 254) &&
-        !(first === 172 && second >= 16 && second <= 31) &&
-        !(first === 192 && (second === 0 || second === 168)) &&
-        !(first === 198 && (second === 18 || second === 19 || (second === 51 && third === 100))) &&
-        !(first === 203 && second === 0 && third === 113);
-}
-
-function publicIpv6(value: string): boolean {
-    if (value === "::" || value === "::1") return false;
-    if (value.startsWith("::ffff:")) {
-        const tail = value.slice("::ffff:".length);
-        if (isIP(tail) === 4) return publicIpv4(tail);
-        const mapped = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/iu.exec(tail);
-        if (mapped === null) return false;
-        const high = Number.parseInt(mapped[1], 16);
-        const low = Number.parseInt(mapped[2], 16);
-        return publicIpv4(`${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`);
-    }
-    if (value.startsWith("::")) return false;
-    const first = Number.parseInt(value.split(":", 1)[0] || "0", 16);
-    return !(first >= 0xfc00 && first <= 0xfdff) &&
-        !(first >= 0xfe80 && first <= 0xfebf) &&
-        !(first >= 0xff00) &&
-        !value.startsWith("2001:db8:");
-}
-
-function isDiscardedQueryParameter(value: string): boolean {
-    return /^(utm_.+|spm|from|source|ref|fbclid|gclid|dclid|yclid|mc_cid|mc_eid|igshid|msclkid|ttclid|twclid)$/iu.test(value) ||
-        /^(token|(?:access|refresh|id|session|security)[_-]?token|auth(?:orization)?|api[_-]?key|credential|signature|sig|expires?|expiry|awsaccesskeyid|googleaccessid|key-pair-id|policy|x-amz-.+|x-goog-.+)$/iu.test(value);
 }
 
 function assertInterviewSubmission(
     targets: readonly PreparedTarget[],
-    submission: InterviewSubmissionMetadata,
+    submission: VaultChangeInterviewSubmissionReceipt,
 ): void {
     const experiences = targets.filter(isInterviewExperienceTarget);
     if (experiences.length !== 1 || experiences[0].operation !== "create" ||
@@ -1356,15 +1380,34 @@ function digest(content: string | Buffer): string {
     return `sha256:${createHash("sha256").update(content).digest("hex")}`;
 }
 
-function batchDiff(targets: readonly PreparedTarget[]): string {
-    const sections = targets.map((target) => [
-        `--- before/${target.path}`,
-        `+++ after/${target.path}`,
-        `@@ ${target.operation} @@`,
-        ...(target.beforeContent ?? "").split(/\r?\n/u).slice(0, 100).map((line) => `-${line}`),
-        ...(target.afterContent ?? "").split(/\r?\n/u).slice(0, 100).map((line) => `+${line}`),
-    ].join("\n"));
-    return truncateUtf8(sections.join("\n"), MAX_DIFF_BYTES);
+function authorizationProposal(
+    prepared: PreparedBatch,
+    argsHash: string,
+): VaultChangeAuthorizationProposal {
+    const reviewTargets: VaultChangeReviewTarget[] = prepared.targets.map((target) => ({
+        operation: target.operation,
+        path: target.path,
+        beforeContent: target.beforeContent ?? null,
+        afterContent: target.afterContent ?? null,
+        beforeContentHash: target.beforeHash,
+        afterContentHash: target.afterHash,
+        beforeModifiedVersion: target.beforeModifiedVersion,
+    }));
+    const reviewed = {
+        version: 1,
+        batchId: prepared.batchId,
+        argsHash,
+        changeKind: prepared.changeKind,
+        task: prepared.task,
+        paths: prepared.targets.map((target) => target.path),
+        categorizedTargets: prepared.categorizedTargets,
+        sourceBindings: prepared.sourceBindings,
+        interviewSubmission: prepared.interviewSubmission ?? null,
+        reviewTargets,
+        controlFiles: prepared.controlFiles,
+        memoryDelete: prepared.memoryDelete,
+    } as const;
+    return { ...reviewed, reviewHash: digest(JSON.stringify(reviewed)) };
 }
 
 function conflictDiff(path: string, current: string | undefined, before: string | undefined): string {
@@ -1556,9 +1599,22 @@ export class FileVaultChangeJournal implements VaultChangeJournalStore {
     }
 
     async listUnresolved(): Promise<VaultChangeJournalRecord[]> {
+        return (await this.listRecords()).filter((record) =>
+            ["prepared", "applying", "undoing", "recovery_failed"].includes(record.state),
+        );
+    }
+
+    async findInterviewSubmissionByRootRun(rootRunId: string): Promise<VaultChangeJournalRecord | undefined> {
+        if (!boundedIdentifier(rootRunId)) throw new Error("journal root Run ID is invalid");
+        return (await this.listRecords()).find((record) =>
+            record.version === 2 && record.changeKind === "interview_submission" &&
+            record.rootRunId === rootRunId,
+        );
+    }
+
+    private async listRecords(): Promise<VaultChangeJournalRecord[]> {
         let names: string[];
         try {
-            const { readdir } = await import("node:fs/promises");
             names = await readdir(this.directory);
         } catch (error) {
             if (isNodeError(error) && error.code === "ENOENT") return [];
@@ -1568,9 +1624,7 @@ export class FileVaultChangeJournal implements VaultChangeJournalStore {
         for (const name of names.sort()) {
             if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.json$/u.test(name)) continue;
             const record = await this.load(name.slice(0, -5));
-            if (record !== undefined && ["prepared", "applying", "undoing", "recovery_failed"].includes(record.state)) {
-                records.push(record);
-            }
+            if (record !== undefined) records.push(record);
         }
         return records;
     }
@@ -1580,13 +1634,21 @@ function parseJournal(value: unknown): VaultChangeJournalRecord {
     const malformed = (): never => { throw new Error("Vault Change journal record is malformed"); };
     if (!isRecord(value)) malformed();
     const record = value as Record<string, unknown>;
+    const version = record.version;
     if (hasExtraKeys(record, [
         "version", "batchId", "toolCallId", "workspaceId", "runId", "argsHash", "idempotencyKey", "state",
-        "checkpointRef", "targets", "appliedPaths", "manualReviewPaths",
-    ]) || record.version !== 1 || typeof record.batchId !== "string" || !BATCH_ID.test(record.batchId) ||
+        "checkpointRef", "targets", "appliedPaths", "manualReviewPaths", "rootRunId", "changeKind", "reviewHash",
+    ]) || ![1, 2].includes(Number(version)) ||
+        (version === 1 && ["rootRunId", "changeKind", "reviewHash"].some((key) =>
+            Object.prototype.hasOwnProperty.call(record, key))) ||
+        (version === 2 && (!boundedIdentifier(record.rootRunId) ||
+            !["general", "interview_submission"].includes(String(record.changeKind)) ||
+            typeof record.reviewHash !== "string" || !DIGEST.test(record.reviewHash))) ||
+        typeof record.batchId !== "string" || !BATCH_ID.test(record.batchId) ||
         !boundedIdentifier(record.toolCallId) || !boundedIdentifier(record.workspaceId) || !boundedIdentifier(record.runId) ||
         typeof record.argsHash !== "string" || !DIGEST.test(record.argsHash) || !boundedIdentifier(record.idempotencyKey) ||
-        !["prepared", "applying", "applied", "undoing", "rolled_back", "undone", "recovery_failed"].includes(String(record.state)) ||
+        !["prepared", "applying", "applied", "undoing", "rolled_back", "rejected", "undone", "recovery_failed"].includes(String(record.state)) ||
+        (record.state === "rejected" && version !== 2) ||
         (record.checkpointRef !== null && (typeof record.checkpointRef !== "string" ||
             !/^refs\/offeragent\/checkpoints\/[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(record.checkpointRef))) ||
         !Array.isArray(record.targets) || record.targets.length < 1 || record.targets.length > MAX_ACTIONS ||
@@ -1596,7 +1658,15 @@ function parseJournal(value: unknown): VaultChangeJournalRecord {
     for (const candidate of targets) {
         if (!isRecord(candidate)) malformed();
         const target = candidate as Record<string, unknown>;
-        if (hasExtraKeys(target, ["operation", "path", "beforeHash", "afterHash"]) ||
+        if (hasExtraKeys(target, [
+            "operation", "path", "beforeHash", "afterHash", "beforeModifiedVersion", "afterModifiedVersion",
+        ]) ||
+            (version === 1 && ["beforeModifiedVersion", "afterModifiedVersion"].some((key) =>
+                Object.prototype.hasOwnProperty.call(target, key))) ||
+            (version === 2 && (typeof target.beforeModifiedVersion !== "string" ||
+                !MODIFIED_VERSION.test(target.beforeModifiedVersion) ||
+                (target.afterModifiedVersion !== null && (typeof target.afterModifiedVersion !== "string" ||
+                    !MODIFIED_VERSION.test(target.afterModifiedVersion))))) ||
             !["create", "append", "replace", "patch", "delete"].includes(String(target.operation)) ||
             typeof target.path !== "string" || safeVaultPath(target.path) !== target.path ||
             typeof target.beforeHash !== "string" || typeof target.afterHash !== "string" ||
@@ -1624,6 +1694,11 @@ function parseJournal(value: unknown): VaultChangeJournalRecord {
         });
     };
     if (!validJournalPaths(record.appliedPaths as unknown[]) || !validJournalPaths(record.manualReviewPaths as unknown[]) ||
+        (version === 2 && (record.appliedPaths as string[]).some((path) => {
+            const target = targets.find((candidate) => isRecord(candidate) && candidate.path === path) as
+                Record<string, unknown> | undefined;
+            return typeof target?.afterModifiedVersion !== "string";
+        })) ||
         (["applying", "applied", "undoing", "undone"].includes(String(record.state)) && record.checkpointRef === null)) malformed();
     return record as unknown as VaultChangeJournalRecord;
 }
@@ -1639,8 +1714,7 @@ function validStateIdentity(value: string): boolean {
 export class ObsidianVaultChangePort implements VaultChangePort {
     constructor(private readonly vault: Pick<
         Vault,
-        "cachedRead" | "create" | "createFolder" | "delete" | "getAbstractFileByPath" | "getFileByPath" |
-        "modify" | "process"
+        "cachedRead" | "create" | "createFolder" | "getAbstractFileByPath" | "getFileByPath" | "process"
     >) {}
 
     async read(path: string): Promise<string | undefined> {
@@ -1670,7 +1744,10 @@ export class ObsidianVaultChangePort implements VaultChangePort {
         if (mutation.kind === "create") {
             try {
                 await this.create(mutation.path, mutation.afterContent);
-                return { status: "applied" };
+                const applied = await this.observedIdentity(mutation.path);
+                return applied !== null && applied.contentHash === contentIdentity(mutation.afterContent)
+                    ? { status: "applied", applied }
+                    : { status: "unknown", observed: applied };
             } catch (error) {
                 return this.classifyConditionalFailure(mutation, error);
             }
@@ -1684,7 +1761,6 @@ export class ObsidianVaultChangePort implements VaultChangePort {
             };
         }
         let callbackConflict: VaultIdentity | null = null;
-        const conflictSentinel = Object.freeze({ conditionalConflict: mutation.path });
         try {
             const written = await this.vault.process(file, (currentContent) => {
                 const currentFile = this.vault.getFileByPath(mutation.path);
@@ -1693,41 +1769,26 @@ export class ObsidianVaultChangePort implements VaultChangePort {
                     : { contentHash: contentIdentity(currentContent), modifiedVersion: modifiedVersion(currentFile) };
                 if (!sameVaultIdentity(observed, mutation.expected)) {
                     callbackConflict = observed;
-                    throw conflictSentinel;
+                    // Vault.process documents its single-file read/modify/save
+                    // boundary, but not exception-abort semantics. Returning the
+                    // observed bytes preserves concurrent content even if the
+                    // implementation performs a same-content write.
+                    return currentContent;
                 }
                 return mutation.afterContent;
             });
+            if (callbackConflict !== null) return { status: "conflict", observed: callbackConflict };
             if (contentIdentity(written) !== contentIdentity(mutation.afterContent)) {
                 return { status: "unknown", observed: await this.observedIdentity(mutation.path) };
             }
-            return { status: "applied" };
+            const applied = await this.observedIdentity(mutation.path);
+            return applied !== null && applied.contentHash === contentIdentity(mutation.afterContent)
+                ? { status: "applied", applied }
+                : { status: "unknown", observed: applied };
         } catch (error) {
-            if (error === conflictSentinel && callbackConflict !== null) {
-                return { status: "conflict", observed: callbackConflict };
-            }
+            if (callbackConflict !== null) return { status: "conflict", observed: callbackConflict };
             return this.classifyConditionalFailure(mutation, error);
         }
-    }
-
-    async modify(path: string, content: string): Promise<void> {
-        const file = this.vault.getFileByPath(path);
-        if (file === null) throw new Error(`Vault modify target is missing: ${path}`);
-        await this.vault.modify(file, content);
-    }
-
-    async write(path: string, content: string): Promise<void> {
-        const file = this.vault.getFileByPath(path);
-        if (file !== null) {
-            await this.vault.modify(file, content);
-            return;
-        }
-        await this.ensureParentFolders(path);
-        await this.vault.create(path, content);
-    }
-
-    async restore(path: string, content: string | undefined): Promise<void> {
-        if (content === undefined) await this.remove(path);
-        else await this.write(path, content);
     }
 
     private async ensureParentFolders(path: string): Promise<void> {
@@ -1737,11 +1798,6 @@ export class ObsidianVaultChangePort implements VaultChangePort {
             current = current ? `${current}/${segment}` : segment;
             if (this.vault.getAbstractFileByPath(current) === null) await this.vault.createFolder(current);
         }
-    }
-
-    async remove(path: string): Promise<void> {
-        const file = this.vault.getFileByPath(path);
-        if (file !== null) await this.vault.delete(file, true);
     }
 
     private async observedIdentity(path: string): Promise<VaultIdentity | null> {

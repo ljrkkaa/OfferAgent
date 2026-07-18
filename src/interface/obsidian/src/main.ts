@@ -39,6 +39,7 @@ import {
     FileVaultChangeJournal,
     GitCheckpointStore,
     ObsidianVaultChangePort,
+    VaultChangeAuthorizationDecision,
     VaultChangeAuthorizationProposal,
     VaultChangeCoordinator,
     assertContainedStateDirectory,
@@ -612,37 +613,10 @@ export default class OfferAgentPlugin extends Plugin {
         this.researchBrowser = researchBrowser;
     }
 
-    private authorizeVaultChange(proposal: VaultChangeAuthorizationProposal): boolean {
-        const flags = [
-            proposal.changeKind === "interview_submission" ? "Interview Submission（始终需要确认）" : "",
-            proposal.controlFiles ? "包含控制文件" : "",
-            proposal.memoryDelete ? "包含 Planning Memory 删除" : "",
-        ].filter(Boolean).join("；");
-        const categoryLabel = {
-            experience: "Experience",
-            question: "Question",
-            index: "Index",
-            other: "Other",
-        } as const;
-        const categorizedTargets = proposal.categorizedTargets.map((target) =>
-            `- ${categoryLabel[target.category]} · ${target.operation}: ${target.path}` +
-            ` · version ${target.expectedModifiedVersion}` +
-            ` · hash ${target.expectedContentHash}`,
-        ).join("\n");
-        const sourceBindings = proposal.sourceBindings.map((source) =>
-            `- ${source.path} · ${source.expectedModifiedVersion} · ${source.expectedContentHash}`,
-        ).join("\n");
-        return window.confirm([
-            `OfferAgent 请求应用 Vault Change Batch：${proposal.task}`,
-            `批次：${proposal.batchId}`,
-            `参数绑定：${proposal.argsHash}`,
-            flags,
-            "分类目标：",
-            categorizedTargets,
-            ...(sourceBindings ? ["来源绑定：", sourceBindings] : []),
-            "",
-            proposal.diff,
-        ].filter((line) => line !== "").join("\n"));
+    private authorizeVaultChange(
+        proposal: VaultChangeAuthorizationProposal,
+    ): Promise<VaultChangeAuthorizationDecision> {
+        return new VaultChangeReviewModal(this, proposal).openAndWait();
     }
 
     private disposeVaultToolAdapter(): Promise<void> {
@@ -795,6 +769,118 @@ export default class OfferAgentPlugin extends Plugin {
     private async newChat(): Promise<void> {
         await this.activateChat();
         await (await this.ensureChatStore()).createTab();
+    }
+}
+
+class VaultChangeReviewModal extends Modal {
+    private resolveDecision: ((decision: VaultChangeAuthorizationDecision) => void) | null = null;
+
+    constructor(
+        private readonly plugin: OfferAgentPlugin,
+        private readonly proposal: VaultChangeAuthorizationProposal,
+    ) {
+        super(plugin.app);
+    }
+
+    openAndWait(): Promise<VaultChangeAuthorizationDecision> {
+        if (this.resolveDecision !== null) throw new Error("Vault Change Review is already open");
+        return new Promise((resolveDecision) => {
+            this.resolveDecision = resolveDecision;
+            this.open();
+        });
+    }
+
+    onOpen(): void {
+        this.modalEl.addClass("offeragent-vault-review-modal");
+        this.setTitle("确认完整 Vault Change Batch");
+        const flags = [
+            this.proposal.changeKind === "interview_submission" ? "Interview Submission（始终需要确认）" : "",
+            this.proposal.controlFiles ? "包含控制文件" : "",
+            this.proposal.memoryDelete ? "包含 Planning Memory 删除" : "",
+        ].filter(Boolean).join("；");
+        this.contentEl.createEl("p", {
+            text: "以下是本批次的完整最终预览。只能整体应用或整体拒绝；关闭窗口等同于拒绝。",
+        });
+        const identity = this.contentEl.createEl("dl", { cls: "offeragent-vault-review-identity" });
+        this.addIdentity(identity, "任务", this.proposal.task);
+        this.addIdentity(identity, "批次", this.proposal.batchId);
+        this.addIdentity(identity, "Review hash", this.proposal.reviewHash);
+        this.addIdentity(identity, "参数绑定", this.proposal.argsHash);
+        if (flags) this.addIdentity(identity, "安全提示", flags);
+
+        const scroll = this.contentEl.createDiv({ cls: "offeragent-vault-review-scroll" });
+        if (this.proposal.interviewSubmission !== null) {
+            const source = scroll.createEl("section", { cls: "offeragent-vault-review-source" });
+            source.createEl("h3", { text: "Interview Submission 来源" });
+            source.createEl("pre", {
+                text: JSON.stringify(this.proposal.interviewSubmission, null, 2),
+            });
+        }
+        if (this.proposal.sourceBindings.length > 0) {
+            const sources = scroll.createEl("section", { cls: "offeragent-vault-review-source" });
+            sources.createEl("h3", { text: "精确来源绑定" });
+            sources.createEl("pre", {
+                text: this.proposal.sourceBindings.map((source) =>
+                    `${source.path}\n  version: ${source.expectedModifiedVersion}\n  hash: ${source.expectedContentHash}`,
+                ).join("\n\n"),
+            });
+        }
+
+        const categoryLabel = {
+            experience: "Experience",
+            question: "Question",
+            index: "Index",
+            other: "Other",
+        } as const;
+        for (const [index, target] of this.proposal.reviewTargets.entries()) {
+            const categorized = this.proposal.categorizedTargets.find((candidate) => candidate.path === target.path);
+            const category = categorized === undefined ? "Other" : categoryLabel[categorized.category];
+            const section = scroll.createEl("section", { cls: "offeragent-vault-review-target" });
+            section.createEl("h3", {
+                text: `${index + 1}. ${category} · ${target.operation}: ${target.path}`,
+            });
+            section.createEl("p", {
+                text: `before ${target.beforeModifiedVersion} · ${target.beforeContentHash} → ${target.afterContentHash}`,
+                cls: "setting-item-description",
+            });
+            this.addContent(section, "Before（完整）", target.beforeContent);
+            this.addContent(section, "After（完整）", target.afterContent);
+        }
+
+        const actions = this.contentEl.createDiv({ cls: "offeragent-vault-review-actions" });
+        const reject = actions.createEl("button", { text: "拒绝整个批次" });
+        reject.addEventListener("click", () => this.finish("reject"));
+        const accept = actions.createEl("button", { text: "应用全部变更", cls: "mod-cta" });
+        accept.addEventListener("click", () => this.finish("accept"));
+    }
+
+    onClose(): void {
+        this.contentEl.empty();
+        this.resolve("reject");
+    }
+
+    private addIdentity(list: HTMLElement, label: string, value: string): void {
+        list.createEl("dt", { text: label });
+        list.createEl("dd", { text: value });
+    }
+
+    private addContent(parent: HTMLElement, label: string, content: string | null): void {
+        const details = parent.createEl("details");
+        details.open = true;
+        details.createEl("summary", { text: label });
+        details.createEl("pre", { text: content ?? "（不存在）" });
+    }
+
+    private finish(decision: VaultChangeAuthorizationDecision["decision"]): void {
+        this.resolve(decision);
+        this.close();
+    }
+
+    private resolve(decision: VaultChangeAuthorizationDecision["decision"]): void {
+        const resolveDecision = this.resolveDecision;
+        if (resolveDecision === null) return;
+        this.resolveDecision = null;
+        resolveDecision({ decision, reviewHash: this.proposal.reviewHash });
     }
 }
 

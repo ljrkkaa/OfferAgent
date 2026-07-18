@@ -53,10 +53,12 @@ cd E:\Projects\offeragent\repo\src\interface\obsidian
 corepack yarn smoke:fused E:\Projects\offeragent\artifacts\offeragent-obsidian-plugin
 ```
 
-烟测使用真实冻结 Worker、stdio 协议和本地 Responses Gateway，完成模型配置重启、来源绑定的
-`agent_contract.read`/`vault.search`/`vault.read` 回合、Worker 审批、插件确认的 Vault Change Batch、
-重启恢复、冲突保护的撤销、持久事件回放及进程树清理。它只操作自动创建并删除的临时 Vault，不能
-代替目标 Vault 上另行授权的真实写入验收。
+烟测使用真实冻结 Worker 和 stdio 协议，验证读取到的 Codex-only 配置形状不再暴露已退役 Provider 字段、策略与
+Session 跨 Worker 重启持久化，并用真实插件 Vault Change coordinator 覆盖 Review hash、来源绑定、
+checkpoint、journal、条件 CAS 和 compare-delete 不可用时的人工复核保留路径，最后检查进程树清理。
+它只操作自动创建并删除的临时 Vault。确定性的 Codex 目录、Responses 编解码和 Agent Loop 由 Harness
+production-composition 集成测试覆盖；本烟测不会给安装版 Worker 注入测试模型通道，也不能代替目标
+账户与目标 Vault 上另行授权的真实模型和写入验收。
 
 产物结构：
 

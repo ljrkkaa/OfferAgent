@@ -61,6 +61,7 @@ class _CapturingFactory(ProductionRunComponentsFactory):
     def __init__(self, registry: ToolRegistry) -> None:
         self._registries = {"run_root": registry}
         self._effective_configs = {"run_root": HarnessConfig()}
+        self._plugin_executor = None
         self.captured: dict[str, Any] = {}
 
     def _build(self, config: Any, state: Any, inputs: Any, **kwargs: Any) -> RunComponents:
@@ -107,6 +108,16 @@ class _CountingExecutor:
             None,
             None,
         )
+
+
+@pytest.mark.parametrize("method_name", ["build", "build_child"])
+def test_production_plugin_tools_reject_synchronous_unprepared_components(method_name: str) -> None:
+    definition = _side_effect_definition()
+    factory = _CapturingFactory(ToolRegistry("root-run", (definition,)))
+    factory._plugin_executor = cast(Any, object())
+
+    with pytest.raises(ValueError, match="prepared production capabilities"):
+        getattr(factory, method_name)(cast(Any, object()), cast(Any, object()))
 
 
 class _RecordingJournal:

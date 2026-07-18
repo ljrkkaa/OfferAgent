@@ -165,6 +165,11 @@ from offeragent_harness.runtime.harness_service import (
     RunHookBinding,
     StartTurnCommand,
 )
+from offeragent_harness.runtime.interview_submission_authority import (
+    InterviewSubmissionAuthorityPolicy,
+    InterviewSubmissionRunAuthority,
+    InterviewSubmissionToolExecutor,
+)
 from offeragent_harness.runtime.local_process_catalog import load_local_process_catalog
 from offeragent_harness.runtime.loopback_gateway import LoopbackGatewayConfig, LoopbackWebGateway
 from offeragent_harness.runtime.loopback_server import AsyncioLoopbackServer
@@ -293,7 +298,8 @@ _ROOT_PRODUCT_RULES = (
     "Daily Study Plan 如产生跨天主题、顺序或暂缓方向, 必须在同一个 vault.changes.apply 批次更新精简的 "
     "Study Memory, 不得复制完整日清单。Study-State Synchronization 在 daily 缺失时只报告缺失且不得创建文件。",
     "Interview Submission 把当前 USER 的文字、公共 URL 和按序 Run Attachments 视为一个不可拆分的来源事件; "
-    "同一 USER 中的运行时图片清单是图片顺序、内容哈希和来源指纹的权威。必须先确认每页语义可读; 任一页"
+    "同一 USER 中模型可见的运行时图片清单只是 Attachment Store 权威事实的投影, 不自身构成工具授权; Runtime "
+    "会用 root Run authority 强制绑定 Catalog 和 Apply。必须先确认每页语义可读; 任一页"
     "不可读时以 no-change 完成本轮, 指出从 1 开始的页码, 且不得调用 Catalog 或写工具。不得逐页建档, 也不得"
     "把原始截图、网页正文或 Conversation 原文复制进 Vault。",
     "摄取前把全部原始公共 URL 和有序图片哈希交给 interview_catalog.search, 使用其 normalizedSource 和索引绑定, "
@@ -541,6 +547,8 @@ class _FingerprintDefinitionResolver:
 @dataclass(frozen=True, slots=True)
 class _PreparedProductionCapabilities:
     run_id: str
+    snapshot_schema_version: int
+    snapshot_includes_interview_authority: bool
     config: WireRunConfigSnapshot
     inputs: ContextInputs
     effective_config: HarnessConfig
@@ -555,6 +563,7 @@ class _PreparedProductionCapabilities:
     skills: PreparedSkillBundle | None
     shell: PreparedShellBundle | None
     hooks: PreparedHookBundle | None
+    interview_submission_authority: InterviewSubmissionRunAuthority
     parent_snapshot_fingerprint: str | None = None
 
 
@@ -663,6 +672,12 @@ class ProductionRunComponentsFactory(
         cancellation.checkpoint()
         config = validate_wire(WireRunConfigSnapshot, thaw_json(command.run_config))
         effective_config = command.effective_config or self._default_config
+        snapshot_schema_version = _prepared_snapshot_schema_version(durable_snapshot)
+        if durable_snapshot is not None and snapshot_schema_version == 1:
+            self._require_pristine_legacy_interview_authority(state)
+        snapshot_includes_interview_authority = (
+            durable_snapshot is None or "interviewSubmissionAuthority" in durable_snapshot
+        )
         self._ensure_worker_read_limit(effective_config)
         model_binding: CodexRunBinding | None = None
         if self._codex_models is not None:
@@ -761,6 +776,16 @@ class ProductionRunComponentsFactory(
             worker_max_parallel_reads=self._effect_gate.max_readers,
         )
         context_budget = _model_context_budget(model_binding, prepared_budget)
+        durable_interview_authority = _durable_interview_submission_authority(durable_snapshot)
+        captured_on = (
+            durable_interview_authority.captured_on
+            if durable_interview_authority is not None
+            else (
+                self._legacy_run_captured_on(state)
+                if durable_snapshot is not None and snapshot_schema_version == 1
+                else self._current_local_date()
+            )
+        )
         inputs = await _resolved_context_inputs(
             command.input_blocks,
             session_id=state.session_id,
@@ -768,8 +793,16 @@ class ProductionRunComponentsFactory(
             attachments=self._attachments,
             cancellation=cancellation,
             model_binding=model_binding,
-            captured_on=self._current_local_date(),
+            captured_on=captured_on,
         )
+        interview_submission_authority = _interview_submission_authority_from_inputs(
+            inputs,
+            captured_on=captured_on,
+        )
+        if durable_interview_authority is not None and durable_interview_authority != interview_submission_authority:
+            raise ValueError(
+                "Store-materialized Run attachments differ from the durable Interview Submission authority"
+            )
         if self._conversation_history is not None:
             current_images = tuple(
                 block
@@ -810,6 +843,8 @@ class ProductionRunComponentsFactory(
             )
         prepared = _PreparedProductionCapabilities(
             run_id=state.run_id,
+            snapshot_schema_version=snapshot_schema_version,
+            snapshot_includes_interview_authority=snapshot_includes_interview_authority,
             config=config,
             inputs=_with_skill_prompt_context(inputs, skills),
             effective_config=effective_config,
@@ -824,6 +859,7 @@ class ProductionRunComponentsFactory(
             skills=skills,
             shell=shell,
             hooks=hooks,
+            interview_submission_authority=interview_submission_authority,
         )
         self._remember_prepared(state, prepared)
         return PreparedRunComponents(prepared, _prepared_capability_snapshot(prepared))
@@ -863,10 +899,22 @@ class ProductionRunComponentsFactory(
         durable_snapshot: Mapping[str, Any] | None,
     ) -> PreparedRunComponents:
         cancellation.checkpoint()
+        snapshot_schema_version = _prepared_snapshot_schema_version(durable_snapshot)
+        if durable_snapshot is not None and snapshot_schema_version == 1:
+            self._require_pristine_legacy_interview_authority(state)
+        snapshot_includes_interview_authority = (
+            durable_snapshot is None or "interviewSubmissionAuthority" in durable_snapshot
+        )
         root = self._prepared_runs.get(execution.record.root_run_id)
         root_registry = self._registries.get(execution.record.root_run_id)
         if root is None or root_registry is None:
             raise ValueError("child Run parent prepared capability snapshot is unavailable")
+        durable_interview_authority = _durable_interview_submission_authority(durable_snapshot)
+        if (
+            durable_interview_authority is not None
+            and durable_interview_authority != root.interview_submission_authority
+        ):
+            raise ValueError("child Run Interview Submission authority differs from its root Run")
         parent_parallel_reads = self._parent_parallel_reads(execution.record)
         if root_registry.snapshot_hash != execution.tool_scope.registry_snapshot_hash:
             raise ValueError("child Run Tool scope refers to a different root Registry snapshot")
@@ -941,6 +989,8 @@ class ProductionRunComponentsFactory(
         )
         prepared = _PreparedProductionCapabilities(
             run_id=state.run_id,
+            snapshot_schema_version=snapshot_schema_version,
+            snapshot_includes_interview_authority=snapshot_includes_interview_authority,
             config=config,
             inputs=_with_skill_prompt_context(_child_context_inputs(execution), skills),
             effective_config=effective_config,
@@ -958,6 +1008,7 @@ class ProductionRunComponentsFactory(
             skills=skills,
             shell=shell,
             hooks=hooks,
+            interview_submission_authority=root.interview_submission_authority,
             parent_snapshot_fingerprint=canonical_json_sha256(_prepared_capability_snapshot(root)),
         )
         self._remember_prepared(state, prepared)
@@ -1170,6 +1221,8 @@ class ProductionRunComponentsFactory(
         return optional_definitions
 
     def build(self, command: StartTurnCommand, state: RunState) -> RunComponents:
+        if self._plugin_executor is not None:
+            raise ValueError("production plugin tools require prepared production capabilities")
         config = validate_wire(WireRunConfigSnapshot, thaw_json(command.run_config))
         inputs = _context_inputs(command.input_blocks)
         effective_config = command.effective_config or self._default_config
@@ -1183,6 +1236,8 @@ class ProductionRunComponentsFactory(
         )
 
     def build_child(self, execution: Any, state: RunState) -> RunComponents:
+        if self._plugin_executor is not None:
+            raise ValueError("production plugin tools require prepared production capabilities")
         config = validate_wire(WireRunConfigSnapshot, thaw_json(execution.run_config))
         content = canonical_json_bytes(execution.context.content).decode("utf-8")
         inputs = ContextInputs(
@@ -1253,6 +1308,27 @@ class ProductionRunComponentsFactory(
         if isinstance(root_config, HarnessConfig):
             return root_config.budgets.max_parallel_reads
         raise ValueError("child Run parent budget snapshot is unavailable")
+
+    @staticmethod
+    def _legacy_run_captured_on(state: RunState) -> date:
+        checkpoint = state.budget_checkpoint
+        if checkpoint is None:
+            raise ValueError("legacy production capability recovery requires the original BudgetCheckpoint")
+        return checkpoint.started_at.astimezone().date()
+
+    @staticmethod
+    def _require_pristine_legacy_interview_authority(state: RunState) -> None:
+        if (
+            state.tool_calls > 0
+            or not state.pending.empty
+            or bool(state.pending.tool_calls)
+            or bool(state.tool_results)
+            or bool(state.write_obligation.outcomes)
+        ):
+            raise ValueError(
+                "legacy production capability snapshot has prior tool activity and cannot safely reconstruct "
+                "Interview Submission single-use authority"
+            )
 
     def bind_worker_read_limit(self, max_parallel_reads: int) -> None:
         if not self._effect_gate_bound:
@@ -1453,12 +1529,33 @@ class ProductionRunComponentsFactory(
             audit_sink=self._policy_audit,
             grant_store=self._approvals.grants,
         )
-        policy: PolicyEvaluator = downstream_policy
+        authority_policy: PolicyEvaluator = downstream_policy
+        run_plugin_executor = self._plugin_executor
+        if prepared_capabilities is not None:
+            authority_policy = InterviewSubmissionAuthorityPolicy(
+                workspace_id=state.workspace_id,
+                root_run_id=state.lineage.root_run_id,
+                authority=prepared_capabilities.interview_submission_authority,
+                journal=self._journal,
+                clock=self._clock,
+                downstream=downstream_policy,
+                audit_sink=self._policy_audit,
+            )
+            if run_plugin_executor is not None:
+                run_plugin_executor = InterviewSubmissionToolExecutor(
+                    workspace_id=state.workspace_id,
+                    root_run_id=state.lineage.root_run_id,
+                    authority=prepared_capabilities.interview_submission_authority,
+                    journal=self._journal,
+                    clock=self._clock,
+                    delegate=run_plugin_executor,
+                )
+        policy: PolicyEvaluator = authority_policy
         if child_record is not None:
             policy = SubagentScopePolicy(
                 child_record,
                 self._parent_authorities,
-                downstream_policy,
+                authority_policy,
                 audit_sink=self._policy_audit,
             )
         expected_budget = budget
@@ -1565,7 +1662,7 @@ class ProductionRunComponentsFactory(
             self._registries[state.run_id] = registry
             dispatcher = ToolDispatcher(
                 local=_CompositeExecutor(active_local_routes),
-                plugin=self._plugin_executor,
+                plugin=run_plugin_executor,
                 subagent=self._subagent_executor,
             )
             bound_ledger = budget
@@ -1711,8 +1808,8 @@ def _prepared_capability_snapshot(prepared: _PreparedProductionCapabilities) -> 
                 for item in prepared.shell.profiles
             ],
         }
-    return {
-        "schemaVersion": 1,
+    snapshot = {
+        "schemaVersion": prepared.snapshot_schema_version,
         "runId": prepared.run_id,
         "effectiveConfigFingerprint": canonical_json_sha256(prepared.effective_config.model_dump(mode="json")),
         "runConfigFingerprint": canonical_json_sha256(prepared.config.to_wire()),
@@ -1736,6 +1833,9 @@ def _prepared_capability_snapshot(prepared: _PreparedProductionCapabilities) -> 
         "hooks": None if prepared.hooks is None else prepared.hooks.recovery_snapshot(),
         "parentSnapshotFingerprint": prepared.parent_snapshot_fingerprint,
     }
+    if prepared.snapshot_includes_interview_authority:
+        snapshot["interviewSubmissionAuthority"] = prepared.interview_submission_authority.durable_snapshot()
+    return snapshot
 
 
 def _prepared_hook_recovery(
@@ -1747,6 +1847,29 @@ def _prepared_hook_recovery(
     if not isinstance(value, Mapping):
         raise ValueError("persisted production Hook recovery snapshot is missing or invalid")
     return value
+
+
+def _durable_interview_submission_authority(
+    durable_snapshot: Mapping[str, Any] | None,
+) -> InterviewSubmissionRunAuthority | None:
+    if durable_snapshot is None:
+        return None
+    schema_version = _prepared_snapshot_schema_version(durable_snapshot)
+    value = durable_snapshot.get("interviewSubmissionAuthority")
+    if schema_version == 1 and value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("persisted Interview Submission authority is missing or invalid")
+    return InterviewSubmissionRunAuthority.from_durable_snapshot(value)
+
+
+def _prepared_snapshot_schema_version(durable_snapshot: Mapping[str, Any] | None) -> int:
+    if durable_snapshot is None:
+        return 2
+    schema_version = durable_snapshot.get("schemaVersion")
+    if schema_version not in {1, 2}:
+        raise ValueError("persisted production capability snapshot version is unsupported")
+    return cast(int, schema_version)
 
 
 def _definition_proofs(definitions: Sequence[ToolDefinition]) -> list[dict[str, str]]:
@@ -2033,6 +2156,26 @@ async def _resolved_context_inputs(
                 image_provenance=(UserImageProvenance.CURRENT_SUBMISSION if images else None),
             ),
         )
+    )
+
+
+def _interview_submission_authority_from_inputs(
+    inputs: ContextInputs,
+    *,
+    captured_on: date,
+) -> InterviewSubmissionRunAuthority:
+    hashes: list[str] = []
+    for fragment in inputs.user_input:
+        for block in fragment.model_blocks:
+            if block.kind != "image" or block.binary_data is None:
+                continue
+            content_hash = block.data.get("contentHash")
+            if not isinstance(content_hash, str):
+                raise ValueError("Store-materialized Run image omitted its canonical content hash")
+            hashes.append(content_hash)
+    return InterviewSubmissionRunAuthority(
+        captured_on=captured_on,
+        ordered_image_content_hashes=tuple(hashes),
     )
 
 

@@ -74,6 +74,14 @@ function call(batchId, operations, argumentOverrides = {}, overrides = {}) {
     };
 }
 
+function approve(proposal) {
+    return { decision: "accept", reviewHash: proposal.reviewHash };
+}
+
+function reject(proposal) {
+    return { decision: "reject", reviewHash: proposal.reviewHash };
+}
+
 class MemoryVault {
     constructor(entries) {
         this.entries = new Map(Object.entries(entries));
@@ -81,6 +89,7 @@ class MemoryVault {
             target, `mtime:${index + 1}:size:${Buffer.byteLength(content)}`,
         ]));
         this.failPath = null;
+        this.writeSequence = 0;
     }
     async read(target) { return this.entries.has(target) ? this.entries.get(target) : undefined; }
     async snapshot(target) {
@@ -101,11 +110,14 @@ class MemoryVault {
         if (mutation.kind === "create") await this.create(mutation.path, mutation.afterContent);
         else if (mutation.kind === "modify") await this.modify(mutation.path, mutation.afterContent);
         else await this.remove(mutation.path);
-        return { status: "applied" };
-    }
-    async restore(target, content) {
-        if (content === undefined) await this.remove(target);
-        else await this.write(target, content);
+        const applied = await this.snapshot(mutation.path);
+        return {
+            status: "applied",
+            applied: {
+                contentHash: applied.content === undefined ? "absent" : digest(applied.content),
+                modifiedVersion: applied.modifiedVersion,
+            },
+        };
     }
     async create(target, content) {
         if (this.entries.has(target)) throw new Error(`create target already exists: ${target}`);
@@ -118,7 +130,7 @@ class MemoryVault {
     async write(target, content) {
         if (target === this.failPath) throw new Error(`injected write failure: ${target}`);
         this.entries.set(target, content);
-        this.versions.set(target, `mtime:write:size:${Buffer.byteLength(content)}`);
+        this.versions.set(target, `mtime:write:${++this.writeSequence}:size:${Buffer.byteLength(content)}`);
     }
     async remove(target) { this.entries.delete(target); this.versions.delete(target); }
 }
@@ -127,6 +139,13 @@ class MemoryJournal {
     constructor() { this.records = new Map(); }
     async load(batchId) { return structuredClone(this.records.get(batchId)); }
     async save(record) { this.records.set(record.batchId, structuredClone(record)); }
+    async findInterviewSubmissionByRootRun(rootRunId) {
+        const record = [...this.records.values()].find((candidate) =>
+            candidate.version === 2 && candidate.changeKind === "interview_submission" &&
+            candidate.rootRunId === rootRunId,
+        );
+        return structuredClone(record);
+    }
     async listUnresolved() {
         return [...this.records.values()].filter((record) => ["prepared", "applying", "undoing", "recovery_failed"].includes(record.state))
             .map((record) => structuredClone(record));
@@ -254,7 +273,7 @@ test("trusted Vault previews and confirms one categorized Interview Submission b
         authorize: async (candidate) => {
             approvals += 1;
             proposal = candidate;
-            return true;
+            return approve(candidate);
         },
     });
     const request = call("batch_interview_preview", fixture.operations, fixture.argumentOverrides);
@@ -287,14 +306,139 @@ test("trusted Vault previews and confirms one categorized Interview Submission b
         },
     ]);
     assert.deepEqual(proposal.sourceBindings, fixture.argumentOverrides.sourceBindings);
-    assert.match(proposal.diff, /experiences\/acme-backend-2026-07-18\.md/u);
-    assert.match(proposal.diff, /interview\/database-isolation\.md/u);
-    assert.match(proposal.diff, /experiences\/index\.md/u);
-    assert.match(proposal.diff, /interview\/index\.md/u);
+    assert.deepEqual(proposal.reviewTargets.map((target) => target.path), [
+        fixture.experiencePath,
+        fixture.questionPath,
+        fixture.experienceIndexPath,
+        fixture.questionIndexPath,
+    ]);
+    assert.equal(proposal.reviewTargets[0].afterContent, fixture.operations[0].content);
+    assert.match(proposal.reviewHash, /^sha256:[0-9a-f]{64}$/u);
     assert.equal(vault.entries.get(fixture.experiencePath), fixture.operations[0].content);
     assert.equal(vault.entries.get(fixture.questionPath), fixture.operations[1].content);
     assert.match(vault.entries.get(fixture.experienceIndexPath), /acme-backend/u);
     assert.match(vault.entries.get(fixture.questionIndexPath), /database-isolation/u);
+});
+
+test("Interview Submission review exposes every byte beyond 100 lines and 32 KiB", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const tail = [
+        ...Array.from({ length: 220 }, (_unused, index) => `review-line-${index}-${"x".repeat(180)}`),
+        "COMPLETE-REVIEW-TAIL-SENTINEL",
+        "",
+    ].join("\n");
+    const longBefore = [
+        "# Experiences",
+        ...Array.from({ length: 190 }, (_unused, index) => `existing-line-${index}-${"y".repeat(180)}`),
+        "COMPLETE-BEFORE-TAIL-SENTINEL",
+        "",
+    ].join("\n");
+    const entries = { ...fixture.entries, [fixture.experienceIndexPath]: longBefore };
+    const operations = fixture.operations.map((operation, index) => {
+        if (index === 0) return { ...operation, content: `${operation.content}${tail}` };
+        if (index === 2) {
+            return {
+                ...operation,
+                expectedContentHash: digest(longBefore),
+                expectedModifiedVersion: initialModifiedVersion(2, longBefore),
+            };
+        }
+        return operation;
+    });
+    const vault = new MemoryVault(entries);
+    let proposal;
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal: new MemoryJournal(),
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async (candidate) => {
+            proposal = candidate;
+            return reject(candidate);
+        },
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_complete_review", operations, fixture.argumentOverrides,
+    ));
+
+    assert.equal(result.status, "denied");
+    const experience = proposal.reviewTargets.find((target) => target.path === fixture.experiencePath);
+    assert.equal(experience.beforeContent, null);
+    assert.equal(experience.afterContent, operations[0].content);
+    assert.ok(Buffer.byteLength(experience.afterContent, "utf8") > 32_768);
+    assert.match(experience.afterContent, /COMPLETE-REVIEW-TAIL-SENTINEL/u);
+    const experienceIndex = proposal.reviewTargets.find((target) => target.path === fixture.experienceIndexPath);
+    assert.equal(experienceIndex.beforeContent, longBefore);
+    assert.equal(experienceIndex.afterContent, `${longBefore}${operations[2].content}`);
+    assert.ok(Buffer.byteLength(experienceIndex.beforeContent, "utf8") > 32_768);
+    assert.match(experienceIndex.beforeContent, /COMPLETE-BEFORE-TAIL-SENTINEL/u);
+});
+
+test("authorization cannot accept a different review hash", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const vault = new MemoryVault(fixture.entries);
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal: new MemoryJournal(),
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async () => ({ decision: "accept", reviewHash: digest("different review") }),
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_review_hash_mismatch", fixture.operations, fixture.argumentOverrides,
+    ));
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "resource.conflict");
+    assert.deepEqual(Object.fromEntries(vault.entries), fixture.entries);
+});
+
+test("a rejected Interview Submission durably consumes the root Run proposal slot", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const vault = new MemoryVault(fixture.entries);
+    const journal = new MemoryJournal();
+    let reviews = 0;
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async (proposal) => {
+            reviews += 1;
+            return reject(proposal);
+        },
+    });
+    const rootRun = ["run_interview_root", "run_interview_child"];
+    const first = call(
+        "batch_interview_root_first",
+        fixture.operations,
+        fixture.argumentOverrides,
+        { runId: rootRun[1], agentLineage: rootRun },
+    );
+    const second = call(
+        "batch_interview_root_second",
+        fixture.operations,
+        fixture.argumentOverrides,
+        { runId: "run_interview_sibling", agentLineage: [rootRun[0], "run_interview_sibling"] },
+    );
+
+    const rejected = await coordinator.execute(first);
+    const replay = await coordinator.execute(first);
+    const duplicate = await coordinator.execute(second);
+
+    assert.equal(rejected.status, "denied");
+    assert.equal(replay.status, "denied");
+    assert.equal(duplicate.status, "failed");
+    assert.equal(duplicate.error.code, "resource.conflict");
+    assert.equal(reviews, 1);
+    assert.equal((await journal.load(first.arguments.batchId)).state, "rejected");
+    assert.equal(await journal.load(second.arguments.batchId), undefined);
+    assert.deepEqual(Object.fromEntries(vault.entries), fixture.entries);
 });
 
 test("Interview Submission accepts the Catalog's deterministic code-point URL ordering", async () => {
@@ -317,7 +461,7 @@ test("Interview Submission accepts the Catalog's deterministic code-point URL or
         journal: new MemoryJournal(),
         checkpoints: new MemoryCheckpoints(vault),
         permissionMode: () => "trusted_vault",
-        authorize: async () => true,
+        authorize: async (proposal) => approve(proposal),
     });
 
     const result = await coordinator.execute(call(
@@ -347,7 +491,7 @@ test("Interview Submission accepts the Catalog's canonical public IPv6 URL", asy
         journal: new MemoryJournal(),
         checkpoints: new MemoryCheckpoints(vault),
         permissionMode: () => "trusted_vault",
-        authorize: async () => true,
+        authorize: async (proposal) => approve(proposal),
     });
 
     const result = await coordinator.execute(call(
@@ -380,7 +524,7 @@ test("Interview Submission accepts a linked existing Question with a positive ac
         journal: new MemoryJournal(),
         checkpoints: new MemoryCheckpoints(vault),
         permissionMode: () => "trusted_vault",
-        authorize: async () => true,
+        authorize: async (proposal) => approve(proposal),
     });
 
     const result = await coordinator.execute(call(
@@ -402,7 +546,7 @@ test("rejecting an Interview Submission preview leaves every Vault target unchan
         journal,
         checkpoints: new MemoryCheckpoints(vault),
         permissionMode: () => "trusted_vault",
-        authorize: async () => { approvals += 1; return false; },
+        authorize: async (proposal) => { approvals += 1; return reject(proposal); },
     });
 
     const result = await coordinator.execute(call(
@@ -412,7 +556,7 @@ test("rejecting an Interview Submission preview leaves every Vault target unchan
     assert.equal(result.status, "denied");
     assert.equal(approvals, 1);
     assert.deepEqual(Object.fromEntries(vault.entries), fixture.entries);
-    assert.equal(await journal.load("batch_interview_rejected"), undefined);
+    assert.equal((await journal.load("batch_interview_rejected")).state, "rejected");
 });
 
 test("Interview Submission create never overwrites a user file raced into the final missing check", async () => {
@@ -442,7 +586,7 @@ test("Interview Submission create never overwrites a user file raced into the fi
         journal,
         checkpoints: new MemoryCheckpoints(vault),
         permissionMode: () => "trusted_vault",
-        authorize: async () => true,
+        authorize: async (proposal) => approve(proposal),
     });
 
     const result = await coordinator.execute(call(
@@ -477,7 +621,7 @@ test("Interview Submission preserves an identical user file raced into a create 
         journal,
         checkpoints: new MemoryCheckpoints(vault),
         permissionMode: () => "trusted_vault",
-        authorize: async () => true,
+        authorize: async (proposal) => approve(proposal),
     });
 
     const result = await coordinator.execute(call(
@@ -521,7 +665,7 @@ test("Interview Submission reports unknown outcome when modify writes and then r
         journal,
         checkpoints: new MemoryCheckpoints(vault),
         permissionMode: () => "trusted_vault",
-        authorize: async () => true,
+        authorize: async (proposal) => approve(proposal),
     });
 
     const result = await coordinator.execute(call(
@@ -606,7 +750,7 @@ test("Interview Submission never recreates an existing target deleted after its 
         journal,
         checkpoints: new MemoryCheckpoints(vault),
         permissionMode: () => "trusted_vault",
-        authorize: async () => true,
+        authorize: async (proposal) => approve(proposal),
     });
 
     const result = await coordinator.execute(call(
@@ -641,7 +785,7 @@ test("Vault delete reports unknown outcome when removal succeeds and then reject
         journal,
         checkpoints: new MemoryCheckpoints(vault),
         permissionMode: () => "trusted_vault",
-        authorize: async () => true,
+        authorize: async (proposal) => approve(proposal),
     });
 
     const result = await coordinator.execute(call("batch_delete_unknown", [
@@ -680,6 +824,7 @@ test("Obsidian Vault conditional modify uses process and compares the callback-t
     let content = before;
     let processCalls = 0;
     let modifyCalls = 0;
+    let callbackThrew = false;
     const vault = {
         getFileByPath: () => file,
         getAbstractFileByPath: () => file,
@@ -691,7 +836,14 @@ test("Obsidian Vault conditional modify uses process and compares the callback-t
         process: async (_file, callback) => {
             processCalls += 1;
             file.stat.mtime = 2;
-            content = callback(content);
+            try {
+                content = callback(content);
+            } catch {
+                // Model an implementation whose undocumented callback-exception behavior
+                // still commits a value. Safety must not depend on that exception aborting.
+                callbackThrew = true;
+                content = after;
+            }
             return content;
         },
     };
@@ -711,6 +863,7 @@ test("Obsidian Vault conditional modify uses process and compares the callback-t
     assert.equal(content, before);
     assert.equal(processCalls, 1);
     assert.equal(modifyCalls, 0);
+    assert.equal(callbackThrew, false);
 });
 
 test("Obsidian Vault conditional modify reports applied and ambiguous process outcomes", async () => {
@@ -751,7 +904,13 @@ test("Obsidian Vault conditional modify reports applied and ambiguous process ou
         return { content, outcome };
     }
 
-    assert.deepEqual(await execute(false), { content: after, outcome: { status: "applied" } });
+    assert.deepEqual(await execute(false), {
+        content: after,
+        outcome: {
+            status: "applied",
+            applied: { contentHash: digest(after), modifiedVersion: `mtime:2:size:${Buffer.byteLength(after)}` },
+        },
+    });
     const ambiguous = await execute(true);
     assert.equal(ambiguous.content, after);
     assert.equal(ambiguous.outcome.status, "unknown");
@@ -790,6 +949,67 @@ test("Obsidian Vault conditional delete is unsupported and never invokes Vault.d
     assert.equal(deleteCalls, 0);
 });
 
+test("production adapter undo keeps a created file when compare-and-delete is unavailable", async () => {
+    const { ObsidianVaultChangePort, VaultChangeCoordinator } = loadModule();
+    const files = new Map();
+    const contents = new Map();
+    let sequence = 0;
+    let deleteCalls = 0;
+    const obsidianVault = {
+        getFileByPath: (target) => files.get(target) ?? null,
+        getAbstractFileByPath: (target) => files.get(target) ?? null,
+        cachedRead: async (file) => contents.get(file.path),
+        createFolder: async () => {},
+        create: async (target, content) => {
+            const file = {
+                path: target,
+                stat: { mtime: ++sequence, size: Buffer.byteLength(content) },
+            };
+            files.set(target, file);
+            contents.set(target, content);
+            return file;
+        },
+        delete: async () => { deleteCalls += 1; },
+        modify: async () => { throw new Error("Vault.modify must not be used"); },
+        process: async (file, callback) => {
+            const content = callback(contents.get(file.path));
+            contents.set(file.path, content);
+            file.stat = { mtime: ++sequence, size: Buffer.byteLength(content) };
+            return content;
+        },
+    };
+    const journal = new MemoryJournal();
+    const coordinator = new VaultChangeCoordinator({
+        vault: new ObsidianVaultChangePort(obsidianVault),
+        journal,
+        checkpoints: {
+            create: async (batchId) => `refs/offeragent/checkpoints/${batchId}`,
+            read: async () => undefined,
+        },
+        permissionMode: () => "trusted_vault",
+    });
+    const request = call("batch_production_created_undo", [{
+        op: "create",
+        path: "notes/created.md",
+        content: "agent content\n",
+        expectedContentHash: "absent",
+        expectedModifiedVersion: "missing",
+    }]);
+
+    assert.equal((await coordinator.execute(request)).status, "succeeded");
+    const undone = await coordinator.undo("batch_production_created_undo");
+
+    assert.equal(undone.status, "conflict");
+    assert.deepEqual(undone.paths, ["notes/created.md"]);
+    assert.equal(contents.get("notes/created.md"), "agent content\n");
+    assert.equal(deleteCalls, 0);
+    assert.equal((await journal.load("batch_production_created_undo")).state, "undoing");
+    assert.deepEqual(
+        (await journal.load("batch_production_created_undo")).manualReviewPaths,
+        ["notes/created.md"],
+    );
+});
+
 test("Interview Submission source version drift after confirmation invalidates the whole batch", async () => {
     const { VaultChangeCoordinator } = loadModule();
     const fixture = interviewFixture();
@@ -801,9 +1021,9 @@ test("Interview Submission source version drift after confirmation invalidates t
         journal,
         checkpoints: new MemoryCheckpoints(vault),
         permissionMode: () => "trusted_vault",
-        authorize: async () => {
+        authorize: async (proposal) => {
             vault.versions.set(sourcePath, "mtime:manual:size:76");
-            return true;
+            return approve(proposal);
         },
     });
 
@@ -814,7 +1034,7 @@ test("Interview Submission source version drift after confirmation invalidates t
     assert.equal(result.status, "failed");
     assert.equal(result.error.code, "resource.conflict");
     assert.deepEqual(Object.fromEntries(vault.entries), fixture.entries);
-    assert.equal(await journal.load("batch_interview_source_drift"), undefined);
+    assert.equal((await journal.load("batch_interview_source_drift")).state, "rolled_back");
 });
 
 test("Interview Submission target version drift after checkpoint invalidates the whole batch", async () => {
@@ -834,7 +1054,7 @@ test("Interview Submission target version drift after checkpoint invalidates the
         journal,
         checkpoints,
         permissionMode: () => "trusted_vault",
-        authorize: async () => true,
+        authorize: async (proposal) => approve(proposal),
     });
 
     const result = await coordinator.execute(call(
@@ -858,7 +1078,7 @@ test("Interview Submission rolls back an earlier Experience when a later Questio
         journal,
         checkpoints: new MemoryCheckpoints(vault),
         permissionMode: () => "trusted_vault",
-        authorize: async () => true,
+        authorize: async (proposal) => approve(proposal),
     });
 
     const result = await coordinator.execute(call(
@@ -882,7 +1102,7 @@ test("structural Interview Experience ingestion cannot be mislabeled as a genera
         journal,
         checkpoints: new MemoryCheckpoints(vault),
         permissionMode: () => "trusted_vault",
-        authorize: async () => { approvals += 1; return true; },
+        authorize: async (proposal) => { approvals += 1; return approve(proposal); },
     });
 
     const result = await coordinator.execute(call("batch_interview_mislabeled", fixture.operations));
@@ -1242,7 +1462,7 @@ test("unsafe Interview Submission structure is rejected before preview or mutati
                 journal,
                 checkpoints: new MemoryCheckpoints(vault),
                 permissionMode: () => "trusted_vault",
-                authorize: async () => { approvals += 1; return true; },
+                authorize: async (proposal) => { approvals += 1; return approve(proposal); },
             });
 
             const request = call(
@@ -1306,6 +1526,51 @@ test("Vault Change Batch validates every target before mutation and rolls back a
     assert.equal(vault.entries.get("notes/a.md"), "alpha\n");
     assert.equal(vault.entries.get("notes/b.md"), "beta\n");
     assert.equal((await journal.load("batch_failure")).state, "rolled_back");
+});
+
+test("unsupported reverse deletion preserves the created file and records manual review", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const vault = new MemoryVault({ "notes/existing.md": "before\n" });
+    const journal = new MemoryJournal();
+    const originalApplyConditional = vault.applyConditional.bind(vault);
+    vault.applyConditional = async (mutation) => {
+        if (mutation.kind === "delete") return { status: "unsupported", operation: "delete" };
+        if (mutation.path === "notes/existing.md") {
+            const observed = await vault.snapshot(mutation.path);
+            return {
+                status: "conflict",
+                observed: { contentHash: digest(observed.content), modifiedVersion: observed.modifiedVersion },
+            };
+        }
+        return originalApplyConditional(mutation);
+    };
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+    });
+
+    const result = await coordinator.execute(call("batch_reverse_delete_unsupported", [
+        {
+            op: "create", path: "notes/created.md", content: "agent content\n",
+            expectedContentHash: "absent", expectedModifiedVersion: "missing",
+        },
+        {
+            op: "append", path: "notes/existing.md", content: "agent\n",
+            expectedContentHash: digest("before\n"),
+            expectedModifiedVersion: initialModifiedVersion(1, "before\n"),
+        },
+    ]));
+
+    assert.equal(result.status, "unknown_outcome");
+    assert.equal(vault.entries.get("notes/created.md"), "agent content\n");
+    assert.equal(vault.entries.get("notes/existing.md"), "before\n");
+    assert.equal((await journal.load("batch_reverse_delete_unsupported")).state, "recovery_failed");
+    assert.deepEqual(
+        (await journal.load("batch_reverse_delete_unsupported")).manualReviewPaths,
+        ["notes/created.md"],
+    );
 });
 
 test("an unresolved apply outcome latches the current coordinator fail-closed", async () => {
@@ -1418,7 +1683,7 @@ test("plugin permission is fail-closed and control or memory-delete batches alwa
     let approvals = 0;
     const readOnly = new VaultChangeCoordinator({
         vault, journal, checkpoints, permissionMode: () => "read_only",
-        authorize: async () => { approvals += 1; return true; },
+        authorize: async (proposal) => { approvals += 1; return approve(proposal); },
     });
     const denied = await readOnly.execute(call("batch_denied", [
         {
@@ -1433,8 +1698,8 @@ test("plugin permission is fail-closed and control or memory-delete batches alwa
         vault, journal, checkpoints, permissionMode: () => "trusted_vault",
         authorize: async (proposal) => {
             approvals += 1;
-            assert.match(proposal.diff, /memory\/user\/old\.md/);
-            return true;
+            assert.ok(proposal.reviewTargets.some((target) => target.path === "memory/user/old.md"));
+            return approve(proposal);
         },
     });
     const applied = await trusted.execute(call("batch_memory_delete", [
@@ -1618,7 +1883,12 @@ test("crash reconciliation reaches a stable rolled-back state and exact replay i
         },
     ]);
     await assert.rejects(crashing.execute(request), VaultChangeCrashInjectionError);
-    assert.equal((await journal.load("batch_crash")).state, "applying");
+    const crashedRecord = await journal.load("batch_crash");
+    assert.equal(crashedRecord.state, "applying");
+    assert.equal(crashedRecord.version, 2);
+    assert.deepEqual(crashedRecord.appliedPaths, []);
+    assert.equal(crashedRecord.targets[0].afterModifiedVersion, vault.versions.get("notes/a.md"));
+    assert.equal(crashedRecord.targets[1].afterModifiedVersion, null);
 
     const unresolvedReplay = await crashing.execute(request);
     assert.equal(unresolvedReplay.status, "unknown_outcome");
@@ -1777,6 +2047,43 @@ test("guarded undo restores only an unchanged applied batch", async () => {
     assert.equal(vault.entries.get("notes/a.md"), "alpha\n");
 });
 
+test("guarded undo preserves a user edit racing the reverse compare-exchange", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const vault = new MemoryVault({ "notes/a.md": "alpha\n" });
+    const journal = new MemoryJournal();
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+    });
+    const applied = await coordinator.execute(call("batch_reverse_race", [{
+        op: "append",
+        path: "notes/a.md",
+        content: "next\n",
+        expectedContentHash: digest("alpha\n"),
+        expectedModifiedVersion: initialModifiedVersion(1, "alpha\n"),
+    }]));
+    assert.equal(applied.status, "succeeded");
+    const originalApplyConditional = vault.applyConditional.bind(vault);
+    let raced = false;
+    vault.applyConditional = async (mutation) => {
+        if (!raced && mutation.kind === "modify" && mutation.afterContent === "alpha\n") {
+            raced = true;
+            await vault.write(mutation.path, "user edit during undo\n");
+        }
+        return originalApplyConditional(mutation);
+    };
+
+    const result = await coordinator.undo("batch_reverse_race");
+
+    assert.equal(result.status, "conflict");
+    assert.deepEqual(result.paths, ["notes/a.md"]);
+    assert.equal(vault.entries.get("notes/a.md"), "user edit during undo\n");
+    assert.equal((await journal.load("batch_reverse_race")).state, "undoing");
+    assert.deepEqual((await journal.load("batch_reverse_race")).manualReviewPaths, ["notes/a.md"]);
+});
+
 test("an unresolved guarded undo latches later writes in the current coordinator", async () => {
     const { VaultChangeCoordinator } = loadModule();
     const vault = new MemoryVault({ "notes/a.md": "alpha\n", "notes/b.md": "beta\n" });
@@ -1790,19 +2097,18 @@ test("an unresolved guarded undo latches later writes in the current coordinator
             expectedModifiedVersion: initialModifiedVersion(1, "alpha\n"),
         },
     ]));
-    const originalRead = vault.read.bind(vault);
-    let appliedReads = 0;
-    vault.read = async (target) => {
-        const content = await originalRead(target);
-        if (target === "notes/a.md" && content === "alpha\nnext\n" && ++appliedReads === 2) {
-            vault.entries.set(target, "racing user edit\n");
-            return "racing user edit\n";
+    const originalApplyConditional = vault.applyConditional.bind(vault);
+    let raced = false;
+    vault.applyConditional = async (mutation) => {
+        if (!raced && mutation.kind === "modify" && mutation.afterContent === "alpha\n") {
+            raced = true;
+            await vault.write(mutation.path, "racing user edit\n");
         }
-        return content;
+        return originalApplyConditional(mutation);
     };
 
     const conflict = await coordinator.undo("batch_unresolved_undo");
-    vault.read = originalRead;
+    vault.applyConditional = originalApplyConditional;
     const blocked = await coordinator.execute(call("batch_after_unresolved_undo", [
         {
             op: "append", path: "notes/b.md", content: "later\n", expectedContentHash: digest("beta\n"),
@@ -1923,6 +2229,30 @@ test("file journal atomically replaces durable state and rejects unsafe recovery
         targets: [{ ...base.targets[0], path: "../outside.md" }],
     }));
     await assert.rejects(store.load("batch_unsafe"), /malformed/);
+    await rm(path.join(root, "batch_unsafe.json"));
+
+    const reservation = {
+        ...base,
+        version: 2,
+        batchId: "batch_interview_reservation",
+        toolCallId: "call_interview_reservation",
+        runId: "run_interview_child",
+        rootRunId: "run_interview_root",
+        changeKind: "interview_submission",
+        reviewHash: digest("complete review"),
+        state: "rejected",
+        targets: [{
+            ...base.targets[0],
+            beforeModifiedVersion: "mtime:1:size:6",
+            afterModifiedVersion: null,
+        }],
+    };
+    await store.save(reservation);
+    assert.deepEqual(
+        await store.findInterviewSubmissionByRootRun("run_interview_root"),
+        reservation,
+    );
+    assert.equal(await store.findInterviewSubmissionByRootRun("another_root"), undefined);
 });
 
 test("file journal migrates the plugin-local journal idempotently and fails closed on conflicts", async (t) => {

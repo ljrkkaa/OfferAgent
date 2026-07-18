@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Protocol, cast
@@ -13,7 +13,7 @@ import pytest
 from offeragent_harness.adapters.local_artifacts import LocalArtifactStore
 from offeragent_harness.agent import BudgetCheckpoint, BudgetLedger, RunPreparationFailure
 from offeragent_harness.agent.context_manager import ContextBudgetExceeded
-from offeragent_harness.agent.state import RunState
+from offeragent_harness.agent.state import PendingWork, RunState, WriteObligation, WriteOutcome
 from offeragent_harness.config import HarnessConfig, ModelProvider
 from offeragent_harness.models import ModelEvent, ModelRequest, ModelRole
 from offeragent_harness.ports import CancellationToken
@@ -34,7 +34,7 @@ from offeragent_harness.testing import (
     InMemoryUnitOfWorkFactory,
     ManualClock,
 )
-from offeragent_harness.tools import canonical_json_sha256
+from offeragent_harness.tools import ToolResultStatus, canonical_json_sha256
 
 NOW = datetime(2026, 7, 18, 6, 0, tzinfo=timezone.utc)
 ACCOUNT_BINDING = "sha256:" + "b" * 64
@@ -186,6 +186,7 @@ def _factory(
     gateway_calls: list[Any],
     *,
     attachments: object | None = None,
+    current_local_date: Callable[[], date] | None = None,
 ) -> ProductionRunComponentsFactory:
     clock = ManualClock(NOW)
 
@@ -205,6 +206,7 @@ def _factory(
         journal=object(),
         artifacts=LocalArtifactStore(tmp_path / "artifacts", workspace_id="ws_test"),
         attachments=attachments,  # type: ignore[arg-type]
+        current_local_date=current_local_date,
         local_transaction=None,
         parent_authorities=object(),  # type: ignore[arg-type]
     )
@@ -236,6 +238,7 @@ async def test_prepare_root_binds_fresh_catalog_model_and_build_uses_only_that_e
     model_request = _create_model_request(components.planner_factory(ledger), request_state)
     assert model_request.model == "gpt-selected"
     proof = prepared.durable_snapshot
+    assert proof["schemaVersion"] == 2
     assert proof["modelBinding"]["modelId"] == "gpt-selected"
     assert proof["modelBinding"]["catalogRevision"] == "sha256:" + "a" * 64
     assert proof["modelBinding"]["boundAt"] == NOW.isoformat()
@@ -317,6 +320,90 @@ async def test_recovery_restores_the_fingerprinted_binding_without_catalog_io_or
     assert unavailable.restore_calls == [("gpt-selected", ACCOUNT_BINDING)]
     assert prepared.durable_snapshot == durable
     assert gateway_calls[0].model == "gpt-selected"
+
+
+@pytest.mark.asyncio
+async def test_recovery_reads_a_legacy_v1_text_only_snapshot_without_using_restart_date(tmp_path: Path) -> None:
+    command = _command(_config())
+    state = _state()
+    first = _factory(tmp_path / "first", _ModelModule(_binding()), [])
+    current = (await first.prepare_root(command, state, _cancellation(), None)).durable_snapshot
+    legacy = {**current, "schemaVersion": 1}
+    legacy.pop("interviewSubmissionAuthority")
+    budget = first.budget_root(command, state)
+    recovered_state = replace(
+        state,
+        budget_checkpoint=await BudgetCheckpoint.capture(BudgetLedger(budget, started_at=NOW), now=NOW),
+    )
+    restarted = _factory(
+        tmp_path / "restarted",
+        _ModelModule(_binding(), restore_outcome=_binding()),
+        [],
+        current_local_date=lambda: date(2026, 7, 19),
+    )
+
+    prepared = await restarted.prepare_root(
+        command,
+        recovered_state,
+        _cancellation(),
+        legacy,
+    )
+    restarted.build_prepared_root(command, recovered_state, prepared)
+
+    assert prepared.durable_snapshot == legacy
+    token = cast(Any, prepared.token)
+    assert token.interview_submission_authority.captured_on == date(2026, 7, 18)
+    assert token.interview_submission_authority.ordered_image_content_hashes == ()
+
+
+@pytest.mark.asyncio
+async def test_legacy_v1_recovery_rejects_pending_or_completed_interview_apply_windows(tmp_path: Path) -> None:
+    command = _command(_config())
+    state = _state()
+    first = _factory(tmp_path / "first", _ModelModule(_binding()), [])
+    current = (await first.prepare_root(command, state, _cancellation(), None)).durable_snapshot
+    legacy = {**current, "schemaVersion": 1}
+    legacy.pop("interviewSubmissionAuthority")
+    budget = first.budget_root(command, state)
+    pristine = replace(
+        state,
+        budget_checkpoint=await BudgetCheckpoint.capture(BudgetLedger(budget, started_at=NOW), now=NOW),
+    )
+    active_states = (
+        replace(pristine, pending=PendingWork(tool_call_ids=frozenset({"call_apply_pending"}))),
+        replace(
+            pristine,
+            tool_calls=1,
+            write_obligation=WriteObligation(
+                required=True,
+                reasons=("model declared an Interview write",),
+                outcomes=(WriteOutcome("call_apply_completed", ToolResultStatus.SUCCEEDED, "Applied."),),
+            ),
+        ),
+        replace(
+            pristine,
+            tool_calls=1,
+            write_obligation=WriteObligation(
+                required=True,
+                reasons=("model declared an Interview write",),
+                outcomes=(WriteOutcome("call_apply_unknown", ToolResultStatus.UNKNOWN_OUTCOME, "Outcome unknown."),),
+            ),
+        ),
+    )
+
+    for index, active_state in enumerate(active_states):
+        restarted = _factory(
+            tmp_path / f"restarted-{index}",
+            _ModelModule(_binding(), restore_outcome=_binding()),
+            [],
+        )
+        with pytest.raises(ValueError, match="legacy production capability snapshot has prior tool activity"):
+            await restarted.prepare_root(
+                command,
+                active_state,
+                _cancellation(),
+                legacy,
+            )
 
 
 @pytest.mark.asyncio
@@ -508,6 +595,143 @@ async def test_current_turn_images_reach_one_user_request_in_order_with_catalog_
     assert [block.data["detail"] for block in images] == [expected_detail, expected_detail]
     assert attachments.calls == ["art_one", "art_two"]
     assert len(gateway_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_reuses_captured_date_and_rechecks_store_materialized_attachment_authority(
+    tmp_path: Path,
+) -> None:
+    first = b"\x89PNG\r\n\x1a\nfirst-image"
+    second = b"\x89PNG\r\n\x1a\nsecond-image"
+    hashes = (
+        "sha256:" + hashlib.sha256(first).hexdigest(),
+        "sha256:" + hashlib.sha256(second).hexdigest(),
+    )
+
+    class _Attachments:
+        blobs = (first, second)
+        reported_hashes = hashes
+
+        async def materialize_claimed_submission(
+            self,
+            session_id: str,
+            turn_id: str,
+            claims: tuple[AttachmentClaim, ...],
+            cancellation: CancellationToken,
+        ) -> object:
+            assert session_id == "ses_test"
+            assert turn_id == "turn_test"
+            cancellation.checkpoint()
+            return tuple(
+                SimpleNamespace(
+                    attachment=SimpleNamespace(
+                        artifact_id=claim.artifact_id,
+                        order=claim.order,
+                        media_type=claim.media_type,
+                        content_hash=self.reported_hashes[index],
+                        byte_length=len(self.blobs[index]),
+                    ),
+                    content=self.blobs[index],
+                    width=1,
+                    height=1,
+                )
+                for index, claim in enumerate(claims)
+            )
+
+    def image_block(index: int, payload: bytes) -> dict[str, object]:
+        return {
+            "type": "image",
+            "artifact": {
+                "artifactId": f"art_{index}",
+                "contentHash": "sha256:" + hashlib.sha256(payload).hexdigest(),
+                "mediaType": "image/png",
+                "sizeBytes": len(payload),
+                "sensitivity": "private",
+                "state": "complete",
+            },
+            "altText": f"page {index}",
+        }
+
+    attachments = _Attachments()
+    local_date = [date(2026, 7, 18)]
+    binding = _binding(input_modalities=("text", "image"), supports_image_detail_original=True)
+    command = replace(
+        _command(_config()),
+        input_blocks=(
+            {"type": "text", "text": "compare", "format": "markdown", "references": []},
+            image_block(1, first),
+            image_block(2, second),
+        ),
+    )
+    initial = _factory(
+        tmp_path / "initial",
+        _ModelModule(binding),
+        [],
+        attachments=attachments,
+        current_local_date=lambda: local_date[0],
+    )
+    durable = (await initial.prepare_root(command, _state(), _cancellation(), None)).durable_snapshot
+    authority = durable["interviewSubmissionAuthority"]
+    assert authority["capturedOn"] == "2026-07-18"
+    assert tuple(authority["orderedImageContentHashes"]) == hashes
+
+    legacy = {**durable, "schemaVersion": 1}
+    legacy.pop("interviewSubmissionAuthority")
+    initial_budget = initial.budget_root(command, _state())
+    legacy_state = replace(
+        _state(),
+        budget_checkpoint=await BudgetCheckpoint.capture(
+            BudgetLedger(initial_budget, started_at=NOW),
+            now=NOW,
+        ),
+    )
+
+    local_date[0] = date(2026, 7, 19)
+    restarted = _factory(
+        tmp_path / "restarted",
+        _ModelModule(binding, restore_outcome=binding),
+        [],
+        attachments=attachments,
+        current_local_date=lambda: local_date[0],
+    )
+    restored = await restarted.prepare_root(command, _state(), _cancellation(), durable)
+
+    assert restored.durable_snapshot == durable
+    assert restored.durable_snapshot["interviewSubmissionAuthority"]["capturedOn"] == "2026-07-18"
+
+    legacy_restarted = _factory(
+        tmp_path / "legacy-restarted",
+        _ModelModule(binding, restore_outcome=binding),
+        [],
+        attachments=attachments,
+        current_local_date=lambda: local_date[0],
+    )
+    legacy_restored = await legacy_restarted.prepare_root(
+        command,
+        legacy_state,
+        _cancellation(),
+        legacy,
+    )
+    assert legacy_restored.durable_snapshot == legacy
+    legacy_token = cast(Any, legacy_restored.token)
+    assert legacy_token.interview_submission_authority.captured_on == date(2026, 7, 18)
+    assert legacy_token.interview_submission_authority.ordered_image_content_hashes == hashes
+
+    drifted_first = b"x" * len(first)
+    attachments.blobs = (drifted_first, second)
+    attachments.reported_hashes = (
+        "sha256:" + hashlib.sha256(drifted_first).hexdigest(),
+        hashes[1],
+    )
+    drifted = _factory(
+        tmp_path / "drifted",
+        _ModelModule(binding, restore_outcome=binding),
+        [],
+        attachments=attachments,
+        current_local_date=lambda: local_date[0],
+    )
+    with pytest.raises(ValueError, match="Store-materialized Run attachments"):
+        await drifted.prepare_root(command, _state(), _cancellation(), durable)
 
 
 @pytest.mark.asyncio

@@ -1,10 +1,10 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { isIP } from "node:net";
 
 import type { TFile } from "obsidian";
 
 import type { ExecutableToolCallDescriptor, ToolResultDescriptor } from "./generated_protocol";
+import { normalizeInterviewSourceIdentity } from "./interview_source_identity";
 import { failed, hasExtraKeys, succeeded } from "./plugin_tool_results";
 
 const EXPERIENCE_PATH = /^experiences\/[^/.][^/]*\.md$/u;
@@ -16,8 +16,6 @@ const MAX_FILE_BYTES = 65_536;
 const MAX_SCANNED_FILES = 1_000;
 const MAX_EXPERIENCES = 50;
 const MAX_QUESTIONS = 100;
-const MAX_SOURCE_URLS = 8;
-const MAX_ORDERED_IMAGE_HASHES = 20;
 const EXPERIENCE_INDEX_PATH = "experiences/index.md";
 const QUESTION_INDEX_PATH = "interview/index.md";
 
@@ -159,19 +157,11 @@ function parseQuery(value: Readonly<Record<string, unknown>>): CatalogQuery | nu
     if (hasExtraKeys(value, [
         "sourceUrls", "orderedImageContentHashes", "company", "role", "questionTerms",
     ])) return null;
-    const rawSourceUrls = value.sourceUrls ?? [];
-    if (!Array.isArray(rawSourceUrls) || rawSourceUrls.length > MAX_SOURCE_URLS ||
-        rawSourceUrls.some((item) => optionalBounded(item, 2_048) === undefined)) return null;
-    const canonicalUrls = rawSourceUrls.map((item) => canonicalPublicUrl(String(item).trim()));
-    if (canonicalUrls.some((item) => item === undefined)) return null;
-    const sourceUrls = [...new Set(canonicalUrls as string[])];
-    const rawImageHashes = value.orderedImageContentHashes ?? [];
-    if (!Array.isArray(rawImageHashes) || rawImageHashes.length > MAX_ORDERED_IMAGE_HASHES ||
-        rawImageHashes.some((item) => typeof item !== "string" || !DIGEST.test(item))) return null;
-    const orderedImageContentHashes = rawImageHashes as string[];
-    const computedFingerprint = orderedImageContentHashes.length > 0
-        ? orderedImageFingerprint(orderedImageContentHashes)
-        : null;
+    const sourceIdentity = normalizeInterviewSourceIdentity({
+        sourceUrls: value.sourceUrls ?? [],
+        orderedImageContentHashes: value.orderedImageContentHashes ?? [],
+    });
+    if (sourceIdentity === null) return null;
     const company = optionalBounded(value.company, 128);
     const role = optionalBounded(value.role, 128);
     if ((value.company !== undefined && company === undefined) || (value.role !== undefined && role === undefined)) return null;
@@ -182,9 +172,9 @@ function parseQuery(value: Readonly<Record<string, unknown>>): CatalogQuery | nu
     const questionTerms = [...new Set((rawTerms as string[]).map((term) => term.trim()))];
     if (questionTerms.length !== rawTerms.length) return null;
     return {
-        sourceUrls,
-        sourceFingerprint: computedFingerprint,
-        orderedImageContentHashes,
+        sourceUrls: sourceIdentity.canonicalUrls,
+        sourceFingerprint: sourceIdentity.sourceFingerprint,
+        orderedImageContentHashes: sourceIdentity.orderedImageContentHashes,
         company,
         role,
         questionTerms,
@@ -228,7 +218,9 @@ function experienceMetadata(path: string, snapshot: Snapshot, query: CatalogQuer
     const sourceKind = bounded(values.get("source-kind"), 32);
     if (experienceId === undefined || sourceKind === undefined) return null;
     const rawUrl = bounded(values.get("source-url"), 2_048);
-    const sourceUrl = rawUrl === undefined ? undefined : canonicalPublicUrl(rawUrl);
+    const sourceUrl = rawUrl === undefined ? undefined : normalizeInterviewSourceIdentity({
+        sourceUrls: [rawUrl],
+    })?.canonicalUrls[0];
     if (rawUrl !== undefined && sourceUrl === undefined) return null;
     const sourceFingerprint = bounded(values.get("source-fingerprint"), 71);
     if (sourceFingerprint !== undefined && !DIGEST.test(sourceFingerprint)) return null;
@@ -331,80 +323,6 @@ function scalar(raw: string): string | null {
         return value.endsWith("'") && value.length >= 2 ? value.slice(1, -1).replace(/''/gu, "'") : null;
     }
     return !/[\[\]{}\n\r]/u.test(value) ? value : null;
-}
-
-function canonicalPublicUrl(value: string): string | undefined {
-    try {
-        const url = new URL(value);
-        if (!["http:", "https:"].includes(url.protocol) || url.username || url.password ||
-            !publicHostname(url.hostname)) return undefined;
-        url.hash = "";
-        url.hostname = url.hostname.toLocaleLowerCase();
-        const retained = [...url.searchParams.entries()]
-            .map(([key, item], index) => ({ key, item, index }))
-            .filter(({ key }) => !isDiscardedQueryParameter(key))
-            .sort((left, right) => compareCodePoints(left.key, right.key) ||
-                compareCodePoints(left.item, right.item) || left.index - right.index);
-        url.search = "";
-        for (const { key, item } of retained) url.searchParams.append(key, item);
-        return Buffer.byteLength(url.href, "utf8") <= 2_048 ? url.href : undefined;
-    } catch {
-        return undefined;
-    }
-}
-
-function compareCodePoints(left: string, right: string): number {
-    return left < right ? -1 : left > right ? 1 : 0;
-}
-
-function publicHostname(value: string): boolean {
-    const hostname = value.toLocaleLowerCase().replace(/^\[|\]$/gu, "");
-    const version = isIP(hostname);
-    if (version === 4) return publicIpv4(hostname);
-    if (version === 6) return publicIpv6(hostname);
-    if (!hostname.includes(".") || hostname.startsWith(".") || hostname.endsWith(".")) return false;
-    return !/\.(?:home|internal|invalid|lan|local|localhost|test|example)$/iu.test(hostname);
-}
-
-function publicIpv4(value: string): boolean {
-    const [first, second, third] = value.split(".").map(Number);
-    return first !== 0 && first !== 10 && first !== 127 && first < 224 &&
-        !(first === 100 && second >= 64 && second <= 127) &&
-        !(first === 169 && second === 254) &&
-        !(first === 172 && second >= 16 && second <= 31) &&
-        !(first === 192 && (second === 0 || second === 168)) &&
-        !(first === 198 && (second === 18 || second === 19 || (second === 51 && third === 100))) &&
-        !(first === 203 && second === 0 && third === 113);
-}
-
-function publicIpv6(value: string): boolean {
-    if (value === "::" || value === "::1") return false;
-    if (value.startsWith("::ffff:")) {
-        const tail = value.slice("::ffff:".length);
-        if (isIP(tail) === 4) return publicIpv4(tail);
-        const mapped = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/iu.exec(tail);
-        if (mapped === null) return false;
-        const high = Number.parseInt(mapped[1], 16);
-        const low = Number.parseInt(mapped[2], 16);
-        return publicIpv4(`${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`);
-    }
-    if (value.startsWith("::")) return false;
-    const first = Number.parseInt(value.split(":", 1)[0] || "0", 16);
-    return !(first >= 0xfc00 && first <= 0xfdff) &&
-        !(first >= 0xfe80 && first <= 0xfebf) &&
-        !(first >= 0xff00) &&
-        !value.startsWith("2001:db8:");
-}
-
-function isDiscardedQueryParameter(value: string): boolean {
-    return /^(utm_.+|spm|from|source|ref|fbclid|gclid|dclid|yclid|mc_cid|mc_eid|igshid|msclkid|ttclid|twclid)$/iu.test(value) ||
-        /^(token|(?:access|refresh|id|session|security)[_-]?token|auth(?:orization)?|api[_-]?key|credential|signature|sig|expires?|expiry|awsaccesskeyid|googleaccessid|key-pair-id|policy|x-amz-.+|x-goog-.+)$/iu.test(value);
-}
-
-function orderedImageFingerprint(contentHashes: readonly string[]): string {
-    const hash = createHash("sha256");
-    contentHashes.forEach((contentHash, order) => hash.update(`${order}\0${contentHash}\n`, "utf8"));
-    return `sha256:${hash.digest("hex")}`;
 }
 
 function optionalBounded(value: unknown, maximumBytes: number): string | undefined {

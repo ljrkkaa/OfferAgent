@@ -21,8 +21,8 @@ OfferAgent 根据明确来源提出、但尚未应用到 Vault 的内容变更�
 _Avoid_: 自动写入、模型已经修改、后台静默修改
 
 **Vault Change Batch**:
-一个 Agent Run 为完成同一逻辑任务而提出的一组 Vault Action；用户只能全部应用或全部拒绝。应用前任一源文件版本不再匹配时，整个批次失效。
-_Avoid_: 可部分勾选的修改列表、后台任务队列、多个无关任务的合并
+一个 Agent Run 为完成同一逻辑任务而提出的一组 Vault Action；用户只能全部应用或全部拒绝。应用前任一源文件版本不再匹配时，整个批次失效。它以完整预览、持久化 Journal、Git Checkpoint、条件变更和明确的人工复核状态提供决策与恢复上的逻辑原子性；它不是底层多文件事务，也不承诺所有外部观察者同时看到全有或全无。
+_Avoid_: 可部分勾选的修改列表、后台任务队列、多个无关任务的合并、把顺序补偿描述成多文件事务
 
 **Vault Permission Mode**:
 Obsidian 插件为单个 Vault 保存和执行的写入授权策略。默认模式为 Trusted Vault；Agent 和 Runtime 都不能自行扩大或修改该策略。
@@ -45,8 +45,8 @@ OfferAgent 从用户分享或自主检索的内容中整理出的结构化面经
 _Avoid_: 原始素材库、网页镜像、聊天记录副本
 
 **Interview Submission**:
-用户在一条消息中提供并作为一次入库尝试处理的文本、公共 URL 和有序 Run Attachment 集合；它是不可分割的输入单元，必须综合全部内容后产生零或一篇 Interview Experience，任一页无法处理时不保留其他页的部分结果。
-_Avoid_: 每张截图一篇面经、忽略附件顺序、部分入库、未征得用户意图自动拆分
+用户在一条消息中提供并作为一次入库尝试处理的文本、公共 URL 和有序 Run Attachment 集合；它是不可分割的输入单元，必须综合全部内容后产生零或一篇 Interview Experience，任一页无法处理时不保留其他页的部分结果。Python Harness 从 Conversation Attachment Store 为当前 root Agent Run 建立不可由模型改写的日期、图片顺序、内容哈希和来源指纹权威；一次成功 Catalog 结果绑定该来源，而同一 root Agent Run 最多提出一个持久化的 Interview Vault Change Batch。
+_Avoid_: 每张截图一篇面经、忽略附件顺序、模型复制的附件清单充当权威、同一 Run 拆分或重提多个入库批次、部分入库、未征得用户意图自动拆分
 
 **Interview Experience Identity**:
 一篇 Interview Experience 所代表的单次来源事件；相同 URL、相同截图内容或明显搬运内容属于同一事件并合并，来自不同求职者、时间或轮次的经历仍是不同事件，即使部分问题重合。

@@ -2199,6 +2199,77 @@ button.reference-button:hover {
     color: var(--text-error);
 }
 
+.offeragent-vault-review-modal {
+    width: min(92vw, 1100px);
+    max-width: 1100px;
+}
+
+.offeragent-vault-review-identity {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 4px 12px;
+    margin: 12px 0;
+}
+
+.offeragent-vault-review-identity dt {
+    color: var(--text-muted);
+    font-weight: var(--font-semibold);
+}
+
+.offeragent-vault-review-identity dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+    user-select: text;
+}
+
+.offeragent-vault-review-scroll {
+    max-height: 62vh;
+    overflow: auto;
+    padding: 4px 10px 4px 0;
+    border-block: 1px solid var(--background-modifier-border);
+}
+
+.offeragent-vault-review-source,
+.offeragent-vault-review-target {
+    margin: 12px 0;
+    padding: 12px;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 8px;
+    background: var(--background-secondary);
+}
+
+.offeragent-vault-review-source h3,
+.offeragent-vault-review-target h3 {
+    margin-top: 0;
+}
+
+.offeragent-vault-review-source pre,
+.offeragent-vault-review-target pre {
+    overflow-x: auto;
+    max-height: none;
+    padding: 10px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    user-select: text;
+    background: var(--background-primary);
+}
+
+.offeragent-vault-review-target details + details {
+    margin-top: 10px;
+}
+
+.offeragent-vault-review-target summary {
+    cursor: pointer;
+    font-weight: var(--font-semibold);
+}
+
+.offeragent-vault-review-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding-top: 12px;
+}
+
 @media (max-width: 520px) {
     .offeragent-timeline {
         padding-inline: 9px;
