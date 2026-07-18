@@ -3,9 +3,9 @@
 ## 权威入口
 
 每个 Obsidian 插件实例直接创建一个 Worker；Worker 内只有一个带 `@agent_loop_entrypoint` 标记的 Agent Loop 实现。
-`HarnessService` 是所有 UI Command 的应用入口。当前插件 direct stdio、Loopback Web、测试 Direct
-Adapter 都只能调用这一个服务。插件 IPC 只有继承 stdin/stdout 上的 framed JSON-RPC；不存在第二个
-transport composition root。
+`HarnessService` 是所有 UI Command 的应用入口。当前插件 direct stdio 与测试 Direct Adapter
+都只能调用这一个服务。插件 IPC 只有继承 stdin/stdout 上的 framed JSON-RPC；不存在第二个
+transport composition root 或 HTTP/WebSocket 控制面。
 
 ## 依赖方向
 
@@ -23,7 +23,7 @@ app / cli composition root
 
 - 新 Runtime 不得 import `khoj`、Django、PostgreSQL、Router、LangChain 或旧远程 Store。
 - Model Provider 不得 import Tool Kernel、Vault、Storage、ProcessSupervisor，也不得使用文件或进程 API。
-- 插件和本地 Web UI 不得 import 模型 SDK、工具执行器或实现 Planner/Tool Loop。
+- 插件不得 import 模型 SDK、工具执行器或实现 Planner/Tool Loop。
 - 生产模块不得 import `offeragent_harness.testing`。
 - Core 不读取全局 Vault/Model 环境变量；Workspace 与 RunConfig 通过不可变快照注入。
 - `runtime.duplex_json_rpc` 只负责 direct stdio framing、取消、背压和应用命令分发，不得拥有 Agent、

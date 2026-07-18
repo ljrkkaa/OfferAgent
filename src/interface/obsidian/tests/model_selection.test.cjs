@@ -36,17 +36,13 @@ const ACCOUNT_B = `sha256:${"b".repeat(64)}`;
 
 function catalogModel(model = "gpt-catalog-model") {
     return {
-        provider: "codex-subscription-experimental",
         model,
         displayName: "GPT Catalog Model",
-        supportsStreaming: true,
-        supportsStructuredOutput: true,
         inputModalities: ["text", "image"],
         supportsImageDetailOriginal: true,
         supportsHostedSearch: true,
         supportsFastMode: false,
         contextWindow: 128_000,
-        available: true,
     };
 }
 

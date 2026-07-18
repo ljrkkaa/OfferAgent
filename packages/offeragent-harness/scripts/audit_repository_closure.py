@@ -95,7 +95,6 @@ REQUIRED_PATHS = (
     "packages/offeragent-harness/scripts/build_local_windows_plugin.py",
     "packages/offeragent-harness/scripts/frozen_payload.py",
     "packages/offeragent-harness/scripts/local_windows_runtime_build.py",
-    "packages/offeragent-harness/web/index.html",
     "src/interface/obsidian/manifest.json",
     "src/interface/obsidian/package.json",
     "src/interface/obsidian/yarn.lock",

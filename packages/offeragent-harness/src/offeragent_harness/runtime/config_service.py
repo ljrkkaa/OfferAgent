@@ -22,15 +22,20 @@ from offeragent_harness.config import (
     RunConfigSnapshot,
 )
 from offeragent_harness.config.files import ConfigFileLoad, ConfigFileStore
-from offeragent_harness.config.migrations import project_legacy_codex_config, validate_current_codex_config
+from offeragent_harness.config.migrations import (
+    project_legacy_codex_config,
+    project_previous_codex_config_with_report,
+    validate_current_codex_config,
+)
 from offeragent_harness.config.resolver import changed_paths, merge_patch, resolve_config
 from offeragent_harness.error_codes import ResourceConflictCause
 from offeragent_harness.ports import Clock, EventSink, IdGenerator, NewEvent, StoredEvent, UnitOfWorkFactory
 
 _CONFIG_COLLECTION = "config_layers"
 _RECEIPT_COLLECTION = "config_receipts"
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _LEGACY_SCHEMA_VERSIONS = frozenset({2, 3})
+_PREVIOUS_SCHEMA_VERSION = 4
 _LAYER_FIELDS = frozenset({"config", "eventSequence", "ownerId", "revision", "schemaVersion", "scope", "updatedAt"})
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}")
 
@@ -432,7 +437,10 @@ def _decode_layer(raw: Any, scope: ConfigScope, owner_id: str) -> ConfigLayer:
         if set(raw) != _LAYER_FIELDS:
             raise ValueError("configuration layer fields are incompatible")
         schema_version = raw.get("schemaVersion")
-        if schema_version not in {*_LEGACY_SCHEMA_VERSIONS, _SCHEMA_VERSION} or raw.get("scope") != scope.value:
+        if (
+            schema_version not in {*_LEGACY_SCHEMA_VERSIONS, _PREVIOUS_SCHEMA_VERSION, _SCHEMA_VERSION}
+            or raw.get("scope") != scope.value
+        ):
             raise ValueError("incompatible configuration layer")
         if raw.get("ownerId") != owner_id:
             raise ValueError("configuration owner mismatch")
@@ -443,6 +451,8 @@ def _decode_layer(raw: Any, scope: ConfigScope, owner_id: str) -> ConfigLayer:
         config = raw["config"]
         if schema_version in _LEGACY_SCHEMA_VERSIONS:
             patch = project_legacy_codex_config(config)
+        elif schema_version == _PREVIOUS_SCHEMA_VERSION:
+            patch = project_previous_codex_config_with_report(config).patch
         else:
             patch = validate_current_codex_config(config)
         return ConfigLayer(

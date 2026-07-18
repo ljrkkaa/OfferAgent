@@ -23,7 +23,7 @@ class EntityNetworkAuditSink(NetworkAuditSink):
     async def record(self, audit: NetworkAuditRecord) -> None:
         audit_id = self._ids.new_id("network_audit") if audit.event_id is None else f"network_audit_{audit.event_id}"
         payload: dict[str, Any] = {
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "auditId": audit_id,
             "category": audit.category.value,
             "workspaceId": audit.workspace_id,
@@ -42,7 +42,6 @@ class EntityNetworkAuditSink(NetworkAuditSink):
             "approvalSource": audit.approval_source,
             "occurredAt": audit.occurred_at.isoformat(),
             "operationId": audit.operation_id,
-            "clientRequestId": audit.client_request_id,
             "operationPurpose": (None if audit.operation_purpose is None else audit.operation_purpose.value),
             "phase": audit.phase,
             "stage": audit.stage,

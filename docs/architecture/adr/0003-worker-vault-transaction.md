@@ -4,7 +4,7 @@
 
 ## 决策
 
-`Glob`、`Grep`、`Read` 与 `vault.transaction` 只在 Worker 的 Tool Registry 中注册，并且只通过 Tool Kernel 执行。Obsidian 和本地 Web 都是协议客户端：发送会话命令、消费可重放事件，不注册执行器、不代理文件工具、不保存调用影子状态。
+`Glob`、`Grep`、`Read` 与 `vault.transaction` 只在 Worker 的 Tool Registry 中注册，并且只通过 Tool Kernel 执行。Obsidian direct stdio 是唯一协议客户端：发送会话命令、消费可重放事件，不注册执行器、不代理文件工具、不保存调用影子状态。
 
 读工具受 Workspace 根目录、隐藏路径白名单、结果字节上限和当前 Run 权限约束。`Grep` 使用受控的 ripgrep 进程；不存在索引、文档分块、评分、语义检索或查询改写。
 

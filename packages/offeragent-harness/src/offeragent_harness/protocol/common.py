@@ -151,7 +151,6 @@ class BudgetSnapshot(WireModel):
 
 
 class RunConfigSnapshot(WireModel):
-    provider: str = Field(default="codex-subscription-experimental", min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=256)
     reasoning_effort: ReasoningEffort = ReasoningEffort.MEDIUM
     permission_mode: PermissionMode = PermissionMode.NORMAL

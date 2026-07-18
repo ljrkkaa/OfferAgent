@@ -173,7 +173,6 @@ class ModelNetworkAuditor:
                 approval_source=None,
                 occurred_at=self._clock.utcnow(),
                 operation_id=operation.operation_id,
-                client_request_id=operation.client_request_id,
                 operation_purpose=operation.purpose,
                 phase="http_request",
                 stage=stage,
@@ -199,16 +198,7 @@ class ModelNetworkAuditor:
                 attempt=attempt,
                 run_id=_identifier(run_id, "model Run ID"),
             )
-        client_request_id = request.metadata.get("clientRequestId")
-        if request.metadata.get("operation") != "model_health" or not isinstance(client_request_id, str):
-            raise ModelNetworkAuditError("non-Run model network request lacks an explicit admin identity")
-        return NetworkOperationIdentity(
-            workspace_id=self._workspace_id,
-            operation_id=_identifier(request.request_id, "model request ID"),
-            purpose=NetworkOperationPurpose.MODEL_HEALTH,
-            attempt=attempt,
-            client_request_id=_identifier(client_request_id, "model health client request ID"),
-        )
+        raise ModelNetworkAuditError("model network request lacks an immutable Run identity")
 
 
 class ModelAuditAttempt:

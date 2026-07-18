@@ -24,18 +24,14 @@ import { LocalOfferAgentSettings, effectivePermissionMode, runConfig } from "./s
 export const LOCAL_CHAT_VIEW = "offeragent-local-chat";
 
 export interface ChatModelChoice {
-    readonly provider: string;
     readonly model: string;
     readonly accountBinding: string | null;
     readonly displayName: string;
-    readonly supportsStreaming: boolean;
-    readonly supportsStructuredOutput: boolean;
     readonly inputModalities: readonly string[];
     readonly supportsImageDetailOriginal: boolean;
     readonly supportsHostedSearch: boolean;
     readonly supportsFastMode: boolean;
     readonly contextWindow: number | null;
-    readonly available: boolean;
     readonly catalogFreshness: "fresh" | "stale";
 }
 
@@ -62,7 +58,6 @@ export interface LocalChatHost {
     selectModel(model: string): Promise<void>;
     openSettings(): void;
     openDiagnostics(): Promise<void>;
-    openLocalWeb(): Promise<void>;
 }
 
 export class LocalChatView extends ItemView {
@@ -250,9 +245,6 @@ export class LocalChatView extends ItemView {
         setIcon(icon, "bot");
         title.createSpan({ text: "OfferAgent" });
         const actions = header.createDiv({ cls: "offeragent-local-header-actions" });
-        const web = actions.createEl("button", { attr: { "aria-label": "打开本地 Web UI" } });
-        setIcon(web, "external-link");
-        web.onclick = () => void this.host.openLocalWeb().catch((error) => new Notice(actionableMessage(error)));
         const diagnostics = actions.createEl("button", { attr: { "aria-label": "运行诊断" } });
         setIcon(diagnostics, "activity");
         diagnostics.onclick = () => void this.host.openDiagnostics().catch((error) => new Notice(actionableMessage(error)));
@@ -807,9 +799,9 @@ export class LocalChatView extends ItemView {
             this.modelError !== null || choices.length === 0;
         model.onchange = () => void this.chooseModel(model.value);
         const selectedModel = boundSelection;
-        const modelReady = selectedModel?.available === true && selectedModel.catalogFreshness === "fresh";
+        const modelReady = selectedModel?.catalogFreshness === "fresh";
         model.title = this.modelError ?? (!this.modelsLoaded ? "正在从 Worker 查询模型能力" : selectedModel
-            ? `${selectedModel.provider} · ${modelCapabilityLabel(selectedModel)}`
+            ? modelCapabilityLabel(selectedModel)
             : "模型能力尚不可用");
         const capability = modelControl.createSpan({ cls: "offeragent-model-capability", attr: { "aria-live": "polite" } });
         capability.setText(this.modelError ? "模型不可用" : !this.modelsLoaded ? "能力查询中" : selectedModel
@@ -1029,7 +1021,7 @@ export class LocalChatView extends ItemView {
             this.modelsLoaded = true;
             this.modelError = models.length === 0
                 ? "当前 Codex 订阅账户没有可见模型"
-                : models.some((model) => model.catalogFreshness !== "fresh" || !model.available)
+                : models.some((model) => model.catalogFreshness !== "fresh")
                     ? "Codex 模型目录已陈旧，仅供展示；刷新成功前不能开始新运行"
                     : null;
         } catch (error) {
@@ -1152,8 +1144,6 @@ export function modelCapabilityLabel(model: ChatModelChoice): string {
         ? `图文${model.supportsImageDetailOriginal ? "（原图）" : "（高清）"}`
         : "文本";
     return [
-        model.supportsStreaming ? "流式" : "非流式",
-        model.supportsStructuredOutput ? "结构化" : "文本输出",
         inputs,
         model.supportsHostedSearch ? "托管搜索" : "无托管搜索",
         model.supportsFastMode ? "Fast Mode" : "标准速度",

@@ -20,7 +20,6 @@ class NetworkCategory(str, Enum):
 
 class NetworkOperationPurpose(str, Enum):
     MODEL_INFERENCE = "model_inference"
-    MODEL_HEALTH = "model_health"
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,24 +32,15 @@ class NetworkOperationIdentity:
     attempt: int = 1
     run_id: str | None = None
     tool_call_id: str | None = None
-    client_request_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.workspace_id or _OPERATION_ID.fullmatch(self.operation_id) is None or self.attempt < 1:
             raise ValueError("network operation identity is invalid")
-        if self.run_id is not None:
-            if self.client_request_id is not None:
-                raise ValueError("Run network operations cannot contain an admin request identity")
-            if self.purpose is not NetworkOperationPurpose.MODEL_INFERENCE or self.tool_call_id is not None:
-                raise ValueError("Run-scoped network operation identity is incoherent")
-        else:
-            if self.tool_call_id is not None or not self.client_request_id:
-                raise ValueError("admin network operations require a clientRequestId and no ToolCall")
-            if self.purpose not in {
-                NetworkOperationPurpose.MODEL_HEALTH,
-            }:
-                raise ValueError("admin network operation purpose is invalid")
-        for value in (self.run_id, self.tool_call_id, self.client_request_id):
+        if self.run_id is None or self.purpose is not NetworkOperationPurpose.MODEL_INFERENCE:
+            raise ValueError("model network operations require an immutable Run identity")
+        if self.tool_call_id is not None:
+            raise ValueError("model inference is not a remote Tool operation")
+        for value in (self.run_id, self.tool_call_id):
             if value is not None and (len(value) > 128 or "\x00" in value):
                 raise ValueError("network operation correlation identity is invalid")
 
@@ -67,7 +57,6 @@ class NetworkOperationIdentity:
             attempt,
             self.run_id,
             self.tool_call_id,
-            self.client_request_id,
         )
 
 
@@ -90,7 +79,6 @@ class NetworkAuditRecord:
     approval_source: str | None
     occurred_at: datetime
     operation_id: str | None = None
-    client_request_id: str | None = None
     operation_purpose: NetworkOperationPurpose | None = None
     phase: str | None = None
     stage: str | None = None
@@ -129,7 +117,6 @@ class NetworkAuditRecord:
                 self.attempt,
                 self.run_id,
                 self.tool_call_id,
-                self.client_request_id,
             )
         elif self.run_id is None:
             raise ValueError("non-model network audit requires a Run identity")
@@ -149,7 +136,6 @@ def network_audit_event_id(
             "purpose": operation.purpose.value,
             "runId": operation.run_id,
             "toolCallId": operation.tool_call_id,
-            "clientRequestId": operation.client_request_id,
             "endpointId": endpoint_id,
             "attempt": operation.attempt,
             "phase": phase,

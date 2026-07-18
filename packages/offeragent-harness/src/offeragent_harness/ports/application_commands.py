@@ -1,4 +1,4 @@
-"""Ready-gated application command boundary used by local transports."""
+"""Ready-gated application command boundary used by direct stdio."""
 
 from __future__ import annotations
 
@@ -11,25 +11,25 @@ from .cancellation import CancellationToken
 
 @dataclass(frozen=True, slots=True)
 class ApplicationCommandContext:
-    """Authenticated local-transport facts, never supplied by request JSON."""
+    """Authenticated direct-stdio facts, never supplied by request JSON."""
 
     transport: str = "stdio"
     client_id: str = "local-client"
     peer: str = "local"
 
     def __post_init__(self) -> None:
-        if self.transport not in {"stdio", "loopback-http", "loopback-websocket"}:
-            raise ValueError("application command transport is invalid")
+        if self.transport != "stdio":
+            raise ValueError("application command transport must be direct stdio")
         if not self.client_id or not self.peer:
             raise ValueError("application command client identity must not be empty")
 
 
 @runtime_checkable
 class ApplicationCommandDispatcher(Protocol):
-    """The only application surface a stdio/Loopback transport may invoke.
+    """The only application surface the direct stdio transport may invoke.
 
     Concrete composition roots are responsible for adapting this port to the one
-    ready ``HarnessApplication``.  A transport never owns a Harness, Agent Loop,
+    ready ``HarnessApplication``.  The transport never owns a Harness, Agent Loop,
     model, tool registry, or persistence implementation.
     """
 

@@ -144,7 +144,7 @@ def build_schema_bundle() -> dict[str, object]:
         "$id": "urn:offeragent:protocol:1.0",
         "title": "OfferAgent Local Harness Protocol v1",
         "description": (
-            "Canonical DTO schema shared by direct stdio and loopback adapters. "
+            "Canonical DTO schema for the direct stdio adapter. "
             "All object schemas are closed and wire fields use camelCase."
         ),
         "protocolVersion": PROTOCOL_VERSION,

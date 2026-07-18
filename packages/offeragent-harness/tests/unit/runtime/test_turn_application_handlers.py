@@ -12,19 +12,16 @@ from offeragent_harness.runtime.application_domain_handlers import DomainCommand
 from offeragent_harness.runtime.harness_service import StartTurnCommand
 from offeragent_harness.testing import ManualCancellationToken
 
-CODEX_SUBSCRIPTION_PROVIDER = "codex-subscription-experimental"
-
 
 class _Config:
-    def __init__(self, *, provider: str = CODEX_SUBSCRIPTION_PROVIDER, model: str = "gpt-selected") -> None:
-        self._provider = provider
+    def __init__(self, *, model: str = "gpt-selected") -> None:
         self._model = model
 
     async def snapshot(self, **keys: str) -> object:
         del keys
         return SimpleNamespace(
             config=SimpleNamespace(
-                model=SimpleNamespace(provider=SimpleNamespace(value=self._provider), model=self._model),
+                model=SimpleNamespace(model=self._model),
                 policy=SimpleNamespace(allow_bypass=False, read_only=False, workspace_trusted=True),
             ),
             fingerprint="sha256:" + "a" * 64,
@@ -62,10 +59,8 @@ class _Attachments:
         del turn_id, cancellation
 
 
-def _params(*, provider: str | None = CODEX_SUBSCRIPTION_PROVIDER, model: str = "gpt-selected") -> TurnStartParams:
+def _params(*, model: str = "gpt-selected") -> TurnStartParams:
     run_config = {"model": model}
-    if provider is not None:
-        run_config["provider"] = provider
     value = validate_command_params(
         "turn/start",
         {
@@ -103,15 +98,17 @@ async def test_turn_start_rejects_request_and_persisted_exact_model_mismatch_bef
         )
 
 
-@pytest.mark.asyncio
-async def test_turn_start_rejects_a_matching_retired_provider_before_run_creation() -> None:
-    handlers = _handlers(config=_Config(provider="codex"))
-
-    with pytest.raises(ValueError, match="New Runs require the internal Codex Subscription provider"):
-        await handlers["turn/start"](
-            _params(provider="codex"),
-            ManualCancellationToken(),
-            ApplicationCommandContext(transport="stdio"),
+def test_turn_start_protocol_rejects_retired_provider_choice() -> None:
+    with pytest.raises(Exception, match="参数不符合协议 Schema"):
+        validate_command_params(
+            "turn/start",
+            {
+                "sessionId": "ses_one",
+                "turnId": "turn_one",
+                "idempotencyKey": "turn-one-provider",
+                "input": [{"type": "text", "text": "hello"}],
+                "runConfig": {"provider": "codex", "model": "gpt-selected"},
+            },
         )
 
 
@@ -121,11 +118,11 @@ async def test_turn_start_persists_the_catalog_selected_model_with_the_internal_
     handlers = _handlers(config=_Config(), harness=harness)
 
     await handlers["turn/start"](
-        _params(provider=None),
+        _params(),
         ManualCancellationToken(),
         ApplicationCommandContext(transport="stdio"),
     )
 
     assert harness.command is not None
-    assert harness.command.run_config["provider"] == CODEX_SUBSCRIPTION_PROVIDER
+    assert "provider" not in harness.command.run_config
     assert harness.command.run_config["model"] == "gpt-selected"

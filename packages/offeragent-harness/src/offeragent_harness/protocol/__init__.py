@@ -1,7 +1,7 @@
 """OfferAgent protocol v1 public API.
 
-The package is intentionally independent from the Agent domain and every adapter;
-it may be imported by direct stdio, loopback, schema tooling, and conformance tests.
+The package is intentionally independent from the Agent domain and its adapter;
+it may be imported by direct stdio, schema tooling, and conformance tests.
 """
 
 # Re-exporting the generated DTO surface is the purpose of this aggregator.

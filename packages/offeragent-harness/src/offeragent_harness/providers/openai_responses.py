@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import json
 import queue
 import random
@@ -42,7 +41,6 @@ from offeragent_harness.models import (
     thaw_json,
 )
 from offeragent_harness.ports.cancellation import CancellationToken
-from offeragent_harness.ports.secrets import SecretHandle, SecretKind, SecretResolver
 
 from .network_audit import ModelNetworkAuditError, ModelNetworkAuditor
 
@@ -193,20 +191,14 @@ class StaticModelEndpointPolicy:
 
 @dataclass(frozen=True, slots=True)
 class OpenAIResponsesConfig:
-    provider_id: str
-    base_url: str
-    secret_scope_id: str
-    credential_handle: SecretHandle | None
-    endpoint_path: str = "responses"
-    require_credential: bool = True
-    external_credential: bool = False
-    organization_id: str | None = None
-    project_id: str | None = None
-    service_tier: str | None = None
-    supports_max_output_tokens: bool = True
-    supports_temperature: bool = True
-    allow_missing_event_stream_content_type: bool = False
-    project_codex_subscription_schema: bool = False
+    """Safety limits for the fixed Codex Subscription Responses adapter.
+
+    Provider identity, endpoint, wire protocol, and credential source are not
+    configuration: they are invariants of this adapter.
+    """
+
+    provider_id: str = field(init=False, default="codex-subscription")
+    base_url: str = field(init=False, default="https://chatgpt.com/backend-api/codex")
     proxy_url: str | None = None
     connect_timeout_seconds: float = 10.0
     read_timeout_seconds: float = 60.0
@@ -226,31 +218,6 @@ class OpenAIResponsesConfig:
     retry_jitter_ratio: float = 0.2
 
     def __post_init__(self) -> None:
-        if _PROVIDER_ID.fullmatch(self.provider_id) is None:
-            raise ModelProviderConfigurationError("model provider ID is invalid")
-        if not self.secret_scope_id or len(self.secret_scope_id) > 256 or "\x00" in self.secret_scope_id:
-            raise ModelProviderConfigurationError("model secret scope is invalid")
-        if self.endpoint_path not in {"responses", "chat/completions"}:
-            raise ModelProviderConfigurationError("model endpoint path is unsupported")
-        endpoint = _provider_endpoint(self.base_url, self.endpoint_path)
-        object.__setattr__(self, "base_url", endpoint[: -len(f"/{self.endpoint_path}")])
-        if self.require_credential and self.credential_handle is None and not self.external_credential:
-            raise ModelProviderConfigurationError("model provider requires an opaque credential handle")
-        if self.credential_handle is not None and self.external_credential:
-            raise ModelProviderConfigurationError("external credentials cannot be combined with a SecretHandle")
-        if self.external_credential and not self.require_credential:
-            raise ModelProviderConfigurationError("external credential mode must require credentials")
-        if self.project_codex_subscription_schema and not self.external_credential:
-            raise ModelProviderConfigurationError(
-                "Codex subscription schema projection requires an external credential source"
-            )
-        for label, value in (("organization_id", self.organization_id), ("project_id", self.project_id)):
-            if value is not None and (_HEADER_ID.fullmatch(value) is None or any(ch in value for ch in "\r\n")):
-                raise ModelProviderConfigurationError(f"{label} is not a safe HTTP header value")
-        if self.service_tier is not None and (
-            not self.service_tier or len(self.service_tier) > 64 or not self.service_tier.isascii()
-        ):
-            raise ModelProviderConfigurationError("service_tier is invalid")
         if self.proxy_url is not None:
             object.__setattr__(self, "proxy_url", _normalize_loopback_proxy(self.proxy_url))
         timeouts = (
@@ -286,7 +253,7 @@ class OpenAIResponsesConfig:
 
     @property
     def endpoint(self) -> str:
-        return _provider_endpoint(self.base_url, self.endpoint_path)
+        return f"{self.base_url}/responses"
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,22 +335,18 @@ class _StreamControl:
 
 
 class OpenAIResponsesGateway:
-    """Responses API implementation with strict SSE and non-exporting secrets."""
+    """Fixed Codex Subscription implementation with strict Responses SSE."""
 
     def __init__(
         self,
         *,
         config: OpenAIResponsesConfig,
-        secrets: SecretResolver,
         endpoint_policy: ModelEndpointPolicy,
+        credential_source: ModelCredentialSource,
         transport: httpx.BaseTransport | None = None,
         network_auditor: ModelNetworkAuditor | None = None,
-        credential_source: ModelCredentialSource | None = None,
     ) -> None:
-        if config.external_credential != (credential_source is not None):
-            raise ModelProviderConfigurationError("model external credential source does not match its configuration")
         self._config = config
-        self._secrets = secrets
         self._endpoint_policy = endpoint_policy
         self._transport = transport
         self._network_auditor = network_auditor
@@ -525,47 +488,14 @@ class OpenAIResponsesGateway:
         cancellation: CancellationToken,
     ) -> None:
         try:
-            handle = self._config.credential_handle
-            failure: _ProducerFault | None
-            if self._credential_source is not None:
-                failure = self._request_with_external_credential(
-                    request,
-                    payload,
-                    messages,
-                    control,
-                    event_loop,
-                    cancellation,
-                )
-            elif handle is None:
-                if self._config.require_credential:
-                    raise ModelProviderConfigurationError("credential handle is required")
-                failure = self._request_with_retries(
-                    request,
-                    payload,
-                    None,
-                    None,
-                    messages,
-                    control,
-                    event_loop,
-                    cancellation,
-                )
-            else:
-                failure = self._secrets.consume(
-                    handle,
-                    scope_id=self._config.secret_scope_id,
-                    expected_kind=SecretKind.MODEL_PROVIDER,
-                    expected_provider_id=self._config.provider_id,
-                    consumer=lambda material: self._request_with_retries(
-                        request,
-                        payload,
-                        material,
-                        None,
-                        messages,
-                        control,
-                        event_loop,
-                        cancellation,
-                    ),
-                )
+            failure = self._request_with_external_credential(
+                request,
+                payload,
+                messages,
+                control,
+                event_loop,
+                cancellation,
+            )
             if failure is not None:
                 _put(messages, failure, control.stop)
         except _StopRequested:
@@ -615,10 +545,7 @@ class OpenAIResponsesGateway:
         event_loop: asyncio.AbstractEventLoop,
         cancellation: CancellationToken,
     ) -> _ProducerFault | None:
-        source = self._credential_source
-        if source is None:
-            raise ModelProviderConfigurationError("external credential source is required")
-        with source.lease() as lease:
+        with self._credential_source.lease() as lease:
             first_credential = lease.credential_fingerprint
             first_account = lease.account_fingerprint
             failure = self._request_with_retries(
@@ -633,7 +560,7 @@ class OpenAIResponsesGateway:
             )
         if failure is None or failure.code != "auth_required":
             return failure
-        with source.lease() as refreshed:
+        with self._credential_source.lease() as refreshed:
             if refreshed.account_fingerprint != first_account:
                 return _ProducerFault(
                     "auth_account_changed",
@@ -794,9 +721,7 @@ class OpenAIResponsesGateway:
                         if response.status_code >= 400:
                             raise _read_http_failure(response, self._config.max_event_bytes)
                         media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().casefold()
-                        if media_type != "text/event-stream" and not (
-                            not media_type and self._config.allow_missing_event_stream_content_type
-                        ):
+                        if media_type not in {"", "text/event-stream"}:
                             raise ModelProviderProtocolError(
                                 "model provider response is not an SSE stream",
                                 reason="invalid_stream_content_type",
@@ -1368,24 +1293,19 @@ def _encode_request(request: ModelRequest, config: OpenAIResponsesConfig) -> byt
     if ModelHostedTool.WEB_SEARCH in request.hosted_tools:
         body["tool_choice"] = "auto"
         body["include"] = ["web_search_call.action.sources"]
-    if request.max_output_tokens is not None and config.supports_max_output_tokens:
-        body["max_output_tokens"] = request.max_output_tokens
+    # The subscription endpoint owns its output-token policy; the Harness
+    # retains the request value only for local planning and validation.
     if request.reasoning_effort is not None:
         if request.reasoning_effort not in _REASONING_EFFORTS:
             raise ModelProviderConfigurationError("reasoning effort is unsupported")
         body["reasoning"] = {"effort": request.reasoning_effort, "summary": "auto"}
     if request.temperature is not None:
-        if config.supports_temperature:
-            body["temperature"] = request.temperature
-        elif request.temperature != 0:
+        if request.temperature != 0:
             raise ModelProviderConfigurationError("model provider does not support temperature")
-    if config.service_tier is not None:
-        body["service_tier"] = config.service_tier
     if request.output_mode is ModelOutputMode.JSON:
         assert request.output_schema is not None
         schema = thaw_json(request.output_schema)
-        if config.project_codex_subscription_schema:
-            schema = _project_codex_subscription_schema(schema)
+        schema = _project_codex_subscription_schema(schema)
         body["text"] = {
             "format": {
                 "type": "json_schema",
@@ -1592,10 +1512,6 @@ def _headers(
         ):
             raise ModelProviderConfigurationError("model credential has an unsafe shape")
         headers["Authorization"] = f"Bearer {credential}"
-    if config.organization_id is not None:
-        headers["OpenAI-Organization"] = config.organization_id
-    if config.project_id is not None:
-        headers["OpenAI-Project"] = config.project_id
     if extra_headers is not None:
         for raw_name, value in extra_headers.items():
             name = _EXTERNAL_HEADER_NAMES.get(raw_name.casefold())
@@ -2017,25 +1933,6 @@ def _normalize_loopback_proxy(value: str) -> str:
     return urlunsplit(("http", authority, "", "", ""))
 
 
-def model_secret_provider_id(provider_id: str, base_url: str | None = None) -> str:
-    """Return the canonical SecretStore identity for a model Provider.
-
-    Official Providers and the local Provider have stable identities.  A
-    Responses-compatible credential is instead bound to its canonical base URL
-    so moving a handle to another endpoint cannot silently disclose it.
-    """
-
-    if _PROVIDER_ID.fullmatch(provider_id) is None:
-        raise ModelProviderConfigurationError("model provider ID is invalid")
-    if provider_id != "openai-compatible":
-        return provider_id
-    if base_url is None:
-        raise ModelProviderConfigurationError("compatible model secret identity requires a base URL")
-    normalized = _normalize_endpoint(base_url)
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
-    return f"openai-compatible.{digest}"
-
-
 __all__ = [
     "ModelCredentialLease",
     "ModelCredentialSource",
@@ -2046,5 +1943,4 @@ __all__ = [
     "OpenAIResponsesConfig",
     "OpenAIResponsesGateway",
     "StaticModelEndpointPolicy",
-    "model_secret_provider_id",
 ]

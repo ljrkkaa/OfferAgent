@@ -25,7 +25,6 @@ class CapabilityName(str, Enum):
     HOOKS = "hooks"
     SUBAGENTS = "subagents"
     ARTIFACTS = "artifacts"
-    LOOPBACK_WEB = "loopbackWeb"
     CONTENT_BLOCKS = "contentBlocks"
     CANCELLATION = "cancellation"
     DIAGNOSTICS = "diagnostics"
@@ -40,7 +39,6 @@ class CapabilitySet(WireModel):
     hooks: bool = False
     subagents: bool = False
     artifacts: bool = False
-    loopback_web: bool = False
     content_blocks: bool = False
     cancellation: bool = False
     diagnostics: bool = False

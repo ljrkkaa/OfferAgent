@@ -12,6 +12,7 @@ from . import (
     v0004_remove_client_vault_authority,
     v0005_remove_obsolete_write_intent_snapshots,
     v0006_canonicalize_tool_result_context,
+    v0007_contract_codex_model_config,
 )
 
 
@@ -79,6 +80,11 @@ MIGRATIONS = (
         v0006_canonicalize_tool_result_context.NAME,
         v0006_canonicalize_tool_result_context.STATEMENTS,
         vacuum_after=True,
+    ),
+    Migration.create(
+        v0007_contract_codex_model_config.VERSION,
+        v0007_contract_codex_model_config.NAME,
+        v0007_contract_codex_model_config.STATEMENTS,
     ),
 )
 

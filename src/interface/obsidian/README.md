@@ -10,12 +10,11 @@
 - 没有常驻协调 Host、插件 IPC 中间 Host、discovery、Named Pipe、listener、后台 Worker 或常驻运行模式。
 - 插件不连接 OfferAgent/Khoj Server，不上传或同步 Vault 内容，不实现第二套 Agent Loop。
 - 插件不执行文件写、模型调用、Shell 或 Hook。磁盘事务、工具调用和状态恢复都由 Worker 拥有。
-- “打开本地 Web”只访问同一 Worker 的随机 Loopback 端口。
 - Shell/Hook 等进程工具由 Worker 通过短生命周期 `offeragent-process-host.exe` 执行；插件不直接
   启动或代理这些进程。
 
-Provider secret 输入只作为一次性命令经当前 stdio 通道写入 Workspace 绑定的 Windows DPAPI
-SecretStore。插件配置只保存 opaque handle，不保存 API key 明文；插件自身不包含 Provider 端点逻辑。
+模型执行固定使用当前 Codex CLI 的 ChatGPT 登录和账户目录。插件不接收 Provider API Key、端点或
+SecretHandle；只保存从实时目录选择的模型及其账户绑定。
 
 ## 生命周期
 

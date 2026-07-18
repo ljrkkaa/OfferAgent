@@ -105,8 +105,8 @@ test("retired provider selections cannot migrate a free-text model into producti
     }
 });
 
-test("Run config fixes Codex Subscription internally and requires an account-bound catalog selection", () => {
-    const { CODEX_SUBSCRIPTION_PROVIDER, parseLocalSettings, runConfig, snapshotLocalSettings } = loadModule();
+test("Run config requires an account-bound Codex catalog selection without exposing provider choice", () => {
+    const { parseLocalSettings, runConfig, snapshotLocalSettings } = loadModule();
     assert.throws(() => runConfig(parseLocalSettings({ schemaVersion: 3 })), /目录选择/);
     assert.throws(() => runConfig({
         ...parseLocalSettings({ schemaVersion: 3 }),
@@ -123,7 +123,6 @@ test("Run config fixes Codex Subscription internally and requires an account-bou
     });
     const config = runConfig(settings);
     assert.deepEqual(config, {
-        provider: CODEX_SUBSCRIPTION_PROVIDER,
         model: "gpt-catalog-model",
         reasoningEffort: "medium",
         permissionMode: "normal",
@@ -186,8 +185,8 @@ test("Workspace trust is independent, explicit, and fail-closed for effective pe
     assert.equal(vaultWriteAvailable(plan), false);
 });
 
-test("Runtime model patch contains only current Codex catalog selection fields", () => {
-    const { modelRuntimePatch, parseLocalSettings } = loadModule();
+test("current settings fail closed when retired Provider decisions conflict with the Codex-only schema", () => {
+    const { DEFAULT_LOCAL_SETTINGS, modelRuntimePatch, parseLocalSettings } = loadModule();
     const binding = `sha256:${"a".repeat(64)}`;
     const settings = parseLocalSettings({
         schemaVersion: 3,
@@ -199,11 +198,12 @@ test("Runtime model patch contains only current Codex catalog selection fields",
         baseUrl: "https://attacker.example/v1",
         credential: "must-not-survive",
     });
+    assert.deepEqual(settings, DEFAULT_LOCAL_SETTINGS);
     assert.deepEqual(modelRuntimePatch(settings), {
-        model: "gpt-catalog-model",
-        account_binding: binding,
+        model: "",
+        account_binding: null,
         reasoning_effort: "medium",
-        proxy_url: "http://127.0.0.1:7896",
+        proxy_url: null,
     });
     assert.equal(modelRuntimePatch.length, 1);
 });
@@ -263,9 +263,6 @@ test("an empty catalog selection remains empty without a model or Provider fallb
     const { modelRuntimePatch, parseLocalSettings } = module;
     const settings = parseLocalSettings({
         schemaVersion: 3,
-        provider: "codex-subscription-experimental",
-        wireApi: "ollama-chat",
-        baseUrl: "https://untrusted.example/v1",
         proxyUrl: "http://127.0.0.1:7896",
     });
     assert.deepEqual(

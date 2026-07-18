@@ -998,7 +998,7 @@ async def _apply_to_staged_state(plan: _Plan, state: Path) -> None:
                 RunStatus.COMPLETED,
                 1,
                 3,
-                {"provider": "legacy-obsidan", "model": legacy_turn.model_id, "permissionMode": "read-only"},
+                {"model": legacy_turn.model_id, "permissionMode": "read-only"},
                 legacy_turn.created_at,
                 legacy_turn.updated_at,
                 None,
@@ -1016,7 +1016,6 @@ async def _apply_to_staged_state(plan: _Plan, state: Path) -> None:
             )
             trace_id = _mapped_id("trace", plan.source_hash, legacy_turn.legacy_run_id)
             run_config = {
-                "provider": "legacy-obsidan",
                 "model": legacy_turn.model_id,
                 "reasoningEffort": "medium",
                 "permissionMode": "read-only",

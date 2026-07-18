@@ -58,7 +58,6 @@ function memoryPersistence(initial = null) {
 }
 
 const runConfig = {
-    provider: "local",
     model: "qwen-test",
     reasoningEffort: "medium",
     permissionMode: "normal",
@@ -438,7 +437,7 @@ test("send creates a Session then submits one typed turn/start command", async (
     assert.equal(result.runId, "run_01J00000000000000000000000");
     assert.deepEqual(calls.map(([method]) => method), ["session/create", "turn/start"]);
     assert.equal(calls[1][1].input[0].text, "hello");
-    assert.equal(calls[1][1].runConfig.provider, "local");
+    assert.deepEqual(calls[1][1].runConfig, runConfig);
     assert.deepEqual(calls[1][1].pinnedContext, pinnedContext);
     assert.deepEqual(
         Object.keys(calls[1][1]).sort(),
@@ -482,7 +481,7 @@ test("ordered images remain in one submission without a capability probe", async
     });
 
     await store.send("compare", {
-        runConfig: { ...runConfig, provider: "openai", model: "gpt-vision" },
+        runConfig: { ...runConfig, model: "gpt-vision" },
         attachments: [artifact("art_one"), artifact("art_two")],
     });
 

@@ -1108,7 +1108,6 @@
         "hooks",
         "subagents",
         "artifacts",
-        "loopbackWeb",
         "contentBlocks",
         "cancellation",
         "diagnostics"
@@ -1152,11 +1151,6 @@
         "hooks": {
           "default": false,
           "title": "Hooks",
-          "type": "boolean"
-        },
-        "loopbackWeb": {
-          "default": false,
-          "title": "Loopbackweb",
           "type": "boolean"
         },
         "multiSession": {
@@ -3620,10 +3614,6 @@
           "title": "Additionalspeedtiers",
           "type": "array"
         },
-        "available": {
-          "title": "Available",
-          "type": "boolean"
-        },
         "contextWindow": {
           "anyOf": [
             {
@@ -3680,10 +3670,6 @@
           "title": "Inputmodalities",
           "type": "array"
         },
-        "local": {
-          "title": "Local",
-          "type": "boolean"
-        },
         "maxContextTokens": {
           "anyOf": [
             {
@@ -3716,12 +3702,6 @@
           "title": "Model",
           "type": "string"
         },
-        "provider": {
-          "maxLength": 128,
-          "minLength": 1,
-          "title": "Provider",
-          "type": "string"
-        },
         "serviceTiers": {
           "items": {
             "$ref": "#/$defs/ModelServiceTierDescriptor"
@@ -3742,14 +3722,6 @@
           "title": "Supportsimagedetailoriginal",
           "type": "boolean"
         },
-        "supportsStreaming": {
-          "title": "Supportsstreaming",
-          "type": "boolean"
-        },
-        "supportsStructuredOutput": {
-          "title": "Supportsstructuredoutput",
-          "type": "boolean"
-        },
         "webSearchToolType": {
           "anyOf": [
             {
@@ -3766,17 +3738,12 @@
         }
       },
       "required": [
-        "provider",
         "model",
         "displayName",
-        "local",
-        "supportsStreaming",
-        "supportsStructuredOutput",
         "inputModalities",
         "supportsImageDetailOriginal",
         "supportsHostedSearch",
-        "supportsFastMode",
-        "available"
+        "supportsFastMode"
       ],
       "title": "ModelDescriptor",
       "type": "object"
@@ -3812,162 +3779,9 @@
       "title": "ModelServiceTierDescriptor",
       "type": "object"
     },
-    "ModelsHealthParams": {
-      "additionalProperties": false,
-      "properties": {
-        "capability": {
-          "default": "text",
-          "enum": [
-            "text",
-            "vision"
-          ],
-          "title": "Capability",
-          "type": "string"
-        },
-        "clientRequestId": {
-          "$ref": "#/$defs/RequestId"
-        },
-        "deadline": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Rfc3339DateTime"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "model": {
-          "anyOf": [
-            {
-              "maxLength": 256,
-              "minLength": 1,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Model"
-        },
-        "provider": {
-          "maxLength": 128,
-          "minLength": 1,
-          "title": "Provider",
-          "type": "string"
-        }
-      },
-      "required": [
-        "provider",
-        "clientRequestId"
-      ],
-      "title": "ModelsHealthParams",
-      "type": "object"
-    },
-    "ModelsHealthResult": {
-      "additionalProperties": false,
-      "properties": {
-        "capability": {
-          "default": "text",
-          "enum": [
-            "text",
-            "vision"
-          ],
-          "title": "Capability",
-          "type": "string"
-        },
-        "checkedAt": {
-          "$ref": "#/$defs/Rfc3339DateTime"
-        },
-        "error": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ErrorEnvelope"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "latencyMs": {
-          "anyOf": [
-            {
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Latencyms"
-        },
-        "model": {
-          "anyOf": [
-            {
-              "maxLength": 256,
-              "minLength": 1,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Model"
-        },
-        "provider": {
-          "maxLength": 128,
-          "minLength": 1,
-          "title": "Provider",
-          "type": "string"
-        },
-        "status": {
-          "enum": [
-            "healthy",
-            "degraded",
-            "unreachable",
-            "auth_required",
-            "unsupported"
-          ],
-          "title": "Status",
-          "type": "string"
-        }
-      },
-      "required": [
-        "provider",
-        "status",
-        "checkedAt"
-      ],
-      "title": "ModelsHealthResult",
-      "type": "object"
-    },
     "ModelsListParams": {
       "additionalProperties": false,
-      "properties": {
-        "includeUnavailable": {
-          "default": false,
-          "title": "Includeunavailable",
-          "type": "boolean"
-        },
-        "provider": {
-          "anyOf": [
-            {
-              "maxLength": 128,
-              "minLength": 1,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Provider"
-        }
-      },
+      "properties": {},
       "title": "ModelsListParams",
       "type": "object"
     },
@@ -5645,13 +5459,6 @@
           "$ref": "#/$defs/PermissionMode",
           "default": "normal"
         },
-        "provider": {
-          "default": "codex-subscription-experimental",
-          "maxLength": 128,
-          "minLength": 1,
-          "title": "Provider",
-          "type": "string"
-        },
         "reasoningEffort": {
           "$ref": "#/$defs/ReasoningEffort",
           "default": "medium"
@@ -6023,218 +5830,6 @@
       "minLength": 1,
       "pattern": "^(?:0|[1-9][0-9]*)$",
       "type": "string"
-    },
-    "SecretMetadataSnapshot": {
-      "additionalProperties": false,
-      "properties": {
-        "createdAt": {
-          "$ref": "#/$defs/Rfc3339DateTime"
-        },
-        "handle": {
-          "pattern": "^secret:v1:[0-9a-f]{32}$",
-          "title": "Handle",
-          "type": "string"
-        },
-        "kind": {
-          "const": "model-provider",
-          "title": "Kind",
-          "type": "string"
-        },
-        "providerId": {
-          "maxLength": 64,
-          "minLength": 1,
-          "pattern": "^[a-z][a-z0-9_.-]{0,63}$",
-          "title": "Providerid",
-          "type": "string"
-        },
-        "rotatedAt": {
-          "$ref": "#/$defs/Rfc3339DateTime"
-        },
-        "version": {
-          "minimum": 1,
-          "title": "Version",
-          "type": "integer"
-        }
-      },
-      "required": [
-        "handle",
-        "kind",
-        "providerId",
-        "version",
-        "createdAt",
-        "rotatedAt"
-      ],
-      "title": "SecretMetadataSnapshot",
-      "type": "object"
-    },
-    "SecretsDeleteParams": {
-      "additionalProperties": false,
-      "properties": {
-        "expectedVersion": {
-          "minimum": 1,
-          "title": "Expectedversion",
-          "type": "integer"
-        },
-        "handle": {
-          "pattern": "^secret:v1:[0-9a-f]{32}$",
-          "title": "Handle",
-          "type": "string"
-        }
-      },
-      "required": [
-        "handle",
-        "expectedVersion"
-      ],
-      "title": "SecretsDeleteParams",
-      "type": "object"
-    },
-    "SecretsDeleteResult": {
-      "additionalProperties": false,
-      "properties": {
-        "deleted": {
-          "const": true,
-          "title": "Deleted",
-          "type": "boolean"
-        },
-        "handle": {
-          "pattern": "^secret:v1:[0-9a-f]{32}$",
-          "title": "Handle",
-          "type": "string"
-        }
-      },
-      "required": [
-        "handle",
-        "deleted"
-      ],
-      "title": "SecretsDeleteResult",
-      "type": "object"
-    },
-    "SecretsListParams": {
-      "additionalProperties": false,
-      "properties": {
-        "kind": {
-          "anyOf": [
-            {
-              "const": "model-provider",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Kind"
-        },
-        "providerId": {
-          "anyOf": [
-            {
-              "maxLength": 64,
-              "minLength": 1,
-              "pattern": "^[a-z][a-z0-9_.-]{0,63}$",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Providerid"
-        }
-      },
-      "title": "SecretsListParams",
-      "type": "object"
-    },
-    "SecretsListResult": {
-      "additionalProperties": false,
-      "properties": {
-        "secrets": {
-          "items": {
-            "$ref": "#/$defs/SecretMetadataSnapshot"
-          },
-          "maxItems": 1024,
-          "title": "Secrets",
-          "type": "array"
-        }
-      },
-      "required": [
-        "secrets"
-      ],
-      "title": "SecretsListResult",
-      "type": "object"
-    },
-    "SecretsPutParams": {
-      "additionalProperties": false,
-      "properties": {
-        "expectedVersion": {
-          "anyOf": [
-            {
-              "minimum": 1,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Expectedversion"
-        },
-        "handle": {
-          "anyOf": [
-            {
-              "pattern": "^secret:v1:[0-9a-f]{32}$",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Handle"
-        },
-        "kind": {
-          "const": "model-provider",
-          "title": "Kind",
-          "type": "string"
-        },
-        "providerId": {
-          "maxLength": 64,
-          "minLength": 1,
-          "pattern": "^[a-z][a-z0-9_.-]{0,63}$",
-          "title": "Providerid",
-          "type": "string"
-        },
-        "secret": {
-          "format": "password",
-          "title": "Secret",
-          "type": "string",
-          "writeOnly": true
-        }
-      },
-      "required": [
-        "providerId",
-        "kind",
-        "secret"
-      ],
-      "title": "SecretsPutParams",
-      "type": "object"
-    },
-    "SecretsPutResult": {
-      "additionalProperties": false,
-      "properties": {
-        "created": {
-          "title": "Created",
-          "type": "boolean"
-        },
-        "secret": {
-          "$ref": "#/$defs/SecretMetadataSnapshot"
-        }
-      },
-      "required": [
-        "secret",
-        "created"
-      ],
-      "title": "SecretsPutResult",
-      "type": "object"
     },
     "SemanticVersion": {
       "maxLength": 64,
@@ -8427,8 +8022,6 @@
     },
     "TransportKind": {
       "enum": [
-        "loopback-http",
-        "loopback-websocket",
         "stdio"
       ],
       "title": "TransportKind",
@@ -9155,42 +8748,6 @@
       "title": "VaultSourceRef",
       "type": "object"
     },
-    "WebLaunchParams": {
-      "additionalProperties": false,
-      "properties": {},
-      "title": "WebLaunchParams",
-      "type": "object"
-    },
-    "WebLaunchResult": {
-      "additionalProperties": false,
-      "properties": {
-        "expiresAt": {
-          "$ref": "#/$defs/Rfc3339DateTime"
-        },
-        "url": {
-          "maxLength": 2048,
-          "minLength": 32,
-          "title": "Url",
-          "type": "string"
-        },
-        "workerPid": {
-          "minimum": 1,
-          "title": "Workerpid",
-          "type": "integer"
-        },
-        "workspaceInstanceId": {
-          "$ref": "#/$defs/WorkspaceInstanceId"
-        }
-      },
-      "required": [
-        "url",
-        "workerPid",
-        "workspaceInstanceId",
-        "expiresAt"
-      ],
-      "title": "WebLaunchResult",
-      "type": "object"
-    },
     "WebSourceRef": {
       "additionalProperties": false,
       "description": "A clickable public-page citation captured by a bounded research tool.",
@@ -9473,14 +9030,6 @@
         "$ref": "#/$defs/InitializeResult"
       }
     },
-    "models/health": {
-      "params": {
-        "$ref": "#/$defs/ModelsHealthParams"
-      },
-      "result": {
-        "$ref": "#/$defs/ModelsHealthResult"
-      }
-    },
     "models/list": {
       "params": {
         "$ref": "#/$defs/ModelsListParams"
@@ -9543,30 +9092,6 @@
       },
       "result": {
         "$ref": "#/$defs/RuntimeStatusResult"
-      }
-    },
-    "secrets/delete": {
-      "params": {
-        "$ref": "#/$defs/SecretsDeleteParams"
-      },
-      "result": {
-        "$ref": "#/$defs/SecretsDeleteResult"
-      }
-    },
-    "secrets/list": {
-      "params": {
-        "$ref": "#/$defs/SecretsListParams"
-      },
-      "result": {
-        "$ref": "#/$defs/SecretsListResult"
-      }
-    },
-    "secrets/put": {
-      "params": {
-        "$ref": "#/$defs/SecretsPutParams"
-      },
-      "result": {
-        "$ref": "#/$defs/SecretsPutResult"
       }
     },
     "session/compact": {
@@ -9734,17 +9259,9 @@
       "result": {
         "$ref": "#/$defs/TurnSteerResult"
       }
-    },
-    "web/launch": {
-      "params": {
-        "$ref": "#/$defs/WebLaunchParams"
-      },
-      "result": {
-        "$ref": "#/$defs/WebLaunchResult"
-      }
     }
   },
-  "description": "Canonical DTO schema shared by direct stdio and loopback adapters. All object schemas are closed and wire fields use camelCase.",
+  "description": "Canonical DTO schema for the direct stdio adapter. All object schemas are closed and wire fields use camelCase.",
   "envelopes": {
     "error": {
       "$ref": "#/$defs/ErrorEnvelope"

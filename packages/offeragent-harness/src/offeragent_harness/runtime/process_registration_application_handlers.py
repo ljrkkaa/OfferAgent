@@ -41,7 +41,7 @@ from .process_supervisor import ProcessFilesystemAccess
 def process_registration_command_handlers(
     service: WorkspaceProcessRegistrationService | None,
 ) -> Mapping[str, ApplicationCommandHandler]:
-    """Expose the complete registration surface without ever serving Loopback."""
+    """Expose the complete registration surface through direct stdio only."""
 
     def require_service(context: ApplicationCommandContext) -> WorkspaceProcessRegistrationService:
         _require_direct_stdio(context)

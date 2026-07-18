@@ -1,6 +1,6 @@
 # ADR-0002：模型只能通过 ModelGateway 推理
 
-状态：Accepted
+状态：Superseded by `docs/adr/0032-contract-model-execution-to-codex-subscription.md`
 
 ## 决策
 

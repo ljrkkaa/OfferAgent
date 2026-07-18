@@ -15,6 +15,7 @@ from offeragent_harness.protocol.capabilities import (
     ProtocolRange,
     negotiate_protocol,
 )
+from offeragent_harness.protocol.common import RunConfigSnapshot
 from offeragent_harness.protocol.content import (
     ContentBlock,
     FileRef,
@@ -48,6 +49,8 @@ from offeragent_harness.protocol.messages import (
     EventsReplayParams,
     EventsReplayResult,
     InitializeParams,
+    ModelDescriptor,
+    ModelsListParams,
     PluginToolCompleteParams,
     TurnStartParams,
     validate_command_params,
@@ -58,10 +61,6 @@ EXPECTED_COMMANDS = {
     "initialize",
     "runtime/ping",
     "runtime/status",
-    "web/launch",
-    "secrets/list",
-    "secrets/put",
-    "secrets/delete",
     "config/get",
     "config/update",
     "skills/list",
@@ -79,7 +78,6 @@ EXPECTED_COMMANDS = {
     "hooks/confirm-layer",
     "hooks/confirm-workspace-command",
     "models/list",
-    "models/health",
     "plugin-tools/complete",
     "session/create",
     "session/list",
@@ -179,16 +177,27 @@ def test_plugin_tool_completion_command_carries_the_exact_execution_binding() ->
     assert params.result.tool_call_id == "call_contract"
 
 
-def test_model_health_requires_an_explicit_admin_request_identity() -> None:
-    with pytest.raises(ProtocolViolation) as missing:
-        validate_command_params("models/health", {"provider": "openai"})
-    assert missing.value.error.code == ErrorCode.PROTOCOL_INVALID_PARAMS
-
-    params = validate_command_params(
-        "models/health",
-        {"provider": "openai", "clientRequestId": "req_model_health_1"},
-    )
-    assert params.to_wire()["clientRequestId"] == "req_model_health_1"
+def test_model_protocol_has_no_provider_choice_or_runtime_probe_state() -> None:
+    assert set(RunConfigSnapshot.model_fields) == {"model", "reasoning_effort", "permission_mode", "budgets"}
+    assert set(ModelsListParams.model_fields) == set()
+    assert set(ModelDescriptor.model_fields) == {
+        "model",
+        "display_name",
+        "input_modalities",
+        "supports_image_detail_original",
+        "supports_hosted_search",
+        "web_search_tool_type",
+        "context_window",
+        "max_context_window",
+        "effective_context_window_percent",
+        "additional_speed_tiers",
+        "service_tiers",
+        "default_service_tier",
+        "supports_fast_mode",
+        "max_context_tokens",
+    }
+    for retired in ("models/health", "secrets/list", "secrets/put", "secrets/delete", "web/launch"):
+        assert retired not in COMMAND_REGISTRY
 
 
 def test_models_are_frozen_and_emit_camel_case_wire_names() -> None:
@@ -353,13 +362,15 @@ def test_hosted_web_source_ref_is_provider_attested_without_fake_content_hash() 
 )
 def test_hosted_web_source_ref_rejects_urls_with_credentials(url: str) -> None:
     with pytest.raises(ValidationError, match="credentials"):
-        HostedWebSourceRef(
-            type="hostedWeb",
-            url=url,
-            title="Credential-bearing source",
-            provider_id="codex-subscription",
-            model="gpt-catalog-model",
-            model_request_id="model-request-42",
+        HostedWebSourceRef.model_validate(
+            {
+                "type": "hostedWeb",
+                "url": url,
+                "title": "Credential-bearing source",
+                "provider_id": "codex-subscription",
+                "model": "gpt-catalog-model",
+                "model_request_id": "model-request-42",
+            }
         )
 
 

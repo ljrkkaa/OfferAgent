@@ -20,7 +20,7 @@ from offeragent_harness.adapters.sqlite_stores import SqliteUnitOfWorkFactory
 from offeragent_harness.agent import BudgetCheckpoint, BudgetLedger
 from offeragent_harness.agent.loop import run_agent_loop
 from offeragent_harness.agent.state import RunPhase, RunState
-from offeragent_harness.config import HarnessConfig, ModelProvider
+from offeragent_harness.config import HarnessConfig
 from offeragent_harness.models import ModelEvent, ModelRequest, ModelRole
 from offeragent_harness.ports import CancellationToken
 from offeragent_harness.providers import (
@@ -68,12 +68,6 @@ SECOND_IMAGE = base64.b64decode(
 
 def _digest(value: bytes) -> str:
     return f"sha256:{hashlib.sha256(value).hexdigest()}"
-
-
-class _UnusedSecrets:
-    def consume(self, *args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise AssertionError("Codex subscription inference must use its account-bound credential lease")
 
 
 class _CredentialSource:
@@ -175,7 +169,6 @@ def _config() -> HarnessConfig:
         update={
             "model": base.model.model_copy(
                 update={
-                    "provider": ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL,
                     "model": MODEL_ID,
                     "account_binding": ACCOUNT_BINDING,
                 }
@@ -324,8 +317,7 @@ async def test_current_turn_images_produce_one_locally_validated_answer_without_
         gateway = _CapturingGateway(
             compose_model_gateway(
                 settings,
-                secret_scope_id="workspace:ws_test",
-                secrets=_UnusedSecrets(),  # type: ignore[arg-type]
+                workspace_id="workspace:ws_test",
                 network_enabled=True,
                 responses_transport=httpx.MockTransport(handler),
                 codex_credential_source=credential_source,
@@ -348,7 +340,6 @@ async def test_current_turn_images_produce_one_locally_validated_answer_without_
             ),
         ),
         run_config={
-            "provider": ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL.value,
             "model": MODEL_ID,
             "reasoningEffort": "medium",
             "permissionMode": "read-only",
@@ -369,7 +360,6 @@ async def test_current_turn_images_produce_one_locally_validated_answer_without_
         journal=object(),
         artifacts=LocalArtifactStore(tmp_path / "artifacts", workspace_id="ws_test"),
         attachments=attachments,
-        local_transaction=None,
         parent_authorities=object(),  # type: ignore[arg-type]
     )
     initial_state = _state()
@@ -458,8 +448,7 @@ async def test_text_follow_up_rematerializes_historical_user_images_after_runtim
         return _CapturingGateway(
             compose_model_gateway(
                 settings,
-                secret_scope_id="workspace:ws_test",
-                secrets=_UnusedSecrets(),  # type: ignore[arg-type]
+                workspace_id="workspace:ws_test",
                 network_enabled=True,
                 responses_transport=httpx.MockTransport(handler),
                 codex_credential_source=credential_source,
@@ -498,7 +487,6 @@ async def test_text_follow_up_rematerializes_historical_user_images_after_runtim
             artifacts=LocalArtifactStore(tmp_path / "artifacts", workspace_id="ws_test"),
             attachments=attachments,
             conversation_history=history,
-            local_transaction=None,
             parent_authorities=object(),  # type: ignore[arg-type]
         )
         harness = HarnessService(
@@ -561,7 +549,6 @@ async def test_text_follow_up_rematerializes_historical_user_images_after_runtim
                 ),
             ),
             run_config={
-                "provider": ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL.value,
                 "model": MODEL_ID,
                 "reasoningEffort": "medium",
                 "permissionMode": "read-only",
@@ -589,7 +576,6 @@ async def test_text_follow_up_rematerializes_historical_user_images_after_runtim
                 },
             ),
             run_config={
-                "provider": ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL.value,
                 "model": MODEL_ID,
                 "reasoningEffort": "medium",
                 "permissionMode": "read-only",

@@ -1,25 +1,27 @@
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from offeragent_harness.protocol.common import RunConfigSnapshot
 from offeragent_harness.protocol.events import TurnStartedPayload
 
 
-def test_new_run_config_defaults_to_the_internal_codex_subscription_provider() -> None:
+def test_new_run_config_has_no_provider_choice() -> None:
     snapshot = RunConfigSnapshot.model_validate_json('{"model":"gpt-selected"}')
 
-    assert snapshot.provider == "codex-subscription-experimental"
+    assert snapshot.to_wire()["model"] == "gpt-selected"
+    assert "provider" not in snapshot.to_wire()
 
 
-def test_historical_turn_started_payload_keeps_its_explicit_retired_provider() -> None:
-    payload = TurnStartedPayload.model_validate_json(
-        """
-        {
-          "input": [{"type": "text", "text": "legacy event"}],
-          "runConfig": {"provider": "codex", "model": "legacy-model"},
-          "attempt": 1
-        }
-        """
-    )
-
-    assert payload.run_config.provider == "codex"
-    assert payload.run_config.model == "legacy-model"
+def test_live_turn_event_contract_rejects_retired_provider_identity() -> None:
+    with pytest.raises(ValidationError):
+        TurnStartedPayload.model_validate_json(
+            """
+            {
+              "input": [{"type": "text", "text": "legacy event"}],
+              "runConfig": {"provider": "codex", "model": "legacy-model"},
+              "attempt": 1
+            }
+            """
+        )

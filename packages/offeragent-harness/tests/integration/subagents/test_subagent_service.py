@@ -548,7 +548,6 @@ async def test_spawn_uses_one_durable_child_run_and_returns_structured_result() 
 async def test_child_execution_preserves_canonical_codex_run_config() -> None:
     service, _uow, _sink, scheduler, runner, _artifacts = _build(
         root_run_config={
-            "provider": "codex-subscription-experimental",
             "model": "gpt-5.6-sol",
             "reasoningEffort": "high",
             "permissionMode": "normal",
@@ -563,11 +562,9 @@ async def test_child_execution_preserves_canonical_codex_run_config() -> None:
 
     execution = runner.executions[0]
     validated = validate_wire(RunConfigSnapshot, thaw_json(execution.run_config))
-    assert validated.provider == "codex-subscription-experimental"
     assert validated.model == "gpt-5.6-sol"
     assert validated.reasoning_effort.value == "high"
     assert set(execution.run_config) == {
-        "provider",
         "model",
         "reasoningEffort",
         "permissionMode",

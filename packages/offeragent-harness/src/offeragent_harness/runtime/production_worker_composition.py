@@ -2,7 +2,7 @@
 
 This module is deliberately the only place that knows concrete adapters.  The
 Obsidian plugin starts a direct stdio process; this root constructs exactly one
-``HarnessService`` and shares its dispatcher with stdio and optional Loopback Web.
+``HarnessService`` behind that transport.
 """
 
 from __future__ import annotations
@@ -44,9 +44,7 @@ from offeragent_harness.config import (
     ConfigPatch,
     ConfigScope,
     HarnessConfig,
-    ModelProvider,
     ModelSettings,
-    ModelWireApi,
 )
 from offeragent_harness.config.migrations import project_legacy_codex_config, validate_current_codex_config
 from offeragent_harness.error_codes import ErrorCode
@@ -83,7 +81,6 @@ from offeragent_harness.ports import (
     IdGenerator,
     ModelGateway,
     PolicyEvaluator,
-    SecretStore,
     StoredEvent,
     ToolExecutor,
     UnitOfWorkFactory,
@@ -171,8 +168,6 @@ from offeragent_harness.runtime.interview_submission_authority import (
     InterviewSubmissionToolExecutor,
 )
 from offeragent_harness.runtime.local_process_catalog import load_local_process_catalog
-from offeragent_harness.runtime.loopback_gateway import LoopbackGatewayConfig, LoopbackWebGateway
-from offeragent_harness.runtime.loopback_server import AsyncioLoopbackServer
 from offeragent_harness.runtime.model_management import ProductionModelCommandService
 from offeragent_harness.runtime.network_audit import EntityNetworkAuditSink
 from offeragent_harness.runtime.ordered_image_source import create_ordered_image_source_manifest
@@ -208,6 +203,10 @@ from offeragent_harness.runtime.production_skills import (
 )
 from offeragent_harness.runtime.recovery import RecoveryCoordinator
 from offeragent_harness.runtime.recovery_apply import RecoveryPlanApplier
+from offeragent_harness.runtime.retired_model_secrets import (
+    RetiredModelSecretMigrationReport,
+    purge_retired_model_secrets,
+)
 from offeragent_harness.runtime.run_preparation import (
     ConversationHistoryRunPreparationAdapter,
     ConversationImagePolicy,
@@ -224,7 +223,6 @@ from offeragent_harness.runtime.windows_process_supervisor import (
     PinnedProcessExecutableVerifier,
     WindowsSupervisedProcessBackend,
 )
-from offeragent_harness.runtime.windows_secrets import WindowsDpapiSecretStore
 from offeragent_harness.sessions import Run, Session, SessionStatus, Turn
 from offeragent_harness.shell import PowerShellToolExecutor, ShellCommandProfile
 from offeragent_harness.skills import SkillAuthority
@@ -262,11 +260,6 @@ from offeragent_harness.tools.dispatcher import ToolDispatcher
 from offeragent_harness.tools.kernel import KeyedLockPool, UnifiedToolKernel
 from offeragent_harness.tools.registry import ToolRegistry
 from offeragent_harness.tools.scheduler import FairEffectGate, ToolScheduler
-from offeragent_harness.vault import (
-    VaultCasBarrier,
-    VaultTransactionCoordinator,
-    vault_transaction_definition,
-)
 from offeragent_harness.workspace import (
     WorkspacePathPolicy,
     WorkspaceRegistry,
@@ -445,7 +438,6 @@ class ProductionWorkerOverrides:
     model_gateway_factory: ModelGatewayFactory | None = None
     codex_credential_source: ModelCredentialSource | None = None
     codex_catalog_http: CodexCatalogHttpAdapter | None = None
-    secret_store: SecretStore | None = None
     parent_pid: int | None = None
     runtime_config: HarnessConfig | None = None
     skill_runtime_root: Path | None = None
@@ -459,8 +451,6 @@ class ProductionWorkerOverrides:
     builtin_shell_profiles: tuple[ShellCommandProfile, ...] = ()
     managed_hook_layer: HookLayer | None = None
     builtin_hook_handlers: Mapping[str, HookHandler] | None = None
-    vault_cas_barrier: VaultCasBarrier | None = None
-    legacy_vault_transaction_test_mode: bool = False
 
 
 class _EventHub(EventSink):
@@ -588,7 +578,6 @@ class ProductionRunComponentsFactory(
         policy_audit: PolicyAuditSink,
         journal: Any,
         artifacts: LocalArtifactStore,
-        local_transaction: VaultTransactionCoordinator | None,
         parent_authorities: ParentRunAuthorityProvider,
         current_local_date: Callable[[], date] | None = None,
         attachments: ConversationAttachmentStore | None = None,
@@ -620,7 +609,6 @@ class ProductionRunComponentsFactory(
         self._policy_audit = policy_audit
         self._journal = journal
         self._artifacts = artifacts
-        self._local_transaction = local_transaction
         self._parent_authorities = parent_authorities
         self._attachments = attachments
         self._conversation_history = conversation_history
@@ -684,10 +672,6 @@ class ProductionRunComponentsFactory(
         if self._codex_models is not None:
             if not effective_config.network.model_provider_enabled:
                 raise ValueError("Codex model network is disabled by the effective persisted configuration")
-            if config.provider != CODEX_SUBSCRIPTION_PROVIDER_ID:
-                raise ValueError("new Runs require the internal Codex subscription provider")
-            if effective_config.model.provider is not ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL:
-                raise ValueError("persisted model settings are not migrated to Codex subscription")
             if not effective_config.model.model or effective_config.model.model != config.model:
                 raise ValueError("Run model must exactly match the persisted catalog selection")
             account_binding = effective_config.model.account_binding
@@ -1393,22 +1377,11 @@ class ProductionRunComponentsFactory(
                 raise ValueError("prepared Codex model binding differs from the immutable Run model")
             settings = effective_config.model.model_copy(
                 update={
-                    "provider": ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL,
-                    "wire_api": ModelWireApi.RESPONSES,
                     "model": binding.model.model_id,
                     "reasoning_effort": config.reasoning_effort.value,
-                    "service_tier": binding.model.default_service_tier or "default",
-                    "temperature": 0.0,
-                    "credential_handle": None,
-                    "base_url": "",
-                    "organization_id": None,
-                    "project_id": None,
-                    "allow_remote_https": False,
                 }
             )
         else:
-            if config.provider != effective_config.model.provider.value:
-                raise ValueError("Run provider must match the persisted Workspace provider")
             settings = effective_config.model.model_copy(
                 update={"model": selected_model, "reasoning_effort": config.reasoning_effort.value}
             )
@@ -1422,11 +1395,7 @@ class ProductionRunComponentsFactory(
         if existing_budget is not None and existing_budget != budget:
             raise RuntimeError("Run budget changed after its production components were built")
         self._run_budgets[state.run_id] = budget
-        visibility = (
-            ContextVisibilityPolicy.local_model()
-            if settings.provider is ModelProvider.LOCAL
-            else ContextVisibilityPolicy.cloud_model()
-        )
+        visibility = ContextVisibilityPolicy.cloud_model()
         context = ContextManager(
             system_rules=(
                 "你是 OfferAgent。只能依据 Harness 提供的上下文和工具结果工作。",
@@ -1483,13 +1452,6 @@ class ProductionRunComponentsFactory(
         if not base_selected <= selected:
             raise ValueError("prepared base Tool definitions exceed the immutable Run definition snapshot")
         local_routes: list[tuple[Sequence[ToolDefinition], ToolExecutor]] = []
-        local_transactions = tuple(
-            item
-            for item in base_definitions
-            if item.name == "vault.transaction" and item.executor_location is ExecutorLocation.LOCAL
-        )
-        if local_transactions and self._local_transaction is None:
-            raise ValueError("legacy Vault transaction Tool has no explicit test executor")
         for route_definitions, executor in self._optional_local_executors:
             narrowed = tuple(
                 item for item in route_definitions if (item.name, item.version, item.fingerprint) in base_selected
@@ -1612,10 +1574,6 @@ class ProductionRunComponentsFactory(
             active_hooks = hook_binding(budget)
             preflight_providers: list[Any] = []
             active_local_routes = list(local_routes)
-            if local_transactions:
-                assert self._local_transaction is not None
-                preflight_providers.append(self._local_transaction)
-                active_local_routes.append((local_transactions, self._local_transaction))
             artifacts = ToolArtifactManager(self._artifacts, self._clock, self._ids, budget)
             if prepared_capabilities is not None and prepared_capabilities.skill_definitions:
                 if self._skills is None or prepared_capabilities.skills is None:
@@ -1651,11 +1609,6 @@ class ProductionRunComponentsFactory(
             registry = ToolRegistry(
                 f"run-{state.run_id}",
                 definitions,
-                preflight_provider_ids=(
-                    frozenset({self._local_transaction.provider_id})
-                    if self._local_transaction is not None
-                    else frozenset()
-                ),
             )
             existing_registry = self._registries.get(state.run_id)
             if existing_registry is not None and existing_registry.snapshot_hash != registry.snapshot_hash:
@@ -1700,7 +1653,7 @@ class ProductionRunComponentsFactory(
             model=selected_model,
             max_output_tokens=min(16_384, budget.max_output_tokens),
             reasoning_effort=config.reasoning_effort.value,
-            temperature=settings.temperature,
+            temperature=0.0,
             hosted_tools=(
                 (ModelHostedTool.WEB_SEARCH,)
                 if context_binding is not None and context_binding.model.supports_hosted_search
@@ -2748,9 +2701,6 @@ class ProductionWorkerApplication(WorkerApplication):
     logger: LocalJsonLogger
     harness_application: HarnessApplication
     dispatcher: RuntimeApplicationCommandDispatcher
-    gateway: LoopbackWebGateway | None
-    loopback: AsyncioLoopbackServer | None
-    local_vault_transaction: VaultTransactionCoordinator | None
     event_hub: _EventHub
     unit_of_work: SqliteUnitOfWorkFactory
     subagents: SubagentService
@@ -2758,6 +2708,7 @@ class ProductionWorkerApplication(WorkerApplication):
     scheduler: ChildRunScheduler
     turn_manager: TurnManager
     process_supervisor: _WorkerProcessSupervisor
+    retired_model_secrets: RetiredModelSecretMigrationReport
     _ready: bool = False
     _shutdown_task: asyncio.Task[None] | None = None
     _shutdown_committed: bool = False
@@ -2774,8 +2725,7 @@ class ProductionWorkerApplication(WorkerApplication):
 
     @property
     def ready(self) -> bool:
-        transport_healthy = self.loopback is None or self.loopback.healthy
-        return self._ready and not self._stopped and self._fatal_error is None and transport_healthy
+        return self._ready and not self._stopped and self._fatal_error is None
 
     @property
     def harness(self) -> HarnessService:
@@ -2788,13 +2738,6 @@ class ProductionWorkerApplication(WorkerApplication):
     @property
     def worker_pid(self) -> int:
         return os.getpid()
-
-    @property
-    def loopback_worker_pid(self) -> int:
-        gateway = self.gateway
-        if gateway is None:
-            raise ProductionWorkerError("Loopback Web is disabled for this Worker")
-        return gateway.config.worker_pid
 
     @property
     def protocol_capabilities(self) -> CapabilitySet:
@@ -2944,40 +2887,6 @@ class ProductionWorkerApplication(WorkerApplication):
         if method == "shutdown":
             self.finalize_shutdown_delivery()
 
-    async def _start_loopback_web(self, *, enabled: bool) -> None:
-        if not enabled:
-            return
-        if self.gateway is not None or self.loopback is not None:
-            raise ProductionWorkerError("Loopback Web listener is already configured")
-        gateway = LoopbackWebGateway(
-            config=LoopbackGatewayConfig(
-                workspace_id=self.workspace_id,
-                workspace_instance_id=self.workspace_instance_id,
-                worker_pid=os.getpid(),
-            ),
-            clock=self.clock,
-            dispatcher=self.dispatcher,
-        )
-        loopback = AsyncioLoopbackServer(
-            gateway,
-            request_finalized=self._application_request_finalized,
-            terminal_response=lambda method: method == "shutdown",
-        )
-        self.gateway = gateway
-        self.loopback = loopback
-        try:
-            await loopback.start()
-        except BaseException:
-            self.loopback = None
-            self.gateway = None
-            raise
-        loopback_closed_task = loopback.closed_task
-        if loopback_closed_task is None:
-            raise ProductionWorkerError("Worker loopback listener did not start")
-        loopback_closed_task.add_done_callback(
-            lambda completed: self._transport_listener_finished("loopback", completed)
-        )
-
     async def start(self) -> object:
         if self._ready or self._stopped:
             raise ProductionWorkerError("Worker application can only start once")
@@ -2987,20 +2896,15 @@ class ProductionWorkerApplication(WorkerApplication):
             "Worker startup began.",
             workerPid=os.getpid(),
         )
-        # The retired Worker-owned Vault transaction path exists only for its
-        # explicit crash-recovery fixture, never in the fused product.
-        if self.local_vault_transaction is not None:
-            vault_recovery = await self.local_vault_transaction.recover_after_restart()
-            if vault_recovery.manual_review_paths:
-                await self._emit_runtime_log(
-                    LogLevel.ERROR,
-                    "runtime.vault_recovery_blocked",
-                    "Worker readiness is blocked by unresolved durable Vault transactions.",
-                    blockedPathCount=len(vault_recovery.manual_review_paths),
-                )
-                raise ProductionWorkerError(
-                    "Worker readiness is blocked by unresolved durable Vault transaction manifests"
-                )
+        if self.retired_model_secrets.deleted_count or self.retired_model_secrets.unclassified_count:
+            await self._emit_runtime_log(
+                LogLevel.INFO,
+                "runtime.retired_model_secrets_migrated",
+                "Retired model-provider Secret envelopes were migrated without decrypting or reporting values.",
+                deletedCount=self.retired_model_secrets.deleted_count,
+                providerIds=",".join(self.retired_model_secrets.provider_ids),
+                unclassifiedCount=self.retired_model_secrets.unclassified_count,
+            )
         layer = await self.config_service.layer(ConfigScope.WORKSPACE, self.workspace_id)
         if layer.revision == 0:
             await self.config_service.update(
@@ -3024,7 +2928,6 @@ class ProductionWorkerApplication(WorkerApplication):
         self.config_activation.freeze(worker_config.config)
         self.components.bind_worker_read_limit(worker_config.config.budgets.max_parallel_reads)
         report = await self.harness_application.start()
-        await self._start_loopback_web(enabled=worker_config.config.ui.loopback_web_enabled)
         self._ready = True
         await self._emit_runtime_log(
             LogLevel.INFO,
@@ -3191,25 +3094,7 @@ class ProductionWorkerApplication(WorkerApplication):
 
     async def _run_transport_shutdown(self) -> None:
         try:
-            failures: list[BaseException] = []
-            loopback = self.loopback
-            self.loopback = None
-            self.gateway = None
-            if loopback is not None:
-                try:
-                    await loopback.stop()
-                except BaseException as error:
-                    failures.append(error)
-            if failures:
-                await self._emit_runtime_log(
-                    LogLevel.ERROR,
-                    "runtime.transport_shutdown_failed",
-                    "Worker transport shutdown was incomplete.",
-                    failureCount=len(failures),
-                )
-                raise ProductionWorkerError("Worker transport shutdown was incomplete") from failures[0]
-            # This is a completion flag, not a claim/lock.  Set it only after
-            # all ingress capabilities and loopback listeners are removed.
+            # Direct stdio shutdown revokes the sole ingress capability.
             self._stopped = True
             await self._emit_runtime_log(
                 LogLevel.INFO,
@@ -3303,11 +3188,10 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             raise ProductionWorkerError("Worker parent process PID is invalid")
         config = self._overrides.runtime_config or HarnessConfig()
         config_activation = WorkerConfigActivation()
-        secret_store = self._overrides.secret_store
-        if secret_store is None:
-            if os.name != "nt":
-                raise ProductionWorkerError("production SecretStore requires Windows DPAPI")
-            secret_store = WindowsDpapiSecretStore(state_directory / "secrets")
+        retired_model_secrets = purge_retired_model_secrets(
+            (state_directory / "secrets").resolve(strict=False),
+            scope_id=workspace_id,
+        )
 
         codex_credentials = self._overrides.codex_credential_source or CodexFileCredentialSource()
         codex_models = CodexSubscriptionModelModule(
@@ -3318,28 +3202,22 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
         )
 
         def configured_gateway_factory(settings: ModelSettings, network_enabled: bool) -> ModelGateway:
-            if settings.provider is ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL:
-                settings = config_activation.codex_model_transport_settings(settings)
+            settings = config_activation.codex_model_transport_settings(settings)
             custom = self._overrides.model_gateway_factory
             if custom is not None:
                 gateway = custom(settings)
             else:
                 gateway = compose_model_gateway(
                     settings,
-                    secret_scope_id=workspace_id,
-                    secrets=secret_store,
+                    workspace_id=workspace_id,
                     network_enabled=network_enabled,
                     network_audit=network_audit,
                     clock=clock,
-                    codex_credential_source=(
-                        codex_credentials
-                        if settings.provider is ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL
-                        else None
-                    ),
+                    codex_credential_source=codex_credentials,
                 )
             return InstrumentedModelGateway(
                 gateway,
-                provider_id=settings.provider.value,
+                provider_id=CODEX_SUBSCRIPTION_PROVIDER_ID,
                 workspace_id=workspace_id,
                 clock=clock,
                 metrics=metrics,
@@ -3364,21 +3242,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                 100_000,
             ),
             started_at=clock.utcnow(),
-        )
-        local_transaction = (
-            VaultTransactionCoordinator(
-                workspace_id=workspace_id,
-                vault_root=bootstrap.canonical_root,
-                artifacts=artifacts,
-                artifact_budget=runtime_budget,
-                clock=clock,
-                manifest_directory=state_directory / "vault-transactions",
-                manifest_state_root=state_directory,
-                journal=uow.invocation_journal,
-                cas_barrier=self._overrides.vault_cas_barrier,
-            )
-            if self._overrides.legacy_vault_transaction_test_mode
-            else None
         )
         process_scratch_root = _prepare_process_scratch_root(state_directory)
         paths = WorkspacePathPolicy(
@@ -3465,9 +3328,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
 
         subagent_definitions = subagent_tool_definitions()
         plugin_definitions = plugin_tool_definitions()
-        legacy_vault_definitions = (
-            (vault_transaction_definition(),) if self._overrides.legacy_vault_transaction_test_mode else ()
-        )
         plugin_executor = PluginToolExecutor()
         late_subagent = _LateToolExecutor()
         late_parent_authorities = _LateParentRunAuthorityProvider()
@@ -3523,14 +3383,12 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             policy_audit=EntityPolicyAuditSink(uow),
             journal=uow.invocation_journal,
             artifacts=artifacts,
-            local_transaction=local_transaction,
             parent_authorities=late_parent_authorities,
             attachments=attachments,
             conversation_history=conversation_history,
             optional_definitions=(
                 *powershell_executor.definitions,
                 *plugin_definitions,
-                *legacy_vault_definitions,
                 *subagent_definitions,
             ),
             optional_local_executors=((powershell_executor.definitions, powershell_executor),),
@@ -3566,7 +3424,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
         base_definitions = (
             *powershell_executor.definitions,
             *plugin_definitions,
-            *legacy_vault_definitions,
             *subagent_definitions,
         )
         base_scope = CapabilityScope(
@@ -3638,9 +3495,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
         recovery_registry = ToolRegistry(
             "worker-recovery",
             base_definitions,
-            preflight_provider_ids=(
-                frozenset({local_transaction.provider_id}) if local_transaction is not None else frozenset()
-            ),
         )
         plugin_recovery_lookup = (
             None
@@ -3721,26 +3575,18 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                 config_activation=config_activation,
                 models=ProductionModelCommandService(
                     config=config_service,
-                    managed_owner_id=_LOCAL_MANAGED_ID,
-                    profile_id=_LOCAL_PROFILE_ID,
                     workspace_id=workspace_id,
-                    secrets=secret_store,
-                    gateway_factory=configured_gateway_factory,
-                    clock=clock,
-                    ids=ids,
                     catalog=codex_models,
                 ),
                 projections=projections,
                 artifacts=artifacts,
                 attachments=attachments,
-                secrets=secret_store,
                 controls=controls,
                 subagents=subagents,
                 subagent_authorities=_SubagentAuthorityResolver(uow),
                 subagent_artifacts=_SubagentArtifactResolver(artifacts),
                 diagnostics=diagnostics,
                 diagnostics_owner_runs=_DiagnosticsOwnerAuthorizer(workspace_id, uow),
-                gateway_provider=lambda: application_holder["application"].gateway,
                 transport_policy=transport_policy,
                 extension_management_handlers=extension_management_command_handlers(
                     workspace_id=workspace_id,
@@ -3836,9 +3682,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             logger=logger,
             harness_application=harness_application,
             dispatcher=dispatcher,
-            gateway=None,
-            loopback=None,
-            local_vault_transaction=local_transaction,
             event_hub=event_hub,
             unit_of_work=uow,
             subagents=subagents,
@@ -3846,6 +3689,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             scheduler=scheduler,
             turn_manager=turn_manager,
             process_supervisor=process_supervisor,
+            retired_model_secrets=retired_model_secrets,
         )
         application_holder["application"] = application
         runtime_diagnostics.application = application
@@ -3900,7 +3744,6 @@ def _protocol_capabilities() -> CapabilitySet:
         hooks=True,
         subagents=True,
         artifacts=True,
-        loopback_web=True,
         content_blocks=True,
         cancellation=True,
         diagnostics=True,

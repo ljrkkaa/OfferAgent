@@ -116,9 +116,9 @@ SQLite 配置层 v2 可读取并在下次写入时使用 v3。迁移只剥离旧
 ## 更新后验收
 
 1. 启动 Obsidian 并启用 OfferAgent，状态应经过“定位 → 校验 → 启动 Worker → 协议握手 → ready”。
-2. 打开聊天，确认当前 Vault 的 stdio Worker、文件工具状态和模型配置可见。
-3. Provider 凭据只能通过插件到当前 Worker 的 stdio 命令写入 Windows DPAPI SecretStore；不要写入
-   `data.json`、Vault、环境变量或命令行。
+2. 打开聊天，确认当前 Vault 的 stdio Worker、文件工具状态和账户绑定的 Codex 模型目录可见。
+3. 模型登录只使用本机 Codex CLI 的 ChatGPT 凭据；插件不接收或保存 Provider API Key、端点或
+   SecretHandle，也不要将登录材料写入 `data.json`、Vault、环境变量或命令行。
 4. 新 Workspace 默认未信任，实际权限应保持只读；提升信任不等于绕过 Diff 和审批。
 5. 首次验收先做真实 Vault 只读检索；真实写入需另行明确授权。
 6. 源码或协议变化后必须从不存在的输出目录重新构建，旧 artifact 不能冒充当前候选。

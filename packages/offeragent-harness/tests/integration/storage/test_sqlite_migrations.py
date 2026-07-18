@@ -424,8 +424,133 @@ async def test_tool_result_context_migration_rewrites_terminal_state_and_interru
             "SELECT json_extract(value_json, '$.schemaVersion') FROM entities "
             "WHERE collection = 'run_states' AND entity_id = 'run_terminal'"
         ).fetchone()[0]
-    assert schema_version == 6
+    assert schema_version == 7
     assert terminal_codec == 5
+
+
+@pytest.mark.asyncio
+async def test_codex_config_contraction_removes_retired_decisions_and_preserves_bound_selection(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "config-v6.sqlite"
+    legacy_layer = {
+        "schemaVersion": 1,
+        "codec": "json",
+        "payload": {
+            "schemaVersion": 3,
+            "scope": "workspace",
+            "ownerId": "ws_legacy",
+            "revision": 1,
+            "eventSequence": 1,
+            "updatedAt": "2026-07-18T00:00:00+00:00",
+            "config": {
+                "model": {
+                    "provider": "deepseek",
+                    "wire_api": "chat-completions",
+                    "model": "free-text-must-be-cleared",
+                    "credential_handle": "secret:v1:" + "a" * 32,
+                    "base_url": "https://sensitive.invalid/token",
+                    "reasoning_effort": "high",
+                    "proxy_url": None,
+                },
+                "ui": {"loopback_web_enabled": True, "persistent_web_lease": True, "locale": "zh-CN"},
+                "network": {"update_network_enabled": False},
+                "update": {"channel": "disabled"},
+            },
+        },
+    }
+    current_layer = {
+        "schemaVersion": 1,
+        "codec": "json",
+        "payload": {
+            "schemaVersion": 4,
+            "scope": "workspace",
+            "ownerId": "ws_current",
+            "revision": 1,
+            "eventSequence": 1,
+            "updatedAt": "2026-07-18T00:00:00+00:00",
+            "config": {
+                "model": {
+                    "model": "gpt-bound",
+                    "account_binding": "sha256:" + "b" * 64,
+                    "reasoning_effort": "medium",
+                    "proxy_url": None,
+                },
+                "ui": {"loopback_web_enabled": False, "persistent_web_lease": False, "locale": "zh-CN"},
+            },
+        },
+    }
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY CHECK (version >= 1),
+                name TEXT NOT NULL UNIQUE,
+                checksum TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            ) STRICT
+            """
+        )
+        for migration in MIGRATIONS[:6]:
+            for statement in migration.statements:
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
+                (migration.version, migration.name, migration.checksum, "2026-07-18T00:00:00Z"),
+            )
+        connection.execute("PRAGMA user_version = 6")
+        for entity_id, value in (("workspace:ws_legacy", legacy_layer), ("workspace:ws_current", current_layer)):
+            connection.execute(
+                "INSERT INTO entities(collection, entity_id, revision, value_json) VALUES ('config_layers', ?, 1, ?)",
+                (entity_id, json.dumps(value, separators=(",", ":"))),
+            )
+
+    factory = SqliteUnitOfWorkFactory(database_path)
+    await factory.initialize()
+
+    legacy = await factory.get_entity("config_layers", "workspace:ws_legacy")
+    current = await factory.get_entity("config_layers", "workspace:ws_current")
+    legacy_report = await factory.get_entity("config_migration_reports", "v0007:workspace:ws_legacy")
+    current_report = await factory.get_entity("config_migration_reports", "v0007:workspace:ws_current")
+    assert isinstance(legacy, dict)
+    assert isinstance(current, dict)
+    assert legacy["schemaVersion"] == 5
+    assert legacy["config"]["model"] == {"reasoning_effort": "high", "proxy_url": None}
+    assert legacy["config"]["ui"] == {"locale": "zh-CN"}
+    assert legacy["config"]["network"] == {}
+    assert "update" not in legacy["config"]
+    assert current["schemaVersion"] == 5
+    assert current["config"]["model"]["model"] == "gpt-bound"
+    assert current["config"]["model"]["account_binding"] == "sha256:" + "b" * 64
+    assert current["config"]["ui"] == {"locale": "zh-CN"}
+    assert legacy_report == {
+        "schemaVersion": 1,
+        "migration": "contract_codex_model_config",
+        "ownerId": "ws_legacy",
+        "retiredFields": [
+            "model.base_url",
+            "model.credential_handle",
+            "model.model",
+            "model.provider",
+            "model.wire_api",
+            "network.update_network_enabled",
+            "ui.loopback_web_enabled",
+            "ui.persistent_web_lease",
+            "update",
+        ],
+        "retiredProviderIds": ["deepseek"],
+    }
+    assert current_report == {
+        "schemaVersion": 1,
+        "migration": "contract_codex_model_config",
+        "ownerId": "ws_current",
+        "retiredFields": ["ui.loopback_web_enabled", "ui.persistent_web_lease"],
+        "retiredProviderIds": [],
+    }
+    assert "sensitive.invalid" not in json.dumps(legacy_report)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
 
 
 @pytest.mark.asyncio

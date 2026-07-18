@@ -101,12 +101,8 @@ async def test_application_boundary_is_direct_stdio_only_and_binds_probe_to_conn
     handlers = process_registration_command_handlers(_service(tmp_path))
     cancellation = ManualCancellationToken()
     list_params = validate_command_params("process/registrations/list", {})
-    with pytest.raises(PermissionError, match="plugin stdio"):
-        await handlers["process/registrations/list"](
-            list_params,
-            cancellation,
-            ApplicationCommandContext("loopback-http", "browser", "127.0.0.1"),
-        )
+    with pytest.raises(ValueError, match="direct stdio"):
+        ApplicationCommandContext("loopback-http", "browser", "127.0.0.1")
 
     context = ApplicationCommandContext("stdio", "stdio-connection-1", "parent-process")
     probe = await handlers["process/registrations/probe"](

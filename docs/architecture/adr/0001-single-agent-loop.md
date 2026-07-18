@@ -4,7 +4,7 @@
 
 ## 决策
 
-Agent Loop 只存在于 Windows Worker 的 Core 中，并以唯一 `@agent_loop_entrypoint` 标记。Obsidian、Loopback Web 和测试 Adapter 都调用同一个 `HarnessService`，不得定义第二套 Planner/Tool 循环。
+Agent Loop 只存在于 Windows Worker 的 Core 中，并以唯一 `@agent_loop_entrypoint` 标记。Obsidian direct stdio 和测试 Adapter 都调用同一个 `HarnessService`，不得定义第二套 Planner/Tool 循环或 HTTP/WebSocket 控制面。
 
 ## 后果
 

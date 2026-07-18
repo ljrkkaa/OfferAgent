@@ -1,19 +1,28 @@
 import pytest
 
-from offeragent_harness.config import ModelProvider, ModelSettings, ModelWireApi
+from offeragent_harness.config import ModelSettings
 from offeragent_harness.config.migrations import validate_current_codex_config
+from offeragent_harness.config.models import ModelPatch, UiPatch, UiSettings
 
 
 def test_fresh_model_settings_are_codex_subscription_only_and_unselected() -> None:
     settings = ModelSettings()
 
-    assert settings.provider is ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL
-    assert settings.wire_api is ModelWireApi.RESPONSES
+    assert set(ModelSettings.model_fields) == {
+        "account_binding",
+        "model",
+        "proxy_url",
+        "reasoning_effort",
+    }
+    assert set(ModelPatch.model_fields) == set(ModelSettings.model_fields)
     assert settings.model == ""
     assert settings.account_binding is None
-    assert settings.credential_handle is None
-    assert settings.base_url == ""
     assert settings.proxy_url is None
+
+
+def test_current_ui_config_has_no_retired_loopback_control_transport() -> None:
+    assert set(UiSettings.model_fields) == {"locale", "show_diagnostics"}
+    assert set(UiPatch.model_fields) == set(UiSettings.model_fields)
 
 
 def test_current_persisted_model_selection_requires_an_account_binding() -> None:

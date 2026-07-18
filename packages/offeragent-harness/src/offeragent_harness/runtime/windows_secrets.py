@@ -67,6 +67,74 @@ class SecretBindingMismatch(SecretStoreError):
     """The opaque handle exists but is not authorized for this consumer."""
 
 
+_SECRET_ENVELOPE_FIELDS = {
+    "version",
+    "handle",
+    "scopeId",
+    "kind",
+    "providerId",
+    "secretVersion",
+    "createdAt",
+    "rotatedAt",
+    "ciphertext",
+    "ciphertextSha256",
+}
+
+
+def parse_secret_envelope_metadata(raw: bytes, *, filename: str) -> SecretMetadata:
+    """Validate one encrypted envelope without decrypting or exposing its value."""
+
+    metadata, _ = _parse_secret_envelope(raw, filename=filename)
+    return metadata
+
+
+def _parse_secret_envelope(
+    raw: bytes,
+    *,
+    filename: str,
+    expected_handle: SecretHandle | None = None,
+) -> tuple[SecretMetadata, bytes]:
+    def closed_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate secret envelope field")
+            value[key] = item
+        return value
+
+    decoded = json.loads(raw.decode("utf-8"), object_pairs_hook=closed_object)
+    if not isinstance(decoded, Mapping) or set(decoded) != _SECRET_ENVELOPE_FIELDS:
+        raise ValueError("secret envelope fields are incompatible")
+    string_fields = ("handle", "scopeId", "kind", "providerId", "createdAt", "rotatedAt", "ciphertext")
+    if any(not isinstance(decoded[field], str) for field in string_fields):
+        raise ValueError("secret envelope string field is invalid")
+    if type(decoded["version"]) is not int or decoded["version"] != _FILE_VERSION:
+        raise ValueError("secret envelope version is incompatible")
+    if type(decoded["secretVersion"]) is not int:
+        raise ValueError("secret envelope secret version is invalid")
+    ciphertext_hash = decoded["ciphertextSha256"]
+    if not isinstance(ciphertext_hash, str) or re.fullmatch(r"[0-9a-f]{64}", ciphertext_hash) is None:
+        raise ValueError("secret ciphertext hash is invalid")
+    handle = SecretHandle(decoded["handle"])
+    if expected_handle is not None and handle != expected_handle:
+        raise ValueError("secret envelope handle mismatch")
+    if filename != f"{_handle_digest(handle)}.secret":
+        raise ValueError("secret filename does not match handle")
+    ciphertext = base64.b64decode(decoded["ciphertext"], validate=True)
+    if hashlib.sha256(ciphertext).hexdigest() != ciphertext_hash:
+        raise ValueError("secret ciphertext hash mismatch")
+    metadata = SecretMetadata(
+        handle,
+        decoded["scopeId"],
+        SecretKind(decoded["kind"]),
+        decoded["providerId"],
+        decoded["secretVersion"],
+        _parse_time(decoded["createdAt"]),
+        _parse_time(decoded["rotatedAt"]),
+    )
+    return metadata, ciphertext
+
+
 class _DataBlob(ctypes.Structure):
     _fields_ = [("size", wintypes.DWORD), ("data", ctypes.POINTER(ctypes.c_ubyte))]
 
@@ -311,38 +379,10 @@ class WindowsDpapiSecretStore:
         expected_handle: SecretHandle | None = None,
     ) -> tuple[SecretMetadata, bytes]:
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(raw, Mapping) or set(raw) != {
-                "version",
-                "handle",
-                "scopeId",
-                "kind",
-                "providerId",
-                "secretVersion",
-                "createdAt",
-                "rotatedAt",
-                "ciphertext",
-                "ciphertextSha256",
-            }:
-                raise ValueError("secret envelope fields are incompatible")
-            if raw["version"] != _FILE_VERSION:
-                raise ValueError("secret envelope version is incompatible")
-            handle = SecretHandle(str(raw["handle"]))
-            if expected_handle is not None and handle != expected_handle:
-                raise ValueError("secret envelope handle mismatch")
-            if path.name != f"{_handle_digest(handle)}.secret":
-                raise ValueError("secret filename does not match handle")
-            ciphertext = base64.b64decode(str(raw["ciphertext"]), validate=True)
-            if hashlib.sha256(ciphertext).hexdigest() != raw["ciphertextSha256"]:
-                raise ValueError("secret ciphertext hash mismatch")
-            metadata = SecretMetadata(
-                handle,
-                str(raw["scopeId"]),
-                SecretKind(raw["kind"]),
-                str(raw["providerId"]),
-                int(raw["secretVersion"]),
-                _parse_time(str(raw["createdAt"])),
-                _parse_time(str(raw["rotatedAt"])),
+            metadata, ciphertext = _parse_secret_envelope(
+                path.read_bytes(),
+                filename=path.name,
+                expected_handle=expected_handle,
             )
             return metadata, ciphertext
         except FileNotFoundError as error:
@@ -537,4 +577,5 @@ __all__ = [
     "SecretStoreError",
     "SecretVersionConflict",
     "WindowsDpapiSecretStore",
+    "parse_secret_envelope_metadata",
 ]

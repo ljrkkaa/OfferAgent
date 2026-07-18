@@ -20,8 +20,8 @@ ARM64 运行路径。这些不是隐藏开关、兼容模式或等待重新启�
    停止当前 Runtime。
 2. **Runtime 身份唯一**：一个插件实例只有一个直接子 Worker；同一交互式 Windows 会话和用户内，
    同一 Vault 同时最多一个 Worker 能持锁并进入 Runtime 校验、SQLite、恢复和运行期；
-   命令只能经 stdio JSON-RPC 进入同一 `HarnessService`，本地 Web 也只连接同一个 Worker。
-3. **模型边界明确**：至少一个用户配置的 `ModelGateway` Provider 能完成真实对话；Provider 不得
+   命令只能经 stdio JSON-RPC 进入同一 `HarnessService`，不存在第二个 HTTP/WebSocket 控制面。
+3. **模型边界明确**：当前 Codex 订阅账户目录中的模型能完成真实对话；Model Module 不得
    取得工具、Vault、Session、Memory、审批或 Subagent 所有权。
 4. **真实工作区读取可用**：在只读权限下验证 Glob、Grep、Read、引用和 wikilink/backlink；项目源码、
    构建物和测试报告不得意外进入工具可见范围。
@@ -42,7 +42,6 @@ ARM64 运行路径。这些不是隐藏开关、兼容模式或等待重新启�
 
 以下能力继续接受安全性和正确性修复，但不作为个人版本的 UI 完成阻塞项：
 
-- 同一 Worker 提供的本地 Loopback Web UI；
 - Memory、Skills、Hooks、Shell 和 Subagent 的高级配置；
 - 复杂 Run tree 和多 Vault 同时打开时的体验优化；
 - 多文件批次、rename/trash 的 durable journal 扩展；
@@ -63,7 +62,7 @@ ARM64 运行路径。这些不是隐藏开关、兼容模式或等待重新启�
 
 - 真实 Obsidian 插件能直接启动并通过 stdio 使用本地 x64 Worker。
 - 真实 Vault 只读检索通过；临时 Vault 的单文件事务与故障恢复通过。
-- 一个真实模型 Provider 可聊天；Session 可恢复；停止后本轮进程树退出。
+- 当前 Codex 订阅账户目录中的真实模型可聊天；Session 可恢复；停止后本轮进程树退出。
 - Python、协议、依赖、文档、Web asset、插件测试和类型检查门禁实时通过。
 - 从干净输出目录执行个人构建，并由更新脚本原子切换到目标 Vault。
 - 没有影响个人主路径或数据安全的已知 P0/P1。

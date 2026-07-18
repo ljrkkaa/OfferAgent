@@ -9,9 +9,8 @@ from enum import Enum
 from pathlib import PureWindowsPath
 from types import MappingProxyType
 from typing import Literal
-from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from ._base import EmptyParams, JsonObject, WireModel, validate_wire
 from .capabilities import CapabilityName, CapabilitySet, ProtocolRange
@@ -47,8 +46,6 @@ from .ids import (
 
 
 class TransportKind(str, Enum):
-    LOOPBACK_HTTP = "loopback-http"
-    LOOPBACK_WEBSOCKET = "loopback-websocket"
     STDIO = "stdio"
 
 
@@ -150,92 +147,6 @@ class RuntimeStatusResult(WireModel):
     active_run_ids: list[RunId] = Field(default_factory=list, max_length=1024)
     skills: SkillCatalogStatusSnapshot
     warnings: list[ErrorEnvelope] = Field(default_factory=list, max_length=256)
-
-
-class WebLaunchParams(EmptyParams):
-    pass
-
-
-class WebLaunchResult(WireModel):
-    url: str = Field(min_length=32, max_length=2048)
-    worker_pid: int = Field(ge=1)
-    workspace_instance_id: WorkspaceInstanceId
-    expires_at: Rfc3339DateTime
-
-    @model_validator(mode="after")
-    def _launch_url_is_loopback_fragment_only(self) -> WebLaunchResult:
-        parsed = urlsplit(self.url)
-        try:
-            port = parsed.port
-        except ValueError as error:
-            raise ValueError("Web launch URL port is invalid") from error
-        if (
-            parsed.scheme != "http"
-            or parsed.hostname not in {"127.0.0.1", "::1"}
-            or port is None
-            or not 1024 <= port <= 65535
-            or parsed.path != "/"
-            or parsed.query
-            or not parsed.fragment
-            or parsed.username is not None
-            or parsed.password is not None
-        ):
-            raise ValueError("Web launch URL must be a numeric loopback URL with a fragment-only token")
-        return self
-
-
-SecretKindValue = Literal["model-provider"]
-
-
-class SecretMetadataSnapshot(WireModel):
-    handle: str = Field(pattern=r"^secret:v1:[0-9a-f]{32}$")
-    kind: SecretKindValue
-    provider_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_.-]{0,63}$")
-    version: int = Field(ge=1)
-    created_at: Rfc3339DateTime
-    rotated_at: Rfc3339DateTime
-
-
-class SecretsListParams(WireModel):
-    kind: SecretKindValue | None = None
-    provider_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_.-]{0,63}$")
-
-
-class SecretsListResult(WireModel):
-    secrets: list[SecretMetadataSnapshot] = Field(max_length=1024)
-
-
-class SecretsPutParams(WireModel):
-    provider_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_.-]{0,63}$")
-    kind: SecretKindValue
-    secret: SecretStr
-    handle: str | None = Field(default=None, pattern=r"^secret:v1:[0-9a-f]{32}$")
-    expected_version: int | None = Field(default=None, ge=1)
-
-    @model_validator(mode="after")
-    def _create_or_rotate_is_unambiguous(self) -> SecretsPutParams:
-        if (self.handle is None) != (self.expected_version is None):
-            raise ValueError("handle and expectedVersion are required together only for rotation")
-        if not self.secret.get_secret_value() or "\x00" in self.secret.get_secret_value():
-            raise ValueError("secret must be non-empty and cannot contain NUL")
-        if len(self.secret.get_secret_value().encode("utf-8")) > 1_048_576:
-            raise ValueError("secret exceeds the protected IPC input bound")
-        return self
-
-
-class SecretsPutResult(WireModel):
-    secret: SecretMetadataSnapshot
-    created: bool
-
-
-class SecretsDeleteParams(WireModel):
-    handle: str = Field(pattern=r"^secret:v1:[0-9a-f]{32}$")
-    expected_version: int = Field(ge=1)
-
-
-class SecretsDeleteResult(WireModel):
-    handle: str = Field(pattern=r"^secret:v1:[0-9a-f]{32}$")
-    deleted: Literal[True]
 
 
 class ConfigScope(str, Enum):
@@ -824,12 +735,8 @@ class ModelServiceTierDescriptor(WireModel):
 
 
 class ModelDescriptor(WireModel):
-    provider: str = Field(min_length=1, max_length=128)
     model: str = Field(min_length=1, max_length=256)
     display_name: str = Field(min_length=1, max_length=512)
-    local: bool
-    supports_streaming: bool
-    supports_structured_output: bool
     input_modalities: list[str] = Field(min_length=1, max_length=16)
     supports_image_detail_original: bool
     supports_hosted_search: bool
@@ -842,7 +749,6 @@ class ModelDescriptor(WireModel):
     default_service_tier: str | None = Field(default=None, min_length=1, max_length=64)
     supports_fast_mode: bool
     max_context_tokens: int | None = Field(default=None, ge=1)
-    available: bool
 
     @field_validator("input_modalities", "additional_speed_tiers")
     @classmethod
@@ -861,9 +767,8 @@ class ModelDescriptor(WireModel):
         return self
 
 
-class ModelsListParams(WireModel):
-    provider: str | None = Field(default=None, min_length=1, max_length=128)
-    include_unavailable: bool = False
+class ModelsListParams(EmptyParams):
+    pass
 
 
 class ModelsListResult(WireModel):
@@ -874,24 +779,6 @@ class ModelsListResult(WireModel):
     fetched_at: Rfc3339DateTime | None = None
     account_binding: Sha256Digest | None = None
     error: ErrorEnvelope | None = None
-
-
-class ModelsHealthParams(WireModel):
-    provider: str = Field(min_length=1, max_length=128)
-    client_request_id: RequestId
-    model: str | None = Field(default=None, min_length=1, max_length=256)
-    deadline: Rfc3339DateTime | None = None
-    capability: Literal["text", "vision"] = "text"
-
-
-class ModelsHealthResult(WireModel):
-    provider: str = Field(min_length=1, max_length=128)
-    model: str | None = Field(default=None, min_length=1, max_length=256)
-    status: Literal["healthy", "degraded", "unreachable", "auth_required", "unsupported"]
-    checked_at: Rfc3339DateTime
-    latency_ms: int | None = Field(default=None, ge=0)
-    error: ErrorEnvelope | None = None
-    capability: Literal["text", "vision"] = "text"
 
 
 class SessionCreateParams(WireModel):
@@ -1329,10 +1216,6 @@ _COMMAND_SPECS = [
     _spec("initialize", InitializeParams, InitializeResult),
     _spec("runtime/ping", RuntimePingParams, RuntimePingResult),
     _spec("runtime/status", RuntimeStatusParams, RuntimeStatusResult),
-    _spec("web/launch", WebLaunchParams, WebLaunchResult),
-    _spec("secrets/list", SecretsListParams, SecretsListResult),
-    _spec("secrets/put", SecretsPutParams, SecretsPutResult),
-    _spec("secrets/delete", SecretsDeleteParams, SecretsDeleteResult),
     _spec("config/get", ConfigGetParams, ConfigSnapshot),
     _spec("config/update", ConfigUpdateParams, ConfigUpdateResult),
     _spec("skills/list", SkillsListParams, SkillsListResult, capability=CapabilityName.SKILLS),
@@ -1368,7 +1251,6 @@ _COMMAND_SPECS = [
         capability=CapabilityName.HOOKS,
     ),
     _spec("models/list", ModelsListParams, ModelsListResult),
-    _spec("models/health", ModelsHealthParams, ModelsHealthResult),
     _spec("plugin-tools/complete", PluginToolCompleteParams, PluginToolCompleteResult),
     _spec("session/create", SessionCreateParams, SessionCreateResult, capability=CapabilityName.MULTI_SESSION),
     _spec("session/list", SessionListParams, SessionListResult, capability=CapabilityName.MULTI_SESSION),

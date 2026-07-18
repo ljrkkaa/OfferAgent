@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, cast
 
-from offeragent_harness.config import ConfigPatch, ModelProvider
+from offeragent_harness.config import ConfigPatch
 from offeragent_harness.config import ConfigScope as DomainConfigScope
 from offeragent_harness.hooks import HookDecision, HookEvent
 from offeragent_harness.models import thaw_json
@@ -21,11 +21,6 @@ from offeragent_harness.ports import (
     ArtifactStore,
     CancellationToken,
     Clock,
-    SecretHandle,
-    SecretInput,
-    SecretKind,
-    SecretMetadata,
-    SecretStore,
 )
 from offeragent_harness.protocol._base import WireModel
 from offeragent_harness.protocol.common import PermissionMode, TurnSnapshot
@@ -52,17 +47,8 @@ from offeragent_harness.protocol.messages import (
     ConfigSnapshot,
     ConfigUpdateParams,
     ConfigUpdateResult,
-    ModelsHealthParams,
-    ModelsHealthResult,
     ModelsListParams,
     ModelsListResult,
-    SecretMetadataSnapshot,
-    SecretsDeleteParams,
-    SecretsDeleteResult,
-    SecretsListParams,
-    SecretsListResult,
-    SecretsPutParams,
-    SecretsPutResult,
     SessionCreateParams,
     SessionCreateResult,
     SessionDeleteParams,
@@ -98,7 +84,6 @@ from .application_handlers import (
     diagnostics_command_handlers,
     event_replay_handlers,
     subagent_command_handlers,
-    web_launch_handlers,
 )
 from .approval_manager import ApprovalManager, ApprovalNotFound
 from .attachment_errors import AttachmentError
@@ -111,7 +96,6 @@ from .conversation_attachments import (
 from .conversation_controls import ConversationControlService
 from .harness_service import HarnessService, StartTurnCommand
 from .hook_lifecycle import LifecycleHookDenied
-from .loopback_gateway import LoopbackWebGateway
 from .pinned_context import pinned_context_block
 from .session_service import (
     SessionCreateCommand as LifecycleSessionCreateCommand,
@@ -153,12 +137,6 @@ class ModelCommandService(Protocol):
         cancellation: CancellationToken,
     ) -> ModelsListResult: ...
 
-    async def health(
-        self,
-        params: ModelsHealthParams,
-        cancellation: CancellationToken,
-    ) -> ModelsHealthResult: ...
-
 
 class ConversationProjectionService(Protocol):
     async def turns(self, session_id: str, cancellation: CancellationToken) -> tuple[TurnSnapshot, ...]: ...
@@ -192,14 +170,12 @@ def compose_domain_command_handlers(
     projections: ConversationProjectionService,
     artifacts: ArtifactStore,
     attachments: ConversationAttachmentStore,
-    secrets: SecretStore,
     controls: ConversationControlService,
     subagents: SubagentService,
     subagent_authorities: SubagentCommandAuthorityResolver,
     subagent_artifacts: SubagentArtifactReferenceResolver,
     diagnostics: DiagnosticsService,
     diagnostics_owner_runs: DiagnosticsOwnerRunAuthorizer,
-    gateway_provider: Callable[[], LoopbackWebGateway | None],
     transport_policy: ApplicationTransportPolicy,
     extension_management_handlers: Mapping[str, ApplicationCommandHandler],
     plugin_tool_handlers: Mapping[str, ApplicationCommandHandler],
@@ -246,7 +222,6 @@ def compose_domain_command_handlers(
     )
     add(_artifact_handlers(identity=identity, artifacts=artifacts))
     add(_attachment_handlers(workspace_id=identity.workspace_id, harness=harness, attachments=attachments))
-    add(secret_command_handlers(identity=identity, secrets=secrets))
     add(_shutdown_handlers(harness=harness, projections=projections))
     add(
         conversation_control_handlers(
@@ -273,7 +248,6 @@ def compose_domain_command_handlers(
             owner_runs=diagnostics_owner_runs,
         )
     )
-    add(web_launch_handlers(gateway_provider=gateway_provider))
     expected = frozenset(COMMAND_REGISTRY) - {"initialize", "runtime/ping", "runtime/status"}
     actual = frozenset(handlers)
     if actual != expected:
@@ -374,11 +348,7 @@ def _model_handlers(*, models: ModelCommandService) -> Mapping[str, ApplicationC
         del context
         return await models.list_models(cast(ModelsListParams, raw), cancellation)
 
-    async def health(raw: WireModel, cancellation: CancellationToken, context: ApplicationCommandContext) -> WireModel:
-        del context
-        return await models.health(cast(ModelsHealthParams, raw), cancellation)
-
-    return {"models/list": list_models, "models/health": health}
+    return {"models/list": list_models}
 
 
 def _session_handlers(
@@ -552,9 +522,6 @@ def _turn_handlers(
             workspace_id=identity.workspace_id,
             session_id=params.session_id,
         )
-        required_provider = ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL.value
-        if params.run_config.provider != required_provider or snapshot.config.model.provider.value != required_provider:
-            raise ValueError("New Runs require the internal Codex Subscription provider")
         if params.run_config.model != snapshot.config.model.model:
             raise ValueError("Run model differs from the effective persisted configuration")
         requested_mode = params.run_config.permission_mode
@@ -860,106 +827,6 @@ def _attachment_handlers(
     }
 
 
-def secret_command_handlers(
-    *,
-    identity: DomainCommandIdentity,
-    secrets: SecretStore,
-) -> Mapping[str, ApplicationCommandHandler]:
-    def require_direct_stdio(context: ApplicationCommandContext) -> None:
-        if context.transport != "stdio":
-            raise PermissionError("Secret input is accepted only over the direct plugin stdio connection")
-
-    async def list_secrets(
-        raw: WireModel,
-        cancellation: CancellationToken,
-        context: ApplicationCommandContext,
-    ) -> WireModel:
-        require_direct_stdio(context)
-        cancellation.checkpoint()
-        params = cast(SecretsListParams, raw)
-        values = await asyncio.to_thread(secrets.list_metadata, scope_id=identity.workspace_id)
-        filtered = tuple(
-            value
-            for value in values
-            if (params.kind is None or value.kind.value == params.kind)
-            and (params.provider_id is None or value.provider_id == params.provider_id)
-        )
-        return SecretsListResult(secrets=[_secret_metadata(value) for value in filtered])
-
-    async def put(
-        raw: WireModel,
-        cancellation: CancellationToken,
-        context: ApplicationCommandContext,
-    ) -> WireModel:
-        require_direct_stdio(context)
-        cancellation.checkpoint()
-        params = cast(SecretsPutParams, raw)
-        plaintext = bytearray(params.secret.get_secret_value().encode("utf-8"))
-        secret_input: SecretInput | None = None
-        try:
-            secret_input = SecretInput(plaintext)
-            if params.handle is None:
-                value = await asyncio.to_thread(
-                    secrets.create,
-                    scope_id=identity.workspace_id,
-                    kind=SecretKind(params.kind),
-                    provider_id=params.provider_id,
-                    secret=secret_input,
-                )
-                created = True
-            else:
-                assert params.expected_version is not None
-                handle = SecretHandle(params.handle)
-                current = await asyncio.to_thread(secrets.metadata, handle, scope_id=identity.workspace_id)
-                if current.kind.value != params.kind or current.provider_id != params.provider_id:
-                    raise ValueError("Secret rotation kind/provider must match the opaque handle metadata")
-                value = await asyncio.to_thread(
-                    secrets.rotate,
-                    handle,
-                    scope_id=identity.workspace_id,
-                    expected_version=params.expected_version,
-                    secret=secret_input,
-                )
-                created = False
-            cancellation.checkpoint()
-            return SecretsPutResult(secret=_secret_metadata(value), created=created)
-        finally:
-            for index in range(len(plaintext)):
-                plaintext[index] = 0
-            plaintext.clear()
-            if secret_input is not None:
-                secret_input.close()
-
-    async def delete(
-        raw: WireModel,
-        cancellation: CancellationToken,
-        context: ApplicationCommandContext,
-    ) -> WireModel:
-        require_direct_stdio(context)
-        cancellation.checkpoint()
-        params = cast(SecretsDeleteParams, raw)
-        await asyncio.to_thread(
-            secrets.delete,
-            SecretHandle(params.handle),
-            scope_id=identity.workspace_id,
-            expected_version=params.expected_version,
-        )
-        return SecretsDeleteResult(handle=params.handle, deleted=True)
-
-    return {"secrets/list": list_secrets, "secrets/put": put, "secrets/delete": delete}
-
-
-def _secret_metadata(value: SecretMetadata) -> SecretMetadataSnapshot:
-    return SecretMetadataSnapshot(
-        handle=str(value.handle),
-        kind=value.kind.value,
-        provider_id=value.provider_id,
-        version=value.version,
-        created_at=value.created_at.isoformat(),
-        rotated_at=value.rotated_at.isoformat(),
-    )
-
-
 def _shutdown_handlers(
     *,
     harness: HarnessService,
@@ -1012,5 +879,4 @@ __all__ = [
     "DomainCommandIdentity",
     "ModelCommandService",
     "compose_domain_command_handlers",
-    "secret_command_handlers",
 ]

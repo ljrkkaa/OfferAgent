@@ -66,6 +66,17 @@ def _write_v4(path: Path, config: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _write_v5(path: Path, config: dict[str, Any]) -> None:
+    payload = {
+        "version": 5,
+        "scope": "workspace",
+        "ownerId": OWNER,
+        "revision": 9,
+        "config": config,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def test_v3_file_migrates_full_legacy_config_once_and_keeps_a_backup(tmp_path: Path) -> None:
     path = tmp_path / "workspace-config.json"
     _write_v3(path, _legacy_config())
@@ -81,7 +92,7 @@ def test_v3_file_migrates_full_legacy_config_once_and_keeps_a_backup(tmp_path: P
     assert projected["model"] == {"reasoning_effort": "high", "proxy_url": None}
     assert projected["policy"] == HarnessConfig().model_dump(mode="json")["policy"]
     current = json.loads(path.read_text(encoding="utf-8"))
-    assert current["version"] == 5
+    assert current["version"] == 6
     assert "update" not in current["config"]
     assert "update_network_enabled" not in current["config"]["network"]
 
@@ -108,7 +119,7 @@ def test_v4_file_requires_fresh_reselection_even_for_explicit_codex_subscription
         "proxy_url": None,
     }
     current = path.read_text(encoding="utf-8")
-    assert '"version": 5' in current
+    assert '"version": 6' in current
     persisted_model = json.loads(current)["config"]["model"]
     for retired in (
         "provider",
@@ -149,10 +160,26 @@ def test_v4_file_clears_model_candidate_from_every_other_or_missing_provider(
     assert "model" not in loaded.layer.patch.payload()["model"]
 
 
-def test_v5_file_rejects_retired_model_decision_fields(tmp_path: Path) -> None:
+def test_v5_file_contracts_loopback_control_fields_with_value_free_report(tmp_path: Path) -> None:
+    path = tmp_path / "workspace-config.json"
+    config = HarnessConfig().model_dump(mode="json")
+    config["ui"].update({"loopback_web_enabled": True, "persistent_web_lease": True})
+    _write_v5(path, config)
+
+    loaded = ConfigFileStore(path, scope=ConfigScope.WORKSPACE, owner_id=OWNER, now=lambda: NOW).load()
+
+    assert loaded.migrated_from == 5
+    assert loaded.retired_fields == ("ui.loopback_web_enabled", "ui.persistent_web_lease")
+    assert loaded.retired_provider_ids == ()
+    current = json.loads(path.read_text(encoding="utf-8"))
+    assert current["version"] == 6
+    assert set(current["config"]["ui"]) == {"locale", "show_diagnostics"}
+
+
+def test_v6_file_rejects_retired_model_decision_fields(tmp_path: Path) -> None:
     path = tmp_path / "workspace-config.json"
     payload = {
-        "version": 5,
+        "version": 6,
         "scope": "workspace",
         "ownerId": OWNER,
         "revision": 1,

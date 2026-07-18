@@ -62,8 +62,8 @@ AppContainer token 不会自动继承普通用户对文件的访问权。内置�
 ## 用户程序注册
 
 用户选择的程序不修改 Runtime 目录，也不能热插入正在执行的 `ProcessSupervisor`。注册状态由当前
-Workspace 的 SQLite 持久化，只在下一次 Worker 启动前合并成不可变快照。管理命令经当前插件实例
-到 Worker 的 stdio JSON-RPC 执行；Loopback Web 不返回本机绝对路径。
+Workspace 的 SQLite 持久化，只在下一次 Worker 启动前合并成不可变快照。管理命令只经当前插件实例
+到 Worker 的 stdio JSON-RPC 执行，协议结果不返回本机绝对路径。
 
 注册采用 `probe -> confirm`：probe 有限时效且只可消费一次；confirm 再次读取文件 identity 和
 SHA-256，并把 catalog revision、record revision/contentHash 与幂等 `clientRequestId` 在同一事务

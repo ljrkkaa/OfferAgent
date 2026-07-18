@@ -31,7 +31,7 @@ def _legacy_v2_layer(
     config["model"]["model"] = "gpt-catalog-candidate"
     config["model"]["credential_handle"] = "secret:v1:" + "b" * 32
     if provider is None:
-        config["model"].pop("provider")
+        config["model"].pop("provider", None)
     else:
         config["model"]["provider"] = provider
     config["network"]["update_network_enabled"] = False
@@ -105,7 +105,7 @@ async def test_config_survives_sqlite_reopen_and_keeps_vaults_isolated(tmp_path:
     assert snapshot_b.config.model.model == "model-b"
     assert snapshot_a.fingerprint != snapshot_b.fingerprint
     assert isinstance(stored_a, dict)
-    assert stored_a["schemaVersion"] == 4
+    assert stored_a["schemaVersion"] == 5
 
 
 @pytest.mark.asyncio

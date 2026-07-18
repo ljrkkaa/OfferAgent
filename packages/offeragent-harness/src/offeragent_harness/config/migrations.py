@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from .models import ConfigPatch
@@ -10,6 +11,27 @@ from .models import ConfigPatch
 _RETIRED_UPDATE_KEYS = frozenset({"automatic_check", "automatic_install", "channel"})
 _RETIRED_UPDATE_CHANNELS = frozenset({"beta", "disabled", "stable"})
 _CURRENT_MODEL_KEYS = frozenset({"account_binding", "model", "proxy_url", "reasoning_effort"})
+_RETIRED_MODEL_KEYS = frozenset(
+    {
+        "allow_remote_https",
+        "base_url",
+        "credential_handle",
+        "organization_id",
+        "project_id",
+        "provider",
+        "service_tier",
+        "temperature",
+        "wire_api",
+    }
+)
+_RETIRED_UI_KEYS = frozenset({"loopback_web_enabled", "persistent_web_lease"})
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyConfigProjection:
+    patch: ConfigPatch
+    retired_fields: tuple[str, ...]
+    retired_provider_ids: tuple[str, ...]
 
 
 def strip_retired_update_fields(value: object) -> dict[str, Any]:
@@ -45,10 +67,32 @@ def project_legacy_codex_config(value: object) -> ConfigPatch:
     tier, and sampling choices are retired as well.
     """
 
-    legacy = ConfigPatch.model_validate(strip_retired_update_fields(value)).payload()
-    projected = dict(legacy)
-    legacy_model = legacy.get("model")
+    return project_legacy_codex_config_with_report(value).patch
+
+
+def project_legacy_codex_config_with_report(value: object) -> LegacyConfigProjection:
+    """Project a legacy config and report identities without retaining values."""
+
+    stripped = strip_retired_update_fields(value)
+    projected = dict(stripped)
+    retired_fields: set[str] = set()
+    if isinstance(value, Mapping) and "update" in value:
+        retired_fields.add("update")
+    original_network = value.get("network") if isinstance(value, Mapping) else None
+    if isinstance(original_network, Mapping) and "update_network_enabled" in original_network:
+        retired_fields.add("network.update_network_enabled")
+
+    legacy_model = projected.pop("model", None)
+    providers: set[str] = set()
     if isinstance(legacy_model, Mapping):
+        unknown = set(legacy_model) - _CURRENT_MODEL_KEYS - _RETIRED_MODEL_KEYS
+        if unknown:
+            raise ValueError("legacy model configuration contains unknown fields")
+        _validate_retired_model_fields(legacy_model)
+        provider = legacy_model.get("provider")
+        if isinstance(provider, str) and provider:
+            providers.add(provider)
+        retired_fields.update(f"model.{key}" for key in set(legacy_model) & (_RETIRED_MODEL_KEYS | {"model"}))
         model = {
             key: legacy_model[key] for key in _CURRENT_MODEL_KEYS - {"account_binding", "model"} if key in legacy_model
         }
@@ -56,7 +100,54 @@ def project_legacy_codex_config(value: object) -> ConfigPatch:
             projected["model"] = model
         else:
             projected.pop("model", None)
-    return validate_current_codex_config(projected)
+    elif legacy_model is not None:
+        raise ValueError("legacy model configuration must be an object")
+
+    legacy_ui = projected.get("ui")
+    if isinstance(legacy_ui, Mapping):
+        unknown_retired = set(legacy_ui) & _RETIRED_UI_KEYS
+        for key in unknown_retired:
+            value = legacy_ui[key]
+            if value is not None and type(value) is not bool:
+                raise ValueError("retired loopback Web setting is invalid")
+        if unknown_retired:
+            ui = {key: item for key, item in legacy_ui.items() if key not in _RETIRED_UI_KEYS}
+            projected["ui"] = ui
+            retired_fields.update(f"ui.{key}" for key in unknown_retired)
+    elif legacy_ui is not None:
+        raise ValueError("legacy UI configuration must be an object")
+
+    return LegacyConfigProjection(
+        validate_current_codex_config(projected),
+        tuple(sorted(retired_fields)),
+        tuple(sorted(providers)),
+    )
+
+
+def project_previous_codex_config_with_report(value: object) -> LegacyConfigProjection:
+    """Migrate the previous Codex-only schema without discarding its bound selection."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("previous configuration payload must be an object")
+    projected = dict(value)
+    retired_fields: set[str] = set()
+    legacy_ui = projected.get("ui")
+    if isinstance(legacy_ui, Mapping):
+        retired = set(legacy_ui) & _RETIRED_UI_KEYS
+        for key in retired:
+            item = legacy_ui[key]
+            if item is not None and type(item) is not bool:
+                raise ValueError("retired loopback Web setting is invalid")
+        if retired:
+            projected["ui"] = {key: item for key, item in legacy_ui.items() if key not in _RETIRED_UI_KEYS}
+            retired_fields.update(f"ui.{key}" for key in retired)
+    elif legacy_ui is not None:
+        raise ValueError("previous UI configuration must be an object")
+    return LegacyConfigProjection(
+        validate_current_codex_config(projected),
+        tuple(sorted(retired_fields)),
+        (),
+    )
 
 
 def validate_current_codex_config(value: object) -> ConfigPatch:
@@ -98,8 +189,35 @@ def _validate_retired_update_patch(value: object) -> None:
             raise ValueError(f"retired update setting {key!r} is invalid")
 
 
+def _validate_retired_model_fields(value: Mapping[str, Any]) -> None:
+    string_fields = {
+        "base_url",
+        "credential_handle",
+        "organization_id",
+        "project_id",
+        "provider",
+        "service_tier",
+        "wire_api",
+    }
+    for key in string_fields & set(value):
+        item = value[key]
+        if item is not None and not isinstance(item, str):
+            raise ValueError("retired model string field is invalid")
+    if "allow_remote_https" in value:
+        item = value["allow_remote_https"]
+        if item is not None and type(item) is not bool:
+            raise ValueError("retired model network field is invalid")
+    if "temperature" in value:
+        item = value["temperature"]
+        if item is not None and (type(item) not in {int, float} or not 0 <= item <= 2):
+            raise ValueError("retired model sampling field is invalid")
+
+
 __all__ = [
+    "LegacyConfigProjection",
     "project_legacy_codex_config",
+    "project_legacy_codex_config_with_report",
+    "project_previous_codex_config_with_report",
     "strip_retired_update_fields",
     "validate_current_codex_config",
 ]

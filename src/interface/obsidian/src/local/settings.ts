@@ -34,7 +34,21 @@ export const DEFAULT_LOCAL_SETTINGS: LocalOfferAgentSettings = {
     telemetryEnabled: false,
 };
 
-export const CODEX_SUBSCRIPTION_PROVIDER = "codex-subscription-experimental" as const;
+const RETIRED_CODEX_SUBSCRIPTION_PROVIDER = "codex-subscription-experimental";
+const CURRENT_SETTINGS_KEYS: ReadonlySet<string> = new Set([
+    "schemaVersion",
+    "proxyUrl",
+    "model",
+    "modelAccountBinding",
+    "reasoningEffort",
+    "permissionMode",
+    "workspaceTrusted",
+    "autoApproveVaultWrites",
+    "shellEnabled",
+    "subagentsEnabled",
+    "hooksEnabled",
+    "telemetryEnabled",
+]);
 
 export interface SettingsHost extends ExtensionSettingsPanelHost {
     settings: LocalOfferAgentSettings;
@@ -212,7 +226,10 @@ export function parseLocalSettings(raw: unknown): LocalOfferAgentSettings {
     if (value.schemaVersion !== 2 && value.schemaVersion !== 3) {
         return { ...DEFAULT_LOCAL_SETTINGS };
     }
-    const codexSettings = value.schemaVersion !== 2 || value.provider === CODEX_SUBSCRIPTION_PROVIDER;
+    if (value.schemaVersion === 3 && Object.keys(value).some((key) => !CURRENT_SETTINGS_KEYS.has(key))) {
+        return { ...DEFAULT_LOCAL_SETTINGS };
+    }
+    const codexSettings = value.schemaVersion !== 2 || value.provider === RETIRED_CODEX_SUBSCRIPTION_PROVIDER;
     const proxyUrl = codexSettings && typeof value.proxyUrl === "string"
         ? safeProxyUrl(value.proxyUrl)
         : "";
@@ -265,7 +282,6 @@ export function runConfig(settings: LocalOfferAgentSettings): TurnRunConfig {
         throw new Error("请先从当前 Codex 模型目录选择模型");
     }
     return {
-        provider: CODEX_SUBSCRIPTION_PROVIDER,
         model: settings.model,
         reasoningEffort: settings.reasoningEffort,
         permissionMode: settings.permissionMode,

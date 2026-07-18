@@ -16,7 +16,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from offeragent_harness.adapters.local_artifacts import LocalArtifactStore
 from offeragent_harness.adapters.sqlite_stores import SqliteUnitOfWorkFactory
-from offeragent_harness.config import HarnessConfig, ModelProvider
+from offeragent_harness.config import HarnessConfig
 from offeragent_harness.models import (
     ModelEvent,
     ModelEventKind,
@@ -629,7 +629,6 @@ def _trusted_config() -> HarnessConfig:
         update={
             "model": base.model.model_copy(
                 update={
-                    "provider": ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL,
                     "model": MODEL_ID,
                     "account_binding": ACCOUNT_BINDING,
                 }
@@ -718,7 +717,6 @@ def _runtime(
         attachments=attachments,
         optional_definitions=definitions,
         plugin_executor=executor,
-        local_transaction=None,
         parent_authorities=object(),  # type: ignore[arg-type]
     )
     harness = HarnessService(
@@ -816,7 +814,6 @@ async def _start_submission(
                     ),
                 ],
                 "runConfig": {
-                    "provider": ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL.value,
                     "model": MODEL_ID,
                     "reasoningEffort": "medium",
                     "permissionMode": "trusted-workspace",

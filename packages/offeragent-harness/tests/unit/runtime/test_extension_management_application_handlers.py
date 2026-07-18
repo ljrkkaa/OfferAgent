@@ -206,12 +206,8 @@ async def test_shell_admin_is_direct_stdio_only_registered_cas_and_replays_after
     cancellation = ManualCancellationToken()
     params = _shell_install(executable, request_id="req_shell_install")
 
-    with pytest.raises(PermissionError, match="direct plugin stdio"):
-        await handlers["shell/install"](
-            params,
-            cancellation,
-            ApplicationCommandContext(transport="loopback-http"),
-        )
+    with pytest.raises(ValueError, match="direct stdio"):
+        ApplicationCommandContext(transport="loopback-http")
 
     installed = await handlers["shell/install"](params, cancellation, ApplicationCommandContext())
     assert isinstance(installed, ShellMutationResult)
@@ -239,7 +235,7 @@ async def test_shell_admin_is_direct_stdio_only_registered_cas_and_replays_after
     listed = await restarted["shell/list"](
         validate_command_params("shell/list", {"includeDisabled": True}),
         cancellation,
-        ApplicationCommandContext(transport="loopback-http"),
+        ApplicationCommandContext(),
     )
     assert isinstance(listed, ShellListResult)
     assert listed.profiles[0].profile.profile_id == "safe_tool"
@@ -430,7 +426,7 @@ async def test_skill_admin_lists_live_metadata_and_status(tmp_path: Path) -> Non
     listed = await handlers["skills/list"](
         validate_command_params("skills/list", {}),
         cancellation,
-        ApplicationCommandContext(transport="loopback-http"),
+        ApplicationCommandContext(),
     )
     assert len(listed.skills) == 1
     skill = listed.skills[0]
@@ -439,7 +435,7 @@ async def test_skill_admin_lists_live_metadata_and_status(tmp_path: Path) -> Non
     status = await handlers["skills/status"](
         validate_command_params("skills/status", {}),
         cancellation,
-        ApplicationCommandContext(transport="loopback-http"),
+        ApplicationCommandContext(),
     )
     assert status.status.revision == listed.revision
     assert status.status.discovered_count == status.status.enabled_count == 1

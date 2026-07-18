@@ -15,7 +15,6 @@ schema hash。任何源码、协议、构建脚本或生成物变化后，都必
   超时强杀后仍等待 process exit，同一插件实例的替代 Worker 只能在回收完成后启动。Obsidian 不等待 `onunload` Promise；卸载、禁用、
   热重载或退出会在同步回调内关闭 stdio 并发起后台 join，同会话同 Vault Worker 在旧进程释放互斥锁
   前不能访问 Runtime 状态。
-- 本地 Web 是同一 Worker 的 Loopback adapter，不是第二套 Runtime。
 - Shell/Hook 等进程工具由短生命周期 `offeragent-process-host.exe` 执行，并受固定 hash/catalog、
   Job Object、AppContainer 和可选离线 Authenticode 约束。
 - 仓库仅支持个人 Windows x64；没有常驻 Host、discovery、Named Pipe、正式签名发布、Setup、自动
@@ -56,7 +55,6 @@ uv run python scripts/audit_repository_closure.py
 uv run python scripts/check_documentation.py
 uv run python scripts/check_architecture.py
 uv run python scripts/check_forbidden_dependencies.py
-uv run python scripts/build_web_assets.py check
 uv build
 ```
 
@@ -103,14 +101,13 @@ Responses 编解码与 Agent Loop 由 Python production-composition 集成测试
 3. 插件热重载、禁用、退出、断线重连和停止命令都会开始回收当前 Worker；同一交互式 Windows 会话
    和用户内，同一 Vault 同时最多一个 Worker 能持锁并访问 Runtime 状态。
 4. 会话发送、取消、重试、分叉、压缩、审批和事件回放使用同一 Worker 状态。
-5. 设置中的 Provider secret 只经 stdio 写入 DPAPI SecretStore，不进入 `data.json`、Vault 或日志。
-6. 本地 Web 若启用，身份和 schema 与同一 Worker 一致。
+5. 设置只保留账户绑定的 Codex 目录选择，不包含 Provider、端点、API Key 或模型 SecretHandle。
 
 ## 真实模型和 Vault 验收
 
 必须区分“代码存在”“配置启用”和“当前候选真实运行成功”。至少复验：
 
-- 一个真实 `ModelGateway` Provider 完成多轮会话；
+- 当前 Codex 订阅账户目录中的真实模型完成多轮会话；
 - 未信任 Workspace 的实际权限保持只读；
 - 真实 Vault 只读 Glob/Grep/Read 返回可核对的来源 hash 和行范围，且前后文件身份不变；
 - 临时 Vault 完成单文件 Diff、审批、提交、冲突、取消和硬崩溃恢复；

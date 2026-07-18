@@ -121,7 +121,6 @@ export default class OfferAgentPlugin extends Plugin {
         this.addRibbonIcon("bot", "打开 OfferAgent", () => void this.activateChat());
         this.addCommand({ id: "open-local-chat", name: "打开本地聊天", callback: () => void this.activateChat() });
         this.addCommand({ id: "new-local-chat", name: "新建本地会话", callback: () => void this.newChat() });
-        this.addCommand({ id: "open-local-web", name: "打开本地 Web 界面", callback: () => void this.openLocalWeb() });
         this.addCommand({ id: "runtime-diagnostics", name: "查看本地 Runtime 诊断", callback: () => void this.openDiagnostics() });
         this.addCommand({
             id: "stop-local-runtime",
@@ -270,9 +269,7 @@ export default class OfferAgentPlugin extends Plugin {
 
     async listModels(): Promise<readonly ChatModelChoice[]> {
         await this.ensureReady();
-        const result = requireJsonObject(await (this.runtime as RuntimeBootstrap).harness.request("models/list", {
-            includeUnavailable: false,
-        }));
+        const result = requireJsonObject(await (this.runtime as RuntimeBootstrap).harness.request("models/list", {}));
         if (!Array.isArray(result.models) || result.models.length > 256) throw new Error("Worker 模型列表无效");
         const freshness = String(result.catalogFreshness);
         if (!["fresh", "stale", "unavailable"].includes(freshness)) throw new Error("Worker 模型目录状态无效");
@@ -290,31 +287,24 @@ export default class OfferAgentPlugin extends Plugin {
         }
         return result.models.map((raw) => {
             const model = requireJsonObject(raw);
-            const provider = requireText(model.provider, "Model provider");
             const modelId = requireText(model.model, "Model id");
             const displayName = requireText(model.displayName, "Model display name");
             const inputModalities = requireBoundedTextArray(model.inputModalities, "Model input modalities", 16);
-            if (provider !== "codex-subscription-experimental" || modelId.length > 256 || displayName.length > 512 ||
-                typeof model.supportsStreaming !== "boolean" || typeof model.supportsStructuredOutput !== "boolean" ||
+            if (modelId.length > 256 || displayName.length > 512 ||
                 typeof model.supportsImageDetailOriginal !== "boolean" ||
-                typeof model.supportsHostedSearch !== "boolean" || typeof model.supportsFastMode !== "boolean" ||
-                typeof model.available !== "boolean") {
+                typeof model.supportsHostedSearch !== "boolean" || typeof model.supportsFastMode !== "boolean") {
                 throw new Error("Worker 返回了无效的 Codex 模型能力");
             }
             return {
-                provider,
                 model: modelId,
                 accountBinding,
                 displayName,
-                supportsStreaming: model.supportsStreaming,
-                supportsStructuredOutput: model.supportsStructuredOutput,
                 inputModalities,
                 supportsImageDetailOriginal: model.supportsImageDetailOriginal,
                 supportsHostedSearch: model.supportsHostedSearch,
                 supportsFastMode: model.supportsFastMode,
                 contextWindow: model.contextWindow === null || model.contextWindow === undefined
                     ? null : requireInteger(model.contextWindow, "Model context window"),
-                available: model.available,
                 catalogFreshness: freshness as ChatModelChoice["catalogFreshness"],
             };
         });
@@ -325,7 +315,7 @@ export default class OfferAgentPlugin extends Plugin {
         if (!candidate || candidate.length > 256 || candidate.includes("\0")) throw new Error("模型标识无效");
         const available = await this.listModels();
         const selected = available.find((item) =>
-            item.model === candidate && item.available && item.catalogFreshness === "fresh" &&
+            item.model === candidate && item.catalogFreshness === "fresh" &&
             item.accountBinding !== null);
         if (!selected) {
             throw new Error("所选模型不在当前有效的 Codex 模型目录中");
@@ -438,7 +428,7 @@ export default class OfferAgentPlugin extends Plugin {
 
     async checkModelCatalog(): Promise<string> {
         const models = await this.listModels();
-        if (models.some((model) => model.catalogFreshness !== "fresh" || !model.available)) {
+        if (models.some((model) => model.catalogFreshness !== "fresh")) {
             throw new Error("Codex 模型目录已陈旧，仅供展示；请恢复登录或网络后重新检查");
         }
         if (models.length === 0) throw new Error("当前 Codex 订阅账户没有可见模型");
@@ -485,18 +475,6 @@ export default class OfferAgentPlugin extends Plugin {
             "diagnostics/snapshot", { includeRecentErrors: true },
         ));
         new DiagnosticsModal(this, snapshot).open();
-    }
-
-    async openLocalWeb(): Promise<void> {
-        await this.ensureReady();
-        const result = requireJsonObject(await (this.runtime as RuntimeBootstrap).harness.request("web/launch", {}));
-        const url = requireText(result.url, "Web launch URL");
-        const parsed = new URL(url);
-        if (parsed.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(parsed.hostname) ||
-            !parsed.hash || parsed.username || parsed.password) {
-            throw new Error("Runtime 返回了不安全的本地 Web 地址");
-        }
-        window.open(url, "_blank", "noopener,noreferrer");
     }
 
     private async stopLocalRuntime(): Promise<void> {

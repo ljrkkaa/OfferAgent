@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
@@ -27,7 +27,6 @@ from offeragent_harness.runtime.application_handlers import (
 )
 from offeragent_harness.runtime.config_service import ConfigRevisionConflict
 from offeragent_harness.runtime.conversation_attachments import AttachmentError
-from offeragent_harness.runtime.loopback_gateway import LoopbackWebGateway
 from offeragent_harness.testing import ManualCancellationToken, ManualClock
 
 
@@ -73,7 +72,7 @@ def test_dispatcher_rejects_any_partial_or_extra_command_table() -> None:
 
 
 @pytest.mark.asyncio
-async def test_initialize_negotiates_identity_and_transport_on_same_dispatcher() -> None:
+async def test_initialize_negotiates_identity_on_the_direct_stdio_dispatcher() -> None:
     identity = _identity()
     domains = {
         method: _unused for method in COMMAND_REGISTRY if method not in {"initialize", "runtime/ping", "runtime/status"}
@@ -99,16 +98,7 @@ async def test_initialize_negotiates_identity_and_transport_on_same_dispatcher()
         ManualCancellationToken(),
         context=ApplicationCommandContext(transport="stdio"),
     )
-    web = await dispatcher.dispatch(
-        "initialize",
-        params,
-        ManualCancellationToken(),
-        context=ApplicationCommandContext(transport="loopback-http"),
-    )
     assert direct["transport"] == "stdio"  # type: ignore[index]
-    assert web["transport"] == "loopback-http"  # type: ignore[index]
-    for key in ("workerPid", "coreVersion", "schemaHash", "workspaceInstanceId"):
-        assert direct[key] == web[key]  # type: ignore[index]
     assert dispatcher.methods == frozenset(COMMAND_REGISTRY)
 
 
@@ -212,9 +202,6 @@ def test_domain_factory_covers_every_non_identity_command_exactly_once() -> None
 
     shared = object()
 
-    def gateway_provider() -> LoopbackWebGateway | None:
-        return cast(LoopbackWebGateway, shared)
-
     handlers = compose_domain_command_handlers(
         identity=DomainCommandIdentity("ws_test", "profile_1", "managed", "actor_1"),
         clock=shared,  # type: ignore[arg-type]
@@ -225,14 +212,12 @@ def test_domain_factory_covers_every_non_identity_command_exactly_once() -> None
         projections=shared,  # type: ignore[arg-type]
         artifacts=shared,  # type: ignore[arg-type]
         attachments=shared,  # type: ignore[arg-type]
-        secrets=shared,  # type: ignore[arg-type]
         controls=shared,  # type: ignore[arg-type]
         subagents=shared,  # type: ignore[arg-type]
         subagent_authorities=shared,  # type: ignore[arg-type]
         subagent_artifacts=shared,  # type: ignore[arg-type]
         diagnostics=shared,  # type: ignore[arg-type]
         diagnostics_owner_runs=shared,  # type: ignore[arg-type]
-        gateway_provider=gateway_provider,
         transport_policy=shared,  # type: ignore[arg-type]
         extension_management_handlers={
             method: _unused

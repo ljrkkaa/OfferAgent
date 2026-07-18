@@ -18,15 +18,14 @@ OfferAgent 是面向项目所有者个人使用的 Windows x64 Obsidian 本地 A
   同步关闭 stdio 并发起 Worker 回收，后台继续等待实际进程退出。同一交互式 Windows 会话和用户内，
   后续同 Vault Worker 在旧进程释放互斥锁前不能进入 Runtime 校验、SQLite 或恢复。
 - 没有常驻 Host、进程发现服务、Named Pipe、后台 Worker 或跨插件实例复用通道。
-- 本地 Web UI 是同一 Worker 的可选 Loopback 客户端，不拥有第二套 Agent Runtime。
 - Shell、Hook 等进程工具由 Worker 通过短生命周期 `offeragent-process-host.exe` 执行；进程受固定
   hash/catalog、Job Object、按策略启用的 AppContainer，以及用户注册可执行文件的可选离线
   Authenticode 校验约束。
 - 模型只能通过 `ModelGateway` 推理，不能执行工具、访问 Vault、拥有 Session 或建立第二套循环。
 
 当前仓库只支持个人 Windows x64 本机构建。它不包含正式签名发布、Setup 安装器、自动更新通道、
-ARM64 构建矩阵，也不保留这些已删除路径的兼容入口。除用户主动选择的模型 Provider 外，Runtime
-没有网络出口；本地 Loopback 不属于外部出口。
+ARM64 构建矩阵，也不保留这些已删除路径的兼容入口。模型网络出口固定为当前 Codex 订阅账户，
+其余网络出口只来自用户显式批准的工具。
 
 ## 目录入口
 
@@ -55,11 +54,10 @@ uv run python scripts/audit_repository_closure.py
 uv run python scripts/check_documentation.py
 uv run python scripts/check_architecture.py
 uv run python scripts/check_forbidden_dependencies.py
-uv run python scripts/build_web_assets.py check
 uv build
 ```
 
-这些门禁验证唯一 Agent Loop、direct stdio transport、依赖方向、协议生成物、Web 资源和生产依赖
+这些门禁验证唯一 Agent Loop、direct stdio transport、依赖方向、协议生成物和生产依赖
 闭包。测试结果以命令的实时退出状态为准，文档不硬编码测试数量或临时 schema hash。
 
 ## Obsidian 门禁

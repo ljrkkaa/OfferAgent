@@ -14,7 +14,7 @@ from offeragent_harness.adapters.local_artifacts import LocalArtifactStore
 from offeragent_harness.agent import BudgetCheckpoint, BudgetLedger, RunPreparationFailure
 from offeragent_harness.agent.context_manager import ContextBudgetExceeded
 from offeragent_harness.agent.state import PendingWork, RunState, WriteObligation, WriteOutcome
-from offeragent_harness.config import HarnessConfig, ModelProvider
+from offeragent_harness.config import HarnessConfig
 from offeragent_harness.models import ModelEvent, ModelRequest, ModelRole
 from offeragent_harness.ports import CancellationToken
 from offeragent_harness.providers.codex_subscription import (
@@ -142,7 +142,6 @@ def _config(model_id: str = "gpt-selected", *, proxy_url: str | None = None) -> 
         update={
             "model": base.model.model_copy(
                 update={
-                    "provider": ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL,
                     "model": model_id,
                     "account_binding": ACCOUNT_BINDING,
                     "proxy_url": proxy_url,
@@ -160,7 +159,6 @@ def _command(config: HarnessConfig, model_id: str = "gpt-selected") -> StartTurn
         idempotency_key="idem-test",
         input_blocks=({"type": "text", "text": "hello"},),
         run_config={
-            "provider": "codex-subscription-experimental",
             "model": model_id,
             "reasoningEffort": "medium",
             "permissionMode": "read-only",
@@ -207,7 +205,6 @@ def _factory(
         artifacts=LocalArtifactStore(tmp_path / "artifacts", workspace_id="ws_test"),
         attachments=attachments,  # type: ignore[arg-type]
         current_local_date=current_local_date,
-        local_transaction=None,
         parent_authorities=object(),  # type: ignore[arg-type]
     )
 
@@ -226,7 +223,6 @@ async def test_prepare_root_binds_fresh_catalog_model_and_build_uses_only_that_e
     assert module.bind_calls == [("gpt-selected", ACCOUNT_BINDING)]
     assert len(gateway_calls) == 1
     settings = gateway_calls[0]
-    assert settings.provider is ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL
     assert settings.model == "gpt-selected"
     assert settings.proxy_url == "http://127.0.0.1:7896"
     assert components.budget.max_model_rounds > 0
@@ -423,25 +419,13 @@ async def test_recovery_rejects_a_durable_binding_for_a_different_model(tmp_path
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["run_provider", "persisted_provider", "persisted_model"])
-async def test_new_run_rejects_provider_or_model_drift_before_catalog_and_gateway(
-    tmp_path: Path,
-    drift: str,
-) -> None:
+async def test_new_run_rejects_model_drift_before_catalog_and_gateway(tmp_path: Path) -> None:
     module = _ModelModule(_binding())
     gateway_calls: list[Any] = []
     config = _config()
     command = _command(config)
-    if drift == "run_provider":
-        command = replace(command, run_config={**command.run_config, "provider": "deepseek"})
-    elif drift == "persisted_provider":
-        config = config.model_copy(
-            update={"model": config.model.model_copy(update={"provider": ModelProvider.DEEPSEEK})}
-        )
-        command = _command(config)
-    else:
-        config = _config("gpt-other")
-        command = _command(config, "gpt-selected")
+    config = _config("gpt-other")
+    command = _command(config, "gpt-selected")
     factory = _factory(tmp_path, module, gateway_calls)
 
     with pytest.raises(ValueError):

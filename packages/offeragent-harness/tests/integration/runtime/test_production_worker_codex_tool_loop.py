@@ -16,7 +16,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
-from offeragent_harness.config import HarnessConfig, ModelProvider, ModelSettings
+from offeragent_harness.config import HarnessConfig, ModelSettings
 from offeragent_harness.ports import ApplicationCommandContext, CancellationToken
 from offeragent_harness.ports.model import ModelGateway
 from offeragent_harness.ports.processes import SupervisedProcessRequest, SupervisedProcessResult
@@ -54,12 +54,6 @@ ACCOUNT_FINGERPRINT = f"fingerprint-{ACCOUNT_ID}"
 ACCOUNT_BINDING = f"sha256:{hashlib.sha256(ACCOUNT_FINGERPRINT.encode()).hexdigest()}"
 FINAL_ANSWER = "The Python production Agent Loop completed the plugin-backed request."
 AGENT_CONTRACT = "# OfferAgent\n\nUse current Vault evidence and complete plugin reads before answering.\n"
-
-
-class _UnusedSecrets:
-    def consume(self, *args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise AssertionError("Codex subscription inference must use its account-bound credential lease")
 
 
 class _CodexCredentials:
@@ -143,7 +137,6 @@ def _config() -> HarnessConfig:
     return HarnessConfig.model_validate(
         {
             "model": {
-                "provider": CODEX_SUBSCRIPTION_PROVIDER_ID,
                 "model": MODEL_ID,
                 "account_binding": ACCOUNT_BINDING,
             },
@@ -424,8 +417,7 @@ async def test_production_worker_codex_loop_round_trips_one_plugin_tool_without_
         gateway_settings.append(settings)
         return compose_model_gateway(
             settings,
-            secret_scope_id=f"workspace:{portable.portable_workspace_id}",
-            secrets=_UnusedSecrets(),  # type: ignore[arg-type]
+            workspace_id=f"workspace:{portable.portable_workspace_id}",
             network_enabled=True,
             responses_transport=transport,
             codex_credential_source=credentials,
@@ -456,7 +448,7 @@ async def test_production_worker_codex_loop_round_trips_one_plugin_tool_without_
         await entrypoint.start(WorkerBootstrap(WORKSPACE_INSTANCE_ID, vault, state_directory)),
     )
     web_context = ApplicationCommandContext(
-        transport="loopback-http",
+        transport="stdio",
         client_id="web-fused-production-test",
         peer="127.0.0.1",
     )
@@ -483,7 +475,6 @@ async def test_production_worker_codex_loop_round_trips_one_plugin_tool_without_
                     }
                 ],
                 "runConfig": {
-                    "provider": CODEX_SUBSCRIPTION_PROVIDER_ID,
                     "model": MODEL_ID,
                     "reasoningEffort": "medium",
                     "permissionMode": "read-only",
@@ -558,7 +549,6 @@ async def test_production_worker_codex_loop_round_trips_one_plugin_tool_without_
         assert len(catalog.requests) == 1
         assert catalog.requests[0].endpoint == CODEX_SUBSCRIPTION_MODELS_ENDPOINT
         assert len(gateway_settings) == 1
-        assert gateway_settings[0].provider is ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL
         assert gateway_settings[0].model == MODEL_ID
         assert gateway_settings[0].account_binding == ACCOUNT_BINDING
 

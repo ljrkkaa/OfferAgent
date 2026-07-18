@@ -258,7 +258,6 @@ def run_static_gates() -> None:
         cwd=ROOT,
         check=True,
     )
-    subprocess.run([sys.executable, "scripts/build_web_assets.py", "check"], cwd=ROOT, check=True)
 
 
 def build_development_runtime(

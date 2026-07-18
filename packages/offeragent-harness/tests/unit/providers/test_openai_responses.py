@@ -4,14 +4,15 @@ import base64
 import hashlib
 import json
 import threading
-from collections.abc import Callable
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
-from typing import TypeVar
+from types import MappingProxyType
+from typing import Any, cast
 
 import httpx
 import pytest
 
-from offeragent_harness.config import ModelProvider, ModelSettings
 from offeragent_harness.models import (
     ModelCitation,
     ModelContentBlock,
@@ -28,51 +29,34 @@ from offeragent_harness.models import (
     ModelRole,
     TraceContext,
 )
-from offeragent_harness.ports import SecretHandle, SecretKind
 from offeragent_harness.providers import (
-    CodexResponsesProvider,
-    LocalModelProvider,
+    ModelCredentialLease,
     ModelProviderConfigurationError,
-    OpenAICompatibleProvider,
-    OpenAIProvider,
     OpenAIResponsesConfig,
     OpenAIResponsesGateway,
-    ResponsesProviderKind,
-    ResponsesProviderSelection,
     StaticModelEndpointPolicy,
-    build_responses_provider,
-    compose_model_gateway,
-    model_secret_provider_id,
 )
 from offeragent_harness.runtime.conversation_attachments import AttachmentLimits
 from offeragent_harness.testing.cancellation import ManualCancellationToken
 from offeragent_harness.testing.errors import FakeRunCancelled
 
-T = TypeVar("T")
 
-
-class _SecretResolver:
+class _CredentialSource:
     def __init__(self, secret: bytes = b"test-provider-secret") -> None:
         self.buffer = bytearray(secret)
         self.calls = 0
 
-    def consume(
-        self,
-        handle: SecretHandle,
-        *,
-        scope_id: str,
-        expected_kind: SecretKind,
-        expected_provider_id: str,
-        consumer: Callable[[memoryview], T],
-    ) -> T:
-        assert handle == SecretHandle("secret:v1:0123456789abcdef0123456789abcdef")
-        assert scope_id == "workspace:wsi_test"
-        assert expected_kind is SecretKind.MODEL_PROVIDER
-        assert expected_provider_id == "openai"
+    @contextmanager
+    def lease(self) -> Iterator[ModelCredentialLease]:
         self.calls += 1
         view = memoryview(self.buffer)
         try:
-            return consumer(view)
+            yield ModelCredentialLease(
+                material=view,
+                headers=MappingProxyType({}),
+                credential_fingerprint="credential-test",
+                account_fingerprint="account-test",
+            )
         finally:
             view.release()
             for index in range(len(self.buffer)):
@@ -118,25 +102,20 @@ def _request(
 
 
 def _config() -> OpenAIResponsesConfig:
-    return OpenAIResponsesConfig(
-        provider_id="openai",
-        base_url="https://api.openai.example/v1",
-        secret_scope_id="workspace:wsi_test",
-        credential_handle=SecretHandle("secret:v1:0123456789abcdef0123456789abcdef"),
-    )
+    return OpenAIResponsesConfig()
 
 
 def _gateway(
     handler: httpx.BaseTransport,
-    secrets: _SecretResolver | None = None,
+    credentials: _CredentialSource | None = None,
     config: OpenAIResponsesConfig | None = None,
 ) -> OpenAIResponsesGateway:
     config = config or _config()
     return OpenAIResponsesGateway(
         config=config,
-        secrets=secrets or _SecretResolver(),
         endpoint_policy=StaticModelEndpointPolicy(frozenset({config.endpoint})),
         transport=handler,
+        credential_source=credentials or _CredentialSource(),
     )
 
 
@@ -157,7 +136,7 @@ def test_default_request_ceiling_covers_one_maximum_attachment_batch_as_data_url
 )
 def test_hosted_search_config_cannot_raise_fixed_safety_ceilings(field: str, value: int) -> None:
     with pytest.raises(ModelProviderConfigurationError, match="hosted search count limits"):
-        replace(_config(), **{field: value})
+        replace(_config(), **cast(Any, {field: value}))
 
 
 def _sse(*events: dict[str, object]) -> bytes:
@@ -198,7 +177,7 @@ async def _collect(gateway: OpenAIResponsesGateway, request: ModelRequest) -> tu
 @pytest.mark.asyncio
 async def test_text_stream_is_real_typed_sse_and_request_exposes_no_runtime_authority() -> None:
     captured: dict[str, object] = {}
-    secrets = _SecretResolver()
+    secrets = _CredentialSource()
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured["authorization"] = request.headers["authorization"]
@@ -443,7 +422,7 @@ async def test_hosted_search_request_and_stream_are_typed_bounded_and_citation_p
     citations = [event.citation for event in events if event.citation is not None]
     assert citations == [
         ModelCitation(
-            provider_id="openai",
+            provider_id="codex-subscription",
             model="gpt-test",
             request_id="req_test_1",
             url="https://example.com/interview",
@@ -904,7 +883,7 @@ async def test_http_errors_are_redacted_and_classified(
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(status, json={"error": {"message": f"echo {secret}"}})
 
-    resolver = _SecretResolver(secret.encode())
+    resolver = _CredentialSource(secret.encode())
     events = await _collect(_gateway(httpx.MockTransport(handler), resolver), _request())
 
     assert [event.kind for event in events] == [ModelEventKind.STARTED, ModelEventKind.ERROR]
@@ -1232,13 +1211,8 @@ async def test_retryable_failure_retries_before_output_with_one_secret_consume()
             ),
         )
 
-    resolver = _SecretResolver()
-    base = _config()
+    resolver = _CredentialSource()
     config = OpenAIResponsesConfig(
-        provider_id=base.provider_id,
-        base_url=base.base_url,
-        secret_scope_id=base.secret_scope_id,
-        credential_handle=base.credential_handle,
         max_retries=2,
         retry_base_seconds=0,
         retry_max_seconds=0,
@@ -1377,7 +1351,7 @@ async def test_cancellation_closes_blocked_response_and_joins_secret_consumer() 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=blocking)
 
-    resolver = _SecretResolver()
+    resolver = _CredentialSource()
     gateway = _gateway(httpx.MockTransport(handler), resolver)
     token = ManualCancellationToken()
     stream = gateway.stream(_request(), token)
@@ -1393,107 +1367,19 @@ async def test_cancellation_closes_blocked_response_and_joins_secret_consumer() 
     assert resolver.calls == 1 and set(resolver.buffer) == {0}
 
 
-def test_endpoint_policy_allows_https_and_loopback_only() -> None:
+def test_endpoint_policy_allows_only_the_fixed_codex_subscription_endpoint() -> None:
     config = _config()
     policy = StaticModelEndpointPolicy(frozenset({config.endpoint}))
-    policy.authorize(provider_id="openai", endpoint="https://api.openai.example/v1/responses")
+    policy.authorize(provider_id=config.provider_id, endpoint=config.endpoint)
     with pytest.raises(ValueError):
-        policy.authorize(provider_id="openai", endpoint="https://attacker.example/v1/responses")
-    with pytest.raises(ValueError):
-        OpenAIResponsesConfig(
-            provider_id="local",
-            base_url="http://192.168.1.10:11434/v1",
-            secret_scope_id="workspace:wsi_test",
-            credential_handle=None,
-            require_credential=False,
-        )
+        policy.authorize(provider_id=config.provider_id, endpoint="https://attacker.example/v1/responses")
 
 
-def test_typed_factory_separates_official_codex_openai_and_loopback_local() -> None:
-    resolver = _SecretResolver()
-    handle = SecretHandle("secret:v1:0123456789abcdef0123456789abcdef")
-    official_policy = StaticModelEndpointPolicy(frozenset({"https://api.openai.com/v1/responses"}))
-    codex = build_responses_provider(
-        ResponsesProviderSelection(ResponsesProviderKind.CODEX, "workspace:wsi_test", handle),
-        secrets=resolver,
-        endpoint_policy=official_policy,
-    )
-    openai = build_responses_provider(
-        ResponsesProviderSelection(ResponsesProviderKind.OPENAI, "workspace:wsi_test", handle),
-        secrets=resolver,
-        endpoint_policy=official_policy,
-    )
-    local = build_responses_provider(
-        ResponsesProviderSelection(
-            ResponsesProviderKind.LOCAL,
-            "workspace:wsi_test",
-            None,
-            base_url="http://127.0.0.1:11434/v1",
-        ),
-        secrets=resolver,
-        endpoint_policy=StaticModelEndpointPolicy(frozenset({"http://127.0.0.1:11434/v1/responses"})),
-    )
-
-    assert isinstance(codex, CodexResponsesProvider)
-    assert isinstance(openai, OpenAIProvider)
-    assert isinstance(local, LocalModelProvider)
-    with pytest.raises(ValueError, match="literal loopback"):
-        build_responses_provider(
-            ResponsesProviderSelection(
-                ResponsesProviderKind.LOCAL,
-                "workspace:wsi_test",
-                None,
-                base_url="https://remote.example/v1",
-            ),
-            secrets=resolver,
-            endpoint_policy=StaticModelEndpointPolicy(frozenset({"https://remote.example/v1/responses"})),
-        )
-    with pytest.raises(ValueError, match="cannot be overridden"):
-        build_responses_provider(
-            ResponsesProviderSelection(
-                ResponsesProviderKind.OPENAI,
-                "workspace:wsi_test",
-                handle,
-                base_url="https://proxy.example/v1",
-            ),
-            secrets=resolver,
-            endpoint_policy=official_policy,
-        )
-
-
-def test_run_snapshot_composition_selects_compatible_responses_without_runtime_authority() -> None:
-    resolver = _SecretResolver()
-    official = compose_model_gateway(
-        ModelSettings(
-            provider=ModelProvider.OPENAI,
-            model="gpt-test",
-            credential_handle="secret:v1:0123456789abcdef0123456789abcdef",
-        ),
-        secret_scope_id="workspace:wsi_test",
-        secrets=resolver,
-        network_enabled=True,
-    )
-    compatible = compose_model_gateway(
-        ModelSettings(
-            provider=ModelProvider.OPENAI_COMPATIBLE,
-            model="custom",
-            base_url="https://models.example/v1",
-            allow_remote_https=True,
-        ),
-        secret_scope_id="workspace:wsi_test",
-        secrets=resolver,
-        network_enabled=True,
-    )
-    assert isinstance(official, OpenAIProvider)
-    assert isinstance(compatible, OpenAICompatibleProvider)
-
-
-def test_compatible_secret_provider_id_has_cross_language_endpoint_fixed_vector() -> None:
+def test_adapter_config_has_no_provider_endpoint_or_secret_decisions() -> None:
     assert (
-        model_secret_provider_id("openai-compatible", "https://MODELS.example:443//v1//")
-        == "openai-compatible.00a98afb5b4eaaf4f9a877f0f3683900"
+        "provider_id" not in OpenAIResponsesConfig.__dataclass_fields__
+        or not OpenAIResponsesConfig.__dataclass_fields__["provider_id"].init
     )
-    assert model_secret_provider_id("openai-compatible", "https://other.example/v1") != model_secret_provider_id(
-        "openai-compatible", "https://models.example/v1"
-    )
-    assert model_secret_provider_id("openai") == "openai"
+    assert not OpenAIResponsesConfig.__dataclass_fields__["base_url"].init
+    for retired in ("secret_scope_id", "credential_handle", "require_credential", "organization_id", "project_id"):
+        assert retired not in OpenAIResponsesConfig.__dataclass_fields__

@@ -224,17 +224,17 @@ _Avoid_: 子 Agent、插件命令、额外权限
 Obsidian 插件中通过官方 Obsidian TypeScript API 实现 Vault 工具协议的模块。它执行 `vault.search`、`vault.read`、受 Registry 约束的 `project.*` 和已授权的 Vault Change Batch，不通过 Shell 或 Obsidian CLI 间接访问 Vault。
 _Avoid_: CLI 包装器、Runtime 直接文件访问、模型执行 Shell
 
-**Provider Capability**:
-当前账户绑定的 Provider 模型目录为精确所选模型声明的托管能力，例如 Codex Hosted Web Search；该声明随目录修订固化到 Agent Run，只有目录明确支持的能力才会进入模型请求。陈旧目录只用于展示，不能创建新 Run，也不发送生产能力探测请求。
-_Avoid_: 运行时能力探测、探测缓存、失败后静默降级、根据模型名称猜测能力、把内部后端当成公开稳定协议
+**Model Catalog Capability**:
+当前 Codex Subscription 账户绑定的模型目录为精确所选模型声明的托管能力，例如 Hosted Web Search；该声明随目录修订固化到 Agent Run，只有目录明确支持的能力才会进入模型请求。陈旧目录只用于展示，不能创建新 Run，也不发送生产能力探测请求。
+_Avoid_: Provider 选择、运行时能力探测、探测缓存、失败后静默降级、根据模型名称猜测能力、把内部后端当成公开稳定协议
 
 **Hosted Search Citation**:
 Codex Hosted Web Search 在 Responses 输出中为答案提供的 Provider 证明型公共 URL 引用；它保存标题、Provider、模型和模型请求身份，但没有网页正文字节，因此不伪造内容哈希。需要精确网页证据时仍使用 `web_read` 读取并产生带真实内容哈希的 Web 来源。
 _Avoid_: 用 URL 或标题生成虚假 content hash、把搜索候选列表全部描述为已使用证据、网页镜像
 
-**Vision Capability**:
-当前账户绑定的 Provider 模型目录为所选模型声明的原生图片理解能力；它只适用于该目录修订中的精确模型选择，并允许读取用户明确提供的 Run Attachment。目录未知或未声明图片输入时不得推断支持，也不依赖本地 OCR。
-_Avoid_: Synthetic Vision Probe、Vision Cache、OCR Pipeline、按模型名称假定支持、把附件永久上传为知识库素材
+**Model Input Modality**:
+当前 Codex Subscription 账户绑定的模型目录为精确所选模型声明的输入种类，例如 `text` 或 `image`。图片模态只适用于该目录修订中的精确 Run 绑定，并允许读取用户明确提供且绑定到 USER 消息的 Run Attachment；目录未知或未声明 `image` 时不得推断支持，也不依赖本地 OCR。
+_Avoid_: Vision Capability 状态、Synthetic Vision Probe、Vision Cache、`requireVision`、OCR Pipeline、按模型名称假定支持、把附件永久上传为知识库素材
 
 **Research Browser**:
 OfferAgent 为用户发起的研究任务使用的隔离登录浏览器；它拥有独立于日常 Chrome 的 Profile，可根据研究目标自主跨站搜索、跳转、翻页和读取，但不发布内容或进行社交互动。

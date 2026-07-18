@@ -25,7 +25,7 @@ import httpx
 from .openai_responses import ModelCredentialLease, ModelCredentialSource, ModelCredentialSourceError
 
 CODEX_SUBSCRIPTION_BASE_URL = "https://chatgpt.com/backend-api/codex"
-CODEX_SUBSCRIPTION_PROVIDER_ID = "codex-subscription-experimental"
+CODEX_SUBSCRIPTION_PROVIDER_ID = "codex-subscription"
 
 # This is a protocol-compatibility declaration, not a model-name default.  It
 # tracks the Codex catalog schema implemented by this adapter.

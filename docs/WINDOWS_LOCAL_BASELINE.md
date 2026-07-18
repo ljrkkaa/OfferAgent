@@ -69,7 +69,6 @@ uv run python scripts/audit_repository_closure.py
 uv run python scripts/check_documentation.py
 uv run python scripts/check_architecture.py
 uv run python scripts/check_forbidden_dependencies.py
-uv run python scripts/build_web_assets.py check
 uv build
 ```
 

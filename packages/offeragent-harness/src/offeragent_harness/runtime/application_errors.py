@@ -19,7 +19,7 @@ from offeragent_harness.error_codes import (
     RuntimeNotReadyCause,
 )
 from offeragent_harness.ports.cancellation import OperationCancelled
-from offeragent_harness.protocol.errors import ErrorEnvelope, ProtocolViolation, protocol_error
+from offeragent_harness.protocol.errors import ProtocolViolation, protocol_error
 
 from .attachment_errors import AttachmentError
 
@@ -124,35 +124,4 @@ def map_application_exception(error: BaseException) -> ProtocolViolation:
     )
 
 
-def application_error_http_status(error: ErrorEnvelope) -> int:
-    """Map an already-sanitized envelope to its Loopback HTTP status."""
-
-    if error.code is ErrorCode.POLICY_DENIED:
-        return 403
-    if error.code is ErrorCode.RESOURCE_NOT_FOUND:
-        return 404
-    if error.code in {ErrorCode.RESOURCE_CONFLICT, ErrorCode.APPROVAL_EXPIRED}:
-        return 409
-    if error.code is ErrorCode.REQUEST_CANCELLED:
-        return 499
-    if error.code is ErrorCode.REQUEST_DEADLINE_EXCEEDED:
-        return 504
-    if error.code is ErrorCode.PROVIDER_RATE_LIMITED:
-        return 429
-    if error.code is ErrorCode.PROVIDER_PROTOCOL_ERROR:
-        return 502
-    if error.code in {
-        ErrorCode.RUNTIME_NOT_READY,
-        ErrorCode.RUNTIME_SHUTTING_DOWN,
-        ErrorCode.RUNTIME_INTERRUPTED,
-        ErrorCode.PROVIDER_UNREACHABLE,
-    }:
-        return 503
-    if error.code in {ErrorCode.AUTH_REQUIRED}:
-        return 401
-    if error.code in {ErrorCode.INTERNAL_ERROR, ErrorCode.PROTOCOL_INTERNAL_ERROR}:
-        return 500
-    return 400
-
-
-__all__ = ["application_error_http_status", "map_application_exception"]
+__all__ = ["map_application_exception"]

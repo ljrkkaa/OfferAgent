@@ -273,7 +273,6 @@ def _execution(record: SubagentRunRecord) -> ChildRunExecution:
         context=context,
         tool_scope=record.tool_scope,
         run_config={
-            "provider": "codex-subscription-experimental",
             "model": "gpt-test",
             "permissionMode": "normal",
         },
@@ -373,7 +372,6 @@ def test_worker_factory_injects_one_gate_and_lock_pool_across_sessions_and_root_
         policy_audit=_RecordingPolicyAudit(),
         journal=_RecordingJournal(),
         artifacts=LocalArtifactStore(tmp_path / "artifacts", workspace_id="ws_test"),
-        local_transaction=cast(Any, SimpleNamespace(provider_id="vault.transaction")),
         parent_authorities=cast(Any, object()),
         optional_definitions=(definition,),
         optional_local_executors=(((definition,), _CountingExecutor()),),
@@ -397,7 +395,6 @@ def test_worker_factory_injects_one_gate_and_lock_pool_across_sessions_and_root_
             idempotency_key=f"idem-{run_id}",
             input_blocks=({"type": "text", "text": run_id},),
             run_config={
-                "provider": "codex-subscription-experimental",
                 "model": "gpt-test",
                 "permissionMode": "normal",
                 "budgets": {
@@ -501,7 +498,7 @@ def test_child_components_fail_closed_on_registry_drift_or_ungranted_tool() -> N
     )
     factory = _CapturingFactory(registry)
     execution = SimpleNamespace(
-        run_config={"provider": "codex-subscription-experimental", "model": "gpt-test"},
+        run_config={"model": "gpt-test"},
         context=SimpleNamespace(content={}),
         tool_scope=SimpleNamespace(
             registry_snapshot_hash="sha256:" + "0" * 64,
@@ -585,7 +582,6 @@ async def test_production_child_kernel_rechecks_live_parent_before_local_side_ef
         policy_audit=audit,
         journal=journal,
         artifacts=LocalArtifactStore(tmp_path / "artifacts", workspace_id=record.workspace_id),
-        local_transaction=cast(Any, SimpleNamespace(provider_id="vault.transaction")),
         parent_authorities=authorities,
         optional_definitions=(definition,),
         optional_local_executors=(((definition,), executor),),

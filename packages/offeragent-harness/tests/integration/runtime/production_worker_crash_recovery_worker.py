@@ -62,7 +62,7 @@ from offeragent_harness.tools import (
     invocation_journal_scope,
     invocation_request_fingerprint,
 )
-from offeragent_harness.vault import VaultCasBarrier, content_hash
+from offeragent_harness.vault import content_hash
 from offeragent_harness.workspace import identify_workspace_root
 from offeragent_harness.workspace.portable_config import read_portable_workspace_config
 from offeragent_harness.workspace.runtime_identity import workspace_database_identity
@@ -292,8 +292,6 @@ def _composition(
             codex_credential_source=_CodexCredentials() if authenticated else _MissingCodexCredentials(),
             codex_catalog_http=_CodexCatalog(),
             runtime_config=runtime_config,
-            vault_cas_barrier=cast(VaultCasBarrier, barrier),
-            legacy_vault_transaction_test_mode=True,
             ripgrep_path=_ripgrep_executable(),
             powershell_path=_powershell_executable(),
         ),
@@ -395,9 +393,9 @@ async def _crash(root: Path, stage: str) -> int:
         await entrypoint.start(WorkerBootstrap(WORKSPACE_INSTANCE_ID, root / "vault", root / "state")),
     )
     context = ApplicationCommandContext(
-        transport="loopback-http",
-        client_id="web-production-crash",
-        peer="127.0.0.1",
+        transport="stdio",
+        client_id="stdio-production-crash",
+        peer="parent-process",
     )
     try:
         created = await _dispatch(

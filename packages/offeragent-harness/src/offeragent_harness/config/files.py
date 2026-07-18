@@ -15,10 +15,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .migrations import project_legacy_codex_config, validate_current_codex_config
+from .migrations import (
+    project_legacy_codex_config_with_report,
+    project_previous_codex_config_with_report,
+    validate_current_codex_config,
+)
 from .models import ConfigLayer, ConfigPatch, ConfigScope
 
-_FILE_VERSION = 5
+_FILE_VERSION = 6
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
 
@@ -33,6 +37,8 @@ class ConfigFileLoad:
     safe_mode: bool
     backup_path: Path | None
     migrated_from: int | None = None
+    retired_fields: tuple[str, ...] = ()
+    retired_provider_ids: tuple[str, ...] = ()
 
 
 class ConfigFileStore:
@@ -62,14 +68,8 @@ class ConfigFileStore:
                 if not isinstance(raw, Mapping):
                     raise ValueError("config file must be an object")
                 version = raw.get("version")
-                if version == 1:
-                    return self._migrate_v1(raw)
-                if version == 2:
-                    return self._migrate_v2(raw)
-                if version == 3:
-                    return self._migrate_v3(raw)
-                if version == 4:
-                    return self._migrate_v4(raw)
+                if type(version) is int and 1 <= version <= 5:
+                    return self._migrate_versioned(raw, version=version)
                 if version != _FILE_VERSION:
                     raise ValueError("unsupported config file version")
                 return ConfigFileLoad(self._decode_current(raw), False, None)
@@ -88,79 +88,48 @@ class ConfigFileStore:
             raise ValueError("config file revision is invalid")
         return ConfigLayer(self.scope, self.owner_id, revision, validate_current_codex_config(raw["config"]))
 
-    def _migrate_v1(self, raw: Mapping[str, Any]) -> ConfigFileLoad:
-        if set(raw) != {"version", "revision", "settings"}:
-            raise ValueError("v1 config fields are incompatible")
+    def _migrate_versioned(self, raw: Mapping[str, Any], *, version: int) -> ConfigFileLoad:
+        legacy_v1 = version == 1
+        expected = (
+            {"version", "revision", "settings"}
+            if legacy_v1
+            else {
+                "version",
+                "scope",
+                "ownerId",
+                "revision",
+                "config",
+            }
+        )
+        if set(raw) != expected:
+            raise ValueError(f"v{version} config fields are incompatible")
+        if not legacy_v1 and (raw["scope"] != self.scope.value or raw["ownerId"] != self.owner_id):
+            raise ValueError(f"v{version} config scope or owner mismatch")
         revision = raw["revision"]
         if type(revision) is not int or revision < 0:
-            raise ValueError("v1 config revision is invalid")
-        patch = project_legacy_codex_config(raw["settings"])
-        layer = ConfigLayer(self.scope, self.owner_id, revision, patch)
-        backup = self.path.with_name(f"{self.path.name}.v1.{_stamp(self._now())}.bak")
+            raise ValueError(f"v{version} config revision is invalid")
+        payload = raw["settings"] if legacy_v1 else raw["config"]
+        projection = (
+            project_previous_codex_config_with_report(payload)
+            if version == 5
+            else project_legacy_codex_config_with_report(payload)
+        )
+        layer = ConfigLayer(self.scope, self.owner_id, revision, projection.patch)
+        backup = self.path.with_name(f"{self.path.name}.v{version}.{_stamp(self._now())}.bak")
         shutil.copy2(self.path, backup)
         try:
             _atomic_write(self.path, _encode(layer))
         except BaseException as error:
             os.replace(backup, self.path)
             raise ConfigFileError("configuration migration failed and was rolled back") from error
-        return ConfigFileLoad(layer, False, backup, migrated_from=1)
-
-    def _migrate_v2(self, raw: Mapping[str, Any]) -> ConfigFileLoad:
-        if set(raw) != {"version", "scope", "ownerId", "revision", "config"}:
-            raise ValueError("v2 config fields are incompatible")
-        if raw["scope"] != self.scope.value or raw["ownerId"] != self.owner_id:
-            raise ValueError("v2 config scope or owner mismatch")
-        revision = raw["revision"]
-        if type(revision) is not int or revision < 0:
-            raise ValueError("v2 config revision is invalid")
-        patch = project_legacy_codex_config(raw["config"])
-        layer = ConfigLayer(self.scope, self.owner_id, revision, patch)
-        backup = self.path.with_name(f"{self.path.name}.v2.{_stamp(self._now())}.bak")
-        shutil.copy2(self.path, backup)
-        try:
-            _atomic_write(self.path, _encode(layer))
-        except BaseException as error:
-            os.replace(backup, self.path)
-            raise ConfigFileError("configuration migration failed and was rolled back") from error
-        return ConfigFileLoad(layer, False, backup, migrated_from=2)
-
-    def _migrate_v3(self, raw: Mapping[str, Any]) -> ConfigFileLoad:
-        if set(raw) != {"version", "scope", "ownerId", "revision", "config"}:
-            raise ValueError("v3 config fields are incompatible")
-        if raw["scope"] != self.scope.value or raw["ownerId"] != self.owner_id:
-            raise ValueError("v3 config scope or owner mismatch")
-        revision = raw["revision"]
-        if type(revision) is not int or revision < 0:
-            raise ValueError("v3 config revision is invalid")
-        patch = project_legacy_codex_config(raw["config"])
-        layer = ConfigLayer(self.scope, self.owner_id, revision, patch)
-        backup = self.path.with_name(f"{self.path.name}.v3.{_stamp(self._now())}.bak")
-        shutil.copy2(self.path, backup)
-        try:
-            _atomic_write(self.path, _encode(layer))
-        except BaseException as error:
-            os.replace(backup, self.path)
-            raise ConfigFileError("configuration migration failed and was rolled back") from error
-        return ConfigFileLoad(layer, False, backup, migrated_from=3)
-
-    def _migrate_v4(self, raw: Mapping[str, Any]) -> ConfigFileLoad:
-        if set(raw) != {"version", "scope", "ownerId", "revision", "config"}:
-            raise ValueError("v4 config fields are incompatible")
-        if raw["scope"] != self.scope.value or raw["ownerId"] != self.owner_id:
-            raise ValueError("v4 config scope or owner mismatch")
-        revision = raw["revision"]
-        if type(revision) is not int or revision < 0:
-            raise ValueError("v4 config revision is invalid")
-        patch = project_legacy_codex_config(raw["config"])
-        layer = ConfigLayer(self.scope, self.owner_id, revision, patch)
-        backup = self.path.with_name(f"{self.path.name}.v4.{_stamp(self._now())}.bak")
-        shutil.copy2(self.path, backup)
-        try:
-            _atomic_write(self.path, _encode(layer))
-        except BaseException as error:
-            os.replace(backup, self.path)
-            raise ConfigFileError("configuration migration failed and was rolled back") from error
-        return ConfigFileLoad(layer, False, backup, migrated_from=4)
+        return ConfigFileLoad(
+            layer,
+            False,
+            backup,
+            migrated_from=version,
+            retired_fields=projection.retired_fields,
+            retired_provider_ids=projection.retired_provider_ids,
+        )
 
     def _isolate_corrupt(self) -> Path:
         backup = self.path.with_name(f"{self.path.name}.corrupt.{_stamp(self._now())}.bak")

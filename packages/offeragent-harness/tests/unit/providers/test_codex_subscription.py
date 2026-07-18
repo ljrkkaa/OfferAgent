@@ -13,7 +13,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from offeragent_harness.agent.model_planner import AgentStepCatalog
-from offeragent_harness.config import ModelProvider, ModelSettings
+from offeragent_harness.config import ModelSettings
 from offeragent_harness.models import (
     ModelContentBlock,
     ModelEvent,
@@ -28,13 +28,11 @@ from offeragent_harness.models import (
 from offeragent_harness.models.json_types import thaw_json
 from offeragent_harness.providers import (
     CODEX_SUBSCRIPTION_BASE_URL,
-    CodexSubscriptionProvider,
     ModelCredentialLease,
     ModelCredentialSourceError,
-    ResponsesProviderKind,
-    ResponsesProviderSelection,
+    OpenAIResponsesConfig,
+    OpenAIResponsesGateway,
     StaticModelEndpointPolicy,
-    build_responses_provider,
     compose_model_gateway,
 )
 from offeragent_harness.runtime.codex_credentials import CodexFileCredentialSource
@@ -49,11 +47,6 @@ _NOW = 2_000_000_000.0
 def _account_binding(account: str) -> str:
     fingerprint = f"account-{account}"
     return f"sha256:{hashlib.sha256(fingerprint.encode()).hexdigest()}"
-
-
-class _UnusedSecrets:
-    def consume(self, *args: object, **kwargs: object) -> object:
-        raise AssertionError("Codex subscription must not consume a SecretStore credential")
 
 
 class _RotatingSource:
@@ -160,29 +153,21 @@ def _completed(text: str = "OK") -> bytes:
     )
 
 
-async def _collect(gateway: CodexSubscriptionProvider) -> tuple[ModelEvent, ...]:
+async def _collect(gateway: OpenAIResponsesGateway) -> tuple[ModelEvent, ...]:
     return tuple([event async for event in gateway.stream(_request(), ManualCancellationToken())])
 
 
 def _provider(
     source: _RotatingSource | CodexFileCredentialSource,
     handler: Callable[[httpx.Request], httpx.Response],
-) -> CodexSubscriptionProvider:
-    selection = ResponsesProviderSelection(
-        kind=ResponsesProviderKind.CODEX_SUBSCRIPTION_EXPERIMENTAL,
-        secret_scope_id="workspace:wsi_test",
-        credential_handle=None,
-        service_tier="default",
-    )
-    provider = build_responses_provider(
-        selection,
-        secrets=_UnusedSecrets(),  # type: ignore[arg-type]
+) -> OpenAIResponsesGateway:
+    config = OpenAIResponsesConfig()
+    return OpenAIResponsesGateway(
+        config=config,
         endpoint_policy=StaticModelEndpointPolicy(frozenset({f"{CODEX_SUBSCRIPTION_BASE_URL}/responses"})),
         transport=httpx.MockTransport(handler),
         credential_source=source,
     )
-    assert isinstance(provider, CodexSubscriptionProvider)
-    return provider
 
 
 def test_file_source_is_read_only_bounded_and_zeroes_the_lease(tmp_path: Path) -> None:
@@ -252,7 +237,7 @@ async def test_subscription_uses_fixed_endpoint_headers_and_dialect_without_temp
     assert isinstance(body, dict)
     assert body["model"] == "gpt-5.6-luna"
     assert body["reasoning"] == {"effort": "medium", "summary": "auto"}
-    assert body["service_tier"] == "default"
+    assert "service_tier" not in body
     assert body["store"] is False and body["tools"] == [] and body["parallel_tool_calls"] is False
     assert "max_output_tokens" not in body
     assert "temperature" not in body
@@ -480,22 +465,13 @@ async def test_all_production_structured_blocks_encode_deterministically_and_unk
     assert rejected[-1].error is not None and rejected[-1].error.code == "provider_configuration"
 
 
-def test_subscription_config_rejects_override_credentials_temperature_and_non_loopback_proxy() -> None:
-    with pytest.raises(ValueError, match="temperature"):
-        ModelSettings(provider=ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL, temperature=0.1)
-    with pytest.raises(ValueError, match="cannot be overridden"):
-        ModelSettings(
-            provider=ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL,
-            credential_handle="secret:v1:0123456789abcdef0123456789abcdef",
-        )
+def test_subscription_config_exposes_only_selection_and_loopback_proxy() -> None:
+    assert set(ModelSettings.model_fields) == {"model", "account_binding", "reasoning_effort", "proxy_url"}
     with pytest.raises(ValueError, match="loopback"):
-        ModelSettings(
-            provider=ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL,
-            proxy_url="http://192.168.1.2:7896",
-        )
+        ModelSettings(proxy_url="http://192.168.1.2:7896")
     settings = ModelSettings(
-        provider=ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL,
         model="gpt-5.6-luna",
+        account_binding=_account_binding("account-one"),
         reasoning_effort="medium",
         proxy_url="http://127.0.0.1:7896",
     )
@@ -504,22 +480,20 @@ def test_subscription_config_rejects_override_credentials_temperature_and_non_lo
 
 def test_composition_preserves_harness_as_the_only_runtime() -> None:
     settings = ModelSettings(
-        provider=ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL,
         model="gpt-5.6-luna",
         account_binding=_account_binding("account-one"),
         reasoning_effort="medium",
     )
     gateway = compose_model_gateway(
         settings,
-        secret_scope_id="workspace:wsi_test",
-        secrets=_UnusedSecrets(),  # type: ignore[arg-type]
+        workspace_id="workspace:wsi_test",
         network_enabled=True,
         responses_transport=httpx.MockTransport(
             lambda request: httpx.Response(200, content=_completed(), request=request)
         ),
         codex_credential_source=_RotatingSource([(b"access-one", "account-one")]),
     )
-    assert isinstance(gateway, CodexSubscriptionProvider)
+    assert isinstance(gateway, OpenAIResponsesGateway)
 
 
 @pytest.mark.asyncio
@@ -532,15 +506,13 @@ async def test_composed_inference_rejects_an_account_switch_before_http() -> Non
         return httpx.Response(200, content=_completed(), request=request)
 
     settings = ModelSettings(
-        provider=ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL,
         model="gpt-5.6-luna",
         account_binding=_account_binding("selected-account"),
         reasoning_effort="medium",
     )
     gateway = compose_model_gateway(
         settings,
-        secret_scope_id="workspace:wsi_test",
-        secrets=_UnusedSecrets(),  # type: ignore[arg-type]
+        workspace_id="workspace:wsi_test",
         network_enabled=True,
         responses_transport=httpx.MockTransport(handler),
         codex_credential_source=_RotatingSource([(b"access-other", "other-account")]),

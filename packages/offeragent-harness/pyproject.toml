@@ -50,11 +50,9 @@ packages = ["src/offeragent_harness"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "schema" = "offeragent_harness/_schema"
-"web/index.html" = "offeragent_harness/_web/index.html"
-"web/assets" = "offeragent_harness/_web/assets"
 
 [tool.hatch.build.targets.sdist]
-include = ["src/offeragent_harness", "schema", "web/index.html", "web/assets", "README.md", "LICENSE"]
+include = ["src/offeragent_harness", "schema", "README.md", "LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

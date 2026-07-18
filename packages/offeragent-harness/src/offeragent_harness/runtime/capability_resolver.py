@@ -26,7 +26,6 @@ class RuntimeCapability(str, Enum):
     SUBAGENT = "subagent"
     SKILLS = "skills"
     HOOKS = "hooks"
-    LOOPBACK_WEB = "loopback.web"
     TELEMETRY = "telemetry"
 
 
@@ -219,8 +218,6 @@ def _configured_capabilities(snapshot: RunConfigSnapshot) -> frozenset[RuntimeCa
     enabled.add(RuntimeCapability.SKILLS)
     if config.extensibility.hooks_enabled:
         enabled.add(RuntimeCapability.HOOKS)
-    if config.ui.loopback_web_enabled:
-        enabled.add(RuntimeCapability.LOOPBACK_WEB)
     if config.telemetry.enabled:
         enabled.add(RuntimeCapability.TELEMETRY)
     return frozenset(enabled)
@@ -231,7 +228,6 @@ _TRUST_CEILINGS = {
         {
             RuntimeCapability.MODEL,
             RuntimeCapability.WORKSPACE_READ,
-            RuntimeCapability.LOOPBACK_WEB,
         }
     ),
     WorkspaceTrustLevel.TRUSTED: frozenset(RuntimeCapability) - {RuntimeCapability.SHELL, RuntimeCapability.HOOKS},

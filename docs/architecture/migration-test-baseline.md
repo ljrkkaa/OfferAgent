@@ -9,7 +9,7 @@
 | 本地知识检索 | root containment、范围/限额、来源 hash、链接解析 | Glob/Grep/Read、Workspace path/filesystem tests |
 | Knowledge Workspace | 来源绑定、read-before-edit、Skill 路径安全 | File Tool Kernel、Skill trust/state/tool tests |
 | Provider adapter | payload/normalization、流式、取消、usage | ModelGateway、AgentStep catalog、network audit |
-| 旧 HTTP/Router | 用户场景保留，不保留 Server/Router 所有权 | direct stdio RPC、Loopback、identity/conformance |
+| 旧 HTTP/Router | 用户场景保留，不保留 Server/Router 或第二控制面 | direct stdio RPC、identity/conformance |
 | 旧插件事件 | 流拆包、stale event、写前检查、重连恢复 | Generated protocol、EventReducer、stdio client tests |
 | 旧进程执行 | 进程树取消、路径固定、无网络、输出限额 | Process Host、Job Object、AppContainer、hash/Authenticode tests |
 

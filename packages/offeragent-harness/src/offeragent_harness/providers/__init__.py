@@ -20,24 +20,7 @@ from .codex_subscription import (
     HttpxCodexCatalogHttpAdapter,
 )
 from .composition import compose_model_gateway
-from .deepseek_chat import (
-    DEEPSEEK_BASE_URL,
-    DEEPSEEK_PROVIDER_ID,
-    DeepSeekChatGateway,
-    build_deepseek_gateway,
-)
-from .factory import (
-    CodexResponsesProvider,
-    CodexSubscriptionProvider,
-    LocalModelProvider,
-    OpenAICompatibleProvider,
-    OpenAIProvider,
-    ResponsesProviderKind,
-    ResponsesProviderSelection,
-    build_responses_provider,
-)
 from .network_audit import ModelNetworkAuditError, ModelNetworkAuditor
-from .ollama import OllamaConfig, OllamaLocalProvider
 from .openai_responses import (
     ModelCredentialLease,
     ModelCredentialSource,
@@ -48,7 +31,6 @@ from .openai_responses import (
     OpenAIResponsesConfig,
     OpenAIResponsesGateway,
     StaticModelEndpointPolicy,
-    model_secret_provider_id,
 )
 
 __all__ = [
@@ -56,8 +38,6 @@ __all__ = [
     "CODEX_SUBSCRIPTION_BASE_URL",
     "CODEX_SUBSCRIPTION_MODELS_ENDPOINT",
     "CODEX_SUBSCRIPTION_PROVIDER_ID",
-    "DEEPSEEK_BASE_URL",
-    "DEEPSEEK_PROVIDER_ID",
     "AccountBoundModelCredentialSource",
     "CodexCatalogError",
     "CodexCatalogHttpAdapter",
@@ -67,14 +47,10 @@ __all__ = [
     "CodexCatalogTransportError",
     "CodexModelCatalogSnapshot",
     "CodexModelServiceTier",
-    "CodexResponsesProvider",
     "CodexRunBinding",
     "CodexRunBindingError",
     "CodexSubscriptionModelModule",
-    "CodexSubscriptionProvider",
-    "DeepSeekChatGateway",
     "HttpxCodexCatalogHttpAdapter",
-    "LocalModelProvider",
     "ModelCredentialLease",
     "ModelCredentialSource",
     "ModelCredentialSourceError",
@@ -83,17 +59,8 @@ __all__ = [
     "ModelNetworkAuditor",
     "ModelProviderConfigurationError",
     "ModelProviderProtocolError",
-    "OllamaConfig",
-    "OllamaLocalProvider",
-    "OpenAICompatibleProvider",
-    "OpenAIProvider",
     "OpenAIResponsesConfig",
     "OpenAIResponsesGateway",
-    "ResponsesProviderKind",
-    "ResponsesProviderSelection",
     "StaticModelEndpointPolicy",
-    "build_deepseek_gateway",
-    "build_responses_provider",
     "compose_model_gateway",
-    "model_secret_provider_id",
 ]

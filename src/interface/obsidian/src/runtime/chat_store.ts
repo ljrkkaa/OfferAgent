@@ -31,7 +31,6 @@ export interface ChatStorePersistence {
 }
 
 export interface TurnRunConfig {
-    provider: string;
     model: string;
     reasoningEffort: "minimal" | "low" | "medium" | "high" | "max";
     permissionMode: "read-only" | "normal" | "trusted-workspace" | "plan" | "bypass";
@@ -337,7 +336,6 @@ export class ChatStore {
                     input,
                     ...(options.pinnedContext?.length ? { pinnedContext: [...options.pinnedContext] } : {}),
                     runConfig: {
-                        provider: options.runConfig.provider,
                         model: options.runConfig.model,
                         reasoningEffort: options.runConfig.reasoningEffort,
                         permissionMode: options.runConfig.permissionMode,
@@ -387,7 +385,6 @@ export class ChatStore {
             sourceRunId,
             idempotencyKey: opaqueId("retry_"),
             runConfig: runConfig ? {
-                provider: runConfig.provider,
                 model: runConfig.model,
                 reasoningEffort: runConfig.reasoningEffort,
                 permissionMode: runConfig.permissionMode,

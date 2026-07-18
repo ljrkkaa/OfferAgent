@@ -12,7 +12,7 @@ Khoj Server 的便携打包，也不启动另一个模型厂商 Agent Runtime。
 - 插件唯一 IPC 是继承 stdin/stdout 上的 framed JSON-RPC。没有常驻 Host、discovery、Named Pipe
   或后台 Worker。
 - 工具调度、权限、审批、Session/Event、SQLite、Vault、Memory、Shell、Hooks 和 Subagent 均归
-  Worker 所有；插件和本地 Web 不拥有第二套状态机。
+  Worker 所有；插件不拥有第二套状态机。
 - 模型只能通过 `ModelGateway` 参与规划和生成，不能访问文件、执行进程或管理业务状态。
 - Shell/Hook 等进程工具经短生命周期 `offeragent-process-host.exe` 执行，并受固定 hash/catalog、
   Job Object、AppContainer 和可选离线 Authenticode 约束。
@@ -34,7 +34,6 @@ uv run python scripts/audit_repository_closure.py
 uv run python scripts/check_documentation.py
 uv run python scripts/check_architecture.py
 uv run python scripts/check_forbidden_dependencies.py
-uv run python scripts/build_web_assets.py check
 uv build
 ```
 
@@ -42,7 +41,7 @@ uv build
 
 ## 执行和文件工具
 
-所有 Agent 请求都从 direct stdio 或同一 Worker 的 Loopback adapter 进入应用命令边界，再统一经过
+所有 Agent 请求都从 direct stdio 进入应用命令边界，再统一经过
 能力策略、审批、审计、UoW 和恢复。`runtime.duplex_json_rpc` 只负责 framing、取消和背压，不拥有
 Agent、Tool、Vault 或 Storage 实现。
 

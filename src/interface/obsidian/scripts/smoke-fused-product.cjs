@@ -19,7 +19,7 @@ const { buildSync } = require("esbuild");
 
 const REQUIRED_CAPABILITIES = [
     "eventReplay", "multiSession", "approvals", "skills", "shell", "hooks", "subagents",
-    "artifacts", "loopbackWeb", "contentBlocks", "cancellation", "diagnostics",
+    "artifacts", "contentBlocks", "cancellation", "diagnostics",
 ];
 const CLIENT_CAPABILITIES = Object.fromEntries(REQUIRED_CAPABILITIES.map((name) => [name, true]));
 

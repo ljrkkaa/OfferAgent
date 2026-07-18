@@ -412,7 +412,7 @@ class _PreparedRecoveredRun:
 
 
 class HarnessService:
-    """The only application entrypoint shared by stdio and Loopback adapters."""
+    """The only application entrypoint exposed through direct stdio."""
 
     def __init__(
         self,

@@ -85,10 +85,10 @@ test("model selection and catalog health accept only a fresh visible Codex model
     const select = main.slice(main.indexOf("async selectModel"), main.indexOf("openSettings():"));
     const health = main.slice(main.indexOf("async checkModelCatalog"), main.indexOf("async extensionRequest"));
 
-    assert.match(select, /item\.model === candidate && item\.available && item\.catalogFreshness === "fresh"/);
+    assert.match(select, /item\.model === candidate && item\.catalogFreshness === "fresh"/);
     assert.match(main, /async checkModelCatalog/);
     assert.match(health, /await this\.listModels\(\)/);
-    assert.match(health, /catalogFreshness !== "fresh"|!model\.available/);
+    assert.match(health, /catalogFreshness !== "fresh"/);
     assert.doesNotMatch(main, /request\("models\/health"/);
 });
 
