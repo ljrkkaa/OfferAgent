@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from offeragent_harness.qualification.windows_product_artifact import verify_paired_windows_artifacts
+from offeragent_harness.workspace.portable_config import ensure_portable_workspace_config
 
 _PRODUCTION_EXPORTS = [
     "StdioWorkerTransport",
@@ -48,16 +49,13 @@ def smoke_built_windows_product(
     marker.write_bytes(marker_payload)
     vault = root / "Vault"
     local_app_data = root / "LocalAppData"
-    workspace_id = f"ws_qualification_{secrets.token_hex(16)}"
     baseline = _offeragent_process_ids()
     result: dict[str, Any]
     removed = False
     try:
-        (vault / ".offeragent").mkdir(parents=True)
+        vault.mkdir()
         local_app_data.mkdir()
-        (vault / ".offeragent" / "workspace.json").write_bytes(
-            _canonical_json({"portableWorkspaceId": workspace_id, "schemaVersion": 1})
-        )
+        workspace_id = ensure_portable_workspace_config(vault).portable_workspace_id
         (vault / "agent.md").write_text("# OfferAgent built-product qualification\n", encoding="utf-8")
         runtime_root = paired.plugin_root / "runtime" / "windows-x64" / "local-development"
         runtime_manifest = _json_object(

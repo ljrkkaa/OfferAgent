@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -219,6 +220,14 @@ def test_smoke_owns_the_temporary_vault_and_drives_frozen_worker_lifecycle(
         )
         assert Path(payload["vaultRoot"]).parent.parent == temporary_parent
         assert Path(payload["localAppData"]).parent == Path(payload["vaultRoot"]).parent
+        assert re.fullmatch(
+            r"ws_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            payload["workspaceId"],
+        )
+        workspace_config = json.loads(
+            (Path(payload["vaultRoot"]) / ".offeragent" / "workspace.json").read_text(encoding="utf-8")
+        )
+        assert workspace_config["portableWorkspaceId"] == payload["workspaceId"]
         return type(
             "Completed",
             (),
