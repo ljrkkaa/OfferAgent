@@ -58,6 +58,9 @@ include = ["src/offeragent_harness", "schema", "README.md", "LICENSE"]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = ["--strict-config", "--strict-markers", "-ra"]
+markers = [
+  "live_codex_subscription: explicit billed acceptance against the current local ChatGPT Codex login",
+]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 

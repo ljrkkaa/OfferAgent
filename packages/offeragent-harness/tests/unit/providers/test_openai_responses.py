@@ -865,6 +865,62 @@ async def test_structured_output_is_parsed_and_schema_validated_before_emission(
 
 
 @pytest.mark.asyncio
+async def test_false_array_items_are_projected_as_an_exact_empty_array_for_codex() -> None:
+    structured = '{"calls":[]}'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        calls = body["text"]["format"]["schema"]["properties"]["calls"]
+        assert calls == {
+            "type": "array",
+            "maxItems": 0,
+            "items": {"type": "string"},
+        }
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream; charset=utf-8"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.output_text.delta",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": structured,
+                },
+                {
+                    "type": "response.output_text.done",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": structured,
+                },
+                _completed(structured),
+            ),
+        )
+
+    request = replace(
+        _request(output_mode=ModelOutputMode.JSON),
+        output_schema={
+            "type": "object",
+            "properties": {
+                "calls": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": False,
+                }
+            },
+            "required": ["calls"],
+            "additionalProperties": False,
+        },
+    )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), request)
+
+    assert events[1].data == {"calls": ()}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status", "expected_code", "retryable"),
     [

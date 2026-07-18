@@ -39,6 +39,25 @@ uv build
 
 结果以当前命令的退出状态为准；README 不保存测试数量或临时 schema hash。
 
+### 实时 Codex 视觉资格门
+
+普通测试只会对这项显式、联网且可能计费的验收产生一个命名 skip。要验证当前本机 ChatGPT Codex
+登录所见的完整模型目录，必须显式提供开关和通过生产校验的 literal-loopback HTTP 代理：
+
+```powershell
+$env:OFFERAGENT_RUN_LIVE_CODEX_VISION = '1'
+$env:OFFERAGENT_CODEX_PROXY_URL = 'http://127.0.0.1:7896'
+# 可选；默认使用 C:\Windows\Fonts\NotoSansSC-VF.ttf
+$env:OFFERAGENT_QUALIFICATION_CJK_FONT = 'C:\Windows\Fonts\NotoSansSC-VF.ttf'
+uv run pytest tests/acceptance/test_live_codex_vision.py -q -s
+```
+
+启用后，缺失登录、代理、字体、实时目录或网络均为失败而不是 skip。测试在临时目录生成三页虚构中文面经，
+通过真实 `ConversationAttachmentStore`、`ProductionRunComponentsFactory`、canonical Agent Loop 和 Codex
+Subscription Responses gateway 验证每个目录声明的图片模型；文本模型必须在附件物化和网络发送前返回
+`image_modality_unsupported`。stdout 报告只包含模型、目录、素材 hash、发送计数和清理状态，不包含认证、
+原始后端响应或图片内容。素材和运行状态在结束时删除，Codex `auth.json` 必须保持不变。
+
 ## 执行和文件工具
 
 所有 Agent 请求都从 direct stdio 进入应用命令边界，再统一经过

@@ -1391,6 +1391,22 @@ def _project_codex_schema_value(value: Any, *, pointer: str, resource_pointer: s
                 raise ModelProviderConfigurationError("Codex subscription object schema properties must be an object")
             projected["required"] = list(properties)
             projected["additionalProperties"] = False
+        if projected.get("type") == "array" and projected.get("items") is False:
+            prefix_items = projected.get("prefixItems")
+            if prefix_items is None:
+                item_limit = 0
+            elif isinstance(prefix_items, list):
+                item_limit = len(prefix_items)
+            else:
+                raise ModelProviderConfigurationError("Codex subscription array schema prefixItems must be an array")
+            max_items = projected.get("maxItems")
+            if isinstance(max_items, int) and not isinstance(max_items, bool):
+                item_limit = min(item_limit, max_items)
+            # The Codex subscription endpoint rejects boolean item schemas.  A
+            # concrete but unreachable item type plus the exact cardinality
+            # limit preserves JSON Schema's ``items: false`` semantics.
+            projected["maxItems"] = item_limit
+            projected["items"] = {"type": "string"}
         return projected
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [

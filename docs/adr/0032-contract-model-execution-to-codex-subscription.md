@@ -66,8 +66,13 @@ Vault Tool Adapter.
 - Codex login material never enters OfferAgent's model SecretStore.
 - Historical Provider choices can be audited by identity but cannot be resumed
   as execution paths.
-- Live screenshot qualification and built Windows-product proof remain explicit
-  downstream acceptance work rather than claims inferred from unit tests.
+- Live screenshot support is proven only by the explicit, billed acceptance gate
+  that freezes one fresh catalog and drives every declared image model through
+  real USER attachments, production Run preparation, the canonical Agent Loop
+  and the Codex Subscription Responses gateway. Text-only entries must fail the
+  same production preparation path before attachment materialization or network
+  send. Built Windows-product proof remains separate downstream acceptance work;
+  neither claim is inferred from unit tests.
 
 See
 [`codex-subscription-model-contraction.md`](../architecture/codex-subscription-model-contraction.md).
