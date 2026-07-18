@@ -757,6 +757,48 @@ async def test_schema_extra_security_field_gets_exactly_one_explicit_repair() ->
 
 
 @pytest.mark.asyncio
+async def test_completed_stream_without_structured_output_gets_one_private_repair() -> None:
+    builder = _planner(ScriptedModelGateway(()))
+    first_request = builder.create_request(_state())
+    repair_error = ModelInvalidOutput(
+        first_request.request_id,
+        ("completed stream omitted structured output",),
+        raw_output=None,
+        usage=USAGE,
+    )
+    repair_request = builder.create_request(_state(), repair=repair_error)
+    omitted_output = (
+        ModelEvent(first_request.request_id, 1, ModelEventKind.STARTED),
+        ModelEvent(first_request.request_id, 2, ModelEventKind.USAGE, usage=USAGE),
+        ModelEvent(
+            first_request.request_id,
+            3,
+            ModelEventKind.COMPLETED,
+            finish_reason=ModelFinishReason.STOP,
+        ),
+    )
+    gateway = ScriptedModelGateway(
+        (
+            ModelScriptStep.from_events(first_request, omitted_output),
+            ModelScriptStep.from_events(repair_request, _events(repair_request, _tool_plan())),
+        )
+    )
+
+    step = await _planner(gateway).plan(_state(), ManualCancellationToken())
+
+    assert [attempt.outcome for attempt in step.attempts] == [
+        PlanningAttemptOutcome.INVALID,
+        PlanningAttemptOutcome.SUCCEEDED,
+    ]
+    prior_output = gateway.requests[1].messages[-1]
+    assert prior_output.name == "offeragent-invalid-agent-step"
+    assert prior_output.content[0].kind == "invalid_structured_output"
+    assert prior_output.content[0].data["output"] is None
+    assert thaw_json(gateway.requests[1].metadata)["schemaRepairAttempt"] == 1
+    gateway.assert_exhausted()
+
+
+@pytest.mark.asyncio
 async def test_second_invalid_output_fails_without_a_third_model_request() -> None:
     catalog = AgentStepCatalog((_definition(),), max_calls=3)
     invalid_plan = _tool_plan(extra_call_fields={"argsHash": "sha256:" + "0" * 64})

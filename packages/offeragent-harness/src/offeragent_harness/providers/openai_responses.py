@@ -1434,16 +1434,12 @@ class _ResponseAccumulator:
         text = "".join(self._ordered_text)
         try:
             value = json.loads(text, parse_constant=_reject_json_constant)
-        except (json.JSONDecodeError, ValueError) as error:
-            raise ModelProviderProtocolError(
-                "structured model output is not strict JSON",
-                reason="invalid_structured_output_json",
-            ) from error
+        except (json.JSONDecodeError, ValueError):
+            # The planner owns the single bounded schema-repair attempt.  An
+            # omitted structured event carries no untrusted output into it.
+            return ()
         if not isinstance(value, dict):
-            raise ModelProviderProtocolError(
-                "structured model output must be a JSON object",
-                reason="invalid_structured_output_object",
-            )
+            return ()
         return (_SemanticEvent(ModelEventKind.STRUCTURED_OUTPUT, data=value),)
 
 

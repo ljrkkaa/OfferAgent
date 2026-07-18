@@ -1313,6 +1313,44 @@ async def test_schema_invalid_object_is_emitted_for_canonical_agent_step_validat
 
 
 @pytest.mark.asyncio
+async def test_non_json_structured_output_finishes_without_exposing_untrusted_text() -> None:
+    invalid = "not-json private model body"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.output_text.delta",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": invalid,
+                },
+                {
+                    "type": "response.output_text.done",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": invalid,
+                },
+                _completed(invalid),
+            ),
+        )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request(output_mode=ModelOutputMode.JSON))
+
+    assert [event.kind for event in events] == [
+        ModelEventKind.STARTED,
+        ModelEventKind.USAGE,
+        ModelEventKind.COMPLETED,
+    ]
+    assert invalid not in repr(events)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("detail", ["high", "original"])
 async def test_image_block_is_encoded_as_an_ephemeral_responses_data_url(detail: str) -> None:
     captured: dict[str, object] = {}
