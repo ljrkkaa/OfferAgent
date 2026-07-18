@@ -90,8 +90,27 @@ test("sealed qualification driver exposes a durable line protocol before product
             sourceFreeRuntime: true,
         },
     });
-    child.stdin.write(`${JSON.stringify({ id: "req_2", command: "stop", params: {} })}\n`);
+
+    child.stdin.write(`${JSON.stringify({
+        id: "req_2",
+        command: "events/replay",
+        params: { runId: "run_01J00000000000000000000000", afterSequence: 0 },
+    })}\n`);
+    const replayBeforeStartup = await new Promise((resolve, reject) => {
+        const deadline = setTimeout(() => reject(new Error("qualification driver did not answer replay")), 5_000);
+        const inspect = () => {
+            const match = lines.map((line) => JSON.parse(line)).find((line) => line.id === "req_2");
+            if (match === undefined) return;
+            clearTimeout(deadline);
+            resolve(match);
+        };
+        child.stdout.on("data", inspect);
+        inspect();
+    });
+    child.stdin.write(`${JSON.stringify({ id: "req_3", command: "stop", params: {} })}\n`);
     await new Promise((resolve, reject) => {
         child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`driver exited ${code}`)));
     });
+    assert.equal(replayBeforeStartup.ok, false);
+    assert.equal(replayBeforeStartup.error, "qualification product is not started");
 });

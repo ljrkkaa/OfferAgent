@@ -239,6 +239,19 @@ function requiredString(value: Record<string, unknown>, key: string): string {
     return result;
 }
 
+function boundedInteger(
+    value: Record<string, unknown>,
+    key: string,
+    minimum: number,
+    maximum: number,
+): number {
+    const result = value[key];
+    if (!Number.isSafeInteger(result) || (result as number) < minimum || (result as number) > maximum) {
+        throw new TypeError(`${key} must be an integer between ${minimum} and ${maximum}`);
+    }
+    return result as number;
+}
+
 async function startProduct(params: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (product !== null) throw new Error("qualification product is already started");
     const input = smokeInput(params);
@@ -359,6 +372,16 @@ async function executeDriverCommand(request: DriverRequest): Promise<Record<stri
             request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
         };
         return genericClient["request"](method, params as Record<string, unknown>);
+    }
+    if (request.command === "events/replay") {
+        if (product === null) throw new Error("qualification product is not started");
+        const runId = requiredString(request.params, "runId");
+        const afterSequence = boundedInteger(request.params, "afterSequence", 0, Number.MAX_SAFE_INTEGER);
+        const limit = request.params.limit === undefined
+            ? 1_000
+            : boundedInteger(request.params, "limit", 1, 10_000);
+        const lastSequence = await product.client.replay({ runId }, afterSequence, { limit });
+        return { lastSequence };
     }
     if (request.command === "attachment/upload") {
         if (product === null) throw new Error("qualification product is not started");
