@@ -11,7 +11,7 @@
         "protocol:check": "node scripts/generate-protocol-identity.mjs --check && node scripts/generate-protocol-types.mjs --check",
         "typecheck": "npm run protocol:check && tsc -noEmit -skipLibCheck",
         "build:local": "npm run typecheck && node esbuild.config.mjs local-development",
-        "smoke:fused": "node scripts/smoke-fused-product.cjs",
+        "build:qualification": "npm run typecheck && node qualification-esbuild.config.mjs",
         "test": "node --test tests/*.test.cjs",
         "version": "node version-bump.mjs && git add manifest.json versions.json"
     },

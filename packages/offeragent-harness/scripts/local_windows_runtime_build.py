@@ -171,7 +171,6 @@ def add_local_assets(runtime: Path, *, ripgrep_executable: Path) -> None:
     if not BUILTIN_SKILLS.is_dir() or not any(BUILTIN_SKILLS.rglob("SKILL.md")):
         raise RuntimeError("local Runtime source contains no built-in Skills")
     _copy_static_tree(BUILTIN_SKILLS, runtime / "skills")
-    _copy_static_tree(ROOT / "web", runtime / "web")
     if not PROCESS_CATALOG.is_file():
         raise RuntimeError("local Runtime source contains no Process catalog")
     try:

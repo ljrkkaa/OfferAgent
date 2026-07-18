@@ -382,10 +382,14 @@ def _local_build_gate_problems(repository_root: Path) -> list[str]:
             "merge_frozen_evidence",
             "verify_project_source_snapshot",
         },
+        "build_qualification_artifact": {
+            "verify_paired_windows_artifacts",
+        },
         "main": {
             "_require_embedded_schema_identity",
             "add_local_assets",
             "build_development_runtime",
+            "build_qualification_artifact",
             "collect_runtime_records",
             "require_source_tree_unchanged",
             "run_static_gates",
@@ -452,12 +456,15 @@ def _local_build_gate_problems(repository_root: Path) -> list[str]:
     for helper in (
         "frozen_payload.py",
         "local_windows_runtime_build.py",
+        "qualify_built_windows_product.py",
         "runtime_sbom.py",
     ):
         if helper not in digest_literals:
             problems.append(f"local build source identity omits scripts/{helper}")
     if "yarn.lock" not in digest_literals:
         problems.append("local build source identity omits the Obsidian yarn.lock")
+    if "qualification-esbuild.config.mjs" not in digest_literals:
+        problems.append("local build source identity omits the qualification bundle configuration")
     if "schema" not in digest_literals:
         problems.append("local build source identity omits the complete schema tree")
 

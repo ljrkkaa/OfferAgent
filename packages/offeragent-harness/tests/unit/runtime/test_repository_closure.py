@@ -95,6 +95,8 @@ def test_local_build_closure_rejects_removing_mandatory_calls(tmp_path: Path) ->
     required_calls = (
         ("build_development_runtime", "_require_exact_root_executables"),
         ("build_development_runtime", "verify_project_source_snapshot"),
+        ("build_qualification_artifact", "verify_paired_windows_artifacts"),
+        ("main", "build_qualification_artifact"),
         ("main", "_require_embedded_schema_identity"),
         ("main", "require_source_tree_unchanged"),
         ("main", "source_tree_identity"),

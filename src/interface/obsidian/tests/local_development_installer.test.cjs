@@ -81,7 +81,6 @@ async function createFixture(t, options = {}) {
         ["process-catalog.v1.json", "asset", Buffer.from("{}\n", "utf8")],
         ["skills/core/SKILL.md", "asset", Buffer.from("# Core\n", "utf8")],
         ...(options.omitRipgrep ? [] : [["tools/rg.exe", "executable", executable]]),
-        ["web/index.html", "asset", Buffer.from("<!doctype html>\n", "utf8")],
     ];
     const records = [];
     for (const [relativePath, kind, payload] of files) {

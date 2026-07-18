@@ -40,25 +40,27 @@ corepack yarn install --frozen-lockfile
 cd E:\Projects\offeragent\repo\packages\offeragent-harness
 uv run python scripts/build_local_windows_plugin.py `
   --output E:\Projects\offeragent\artifacts\offeragent-obsidian-plugin `
+  --qualification-output E:\Projects\offeragent\artifacts\offeragent-product-qualification `
   --ripgrep-executable C:\path\to\rg.exe
 ```
 
 脚本会执行静态门禁，构建 Worker/Process Host，调用插件内部 `build:local`，生成并复验 manifest，
 然后写入一个新的输出目录。不要直接调用 esbuild，也不要恢复无 manifest 锚点的 `build`/`dev`。
 
-构建完成后，可在临时 Vault 对该目录执行确定性的融合产品烟测：
+构建完成后，使用 Python 主控对两份密封产物执行融合产品资格烟测：
 
 ```powershell
-cd E:\Projects\offeragent\repo\src\interface\obsidian
-corepack yarn smoke:fused E:\Projects\offeragent\artifacts\offeragent-obsidian-plugin
+cd E:\Projects\offeragent\repo\packages\offeragent-harness
+uv run python scripts/qualify_built_windows_product.py `
+  --plugin-artifact E:\Projects\offeragent\artifacts\offeragent-obsidian-plugin `
+  --qualification-artifact E:\Projects\offeragent\artifacts\offeragent-product-qualification `
+  --source-root-guard E:\Projects\offeragent\repo
 ```
 
-烟测使用真实冻结 Worker 和 stdio 协议，验证读取到的 Codex-only 配置形状不再暴露已退役 Provider 字段、策略与
-Session 跨 Worker 重启持久化，并用真实插件 Vault Change coordinator 覆盖 Review hash、来源绑定、
-checkpoint、journal、条件 CAS 和 compare-delete 不可用时的人工复核保留路径，最后检查进程树清理。
-它只操作自动创建并删除的临时 Vault。确定性的 Codex 目录、Responses 编解码和 Agent Loop 由 Harness
-production-composition 集成测试覆盖；本烟测不会给安装版 Worker 注入测试模型通道，也不能代替目标
-账户与目标 Vault 上另行授权的真实模型和写入验收。
+主控先验证插件精确布局、完整 Runtime manifest、bundle anchor 和资格 manifest 的同源绑定，再从预编译
+TypeScript 驱动启动真实冻结 Worker。运行期禁止解析仓库源码或编译 TypeScript；临时 Vault 由随机 ownership
+marker 约束创建和删除，结束时比较 Worker/Process Host 进程集合。后续真实模型阶段同样通过此 Python 入口，
+不会给安装版 Worker 注入测试模型通道，也不接触用户真实 Vault。
 
 产物结构：
 
@@ -73,7 +75,14 @@ offeragent-obsidian-plugin\
     offeragent-worker.exe
     offeragent-process-host.exe
     ...完整 onedir 依赖、rg.exe 和内置资产
+
+offeragent-product-qualification\
+  offeragent-qualification-driver.cjs
+  qualification-manifest.json
 ```
+
+资格目录不是插件安装内容。它与插件 build receipt、Runtime manifest、Git commit 和源码树摘要绑定；安装器
+仍只接受上面的插件精确顶层文件集合。
 
 ## 安装或更新
 

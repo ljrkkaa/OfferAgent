@@ -208,7 +208,7 @@ function parseDevelopmentManifest(
     for (const executable of REQUIRED_EXECUTABLES) {
         if (byPath.get(executable)?.kind !== "executable") fail("development_executable_record_invalid");
     }
-    if (byPath.get("process-catalog.v1.json")?.kind !== "asset" || !byPath.has("web/index.html") ||
+    if (byPath.get("process-catalog.v1.json")?.kind !== "asset" ||
         !files.some((item) => item.path.startsWith("skills/") && item.path.endsWith("/SKILL.md"))) {
         fail("development_assets_missing");
     }

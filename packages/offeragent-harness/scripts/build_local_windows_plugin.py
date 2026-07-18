@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from offeragent_harness.protocol.schemas import PROTOCOL_VERSION, schema_hash
+from offeragent_harness.qualification.windows_product_artifact import verify_paired_windows_artifacts
 from offeragent_harness.runtime.development_runtime_manifest import (
     DEVELOPMENT_MANIFEST_NAME,
     DevelopmentBuildIdentity,
@@ -136,6 +137,11 @@ class SourceTreeIdentity:
 def main() -> int:
     parser = argparse.ArgumentParser(description="构建个人本机开发版 OfferAgent 插件 (仅 Windows x64)")
     parser.add_argument("--output", type=Path, required=True, help="不存在的输出目录")
+    parser.add_argument(
+        "--qualification-output",
+        type=Path,
+        help="可选; 不存在且与插件输出同目录的资格驱动输出",
+    )
     parser.add_argument("--ripgrep-executable", type=Path, required=True, help="构建时显式提供的 rg.exe")
     parser.add_argument("--runtime-version", help="可选; 默认由源码指纹生成")
     args = parser.parse_args()
@@ -143,6 +149,14 @@ def main() -> int:
     output = args.output.resolve(strict=False)
     if output.exists():
         raise SystemExit("output already exists; local build never overwrites an existing directory")
+    qualification_output = (
+        args.qualification_output.resolve(strict=False) if args.qualification_output is not None else None
+    )
+    if qualification_output is not None:
+        if qualification_output.exists():
+            raise SystemExit("qualification output already exists; local build never overwrites it")
+        if qualification_output == output or qualification_output.parent != output.parent:
+            raise SystemExit("qualification output must be a distinct sibling of the plugin output")
     output.parent.mkdir(parents=True, exist_ok=True)
     run_static_gates()
     commit = _git_output("rev-parse", "HEAD")
@@ -222,9 +236,28 @@ def main() -> int:
             "targetVaultTemplateSha256": target_vault_template_digest(target_vault_templates),
         }
         (staging / "local-development-build.json").write_bytes(_canonical_json(receipt) + b"\n")
+        qualification_staging: Path | None = None
+        if qualification_output is not None:
+            qualification_staging = temporary_root / "offeragent-product-qualification"
+            build_qualification_artifact(
+                qualification_staging,
+                plugin_artifact=staging,
+                source_identity=source_identity,
+                source_commit=commit,
+            )
         _require_embedded_schema_identity(runtime, source_identity.schema_tree_sha256)
         require_source_tree_unchanged(source_identity)
-        os.replace(staging, output)
+        published: list[Path] = []
+        try:
+            os.replace(staging, output)
+            published.append(output)
+            if qualification_output is not None and qualification_staging is not None:
+                os.replace(qualification_staging, qualification_output)
+                published.append(qualification_output)
+        except BaseException:
+            for path in reversed(published):
+                shutil.rmtree(path)
+            raise
     print(output)
     return 0
 
@@ -283,10 +316,7 @@ def build_development_runtime(
             target,
             hidden_imports=DEVELOPMENT_HIDDEN_IMPORTS,
             excluded_modules=DEVELOPMENT_EXCLUDED_MODULES,
-            add_data=(
-                (ROOT / "web", "offeragent_harness/_web"),
-                (ROOT / "schema", "offeragent_harness/_schema"),
-            ),
+            add_data=((ROOT / "schema", "offeragent_harness/_schema"),),
         )
         roots.append(root)
         target_evidence.append(
@@ -311,6 +341,70 @@ def build_development_runtime(
         if pe_machine(executable) != expected_machine:
             raise RuntimeError(f"development executable is not native x64: {executable.name}")
     return merged
+
+
+def build_qualification_artifact(
+    destination: Path,
+    *,
+    plugin_artifact: Path,
+    source_identity: SourceTreeIdentity,
+    source_commit: str,
+) -> None:
+    """Seal a source-free plugin-adapter driver to one exact product build."""
+
+    if destination.exists():
+        raise RuntimeError("qualification output already exists")
+    if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+        raise RuntimeError("qualification source commit is invalid")
+    destination.mkdir(parents=False)
+    driver = destination / "offeragent-qualification-driver.cjs"
+    subprocess.run(
+        [
+            _npm_command(),
+            "run",
+            "build:qualification",
+            "--",
+            f"--outfile={driver}",
+        ],
+        cwd=PLUGIN,
+        check=True,
+    )
+    if not driver.is_file() or driver.is_symlink() or driver.stat().st_nlink != 1:
+        raise RuntimeError("qualification driver build is missing or unsafe")
+    plugin_receipt_path = plugin_artifact / "local-development-build.json"
+    runtime_manifest_path = (
+        plugin_artifact / "runtime" / "windows-x64" / "local-development" / DEVELOPMENT_MANIFEST_NAME
+    )
+    plugin_receipt_bytes = plugin_receipt_path.read_bytes()
+    try:
+        plugin_receipt = json.loads(plugin_receipt_bytes.decode("utf-8", errors="strict"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("plugin build receipt is malformed") from error
+    if not isinstance(plugin_receipt, dict):
+        raise RuntimeError("plugin build receipt is invalid")
+    runtime_manifest_bytes = runtime_manifest_path.read_bytes()
+    runtime_manifest_sha256 = _digest_bytes(runtime_manifest_bytes)
+    if plugin_receipt.get("manifestSha256") != runtime_manifest_sha256:
+        raise RuntimeError("plugin receipt differs from its Runtime manifest")
+    if plugin_receipt.get("sourceTreeSha256") != source_identity.source_tree_sha256:
+        raise RuntimeError("plugin receipt differs from the qualification source identity")
+    driver_sha256, driver_size = _digest_file_and_size(driver)
+    manifest = {
+        "driver": {
+            "path": driver.name,
+            "sha256": driver_sha256,
+            "size": driver_size,
+        },
+        "pluginBuildReceiptSha256": _digest_bytes(plugin_receipt_bytes),
+        "pluginVersion": plugin_receipt.get("pluginVersion"),
+        "runtimeManifestSha256": runtime_manifest_sha256,
+        "runtimeVersion": plugin_receipt.get("runtimeVersion"),
+        "schemaVersion": 1,
+        "sourceCommit": source_commit,
+        "sourceTreeSha256": source_identity.source_tree_sha256,
+    }
+    (destination / "qualification-manifest.json").write_bytes(_canonical_json(manifest) + b"\n")
+    verify_paired_windows_artifacts(plugin_artifact.resolve(), destination.resolve())
 
 
 def _require_exact_root_executables(runtime: Path) -> None:
@@ -450,7 +544,6 @@ def source_tree_identity() -> SourceTreeIdentity:
         ROOT / "scripts" / "entrypoints" / "development",
         ROOT / "packaging",
         ROOT / "schema",
-        ROOT / "web",
         PLUGIN / "src",
         PLUGIN / "scripts",
     )
@@ -471,10 +564,12 @@ def source_tree_identity() -> SourceTreeIdentity:
             ROOT / "scripts" / "build_local_windows_plugin.py",
             ROOT / "scripts" / "frozen_payload.py",
             ROOT / "scripts" / "local_windows_runtime_build.py",
+            ROOT / "scripts" / "qualify_built_windows_product.py",
             ROOT / "scripts" / "runtime_sbom.py",
             PLUGIN / "package.json",
             PLUGIN / "yarn.lock",
             PLUGIN / "esbuild.config.mjs",
+            PLUGIN / "qualification-esbuild.config.mjs",
             PLUGIN / "manifest.json",
             PLUGIN / "styles.css",
         )

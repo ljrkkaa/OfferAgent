@@ -48,7 +48,6 @@ def _local_runtime(
         "tools/rg.exe": b"ripgrep\n",
         PROCESS_CATALOG_PATH: catalog_payload,
         "skills/core/SKILL.md": b"# Core\n",
-        "web/index.html": b"<!doctype html>\n",
     }
     kinds = {
         "offeragent-process-host.exe": "executable",
@@ -56,7 +55,6 @@ def _local_runtime(
         "tools/rg.exe": "executable",
         PROCESS_CATALOG_PATH: "asset",
         "skills/core/SKILL.md": "skill",
-        "web/index.html": "web",
     }
     runtime.mkdir()
     for relative, payload in payloads.items():

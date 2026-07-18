@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import zipfile
@@ -232,3 +233,64 @@ def test_source_change_check_rejects_schema_drift_even_if_overall_digest_is_reus
 
     with pytest.raises(RuntimeError, match="source tree changed"):
         build_local_windows_plugin.require_source_tree_unchanged(expected)
+
+
+def test_qualification_output_is_sealed_to_the_exact_plugin_build(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin = tmp_path / "plugin"
+    runtime = plugin / "runtime" / "windows-x64" / "local-development"
+    runtime.mkdir(parents=True)
+    runtime_manifest = b'{"runtimeVersion":"0.1.0-test"}\n'
+    (runtime / "development-runtime-manifest.json").write_bytes(runtime_manifest)
+    receipt = {
+        "developmentOnly": True,
+        "manifestSha256": build_local_windows_plugin._digest_bytes(runtime_manifest),
+        "pluginVersion": "2.0.0-test",
+        "runtimeVersion": "0.1.0-test",
+        "schemaVersion": 1,
+        "sourceTreeSha256": "sha256:" + "a" * 64,
+        "targetVaultTemplateSha256": "sha256:" + "b" * 64,
+    }
+    receipt_bytes = build_local_windows_plugin._canonical_json(receipt) + b"\n"
+    (plugin / "local-development-build.json").write_bytes(receipt_bytes)
+    commands: list[list[str]] = []
+
+    def compile_driver(command: list[str], **_: Any) -> None:
+        commands.append(command)
+        output_argument = next(item for item in command if item.startswith("--outfile="))
+        Path(output_argument.removeprefix("--outfile=")).write_bytes(b'"use strict";\n')
+
+    monkeypatch.setattr(subprocess, "run", compile_driver)
+    verified_pairs: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(
+        build_local_windows_plugin,
+        "verify_paired_windows_artifacts",
+        lambda plugin_path, qualification_path: verified_pairs.append((plugin_path, qualification_path)),
+    )
+    qualification = tmp_path / "qualification"
+    identity = build_local_windows_plugin.SourceTreeIdentity(
+        source_tree_sha256="sha256:" + "a" * 64,
+        schema_tree_sha256="sha256:" + "d" * 64,
+        project_sources=(),
+    )
+
+    build_local_windows_plugin.build_qualification_artifact(
+        qualification,
+        plugin_artifact=plugin,
+        source_identity=identity,
+        source_commit="c" * 40,
+    )
+
+    assert {path.name for path in qualification.iterdir()} == {
+        "offeragent-qualification-driver.cjs",
+        "qualification-manifest.json",
+    }
+    manifest = json.loads((qualification / "qualification-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["pluginBuildReceiptSha256"] == build_local_windows_plugin._digest_bytes(receipt_bytes)
+    assert manifest["runtimeManifestSha256"] == receipt["manifestSha256"]
+    assert manifest["sourceCommit"] == "c" * 40
+    assert manifest["sourceTreeSha256"] == identity.source_tree_sha256
+    assert any("build:qualification" in command for command in commands)
+    assert verified_pairs == [(plugin.resolve(), qualification.resolve())]

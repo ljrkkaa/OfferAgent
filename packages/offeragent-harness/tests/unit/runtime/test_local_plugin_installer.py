@@ -37,7 +37,6 @@ def _artifact(root: Path) -> Path:
         "process-catalog.v1.json": b"{}\n",
         "skills/local/SKILL.md": b"# Local\n",
         "tools/rg.exe": b"ripgrep",
-        "web/index.html": b"<!doctype html>\n",
     }
     records: list[RuntimeFileRecord] = []
     for relative, payload in sorted(payloads.items()):
