@@ -378,6 +378,19 @@ class ContextManager:
             local_timezone=self._local_timezone,
         )
 
+    def with_system_rule(self, rule: str) -> ContextManager:
+        """Append one Harness-owned rule ahead of the untrusted-data boundary."""
+
+        if not isinstance(rule, str) or not rule:
+            raise ValueError("system rule must be a non-empty string")
+        return ContextManager(
+            system_rules=(*self._system_rules[:-1], rule),
+            inputs=self._inputs,
+            visibility=self._visibility,
+            budget=self._budget,
+            local_timezone=self._local_timezone,
+        )
+
     def with_memories(self, memories: Sequence[ContextFragment]) -> ContextManager:
         """Append bounded, untrusted Memory fragments without changing any other layer."""
 

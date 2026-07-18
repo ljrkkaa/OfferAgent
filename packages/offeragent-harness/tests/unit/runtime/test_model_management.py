@@ -40,6 +40,8 @@ def _model() -> CodexCatalogModel:
         model_id="gpt-catalog",
         display_name="GPT Catalog",
         description="Catalog-backed model",
+        model_instructions="catalog-owned model baseline",
+        use_responses_lite=False,
         input_modalities=("text", "image"),
         supports_image_detail_original=True,
         supports_hosted_search=True,

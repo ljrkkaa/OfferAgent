@@ -1317,14 +1317,29 @@ def _encode_request(request: ModelRequest, config: OpenAIResponsesConfig) -> byt
         raise ModelProviderConfigurationError("model ID contains unsupported characters")
     if request.seed is not None:
         raise ModelProviderConfigurationError("Responses provider does not support deterministic seed")
+    if request.model_instructions is None:
+        raise ModelProviderConfigurationError("Codex subscription request is missing catalog model instructions")
+    tools = [{"type": tool.value} for tool in request.hosted_tools]
+    inputs = [_encode_message(message) for message in request.messages]
     body: dict[str, Any] = {
         "model": request.model,
-        "input": [_encode_message(message) for message in request.messages],
+        "input": inputs,
         "stream": True,
         "store": False,
         "parallel_tool_calls": False,
-        "tools": [{"type": tool.value} for tool in request.hosted_tools],
     }
+    if request.use_responses_lite:
+        body["input"] = [
+            {"type": "additional_tools", "role": "developer", "tools": tools},
+            {
+                "role": "developer",
+                "content": [{"type": "input_text", "text": request.model_instructions}],
+            },
+            *inputs,
+        ]
+    else:
+        body["instructions"] = request.model_instructions
+        body["tools"] = tools
     if ModelHostedTool.WEB_SEARCH in request.hosted_tools:
         body["tool_choice"] = "auto"
         body["include"] = ["web_search_call.action.sources"]
@@ -1334,6 +1349,8 @@ def _encode_request(request: ModelRequest, config: OpenAIResponsesConfig) -> byt
         if request.reasoning_effort not in _REASONING_EFFORTS:
             raise ModelProviderConfigurationError("reasoning effort is unsupported")
         body["reasoning"] = {"effort": request.reasoning_effort, "summary": "auto"}
+        if request.use_responses_lite:
+            body["reasoning"]["context"] = "all_turns"
     if request.temperature is not None:
         if request.temperature != 0:
             raise ModelProviderConfigurationError("model provider does not support temperature")
@@ -1504,6 +1521,8 @@ def _json_schema_type(value: Any) -> str:
 
 def _encode_message(message: ModelMessage) -> dict[str, Any]:
     role = message.role.value
+    if message.role is ModelRole.SYSTEM:
+        role = "developer"
     if message.role is ModelRole.TOOL:
         role = ModelRole.USER.value
     blocks: list[dict[str, Any]] = []
@@ -1595,6 +1614,8 @@ def _headers(
             headers[name] = value
     if _HEADER_ID.fullmatch(request.request_id) is not None:
         headers["X-Client-Request-Id"] = request.request_id
+    if request.use_responses_lite:
+        headers["x-openai-internal-codex-responses-lite"] = "true"
     return MappingProxyType(headers)
 
 

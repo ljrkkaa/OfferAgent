@@ -225,8 +225,16 @@ Obsidian 插件中通过官方 Obsidian TypeScript API 实现 Vault 工具协议
 _Avoid_: CLI 包装器、Runtime 直接文件访问、模型执行 Shell
 
 **Model Catalog Capability**:
-当前 Codex Subscription 账户绑定的模型目录为精确所选模型声明的托管能力，例如 Hosted Web Search；该声明随目录修订固化到 Agent Run，只有目录明确支持的能力才会进入模型请求。陈旧目录只用于展示，不能创建新 Run，也不发送生产能力探测请求。
+当前 Codex Subscription 账户绑定的模型目录为精确所选模型声明的托管能力、已解析模型指令和 Codex Request Dialect；该声明随目录修订固化到 Agent Run，只有目录明确支持的能力才会进入模型请求。陈旧目录只用于展示，不能创建新 Run，也不发送生产能力探测请求。
 _Avoid_: Provider 选择、运行时能力探测、探测缓存、失败后静默降级、根据模型名称猜测能力、把内部后端当成公开稳定协议
+
+**Codex Request Dialect**:
+精确 Run 绑定决定的 Standard Responses 或 Responses Lite 请求投影。Standard 把已解析模型指令和工具放在顶层；Lite 把工具声明和已解析模型指令前置为 developer input，并使用目录要求的请求头。Harness 应用规则是独立 developer 层，不能替换模型指令，也不能根据模型名称猜测投影。
+_Avoid_: Provider 配置、Prompt 覆盖、模型名称映射、失败后切换方言、把 Harness 规则混入模型基线
+
+**AgentStep Model Projection**:
+Python AgentStepCatalog 为模型提供的紧凑结构化输出信封；每个调用只携带精确工具名、版本、理由和编码单个 JSON 对象的 `argumentsJson`。同一 Catalog 把完整工具目录作为受上下文预算约束的可信应用规则，并在任何 ToolCall 产生前严格解码、拒绝重复键与非标准 JSON，再用原始完整工具 schema 和跨调用规则重新校验。该投影只约束模型输出形状，不授予执行权限。
+_Avoid_: 把 Provider schema 当成权限边界、按轮猜测工具子集、跳过本地工具参数校验、直接执行字符串参数、让模型生成 callId、hash、deadline 或权限身份
 
 **Hosted Search Citation**:
 Codex Hosted Web Search 在 Responses 输出中为答案提供的 Provider 证明型公共 URL 引用；它保存标题、Provider、模型和模型请求身份，但没有网页正文字节，因此不伪造内容哈希。需要精确网页证据时仍使用 `web_read` 读取并产生带真实内容哈希的 Web 来源。

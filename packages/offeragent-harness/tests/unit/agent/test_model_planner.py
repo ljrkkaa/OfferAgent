@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -49,6 +50,7 @@ from offeragent_harness.models import (
 )
 from offeragent_harness.permissions import RiskClass
 from offeragent_harness.ports import ModelGateway, Sensitivity
+from offeragent_harness.runtime.plugin_tools import plugin_tool_definitions
 from offeragent_harness.sessions import AgentLineage
 from offeragent_harness.skills import skill_tool_definitions
 from offeragent_harness.testing import (
@@ -70,6 +72,7 @@ from offeragent_harness.tools import (
     ToolDefinition,
     ToolResult,
     ToolResultStatus,
+    canonical_json_bytes,
     canonical_json_sha256,
 )
 
@@ -171,6 +174,8 @@ def _planner(
         config=PlannerModelConfig(
             "scripted-model",
             512,
+            model_instructions="catalog-owned model baseline",
+            use_responses_lite=True,
             seed=17,
             hosted_tools=(ModelHostedTool.WEB_SEARCH,) if hosted_search else (),
         ),
@@ -183,6 +188,8 @@ def _planner(
 def test_memory_context_enrichment_changes_messages_but_not_tool_catalog_or_output_schema() -> None:
     planner = _planner(ScriptedModelGateway(()))
     before = planner.create_request(_state())
+    assert before.model_instructions == "catalog-owned model baseline"
+    assert before.use_responses_lite is True
     memory = ContextFragment(
         "memory:workspace:mem_planner",
         ContextLayer.MEMORY,
@@ -426,7 +433,10 @@ def _tool_plan(*, extra_call_fields: Mapping[str, Any] | None = None) -> dict[st
     call: dict[str, Any] = {
         "name": "workspace.read",
         "version": "1",
-        "arguments": {"path": "notes/a.md", "options": {"includeHash": True}},
+        "argumentsJson": json.dumps(
+            {"path": "notes/a.md", "options": {"includeHash": True}},
+            separators=(",", ":"),
+        ),
         "reason": "the user requested this exact note",
     }
     if extra_call_fields is not None:
@@ -463,9 +473,10 @@ def _invalid(
     violations: Sequence[str] | None = None,
 ) -> ModelInvalidOutput:
     raw = _frozen_object(output)
+    _normalized, decoded_violations = catalog.decode_model_step(cast(dict[str, Any], thaw_json(raw)))
     return ModelInvalidOutput(
         request.request_id,
-        tuple(violations) if violations is not None else catalog.violations(cast(dict[str, Any], thaw_json(raw))),
+        tuple(violations) if violations is not None else decoded_violations,
         raw_output=raw,
         usage=USAGE,
     )
@@ -502,6 +513,102 @@ def test_catalog_is_canonical_immutable_and_excludes_harness_security_fields() -
     assert all(str(value["$id"]).startswith("urn:offeragent:tool-input:") for value in embedded.values())
     with pytest.raises(TypeError):
         left.schema["unsafe"] = "mutation"  # type: ignore[index]
+
+
+def test_catalog_projects_a_bounded_model_schema_without_weakening_the_execution_schema() -> None:
+    catalog = AgentStepCatalog(plugin_tool_definitions(), max_calls=16)
+
+    execution_schema = cast(dict[str, Any], thaw_json(catalog.schema))
+    model_schema = cast(dict[str, Any], thaw_json(catalog.model_schema))
+    execution_variant = cast(
+        dict[str, Any],
+        cast(list[dict[str, Any]], execution_schema["properties"]["calls"]["items"]["oneOf"])[0],
+    )
+    model_call_properties = cast(dict[str, Any], model_schema["properties"]["calls"]["items"]["properties"])
+
+    assert "arguments" in execution_variant["properties"]
+    assert "$defs" in execution_schema
+    assert set(model_call_properties) == {"name", "version", "argumentsJson", "reason"}
+    assert "arguments" not in model_call_properties
+    assert len(canonical_json_bytes(model_schema)) < 4_096
+
+
+def test_planner_binds_the_compact_projection_and_exact_tool_directory_into_one_request() -> None:
+    catalog = AgentStepCatalog((_definition(), _definition("workspace.stat", "2")), max_calls=3)
+    request = _planner(ScriptedModelGateway(()), catalog=catalog).create_request(_state())
+
+    assert request.output_schema == catalog.model_schema
+    system_text = repr(next(message for message in request.messages if message.name == "offeragent-system-rules"))
+    assert "argumentsJson" in system_text
+    assert "workspace.read" in system_text
+    assert "workspace.stat" in system_text
+    assert '"inputSchema"' in system_text
+    assert "toolCallId" not in system_text
+    assert "argsHash" not in system_text
+
+
+@pytest.mark.asyncio
+async def test_projected_arguments_json_is_strictly_decoded_before_tool_call_construction() -> None:
+    projected = {
+        "requiresWriteOutcome": False,
+        "calls": [
+            {
+                "name": "workspace.read",
+                "version": "1",
+                "argumentsJson": '{"path":"notes/a.md","options":{"includeHash":true}}',
+                "reason": "the user requested this exact note",
+            }
+        ],
+        "finalResponse": None,
+    }
+    builder = _planner(ScriptedModelGateway(()))
+    request = builder.create_request(_state())
+    gateway = ScriptedModelGateway((ModelScriptStep.from_events(request, _events(request, projected)),))
+
+    step = await _planner(gateway).plan(_state(), ManualCancellationToken())
+
+    assert thaw_json(step.calls[0].arguments) == {
+        "path": "notes/a.md",
+        "options": {"includeHash": True},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments_json", "expected_violation"),
+    [
+        ('{"path":"a.md","path":"b.md"}', "duplicate object key"),
+        ('["notes/a.md"]', "must decode to a JSON object"),
+        ('{"unknown":true}', "is a required property"),
+    ],
+)
+async def test_projected_arguments_json_fails_closed_before_execution(
+    arguments_json: str,
+    expected_violation: str,
+) -> None:
+    projected = {
+        "requiresWriteOutcome": False,
+        "calls": [
+            {
+                "name": "workspace.read",
+                "version": "1",
+                "argumentsJson": arguments_json,
+                "reason": "attempt the requested read",
+            }
+        ],
+        "finalResponse": None,
+    }
+    builder = _planner(ScriptedModelGateway(()))
+    request = builder.create_request(_state())
+    gateway = ScriptedModelGateway((ModelScriptStep.from_events(request, _events(request, projected)),))
+    ledger = _budget(rounds=1)
+    await ledger.consume(BudgetDelta(model_rounds=1))
+    planner = _planner(gateway, budget=ledger)
+
+    with pytest.raises(SchemaRepairUnavailable) as caught:
+        await planner.plan(_state(), ManualCancellationToken())
+
+    assert any(expected_violation in violation for violation in caught.value.invalid_output.violations)
 
 
 def test_skill_body_load_is_a_planning_barrier() -> None:

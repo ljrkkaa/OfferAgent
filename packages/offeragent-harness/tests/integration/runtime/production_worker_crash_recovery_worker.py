@@ -117,6 +117,8 @@ class _CodexCatalog:
                     "slug": MODEL_ID,
                     "display_name": "Crash Recovery Model",
                     "description": "Deterministic production recovery fixture",
+                    "base_instructions": "Catalog-owned crash recovery baseline.",
+                    "use_responses_lite": False,
                     "visibility": "list",
                     "input_modalities": ["text"],
                     "supports_image_detail_original": False,
@@ -180,7 +182,7 @@ class _CrashRecoveryModel:
                         {
                             "name": "agent_contract.read",
                             "version": "1",
-                            "arguments": {},
+                            "argumentsJson": "{}",
                             "reason": "在根 Agent Run 行动前加载当前 Vault Agent Contract。",
                         }
                     ],
@@ -209,7 +211,7 @@ class _CrashRecoveryModel:
                         {
                             "name": "vault.transaction",
                             "version": "1",
-                            "arguments": arguments,
+                            "argumentsJson": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
                             "reason": "执行用户明确要求的单文件追加。",
                         }
                     ],

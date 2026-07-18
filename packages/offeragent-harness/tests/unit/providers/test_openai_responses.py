@@ -67,6 +67,7 @@ def _request(
     *,
     output_mode: ModelOutputMode = ModelOutputMode.TEXT,
     hosted_search: bool = False,
+    responses_lite: bool = False,
 ) -> ModelRequest:
     schema = None
     if output_mode is ModelOutputMode.JSON:
@@ -79,6 +80,8 @@ def _request(
     return ModelRequest(
         request_id="req_test_1",
         model="gpt-test",
+        model_instructions="catalog-owned model baseline",
+        use_responses_lite=responses_lite,
         purpose=ModelPurpose.PLANNING if output_mode is ModelOutputMode.JSON else ModelPurpose.RESPONDING,
         messages=(
             ModelMessage(ModelRole.SYSTEM, (ModelContentBlock.text("system boundary"),)),
@@ -226,13 +229,76 @@ async def test_text_stream_is_real_typed_sse_and_request_exposes_no_runtime_auth
     body = captured["body"]
     assert isinstance(body, dict)
     assert body["store"] is False
+    assert body["instructions"] == "catalog-owned model baseline"
     assert body["tools"] == []
     assert body["parallel_tool_calls"] is False
+    assert body["input"][0]["role"] == "developer"
     encoded = json.dumps(body)
     assert "must-not-leave-process" not in encoded
     assert "test-provider-secret" not in encoded
     assert "Local tool result workspace.read" in encoded
     assert secrets.calls == 1 and set(secrets.buffer) == {0}
+
+
+@pytest.mark.asyncio
+async def test_codex_request_without_catalog_model_instructions_fails_before_http() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=_sse(_completed("unreachable")), request=request)
+
+    events = await _collect(
+        _gateway(httpx.MockTransport(handler)),
+        replace(_request(), model_instructions=None),
+    )
+
+    assert calls == 0
+    assert events[-1].kind is ModelEventKind.ERROR
+    assert events[-1].error is not None
+    assert events[-1].error.code == "provider_configuration"
+
+
+@pytest.mark.asyncio
+async def test_responses_lite_moves_catalog_baseline_and_tools_into_input_and_sets_header() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["header"] = request.headers.get("x-openai-internal-codex-responses-lite")
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                _completed("ok"),
+            ),
+            request=request,
+        )
+
+    await _collect(
+        _gateway(httpx.MockTransport(handler)),
+        _request(hosted_search=True, responses_lite=True),
+    )
+
+    body = captured["body"]
+    assert isinstance(body, dict)
+    assert captured["header"] == "true"
+    assert "instructions" not in body
+    assert "tools" not in body
+    assert body["reasoning"]["context"] == "all_turns"
+    assert body["input"][:3] == [
+        {"type": "additional_tools", "role": "developer", "tools": [{"type": "web_search"}]},
+        {
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "catalog-owned model baseline"}],
+        },
+        {
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "system boundary"}],
+        },
+    ]
 
 
 @pytest.mark.asyncio

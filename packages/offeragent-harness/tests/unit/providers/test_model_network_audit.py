@@ -92,6 +92,7 @@ def _request(*, with_run_identity: bool = True) -> ModelRequest:
     return ModelRequest(
         request_id="req_model_inference_1",
         model="gpt-test",
+        model_instructions="catalog-owned model baseline",
         purpose=ModelPurpose.RESPONDING,
         messages=(ModelMessage(ModelRole.USER, (ModelContentBlock.text("fixed"),)),),
         output_mode=ModelOutputMode.TEXT,

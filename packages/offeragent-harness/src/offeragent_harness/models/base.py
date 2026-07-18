@@ -174,6 +174,8 @@ class ModelRequest:
     temperature: float | None
     seed: int | None
     trace_context: TraceContext
+    model_instructions: str | None = field(default=None, repr=False)
+    use_responses_lite: bool = False
     metadata: Mapping[str, Any] = field(default_factory=dict)
     hosted_tools: tuple[ModelHostedTool, ...] = ()
 
@@ -182,6 +184,12 @@ class ModelRequest:
             raise ValueError("request_id and model must not be empty")
         if not self.messages:
             raise ValueError("model request requires at least one message")
+        if self.model_instructions is not None and (
+            not self.model_instructions or len(self.model_instructions.encode("utf-8")) > 512 * 1024
+        ):
+            raise ValueError("model_instructions must be non-empty and bounded")
+        if not isinstance(self.use_responses_lite, bool):
+            raise TypeError("use_responses_lite must be a bool")
         if self.max_output_tokens is not None and self.max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
         if self.temperature is not None and not 0 <= self.temperature <= 2:

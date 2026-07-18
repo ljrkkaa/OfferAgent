@@ -119,6 +119,8 @@ def _binding(
             model_id=model_id,
             display_name="GPT Selected",
             description=None,
+            model_instructions="catalog-owned model baseline",
+            use_responses_lite=False,
             input_modalities=input_modalities,
             supports_image_detail_original=supports_image_detail_original,
             supports_hosted_search=True,

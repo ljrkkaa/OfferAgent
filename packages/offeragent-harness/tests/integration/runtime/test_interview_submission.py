@@ -154,7 +154,7 @@ def _tool_call(name: str, arguments: Mapping[str, object], reason: str) -> dict[
     return {
         "name": name,
         "version": "1",
-        "arguments": dict(arguments),
+        "argumentsJson": json.dumps(dict(arguments), ensure_ascii=False, separators=(",", ":")),
         "reason": reason,
     }
 
@@ -462,6 +462,8 @@ class _CodexModels:
                 model_id=MODEL_ID,
                 display_name="Deterministic interview vision model",
                 description=None,
+                model_instructions="catalog-owned model baseline",
+                use_responses_lite=False,
                 input_modalities=("text", "image"),
                 supports_image_detail_original=True,
                 supports_hosted_search=False,

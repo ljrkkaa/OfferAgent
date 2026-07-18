@@ -59,6 +59,8 @@ def _model(model_id: str, *, image: bool, original: bool) -> CodexCatalogModel:
         model_id=model_id,
         display_name=model_id,
         description=None,
+        model_instructions="catalog-owned model baseline",
+        use_responses_lite=False,
         input_modalities=("text", "image") if image else ("text",),
         supports_image_detail_original=original,
         supports_hosted_search=False,

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from decimal import Decimal
 from types import MappingProxyType
@@ -30,7 +31,14 @@ from offeragent_harness.models import (
 from offeragent_harness.models.json_types import FrozenJsonObject, freeze_json, thaw_json
 from offeragent_harness.permissions import RiskClass
 from offeragent_harness.ports import CancellationToken, Clock, IdGenerator, ModelGateway
-from offeragent_harness.tools import SideEffectClass, ToolCall, ToolDefinition, canonical_json_sha256
+from offeragent_harness.tools import (
+    CanonicalJsonError,
+    SideEffectClass,
+    ToolCall,
+    ToolDefinition,
+    canonical_json_bytes,
+    canonical_json_sha256,
+)
 
 from .budgets import BudgetDelta, BudgetExceeded, BudgetLedger
 from .context_manager import ContextFragment, ContextManager, ContextProjection, ContextWindow
@@ -108,6 +116,8 @@ class SchemaRepairFailed(ModelPlannerError):
 class PlannerModelConfig:
     model: str
     max_output_tokens: int
+    model_instructions: str | None = field(default=None, repr=False)
+    use_responses_lite: bool = False
     reasoning_effort: str | None = None
     temperature: float | None = 0
     seed: int | None = None
@@ -116,6 +126,12 @@ class PlannerModelConfig:
     def __post_init__(self) -> None:
         if not self.model:
             raise ValueError("planner model must not be empty")
+        if self.model_instructions is not None and (
+            not self.model_instructions or len(self.model_instructions.encode("utf-8")) > 512 * 1024
+        ):
+            raise ValueError("planner model instructions exceed their safety limit")
+        if not isinstance(self.use_responses_lite, bool):
+            raise TypeError("planner use_responses_lite must be a bool")
         if self.max_output_tokens < 1:
             raise ValueError("planner max_output_tokens must be positive")
         if self.temperature is not None and not 0 <= self.temperature <= 2:
@@ -135,7 +151,7 @@ class StructuredModelResponse:
 
 
 class AgentStepCatalog:
-    """Immutable tool directory and its exact provider-facing output schema."""
+    """Exact execution authority plus a bounded model-facing AgentStep codec."""
 
     def __init__(self, definitions: Sequence[ToolDefinition], *, max_calls: int) -> None:
         if max_calls < 1:
@@ -146,6 +162,12 @@ class AgentStepCatalog:
             raise AgentStepCatalogError("tool catalog contains duplicate name/version entries")
         self._definitions = ordered
         self._by_key = MappingProxyType(dict(zip(keys, ordered, strict=True)))
+        self._input_validators = MappingProxyType(
+            {
+                key: Draft202012Validator(thaw_json(definition.input_schema))
+                for key, definition in zip(keys, ordered, strict=True)
+            }
+        )
         self._max_calls = max_calls
         self._fingerprint = canonical_json_sha256(
             {
@@ -169,6 +191,31 @@ class AgentStepCatalog:
             raise AgentStepCatalogError("generated AgentStep schema must be an object")
         self._schema = frozen
         self._validator = Draft202012Validator(thaw_json(frozen))
+        model_schema = self._build_model_schema()
+        Draft202012Validator.check_schema(model_schema)
+        frozen_model_schema = freeze_json(model_schema)
+        if not isinstance(frozen_model_schema, FrozenJsonObject):
+            raise AgentStepCatalogError("generated model AgentStep schema must be an object")
+        self._model_schema = frozen_model_schema
+        self._model_validator = Draft202012Validator(thaw_json(frozen_model_schema))
+        directory = {
+            "tools": [
+                {
+                    "name": definition.name,
+                    "version": definition.version,
+                    "description": definition.description,
+                    "inputSchema": thaw_json(definition.input_schema),
+                }
+                for definition in ordered
+            ]
+        }
+        encoded_directory = canonical_json_bytes(directory).decode("utf-8")
+        self._model_instruction = (
+            "OfferAgent 的模型输出使用紧凑 AgentStep 投影。每个 calls 项必须从下列工具目录选择精确的 "
+            "name/version, 并把符合该工具 inputSchema 的单个 JSON 对象编码为 argumentsJson 字符串; "
+            "不要把参数对象放在其他字段中。Harness 会在执行前重新解析并按完整目录严格校验。工具目录: "
+            f"{encoded_directory}"
+        )
 
     @property
     def definitions(self) -> tuple[ToolDefinition, ...]:
@@ -177,6 +224,16 @@ class AgentStepCatalog:
     @property
     def schema(self) -> FrozenJsonObject:
         return self._schema
+
+    @property
+    def model_schema(self) -> FrozenJsonObject:
+        """Bounded schema sent to the model; never an execution authority."""
+
+        return self._model_schema
+
+    @property
+    def model_instruction(self) -> str:
+        return self._model_instruction
 
     @property
     def fingerprint(self) -> str:
@@ -239,6 +296,67 @@ class AgentStepCatalog:
                 return ("$.calls: an already activated Skill cannot be invoked again in the same Run",)
         return ()
 
+    def decode_model_step(
+        self,
+        value: Mapping[str, Any],
+        *,
+        context_activations: frozenset[str] = frozenset(),
+    ) -> tuple[dict[str, Any] | None, tuple[str, ...]]:
+        """Decode the compact model projection and reapply exact local authority."""
+
+        errors = sorted(
+            self._model_validator.iter_errors(value),
+            key=lambda item: tuple(str(part) for part in item.path),
+        )
+        structural = tuple(f"{_json_path(error.absolute_path)}: {error.message}" for error in errors)
+        if structural:
+            return None, structural
+        raw_calls = value.get("calls")
+        if not isinstance(raw_calls, list):
+            raise AssertionError("the validated model AgentStep calls field is not an array")
+        calls: list[dict[str, Any]] = []
+        decoded_violations: list[str] = []
+        for index, raw_call in enumerate(raw_calls):
+            if not isinstance(raw_call, Mapping):
+                raise AssertionError("the validated model AgentStep call is not an object")
+            name = cast(str, raw_call["name"])
+            version = cast(str, raw_call["version"])
+            key = (name, version)
+            validator = self._input_validators.get(key)
+            if validator is None:
+                decoded_violations.append(f"$.calls.{index}: unknown tool/version {name}@{version}")
+                continue
+            arguments, decode_error = _decode_arguments_json(cast(str, raw_call["argumentsJson"]))
+            if decode_error is not None:
+                decoded_violations.append(f"$.calls.{index}.argumentsJson: {decode_error}")
+                continue
+            assert arguments is not None
+            input_errors = sorted(
+                validator.iter_errors(arguments),
+                key=lambda item: tuple(str(part) for part in item.path),
+            )
+            decoded_violations.extend(
+                f"{_json_path(('calls', index, 'arguments', *error.absolute_path))}: {error.message}"
+                for error in input_errors
+            )
+            calls.append(
+                {
+                    "name": name,
+                    "version": version,
+                    "arguments": arguments,
+                    "reason": cast(str, raw_call["reason"]),
+                }
+            )
+        if decoded_violations:
+            return None, tuple(decoded_violations)
+        normalized = {
+            "requiresWriteOutcome": value["requiresWriteOutcome"],
+            "calls": calls,
+            "finalResponse": value["finalResponse"],
+        }
+        exact = self.violations(normalized, context_activations=context_activations)
+        return (normalized if not exact else None), exact
+
     def _build_schema(self) -> dict[str, Any]:
         definitions: dict[str, Any] = {}
         variants: list[dict[str, Any]] = []
@@ -298,6 +416,54 @@ class AgentStepCatalog:
             "$defs": definitions,
         }
 
+    def _build_model_schema(self) -> dict[str, Any]:
+        call_items: bool | dict[str, Any]
+        if not self._definitions:
+            call_items = False
+        else:
+            call_items = {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name", "version", "argumentsJson", "reason"],
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "enum": sorted({definition.name for definition in self._definitions}),
+                    },
+                    "version": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "argumentsJson": {"type": "string", "minLength": 2, "maxLength": 131_072},
+                    "reason": {"type": "string", "minLength": 1, "maxLength": 4096},
+                },
+            }
+        return {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": f"urn:offeragent:model-agent-step:{self._fingerprint[7:]}",
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["requiresWriteOutcome", "calls", "finalResponse"],
+            "properties": {
+                "requiresWriteOutcome": {"type": "boolean"},
+                "calls": {
+                    "type": "array",
+                    "maxItems": self._max_calls,
+                    "items": call_items,
+                },
+                "finalResponse": {
+                    "oneOf": [
+                        {"type": "null"},
+                        {"type": "string", "minLength": 1, "maxLength": 4096},
+                    ]
+                },
+            },
+            "allOf": [
+                {
+                    "if": {"properties": {"calls": {"maxItems": 0}}, "required": ["calls"]},
+                    "then": {"properties": {"finalResponse": {"type": "string", "minLength": 1}}},
+                    "else": {"properties": {"finalResponse": {"type": "null"}}},
+                }
+            ],
+        }
+
 
 class ModelPlanner:
     """Concrete Planner; the model can propose intent but never safety identity."""
@@ -314,7 +480,7 @@ class ModelPlanner:
         budget: BudgetLedger,
     ) -> None:
         self._gateway = gateway
-        self._context_manager = context_manager
+        self._context_manager = context_manager.with_system_rule(catalog.model_instruction)
         self._catalog = catalog
         self._config = config
         self._clock = clock
@@ -402,12 +568,14 @@ class ModelPlanner:
             # a plain recursive JSON tree rather than the catalog's immutable
             # Mapping wrappers so jsonschema's meta-schema type checks see
             # ordinary JSON objects at every level.
-            output_schema=cast(dict[str, Any], thaw_json(self._catalog.schema)),
+            output_schema=cast(dict[str, Any], thaw_json(self._catalog.model_schema)),
             max_output_tokens=self._config.max_output_tokens,
             reasoning_effort=self._config.reasoning_effort,
             temperature=self._config.temperature,
             seed=self._config.seed,
             trace_context=TraceContext(self._ids.new_id("trace")),
+            model_instructions=self._config.model_instructions,
+            use_responses_lite=self._config.use_responses_lite,
             metadata=metadata,
             hosted_tools=self._config.hosted_tools,
         )
@@ -570,11 +738,11 @@ class ModelPlanner:
         )
 
     def _to_planning_step(self, state: RunState, response: StructuredModelResponse) -> PlanningStep:
-        raw = cast(dict[str, Any], thaw_json(response.output))
+        projected = cast(dict[str, Any], thaw_json(response.output))
         activations = frozenset(
             activation for result in state.tool_results for activation in result.context_activations
         )
-        violations = self._catalog.violations(raw, context_activations=activations)
+        raw, violations = self._catalog.decode_model_step(projected, context_activations=activations)
         if violations:
             raise ModelInvalidOutput(
                 response.request_id,
@@ -582,6 +750,7 @@ class ModelPlanner:
                 raw_output=response.output,
                 usage=response.usage,
             )
+        assert raw is not None
         raw_calls = cast(list[dict[str, Any]], raw["calls"])
         calls: list[ToolCall] = []
         now = self._clock.utcnow()
@@ -615,6 +784,37 @@ class ModelPlanner:
             final_response=cast(str | None, raw["finalResponse"]),
             citations=response.citations,
         )
+
+
+def _decode_arguments_json(value: str) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        decoded = json.loads(
+            value,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, UnicodeError, ValueError, RecursionError) as error:
+        return None, f"must contain strict JSON ({error})"
+    if not isinstance(decoded, dict):
+        return None, "must decode to a JSON object"
+    try:
+        canonical_json_bytes(decoded)
+    except CanonicalJsonError as error:
+        return None, f"must contain canonical-hash-compatible JSON ({error})"
+    return decoded, None
+
+
+def _unique_json_object(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate object key {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant {value!r}")
 
 
 def _validated_hook_hints(hints: Sequence[str]) -> tuple[str, ...]:

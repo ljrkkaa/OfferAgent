@@ -109,6 +109,8 @@ class _CodexModels:
                 model_id=MODEL_ID,
                 display_name="GPT Vision Test",
                 description=None,
+                model_instructions="catalog-owned model baseline",
+                use_responses_lite=False,
                 input_modalities=("text", "image"),
                 supports_image_detail_original=True,
                 supports_hosted_search=False,

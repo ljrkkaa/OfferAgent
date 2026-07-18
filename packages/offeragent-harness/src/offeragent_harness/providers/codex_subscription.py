@@ -38,6 +38,7 @@ _MAX_CATALOG_BYTES = 8 * 1024 * 1024
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _CAPABILITY_ID = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _ACCOUNT_BINDING = re.compile(r"^sha256:[0-9a-f]{64}$")
+_PERSONALITY_PLACEHOLDER = "{{ personality }}"
 _CatalogFreshness = Literal["fresh", "stale", "unavailable"]
 _CatalogErrorCode = Literal[
     "auth_account_changed",
@@ -171,6 +172,8 @@ class CodexCatalogModel:
     model_id: str
     display_name: str
     description: str | None
+    model_instructions: str = field(repr=False)
+    use_responses_lite: bool
     input_modalities: tuple[str, ...]
     supports_image_detail_original: bool
     supports_hosted_search: bool
@@ -222,7 +225,7 @@ class CodexRunBinding:
         """Return the complete non-secret proof needed to resume without reselection."""
 
         return {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "modelId": self.model.model_id,
             "catalogRevision": self.catalog_revision,
             "boundAt": self.bound_at.isoformat(),
@@ -230,6 +233,8 @@ class CodexRunBinding:
             "modelCapabilities": {
                 "displayName": self.model.display_name,
                 "description": self.model.description,
+                "modelInstructions": self.model.model_instructions,
+                "useResponsesLite": self.model.use_responses_lite,
                 "inputModalities": list(self.model.input_modalities),
                 "supportsImageDetailOriginal": self.model.supports_image_detail_original,
                 "supportsHostedSearch": self.model.supports_hosted_search,
@@ -256,7 +261,7 @@ class CodexRunBinding:
     ) -> CodexRunBinding:
         """Strictly restore a fingerprinted historical binding for Run recovery."""
 
-        if value.get("schemaVersion") != 1 or value.get("modelId") != expected_model_id:
+        if value.get("schemaVersion") != 2 or value.get("modelId") != expected_model_id:
             raise ValueError("durable Codex model binding does not match the immutable Run model")
         account_binding = value.get("accountBinding")
         if account_binding != expected_account_binding or not isinstance(account_binding, str):
@@ -282,6 +287,8 @@ class CodexRunBinding:
                     "slug": expected_model_id,
                     "display_name": capabilities.get("displayName"),
                     "description": capabilities.get("description"),
+                    "base_instructions": capabilities.get("modelInstructions"),
+                    "use_responses_lite": capabilities.get("useResponsesLite"),
                     "input_modalities": _plain_list(capabilities.get("inputModalities")),
                     "supports_image_detail_original": capabilities.get("supportsImageDetailOriginal"),
                     "supports_search_tool": capabilities.get("supportsHostedSearch"),
@@ -518,6 +525,8 @@ def _decode_model(raw: Mapping[str, Any]) -> CodexCatalogModel:
     model_id = _bounded_text(raw.get("slug"), label="model ID", maximum=256, pattern=_MODEL_ID)
     display_name = _bounded_text(raw.get("display_name"), label="display name", maximum=512)
     description = _optional_text(raw.get("description"), label="description", maximum=2_048)
+    model_instructions = _resolve_model_instructions(raw)
+    use_responses_lite = _required_bool(raw.get("use_responses_lite"), "Responses Lite")
     modalities = _identifier_list(raw.get("input_modalities"), label="input modalities", maximum=16)
     image_original = _required_bool(raw.get("supports_image_detail_original"), "original image detail")
     hosted_search = _required_bool(raw.get("supports_search_tool"), "hosted search")
@@ -541,6 +550,8 @@ def _decode_model(raw: Mapping[str, Any]) -> CodexCatalogModel:
         model_id=model_id,
         display_name=display_name,
         description=description,
+        model_instructions=model_instructions,
+        use_responses_lite=use_responses_lite,
         input_modalities=modalities,
         supports_image_detail_original=image_original,
         supports_hosted_search=hosted_search,
@@ -552,6 +563,46 @@ def _decode_model(raw: Mapping[str, Any]) -> CodexCatalogModel:
         service_tiers=service_tiers,
         default_service_tier=default_service_tier,
     )
+
+
+def _resolve_model_instructions(raw: Mapping[str, Any]) -> str:
+    """Resolve the catalog baseline once, before it enters an immutable Run binding."""
+
+    base = _bounded_prompt_text(raw.get("base_instructions"), label="base instructions")
+    messages = raw.get("model_messages")
+    if messages is None:
+        return base
+    if not isinstance(messages, Mapping):
+        raise _CatalogDecodeError("model messages are invalid")
+    template = _optional_prompt_text(messages.get("instructions_template"), label="instructions template")
+    variables = messages.get("instructions_variables")
+    default_personality = ""
+    if variables is not None:
+        if not isinstance(variables, Mapping):
+            raise _CatalogDecodeError("model instruction variables are invalid")
+        decoded_variables = {
+            name: _optional_prompt_text(variables.get(name), label=name.replace("_", " "))
+            for name in ("personality_default", "personality_friendly", "personality_pragmatic")
+        }
+        default_personality = decoded_variables["personality_default"] or ""
+    if template is None:
+        return base
+    resolved = template.replace(_PERSONALITY_PLACEHOLDER, default_personality)
+    return _bounded_prompt_text(resolved, label="resolved model instructions")
+
+
+def _bounded_prompt_text(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 512 * 1024 or "\x00" in value:
+        raise _CatalogDecodeError(f"{label} is invalid")
+    return value
+
+
+def _optional_prompt_text(value: object, *, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 512 * 1024 or "\x00" in value:
+        raise _CatalogDecodeError(f"{label} is invalid")
+    return value
 
 
 def _service_tiers(value: object) -> tuple[CodexModelServiceTier, ...]:
@@ -665,6 +716,8 @@ def _catalog_revision(models: Sequence[CodexCatalogModel]) -> str:
         {
             "model": model.model_id,
             "displayName": model.display_name,
+            "modelInstructionsHash": hashlib.sha256(model.model_instructions.encode("utf-8")).hexdigest(),
+            "useResponsesLite": model.use_responses_lite,
             "inputModalities": model.input_modalities,
             "supportsImageDetailOriginal": model.supports_image_detail_original,
             "supportsHostedSearch": model.supports_hosted_search,

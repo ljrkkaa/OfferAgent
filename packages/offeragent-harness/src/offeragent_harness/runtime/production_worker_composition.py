@@ -1652,6 +1652,8 @@ class ProductionRunComponentsFactory(
         planner_config = PlannerModelConfig(
             model=selected_model,
             max_output_tokens=min(16_384, budget.max_output_tokens),
+            model_instructions=(context_binding.model.model_instructions if context_binding is not None else None),
+            use_responses_lite=(context_binding.model.use_responses_lite if context_binding is not None else False),
             reasoning_effort=config.reasoning_effort.value,
             temperature=0.0,
             hosted_tools=(

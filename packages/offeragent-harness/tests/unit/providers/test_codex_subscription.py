@@ -111,6 +111,7 @@ def _request(*, blocks: tuple[ModelContentBlock, ...] | None = None) -> ModelReq
     return ModelRequest(
         request_id="req_subscription",
         model="gpt-5.6-luna",
+        model_instructions="catalog-owned model baseline",
         purpose=ModelPurpose.RESPONDING,
         messages=(ModelMessage(ModelRole.USER, blocks or (ModelContentBlock.text("Reply OK"),)),),
         output_mode=ModelOutputMode.TEXT,
@@ -259,6 +260,7 @@ async def test_subscription_projects_production_tool_plan_to_supported_strict_sc
     request = ModelRequest(
         request_id="req_subscription_tool_plan",
         model="gpt-5.6-luna",
+        model_instructions="catalog-owned model baseline",
         purpose=ModelPurpose.PLANNING,
         messages=(ModelMessage(ModelRole.USER, (ModelContentBlock.text("Do not call tools"),)),),
         output_mode=ModelOutputMode.JSON,
@@ -357,6 +359,7 @@ async def test_subscription_projection_can_express_an_honest_pure_screenshot_cat
     request = ModelRequest(
         request_id="req_subscription_screenshot_catalog",
         model="gpt-5.6-luna",
+        model_instructions="catalog-owned model baseline",
         purpose=ModelPurpose.PLANNING,
         messages=(ModelMessage(ModelRole.USER, (ModelContentBlock.text("Catalog these screenshots"),)),),
         output_mode=ModelOutputMode.JSON,

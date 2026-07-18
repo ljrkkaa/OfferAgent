@@ -25,6 +25,7 @@ from offeragent_harness.providers.openai_responses import (
 )
 
 NOW = datetime(2026, 7, 18, 5, 0, tzinfo=timezone.utc)
+BASE_INSTRUCTIONS = "Catalog-owned Codex baseline instructions."
 
 
 def _account_binding(account: str) -> str:
@@ -145,6 +146,8 @@ def _model(
         "slug": slug,
         "display_name": f"Display {slug}",
         "description": f"Description {slug}",
+        "base_instructions": BASE_INSTRUCTIONS,
+        "use_responses_lite": False,
         "visibility": visibility,
         "input_modalities": modalities or ["text", "image"],
         "supports_image_detail_original": True,
@@ -185,6 +188,8 @@ def test_refresh_uses_account_bound_auth_and_projects_only_visible_models() -> N
     first = snapshot.models[0]
     assert first.display_name == "Display gpt-visible"
     assert first.description == "Description gpt-visible"
+    assert first.model_instructions == BASE_INSTRUCTIONS
+    assert first.use_responses_lite is False
     assert first.input_modalities == ("text", "image")
     assert first.supports_image_detail_original is True
     assert first.supports_hosted_search is True
@@ -202,6 +207,27 @@ def test_refresh_uses_account_bound_auth_and_projects_only_visible_models() -> N
     assert request.headers["originator"] == "codex_cli_rs"
     assert "refresh" not in repr(request).casefold()
     assert "access-one" not in repr(request)
+
+
+def test_refresh_resolves_the_catalog_template_with_the_default_personality() -> None:
+    templated = _model("gpt-templated")
+    templated["model_messages"] = {
+        "instructions_template": "Before {{ personality }} After",
+        "instructions_variables": {
+            "personality_default": "DEFAULT",
+            "personality_friendly": "FRIENDLY",
+            "personality_pragmatic": "PRAGMATIC",
+        },
+    }
+    module = CodexSubscriptionModelModule(
+        credentials=_CredentialSource([(b"access-one", "acct-one")]),
+        http=_Http([_response([templated])]),
+        now=lambda: NOW,
+    )
+
+    model = module.refresh().models[0]
+
+    assert model.model_instructions == "Before DEFAULT After"
 
 
 def test_catalog_requests_use_the_current_validated_runtime_proxy_without_caching_it() -> None:
@@ -314,7 +340,11 @@ def test_duplicate_or_malformed_visible_model_invalidates_the_whole_catalog() ->
     duplicate = _model("gpt-duplicate")
     malformed = _model("gpt-malformed")
     malformed["supports_search_tool"] = "yes"
-    for models in ([duplicate, duplicate], [malformed]):
+    missing_instructions = _model("gpt-missing-instructions")
+    del missing_instructions["base_instructions"]
+    missing_dialect = _model("gpt-missing-dialect")
+    del missing_dialect["use_responses_lite"]
+    for models in ([duplicate, duplicate], [malformed], [missing_instructions], [missing_dialect]):
         module = CodexSubscriptionModelModule(
             credentials=_CredentialSource([(b"access-one", "acct-one")]),
             http=_Http([_response(models)]),
@@ -325,6 +355,38 @@ def test_duplicate_or_malformed_visible_model_invalidates_the_whole_catalog() ->
 
         assert snapshot.freshness == "unavailable"
         assert snapshot.error is not None and snapshot.error.code == "catalog_invalid_response"
+
+
+def test_catalog_revision_changes_when_the_provider_model_baseline_changes() -> None:
+    original = _model("gpt-selected")
+    changed = _model("gpt-selected")
+    changed["base_instructions"] = BASE_INSTRUCTIONS + " Updated."
+    module = CodexSubscriptionModelModule(
+        credentials=_CredentialSource([(b"access-one", "acct-one")]),
+        http=_Http([_response([original]), _response([changed])]),
+        now=lambda: NOW,
+    )
+
+    first = module.refresh()
+    second = module.refresh()
+
+    assert first.catalog_revision != second.catalog_revision
+
+
+def test_catalog_revision_changes_when_the_provider_request_dialect_changes() -> None:
+    original = _model("gpt-selected")
+    changed = _model("gpt-selected")
+    changed["use_responses_lite"] = True
+    module = CodexSubscriptionModelModule(
+        credentials=_CredentialSource([(b"access-one", "acct-one")]),
+        http=_Http([_response([original]), _response([changed])]),
+        now=lambda: NOW,
+    )
+
+    first = module.refresh()
+    second = module.refresh()
+
+    assert first.catalog_revision != second.catalog_revision
 
 
 def test_run_binding_refreshes_and_freezes_the_exact_catalog_model() -> None:
@@ -414,4 +476,9 @@ def test_durable_run_binding_restores_without_requiring_startup_authentication()
     )
 
     assert restored == selected
+    assert restored.model.model_instructions == BASE_INSTRUCTIONS
+    capabilities = restored.durable_snapshot()["modelCapabilities"]
+    assert isinstance(capabilities, dict)
+    assert capabilities["modelInstructions"] == BASE_INSTRUCTIONS
+    assert capabilities["useResponsesLite"] is False
     assert unavailable_source.calls == 0

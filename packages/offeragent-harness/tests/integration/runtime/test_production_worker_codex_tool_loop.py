@@ -54,6 +54,7 @@ ACCOUNT_FINGERPRINT = f"fingerprint-{ACCOUNT_ID}"
 ACCOUNT_BINDING = f"sha256:{hashlib.sha256(ACCOUNT_FINGERPRINT.encode()).hexdigest()}"
 FINAL_ANSWER = "The Python production Agent Loop completed the plugin-backed request."
 AGENT_CONTRACT = "# OfferAgent\n\nUse current Vault evidence and complete plugin reads before answering.\n"
+BASE_INSTRUCTIONS = "Catalog-owned Codex production baseline."
 
 
 class _CodexCredentials:
@@ -96,6 +97,8 @@ class _CodexCatalog:
                     "slug": MODEL_ID,
                     "display_name": "Fused Production Fixture",
                     "description": "Deterministic Codex production-composition integration fixture",
+                    "base_instructions": BASE_INSTRUCTIONS,
+                    "use_responses_lite": True,
                     "visibility": "list",
                     "input_modalities": ["text"],
                     "supports_image_detail_original": False,
@@ -382,7 +385,7 @@ async def test_production_worker_codex_loop_round_trips_one_plugin_tool_without_
                     {
                         "name": "agent_contract.read",
                         "version": "1",
-                        "arguments": {},
+                        "argumentsJson": "{}",
                         "reason": "Load the current Vault Agent Contract before answering.",
                     }
                 ],
@@ -560,16 +563,40 @@ async def test_production_worker_codex_loop_round_trips_one_plugin_tool_without_
         )
         assert all(request.headers["chatgpt-account-id"] == ACCOUNT_ID for request in response_requests)
         assert all(body["model"] == MODEL_ID and body["store"] is False for body in response_bodies)
+        assert all("instructions" not in body and "tools" not in body for body in response_bodies)
         expected_tools = [{"type": "web_search"}] if supports_hosted_search else []
-        assert all(body["tools"] == expected_tools for body in response_bodies)
+        assert all(
+            body["input"][:2]
+            == [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": expected_tools,
+                },
+                {
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": BASE_INSTRUCTIONS}],
+                },
+            ]
+            for body in response_bodies
+        )
+        assert all(
+            all(message["role"] == "developer" for message in body["input"][2:first_user])
+            for body in response_bodies
+            for first_user in [
+                next(index for index, message in enumerate(body["input"]) if message.get("role") == "user")
+            ]
+        )
+        assert all(request.headers["x-openai-internal-codex-responses-lite"] == "true" for request in response_requests)
         assert all(("include" in body) is supports_hosted_search for body in response_bodies)
         first_input = json.dumps(response_bodies[0]["input"], ensure_ascii=False)
         second_messages = cast(list[dict[str, Any]], response_bodies[1]["input"])
         assert "Read the Vault Agent Contract" in first_input
+        assert "你是 OfferAgent。只能依据 Harness 提供的上下文和工具结果工作。" in first_input
         tool_blocks = [
             block
             for message in second_messages
-            for block in cast(list[dict[str, Any]], message["content"])
+            for block in cast(list[dict[str, Any]], message.get("content", []))
             if "structured block tool_result" in cast(str, block.get("text", ""))
         ]
         assert len(tool_blocks) == 1
