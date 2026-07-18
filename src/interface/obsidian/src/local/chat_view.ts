@@ -41,6 +41,8 @@ export interface LocalChatHost {
     uploadConversationAttachment(sessionId: string, file: File): Promise<ImageContentBlock>;
     readConversationAttachment(sessionId: string, artifact: ArtifactRef): Promise<Uint8Array>;
     discardConversationAttachment(sessionId: string, artifactId: string): Promise<boolean>;
+    deleteConversation(sessionId: string): Promise<boolean>;
+    undoVaultChange(batchId: string): Promise<string>;
     listSessions(): Promise<readonly { sessionId: string; title: string }[]>;
     listModels(): Promise<readonly ChatModelChoice[]>;
     selectModel(model: string): Promise<void>;
@@ -82,6 +84,7 @@ export class LocalChatView extends ItemView {
     private readonly composerPins = new Map<string, PinnedContextReference[]>();
     private readonly objectUrls = new Set<string>();
     private readonly renderObjectUrls = new Set<string>();
+    private readonly undoneVaultChangeBatches = new Set<string>();
 
     constructor(leaf: WorkspaceLeaf, host: LocalChatHost) {
         super(leaf);
@@ -287,8 +290,22 @@ export class LocalChatView extends ItemView {
                     void this.store?.openSession(session.sessionId)
                         .catch((error) => new Notice(actionableMessage(error)));
                 }));
+                menu.addItem((item) => item
+                    .setTitle(`删除会话及其附件：${session.title}`)
+                    .setIcon("trash-2")
+                    .onClick(() => void this.deleteConversation(session)));
             }
             menu.showAtMouseEvent(event);
+        } catch (error) {
+            new Notice(actionableMessage(error));
+        }
+    }
+
+    private async deleteConversation(session: { sessionId: string; title: string }): Promise<void> {
+        if (!window.confirm(`删除会话“${session.title}”及其附件？此操作不可撤销。`)) return;
+        try {
+            await this.host.deleteConversation(session.sessionId);
+            new Notice("会话及其附件已删除");
         } catch (error) {
             new Notice(actionableMessage(error));
         }
@@ -583,6 +600,25 @@ export class LocalChatView extends ItemView {
         if (tool.error) details.createEl("pre", { text: safeJson(tool.error) });
         if (tool.sideEffects.length > 0) details.createEl("pre", { text: safeJson({ sideEffects: tool.sideEffects }) });
         if (tool.artifactIds.length > 0) card.createDiv({ text: `Artifact: ${tool.artifactIds.join(", ")}` });
+        const batchId = vaultChangeUndoBatchId(tool);
+        if (batchId !== undefined && !this.undoneVaultChangeBatches.has(batchId)) {
+            const undo = card.createEl("button", { text: "撤销此批更改", cls: "offeragent-vault-undo" });
+            undo.onclick = () => void this.undoVaultChange(batchId, undo);
+        }
+    }
+
+    private async undoVaultChange(batchId: string, button: HTMLButtonElement): Promise<void> {
+        if (!window.confirm("仅当这些文件仍与应用后状态完全一致时才会撤销。继续？")) return;
+        button.disabled = true;
+        try {
+            const message = await this.host.undoVaultChange(batchId);
+            this.undoneVaultChangeBatches.add(batchId);
+            new Notice(message);
+            this.scheduleRender();
+        } catch (error) {
+            button.disabled = false;
+            new Notice(actionableMessage(error));
+        }
     }
 
     private renderApproval(container: HTMLElement, approval: ApprovalTimelineItem): void {
@@ -1101,6 +1137,19 @@ function visionStatusLabel(value: ChatModelChoice["visionStatus"]): string {
 export function ordinaryToolActivity(tool: Pick<ToolCallTimelineItem, "name" | "status">): boolean {
     return tool.name !== "vault.changes.apply" &&
         !["failed", "conflict", "unknown_outcome", "timed_out", "denied", "cancelled"].includes(tool.status);
+}
+
+export function vaultChangeUndoBatchId(
+    tool: Pick<ToolCallTimelineItem, "name" | "status" | "result">,
+): string | undefined {
+    if (tool.name !== "vault.changes.apply" || tool.status !== "succeeded" || tool.result === null) return undefined;
+    const data = tool.result.data;
+    if (data === null || typeof data !== "object" || Array.isArray(data)) return undefined;
+    const batchId = data.batchId;
+    return typeof batchId === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(batchId) &&
+        data.state === "applied" && data.undoAvailable === true
+        ? batchId
+        : undefined;
 }
 
 type ProjectedRun = ChatStoreSnapshot["projection"]["runs"] extends Map<string, infer Run> ? Run : never;

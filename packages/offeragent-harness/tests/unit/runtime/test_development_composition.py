@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from offeragent_harness.runtime import development_composition
+from offeragent_harness.runtime import development_composition, production_worker_composition
 from offeragent_harness.runtime.production_worker_composition import WorkerCommandLine, _protocol_capabilities
 from offeragent_harness.runtime.startup import RuntimeStartupBlocked, StartupFailurePhase
 
@@ -15,6 +15,12 @@ def test_protocol_capabilities_are_structural_not_workspace_policy() -> None:
 
     assert capabilities.loopback_web is True
     assert capabilities.event_replay is True
+
+
+def test_production_worker_enables_the_root_agent_contract_gate() -> None:
+    source = Path(production_worker_composition.__file__).read_text(encoding="utf-8")
+
+    assert 'required_root_initial_tool="agent_contract.read"' in source
 
 
 def test_worker_failure_code_exposes_only_stable_startup_phase() -> None:

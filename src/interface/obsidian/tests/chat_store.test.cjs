@@ -172,6 +172,32 @@ test("history reopen and tab selection hydrate durable events from the reducer c
     assert.deepEqual(client.reducer.state.runs.get(RUN).timeline.find((item) => item.kind === "assistant_message").blocks, ["persisted answer"]);
 });
 
+test("Conversation deletion removes every local tab and asks Worker to delete retained attachments", async () => {
+    const { ChatStore } = loadModule("chat_store.ts");
+    const calls = [];
+    const client = createClient(async (method, params) => {
+        calls.push([method, structuredClone(params)]);
+        if (method === "session/delete") {
+            return { sessionId: params.sessionId, deleted: true, activeRunsCancelRequested: [] };
+        }
+        return {};
+    });
+    const persistence = memoryPersistence();
+    const store = new ChatStore(client, persistence);
+    await store.initialize();
+    const blankTabId = store.activeTab.tabId;
+    await store.openSession(SESSION);
+
+    const deleted = await store.deleteSession(SESSION);
+
+    assert.equal(deleted, true);
+    assert.deepEqual(calls, [["session/delete", { sessionId: SESSION, hardDelete: false }]]);
+    assert.deepEqual(store.snapshot.tabs.map((tab) => tab.tabId), [blankTabId]);
+    assert.equal(store.snapshot.tabs.some((tab) => tab.sessionId === SESSION), false);
+    assert.equal(persistence.value.tabs.some((tab) => tab.sessionId === SESSION), false);
+    await store.dispose();
+});
+
 test("restart preserves interrupted partial output and waits for an explicit continuation command", async () => {
     const { ChatStore } = loadModule("chat_store.ts");
     const events = [

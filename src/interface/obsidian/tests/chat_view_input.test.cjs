@@ -155,6 +155,34 @@ test("ordinary tools collapse while Vault changes and failed outcomes remain dir
     assert.equal(ordinaryToolActivity({ name: "vault.read", status: "unknown_outcome" }), false);
 });
 
+test("applied Vault Change cards expose only their exact guarded undo batch", () => {
+    const { vaultChangeUndoBatchId } = loadModule();
+    const applied = {
+        name: "vault.changes.apply",
+        status: "succeeded",
+        result: { data: { batchId: "guarded", state: "applied", undoAvailable: true } },
+    };
+
+    assert.equal(vaultChangeUndoBatchId(applied), "guarded");
+    assert.equal(vaultChangeUndoBatchId({ ...applied, status: "failed" }), undefined);
+    assert.equal(vaultChangeUndoBatchId({
+        ...applied,
+        result: { data: { ...applied.result.data, undoAvailable: false } },
+    }), undefined);
+    assert.equal(vaultChangeUndoBatchId({ ...applied, name: "vault.read" }), undefined);
+});
+
+test("Sidebar exposes confirmed Conversation deletion and guarded Vault undo through its host", () => {
+    const source = readFileSync(path.join(__dirname, "../src/local/chat_view.ts"), "utf8");
+
+    assert.match(source, /deleteConversation\(sessionId: string\): Promise<boolean>/);
+    assert.match(source, /undoVaultChange\(batchId: string\): Promise<string>/);
+    assert.match(source, /删除会话及其附件/);
+    assert.match(source, /this\.host\.deleteConversation\(session\.sessionId\)/);
+    assert.match(source, /撤销此批更改/);
+    assert.match(source, /this\.host\.undoVaultChange\(batchId\)/);
+});
+
 test("sidebar uses Obsidian Markdown, Worker model choices, settings, and a frozen-scroll affordance", () => {
     const source = readFileSync(path.join(__dirname, "../src/local/chat_view.ts"), "utf8");
 

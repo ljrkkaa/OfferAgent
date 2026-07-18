@@ -43,6 +43,87 @@ export interface PluginToolExecutionPort {
     cancelRun?(runId: string): void;
 }
 
+export interface PluginToolEventObserver {
+    /** Stops accepting events synchronously, then resolves after every accepted execution settles. */
+    dispose(): Promise<void>;
+}
+
+const VAULT_FENCE_REGISTRY_KEY = "__offerAgentVaultToolExecutionFences_v1";
+type VaultFenceRegistry = Map<string, Promise<void>>;
+
+function vaultFenceRegistry(): VaultFenceRegistry {
+    const host = globalThis as typeof globalThis & {
+        [VAULT_FENCE_REGISTRY_KEY]?: VaultFenceRegistry;
+    };
+    host[VAULT_FENCE_REGISTRY_KEY] ??= new Map<string, Promise<void>>();
+    return host[VAULT_FENCE_REGISTRY_KEY];
+}
+
+function canonicalFenceScope(scope: string): string {
+    const canonical = scope.replace(/\\/gu, "/").replace(/\/+$/gu, "").toLocaleLowerCase();
+    if (!canonical) throw new TypeError("Vault execution fence scope is required");
+    return canonical;
+}
+
+function enqueueVaultExecution<T>(scope: string, operation: () => Promise<T>): Promise<T> {
+    const registry = vaultFenceRegistry();
+    const previous = registry.get(scope) ?? Promise.resolve();
+    const execution = previous.catch(() => undefined).then(operation);
+    const tail = execution.then(() => undefined, () => undefined);
+    registry.set(scope, tail);
+    void tail.then(() => {
+        if (registry.get(scope) === tail) registry.delete(scope);
+    });
+    return execution;
+}
+
+/**
+ * Serializes plugin Tool work per Vault across adapter replacement and plugin reloads in one Obsidian process.
+ * Initialization is in the same queue, so recovery always follows the retiring adapter and precedes new work.
+ */
+export class SerializedPluginToolExecutionFence implements PluginToolExecutionPort {
+    private readonly scope: string;
+    private readonly initialization: Promise<void>;
+    private readonly inFlight = new Set<Promise<unknown>>();
+
+    constructor(
+        scope: string,
+        private readonly executor: PluginToolExecutionPort,
+        initialize: () => Promise<void> = () => Promise.resolve(),
+    ) {
+        this.scope = canonicalFenceScope(scope);
+        this.initialization = enqueueVaultExecution(this.scope, initialize);
+    }
+
+    ready(): Promise<void> {
+        return this.initialization;
+    }
+
+    execute(call: ExecutableToolCallDescriptor): Promise<PluginToolCompleteResult> {
+        return this.runExclusive(() => this.executor.execute(call));
+    }
+
+    runExclusive<T>(operation: () => Promise<T>): Promise<T> {
+        const execution = enqueueVaultExecution(this.scope, async () => {
+            await this.initialization;
+            return operation();
+        });
+        this.inFlight.add(execution);
+        const forget = (): void => { this.inFlight.delete(execution); };
+        void execution.then(forget, forget);
+        return execution;
+    }
+
+    async drain(): Promise<void> {
+        await this.initialization.catch(() => undefined);
+        await Promise.allSettled([...this.inFlight]);
+    }
+
+    cancelRun(runId: string): void {
+        this.executor.cancelRun?.(runId);
+    }
+}
+
 /** The sole Obsidian-API boundary for capabilities owned by the plugin. */
 export class VaultToolAdapter {
     constructor(
@@ -126,8 +207,10 @@ export function observePluginToolEvents(
     source: PluginToolEventSource,
     executor: PluginToolExecutionPort,
     onError: (error: Error) => void,
-): () => void {
-    return source.subscribe((event) => {
+): PluginToolEventObserver {
+    const inFlight = new Set<Promise<void>>();
+    let disposed = false;
+    const unsubscribe = source.subscribe((event) => {
         if (["turn.cancelled", "turn.failed", "turn.interrupted"].includes(event.type)) {
             if (typeof event.runId === "string") executor.cancelRun?.(event.runId);
             return;
@@ -136,11 +219,25 @@ export function observePluginToolEvents(
         try {
             const call = executablePluginCall(event.payload);
             if (call === null) return;
-            void executor.execute(call).catch((error) => onError(asError(error)));
+            const execution = executor.execute(call)
+                .catch((error) => onError(asError(error)))
+                .then(() => undefined);
+            inFlight.add(execution);
+            const forget = (): void => { inFlight.delete(execution); };
+            void execution.then(forget, forget);
         } catch (error) {
             onError(asError(error));
         }
     });
+    return {
+        dispose: async (): Promise<void> => {
+            if (!disposed) {
+                disposed = true;
+                unsubscribe();
+            }
+            await Promise.allSettled([...inFlight]);
+        },
+    };
 }
 
 function executablePluginCall(payload: unknown): ExecutableToolCallDescriptor | null {

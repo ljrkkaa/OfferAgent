@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import type { TFile } from "obsidian";
 
 import type { ExecutableToolCallDescriptor, SourceRef, ToolResultDescriptor } from "./generated_protocol";
+import { failed, hasExtraKeys, succeeded } from "./plugin_tool_results";
 
 const MAX_CONTROL_BYTES = 32_768;
 const SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u;
@@ -241,37 +242,8 @@ function vaultSource(
     return { type: "vault", file: { workspaceId, path, contentHash }, freshness: "fresh", label };
 }
 
-function succeeded(
-    call: ExecutableToolCallDescriptor,
-    summary: string,
-    data: Record<string, unknown>,
-    sourceRefs: ToolResultDescriptor["sourceRefs"] = [],
-): ToolResultDescriptor {
-    return { toolCallId: call.toolCallId, status: "succeeded", summary, data, sourceRefs, retryable: false };
-}
-
 function controlReadFailure(call: ExecutableToolCallDescriptor, error: unknown, label: string): ToolResultDescriptor {
     const oversized = error instanceof RangeError;
     const message = oversized ? `${label} exceeds its bounded read contract.` : `${label} could not be read consistently.`;
     return failed(call, oversized ? "protocol.message_too_large" : "resource.conflict", message, !oversized);
-}
-
-function failed(
-    call: ExecutableToolCallDescriptor,
-    code: "protocol.invalid_params" | "protocol.message_too_large" | "resource.not_found" | "resource.conflict",
-    message: string,
-    retryable = false,
-): ToolResultDescriptor {
-    return {
-        toolCallId: call.toolCallId,
-        status: "failed",
-        summary: message,
-        data: {},
-        retryable,
-        error: { code, retryable, cancelled: false, userVisibleMessage: message, details: {} },
-    };
-}
-
-function hasExtraKeys(value: Readonly<Record<string, unknown>>, allowed: readonly string[]): boolean {
-    return Object.keys(value).some((key) => !allowed.includes(key));
 }

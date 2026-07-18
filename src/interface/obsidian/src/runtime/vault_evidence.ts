@@ -4,6 +4,7 @@ import { Buffer } from "node:buffer";
 import type { CachedMetadata, TFile } from "obsidian";
 
 import type { ExecutableToolCallDescriptor, ToolResultDescriptor } from "./generated_protocol";
+import { failed, hasExtraKeys, succeeded } from "./plugin_tool_results";
 
 const MAX_LIST_RESULTS = 100;
 const MAX_SEARCH_RESULTS = 20;
@@ -201,31 +202,6 @@ export class VaultEvidenceAdapter {
     }
 }
 
-function succeeded(
-    call: ExecutableToolCallDescriptor,
-    summary: string,
-    data: Record<string, unknown>,
-    sourceRefs: ToolResultDescriptor["sourceRefs"] = [],
-): ToolResultDescriptor {
-    return { toolCallId: call.toolCallId, status: "succeeded", summary, data, sourceRefs, retryable: false };
-}
-
-function failed(
-    call: ExecutableToolCallDescriptor,
-    code: "protocol.invalid_params" | "protocol.message_too_large" | "resource.not_found" | "resource.conflict",
-    message: string,
-    retryable = false,
-): ToolResultDescriptor {
-    return {
-        toolCallId: call.toolCallId,
-        status: "failed",
-        summary: message,
-        data: {},
-        retryable,
-        error: { code, retryable, cancelled: false, userVisibleMessage: message, details: {} },
-    };
-}
-
 function safeFilePath(value: unknown): string | undefined {
     if (typeof value !== "string") return undefined;
     const path = value.trim();
@@ -271,10 +247,6 @@ function optionalDigest(value: unknown): string | undefined | null {
 function optionalText(value: unknown, maximum: number): string | undefined | null {
     if (value === undefined) return undefined;
     return typeof value === "string" && value.length > 0 && value.length <= maximum ? value : null;
-}
-
-function hasExtraKeys(value: Readonly<Record<string, unknown>>, allowed: readonly string[]): boolean {
-    return Object.keys(value).some((key) => !allowed.includes(key));
 }
 
 function metadataText(cache: CachedMetadata | null | undefined): string {

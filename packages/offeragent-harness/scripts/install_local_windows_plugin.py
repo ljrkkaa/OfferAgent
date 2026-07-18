@@ -79,6 +79,7 @@ def install_local_plugin(artifact: Path, vault_root: Path) -> Path:
         _verify_artifact(target, allow_data_json=True)
         _migrate_known_legacy_install(target, vault)
         if backed_up:
+            _preserve_legacy_vault_change_journal(backup, target)
             _remove_tree_without_settings(backup)
         return target
     except BaseException:
@@ -286,6 +287,25 @@ def _migrate_known_legacy_install(target: Path, vault: Path) -> None:
             workspace_id=portable.portable_workspace_id,
         )
     )
+
+
+def _preserve_legacy_vault_change_journal(backup: Path, target: Path) -> None:
+    """Copy plugin-local recovery state so the first new startup can migrate it.
+
+    Copying instead of moving keeps the old install completely recoverable until
+    activation succeeds.  The plugin validates and idempotently migrates the
+    records because it owns their schema.
+    """
+
+    source = backup / "vault-change-journal"
+    if not os.path.lexists(source):
+        return
+    _verify_regular_tree(source)
+    destination = target / "vault-change-journal"
+    if os.path.lexists(destination):
+        raise LocalPluginInstallError("new plugin unexpectedly contains Vault Change recovery state")
+    shutil.copytree(source, destination)
+    _verify_regular_tree(destination)
 
 
 def _strict_canonical_json(path: Path, *, allow_pretty: bool = False) -> dict[str, Any]:

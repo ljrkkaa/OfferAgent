@@ -26,6 +26,7 @@ from offeragent_harness.tools import (
     SideEffectClass,
     ToolCall,
     ToolDefinition,
+    ToolError,
     ToolResult,
     ToolResultStatus,
     canonical_json_sha256,
@@ -190,6 +191,78 @@ def _write_execution() -> ToolExecution:
     return ToolExecution(call, definition, result)
 
 
+def _contract_execution(tool_call_id: str, *, succeeded: bool) -> ToolExecution:
+    definition = ToolDefinition(
+        name="agent_contract.read",
+        version="1",
+        description="Read the root Agent contract before acting",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        output_schema={},
+        executor_location=ExecutorLocation.PLUGIN,
+        risk=RiskClass.READ,
+        side_effect_class=SideEffectClass.READ,
+        required_capabilities=frozenset({"agent_contract.read"}),
+        concurrency_safe=True,
+        idempotent=True,
+        retryable=True,
+        timeout_ms=30_000,
+        output_limit_bytes=4_096,
+        preflight_mode=PreflightMode.NONE,
+        preflight_provider=None,
+        approval_evidence=ApprovalEvidence.NONE,
+        result_sensitivity=ResultSensitivity.WORKSPACE,
+    )
+    call = ToolCall(
+        tool_call_id=tool_call_id,
+        run_id="run",
+        workspace_id="workspace",
+        name=definition.name,
+        version=definition.version,
+        arguments={},
+        args_hash=canonical_json_sha256({}),
+        idempotency_key=f"contract-{tool_call_id}",
+        deadline=None,
+        lineage=AgentLineage.root("run"),
+        definition_fingerprint=definition.fingerprint,
+        result_sensitivity=definition.result_sensitivity,
+    )
+    result = ToolResult(
+        tool_call_id=tool_call_id,
+        status=ToolResultStatus.SUCCEEDED if succeeded else ToolResultStatus.FAILED,
+        data={"contentHash": "sha256:" + "a" * 64} if succeeded else None,
+        user_visible_summary="Agent contract loaded" if succeeded else "Agent contract unavailable",
+        artifact_ids=(),
+        source_refs=(),
+        side_effects=(),
+        retryable=not succeeded,
+        before_state=None,
+        after_state=None,
+        error=None if succeeded else ToolError("resource.not_found", "agent.md is unavailable", True, False, {}),
+    )
+    return ToolExecution(call, definition, result)
+
+
+class ScriptedKernel:
+    def __init__(self, executions: Sequence[ToolExecution]) -> None:
+        self._executions = list(executions)
+
+    async def execute_batch(
+        self,
+        calls: Sequence[ToolCall],
+        cancellation: CancellationToken,
+        observer: ToolLifecycleObserver | None = None,
+    ) -> tuple[ToolExecution, ...]:
+        cancellation.checkpoint()
+        if not self._executions or observer is None:
+            raise AssertionError("unexpected Tool Kernel execution")
+        execution = self._executions.pop(0)
+        if tuple(calls) != (execution.call,):
+            raise AssertionError("Agent Contract gate allowed an unexpected Tool call")
+        await observer.execution_started(execution.call, execution.definition)
+        await observer.result_available(execution.call, execution.definition, execution.result)
+        return (execution,)
+
+
 @pytest.mark.asyncio
 async def test_one_agent_step_publishes_final_response_without_second_model_call() -> None:
     response = "已完成。" * 100
@@ -237,6 +310,46 @@ async def test_tool_result_returns_to_same_loop_before_final_response() -> None:
     assert result.write_obligation.satisfied
     event_names = [event for event, _, _ in recorder.events]
     assert event_names.index("tool.completed") < event_names.index("assistant.completed")
+
+
+@pytest.mark.asyncio
+async def test_root_agent_rejects_final_or_other_actions_until_agent_contract_read_succeeds() -> None:
+    failed_contract = _contract_execution("call-contract-failed", succeeded=False)
+    loaded_contract = _contract_execution("call-contract-loaded", succeeded=True)
+    other_call = _write_execution().call
+    recorder = Recorder()
+
+    result = await run_agent_loop(
+        _state(),
+        planner=ScriptedPlanner(
+            (
+                PlanningStep((), False, "premature response"),
+                PlanningStep((other_call,), False, None),
+                PlanningStep((failed_contract.call,), False, None),
+                PlanningStep((), False, "still premature after failed read"),
+                PlanningStep((loaded_contract.call,), False, None),
+                PlanningStep((), False, "contract-aware response"),
+            )
+        ),
+        tool_kernel=ScriptedKernel((failed_contract, loaded_contract)),
+        recorder=recorder,
+        budget=_budget(model_rounds=8),
+        cancellation=CancellationScope(name="test-contract-gate"),
+        now=lambda: datetime.now(timezone.utc),
+        required_root_initial_tool="agent_contract.read",
+    )
+
+    assert result.phase is RunPhase.COMPLETED
+    assert result.assistant_text == "contract-aware response"
+    assert result.tool_calls == 2
+    accepted = [payload for event, payload, _ in recorder.events if event == "tool.calls.accepted"]
+    assert [[call["name"] for call in cast(list[dict[str, object]], payload["calls"])] for payload in accepted] == [
+        ["agent_contract.read"],
+        ["agent_contract.read"],
+    ]
+    blockers = [payload for event, payload, _ in recorder.events if event == "run.continuation_required"]
+    assert len(blockers) == 3
+    assert all(payload["blockers"] == ["required_initial_tool:agent_contract.read"] for payload in blockers)
 
 
 def test_agent_step_contract_rejects_mixed_or_empty_terminal_states() -> None:

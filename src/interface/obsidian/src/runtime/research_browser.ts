@@ -6,6 +6,7 @@ import { connect as netConnect, isIP } from "node:net";
 import type { Duplex } from "node:stream";
 
 import type { ExecutableToolCallDescriptor, ToolResultDescriptor, WebSourceRef } from "./generated_protocol";
+import { failed, hasExtraKeys, succeeded } from "./plugin_tool_results";
 
 export const RESEARCH_BROWSER_PARTITION = "persist:offeragent-research-v1";
 const MAX_PAGE_BYTES = 65_536;
@@ -195,7 +196,7 @@ interface ElectronSessionLike {
     on(name: "will-download", handler: (event: { preventDefault(): void }) => void): void;
     webRequest: {
         onBeforeRequest(handler: (
-            details: { url: string },
+            details: { url: string; method: string; uploadData?: readonly unknown[] },
             callback: (response: { cancel: boolean }) => void,
         ) => void): void;
     };
@@ -307,6 +308,9 @@ class PublicNetworkProxy {
         request: import("node:http").IncomingMessage,
         response: import("node:http").ServerResponse,
     ): Promise<void> {
+        if (!readOnlyRequest(request.method, request.headers, undefined)) {
+            throw new UnsafeResearchUrlError("Research Browser proxy refused a state-changing HTTP request.");
+        }
         const url = validatedPublicUrl(request.url);
         if (url === undefined || url.protocol !== "http:") {
             throw new UnsafeResearchUrlError("Research Browser proxy refused an unsafe HTTP request.");
@@ -314,6 +318,8 @@ class PublicNetworkProxy {
         const destination = await this.publicEndpoint(url.hostname);
         const headers: Record<string, string | string[] | undefined> = { ...request.headers, host: url.host };
         delete headers["proxy-connection"];
+        delete headers["content-length"];
+        delete headers["transfer-encoding"];
         const upstream = httpRequest({
             host: destination.address,
             family: destination.family,
@@ -330,7 +336,7 @@ class PublicNetworkProxy {
             if (!response.headersSent) response.writeHead(502);
             response.end();
         });
-        request.pipe(upstream);
+        upstream.end();
     }
 
     private async tunnel(authority: string | undefined, client: Duplex, head: Buffer): Promise<void> {
@@ -470,6 +476,10 @@ export class ElectronResearchPagePort implements ResearchPagePort {
         window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
         window.webContents.session.on("will-download", (event) => event.preventDefault());
         window.webContents.session.webRequest.onBeforeRequest((details, callback) => {
+            if (!readOnlyRequest(details.method, undefined, details.uploadData)) {
+                callback({ cancel: true });
+                return;
+            }
             void this.safeNetworkUrl(details.url).then(
                 (safe) => callback({ cancel: !safe }),
                 () => callback({ cancel: true }),
@@ -491,6 +501,21 @@ export class ElectronResearchPagePort implements ResearchPagePort {
             return false;
         }
     }
+}
+
+function readOnlyRequest(
+    method: string | undefined,
+    headers?: Readonly<Record<string, string | string[] | undefined>>,
+    uploadData?: readonly unknown[],
+): boolean {
+    const normalized = (method ?? "GET").toLocaleUpperCase();
+    if (normalized !== "GET" && normalized !== "HEAD") return false;
+    if (uploadData !== undefined && uploadData.length > 0) return false;
+    if (headers?.["transfer-encoding"] !== undefined) return false;
+    const length = headers?.["content-length"];
+    if (length === undefined) return true;
+    const values = Array.isArray(length) ? length : [length];
+    return values.every((value) => /^0+$/u.test(value.trim()));
 }
 
 class UnavailableResearchPagePort implements ResearchPagePort {
@@ -687,38 +712,8 @@ function waitForNavigation(contents: ElectronWebContentsLike, action: () => void
     });
 }
 
-function succeeded(
-    call: ExecutableToolCallDescriptor,
-    summary: string,
-    data: Record<string, unknown>,
-    sourceRefs: ToolResultDescriptor["sourceRefs"] = [],
-): ToolResultDescriptor {
-    return { toolCallId: call.toolCallId, status: "succeeded", summary, data, sourceRefs, retryable: false };
-}
-
-function failed(
-    call: ExecutableToolCallDescriptor,
-    code: "protocol.invalid_params" | "protocol.message_too_large" | "resource.not_found" |
-        "resource.conflict" | "policy.denied",
-    message: string,
-    retryable = false,
-): ToolResultDescriptor {
-    return {
-        toolCallId: call.toolCallId,
-        status: "failed",
-        summary: message,
-        data: {},
-        retryable,
-        error: { code, retryable, cancelled: false, userVisibleMessage: message, details: {} },
-    };
-}
-
 function invalidAction(call: ExecutableToolCallDescriptor): ToolResultDescriptor {
     return failed(call, "protocol.invalid_params", "Research Browser action arguments are invalid.");
-}
-
-function hasExtraKeys(value: Readonly<Record<string, unknown>>, allowed: readonly string[]): boolean {
-    return Object.keys(value).some((key) => !allowed.includes(key));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

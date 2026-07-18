@@ -5,7 +5,7 @@ import asyncio
 import json
 import os
 import shutil
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -59,6 +59,7 @@ class _CrashRecoveryModel:
     def __init__(self) -> None:
         self.planning_requests = 0
         self.planning_requests_with_tool_result = 0
+        self._write_already_resolved = False
 
     async def stream(
         self,
@@ -70,10 +71,26 @@ class _CrashRecoveryModel:
         sequence = 2
         if request.purpose is ModelPurpose.PLANNING:
             self.planning_requests += 1
-            has_tool_result = any(message.role is ModelRole.TOOL for message in request.messages)
+            tool_result_count = sum(message.role is ModelRole.TOOL for message in request.messages)
+            has_tool_result = tool_result_count > 0
             if has_tool_result:
                 self.planning_requests_with_tool_result += 1
+            if self.planning_requests == 1:
+                self._write_already_resolved = tool_result_count >= 2
                 output: dict[str, Any] = {
+                    "requiresWriteOutcome": False,
+                    "calls": [
+                        {
+                            "name": "agent_contract.read",
+                            "version": "1",
+                            "arguments": {},
+                            "reason": "在根 Agent Run 行动前加载当前 Vault Agent Contract。",
+                        }
+                    ],
+                    "finalResponse": None,
+                }
+            elif self._write_already_resolved or tool_result_count >= 2:
+                output = {
                     "requiresWriteOutcome": True,
                     "calls": [],
                     "finalResponse": "已依据持久化的工具结果完成恢复。",
@@ -197,6 +214,72 @@ async def _dispatch(
     return cast(dict[str, Any], result)
 
 
+async def _complete_pending_agent_contract(
+    application: ProductionWorkerApplication,
+    run_id: str,
+) -> bool:
+    events = await application.harness.replay_events(run_id)
+    completed_ids: set[str] = set()
+    for event in events:
+        if event.event_type not in {"tool.completed", "tool.failed"}:
+            continue
+        payload = cast(Mapping[str, Any], event.payload["payload"])
+        result = cast(Mapping[str, Any], payload["result"])
+        completed_ids.add(cast(str, result["toolCallId"]))
+    for event in reversed(events):
+        if event.event_type != "tool.started":
+            continue
+        payload = cast(Mapping[str, Any], event.payload["payload"])
+        call = cast(Mapping[str, Any], payload["call"])
+        tool_call_id = cast(str, call["toolCallId"])
+        if call["name"] != "agent_contract.read" or tool_call_id in completed_ids:
+            continue
+        content = (application.vault_root / "agent.md").read_text(encoding="utf-8")
+        digest = content_hash(content.encode("utf-8"))
+        await _dispatch(
+            application,
+            "plugin-tools/complete",
+            {
+                "workspaceId": call["workspaceId"],
+                "runId": call["runId"],
+                "definitionFingerprint": call["definitionFingerprint"],
+                "argsHash": call["argsHash"],
+                "idempotencyKey": call["idempotencyKey"],
+                "result": {
+                    "toolCallId": tool_call_id,
+                    "status": "succeeded",
+                    "summary": "Read the Vault Agent Contract.",
+                    "data": {"path": "agent.md", "content": content, "contentHash": digest},
+                    "sourceRefs": [
+                        {
+                            "type": "vault",
+                            "file": {
+                                "workspaceId": call["workspaceId"],
+                                "path": "agent.md",
+                                "contentHash": digest,
+                            },
+                            "freshness": "fresh",
+                        }
+                    ],
+                },
+            },
+            ApplicationCommandContext(transport="stdio", client_id="obsidian-plugin"),
+        )
+        return True
+    return False
+
+
+async def _wait_for_agent_contract(application: ProductionWorkerApplication, run_id: str) -> None:
+    for _ in range(1_000):
+        if await _complete_pending_agent_contract(application, run_id):
+            return
+        run = await application.harness.get_run(run_id)
+        if run.status.is_terminal:
+            raise RuntimeError(f"Run terminated before Agent Contract read: {run.status.value}")
+        await asyncio.sleep(0.01)
+    raise RuntimeError("root Agent Run did not request agent_contract.read")
+
+
 async def _crash(root: Path, stage: str) -> int:
     barrier = _CrashAndRecoveryBarrier(stage)
     model = _CrashRecoveryModel()
@@ -229,6 +312,8 @@ async def _crash(root: Path, stage: str) -> int:
             },
             context,
         )
+        run_id = cast(str, started["runId"])
+        await _wait_for_agent_contract(application, run_id)
         session_id = cast(str, created["session"]["sessionId"])
         pending: tuple[ApprovalRequest, ...] = ()
         for _ in range(1_000):
@@ -243,7 +328,7 @@ async def _crash(root: Path, stage: str) -> int:
             )
             if pending:
                 break
-            run = await application.harness.get_run(cast(str, started["runId"]))
+            run = await application.harness.get_run(run_id)
             if run.status.is_terminal:
                 raise RuntimeError(f"Run terminated before Vault approval: {run.status.value}")
             await asyncio.sleep(0.01)
@@ -275,7 +360,10 @@ async def _wait_recovered_runs(application: ProductionWorkerApplication) -> list
         raise RuntimeError("production Harness startup report is missing")
     statuses: list[str] = []
     for active in report.active_runs:
+        contract_completed = False
         for _ in range(1_000):
+            if not contract_completed:
+                contract_completed = await _complete_pending_agent_contract(application, active.run_id)
             run = await application.harness.get_run(active.run_id)
             if run.status.is_terminal:
                 statuses.append(run.status.value)

@@ -83,7 +83,7 @@ test("plugin tool event observer delegates only plugin-owned started calls", asy
     };
     const observed = [];
     const cancelled = [];
-    const dispose = observePluginToolEvents(events, {
+    const observer = observePluginToolEvents(events, {
         execute: async (candidate) => {
             observed.push(candidate);
             return { accepted: true, replayed: false };
@@ -99,8 +99,73 @@ test("plugin tool event observer delegates only plugin-owned started calls", asy
     assert.equal(observed.length, 1);
     assert.equal(observed[0].toolCallId, "call_contract");
     assert.deepEqual(cancelled, ["run_contract"]);
-    dispose();
+    await observer.dispose();
     assert.equal(listener, undefined);
+});
+
+test("plugin tool event observer unsubscribes immediately and drains in-flight executions", async () => {
+    const { observePluginToolEvents } = loadModule();
+    let listener;
+    let releaseExecution;
+    let executionStarted = false;
+    const executionGate = new Promise((resolve) => { releaseExecution = resolve; });
+    const observer = observePluginToolEvents({
+        subscribe: (candidate) => {
+            listener = candidate;
+            return () => { listener = undefined; };
+        },
+    }, {
+        execute: async () => {
+            executionStarted = true;
+            await executionGate;
+            return { accepted: true, replayed: false };
+        },
+    }, (error) => { throw error; });
+
+    listener({ type: "tool.started", payload: { call: call() } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(executionStarted, true);
+
+    let drained = false;
+    const draining = observer.dispose().then(() => { drained = true; });
+    assert.equal(listener, undefined);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(drained, false);
+
+    releaseExecution();
+    await draining;
+    assert.equal(drained, true);
+});
+
+test("same-process Vault execution fence serializes replacement adapters and recovery", async () => {
+    const { SerializedPluginToolExecutionFence } = loadModule();
+    const events = [];
+    let releaseFirst;
+    const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+    const first = new SerializedPluginToolExecutionFence("C:/vault", {
+        execute: async () => {
+            events.push("first:start");
+            await firstGate;
+            events.push("first:end");
+            return { accepted: true, replayed: false };
+        },
+    }, async () => { events.push("first:recover"); });
+    const firstExecution = first.execute(call({ toolCallId: "call_first" }));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const second = new SerializedPluginToolExecutionFence("c:\\VAULT", {
+        execute: async () => {
+            events.push("second:execute");
+            return { accepted: true, replayed: false };
+        },
+    }, async () => { events.push("second:recover"); });
+    const secondExecution = second.execute(call({ toolCallId: "call_second" }));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(events, ["first:recover", "first:start"]);
+
+    releaseFirst();
+    await Promise.all([firstExecution, secondExecution]);
+    assert.deepEqual(events, ["first:recover", "first:start", "first:end", "second:recover", "second:execute"]);
 });
 
 test("Vault Tool Adapter rejects a cross-Vault call before reading or completing", async () => {

@@ -128,6 +128,30 @@ def test_installer_atomically_preserves_opaque_data_json(
     assert not tuple(target.parent.glob(".offeragent-obsidian-plugin.backup-*"))
 
 
+def test_installer_preserves_legacy_vault_change_journal_for_first_start_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "offeragent_harness.runtime.development_runtime_manifest.native_windows_architecture",
+        lambda: "x64",
+    )
+    artifact = _artifact(tmp_path / "artifact")
+    vault = tmp_path / "Vault"
+    target = vault / ".obsidian" / "plugins" / "offeragent-obsidian-plugin"
+    legacy_journal = target / "vault-change-journal"
+    legacy_journal.mkdir(parents=True)
+    (target / "main.js").write_text("old", encoding="utf-8")
+    record = b'{"version":1,"batchId":"batch_pending","state":"applying"}\n'
+    (legacy_journal / "batch_pending.json").write_bytes(record)
+
+    installed = install_local_plugin(artifact, vault)
+
+    assert installed == target
+    assert (target / "vault-change-journal" / "batch_pending.json").read_bytes() == record
+    assert not tuple(target.parent.glob(".offeragent-obsidian-plugin.backup-*"))
+
+
 def test_installer_rolls_back_old_plugin_and_data_on_post_activation_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

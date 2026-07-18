@@ -511,3 +511,44 @@ test("file journal atomically replaces durable state and rejects unsafe recovery
     }));
     await assert.rejects(store.load("batch_unsafe"), /malformed/);
 });
+
+test("file journal migrates the plugin-local journal idempotently and fails closed on conflicts", async (t) => {
+    const { FileVaultChangeJournal } = loadModule();
+    const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-journal-migration-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const legacyDirectory = path.join(root, "plugin", "vault-change-journal");
+    const stableDirectory = path.join(root, ".obsidian", "offeragent", "vault-change-journal");
+    const legacy = new FileVaultChangeJournal(legacyDirectory);
+    const stable = new FileVaultChangeJournal(stableDirectory);
+    const base = {
+        version: 1,
+        batchId: "batch_migrated",
+        toolCallId: "call_migrated",
+        workspaceId: "ws_vault",
+        runId: "run_migrated",
+        argsHash: digest("arguments"),
+        idempotencyKey: "idem_migrated",
+        state: "applying",
+        checkpointRef: "refs/offeragent/checkpoints/batch_migrated",
+        targets: [{
+            operation: "append",
+            path: "notes/a.md",
+            beforeHash: digest("before"),
+            afterHash: digest("after"),
+        }],
+        appliedPaths: ["notes/a.md"],
+        manualReviewPaths: [],
+    };
+    await legacy.save(base);
+
+    await stable.migrateLegacyDirectory(legacyDirectory);
+    await stable.migrateLegacyDirectory(legacyDirectory);
+
+    assert.deepEqual(await stable.load("batch_migrated"), base);
+    await assert.rejects(readFile(path.join(legacyDirectory, "batch_migrated.json")), /ENOENT/);
+
+    await legacy.save({ ...base, state: "recovery_failed", manualReviewPaths: ["notes/a.md"] });
+    await assert.rejects(stable.migrateLegacyDirectory(legacyDirectory), /conflicts with stable journal/);
+    assert.equal((await stable.load("batch_migrated")).state, "applying");
+    assert.equal((await legacy.load("batch_migrated")).state, "recovery_failed");
+});

@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const http = require("node:http");
 const path = require("node:path");
 const test = require("node:test");
 const { buildSync } = require("esbuild");
@@ -106,9 +107,11 @@ test("Research Browser exposes only isolated read navigation and treats rendered
     assert.ok(page.state.shown >= 5);
 });
 
-test("Electron Research Browser uses an isolated partition and a public-DNS-pinning proxy", async () => {
+test("Electron Research Browser uses an isolated partition and a public-DNS-pinning proxy", async (t) => {
     const { ElectronResearchPagePort, RESEARCH_BROWSER_PARTITION } = loadModule();
     const state = { options: null, proxy: null, loaded: null, permission: null, download: null, request: null };
+    let resolutions = 0;
+    let rejectResolutions = false;
     class FakeWindow {
         constructor(options) {
             state.options = options;
@@ -132,8 +135,13 @@ test("Electron Research Browser uses an isolated partition and a public-DNS-pinn
     }
     const page = new ElectronResearchPagePort(
         { BrowserWindow: FakeWindow },
-        async () => [{ address: "93.184.216.34" }],
+        async () => {
+            resolutions += 1;
+            if (rejectResolutions) throw new Error("network access should not be attempted");
+            return [{ address: "93.184.216.34" }];
+        },
     );
+    t.after(async () => page.close());
     page.show();
     await page.open("https://example.com/interviews", new AbortController().signal);
 
@@ -148,7 +156,38 @@ test("Electron Research Browser uses an isolated partition and a public-DNS-pinn
     let downloadPrevented = false;
     state.download({ preventDefault: () => { downloadPrevented = true; } });
     assert.equal(downloadPrevented, true);
-    await page.close();
+
+    const requestAllowed = async (details) => await new Promise((resolve) => {
+        state.request(details, ({ cancel }) => resolve(!cancel));
+    });
+    assert.equal(await requestAllowed({ url: "https://example.com/read", method: "GET" }), true);
+    assert.equal(await requestAllowed({ url: "https://example.com/read", method: "HEAD" }), true);
+    assert.equal(await requestAllowed({ url: "https://example.com/write", method: "POST" }), false);
+    assert.equal(await requestAllowed({
+        url: "https://example.com/upload",
+        method: "GET",
+        uploadData: [{ bytes: Buffer.from("payload") }],
+    }), false);
+
+    const proxyPort = Number(state.proxy.proxyRules.match(/http=127\.0\.0\.1:(\d+)/)[1]);
+    const resolutionsBeforePost = resolutions;
+    rejectResolutions = true;
+    const proxyStatus = await new Promise((resolve, reject) => {
+        const request = http.request({
+            host: "127.0.0.1",
+            port: proxyPort,
+            method: "POST",
+            path: "http://example.com/write",
+            headers: { "content-length": "1" },
+        }, (response) => {
+            response.resume();
+            response.on("end", () => resolve(response.statusCode));
+        });
+        request.on("error", reject);
+        request.end("x");
+    });
+    assert.equal(proxyStatus, 502);
+    assert.equal(resolutions, resolutionsBeforePost, "read-only proxy must reject POST before DNS or network access");
 });
 
 test("Research Browser reports login pause and insufficient pagination without broadening scope", async () => {

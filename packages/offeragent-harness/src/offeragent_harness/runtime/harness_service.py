@@ -425,9 +425,14 @@ class HarnessService:
         run_context_provider: RunContextProvider | None = None,
         context_enricher: ContextInputsEnricher | None = None,
         run_preparation_limits: RunPreparationLimits | None = None,
+        required_root_initial_tool: str | None = None,
     ) -> None:
         if (hooks is None) != (hook_context_factory is None):
             raise ValueError("hooks and hook_context_factory must be configured together")
+        if required_root_initial_tool is not None and (
+            not required_root_initial_tool.strip() or len(required_root_initial_tool) > 256
+        ):
+            raise ValueError("required root initial Tool name must be a non-empty bounded string")
         self._unit_of_work = unit_of_work
         self._event_sink = event_sink
         self._clock = clock
@@ -443,6 +448,7 @@ class HarnessService:
         self._run_context_provider = run_context_provider
         self._context_enricher = context_enricher or ContextInputsEnricher()
         self._run_preparation_limits = run_preparation_limits or RunPreparationLimits()
+        self._required_root_initial_tool = required_root_initial_tool
         self._turn_manager = turn_manager or TurnManager()
         self._approval_manager = approval_manager or ApprovalManager(unit_of_work=unit_of_work, clock=clock)
         self._command_lock = asyncio.Lock()
@@ -1111,6 +1117,7 @@ class HarnessService:
                 hook_context=hook_context,
                 control_inbox=control_inbox,
                 run_preparation=run_preparation,
+                required_root_initial_tool=self._required_root_initial_tool,
             )
             if result.phase.terminal:
                 persisted = await self._authoritative_terminal_state(result.run_id)

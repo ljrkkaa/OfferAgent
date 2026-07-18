@@ -8,6 +8,8 @@ status: accepted
 
 在插件执行边界内，耐久 Journal 只保存批次绑定、目标路径、读取时与应用后 Hash、Git Checkpoint 引用和事务状态；Python Runtime 的 invocation journal 独立保存本次 Tool 调用结果。文件恢复内容由 Git 对象保存，不在任一 Journal 中复制完整文件或保存长期反向文本副本。此所有权划分由 ADR 0025 收窄：Python Runtime 不执行 Vault 文件恢复，插件也不拥有 Agent Run 状态。
 
+插件 Journal 位于 Vault 配置目录下的 `offeragent/vault-change-journal`，不属于可被更新器替换的插件安装树。升级自早期本地构建时，安装器先把旧插件目录中的 Journal 原样复制到新安装树以保持可回滚性；新插件在每 Vault 串行执行栅栏内校验并幂等迁移记录，完成后才开始恢复和接受新 Tool 调用。冲突记录失败关闭，不覆盖任一副本。
+
 ## Recovery protocol
 
 1. 验证全部目标路径、操作和读取时版本。

@@ -855,10 +855,16 @@ async def run_agent_loop(
     hook_context: HookExecutionContext | None = None,
     control_inbox: RunControlInbox | None = None,
     run_preparation: RunPreparationPort | None = None,
+    required_root_initial_tool: str | None = None,
 ) -> RunState:
     """Drive one root or child AgentRun through the single canonical state machine."""
 
     state = initial_state
+    if required_root_initial_tool is not None and (
+        not required_root_initial_tool.strip() or len(required_root_initial_tool) > 256
+    ):
+        raise ValueError("required root initial Tool name must be a non-empty bounded string")
+    initial_tool_pending = required_root_initial_tool is not None and state.lineage.depth == 0
     if hooks is not None and hook_context is None:
         raise ValueError("hook_context is required when Agent lifecycle Hooks are configured")
     planning_in_flight = False
@@ -949,6 +955,13 @@ async def run_agent_loop(
                 # Discard decisions made before the newly accepted control
                 # message became visible. Effectful tools are never interrupted.
                 continue
+            if initial_tool_pending and (len(step.calls) != 1 or step.calls[0].name != required_root_initial_tool):
+                await recorder.commit(
+                    state,
+                    event_type="run.continuation_required",
+                    payload={"blockers": [f"required_initial_tool:{required_root_initial_tool}"]},
+                )
+                continue
             if step.requires_write_outcome:
                 state = state.require_write_outcome("planner.requires_write_outcome")
                 await recorder.commit(
@@ -1020,6 +1033,8 @@ async def run_agent_loop(
             if state.phase is not RunPhase.RECORDING_RESULTS or state.pending.tool_call_ids:
                 raise RuntimeError("ToolKernel returned before every result was durably observed")
             state = _restore_planned_result_order(state, expected_ids)
+            if initial_tool_pending and executions[0].result.status is ToolResultStatus.SUCCEEDED:
+                initial_tool_pending = False
             state = await _commit_phase(state, RunPhase.PLANNING, recorder)
     except OperationCancelled as cancelled:
         return await _cancelled(state, recorder, cancelled, budget=budget, now=now)

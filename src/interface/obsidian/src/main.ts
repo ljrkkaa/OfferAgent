@@ -33,7 +33,12 @@ import { HarnessClient, REQUIRED_RUNTIME_CAPABILITIES } from "./runtime/harness_
 import { JsonObject, JsonValue, requireJsonObject } from "./runtime/json_rpc";
 import { LocalDevelopmentRuntimeInstaller } from "./runtime/local_development_installer";
 import { StdioWorkerTransport } from "./runtime/stdio_worker";
-import { observePluginToolEvents, VaultToolAdapter } from "./runtime/vault_tool_adapter";
+import {
+    observePluginToolEvents,
+    PluginToolEventObserver,
+    SerializedPluginToolExecutionFence,
+    VaultToolAdapter,
+} from "./runtime/vault_tool_adapter";
 import { createHostResearchBrowser, ResearchBrowserAdapter } from "./runtime/research_browser";
 import {
     FileVaultChangeJournal,
@@ -91,7 +96,9 @@ export default class OfferAgentPlugin extends Plugin {
     private chatStore: ChatStore | null = null;
     private chatClient: HarnessClient | null = null;
     private vaultToolClient: HarnessClient | null = null;
-    private vaultToolDisposal: (() => void) | null = null;
+    private vaultToolObserver: PluginToolEventObserver | null = null;
+    private vaultToolFence: SerializedPluginToolExecutionFence | null = null;
+    private vaultToolRetirement: Promise<void> = Promise.resolve();
     private vaultChanges: VaultChangeCoordinator | null = null;
     private researchBrowser: ResearchBrowserAdapter | null = null;
     private runtimeStart: Promise<void> | null = null;
@@ -139,13 +146,14 @@ export default class OfferAgentPlugin extends Plugin {
         const chatDisposal = this.chatStore?.dispose().catch(() => undefined);
         this.chatStore = null;
         this.chatClient = null;
-        this.disposeVaultToolAdapter();
+        const vaultToolRetirement = this.disposeVaultToolAdapter();
         // Obsidian ignores a Promise returned from onunload. beginUnload aborts
         // lifecycle work and starts stdio EOF synchronously; its normal stop gate
         // continues tracking the child-process join in the background.
         const retirement = this.runtime?.beginUnload();
         void Promise.all([
             chatDisposal,
+            vaultToolRetirement,
             retirement?.catch(() => undefined),
             pendingStart?.catch(() => undefined),
             pendingRestart?.catch(() => undefined),
@@ -222,6 +230,24 @@ export default class OfferAgentPlugin extends Plugin {
     async discardConversationAttachment(sessionId: string, artifactId: string): Promise<boolean> {
         await this.ensureReady();
         return (this.runtime as RuntimeBootstrap).harness.discardUploadedAttachment(sessionId, artifactId);
+    }
+
+    async deleteConversation(sessionId: string): Promise<boolean> {
+        return (await this.ensureChatStore()).deleteSession(sessionId);
+    }
+
+    async undoVaultChange(batchId: string): Promise<string> {
+        await this.ensureReady();
+        if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(batchId)) throw new Error("Vault Change Batch 标识无效");
+        const changes = this.vaultChanges;
+        const fence = this.vaultToolFence;
+        if (changes === null || fence === null) throw new Error("Vault Change Coordinator 尚未就绪");
+        const result = await fence.runExclusive(() => changes.undo(batchId));
+        if (result.status === "undone") return `已安全撤销 ${result.paths.length} 个文件`;
+        if (result.status === "conflict") {
+            throw new Error(`撤销已阻止：${result.paths.join(", ")} 已在应用后发生变化。\n${result.diff}`);
+        }
+        throw new Error("该 Vault Change Batch 不存在、尚未应用或已经撤销");
     }
 
     async listSessions(): Promise<readonly { sessionId: string; title: string }[]> {
@@ -531,7 +557,7 @@ export default class OfferAgentPlugin extends Plugin {
         await this.chatStore?.dispose().catch(() => undefined);
         this.chatStore = null;
         this.chatClient = null;
-        this.disposeVaultToolAdapter();
+        await this.disposeVaultToolAdapter();
         await runtime.stop();
         await Promise.all([
             pendingStart?.catch(() => undefined),
@@ -577,15 +603,16 @@ export default class OfferAgentPlugin extends Plugin {
 
     private attachVaultToolAdapter(client: HarnessClient): void {
         if (this.vaultToolClient === client) return;
-        this.disposeVaultToolAdapter();
+        const previousRetirement = this.disposeVaultToolAdapter();
         const journalDirectory = assertContainedStateDirectory(
             this.vaultRoot,
-            resolve(pluginInstallDirectory(this, this.vaultRoot), "vault-change-journal"),
+            resolve(this.vaultRoot, this.app.vault.configDir, "offeragent", "vault-change-journal"),
         );
+        const journal = new FileVaultChangeJournal(journalDirectory);
         const changes = new VaultChangeCoordinator({
             vault: new ObsidianVaultChangePort(this.app.vault),
             checkpoints: new GitCheckpointStore(this.vaultRoot),
-            journal: new FileVaultChangeJournal(journalDirectory),
+            journal,
             permissionMode: () => {
                 if (!this.settings.workspaceTrusted || ["read-only", "plan"].includes(this.settings.permissionMode)) {
                     return "read_only";
@@ -593,9 +620,6 @@ export default class OfferAgentPlugin extends Plugin {
                 return this.settings.autoApproveVaultWrites ? "trusted_vault" : "ask_every_time";
             },
             authorize: async (proposal) => this.authorizeVaultChange(proposal),
-        });
-        void changes.beginRecovery().catch((error) => {
-            if (!this.unloading) new Notice(actionableError(error));
         });
         const researchBrowser = createHostResearchBrowser();
         const adapter = new VaultToolAdapter(this.app.vault, client, this.workspaceId, this.app.metadataCache, {
@@ -613,10 +637,19 @@ export default class OfferAgentPlugin extends Plugin {
                 formatDate: (date, format) => localMoment(date, "YYYY-MM-DD", true).format(format),
             },
         }, changes, researchBrowser);
-        this.vaultToolDisposal = observePluginToolEvents(client.reducer, adapter, (error) => {
+        const fencedAdapter = new SerializedPluginToolExecutionFence(this.vaultRoot, adapter, async () => {
+            await previousRetirement;
+            await journal.migrateLegacyDirectory(resolve(pluginInstallDirectory(this, this.vaultRoot), "vault-change-journal"));
+            await changes.beginRecovery();
+        });
+        void fencedAdapter.ready().catch((error) => {
+            if (!this.unloading) new Notice(actionableError(error));
+        });
+        this.vaultToolObserver = observePluginToolEvents(client.reducer, fencedAdapter, (error) => {
             if (!this.unloading) new Notice(actionableError(error));
         });
         this.vaultToolClient = client;
+        this.vaultToolFence = fencedAdapter;
         this.vaultChanges = changes;
         this.researchBrowser = researchBrowser;
     }
@@ -635,14 +668,25 @@ export default class OfferAgentPlugin extends Plugin {
         ].filter((line) => line !== "").join("\n"));
     }
 
-    private disposeVaultToolAdapter(): void {
-        this.vaultToolDisposal?.();
-        this.vaultToolDisposal = null;
+    private disposeVaultToolAdapter(): Promise<void> {
+        const observer = this.vaultToolObserver;
+        this.vaultToolObserver = null;
+        const fence = this.vaultToolFence;
+        this.vaultToolFence = null;
         this.vaultToolClient = null;
         this.vaultChanges = null;
         const researchBrowser = this.researchBrowser;
         this.researchBrowser = null;
-        void researchBrowser?.close().catch(() => undefined);
+        const currentRetirement = (observer?.dispose() ?? Promise.resolve())
+            .catch(() => undefined)
+            .then(() => fence?.drain())
+            .then(() => researchBrowser?.close().catch(() => undefined));
+        const previousRetirement = this.vaultToolRetirement ?? Promise.resolve();
+        this.vaultToolRetirement = Promise.all([
+            previousRetirement.catch(() => undefined),
+            currentRetirement,
+        ]).then(() => undefined);
+        return this.vaultToolRetirement;
     }
 
     private async startRuntime(): Promise<void> {
@@ -692,7 +736,7 @@ export default class OfferAgentPlugin extends Plugin {
         await this.chatStore?.dispose().catch(() => undefined);
         this.chatStore = null;
         this.chatClient = null;
-        this.disposeVaultToolAdapter();
+        await this.disposeVaultToolAdapter();
         if (this.unloading || this.runtimeExplicitlyStopped) return;
         await this.runtime.stop();
         if (this.unloading || this.runtimeExplicitlyStopped) return;

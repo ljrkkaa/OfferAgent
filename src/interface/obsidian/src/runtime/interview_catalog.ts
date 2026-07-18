@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import type { TFile } from "obsidian";
 
 import type { ExecutableToolCallDescriptor, ToolResultDescriptor } from "./generated_protocol";
+import { failed, hasExtraKeys, succeeded } from "./plugin_tool_results";
 
 const EXPERIENCE_PATH = /^interviews\/experiences\/[^/.][^/]*\.md$/u;
 const QUESTION_PATH = /^interviews\/questions\/[^/.][^/]*\.md$/u;
@@ -93,7 +94,7 @@ export class InterviewCatalogAdapter {
             questions.sort((left, right) => right.matchedTerms.length - left.matchedTerms.length ||
                 left.path.localeCompare(right.path));
             if (experiences.length > MAX_EXPERIENCES || questions.length > MAX_QUESTIONS) truncated = true;
-            return succeeded(call, {
+            return succeeded(call, "Discovered bounded Interview Catalog candidates without making semantic merge decisions.", {
                 experienceCandidates: experiences.slice(0, MAX_EXPERIENCES),
                 questionCandidates: questions.slice(0, MAX_QUESTIONS),
                 truncated,
@@ -300,35 +301,4 @@ function modifiedVersion(file: TFile): string {
 
 function digest(content: string): string {
     return `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
-}
-
-function succeeded(call: ExecutableToolCallDescriptor, data: Record<string, unknown>): ToolResultDescriptor {
-    return {
-        toolCallId: call.toolCallId,
-        status: "succeeded",
-        summary: "Discovered bounded Interview Catalog candidates without making semantic merge decisions.",
-        data,
-        sourceRefs: [],
-        retryable: false,
-    };
-}
-
-function failed(
-    call: ExecutableToolCallDescriptor,
-    code: "protocol.invalid_params" | "protocol.message_too_large" | "resource.conflict",
-    message: string,
-    retryable = false,
-): ToolResultDescriptor {
-    return {
-        toolCallId: call.toolCallId,
-        status: "failed",
-        summary: message,
-        data: {},
-        retryable,
-        error: { code, retryable, cancelled: false, userVisibleMessage: message, details: {} },
-    };
-}
-
-function hasExtraKeys(value: Readonly<Record<string, unknown>>, allowed: readonly string[]): boolean {
-    return Object.keys(value).some((key) => !allowed.includes(key));
 }

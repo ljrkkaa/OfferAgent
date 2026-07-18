@@ -25,6 +25,7 @@ def _fixture(tmp_path: Path) -> Path:
     vault = tmp_path / "vault"
     vault.mkdir()
     ensure_portable_workspace_config(vault)
+    (vault / "agent.md").write_text("# OfferAgent\n\nUse current Vault evidence.\n", encoding="utf-8")
     (vault / "note.md").write_bytes(BEFORE_CONTENT)
     return tmp_path
 

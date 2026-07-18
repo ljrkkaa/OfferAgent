@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import type { TFile } from "obsidian";
 
 import type { ExecutableToolCallDescriptor, SourceRef, ToolResultDescriptor } from "./generated_protocol";
+import { failed, hasExtraKeys, succeeded } from "./plugin_tool_results";
 
 const TOPIC_PATH = /^memory\/(user|feedback|project|study)\/[^/.][^/]*\.md$/u;
 const CONTENT_HASH = /^sha256:[0-9a-f]{64}$/u;
@@ -209,15 +210,6 @@ function vaultSource(workspaceId: string, path: string, contentHash: string, lab
     return { type: "vault", file: { workspaceId, path, contentHash }, freshness: "fresh", label };
 }
 
-function succeeded(
-    call: ExecutableToolCallDescriptor,
-    summary: string,
-    data: Record<string, unknown>,
-    sourceRefs: ToolResultDescriptor["sourceRefs"] = [],
-): ToolResultDescriptor {
-    return { toolCallId: call.toolCallId, status: "succeeded", summary, data, sourceRefs, retryable: false };
-}
-
 function readFailure(call: ExecutableToolCallDescriptor, error: unknown, label: string): ToolResultDescriptor {
     const oversized = error instanceof RangeError;
     return failed(
@@ -226,24 +218,4 @@ function readFailure(call: ExecutableToolCallDescriptor, error: unknown, label: 
         oversized ? `${label} exceeds its bounded read contract.` : `${label} could not be read consistently.`,
         !oversized,
     );
-}
-
-function failed(
-    call: ExecutableToolCallDescriptor,
-    code: "protocol.invalid_params" | "protocol.message_too_large" | "resource.not_found" | "resource.conflict",
-    message: string,
-    retryable = false,
-): ToolResultDescriptor {
-    return {
-        toolCallId: call.toolCallId,
-        status: "failed",
-        summary: message,
-        data: {},
-        retryable,
-        error: { code, retryable, cancelled: false, userVisibleMessage: message, details: {} },
-    };
-}
-
-function hasExtraKeys(value: Readonly<Record<string, unknown>>, allowed: readonly string[]): boolean {
-    return Object.keys(value).some((key) => !allowed.includes(key));
 }

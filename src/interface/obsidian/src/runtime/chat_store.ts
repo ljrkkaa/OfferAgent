@@ -227,6 +227,42 @@ export class ChatStore {
         await this.persistAndEmit();
     }
 
+    async deleteSession(sessionId: string): Promise<boolean> {
+        this.requireInitialized();
+        requireId(sessionId, "ses_");
+        if (this.sessionMutationsInFlight.has(sessionId)) {
+            throw new Error("当前会话已有操作正在提交，请等待完成");
+        }
+        this.sessionMutationsInFlight.add(sessionId);
+        try {
+            return await this.operation(async () => {
+                const result = requireJsonObject(await this.client.request("session/delete", {
+                    sessionId,
+                    hardDelete: false,
+                }));
+                if (textField(result, "sessionId") !== sessionId || typeof result.deleted !== "boolean") {
+                    throw new Error("Worker 返回了无效的 Session 删除结果");
+                }
+                const removedTabIds = new Set(
+                    this.tabs.filter((tab) => tab.sessionId === sessionId).map((tab) => tab.tabId),
+                );
+                this.tabs = this.tabs.filter((tab) => tab.sessionId !== sessionId);
+                for (const [turnId, submission] of this.pendingSubmissions) {
+                    if (removedTabIds.has(submission.tabId)) this.pendingSubmissions.delete(turnId);
+                }
+                this.sessionHydrations.delete(sessionId);
+                if (this.tabs.length === 0) this.tabs.push(newTab());
+                if (!this.tabs.some((tab) => tab.tabId === this.activeTabId)) {
+                    this.activeTabId = this.tabs[0].tabId;
+                }
+                await this.persistAndEmit();
+                return result.deleted;
+            });
+        } finally {
+            this.sessionMutationsInFlight.delete(sessionId);
+        }
+    }
+
     async updateDraft(tabId: string, text: string): Promise<void> {
         this.requireInitialized();
         requireId(tabId, "tab_");

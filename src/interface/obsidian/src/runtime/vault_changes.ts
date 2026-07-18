@@ -1,9 +1,9 @@
 import { Buffer } from "node:buffer";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, open, readFile, realpath, rename, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import * as os from "node:os";
 
 import type { TFile, Vault } from "obsidian";
@@ -14,6 +14,7 @@ import type {
     SideEffect,
     ToolResultDescriptor,
 } from "./generated_protocol";
+import { failed, hasExtraKeys } from "./plugin_tool_results";
 
 const execFileAsync = promisify(execFile);
 const MAX_ACTIONS = 20;
@@ -689,33 +690,12 @@ function validationFailure(call: ExecutableToolCallDescriptor, error: unknown): 
         : failed(call, "tool.failed", "Vault Change Batch validation failed.");
 }
 
-function failed(
-    call: ExecutableToolCallDescriptor,
-    code: ErrorCode,
-    message: string,
-    retryable = false,
-    status: "failed" | "denied" | "unknown_outcome" = "failed",
-): ToolResultDescriptor {
-    return {
-        toolCallId: call.toolCallId,
-        status,
-        summary: message,
-        data: {},
-        retryable,
-        error: { code, retryable, cancelled: false, userVisibleMessage: message, details: {} },
-    };
-}
-
 function invalid(message: string): never {
     throw new ChangeValidationError("protocol.invalid_params", message);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasExtraKeys(value: Readonly<Record<string, unknown>>, allowed: readonly string[]): boolean {
-    return Object.keys(value).some((key) => !allowed.includes(key));
 }
 
 function positiveInteger(value: unknown): boolean {
@@ -788,6 +768,36 @@ export class GitCheckpointStore implements VaultCheckpointStore {
 
 export class FileVaultChangeJournal implements VaultChangeJournalStore {
     constructor(private readonly directory: string) {}
+
+    /** Idempotently relocates recovery records preserved from the replaceable plugin tree. */
+    async migrateLegacyDirectory(legacyDirectory: string): Promise<void> {
+        const source = resolve(legacyDirectory);
+        if (samePath(source, resolve(this.directory))) return;
+        let entries;
+        try {
+            entries = await readdir(source, { withFileTypes: true });
+        } catch (error) {
+            if (isNodeError(error) && error.code === "ENOENT") return;
+            throw error;
+        }
+        for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+            if (entry.isFile() && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.json\.\d+\.\d+\.tmp$/u.test(entry.name)) {
+                continue;
+            }
+            if (!entry.isFile() || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.json$/u.test(entry.name)) {
+                throw new Error(`legacy Vault Change journal contains an unexpected entry: ${entry.name}`);
+            }
+            const batchId = entry.name.slice(0, -5);
+            const record = parseJournal(JSON.parse(await readFile(join(source, entry.name), "utf8")));
+            if (record.batchId !== batchId) throw new Error("legacy Vault Change journal filename does not match its batch");
+            const existing = await this.load(batchId);
+            if (existing !== undefined && !isDeepStrictEqual(existing, record)) {
+                throw new Error(`legacy batch '${batchId}' conflicts with stable journal`);
+            }
+            if (existing === undefined) await this.save(record);
+        }
+        await rm(source, { recursive: true });
+    }
 
     async load(batchId: string): Promise<VaultChangeJournalRecord | undefined> {
         if (!BATCH_ID.test(batchId)) throw new Error("journal batch ID is invalid");

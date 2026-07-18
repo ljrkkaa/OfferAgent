@@ -3148,6 +3148,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                 ),
             ),
             lifecycle_hooks=components,
+            required_root_initial_tool="agent_contract.read",
         )
         base_definitions = (
             *read_executor.definitions,

@@ -5,12 +5,8 @@ import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { TFile } from "obsidian";
 
-import type {
-    ErrorCode,
-    ExecutableToolCallDescriptor,
-    ProjectSourceRef,
-    ToolResultDescriptor,
-} from "./generated_protocol";
+import type { ExecutableToolCallDescriptor, ProjectSourceRef, ToolResultDescriptor } from "./generated_protocol";
+import { failed, hasExtraKeys, succeeded } from "./plugin_tool_results";
 
 const REGISTRY_PATH = "projects/index.md";
 const MAX_CONTROL_BYTES = 32_768;
@@ -408,33 +404,4 @@ function truncateUtf8(value: string, maximumBytes: number): { content: string; t
     while (end > 0 && Buffer.byteLength(value.slice(0, end), "utf8") > maximumBytes) end -= 1;
     if (end > 0 && /[\uD800-\uDBFF]/u.test(value[end - 1] ?? "")) end -= 1;
     return { content: value.slice(0, end), truncated: true };
-}
-
-function succeeded(
-    call: ExecutableToolCallDescriptor,
-    summary: string,
-    data: Record<string, unknown>,
-    sourceRefs: readonly ProjectSourceRef[] = [],
-): ToolResultDescriptor {
-    return { toolCallId: call.toolCallId, status: "succeeded", summary, data, sourceRefs, retryable: false };
-}
-
-function failed(
-    call: ExecutableToolCallDescriptor,
-    code: ErrorCode,
-    message: string,
-    retryable = false,
-): ToolResultDescriptor {
-    return {
-        toolCallId: call.toolCallId,
-        status: "failed",
-        summary: message,
-        data: {},
-        retryable,
-        error: { code, retryable, cancelled: false, userVisibleMessage: message, details: {} },
-    };
-}
-
-function hasExtraKeys(value: Readonly<Record<string, unknown>>, allowed: readonly string[]): boolean {
-    return Object.keys(value).some((key) => !allowed.includes(key));
 }
