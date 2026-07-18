@@ -14,7 +14,7 @@ from offeragent_harness.agent.loop import AgentLoopFailure, ToolExecution, run_a
 from offeragent_harness.agent.model_planner import ModelProviderFailure
 from offeragent_harness.agent.planner import PlanningAttempt, PlanningAttemptOutcome, PlanningStep
 from offeragent_harness.agent.state import RunPhase, RunState
-from offeragent_harness.models import ModelError, ModelUsage
+from offeragent_harness.models import ModelCitation, ModelError, ModelUsage
 from offeragent_harness.permissions import RiskClass
 from offeragent_harness.ports import CancellationToken, ToolLifecycleObserver
 from offeragent_harness.runtime import CancellationScope
@@ -300,6 +300,47 @@ async def test_one_agent_step_publishes_final_response_without_second_model_call
     deltas = [cast(str, payload["delta"]) for event, payload, _ in recorder.events if event == "assistant.delta"]
     assert "".join(deltas) == response
     assert recorder.events[-1][0::2] == ("turn.completed", True)
+
+
+@pytest.mark.asyncio
+async def test_final_hosted_citations_publish_distinct_no_fake_hash_references() -> None:
+    citation = ModelCitation(
+        provider_id="codex-subscription",
+        model="gpt-catalog-model",
+        request_id="model-request-cited",
+        url="https://example.com/interview",
+        title="Interview source",
+        start_index=0,
+        end_index=9,
+    )
+    recorder = Recorder()
+
+    result = await run_agent_loop(
+        _state(),
+        planner=ScriptedPlanner((PlanningStep((), False, "有引用的回答。", citations=(citation,)),)),
+        tool_kernel=Kernel(),
+        recorder=recorder,
+        budget=_budget(),
+        cancellation=CancellationScope(name="test-run"),
+        now=lambda: datetime.now(timezone.utc),
+    )
+
+    assert result.phase is RunPhase.COMPLETED
+    names = [name for name, _, _ in recorder.events]
+    assert names.index("references.updated") < names.index("assistant.completed")
+    references = next(payload["references"] for name, payload, _ in recorder.events if name == "references.updated")
+    assert references == [
+        {
+            "type": "hostedWeb",
+            "url": "https://example.com/interview",
+            "title": "Interview source",
+            "providerId": "codex-subscription",
+            "model": "gpt-catalog-model",
+            "modelRequestId": "model-request-cited",
+            "freshness": "unknown",
+        }
+    ]
+    assert "contentHash" not in cast(list[dict[str, object]], references)[0]
 
 
 @pytest.mark.asyncio

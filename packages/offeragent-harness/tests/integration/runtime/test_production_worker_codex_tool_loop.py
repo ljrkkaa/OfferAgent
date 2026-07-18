@@ -90,8 +90,9 @@ class _CodexCredentials:
 
 
 class _CodexCatalog:
-    def __init__(self) -> None:
+    def __init__(self, *, supports_hosted_search: bool = False) -> None:
         self.requests: list[CodexCatalogHttpRequest] = []
+        self.supports_hosted_search = supports_hosted_search
 
     def get(self, request: CodexCatalogHttpRequest) -> CodexCatalogHttpResponse:
         self.requests.append(request)
@@ -104,8 +105,8 @@ class _CodexCatalog:
                     "visibility": "list",
                     "input_modalities": ["text"],
                     "supports_image_detail_original": False,
-                    "supports_search_tool": False,
-                    "web_search_tool_type": None,
+                    "supports_search_tool": self.supports_hosted_search,
+                    "web_search_tool_type": "text" if self.supports_hosted_search else None,
                     "context_window": 128000,
                     "max_context_window": 128000,
                     "effective_context_window_percent": 95,
@@ -196,6 +197,114 @@ def _structured_response(response_id: str, value: Mapping[str, object]) -> bytes
     )
 
 
+def _structured_hosted_search_response(response_id: str, value: Mapping[str, object]) -> bytes:
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    citation = {
+        "type": "url_citation",
+        "start_index": 0,
+        "end_index": 5,
+        "url": "https://example.com/interview/research",
+        "title": "Interview research source",
+    }
+    search_item = {
+        "id": "ws_production",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {
+            "type": "search",
+            "queries": ["OfferAgent interview research"],
+            "sources": [{"type": "url", "url": citation["url"]}],
+        },
+    }
+    message_item = {
+        "id": "msg_production",
+        "type": "message",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": text, "annotations": [citation]}],
+    }
+    events: tuple[Mapping[str, object], ...] = (
+        {"type": "response.created", "sequence_number": 0, "response": {"id": response_id}},
+        {
+            "type": "response.output_item.added",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item": {"id": "ws_production", "type": "web_search_call", "status": "in_progress"},
+        },
+        {
+            "type": "response.web_search_call.in_progress",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item_id": "ws_production",
+        },
+        {
+            "type": "response.web_search_call.searching",
+            "sequence_number": 3,
+            "output_index": 0,
+            "item_id": "ws_production",
+        },
+        {
+            "type": "response.web_search_call.completed",
+            "sequence_number": 4,
+            "output_index": 0,
+            "item_id": "ws_production",
+        },
+        {
+            "type": "response.output_item.done",
+            "sequence_number": 5,
+            "output_index": 0,
+            "item": search_item,
+        },
+        {
+            "type": "response.output_text.delta",
+            "sequence_number": 6,
+            "item_id": "msg_production",
+            "output_index": 1,
+            "content_index": 0,
+            "delta": text,
+        },
+        {
+            "type": "response.output_text.annotation.added",
+            "sequence_number": 7,
+            "item_id": "msg_production",
+            "output_index": 1,
+            "content_index": 0,
+            "annotation_index": 0,
+            "annotation": citation,
+        },
+        {
+            "type": "response.output_text.done",
+            "sequence_number": 8,
+            "item_id": "msg_production",
+            "output_index": 1,
+            "content_index": 0,
+            "text": text,
+        },
+        {
+            "type": "response.output_item.done",
+            "sequence_number": 9,
+            "output_index": 1,
+            "item": message_item,
+        },
+        {
+            "type": "response.completed",
+            "sequence_number": 10,
+            "response": {
+                "status": "completed",
+                "output": [search_item, message_item],
+                "usage": {
+                    "input_tokens": 32,
+                    "output_tokens": 16,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                },
+            },
+        },
+    )
+    return b"".join(
+        f"event: {event['type']}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n".encode() for event in events
+    )
+
+
 async def _dispatch(
     application: ProductionWorkerApplication,
     method: str,
@@ -247,8 +356,10 @@ async def _wait_terminal(application: ProductionWorkerApplication, run_id: str) 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("supports_hosted_search", [False, True])
 async def test_production_worker_codex_loop_round_trips_one_plugin_tool_without_local_provider(
     tmp_path: Path,
+    supports_hosted_search: bool,
 ) -> None:
     vault = tmp_path / "vault"
     vault.mkdir()
@@ -292,15 +403,20 @@ async def test_production_worker_codex_loop_round_trips_one_plugin_tool_without_
             }
         else:
             raise AssertionError("the deterministic Agent Loop must complete in two model rounds")
+        response_content = (
+            _structured_hosted_search_response(f"resp_fused_{len(response_bodies)}", output)
+            if supports_hosted_search and len(response_bodies) == 2
+            else _structured_response(f"resp_fused_{len(response_bodies)}", output)
+        )
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            content=_structured_response(f"resp_fused_{len(response_bodies)}", output),
+            content=response_content,
             request=request,
         )
 
     credentials = _CodexCredentials()
-    catalog = _CodexCatalog()
+    catalog = _CodexCatalog(supports_hosted_search=supports_hosted_search)
     gateway_settings: list[ModelSettings] = []
     transport = httpx.MockTransport(responses_handler)
 
@@ -420,6 +536,24 @@ async def test_production_worker_codex_loop_round_trips_one_plugin_tool_without_
         event_types = [event.event_type for event in events]
         assert event_types.index("tool.started") < event_types.index("tool.completed")
         assert event_types.index("tool.completed") < event_types.index("turn.completed")
+        if supports_hosted_search:
+            reference_event = next(event for event in events if event.event_type == "references.updated")
+            reference_payload = cast(Mapping[str, Any], reference_event.payload["payload"])
+            references = cast(list[Mapping[str, Any]], reference_payload["references"])
+            model_attempts = [event for event in events if event.event_type == "model.attempt"]
+            final_attempt = cast(Mapping[str, Any], model_attempts[-1].payload["payload"])
+            assert len(references) == 1
+            reference = references[0]
+            assert reference["type"] == "hostedWeb"
+            assert reference["url"] == "https://example.com/interview/research"
+            assert reference["title"] == "Interview research source"
+            assert reference["providerId"] == CODEX_SUBSCRIPTION_PROVIDER_ID
+            assert reference["model"] == MODEL_ID
+            assert reference["modelRequestId"] == final_attempt["requestId"]
+            assert reference["freshness"] == "unknown"
+            assert "contentHash" not in reference
+        else:
+            assert "references.updated" not in event_types
 
         assert len(catalog.requests) == 1
         assert catalog.requests[0].endpoint == CODEX_SUBSCRIPTION_MODELS_ENDPOINT
@@ -436,6 +570,9 @@ async def test_production_worker_codex_loop_round_trips_one_plugin_tool_without_
         )
         assert all(request.headers["chatgpt-account-id"] == ACCOUNT_ID for request in response_requests)
         assert all(body["model"] == MODEL_ID and body["store"] is False for body in response_bodies)
+        expected_tools = [{"type": "web_search"}] if supports_hosted_search else []
+        assert all(body["tools"] == expected_tools for body in response_bodies)
+        assert all(("include" in body) is supports_hosted_search for body in response_bodies)
         first_input = json.dumps(response_bodies[0]["input"], ensure_ascii=False)
         second_messages = cast(list[dict[str, Any]], response_bodies[1]["input"])
         assert "Read the Vault Agent Contract" in first_input

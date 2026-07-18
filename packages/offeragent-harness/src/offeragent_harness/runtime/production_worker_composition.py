@@ -51,7 +51,7 @@ from offeragent_harness.config import (
 from offeragent_harness.config.migrations import project_legacy_codex_config, validate_current_codex_config
 from offeragent_harness.error_codes import ErrorCode
 from offeragent_harness.hooks import HookDecision, HookEvent, HookInvocation, HookLayer, HookScope
-from offeragent_harness.models import ModelContentBlock, thaw_json
+from offeragent_harness.models import ModelContentBlock, ModelHostedTool, thaw_json
 from offeragent_harness.observability import (
     DiagnosticsService,
     InstrumentedModelGateway,
@@ -1701,6 +1701,11 @@ class ProductionRunComponentsFactory(
             max_output_tokens=min(16_384, budget.max_output_tokens),
             reasoning_effort=config.reasoning_effort.value,
             temperature=settings.temperature,
+            hosted_tools=(
+                (ModelHostedTool.WEB_SEARCH,)
+                if context_binding is not None and context_binding.model.supports_hosted_search
+                else ()
+            ),
         )
         return RunComponents(
             planner_factory=lambda active: ModelPlanner(

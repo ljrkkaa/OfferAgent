@@ -28,15 +28,20 @@ from offeragent_harness.agent.model_planner import (
     PlannerModelConfig,
     SchemaRepairFailed,
     SchemaRepairUnavailable,
+    collect_structured_response,
 )
 from offeragent_harness.agent.planner import PlanningAttemptOutcome
 from offeragent_harness.agent.state import RunState
 from offeragent_harness.models import (
     FrozenJsonObject,
+    ModelCitation,
     ModelError,
     ModelEvent,
     ModelEventKind,
     ModelFinishReason,
+    ModelHostedSearch,
+    ModelHostedSearchPhase,
+    ModelHostedTool,
     ModelRequest,
     ModelUsage,
     freeze_json,
@@ -157,12 +162,18 @@ def _planner(
     ids: DeterministicIdGenerator | None = None,
     budget: BudgetLedger | None = None,
     context_manager: ContextManager | None = None,
+    hosted_search: bool = False,
 ) -> ModelPlanner:
     return ModelPlanner(
         gateway=gateway,
         context_manager=context_manager or _context(),
         catalog=catalog or AgentStepCatalog((_definition(),), max_calls=3),
-        config=PlannerModelConfig("scripted-model", 512, seed=17),
+        config=PlannerModelConfig(
+            "scripted-model",
+            512,
+            seed=17,
+            hosted_tools=(ModelHostedTool.WEB_SEARCH,) if hosted_search else (),
+        ),
         clock=ManualClock(NOW),
         ids=ids or DeterministicIdGenerator(),
         budget=budget or _budget(),
@@ -188,6 +199,184 @@ def test_memory_context_enrichment_changes_messages_but_not_tool_catalog_or_outp
     assert repr(after.messages).count("planner local Memory evidence") == 1
     assert after.output_schema == before.output_schema
     assert thaw_json(after.metadata)["toolCatalogHash"] == thaw_json(before.metadata)["toolCatalogHash"]
+
+
+def test_catalog_authorized_hosted_search_is_explicit_on_every_planner_request() -> None:
+    unsupported = _planner(ScriptedModelGateway(())).create_request(_state())
+    supported = _planner(ScriptedModelGateway(()), hosted_search=True).create_request(_state())
+
+    assert unsupported.hosted_tools == ()
+    assert supported.hosted_tools == (ModelHostedTool.WEB_SEARCH,)
+
+
+@pytest.mark.asyncio
+async def test_planner_preserves_unique_hosted_search_citations_on_the_final_step() -> None:
+    request = _planner(ScriptedModelGateway(()), hosted_search=True).create_request(_state())
+    citation = ModelCitation(
+        provider_id="codex-subscription",
+        model=request.model,
+        request_id=request.request_id,
+        url="https://example.com/source",
+        title="Example source",
+        start_index=5,
+        end_index=12,
+    )
+    gateway = ScriptedModelGateway(
+        (
+            ModelScriptStep(
+                expected_request=request,
+                events=(
+                    ScriptedModelEvent(ModelEvent(request.request_id, 1, ModelEventKind.STARTED)),
+                    ScriptedModelEvent(
+                        ModelEvent(
+                            request.request_id,
+                            2,
+                            ModelEventKind.HOSTED_SEARCH,
+                            hosted_search=ModelHostedSearch("search_1", ModelHostedSearchPhase.STARTED),
+                        )
+                    ),
+                    ScriptedModelEvent(
+                        ModelEvent(
+                            request.request_id,
+                            3,
+                            ModelEventKind.HOSTED_SEARCH,
+                            hosted_search=ModelHostedSearch("search_1", ModelHostedSearchPhase.COMPLETED),
+                        )
+                    ),
+                    ScriptedModelEvent(ModelEvent(request.request_id, 4, ModelEventKind.CITATION, citation=citation)),
+                    ScriptedModelEvent(
+                        ModelEvent(
+                            request.request_id,
+                            5,
+                            ModelEventKind.STRUCTURED_OUTPUT,
+                            data={"requiresWriteOutcome": False, "calls": [], "finalResponse": "Cited answer"},
+                        )
+                    ),
+                    ScriptedModelEvent(ModelEvent(request.request_id, 6, ModelEventKind.USAGE, usage=USAGE)),
+                    ScriptedModelEvent(
+                        ModelEvent(
+                            request.request_id, 7, ModelEventKind.COMPLETED, finish_reason=ModelFinishReason.STOP
+                        )
+                    ),
+                ),
+            ),
+        )
+    )
+    planner = _planner(gateway, hosted_search=True)
+
+    step = await planner.plan(_state(), ManualCancellationToken())
+
+    assert step.final_response == "Cited answer"
+    assert step.citations == (citation,)
+
+
+@pytest.mark.asyncio
+async def test_structured_collector_rejects_undeclared_or_unfinished_hosted_search() -> None:
+    unsupported = _planner(ScriptedModelGateway(())).create_request(_state())
+    undeclared_gateway = ScriptedModelGateway(
+        (
+            ModelScriptStep(
+                expected_request=unsupported,
+                events=(
+                    ScriptedModelEvent(ModelEvent(unsupported.request_id, 1, ModelEventKind.STARTED)),
+                    ScriptedModelEvent(
+                        ModelEvent(
+                            unsupported.request_id,
+                            2,
+                            ModelEventKind.HOSTED_SEARCH,
+                            hosted_search=ModelHostedSearch("search_1", ModelHostedSearchPhase.STARTED),
+                        )
+                    ),
+                ),
+            ),
+        )
+    )
+    with pytest.raises(ModelStreamProtocolError, match="undeclared hosted search"):
+        await collect_structured_response(undeclared_gateway, unsupported, ManualCancellationToken())
+
+    supported = _planner(ScriptedModelGateway(()), hosted_search=True).create_request(_state())
+    unfinished_gateway = ScriptedModelGateway(
+        (
+            ModelScriptStep(
+                expected_request=supported,
+                events=(
+                    ScriptedModelEvent(ModelEvent(supported.request_id, 1, ModelEventKind.STARTED)),
+                    ScriptedModelEvent(
+                        ModelEvent(
+                            supported.request_id,
+                            2,
+                            ModelEventKind.HOSTED_SEARCH,
+                            hosted_search=ModelHostedSearch("search_2", ModelHostedSearchPhase.STARTED),
+                        )
+                    ),
+                    ScriptedModelEvent(
+                        ModelEvent(
+                            supported.request_id,
+                            3,
+                            ModelEventKind.STRUCTURED_OUTPUT,
+                            data={"requiresWriteOutcome": False, "calls": [], "finalResponse": "answer"},
+                        )
+                    ),
+                    ScriptedModelEvent(ModelEvent(supported.request_id, 4, ModelEventKind.USAGE, usage=USAGE)),
+                    ScriptedModelEvent(
+                        ModelEvent(
+                            supported.request_id,
+                            5,
+                            ModelEventKind.COMPLETED,
+                            finish_reason=ModelFinishReason.STOP,
+                        )
+                    ),
+                ),
+            ),
+        )
+    )
+    with pytest.raises(ModelStreamProtocolError, match="unfinished hosted search"):
+        await collect_structured_response(unfinished_gateway, supported, ManualCancellationToken())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ("model", "request"))
+async def test_structured_collector_rejects_hosted_citation_identity_mismatch(mismatch: str) -> None:
+    request = _planner(ScriptedModelGateway(()), hosted_search=True).create_request(_state())
+    citation = ModelCitation(
+        provider_id="codex-subscription",
+        model="another-model" if mismatch == "model" else request.model,
+        request_id="another-request" if mismatch == "request" else request.request_id,
+        url="https://example.com/source",
+        title="Mismatched source",
+        start_index=0,
+        end_index=1,
+    )
+    gateway = ScriptedModelGateway(
+        (
+            ModelScriptStep(
+                expected_request=request,
+                events=(
+                    ScriptedModelEvent(ModelEvent(request.request_id, 1, ModelEventKind.STARTED)),
+                    ScriptedModelEvent(
+                        ModelEvent(
+                            request.request_id,
+                            2,
+                            ModelEventKind.HOSTED_SEARCH,
+                            hosted_search=ModelHostedSearch("search_1", ModelHostedSearchPhase.STARTED),
+                        )
+                    ),
+                    ScriptedModelEvent(
+                        ModelEvent(
+                            request.request_id,
+                            3,
+                            ModelEventKind.HOSTED_SEARCH,
+                            hosted_search=ModelHostedSearch("search_1", ModelHostedSearchPhase.COMPLETED),
+                        )
+                    ),
+                    ScriptedModelEvent(ModelEvent(request.request_id, 4, ModelEventKind.CITATION, citation=citation)),
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(ModelStreamProtocolError, match="citation identity mismatch"):
+        await collect_structured_response(gateway, request, ManualCancellationToken())
 
 
 def test_estimated_normal_overflow_uses_reference_projection_before_provider_call() -> None:

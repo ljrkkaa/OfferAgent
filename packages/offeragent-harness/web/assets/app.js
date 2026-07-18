@@ -2,7 +2,7 @@
   "use strict";
 
   const PROTOCOL_VERSION = "1.0";
-  const SCHEMA_HASH = "sha256:c4a1b88139aa40ddcdf98b991a6d6aaa0b3dbc38f366e665679592066512d1b7";
+  const SCHEMA_HASH = "sha256:a4655cb001f8fbeed83825b1e19ea46b6bd492432428ff658621f107599b1a12";
   const CLIENT_VERSION = "0.1.0";
   const CODEX_SUBSCRIPTION_PROVIDER = "codex-subscription-experimental";
   const ARTIFACT_PAGE_BYTES = 65_536;
@@ -1075,7 +1075,16 @@
     const list = node("ol");
     for (const reference of references) {
       const item = node("li");
-      item.append(node("span", referenceText(reference)));
+      const target = safeReferenceUrl(reference);
+      if (target) {
+        const link = node("a", referenceText(reference));
+        link.href = target;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        item.append(link);
+      } else {
+        item.append(node("span", referenceText(reference)));
+      }
       if (reference.type === "artifact" && reference.artifact?.artifactId) {
         const button = node("button", "查看 Artifact");
         button.type = "button";
@@ -1356,6 +1365,10 @@
       ].join(":");
     }
     if (reference?.type === "artifact") return `artifact:${reference.artifact?.artifactId}`;
+    if (reference?.type === "web") return `web:${reference.url}:${reference.contentHash}`;
+    if (reference?.type === "hostedWeb") {
+      return `hostedWeb:${reference.providerId}:${reference.model}:${reference.modelRequestId}:${reference.url}`;
+    }
     return JSON.stringify(reference);
   }
 
@@ -1370,7 +1383,21 @@
       return `${reference.label ?? reference.file?.path ?? "Vault"}${line}${freshness}`;
     }
     if (reference?.type === "artifact") return reference.label ?? reference.artifact?.title ?? reference.artifact?.artifactId;
+    if (reference?.type === "web" || reference?.type === "hostedWeb") {
+      return reference.label ?? reference.title ?? reference.url ?? "Web";
+    }
     return "未知引用";
+  }
+
+  function safeReferenceUrl(reference) {
+    if (reference?.type !== "web" && reference?.type !== "hostedWeb") return null;
+    try {
+      const url = new URL(reference.url);
+      if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return null;
+      return url.href;
+    } catch {
+      return null;
+    }
   }
 
   function node(tag, textValue, className) {

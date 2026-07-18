@@ -9,7 +9,7 @@ from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from offeragent_harness.error_codes import ErrorCode, PolicyDeniedCause
 from offeragent_harness.hooks import HookDecision, HookEvent, HookExecutionContext, HookInvocation, HookOutcome
-from offeragent_harness.models import thaw_json
+from offeragent_harness.models import ModelCitation, thaw_json
 from offeragent_harness.permissions import ApprovalRequest, ApprovalResolution, ApprovalState
 from offeragent_harness.ports import CancellationToken, HookLifecyclePort, OperationCancelled, ToolLifecycleObserver
 from offeragent_harness.tools import ToolCall, ToolDefinition, ToolResult, ToolResultStatus
@@ -128,10 +128,26 @@ class AgentHookDenied(RuntimeError, PolicyDeniedCause):
         super().__init__(f"{event.value} Hook returned {decision.value}")
 
 
-def _text_content(text: str) -> list[dict[str, object]]:
+def _hosted_references(citations: Sequence[ModelCitation]) -> list[dict[str, object]]:
+    references: dict[tuple[str, str, str, str, str], dict[str, object]] = {}
+    for citation in citations:
+        key = (citation.provider_id, citation.model, citation.request_id, citation.url, citation.title)
+        references[key] = {
+            "type": "hostedWeb",
+            "url": citation.url,
+            "title": citation.title,
+            "providerId": citation.provider_id,
+            "model": citation.model,
+            "modelRequestId": citation.request_id,
+            "freshness": "unknown",
+        }
+    return list(references.values())
+
+
+def _text_content(text: str, citations: Sequence[ModelCitation] = ()) -> list[dict[str, object]]:
     if not text:
         return []
-    return [{"type": "text", "text": text, "format": "markdown", "references": []}]
+    return [{"type": "text", "text": text, "format": "markdown", "references": _hosted_references(citations)}]
 
 
 def _cost_micros(cost: Decimal | None) -> int | None:
@@ -635,6 +651,7 @@ async def _complete_with_response(
     now: Callable[[], Any],
     hooks: HookLifecyclePort | None,
     hook_context: HookExecutionContext | None,
+    citations: Sequence[ModelCitation] = (),
 ) -> RunState:
     cancellation.checkpoint()
     if not response.strip():
@@ -651,11 +668,18 @@ async def _complete_with_response(
         )
         offset += len(delta)
     state = replace(state, assistant_text=response, revision=state.revision + 1)
+    references = _hosted_references(citations)
+    if references:
+        await recorder.commit(
+            state,
+            event_type="references.updated",
+            payload={"references": references, "replace": False},
+        )
     await recorder.commit(
         state,
         event_type="assistant.completed",
         payload={
-            "content": _text_content(state.assistant_text),
+            "content": _text_content(state.assistant_text, citations),
             "finishReason": "stop",
         },
     )
@@ -675,7 +699,7 @@ async def _complete_with_response(
         event_type="turn.completed",
         payload={
             "reason": "completed",
-            "assistantContent": _text_content(state.assistant_text),
+            "assistantContent": _text_content(state.assistant_text, citations),
             "usage": await _run_usage_payload(state, budget, now=now),
         },
         terminal=True,
@@ -998,6 +1022,7 @@ async def run_agent_loop(
                         now=now,
                         hooks=hooks,
                         hook_context=hook_context,
+                        citations=step.citations,
                     )
                 await recorder.commit(
                     state,

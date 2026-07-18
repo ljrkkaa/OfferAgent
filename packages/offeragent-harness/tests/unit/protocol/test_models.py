@@ -18,6 +18,7 @@ from offeragent_harness.protocol.capabilities import (
 from offeragent_harness.protocol.content import (
     ContentBlock,
     FileRef,
+    HostedWebSourceRef,
     PinnedContextContentBlock,
     PinnedSelectionContextReference,
     ProjectSourceRef,
@@ -323,6 +324,43 @@ def test_web_source_ref_preserves_clickable_research_provenance() -> None:
     )
     assert isinstance(source, WebSourceRef)
     assert str(source.url) == "https://example.com/interview/42"
+
+
+def test_hosted_web_source_ref_is_provider_attested_without_fake_content_hash() -> None:
+    source: SourceRef = TypeAdapter(SourceRef).validate_json(
+        """
+        {
+          "type": "hostedWeb",
+          "url": "https://example.com/interview/42",
+          "title": "Acme backend interview",
+          "providerId": "codex-subscription",
+          "model": "gpt-catalog-model",
+          "modelRequestId": "model-request-42",
+          "freshness": "unknown"
+        }
+        """
+    )
+    assert isinstance(source, HostedWebSourceRef)
+    assert "contentHash" not in source.to_wire()
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "https://user@example.com/interview/42",
+        "https://user:secret@example.com/interview/42",
+    ),
+)
+def test_hosted_web_source_ref_rejects_urls_with_credentials(url: str) -> None:
+    with pytest.raises(ValidationError, match="credentials"):
+        HostedWebSourceRef(
+            type="hostedWeb",
+            url=url,
+            title="Credential-bearing source",
+            provider_id="codex-subscription",
+            model="gpt-catalog-model",
+            model_request_id="model-request-42",
+        )
 
 
 def test_turn_start_accepts_at_most_eight_safe_pinned_source_locators() -> None:

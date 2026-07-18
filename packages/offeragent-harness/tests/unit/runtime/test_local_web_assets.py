@@ -160,6 +160,9 @@ def test_web_client_renders_diff_session_approval_and_subagent_timeline_items() 
     assert 'renderArtifactLinks(approval.diffs, "查看 Diff 内容")' in source
     assert "usageText(run.usage, run.startedAt, run.completedAt)" in source
     assert "renderReferences(run.references)" in source
+    assert 'reference?.type === "hostedWeb"' in source
+    assert 'reference?.type === "web"' in source
+    assert 'link.rel = "noopener noreferrer"' in source
     assert "for (const item of run.timeline)" in source
     assert 'item.kind === "subagent"' in source
     assert "appendTimelineItem(run, {" in source

@@ -159,10 +159,29 @@ class WebSourceRef(WireModel):
     label: str | None = Field(default=None, min_length=1, max_length=512)
 
 
+class HostedWebSourceRef(WireModel):
+    """A provider-attested URL citation without captured page bytes."""
+
+    type: Literal["hostedWeb"]
+    url: AnyHttpUrl
+    title: str = Field(min_length=1, max_length=512)
+    provider_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    model: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+    model_request_id: str = Field(min_length=1, max_length=256, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+    freshness: Freshness = Freshness.UNKNOWN
+    label: str | None = Field(default=None, min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def _url_has_no_credentials(self) -> HostedWebSourceRef:
+        if self.url.username is not None or self.url.password is not None:
+            raise ValueError("hosted Web source URL must not contain credentials")
+        return self
+
+
 SourceRef = TypeAliasType(
     "SourceRef",
     Annotated[
-        VaultSourceRef | ArtifactSourceRef | ProjectSourceRef | WebSourceRef,
+        VaultSourceRef | ArtifactSourceRef | ProjectSourceRef | WebSourceRef | HostedWebSourceRef,
         Field(discriminator="type"),
     ],
 )

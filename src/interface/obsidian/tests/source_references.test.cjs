@@ -91,3 +91,33 @@ test("Web references retain a safe clickable public URL", () => {
         url: "file:///C:/secret.txt",
     }]), /invalid Web source URL/);
 });
+
+test("Hosted Web references remain clickable without pretending to capture page bytes", () => {
+    const {
+        sourceReferenceArray,
+        sourceReferenceKey,
+        sourceReferenceLabel,
+        webReferenceTarget,
+    } = loadModule();
+    const references = sourceReferenceArray([{
+        type: "hostedWeb",
+        url: "https://example.com/interview/42",
+        title: "Acme backend interview",
+        providerId: "codex-subscription",
+        model: "gpt-catalog-model",
+        modelRequestId: "model-request-42",
+        freshness: "unknown",
+    }]);
+
+    assert.equal(sourceReferenceLabel(references[0]), "Acme backend interview");
+    assert.equal(webReferenceTarget(references[0]), "https://example.com/interview/42");
+    assert.equal(
+        sourceReferenceKey(references[0]),
+        "hostedWeb:codex-subscription:gpt-catalog-model:model-request-42:https://example.com/interview/42",
+    );
+    assert.equal("contentHash" in references[0], false);
+    assert.throws(() => sourceReferenceArray([{
+        ...references[0],
+        url: "https://user:password@example.com/private",
+    }]), /invalid Hosted Web source URL/);
+});

@@ -3046,6 +3046,78 @@
       "title": "HooksMutationResult",
       "type": "object"
     },
+    "HostedWebSourceRef": {
+      "additionalProperties": false,
+      "description": "A provider-attested URL citation without captured page bytes.",
+      "properties": {
+        "freshness": {
+          "$ref": "#/$defs/Freshness",
+          "default": "unknown"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "model": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*$",
+          "title": "Model",
+          "type": "string"
+        },
+        "modelRequestId": {
+          "maxLength": 256,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+          "title": "Modelrequestid",
+          "type": "string"
+        },
+        "providerId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "title": "Providerid",
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 512,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "type": {
+          "const": "hostedWeb",
+          "title": "Type",
+          "type": "string"
+        },
+        "url": {
+          "format": "uri",
+          "minLength": 1,
+          "title": "Url",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "url",
+        "title",
+        "providerId",
+        "model",
+        "modelRequestId"
+      ],
+      "title": "HostedWebSourceRef",
+      "type": "object"
+    },
     "ImageContentBlock": {
       "additionalProperties": false,
       "properties": {
@@ -7536,6 +7608,7 @@
       "discriminator": {
         "mapping": {
           "artifact": "#/$defs/ArtifactSourceRef",
+          "hostedWeb": "#/$defs/HostedWebSourceRef",
           "project": "#/$defs/ProjectSourceRef",
           "vault": "#/$defs/VaultSourceRef",
           "web": "#/$defs/WebSourceRef"
@@ -7554,6 +7627,9 @@
         },
         {
           "$ref": "#/$defs/WebSourceRef"
+        },
+        {
+          "$ref": "#/$defs/HostedWebSourceRef"
         }
       ]
     },

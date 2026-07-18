@@ -1,4 +1,10 @@
-import type { ProjectSourceRef, SourceRef, VaultSourceRef, WebSourceRef } from "./generated_protocol";
+import type {
+    HostedWebSourceRef,
+    ProjectSourceRef,
+    SourceRef,
+    VaultSourceRef,
+    WebSourceRef,
+} from "./generated_protocol";
 import type { JsonObject, JsonValue } from "./json_rpc";
 
 const FRESHNESS = new Set(["fresh", "stale", "partial", "stale_partial", "unknown"]);
@@ -53,6 +59,14 @@ export function sourceReferenceKey(reference: SourceRef): string {
             ].join(":");
         case "web":
             return `web:${reference.url}:${reference.contentHash}`;
+        case "hostedWeb":
+            return [
+                "hostedWeb",
+                reference.providerId,
+                reference.model,
+                reference.modelRequestId,
+                reference.url,
+            ].join(":");
     }
 }
 
@@ -78,6 +92,8 @@ export function sourceReferenceLabel(reference: SourceRef): string {
         }
         case "web":
             return reference.label ?? reference.title;
+        case "hostedWeb":
+            return reference.label ?? reference.title;
     }
 }
 
@@ -102,7 +118,7 @@ export function vaultReferenceTarget(reference: SourceRef): VaultReferenceTarget
 }
 
 export function webReferenceTarget(reference: SourceRef): string | null {
-    if (reference.type !== "web") return null;
+    if (reference.type !== "web" && reference.type !== "hostedWeb") return null;
     return safeWebUrl(reference.url);
 }
 
@@ -113,6 +129,7 @@ function sourceReference(value: JsonValue): SourceRef {
     if (type === "vault") return vaultSourceReference(reference);
     if (type === "project") return projectSourceReference(reference);
     if (type === "web") return webSourceReference(reference);
+    if (type === "hostedWeb") return hostedWebSourceReference(reference);
     if (type === "artifact") {
         const artifact = jsonObject(reference.artifact, "artifact reference");
         requiredText(artifact, "artifactId");
@@ -135,6 +152,18 @@ function webSourceReference(reference: JsonObject): WebSourceRef {
     const freshness = optionalText(reference, "freshness");
     if (freshness !== null && !FRESHNESS.has(freshness)) throw new TypeError("invalid source freshness");
     return reference as unknown as WebSourceRef;
+}
+
+function hostedWebSourceReference(reference: JsonObject): HostedWebSourceRef {
+    const url = requiredText(reference, "url");
+    if (safeWebUrl(url) === null) throw new TypeError("invalid Hosted Web source URL");
+    requiredText(reference, "title");
+    requiredText(reference, "providerId");
+    requiredText(reference, "model");
+    requiredText(reference, "modelRequestId");
+    const freshness = optionalText(reference, "freshness");
+    if (freshness !== null && !FRESHNESS.has(freshness)) throw new TypeError("invalid source freshness");
+    return reference as unknown as HostedWebSourceRef;
 }
 
 function safeWebUrl(value: string): string | null {

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
-from offeragent_harness.models import ModelUsage
+from offeragent_harness.models import ModelCitation, ModelUsage
 from offeragent_harness.ports import CancellationToken
 from offeragent_harness.tools import ToolCall
 
@@ -61,6 +61,7 @@ class PlanningStep:
     requires_write_outcome: bool
     final_response: str | None
     attempts: tuple[PlanningAttempt, ...] = ()
+    citations: tuple[ModelCitation, ...] = ()
 
     def __post_init__(self) -> None:
         call_ids = [call.tool_call_id for call in self.calls]
@@ -78,6 +79,8 @@ class PlanningStep:
                 raise ValueError("a successful PlanningStep must end in a successful attempt")
             if tuple(attempt.repair_index for attempt in self.attempts) != tuple(range(len(self.attempts))):
                 raise ValueError("planning repair indexes must be contiguous from zero")
+        if len(self.citations) > 256 or len(self.citations) != len(set(self.citations)):
+            raise ValueError("planning citations must be bounded and unique")
 
 
 @runtime_checkable

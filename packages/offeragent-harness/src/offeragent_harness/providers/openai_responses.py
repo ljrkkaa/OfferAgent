@@ -26,10 +26,14 @@ import httpx
 from jsonschema import Draft202012Validator
 
 from offeragent_harness.models import (
+    ModelCitation,
     ModelError,
     ModelEvent,
     ModelEventKind,
     ModelFinishReason,
+    ModelHostedSearch,
+    ModelHostedSearchPhase,
+    ModelHostedTool,
     ModelMessage,
     ModelOutputMode,
     ModelRequest,
@@ -212,6 +216,9 @@ class OpenAIResponsesConfig:
     max_stream_bytes: int = 32 * 1024 * 1024
     max_event_bytes: int = 2 * 1024 * 1024
     max_output_bytes: int = 16 * 1024 * 1024
+    max_hosted_search_calls: int = 16
+    max_hosted_search_sources: int = 64
+    max_hosted_search_citations: int = 256
     queue_capacity: int = 64
     max_retries: int = 3
     retry_base_seconds: float = 0.25
@@ -261,6 +268,13 @@ class OpenAIResponsesConfig:
             raise ModelProviderConfigurationError("model request/stream limit exceeds the safety ceiling")
         if self.max_event_bytes > self.max_stream_bytes or self.max_output_bytes > self.max_stream_bytes:
             raise ModelProviderConfigurationError("model event/output limit cannot exceed the stream limit")
+        hosted_limits = (
+            (self.max_hosted_search_calls, 16),
+            (self.max_hosted_search_sources, 64),
+            (self.max_hosted_search_citations, 256),
+        )
+        if any(type(value) is not int or value < 1 or value > maximum for value, maximum in hosted_limits):
+            raise ModelProviderConfigurationError("hosted search count limits exceed their fixed safety ceilings")
         if not 1 <= self.queue_capacity <= 1_024:
             raise ModelProviderConfigurationError("model stream queue capacity must be in 1..1024")
         if not 0 <= self.max_retries <= 10:
@@ -283,6 +297,8 @@ class _SemanticEvent:
     usage: ModelUsage | None = None
     finish_reason: ModelFinishReason | None = None
     error: ModelError | None = None
+    hosted_search: ModelHostedSearch | None = None
+    citation: ModelCitation | None = None
 
 
 class _StreamAccumulator(Protocol):
@@ -470,6 +486,8 @@ class OpenAIResponsesGateway:
                     usage=item.usage,
                     finish_reason=item.finish_reason,
                     error=item.error,
+                    hosted_search=item.hosted_search,
+                    citation=item.citation,
                 )
                 sequence += 1
         finally:
@@ -914,6 +932,15 @@ class _SseDecoder:
         return event_name, data
 
 
+@dataclass(slots=True)
+class _HostedSearchState:
+    output_index: int
+    phase: ModelHostedSearchPhase
+    item_done: bool = False
+    done_event_seen: bool = False
+    action_snapshot: str | None = None
+
+
 class _ResponseAccumulator:
     def __init__(self, request: ModelRequest, config: OpenAIResponsesConfig) -> None:
         self.request = request
@@ -925,6 +952,9 @@ class _ResponseAccumulator:
         self._parts: dict[tuple[int, int], list[str]] = {}
         self._ordered_text: list[str] = []
         self._refusal = False
+        self._hosted_searches: dict[str, _HostedSearchState] = {}
+        self._citation_coordinates: dict[tuple[str, int, int, int], ModelCitation] = {}
+        self._citation_values: set[ModelCitation] = set()
 
     def accept(self, event_name: str | None, data: bytes) -> tuple[_SemanticEvent, ...]:
         if self.terminal:
@@ -966,7 +996,21 @@ class _ResponseAccumulator:
             key = _output_key(value)
             if completed != "".join(self._parts.get(key, ())):
                 raise ModelProviderProtocolError("provider output_text.done disagrees with streamed deltas")
+            self._validate_citation_offsets(key, completed)
             return ()
+        if kind == "response.output_text.annotation.added":
+            annotation_index = _bounded_nonnegative_int(
+                value,
+                "annotation_index",
+                maximum=self.config.max_hosted_search_citations - 1,
+            )
+            output_index, content_index = _output_key(value)
+            item_id = _bounded_required_string(value, "item_id", maximum=256)
+            annotation = _required_mapping(value, "annotation")
+            return self._citation_events(
+                annotation,
+                coordinate=(item_id, output_index, content_index, annotation_index),
+            )
         if kind == "response.reasoning_summary_text.delta":
             delta = _required_string(value, "delta")
             if not delta:
@@ -1003,6 +1047,7 @@ class _ResponseAccumulator:
             usage = _usage(response)
             return tuple(
                 [
+                    *self._reconcile_terminal_output(response, require_complete=False),
                     *self._final_output(),
                     _SemanticEvent(ModelEventKind.USAGE, usage=usage),
                     _SemanticEvent(
@@ -1028,8 +1073,10 @@ class _ResponseAccumulator:
                     ),
                 )
             usage = _usage(response)
+            terminal_events = self._reconcile_terminal_output(response, require_complete=True)
             return tuple(
                 [
+                    *terminal_events,
                     *self._final_output(),
                     _SemanticEvent(ModelEventKind.USAGE, usage=usage),
                     _SemanticEvent(ModelEventKind.COMPLETED, finish_reason=ModelFinishReason.STOP),
@@ -1037,11 +1084,249 @@ class _ResponseAccumulator:
             )
         if kind.startswith("response.function_call"):
             raise ModelProviderProtocolError("model provider attempted an unrequested remote tool call")
+        if kind.startswith("response.web_search_call"):
+            return self._hosted_search_lifecycle(kind, value)
         if kind == "response.output_item.added":
             item = value.get("item")
             if isinstance(item, Mapping) and item.get("type") == "function_call":
                 raise ModelProviderProtocolError("model provider attempted an unrequested remote tool call")
+            if isinstance(item, Mapping) and item.get("type") == "web_search_call":
+                return self._start_hosted_search(value, item)
+        if kind == "response.output_item.done":
+            item = _required_mapping(value, "item")
+            item_type = item.get("type")
+            if item_type == "function_call":
+                raise ModelProviderProtocolError("model provider attempted an unrequested remote tool call")
+            if item_type == "web_search_call":
+                self._validate_hosted_search_item(item, _output_index(value), terminal_snapshot=False)
+                return ()
+            if item_type == "message":
+                return self._message_citation_events(item, _output_index(value))
         return ()
+
+    def _require_hosted_search(self) -> None:
+        if ModelHostedTool.WEB_SEARCH not in self.request.hosted_tools:
+            raise ModelProviderProtocolError("provider attempted undeclared Hosted Web Search")
+
+    def _start_hosted_search(
+        self,
+        event: Mapping[str, Any],
+        item: Mapping[str, Any],
+    ) -> tuple[_SemanticEvent, ...]:
+        self._require_hosted_search()
+        call_id = _bounded_required_string(item, "id", maximum=256)
+        output_index = _output_index(event)
+        if item.get("status") != "in_progress":
+            raise ModelProviderProtocolError("provider hosted search start status is invalid")
+        if call_id in self._hosted_searches or len(self._hosted_searches) >= self.config.max_hosted_search_calls:
+            raise ModelProviderProtocolError("provider hosted search calls are duplicate or exceed their limit")
+        self._hosted_searches[call_id] = _HostedSearchState(output_index, ModelHostedSearchPhase.STARTED)
+        return (
+            _SemanticEvent(
+                ModelEventKind.HOSTED_SEARCH,
+                hosted_search=ModelHostedSearch(call_id, ModelHostedSearchPhase.STARTED),
+            ),
+        )
+
+    def _hosted_search_lifecycle(
+        self,
+        kind: str,
+        event: Mapping[str, Any],
+    ) -> tuple[_SemanticEvent, ...]:
+        self._require_hosted_search()
+        phases = {
+            "response.web_search_call.in_progress": ModelHostedSearchPhase.IN_PROGRESS,
+            "response.web_search_call.searching": ModelHostedSearchPhase.SEARCHING,
+            "response.web_search_call.completed": ModelHostedSearchPhase.COMPLETED,
+        }
+        phase = phases.get(kind)
+        if phase is None:
+            raise ModelProviderProtocolError("provider hosted search lifecycle event is unsupported")
+        call_id = _bounded_required_string(event, "item_id", maximum=256)
+        output_index = _output_index(event)
+        state = self._hosted_searches.get(call_id)
+        allowed = {
+            ModelHostedSearchPhase.STARTED: {
+                ModelHostedSearchPhase.IN_PROGRESS,
+                ModelHostedSearchPhase.SEARCHING,
+                ModelHostedSearchPhase.COMPLETED,
+            },
+            ModelHostedSearchPhase.IN_PROGRESS: {
+                ModelHostedSearchPhase.SEARCHING,
+                ModelHostedSearchPhase.COMPLETED,
+            },
+            ModelHostedSearchPhase.SEARCHING: {ModelHostedSearchPhase.COMPLETED},
+        }
+        if state is None or state.output_index != output_index or phase not in allowed.get(state.phase, set()):
+            raise ModelProviderProtocolError("provider hosted search lifecycle is invalid")
+        state.phase = phase
+        return (
+            _SemanticEvent(
+                ModelEventKind.HOSTED_SEARCH,
+                hosted_search=ModelHostedSearch(call_id, phase),
+            ),
+        )
+
+    def _validate_hosted_search_item(
+        self,
+        item: Mapping[str, Any],
+        output_index: int,
+        *,
+        terminal_snapshot: bool,
+    ) -> None:
+        self._require_hosted_search()
+        call_id = _bounded_required_string(item, "id", maximum=256)
+        state = self._hosted_searches.get(call_id)
+        if (
+            state is None
+            or state.output_index != output_index
+            or state.phase is not ModelHostedSearchPhase.COMPLETED
+            or item.get("status") != "completed"
+        ):
+            raise ModelProviderProtocolError("provider hosted search item does not match its lifecycle")
+        action = _required_mapping(item, "action")
+        _validate_hosted_search_action(action, self.config)
+        action_snapshot = json.dumps(
+            action,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if state.action_snapshot is None:
+            state.action_snapshot = action_snapshot
+        elif state.action_snapshot != action_snapshot:
+            raise ModelProviderProtocolError("provider changed its completed hosted search action")
+        if not terminal_snapshot:
+            if state.done_event_seen:
+                raise ModelProviderProtocolError("provider emitted duplicate hosted search done items")
+            state.done_event_seen = True
+        state.item_done = True
+
+    def _citation_events(
+        self,
+        annotation: Mapping[str, Any],
+        *,
+        coordinate: tuple[str, int, int, int],
+        output_text: str | None = None,
+    ) -> tuple[_SemanticEvent, ...]:
+        if annotation.get("type") != "url_citation":
+            return ()
+        self._require_hosted_search()
+        if not any(state.phase is ModelHostedSearchPhase.COMPLETED for state in self._hosted_searches.values()):
+            raise ModelProviderProtocolError("provider citation arrived before Hosted Web Search completed")
+        url = _bounded_required_string(annotation, "url", maximum=2_048)
+        _validate_public_http_url(url)
+        try:
+            citation = ModelCitation(
+                provider_id=self.config.provider_id,
+                model=self.request.model,
+                request_id=self.request.request_id,
+                url=url,
+                title=_bounded_required_string(annotation, "title", maximum=512, utf8_bytes=True),
+                start_index=_bounded_nonnegative_int(
+                    annotation,
+                    "start_index",
+                    maximum=self.config.max_output_bytes,
+                ),
+                end_index=_bounded_nonnegative_int(
+                    annotation,
+                    "end_index",
+                    maximum=self.config.max_output_bytes,
+                ),
+            )
+        except ValueError as error:
+            raise ModelProviderProtocolError("provider URL citation is invalid") from error
+        if output_text is not None and citation.end_index > len(output_text):
+            raise ModelProviderProtocolError("provider citation range exceeds its output text")
+        previous = self._citation_coordinates.get(coordinate)
+        if previous is not None and previous != citation:
+            raise ModelProviderProtocolError("provider changed a citation at the same output coordinate")
+        self._citation_coordinates[coordinate] = citation
+        if citation in self._citation_values:
+            return ()
+        if len(self._citation_values) >= self.config.max_hosted_search_citations:
+            raise ModelProviderProtocolError("provider citations exceed their count limit")
+        self._citation_values.add(citation)
+        return (_SemanticEvent(ModelEventKind.CITATION, citation=citation),)
+
+    def _message_citation_events(
+        self,
+        item: Mapping[str, Any],
+        output_index: int,
+    ) -> tuple[_SemanticEvent, ...]:
+        if not self._hosted_searches:
+            if _message_has_url_citation(item):
+                raise ModelProviderProtocolError("provider emitted a URL citation without Hosted Web Search")
+            return ()
+        item_id = _bounded_required_string(item, "id", maximum=256)
+        content = item.get("content")
+        if not isinstance(content, Sequence) or isinstance(content, (str, bytes, bytearray)):
+            raise ModelProviderProtocolError("provider message item content is invalid")
+        semantic: list[_SemanticEvent] = []
+        for content_index, part in enumerate(content):
+            if not isinstance(part, Mapping) or part.get("type") != "output_text":
+                continue
+            text = _bounded_required_string(part, "text", maximum=self.config.max_output_bytes, utf8_bytes=True)
+            annotations = part.get("annotations", [])
+            if not isinstance(annotations, Sequence) or isinstance(annotations, (str, bytes, bytearray)):
+                raise ModelProviderProtocolError("provider output annotations are invalid")
+            if len(annotations) > self.config.max_hosted_search_citations:
+                raise ModelProviderProtocolError("provider citations exceed their count limit")
+            for annotation_index, annotation in enumerate(annotations):
+                if not isinstance(annotation, Mapping):
+                    raise ModelProviderProtocolError("provider output annotation is invalid")
+                semantic.extend(
+                    self._citation_events(
+                        annotation,
+                        coordinate=(item_id, output_index, content_index, annotation_index),
+                        output_text=text,
+                    )
+                )
+        return tuple(semantic)
+
+    def _reconcile_terminal_output(
+        self,
+        response: Mapping[str, Any],
+        *,
+        require_complete: bool,
+    ) -> tuple[_SemanticEvent, ...]:
+        output = response.get("output")
+        if not isinstance(output, Sequence) or isinstance(output, (str, bytes, bytearray)):
+            raise ModelProviderProtocolError("provider terminal output is invalid")
+        semantic: list[_SemanticEvent] = []
+        for output_index, item in enumerate(output):
+            if not isinstance(item, Mapping):
+                raise ModelProviderProtocolError("provider terminal output item is invalid")
+            item_type = item.get("type")
+            if item_type == "web_search_call":
+                self._validate_hosted_search_item(item, output_index, terminal_snapshot=True)
+            elif item_type == "message":
+                semantic.extend(self._message_citation_events(item, output_index))
+            elif item_type == "function_call":
+                raise ModelProviderProtocolError("model provider attempted an unrequested remote tool call")
+        self._validate_all_citation_offsets()
+        if require_complete and any(
+            state.phase is not ModelHostedSearchPhase.COMPLETED or not state.item_done
+            for state in self._hosted_searches.values()
+        ):
+            raise ModelProviderProtocolError("provider completed with unfinished Hosted Web Search")
+        return tuple(semantic)
+
+    def _validate_citation_offsets(self, key: tuple[int, int], text: str) -> None:
+        output_index, content_index = key
+        if any(
+            citation.end_index > len(text)
+            for (_, output, content, _), citation in self._citation_coordinates.items()
+            if output == output_index and content == content_index
+        ):
+            raise ModelProviderProtocolError("provider citation range exceeds its output text")
+
+    def _validate_all_citation_offsets(self) -> None:
+        for (_, output_index, content_index, _), citation in self._citation_coordinates.items():
+            text = "".join(self._parts.get((output_index, content_index), ()))
+            if citation.end_index > len(text):
+                raise ModelProviderProtocolError("provider citation range exceeds its output text")
 
     def _record_output(self, event: Mapping[str, Any], delta: str) -> None:
         self._count_output(delta)
@@ -1078,8 +1363,11 @@ def _encode_request(request: ModelRequest, config: OpenAIResponsesConfig) -> byt
         "stream": True,
         "store": False,
         "parallel_tool_calls": False,
-        "tools": [],
+        "tools": [{"type": tool.value} for tool in request.hosted_tools],
     }
+    if ModelHostedTool.WEB_SEARCH in request.hosted_tools:
+        body["tool_choice"] = "auto"
+        body["include"] = ["web_search_call.action.sources"]
     if request.max_output_tokens is not None and config.supports_max_output_tokens:
         body["max_output_tokens"] = request.max_output_tokens
     if request.reasoning_effort is not None:
@@ -1511,12 +1799,112 @@ def _required_string(value: Mapping[str, Any], field: str) -> str:
     return result
 
 
+def _bounded_required_string(
+    value: Mapping[str, Any],
+    field: str,
+    *,
+    maximum: int,
+    utf8_bytes: bool = False,
+) -> str:
+    result = _required_string(value, field)
+    length = len(result.encode("utf-8")) if utf8_bytes else len(result)
+    if not result or result != result.strip() or length > maximum or any(ord(character) < 32 for character in result):
+        raise ModelProviderProtocolError(f"provider event field {field!r} exceeds its text limit")
+    return result
+
+
+def _bounded_nonnegative_int(value: Mapping[str, Any], field: str, *, maximum: int) -> int:
+    result = value.get(field)
+    if type(result) is not int or not 0 <= result <= maximum:
+        raise ModelProviderProtocolError(f"provider event field {field!r} is outside its integer limit")
+    return result
+
+
+def _output_index(value: Mapping[str, Any]) -> int:
+    return _bounded_nonnegative_int(value, "output_index", maximum=1_000_000)
+
+
 def _output_key(value: Mapping[str, Any]) -> tuple[int, int]:
     output = value.get("output_index")
     content = value.get("content_index")
     if type(output) is not int or output < 0 or type(content) is not int or content < 0:
         raise ModelProviderProtocolError("provider output delta indices are invalid")
     return output, content
+
+
+def _message_has_url_citation(item: Mapping[str, Any]) -> bool:
+    content = item.get("content")
+    if not isinstance(content, Sequence) or isinstance(content, (str, bytes, bytearray)):
+        return False
+    for part in content:
+        if not isinstance(part, Mapping) or part.get("type") != "output_text":
+            continue
+        annotations = part.get("annotations")
+        if not isinstance(annotations, Sequence) or isinstance(annotations, (str, bytes, bytearray)):
+            continue
+        if any(
+            isinstance(annotation, Mapping) and annotation.get("type") == "url_citation" for annotation in annotations
+        ):
+            return True
+    return False
+
+
+def _validate_hosted_search_action(action: Mapping[str, Any], config: OpenAIResponsesConfig) -> None:
+    action_type = _bounded_required_string(action, "type", maximum=32)
+    if action_type == "search":
+        query = action.get("query")
+        if query is not None:
+            _bounded_required_string(action, "query", maximum=4_096, utf8_bytes=True)
+        queries = action.get("queries")
+        if queries is not None:
+            if not isinstance(queries, Sequence) or isinstance(queries, (str, bytes, bytearray)) or len(queries) > 32:
+                raise ModelProviderProtocolError("provider hosted search queries are invalid")
+            for value in queries:
+                if not isinstance(value, str):
+                    raise ModelProviderProtocolError("provider hosted search query is invalid")
+                _bounded_required_string({"query": value}, "query", maximum=4_096, utf8_bytes=True)
+        sources = action.get("sources")
+        if sources is None:
+            return
+        if (
+            not isinstance(sources, Sequence)
+            or isinstance(sources, (str, bytes, bytearray))
+            or len(sources) > config.max_hosted_search_sources
+        ):
+            raise ModelProviderProtocolError("provider hosted search sources are invalid or exceed their limit")
+        for source in sources:
+            if not isinstance(source, Mapping) or source.get("type") != "url":
+                raise ModelProviderProtocolError("provider hosted search source is invalid")
+            _validate_public_http_url(_bounded_required_string(source, "url", maximum=2_048))
+        return
+    if action_type == "open_page":
+        url = action.get("url")
+        if url is not None:
+            _validate_public_http_url(_bounded_required_string(action, "url", maximum=2_048))
+        return
+    if action_type == "find_in_page":
+        _validate_public_http_url(_bounded_required_string(action, "url", maximum=2_048))
+        _bounded_required_string(action, "pattern", maximum=4_096, utf8_bytes=True)
+        return
+    raise ModelProviderProtocolError("provider hosted search action type is unsupported")
+
+
+def _validate_public_http_url(value: str) -> None:
+    if any(character.isspace() or ord(character) < 32 for character in value):
+        raise ModelProviderProtocolError("provider public URL is invalid")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise ModelProviderProtocolError("provider public URL is invalid") from error
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or (port is not None and not 1 <= port <= 65_535)
+    ):
+        raise ModelProviderProtocolError("provider public URL is invalid")
 
 
 def _nonnegative_int(value: Mapping[str, Any], field: str) -> int:

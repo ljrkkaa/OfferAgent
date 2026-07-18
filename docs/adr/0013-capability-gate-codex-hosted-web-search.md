@@ -1,8 +1,12 @@
 ---
-status: accepted
+status: superseded
+supersededBy: 0031
 ---
 
 # Capability-gate Codex hosted web search
+
+> Superseded by ADR 0031. The fused Python Harness uses the current account-bound model catalog and does not
+> perform runtime capability probes or retry without Hosted Web Search.
 
 OfferAgent 在模型请求中允许同时声明本地 Function Tool 和 Provider 托管工具。首版尝试向 Codex Responses 兼容后端声明 `{ "type": "web_search" }`，由 Provider 执行互联网搜索并返回 `web_search_call`、来源和 `url_citation`；Vault 工具仍由 OfferAgent Runtime 与 Obsidian 插件执行。
 

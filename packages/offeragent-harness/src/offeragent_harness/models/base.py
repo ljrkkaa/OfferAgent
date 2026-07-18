@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 from typing import Any
+from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator
 
@@ -37,6 +38,8 @@ class ModelEventKind(str, Enum):
     TEXT_DELTA = "text_delta"
     REASONING_SUMMARY = "reasoning_summary"
     STRUCTURED_OUTPUT = "structured_output"
+    HOSTED_SEARCH = "hosted_search"
+    CITATION = "citation"
     USAGE = "usage"
     COMPLETED = "completed"
     ERROR = "error"
@@ -49,6 +52,54 @@ class ModelFinishReason(str, Enum):
     CONTENT_FILTER = "content_filter"
     CANCELLED = "cancelled"
     ERROR = "error"
+
+
+class ModelHostedTool(str, Enum):
+    WEB_SEARCH = "web_search"
+
+
+class ModelHostedSearchPhase(str, Enum):
+    STARTED = "started"
+    IN_PROGRESS = "in_progress"
+    SEARCHING = "searching"
+    COMPLETED = "completed"
+
+
+@dataclass(frozen=True)
+class ModelHostedSearch:
+    call_id: str
+    phase: ModelHostedSearchPhase
+
+    def __post_init__(self) -> None:
+        _validate_bounded_text(self.call_id, "hosted search call_id", maximum=256)
+
+
+@dataclass(frozen=True)
+class ModelCitation:
+    """One provider-attested URL annotation in provider output coordinates."""
+
+    provider_id: str
+    model: str
+    request_id: str
+    url: str
+    title: str
+    start_index: int
+    end_index: int
+
+    def __post_init__(self) -> None:
+        _validate_bounded_text(self.provider_id, "citation provider_id", maximum=128)
+        _validate_bounded_text(self.model, "citation model", maximum=256)
+        _validate_bounded_text(self.request_id, "citation request_id", maximum=256)
+        _validate_public_url(self.url)
+        _validate_bounded_text(self.title, "citation title", maximum=512, utf8_bytes=True)
+        if (
+            type(self.start_index) is not int
+            or type(self.end_index) is not int
+            or self.start_index < 0
+            or self.end_index <= self.start_index
+            or self.end_index > 16 * 1024 * 1024
+        ):
+            raise ValueError("citation indices must be a bounded non-empty ordered range")
 
 
 @dataclass(frozen=True)
@@ -124,6 +175,7 @@ class ModelRequest:
     seed: int | None
     trace_context: TraceContext
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    hosted_tools: tuple[ModelHostedTool, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.request_id or not self.model:
@@ -146,6 +198,14 @@ class ModelRequest:
         if not isinstance(frozen_metadata, FrozenJsonObject):
             raise TypeError("metadata must be a JSON object")
         object.__setattr__(self, "metadata", frozen_metadata)
+        tools = tuple(self.hosted_tools)
+        if (
+            len(tools) > 4
+            or len(tools) != len(set(tools))
+            or any(not isinstance(tool, ModelHostedTool) for tool in tools)
+        ):
+            raise ValueError("hosted model tools must be a small unique typed tuple")
+        object.__setattr__(self, "hosted_tools", tools)
 
 
 @dataclass(frozen=True)
@@ -202,6 +262,8 @@ class ModelEvent:
     usage: ModelUsage | None = None
     finish_reason: ModelFinishReason | None = None
     error: ModelError | None = None
+    hosted_search: ModelHostedSearch | None = None
+    citation: ModelCitation | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -215,6 +277,8 @@ class ModelEvent:
             ModelEventKind.TEXT_DELTA: ("text",),
             ModelEventKind.REASONING_SUMMARY: ("text",),
             ModelEventKind.STRUCTURED_OUTPUT: ("data",),
+            ModelEventKind.HOSTED_SEARCH: ("hosted_search",),
+            ModelEventKind.CITATION: ("citation",),
             ModelEventKind.USAGE: ("usage",),
             ModelEventKind.COMPLETED: ("finish_reason",),
             ModelEventKind.ERROR: ("error",),
@@ -226,6 +290,8 @@ class ModelEvent:
             "usage": self.usage,
             "finish_reason": self.finish_reason,
             "error": self.error,
+            "hosted_search": self.hosted_search,
+            "citation": self.citation,
         }
         missing = [name for name in required.get(self.kind, ()) if fields[name] is None]
         if missing:
@@ -240,12 +306,54 @@ class ModelEvent:
             raise ValueError("cancelled events require the cancelled finish reason")
 
 
+def _validate_bounded_text(value: str, label: str, *, maximum: int, utf8_bytes: bool = False) -> None:
+    length = (
+        len(value.encode("utf-8"))
+        if isinstance(value, str) and utf8_bytes
+        else len(value)
+        if isinstance(value, str)
+        else 0
+    )
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or length > maximum
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ValueError(f"{label} must be bounded non-empty text")
+
+
+def _validate_public_url(value: str) -> None:
+    if not isinstance(value, str) or not value or value != value.strip() or len(value) > 2_048:
+        raise ValueError("citation URL must be a bounded public HTTP(S) URL")
+    if any(character.isspace() or ord(character) < 32 for character in value):
+        raise ValueError("citation URL must be a bounded public HTTP(S) URL")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("citation URL must be a bounded public HTTP(S) URL") from error
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or (port is not None and not 1 <= port <= 65_535)
+    ):
+        raise ValueError("citation URL must be a bounded public HTTP(S) URL")
+
+
 __all__ = [
+    "ModelCitation",
     "ModelContentBlock",
     "ModelError",
     "ModelEvent",
     "ModelEventKind",
     "ModelFinishReason",
+    "ModelHostedSearch",
+    "ModelHostedSearchPhase",
+    "ModelHostedTool",
     "ModelMessage",
     "ModelOutputMode",
     "ModelPurpose",

@@ -26,7 +26,7 @@ node_modules/
 src/interface/obsidian/main.js
 *.map
 
-# Track reviewed architecture, domain, and repository-agent documents.
+# Track reviewed architecture, research, domain, and repository-agent documents.
 docs/
 !docs/
 docs/*
@@ -39,6 +39,8 @@ docs/*
 !docs/adr/**
 !docs/agents/
 !docs/agents/**
+!docs/research/
+!docs/research/**
 
 INTERVIEW_PERSONAL_KB_AGENT.md
 demos/

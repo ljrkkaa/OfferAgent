@@ -12,10 +12,13 @@ from typing import Any, cast
 from jsonschema import Draft202012Validator
 
 from offeragent_harness.models import (
+    ModelCitation,
     ModelContentBlock,
     ModelError,
     ModelEventKind,
     ModelFinishReason,
+    ModelHostedSearchPhase,
+    ModelHostedTool,
     ModelMessage,
     ModelOutputMode,
     ModelPurpose,
@@ -108,6 +111,7 @@ class PlannerModelConfig:
     reasoning_effort: str | None = None
     temperature: float | None = 0
     seed: int | None = None
+    hosted_tools: tuple[ModelHostedTool, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.model:
@@ -116,6 +120,10 @@ class PlannerModelConfig:
             raise ValueError("planner max_output_tokens must be positive")
         if self.temperature is not None and not 0 <= self.temperature <= 2:
             raise ValueError("planner temperature must be between 0 and 2")
+        tools = tuple(self.hosted_tools)
+        if len(tools) != len(set(tools)) or any(not isinstance(tool, ModelHostedTool) for tool in tools):
+            raise ValueError("planner hosted tools must be unique typed values")
+        object.__setattr__(self, "hosted_tools", tools)
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +131,7 @@ class StructuredModelResponse:
     request_id: str
     output: FrozenJsonObject
     usage: ModelUsage
+    citations: tuple[ModelCitation, ...] = ()
 
 
 class AgentStepCatalog:
@@ -400,6 +409,7 @@ class ModelPlanner:
             seed=self._config.seed,
             trace_context=TraceContext(self._ids.new_id("trace")),
             metadata=metadata,
+            hosted_tools=self._config.hosted_tools,
         )
 
     def _build_window(self, state: RunState, *, projection: ContextProjection | None) -> ContextWindow:
@@ -603,6 +613,7 @@ class ModelPlanner:
             calls=tuple(calls),
             requires_write_outcome=cast(bool, raw["requiresWriteOutcome"]),
             final_response=cast(str | None, raw["finalResponse"]),
+            citations=response.citations,
         )
 
 
@@ -682,6 +693,8 @@ async def collect_structured_response(
     completed = False
     output: FrozenJsonObject | None = None
     usage: ModelUsage | None = None
+    search_phases: dict[str, ModelHostedSearchPhase] = {}
+    citations: list[ModelCitation] = []
     async for event in gateway.stream(request, cancellation):
         cancellation.checkpoint()
         if completed:
@@ -721,6 +734,46 @@ async def collect_structured_response(
         elif event.kind is ModelEventKind.REASONING_SUMMARY:
             if not event.text:
                 raise ModelStreamProtocolError(request.request_id, "empty reasoning summary", usage=usage)
+        elif event.kind is ModelEventKind.HOSTED_SEARCH:
+            if ModelHostedTool.WEB_SEARCH not in request.hosted_tools:
+                raise ModelStreamProtocolError(request.request_id, "undeclared hosted search event", usage=usage)
+            assert event.hosted_search is not None
+            call_id = event.hosted_search.call_id
+            phase = event.hosted_search.phase
+            previous = search_phases.get(call_id)
+            if phase is ModelHostedSearchPhase.STARTED:
+                if previous is not None or len(search_phases) >= 16:
+                    raise ModelStreamProtocolError(request.request_id, "invalid hosted search start", usage=usage)
+            else:
+                allowed = {
+                    ModelHostedSearchPhase.STARTED: {
+                        ModelHostedSearchPhase.IN_PROGRESS,
+                        ModelHostedSearchPhase.SEARCHING,
+                        ModelHostedSearchPhase.COMPLETED,
+                    },
+                    ModelHostedSearchPhase.IN_PROGRESS: {
+                        ModelHostedSearchPhase.SEARCHING,
+                        ModelHostedSearchPhase.COMPLETED,
+                    },
+                    ModelHostedSearchPhase.SEARCHING: {ModelHostedSearchPhase.COMPLETED},
+                }
+                if previous is None or phase not in allowed.get(previous, set()):
+                    raise ModelStreamProtocolError(request.request_id, "invalid hosted search phase", usage=usage)
+            search_phases[call_id] = phase
+        elif event.kind is ModelEventKind.CITATION:
+            if ModelHostedTool.WEB_SEARCH not in request.hosted_tools:
+                raise ModelStreamProtocolError(request.request_id, "undeclared hosted citation event", usage=usage)
+            if not any(phase is ModelHostedSearchPhase.COMPLETED for phase in search_phases.values()):
+                raise ModelStreamProtocolError(request.request_id, "citation arrived before hosted search", usage=usage)
+            assert event.citation is not None
+            if event.citation.request_id != request.request_id or event.citation.model != request.model:
+                raise ModelStreamProtocolError(request.request_id, "hosted citation identity mismatch", usage=usage)
+            if event.citation not in citations:
+                if len(citations) >= 256:
+                    raise ModelStreamProtocolError(
+                        request.request_id, "hosted citations exceed their limit", usage=usage
+                    )
+                citations.append(event.citation)
         elif event.kind is ModelEventKind.COMPLETED:
             assert event.finish_reason is not None
             if event.usage is not None:
@@ -735,6 +788,10 @@ async def collect_structured_response(
                     (f"model finish reason was {event.finish_reason.value}, expected stop",),
                     raw_output=raw,
                     usage=usage,
+                )
+            if any(phase is not ModelHostedSearchPhase.COMPLETED for phase in search_phases.values()):
+                raise ModelStreamProtocolError(
+                    request.request_id, "completed with unfinished hosted search", usage=usage
                 )
             completed = True
         elif event.kind is ModelEventKind.ERROR:
@@ -762,7 +819,7 @@ async def collect_structured_response(
             raw_output=None,
             usage=usage,
         )
-    return StructuredModelResponse(request.request_id, output, usage)
+    return StructuredModelResponse(request.request_id, output, usage, tuple(citations))
 
 
 def validate_usage_progression(previous: ModelUsage | None, current: ModelUsage, request_id: str) -> None:

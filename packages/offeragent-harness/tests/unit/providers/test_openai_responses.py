@@ -13,10 +13,14 @@ import pytest
 
 from offeragent_harness.config import ModelProvider, ModelSettings
 from offeragent_harness.models import (
+    ModelCitation,
     ModelContentBlock,
     ModelEvent,
     ModelEventKind,
     ModelFinishReason,
+    ModelHostedSearch,
+    ModelHostedSearchPhase,
+    ModelHostedTool,
     ModelMessage,
     ModelOutputMode,
     ModelPurpose,
@@ -28,6 +32,7 @@ from offeragent_harness.ports import SecretHandle, SecretKind
 from offeragent_harness.providers import (
     CodexResponsesProvider,
     LocalModelProvider,
+    ModelProviderConfigurationError,
     OpenAICompatibleProvider,
     OpenAIProvider,
     OpenAIResponsesConfig,
@@ -74,7 +79,11 @@ class _SecretResolver:
                 self.buffer[index] = 0
 
 
-def _request(*, output_mode: ModelOutputMode = ModelOutputMode.TEXT) -> ModelRequest:
+def _request(
+    *,
+    output_mode: ModelOutputMode = ModelOutputMode.TEXT,
+    hosted_search: bool = False,
+) -> ModelRequest:
     schema = None
     if output_mode is ModelOutputMode.JSON:
         schema = {
@@ -104,6 +113,7 @@ def _request(*, output_mode: ModelOutputMode = ModelOutputMode.TEXT) -> ModelReq
         seed=None,
         trace_context=TraceContext("trace_test"),
         metadata={"workspaceId": "must-not-leave-process"},
+        hosted_tools=(ModelHostedTool.WEB_SEARCH,) if hosted_search else (),
     )
 
 
@@ -135,6 +145,19 @@ def test_default_request_ceiling_covers_one_maximum_attachment_batch_as_data_url
     base64_bytes = 4 * ((raw_image_bytes + 2) // 3)
 
     assert _config().max_request_bytes >= base64_bytes + 8 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("max_hosted_search_calls", 17),
+        ("max_hosted_search_sources", 65),
+        ("max_hosted_search_citations", 257),
+    ),
+)
+def test_hosted_search_config_cannot_raise_fixed_safety_ceilings(field: str, value: int) -> None:
+    with pytest.raises(ModelProviderConfigurationError, match="hosted search count limits"):
+        replace(_config(), **{field: value})
 
 
 def _sse(*events: dict[str, object]) -> bytes:
@@ -231,6 +254,584 @@ async def test_text_stream_is_real_typed_sse_and_request_exposes_no_runtime_auth
     assert "test-provider-secret" not in encoded
     assert "Local tool result workspace.read" in encoded
     assert secrets.calls == 1 and set(secrets.buffer) == {0}
+
+
+@pytest.mark.asyncio
+async def test_hosted_search_request_and_stream_are_typed_bounded_and_citation_preserving() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        content = _sse(
+            {"type": "response.created", "sequence_number": 0, "response": {"id": "resp_search"}},
+            {
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {"id": "ws_1", "type": "web_search_call", "status": "in_progress"},
+            },
+            {
+                "type": "response.web_search_call.in_progress",
+                "sequence_number": 2,
+                "output_index": 0,
+                "item_id": "ws_1",
+            },
+            {
+                "type": "response.web_search_call.searching",
+                "sequence_number": 3,
+                "output_index": 0,
+                "item_id": "ws_1",
+            },
+            {
+                "type": "response.web_search_call.completed",
+                "sequence_number": 4,
+                "output_index": 0,
+                "item_id": "ws_1",
+            },
+            {
+                "type": "response.output_item.done",
+                "sequence_number": 5,
+                "output_index": 0,
+                "item": {
+                    "id": "ws_1",
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "queries": ["OfferAgent interview research"],
+                        "sources": [{"type": "url", "url": "https://example.com/interview"}],
+                    },
+                },
+            },
+            {
+                "type": "response.reasoning_summary_text.delta",
+                "sequence_number": 6,
+                "output_index": 1,
+                "summary_index": 0,
+                "delta": "Checked a public source.",
+            },
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 7,
+                "item_id": "msg_1",
+                "output_index": 1,
+                "content_index": 0,
+                "delta": "Cited answer",
+            },
+            {
+                "type": "response.output_text.annotation.added",
+                "sequence_number": 8,
+                "item_id": "msg_1",
+                "output_index": 1,
+                "content_index": 0,
+                "annotation_index": 0,
+                "annotation": {
+                    "type": "url_citation",
+                    "start_index": 0,
+                    "end_index": 5,
+                    "url": "https://example.com/interview",
+                    "title": "Example interview",
+                },
+            },
+            {
+                "type": "response.output_text.done",
+                "sequence_number": 9,
+                "item_id": "msg_1",
+                "output_index": 1,
+                "content_index": 0,
+                "text": "Cited answer",
+            },
+            {
+                "type": "response.output_item.done",
+                "sequence_number": 10,
+                "output_index": 1,
+                "item": {
+                    "id": "msg_1",
+                    "type": "message",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Cited answer",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "start_index": 0,
+                                    "end_index": 5,
+                                    "url": "https://example.com/interview",
+                                    "title": "Example interview",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "response.completed",
+                "sequence_number": 11,
+                "response": {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "id": "ws_1",
+                            "type": "web_search_call",
+                            "status": "completed",
+                            "action": {
+                                "type": "search",
+                                "queries": ["OfferAgent interview research"],
+                                "sources": [{"type": "url", "url": "https://example.com/interview"}],
+                            },
+                        },
+                        {
+                            "id": "msg_1",
+                            "type": "message",
+                            "status": "completed",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Cited answer",
+                                    "annotations": [
+                                        {
+                                            "type": "url_citation",
+                                            "start_index": 0,
+                                            "end_index": 5,
+                                            "url": "https://example.com/interview",
+                                            "title": "Example interview",
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    ],
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 8,
+                        "input_tokens_details": {"cached_tokens": 2},
+                        "output_tokens_details": {"reasoning_tokens": 1},
+                    },
+                },
+            },
+        )
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=content)
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request(hosted_search=True))
+
+    body = captured["body"]
+    assert isinstance(body, dict)
+    assert body["tools"] == [{"type": "web_search"}]
+    assert body["tool_choice"] == "auto"
+    assert body["include"] == ["web_search_call.action.sources"]
+    assert [event.kind for event in events] == [
+        ModelEventKind.STARTED,
+        ModelEventKind.HOSTED_SEARCH,
+        ModelEventKind.HOSTED_SEARCH,
+        ModelEventKind.HOSTED_SEARCH,
+        ModelEventKind.HOSTED_SEARCH,
+        ModelEventKind.REASONING_SUMMARY,
+        ModelEventKind.TEXT_DELTA,
+        ModelEventKind.CITATION,
+        ModelEventKind.USAGE,
+        ModelEventKind.COMPLETED,
+    ]
+    searches = [event.hosted_search for event in events if event.hosted_search is not None]
+    assert searches == [
+        ModelHostedSearch("ws_1", ModelHostedSearchPhase.STARTED),
+        ModelHostedSearch("ws_1", ModelHostedSearchPhase.IN_PROGRESS),
+        ModelHostedSearch("ws_1", ModelHostedSearchPhase.SEARCHING),
+        ModelHostedSearch("ws_1", ModelHostedSearchPhase.COMPLETED),
+    ]
+    citations = [event.citation for event in events if event.citation is not None]
+    assert citations == [
+        ModelCitation(
+            provider_id="openai",
+            model="gpt-test",
+            request_id="req_test_1",
+            url="https://example.com/interview",
+            title="Example interview",
+            start_index=0,
+            end_index=5,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_undeclared_or_out_of_order_hosted_search_fails_without_retry() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.web_search_call.searching",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item_id": "ws_missing",
+                },
+            ),
+        )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request())
+
+    assert calls == 1
+    assert [event.kind for event in events] == [ModelEventKind.STARTED, ModelEventKind.ERROR]
+    assert events[-1].error is not None and events[-1].error.code == "provider_protocol_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_url",
+    ["https://user:password@example.com/private", "file:///C:/private.txt"],
+)
+async def test_hosted_search_rejects_unsafe_included_source_urls(source_url: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item": {"id": "ws_unsafe", "type": "web_search_call", "status": "in_progress"},
+                },
+                {
+                    "type": "response.web_search_call.completed",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "item_id": "ws_unsafe",
+                },
+                {
+                    "type": "response.output_item.done",
+                    "sequence_number": 3,
+                    "output_index": 0,
+                    "item": {
+                        "id": "ws_unsafe",
+                        "type": "web_search_call",
+                        "status": "completed",
+                        "action": {
+                            "type": "search",
+                            "sources": [{"type": "url", "url": source_url}],
+                        },
+                    },
+                },
+            ),
+        )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request(hosted_search=True))
+
+    assert events[-1].kind is ModelEventKind.ERROR
+    assert events[-1].error is not None and events[-1].error.code == "provider_protocol_error"
+
+
+@pytest.mark.asyncio
+async def test_hosted_search_source_count_is_locally_bounded() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item": {"id": "ws_bounded", "type": "web_search_call", "status": "in_progress"},
+                },
+                {
+                    "type": "response.web_search_call.completed",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "item_id": "ws_bounded",
+                },
+                {
+                    "type": "response.output_item.done",
+                    "sequence_number": 3,
+                    "output_index": 0,
+                    "item": {
+                        "id": "ws_bounded",
+                        "type": "web_search_call",
+                        "status": "completed",
+                        "action": {
+                            "type": "search",
+                            "sources": [
+                                {"type": "url", "url": "https://example.com/one"},
+                                {"type": "url", "url": "https://example.com/two"},
+                            ],
+                        },
+                    },
+                },
+            ),
+        )
+
+    config = replace(_config(), max_hosted_search_sources=1)
+    events = await _collect(_gateway(httpx.MockTransport(handler), config=config), _request(hosted_search=True))
+
+    assert events[-1].kind is ModelEventKind.ERROR
+    assert events[-1].error is not None and events[-1].error.code == "provider_protocol_error"
+
+
+@pytest.mark.asyncio
+async def test_successful_terminal_must_reconcile_every_hosted_search_output_item() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item": {"id": "ws_lost", "type": "web_search_call", "status": "in_progress"},
+                },
+                {
+                    "type": "response.web_search_call.completed",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "item_id": "ws_lost",
+                },
+                _completed("answer", sequence=3),
+            ),
+        )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request(hosted_search=True))
+
+    assert events[-1].kind is ModelEventKind.ERROR
+    assert events[-1].error is not None and events[-1].error.code == "provider_protocol_error"
+
+
+@pytest.mark.asyncio
+async def test_terminal_hosted_search_snapshot_must_match_its_done_event() -> None:
+    done_action = {
+        "type": "search",
+        "queries": ["OfferAgent"],
+        "sources": [{"type": "url", "url": "https://example.com/one"}],
+    }
+    terminal_action = {
+        "type": "search",
+        "queries": ["OfferAgent"],
+        "sources": [{"type": "url", "url": "https://example.com/two"}],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item": {"id": "ws_changed", "type": "web_search_call", "status": "in_progress"},
+                },
+                {
+                    "type": "response.web_search_call.completed",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "item_id": "ws_changed",
+                },
+                {
+                    "type": "response.output_item.done",
+                    "sequence_number": 3,
+                    "output_index": 0,
+                    "item": {
+                        "id": "ws_changed",
+                        "type": "web_search_call",
+                        "status": "completed",
+                        "action": done_action,
+                    },
+                },
+                {
+                    "type": "response.completed",
+                    "sequence_number": 4,
+                    "response": {
+                        "status": "completed",
+                        "output": [
+                            {
+                                "id": "ws_changed",
+                                "type": "web_search_call",
+                                "status": "completed",
+                                "action": terminal_action,
+                            }
+                        ],
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    },
+                },
+            ),
+        )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request(hosted_search=True))
+
+    assert events[-1].kind is ModelEventKind.ERROR
+    assert events[-1].error is not None and events[-1].error.code == "provider_protocol_error"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_hosted_search_done_event_is_rejected() -> None:
+    search_item = {
+        "id": "ws_duplicate_done",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"type": "search", "queries": ["OfferAgent"]},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item": {"id": "ws_duplicate_done", "type": "web_search_call", "status": "in_progress"},
+                },
+                {
+                    "type": "response.web_search_call.completed",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "item_id": "ws_duplicate_done",
+                },
+                {
+                    "type": "response.output_item.done",
+                    "sequence_number": 3,
+                    "output_index": 0,
+                    "item": search_item,
+                },
+                {
+                    "type": "response.output_item.done",
+                    "sequence_number": 4,
+                    "output_index": 0,
+                    "item": search_item,
+                },
+            ),
+        )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request(hosted_search=True))
+
+    assert events[-1].kind is ModelEventKind.ERROR
+    assert events[-1].error is not None and events[-1].error.code == "provider_protocol_error"
+
+
+@pytest.mark.asyncio
+async def test_terminal_url_citation_without_a_hosted_search_is_rejected() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        terminal = _completed("Cited answer", sequence=1)
+        response = terminal["response"]
+        assert isinstance(response, dict)
+        response["output"] = [
+            {
+                "id": "msg_unsupported_citation",
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "Cited answer",
+                        "annotations": [
+                            {
+                                "type": "url_citation",
+                                "start_index": 0,
+                                "end_index": 5,
+                                "url": "https://example.com/source",
+                                "title": "Unsupported citation",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse({"type": "response.created", "sequence_number": 0, "response": {}}, terminal),
+        )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request(hosted_search=True))
+
+    assert events[-1].kind is ModelEventKind.ERROR
+    assert events[-1].error is not None and events[-1].error.code == "provider_protocol_error"
+
+
+@pytest.mark.asyncio
+async def test_streamed_citation_must_resolve_to_streamed_output_text_coordinates() -> None:
+    action = {"type": "search", "queries": ["OfferAgent"]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        terminal = _completed("answer", sequence=5)
+        response = terminal["response"]
+        assert isinstance(response, dict)
+        response["output"] = [
+            {
+                "id": "ws_coordinate",
+                "type": "web_search_call",
+                "status": "completed",
+                "action": action,
+            },
+            {
+                "id": "msg_coordinate",
+                "type": "message",
+                "content": [{"type": "output_text", "text": "answer", "annotations": []}],
+            },
+        ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "item": {"id": "ws_coordinate", "type": "web_search_call", "status": "in_progress"},
+                },
+                {
+                    "type": "response.web_search_call.completed",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "item_id": "ws_coordinate",
+                },
+                {
+                    "type": "response.output_item.done",
+                    "sequence_number": 3,
+                    "output_index": 0,
+                    "item": {
+                        "id": "ws_coordinate",
+                        "type": "web_search_call",
+                        "status": "completed",
+                        "action": action,
+                    },
+                },
+                {
+                    "type": "response.output_text.annotation.added",
+                    "sequence_number": 4,
+                    "item_id": "msg_missing",
+                    "output_index": 99,
+                    "content_index": 0,
+                    "annotation_index": 0,
+                    "annotation": {
+                        "type": "url_citation",
+                        "start_index": 0,
+                        "end_index": 1,
+                        "url": "https://example.com/source",
+                        "title": "Missing coordinates",
+                    },
+                },
+                terminal,
+            ),
+        )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request(hosted_search=True))
+
+    assert events[-1].kind is ModelEventKind.ERROR
+    assert events[-1].error is not None and events[-1].error.code == "provider_protocol_error"
 
 
 @pytest.mark.asyncio

@@ -1075,7 +1075,16 @@
     const list = node("ol");
     for (const reference of references) {
       const item = node("li");
-      item.append(node("span", referenceText(reference)));
+      const target = safeReferenceUrl(reference);
+      if (target) {
+        const link = node("a", referenceText(reference));
+        link.href = target;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        item.append(link);
+      } else {
+        item.append(node("span", referenceText(reference)));
+      }
       if (reference.type === "artifact" && reference.artifact?.artifactId) {
         const button = node("button", "查看 Artifact");
         button.type = "button";
@@ -1356,6 +1365,10 @@
       ].join(":");
     }
     if (reference?.type === "artifact") return `artifact:${reference.artifact?.artifactId}`;
+    if (reference?.type === "web") return `web:${reference.url}:${reference.contentHash}`;
+    if (reference?.type === "hostedWeb") {
+      return `hostedWeb:${reference.providerId}:${reference.model}:${reference.modelRequestId}:${reference.url}`;
+    }
     return JSON.stringify(reference);
   }
 
@@ -1370,7 +1383,21 @@
       return `${reference.label ?? reference.file?.path ?? "Vault"}${line}${freshness}`;
     }
     if (reference?.type === "artifact") return reference.label ?? reference.artifact?.title ?? reference.artifact?.artifactId;
+    if (reference?.type === "web" || reference?.type === "hostedWeb") {
+      return reference.label ?? reference.title ?? reference.url ?? "Web";
+    }
     return "未知引用";
+  }
+
+  function safeReferenceUrl(reference) {
+    if (reference?.type !== "web" && reference?.type !== "hostedWeb") return null;
+    try {
+      const url = new URL(reference.url);
+      if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return null;
+      return url.href;
+    } catch {
+      return null;
+    }
   }
 
   function node(tag, textValue, className) {

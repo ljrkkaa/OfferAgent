@@ -225,8 +225,12 @@ Obsidian 插件中通过官方 Obsidian TypeScript API 实现 Vault 工具协议
 _Avoid_: CLI 包装器、Runtime 直接文件访问、模型执行 Shell
 
 **Provider Capability**:
-模型 Provider 在当前认证方式和后端上经过实际探测后可用的托管能力，例如 Codex Hosted Web Search。未知或探测失败的能力不得被 Agent 当成已提供的工具。
-_Avoid_: 根据模型名称猜测能力、把内部后端当成公开稳定协议
+当前账户绑定的 Provider 模型目录为精确所选模型声明的托管能力，例如 Codex Hosted Web Search；该声明随目录修订固化到 Agent Run，只有目录明确支持的能力才会进入模型请求。陈旧目录只用于展示，不能创建新 Run，也不发送生产能力探测请求。
+_Avoid_: 运行时能力探测、探测缓存、失败后静默降级、根据模型名称猜测能力、把内部后端当成公开稳定协议
+
+**Hosted Search Citation**:
+Codex Hosted Web Search 在 Responses 输出中为答案提供的 Provider 证明型公共 URL 引用；它保存标题、Provider、模型和模型请求身份，但没有网页正文字节，因此不伪造内容哈希。需要精确网页证据时仍使用 `web_read` 读取并产生带真实内容哈希的 Web 来源。
+_Avoid_: 用 URL 或标题生成虚假 content hash、把搜索候选列表全部描述为已使用证据、网页镜像
 
 **Vision Capability**:
 当前账户绑定的 Provider 模型目录为所选模型声明的原生图片理解能力；它只适用于该目录修订中的精确模型选择，并允许读取用户明确提供的 Run Attachment。目录未知或未声明图片输入时不得推断支持，也不依赖本地 OCR。

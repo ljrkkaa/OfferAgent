@@ -14,7 +14,13 @@ from offeragent_harness.permissions import RiskClass
 from offeragent_harness.ports import ApplicationCommandContext, CancellationToken
 from offeragent_harness.protocol._base import WireModel
 from offeragent_harness.protocol.common import ToolCallStatus, ToolResultDescriptor
-from offeragent_harness.protocol.content import ArtifactSourceRef, ProjectSourceRef, VaultSourceRef, WebSourceRef
+from offeragent_harness.protocol.content import (
+    ArtifactSourceRef,
+    HostedWebSourceRef,
+    ProjectSourceRef,
+    VaultSourceRef,
+    WebSourceRef,
+)
 from offeragent_harness.protocol.messages import PluginToolCompleteParams, PluginToolCompleteResult
 from offeragent_harness.runtime.application_dispatcher import ApplicationCommandHandler
 from offeragent_harness.tools import (
@@ -208,7 +214,11 @@ _SIDE_EFFECT_KIND = {
 }
 
 
-def _source_reference_id(reference: VaultSourceRef | ArtifactSourceRef | ProjectSourceRef | WebSourceRef) -> str:
+def _source_reference_id(
+    reference: VaultSourceRef | ArtifactSourceRef | ProjectSourceRef | WebSourceRef | HostedWebSourceRef,
+) -> str:
+    if isinstance(reference, HostedWebSourceRef):
+        raise ValueError("only model Providers can produce hosted Web source references")
     if isinstance(reference, VaultSourceRef):
         revision = reference.file.content_hash or "current"
         return f"vault:{reference.file.workspace_id}:{reference.file.path}:{revision}"
