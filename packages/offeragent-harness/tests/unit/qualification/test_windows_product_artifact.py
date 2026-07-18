@@ -170,6 +170,7 @@ def test_probe_runs_only_the_sealed_driver_with_the_repository_guard(
                             "VaultChangeCoordinator",
                             "FileVaultChangeJournal",
                             "GitCheckpointStore",
+                            "ResearchBrowserAdapter",
                         ],
                         "sourceFreeRuntime": True,
                     }

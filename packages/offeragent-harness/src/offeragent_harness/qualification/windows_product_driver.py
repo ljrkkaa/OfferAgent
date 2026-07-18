@@ -144,9 +144,7 @@ class QualificationDriverClient:
             self._stderr_reader.join(timeout=5)
         if self._process.returncode != 0:
             details = "".join(self._stderr)[-8_192:].strip()
-            raise QualificationDriverError(
-                f"qualification driver exited {self._process.returncode}: {details}"
-            )
+            raise QualificationDriverError(f"qualification driver exited {self._process.returncode}: {details}")
 
     def __enter__(self) -> QualificationDriverClient:
         return self

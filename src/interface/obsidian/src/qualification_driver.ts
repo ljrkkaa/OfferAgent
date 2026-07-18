@@ -20,6 +20,16 @@ import {
     VaultChangeCoordinator,
 } from "./runtime/vault_changes";
 import { QualificationVaultPort } from "./qualification_vault";
+import {
+    ResearchBrowserAdapter,
+    ResearchPagePort,
+    ResearchPageSnapshot,
+} from "./runtime/research_browser";
+import type {
+    ExecutableToolCallDescriptor,
+    JsonValue,
+    ToolResultDescriptor,
+} from "./runtime/generated_protocol";
 
 const PRODUCTION_EXPORTS = Object.freeze([
     "StdioWorkerTransport",
@@ -27,6 +37,7 @@ const PRODUCTION_EXPORTS = Object.freeze([
     "VaultChangeCoordinator",
     "FileVaultChangeJournal",
     "GitCheckpointStore",
+    "ResearchBrowserAdapter",
 ]);
 
 function installSourceRootGuard(): void {
@@ -210,6 +221,129 @@ type ProductState = {
 let product: ProductState | null = null;
 const reviews = new Map<string, PendingReview>();
 
+class QualificationResearchPagePort implements ResearchPagePort {
+    private current = "https://example.com/offeragent/qualification";
+
+    show(): void {}
+
+    async open(url: string, signal: AbortSignal): Promise<void> {
+        if (signal.aborted) throw new Error("qualification Research Browser was cancelled");
+        this.current = url;
+    }
+
+    async snapshot(signal: AbortSignal): Promise<ResearchPageSnapshot> {
+        if (signal.aborted) throw new Error("qualification Research Browser was cancelled");
+        const result = this.current.endsWith("/result");
+        return {
+            url: this.current,
+            title: result ? "OfferAgent qualification result" : "OfferAgent qualification research",
+            text: result
+                ? "A scripted public result used only to qualify the production read adapter."
+                : "Untrusted scripted research text used only to qualify the production read adapter.",
+            loginRequired: false,
+            links: result ? [] : [{
+                title: "qualification result",
+                url: "https://example.com/offeragent/result",
+            }],
+        };
+    }
+
+    async paginate(_direction: "next" | "scroll", signal: AbortSignal): Promise<boolean> {
+        if (signal.aborted) throw new Error("qualification Research Browser was cancelled");
+        return false;
+    }
+
+    async back(signal: AbortSignal): Promise<void> {
+        if (signal.aborted) throw new Error("qualification Research Browser was cancelled");
+        this.current = "https://example.com/offeragent/qualification";
+    }
+
+    cancel(): void {}
+
+    async close(): Promise<void> {}
+}
+
+function qualificationResearchCall(
+    action: string,
+    argumentsValue: Record<string, JsonValue> = {},
+): ExecutableToolCallDescriptor {
+    return {
+        toolCallId: `call_qualification_${action}`,
+        workspaceId: "ws_qualification",
+        runId: "run_qualification_research",
+        name: "research_browser.navigate",
+        version: "1",
+        arguments: { action, ...argumentsValue },
+        argsHash: `sha256:${"a".repeat(64)}`,
+        idempotencyKey: `qualification-research-${action}`,
+        risk: "read",
+        reason: null,
+        agentLineage: ["run_qualification_research"],
+        executorLocation: "plugin",
+        definitionFingerprint: `sha256:${"b".repeat(64)}`,
+        resultSensitivity: "workspace",
+        deadline: null,
+    };
+}
+
+function requireResearchSuccess(result: ToolResultDescriptor, action: string): ToolResultDescriptor {
+    if (result.status !== "succeeded" || (result.sideEffects?.length ?? 0) !== 0) {
+        throw new Error(`qualification Research Browser ${action} failed or produced a side effect`);
+    }
+    return result;
+}
+
+async function qualifyResearchBrowser(): Promise<Record<string, unknown>> {
+    const browser = new ResearchBrowserAdapter(new QualificationResearchPagePort());
+    const actions = ["open", "read", "enumerate", "follow", "back"];
+    try {
+        requireResearchSuccess(await browser.execute(qualificationResearchCall(
+            "open",
+            { url: "https://example.com/offeragent/qualification" },
+        )), "open");
+        const read = requireResearchSuccess(
+            await browser.execute(qualificationResearchCall("read")),
+            "read",
+        );
+        const listed = requireResearchSuccess(
+            await browser.execute(qualificationResearchCall("enumerate")),
+            "enumerate",
+        );
+        const links = listed.data?.links;
+        if (!Array.isArray(links) || links.length !== 1 || links[0] === null ||
+            typeof links[0] !== "object" || Array.isArray(links[0])) {
+            throw new Error("qualification Research Browser link enumeration is invalid");
+        }
+        const targetId = (links[0] as Record<string, unknown>).targetId;
+        if (typeof targetId !== "string") {
+            throw new Error("qualification Research Browser target identity is invalid");
+        }
+        requireResearchSuccess(await browser.execute(qualificationResearchCall(
+            "follow",
+            { targetId },
+        )), "follow");
+        requireResearchSuccess(
+            await browser.execute(qualificationResearchCall("back")),
+            "back",
+        );
+        const readSource = read.sourceRefs?.[0];
+        if (readSource === undefined || readSource.type !== "web") {
+            throw new Error("qualification Research Browser did not attribute its read source");
+        }
+        return {
+            actions,
+            adapter: "ResearchBrowserAdapter",
+            networkRequests: 0,
+            pagePort: "qualification-scripted",
+            readSource,
+            sideEffects: 0,
+            untrusted: read.data?.untrusted === true,
+        };
+    } finally {
+        await browser.close();
+    }
+}
+
 function driverRequest(value: unknown): DriverRequest {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
         throw new TypeError("qualification control request must be an object");
@@ -358,6 +492,12 @@ async function executeDriverCommand(request: DriverRequest): Promise<Record<stri
             reviewResolution: "explicit",
             sourceFreeRuntime: true,
         };
+    }
+    if (request.command === "research-browser/qualify") {
+        if (Object.keys(request.params).length !== 0) {
+            throw new TypeError("Research Browser qualification params must be empty");
+        }
+        return qualifyResearchBrowser();
     }
     if (request.command === "product/start") return startProduct(request.params);
     if (request.command === "product/stop") return stopProduct();

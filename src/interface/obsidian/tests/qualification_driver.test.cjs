@@ -92,6 +92,39 @@ test("sealed qualification driver exposes a durable line protocol before product
     });
 
     child.stdin.write(`${JSON.stringify({
+        id: "req_browser",
+        command: "research-browser/qualify",
+        params: {},
+    })}\n`);
+    const browserQualification = await new Promise((resolve, reject) => {
+        const deadline = setTimeout(() => reject(new Error("qualification driver did not answer Research Browser")), 5_000);
+        const inspect = () => {
+            const match = lines.map((line) => JSON.parse(line)).find((line) => line.id === "req_browser");
+            if (match === undefined) return;
+            clearTimeout(deadline);
+            resolve(match);
+        };
+        child.stdout.on("data", inspect);
+        inspect();
+    });
+    assert.equal(browserQualification.ok, true);
+    assert.equal(browserQualification.result.adapter, "ResearchBrowserAdapter");
+    assert.equal(browserQualification.result.pagePort, "qualification-scripted");
+    assert.deepEqual(
+        browserQualification.result.actions,
+        ["open", "read", "enumerate", "follow", "back"],
+    );
+    assert.equal(browserQualification.result.readSource.type, "web");
+    assert.equal(
+        browserQualification.result.readSource.url,
+        "https://example.com/offeragent/qualification",
+    );
+    assert.match(browserQualification.result.readSource.contentHash, /^sha256:[0-9a-f]{64}$/u);
+    assert.equal(browserQualification.result.untrusted, true);
+    assert.equal(browserQualification.result.networkRequests, 0);
+    assert.equal(browserQualification.result.sideEffects, 0);
+
+    child.stdin.write(`${JSON.stringify({
         id: "req_2",
         command: "events/replay",
         params: { runId: "run_01J00000000000000000000000", afterSequence: 0 },

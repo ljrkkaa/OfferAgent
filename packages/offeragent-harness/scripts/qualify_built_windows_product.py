@@ -21,6 +21,7 @@ _PRODUCTION_EXPORTS = [
     "VaultChangeCoordinator",
     "FileVaultChangeJournal",
     "GitCheckpointStore",
+    "ResearchBrowserAdapter",
 ]
 
 
