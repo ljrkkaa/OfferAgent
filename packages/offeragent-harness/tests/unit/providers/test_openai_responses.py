@@ -921,6 +921,60 @@ async def test_false_array_items_are_projected_as_an_exact_empty_array_for_codex
 
 
 @pytest.mark.asyncio
+async def test_implicit_object_refinements_are_omitted_from_the_codex_schema_projection() -> None:
+    structured = '{"changeKind":"general","payload":null}'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        schema = json.loads(request.content)["text"]["format"]["schema"]
+        assert "oneOf" not in schema
+        assert "anyOf" not in schema
+        assert schema["properties"]["changeKind"] == {"type": "string"}
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.output_text.delta",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": structured,
+                },
+                {
+                    "type": "response.output_text.done",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": structured,
+                },
+                _completed(structured),
+            ),
+        )
+
+    request = replace(
+        _request(output_mode=ModelOutputMode.JSON),
+        output_schema={
+            "type": "object",
+            "properties": {
+                "changeKind": {"type": "string"},
+                "payload": {"type": ["object", "null"]},
+            },
+            "required": ["changeKind", "payload"],
+            "oneOf": [
+                {"properties": {"changeKind": {"const": "general"}, "payload": {"type": "null"}}},
+                {"properties": {"changeKind": {"const": "special"}, "payload": {"type": "object"}}},
+            ],
+            "additionalProperties": False,
+        },
+    )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), request)
+
+    assert events[1].data == {"changeKind": "general", "payload": None}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status", "expected_code", "retryable"),
     [
@@ -1065,6 +1119,41 @@ async def test_sse_provider_failures_share_stable_redacted_classification(
 
     assert events[-1].error is not None and events[-1].error.code == expected_code
     assert events[-1].error.retryable is retryable
+    assert secret not in repr(events[-1])
+
+
+@pytest.mark.asyncio
+async def test_stream_error_followed_by_response_failed_converges_on_the_structured_failure() -> None:
+    secret = "private provider failure body"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "error",
+                    "sequence_number": 1,
+                    "error": {"code": "server_error", "message": secret},
+                },
+                {
+                    "type": "response.failed",
+                    "sequence_number": 2,
+                    "response": {
+                        "status": "failed",
+                        "error": {"code": "server_error", "message": secret},
+                    },
+                },
+            ),
+        )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request())
+
+    assert [event.kind for event in events] == [ModelEventKind.STARTED, ModelEventKind.ERROR]
+    assert events[-1].error is not None
+    assert events[-1].error.code == "provider_unavailable"
+    assert events[-1].error.retryable is True
     assert secret not in repr(events[-1])
 
 
@@ -1284,6 +1373,79 @@ async def test_retryable_failure_retries_before_output_with_one_secret_consume()
         ModelEventKind.USAGE,
         ModelEventKind.COMPLETED,
     ]
+
+
+@pytest.mark.asyncio
+async def test_retryable_stream_failure_retries_before_output_with_one_secret_consume() -> None:
+    calls = 0
+    secret = "private transient stream failure"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=_sse(
+                    {"type": "response.created", "sequence_number": 0, "response": {}},
+                    {
+                        "type": "error",
+                        "sequence_number": 1,
+                        "error": {"code": "server_error", "message": secret},
+                    },
+                    {
+                        "type": "response.failed",
+                        "sequence_number": 2,
+                        "response": {
+                            "status": "failed",
+                            "error": {"code": "server_error", "message": secret},
+                        },
+                    },
+                ),
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.output_text.delta",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "recovered",
+                },
+                {
+                    "type": "response.output_text.done",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": "recovered",
+                },
+                _completed("recovered"),
+            ),
+        )
+
+    resolver = _CredentialSource()
+    config = replace(
+        _config(),
+        max_retries=2,
+        retry_base_seconds=0,
+        retry_max_seconds=0,
+        retry_jitter_ratio=0,
+    )
+    events = await _collect(_gateway(httpx.MockTransport(handler), resolver, config), _request())
+
+    assert calls == 2
+    assert resolver.calls == 1
+    assert [event.kind for event in events] == [
+        ModelEventKind.STARTED,
+        ModelEventKind.TEXT_DELTA,
+        ModelEventKind.USAGE,
+        ModelEventKind.COMPLETED,
+    ]
+    assert secret not in repr(events)
 
 
 class _PartialThenFailure(httpx.SyncByteStream):

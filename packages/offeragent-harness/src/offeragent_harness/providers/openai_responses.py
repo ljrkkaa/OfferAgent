@@ -273,6 +273,8 @@ class _StreamAccumulator(Protocol):
 
     def accept(self, event_name: str | None, data: bytes) -> tuple[_SemanticEvent, ...]: ...
 
+    def finish(self) -> tuple[_SemanticEvent, ...]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class _ProducerFault:
@@ -591,14 +593,14 @@ class OpenAIResponsesGateway:
         event_loop: asyncio.AbstractEventLoop,
         cancellation: CancellationToken,
     ) -> _ProducerFault | None:
-        failure: _ProducerFault | None = None
-        retry_after: float | None = None
         for attempt in range(self._config.max_retries + 1):
             if control.stop.is_set():
                 raise _StopRequested
             state = _AttemptState()
+            failure: _ProducerFault | None = None
+            retry_after: float | None = None
             try:
-                self._request_with_material(
+                failure = self._request_with_material(
                     request,
                     payload,
                     material,
@@ -610,7 +612,8 @@ class OpenAIResponsesGateway:
                     event_loop,
                     cancellation,
                 )
-                return None
+                if failure is None:
+                    return None
             except _StopRequested:
                 raise
             except _HttpFailure as error:
@@ -659,7 +662,7 @@ class OpenAIResponsesGateway:
         attempt: int,
         event_loop: asyncio.AbstractEventLoop,
         cancellation: CancellationToken,
-    ) -> None:
+    ) -> _ProducerFault | None:
         headers = _headers(request, self._config, material, extra_headers)
         if self._network_auditor is not None:
             self._network_auditor.record_intent_blocking(
@@ -742,6 +745,8 @@ class OpenAIResponsesGateway:
                         for event_name, data in decoder.finish():
                             for semantic in accumulator.accept(event_name, data):
                                 publish(semantic)
+                        for semantic in accumulator.finish():
+                            publish(semantic)
                         if not accumulator.terminal:
                             raise ModelProviderProtocolError(
                                 "model provider stream ended without a terminal event",
@@ -780,10 +785,26 @@ class OpenAIResponsesGateway:
                     sent_bytes=sent_bytes,
                     received_bytes=received_bytes,
                 )
+        if not state.semantic_emitted:
+            retryable_error = next(
+                (
+                    semantic.error
+                    for semantic in reversed(held_terminal)
+                    if semantic.kind is ModelEventKind.ERROR and semantic.error is not None and semantic.error.retryable
+                ),
+                None,
+            )
+            if retryable_error is not None:
+                return _ProducerFault(
+                    retryable_error.code,
+                    True,
+                    retryable_error.details,
+                )
         for semantic in held_terminal:
             if not _put(messages, semantic, control.stop):
                 raise _StopRequested
             state.semantic_emitted = True
+        return None
 
 
 class _SseDecoder:
@@ -880,9 +901,11 @@ class _ResponseAccumulator:
         self._hosted_searches: dict[str, _HostedSearchState] = {}
         self._citation_coordinates: dict[tuple[str, int, int, int], ModelCitation] = {}
         self._citation_values: set[ModelCitation] = set()
+        self._pending_stream_error: _SemanticEvent | None = None
 
     def accept(self, event_name: str | None, data: bytes) -> tuple[_SemanticEvent, ...]:
-        if self.terminal:
+        pending_failure = self._pending_stream_error is not None
+        if self.terminal and not pending_failure:
             raise ModelProviderProtocolError("provider emitted an event after terminal completion")
         if data == b"[DONE]":
             raise ModelProviderProtocolError("Responses API stream used an unsupported legacy sentinel")
@@ -897,6 +920,8 @@ class _ResponseAccumulator:
             raise ModelProviderProtocolError("provider SSE event omitted its type")
         if event_name is not None and event_name != kind:
             raise ModelProviderProtocolError("SSE event field and JSON event type disagree")
+        if pending_failure and kind != "response.failed":
+            raise ModelProviderProtocolError("provider emitted a non-failure event after a stream error")
         provider_sequence = value.get("sequence_number")
         if provider_sequence is not None:
             if type(provider_sequence) is not int or provider_sequence <= self._provider_sequence:
@@ -953,18 +978,21 @@ class _ResponseAccumulator:
             failure_usage = _failure_usage(value)
             if failure_usage is not None:
                 semantic.append(_SemanticEvent(ModelEventKind.USAGE, usage=failure_usage))
-            semantic.append(
-                _SemanticEvent(
-                    ModelEventKind.ERROR,
-                    error=ModelError(
-                        code,
-                        "model provider reported a failed response",
-                        retryable,
-                        False,
-                        {"providerId": self.config.provider_id},
-                    ),
-                )
+            failure = _SemanticEvent(
+                ModelEventKind.ERROR,
+                error=ModelError(
+                    code,
+                    "model provider reported a failed response",
+                    retryable,
+                    False,
+                    {"providerId": self.config.provider_id},
+                ),
             )
+            if kind == "error":
+                self._pending_stream_error = failure
+                return tuple(semantic)
+            self._pending_stream_error = None
+            semantic.append(failure)
             return tuple(semantic)
         if kind == "response.incomplete":
             self.terminal = True
@@ -1028,6 +1056,13 @@ class _ResponseAccumulator:
             if item_type == "message":
                 return self._message_citation_events(item, _output_index(value))
         return ()
+
+    def finish(self) -> tuple[_SemanticEvent, ...]:
+        """Materialize a standalone stream error after its optional failed snapshot window closes."""
+
+        pending = self._pending_stream_error
+        self._pending_stream_error = None
+        return () if pending is None else (pending,)
 
     def _require_hosted_search(self) -> None:
         if ModelHostedTool.WEB_SEARCH not in self.request.hosted_tools:
@@ -1360,6 +1395,14 @@ def _project_codex_schema_value(value: Any, *, pointer: str, resource_pointer: s
         for key, child in value.items():
             if key in _CODEX_SUBSCRIPTION_SCHEMA_OMIT:
                 continue
+            if key == "oneOf" and _implicit_object_refinements(child):
+                # These branches narrow properties already declared by their
+                # enclosing object.  Codex strict schemas require every object
+                # branch to be closed, which would make the refinement reject
+                # the enclosing object's other fields.  Omit only this
+                # provider-side constraint; the canonical local schema still
+                # validates the returned AgentStep in full.
+                continue
             output_key = "anyOf" if key == "oneOf" else key
             child_pointer = f"{pointer}/{_json_pointer_token(output_key)}"
             if key == "$ref":
@@ -1418,6 +1461,15 @@ def _project_codex_schema_value(value: Any, *, pointer: str, resource_pointer: s
             for index, item in enumerate(value)
         ]
     return value
+
+
+def _implicit_object_refinements(value: Any) -> bool:
+    return (
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes, bytearray))
+        and bool(value)
+        and all(isinstance(item, Mapping) and "properties" in item and "type" not in item for item in value)
+    )
 
 
 def _project_codex_schema_ref(value: Any, resource_pointer: str) -> str:
