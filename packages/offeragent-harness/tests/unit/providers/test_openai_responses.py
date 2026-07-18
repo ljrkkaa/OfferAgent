@@ -1189,6 +1189,33 @@ async def test_sse_provider_failures_share_stable_redacted_classification(
 
 
 @pytest.mark.asyncio
+async def test_sse_protocol_failure_names_the_closed_check_without_reflecting_content() -> None:
+    secret = "private provider event content"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": 0,
+                    "output_index": 0,
+                    "item": {"type": "message", "content": secret},
+                },
+            ),
+        )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request())
+
+    assert events[-1].error is not None
+    assert events[-1].error.code == "provider_protocol_error"
+    assert events[-1].error.details["protocolReason"] == "non_monotonic_provider_sequence"
+    assert secret not in repr(events[-1])
+
+
+@pytest.mark.asyncio
 async def test_stream_error_followed_by_response_failed_converges_on_the_structured_failure() -> None:
     secret = "private provider failure body"
 
