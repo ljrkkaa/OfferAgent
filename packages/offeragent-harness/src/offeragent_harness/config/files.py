@@ -15,10 +15,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .migrations import strip_retired_update_fields
+from .migrations import project_legacy_codex_config, validate_current_codex_config
 from .models import ConfigLayer, ConfigPatch, ConfigScope
 
-_FILE_VERSION = 4
+_FILE_VERSION = 5
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
 
@@ -68,6 +68,8 @@ class ConfigFileStore:
                     return self._migrate_v2(raw)
                 if version == 3:
                     return self._migrate_v3(raw)
+                if version == 4:
+                    return self._migrate_v4(raw)
                 if version != _FILE_VERSION:
                     raise ValueError("unsupported config file version")
                 return ConfigFileLoad(self._decode_current(raw), False, None)
@@ -84,7 +86,7 @@ class ConfigFileStore:
         revision = raw["revision"]
         if type(revision) is not int or revision < 0:
             raise ValueError("config file revision is invalid")
-        return ConfigLayer(self.scope, self.owner_id, revision, ConfigPatch.model_validate(raw["config"]))
+        return ConfigLayer(self.scope, self.owner_id, revision, validate_current_codex_config(raw["config"]))
 
     def _migrate_v1(self, raw: Mapping[str, Any]) -> ConfigFileLoad:
         if set(raw) != {"version", "revision", "settings"}:
@@ -92,8 +94,7 @@ class ConfigFileStore:
         revision = raw["revision"]
         if type(revision) is not int or revision < 0:
             raise ValueError("v1 config revision is invalid")
-        patch = ConfigPatch.model_validate(strip_retired_update_fields(raw["settings"]))
-        _reject_unsafe_legacy_local(patch)
+        patch = project_legacy_codex_config(raw["settings"])
         layer = ConfigLayer(self.scope, self.owner_id, revision, patch)
         backup = self.path.with_name(f"{self.path.name}.v1.{_stamp(self._now())}.bak")
         shutil.copy2(self.path, backup)
@@ -112,8 +113,7 @@ class ConfigFileStore:
         revision = raw["revision"]
         if type(revision) is not int or revision < 0:
             raise ValueError("v2 config revision is invalid")
-        patch = ConfigPatch.model_validate(strip_retired_update_fields(raw["config"]))
-        _reject_unsafe_legacy_local(patch)
+        patch = project_legacy_codex_config(raw["config"])
         layer = ConfigLayer(self.scope, self.owner_id, revision, patch)
         backup = self.path.with_name(f"{self.path.name}.v2.{_stamp(self._now())}.bak")
         shutil.copy2(self.path, backup)
@@ -132,7 +132,7 @@ class ConfigFileStore:
         revision = raw["revision"]
         if type(revision) is not int or revision < 0:
             raise ValueError("v3 config revision is invalid")
-        patch = ConfigPatch.model_validate(strip_retired_update_fields(raw["config"]))
+        patch = project_legacy_codex_config(raw["config"])
         layer = ConfigLayer(self.scope, self.owner_id, revision, patch)
         backup = self.path.with_name(f"{self.path.name}.v3.{_stamp(self._now())}.bak")
         shutil.copy2(self.path, backup)
@@ -142,6 +142,25 @@ class ConfigFileStore:
             os.replace(backup, self.path)
             raise ConfigFileError("configuration migration failed and was rolled back") from error
         return ConfigFileLoad(layer, False, backup, migrated_from=3)
+
+    def _migrate_v4(self, raw: Mapping[str, Any]) -> ConfigFileLoad:
+        if set(raw) != {"version", "scope", "ownerId", "revision", "config"}:
+            raise ValueError("v4 config fields are incompatible")
+        if raw["scope"] != self.scope.value or raw["ownerId"] != self.owner_id:
+            raise ValueError("v4 config scope or owner mismatch")
+        revision = raw["revision"]
+        if type(revision) is not int or revision < 0:
+            raise ValueError("v4 config revision is invalid")
+        patch = project_legacy_codex_config(raw["config"])
+        layer = ConfigLayer(self.scope, self.owner_id, revision, patch)
+        backup = self.path.with_name(f"{self.path.name}.v4.{_stamp(self._now())}.bak")
+        shutil.copy2(self.path, backup)
+        try:
+            _atomic_write(self.path, _encode(layer))
+        except BaseException as error:
+            os.replace(backup, self.path)
+            raise ConfigFileError("configuration migration failed and was rolled back") from error
+        return ConfigFileLoad(layer, False, backup, migrated_from=4)
 
     def _isolate_corrupt(self) -> Path:
         backup = self.path.with_name(f"{self.path.name}.corrupt.{_stamp(self._now())}.bak")
@@ -180,12 +199,6 @@ def _stamp(value: datetime) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("config clock must return timezone-aware values")
     return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-
-
-def _reject_unsafe_legacy_local(patch: ConfigPatch) -> None:
-    model = patch.model
-    if model is not None and model.provider is not None and model.provider.value == "local" and not model.base_url:
-        raise ValueError("legacy local provider omitted its required base_url")
 
 
 @contextmanager

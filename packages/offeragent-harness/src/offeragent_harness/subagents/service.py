@@ -565,13 +565,6 @@ class SubagentService:
             record.lineage,
         )
         run_config = dict(thaw_json(parent_run_config))
-        run_config["subagent"] = {
-            "agentName": record.agent_name,
-            "agentVersion": record.agent_version,
-            "permissionMode": record.permission_mode.value,
-            "contextSnapshotId": record.context_snapshot_id,
-            "toolScope": thaw_json(record.tool_scope.allowed_versions),
-        }
         run = Run(
             record.run_id,
             record.session_id,

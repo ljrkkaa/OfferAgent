@@ -216,6 +216,7 @@ async def test_model_list_projects_the_live_codex_catalog_through_the_public_pro
             freshness="fresh",
             catalog_revision="sha256:" + "a" * 64,
             fetched_at=NOW,
+            account_binding="sha256:" + "b" * 64,
             error=None,
         )
     )
@@ -228,6 +229,7 @@ async def test_model_list_projects_the_live_codex_catalog_through_the_public_pro
     assert result.catalog_freshness == "fresh"
     assert result.catalog_revision == "sha256:" + "a" * 64
     assert result.fetched_at == NOW.isoformat()
+    assert result.account_binding == "sha256:" + "b" * 64
     assert result.error is None
     assert len(result.models) == 1
     descriptor = result.models[0]

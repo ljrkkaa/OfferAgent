@@ -15,6 +15,7 @@ from offeragent_harness.agent.planner import Planner, PlanningAttempt, PlanningA
 from offeragent_harness.agent.preparation import RunPreparationFailure
 from offeragent_harness.agent.state import RunPhase, RunState
 from offeragent_harness.config import HarnessConfig, MemorySettings
+from offeragent_harness.error_codes import ErrorCode
 from offeragent_harness.models import ModelUsage
 from offeragent_harness.ports import CancellationToken, Sensitivity, StoredEvent, ToolLifecycleObserver
 from offeragent_harness.protocol.events import TurnFailedPayload, parse_event, stored_event_to_envelope
@@ -387,6 +388,57 @@ async def test_async_components_failure_uses_one_durable_terminal_commit() -> No
     assert await uow.get_entity("run_capability_snapshots", receipt.run_id) is None
     assert await uow.get_entity("active_root_runs", session.session_id) is None
     assert deferred.released == [receipt.run_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "error_code", "retryable"),
+    [
+        ("auth_account_changed", ErrorCode.AUTH_REQUIRED, False),
+        ("catalog_unreachable", ErrorCode.PROVIDER_UNREACHABLE, True),
+        ("model_unavailable", ErrorCode.PROVIDER_UNSUPPORTED, False),
+    ],
+)
+async def test_typed_model_binding_preparation_failure_preserves_actionable_wire_error(
+    reason: str,
+    error_code: ErrorCode,
+    retryable: bool,
+) -> None:
+    clock = ManualClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    uow = InMemoryUnitOfWorkFactory()
+    manager = TurnManager()
+    failure = RunPreparationFailure(
+        reason,
+        "Codex model selection could not be verified; refresh the catalog and try again.",
+        retryable=retryable,
+        error_code=error_code,
+        failure_category="model",
+        details={"runBindingCode": reason},
+    )
+    deferred = DeferredComponents(StopPlanner(), uow, failure=failure)
+    harness = HarnessService(
+        unit_of_work=uow,
+        event_sink=RecordingEventSink(),
+        clock=clock,
+        ids=DeterministicIdGenerator(),
+        components=deferred,
+        async_components=deferred,
+        turn_manager=manager,
+    )
+    session = await create_session(harness)
+
+    receipt = await harness.start_turn(turn_command(session.session_id))
+    active = await manager.get(receipt.run_id)
+    assert active is not None
+    with pytest.raises(AgentLoopFailure):
+        await active.task
+
+    terminal = stored_event_to_envelope((await harness.replay_events(receipt.run_id))[-1])
+    assert isinstance(terminal.payload, TurnFailedPayload)
+    assert terminal.payload.error.code is error_code
+    assert terminal.payload.error.retryable is retryable
+    assert terminal.payload.error.details["runBindingCode"] == reason
+    assert terminal.payload.error.details["failureCategory"] == "model"
 
 
 @pytest.mark.asyncio

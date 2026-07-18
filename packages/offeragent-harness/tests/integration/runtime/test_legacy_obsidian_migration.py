@@ -232,6 +232,9 @@ def test_dry_run_then_transactional_import_is_replayable_and_idempotent(tmp_path
     assert repeated.receipt_path == applied.receipt_path
     data = json.loads(request.target_plugin_data.read_text(encoding="utf-8"))
     assert data["schemaVersion"] == 2
+    assert data["settings"]["schemaVersion"] == 3
+    assert data["settings"]["model"] == ""
+    assert data["settings"]["modelAccountBinding"] is None
     assert data["settings"]["permissionMode"] == "normal"
     assert data["settings"]["workspaceTrusted"] is True
     assert data["settings"]["autoApproveVaultWrites"] is False
@@ -239,6 +242,95 @@ def test_dry_run_then_transactional_import_is_replayable_and_idempotent(tmp_path
     assert data["chatTabs"]["activeTabId"] == "tab_local"
     assert (request.vault_root / "agent.md").read_text(encoding="utf-8") == "# OfferAgent Contract\n"
     assert (request.vault_root / ".codex" / "skills" / "obsidian-cli" / "SKILL.md").is_file()
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected_model"),
+    (
+        ("codex-subscription-experimental", ""),
+        ("codex", ""),
+        ("deepseek", ""),
+        (None, ""),
+    ),
+)
+def test_plugin_settings_migration_allowlists_codex_only_values_without_leaking_secrets(
+    tmp_path: Path,
+    provider: str | None,
+    expected_model: str,
+) -> None:
+    request = _request(tmp_path)
+    assert request.source_plugin_data is not None
+    settings: dict[str, object] = {
+        "schemaVersion": 2,
+        "model": "gpt-catalog-candidate",
+        "reasoningEffort": "high",
+        "permissionMode": "normal",
+        "workspaceTrusted": True,
+        "autoApproveVaultWrites": True,
+        "shellEnabled": True,
+        "subagentsEnabled": True,
+        "hooksEnabled": True,
+        "telemetryEnabled": False,
+        "apiToken": "do-not-leak-this-token",
+        "baseUrl": "https://secret.example/token",
+    }
+    if provider is not None:
+        settings["provider"] = provider
+    request.source_plugin_data.write_text(
+        json.dumps({"schemaVersion": 2, "settings": settings, "chatTabs": None}),
+        encoding="utf-8",
+    )
+
+    report = migrate_legacy_obsidian(request)
+
+    migrated = json.loads(request.target_plugin_data.read_text(encoding="utf-8"))
+    assert migrated["settings"] == {
+        "schemaVersion": 3,
+        "proxyUrl": "",
+        "model": expected_model,
+        "modelAccountBinding": None,
+        "reasoningEffort": "high",
+        "permissionMode": "normal",
+        "workspaceTrusted": True,
+        "autoApproveVaultWrites": True,
+        "shellEnabled": True,
+        "subagentsEnabled": True,
+        "hooksEnabled": True,
+        "telemetryEnabled": False,
+    }
+    encoded_report = repr(report)
+    encoded_output = request.target_plugin_data.read_text(encoding="utf-8")
+    assert "do-not-leak-this-token" not in encoded_report + encoded_output
+    assert "https://secret.example/token" not in encoded_report + encoded_output
+    assert {item.identifier for item in report.exclusions} >= {"apiToken", "baseUrl"}
+
+
+def test_plugin_settings_migration_defaults_invalid_nested_values_without_echoing_them(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    assert request.source_plugin_data is not None
+    request.source_plugin_data.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 2,
+                "settings": {
+                    "schemaVersion": 2,
+                    "provider": "codex-subscription-experimental",
+                    "reasoningEffort": {"token": "nested-secret-value"},
+                    "permissionMode": ["nested-secret-value"],
+                },
+                "chatTabs": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = migrate_legacy_obsidian(request)
+
+    output = request.target_plugin_data.read_text(encoding="utf-8")
+    settings = json.loads(output)["settings"]
+    assert settings["reasoningEffort"] == "medium"
+    assert settings["permissionMode"] == "normal"
+    assert "nested-secret-value" not in output + repr(report)
 
 
 @pytest.mark.asyncio

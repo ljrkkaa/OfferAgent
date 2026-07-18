@@ -14,12 +14,15 @@ import pytest
 from offeragent_harness.adapters.sqlite_stores import SqliteUnitOfWorkFactory
 from offeragent_harness.agent import BudgetDelta, BudgetLedger, RunBudget
 from offeragent_harness.agent.state import RunState
+from offeragent_harness.models.json_types import thaw_json
 from offeragent_harness.permissions import CapabilityScope, PermissionMode, RiskClass
 from offeragent_harness.ports import ArtifactMetadata, ArtifactState, OperationCancelled, Sensitivity
 from offeragent_harness.ports.subagents import (
     ParentRunAuthority,
     StoredSubagentResultArtifact,
 )
+from offeragent_harness.protocol._base import validate_wire
+from offeragent_harness.protocol.common import RunConfigSnapshot
 from offeragent_harness.runtime.subagent_runtime import ProtocolSubagentEventFactory
 from offeragent_harness.sessions import AgentLineage, Run, RunKind, RunStatus
 from offeragent_harness.subagents import (
@@ -251,6 +254,7 @@ def _build(
     block: bool = False,
     unit_of_work: Any | None = None,
     ledger: BudgetLedger | None = None,
+    root_run_config: dict[str, Any] | None = None,
 ) -> tuple[
     SubagentService,
     Any,
@@ -288,7 +292,7 @@ def _build(
         ),
         NOW + timedelta(minutes=10),
         {"summary": "root context"},
-        {"provider": "fake"},
+        root_run_config or {"provider": "fake"},
         True,
         True,
     )
@@ -537,6 +541,39 @@ async def test_spawn_uses_one_durable_child_run_and_returns_structured_result() 
         "subagent.completed",
     ]
     assert [item.event_type for item in sink.events] == [item.event_type for item in events]
+    await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_child_execution_preserves_canonical_codex_run_config() -> None:
+    service, _uow, _sink, scheduler, runner, _artifacts = _build(
+        root_run_config={
+            "provider": "codex-subscription-experimental",
+            "model": "gpt-5.6-sol",
+            "reasoningEffort": "high",
+            "permissionMode": "normal",
+        }
+    )
+
+    handle = await service.spawn(_command(), ManualCancellationToken())
+    await service.wait(
+        AgentWaitCommand("run_root", (handle.run_id,), WaitMode.ALL, 5_000),
+        ManualCancellationToken(),
+    )
+
+    execution = runner.executions[0]
+    validated = validate_wire(RunConfigSnapshot, thaw_json(execution.run_config))
+    assert validated.provider == "codex-subscription-experimental"
+    assert validated.model == "gpt-5.6-sol"
+    assert validated.reasoning_effort.value == "high"
+    assert set(execution.run_config) == {
+        "provider",
+        "model",
+        "reasoningEffort",
+        "permissionMode",
+    }
+    assert execution.record.agent_name == "general"
+    assert execution.record.context_snapshot_id == execution.context.snapshot_id
     await scheduler.shutdown()
 
 

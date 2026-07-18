@@ -22,8 +22,18 @@ from offeragent_harness.testing import DeterministicIdGenerator, ManualClock, Re
 NOW = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
 
 
-def _legacy_v2_layer(owner: str) -> dict[str, Any]:
+def _legacy_v2_layer(
+    owner: str,
+    *,
+    provider: str | None = "codex-subscription-experimental",
+) -> dict[str, Any]:
     config = HarnessConfig().model_dump(mode="json")
+    config["model"]["model"] = "gpt-catalog-candidate"
+    config["model"]["credential_handle"] = "secret:v1:" + "b" * 32
+    if provider is None:
+        config["model"].pop("provider")
+    else:
+        config["model"]["provider"] = provider
     config["network"]["update_network_enabled"] = False
     config["update"] = {
         "automatic_check": False,
@@ -75,7 +85,7 @@ async def test_config_survives_sqlite_reopen_and_keeps_vaults_isolated(tmp_path:
                 0,
                 f"idem-{model}",
                 "user",
-                ConfigPatch.model_validate({"model": {"model": model}}),
+                ConfigPatch.model_validate({"model": {"model": model, "account_binding": "sha256:" + "a" * 64}}),
             )
         )
 
@@ -95,7 +105,7 @@ async def test_config_survives_sqlite_reopen_and_keeps_vaults_isolated(tmp_path:
     assert snapshot_b.config.model.model == "model-b"
     assert snapshot_a.fingerprint != snapshot_b.fingerprint
     assert isinstance(stored_a, dict)
-    assert stored_a["schemaVersion"] == 3
+    assert stored_a["schemaVersion"] == 4
 
 
 @pytest.mark.asyncio
@@ -112,7 +122,7 @@ async def test_two_sqlite_writers_cannot_both_win_same_expected_revision(tmp_pat
             0,
             f"idem-{name}",
             "user",
-            ConfigPatch.model_validate({"model": {"model": name}}),
+            ConfigPatch.model_validate({"model": {"model": name, "account_binding": "sha256:" + "a" * 64}}),
         )
 
     results = await asyncio.gather(
@@ -140,12 +150,29 @@ async def test_legacy_v2_sqlite_layer_strips_full_retired_config_on_repeated_rea
         workspace_id=owner,
     )
 
-    expected = HarnessConfig().model_dump(mode="json")
     assert first == second
     assert first.revision == 1 and first.event_sequence == 1
-    assert first.patch.payload() == expected
-    assert snapshot.config.model_dump(mode="json") == expected
+    assert first.patch.payload()["model"] == {
+        "reasoning_effort": "medium",
+        "proxy_url": None,
+    }
+    assert snapshot.config.model.model == ""
     assert await factory.get_entity("config_layers", f"workspace:{owner}") == legacy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ("codex", "deepseek", "openai", "local", None))
+async def test_legacy_sqlite_layer_clears_model_for_every_other_or_missing_provider(
+    tmp_path: Path,
+    provider: str | None,
+) -> None:
+    database = tmp_path / "legacy-provider.sqlite"
+    owner = "wsi_52345678-1234-4234-8234-123456789abc"
+    await _store_layer(database, owner, _legacy_v2_layer(owner, provider=provider))
+
+    layer = await service(database).layer(ConfigScope.WORKSPACE, owner)
+
+    assert "model" not in layer.patch.payload()["model"]
 
 
 @pytest.mark.asyncio
@@ -156,7 +183,7 @@ async def test_legacy_v2_sqlite_layer_strips_full_retired_config_on_repeated_rea
         lambda value: value["config"]["update"].__setitem__("unknown", True),
         lambda value: value["config"]["network"].__setitem__("unknown", True),
         lambda value: value.__setitem__("unknown", True),
-        lambda value: value.__setitem__("schemaVersion", 3),
+        lambda value: value.__setitem__("schemaVersion", 4),
     ),
 )
 async def test_sqlite_legacy_migration_rejects_unknown_or_current_schema_retired_fields(
@@ -171,3 +198,25 @@ async def test_sqlite_legacy_migration_rejects_unknown_or_current_schema_retired
 
     with pytest.raises(ConfigCorrupt):
         await service(database).layer(ConfigScope.WORKSPACE, owner)
+
+
+@pytest.mark.asyncio
+async def test_current_sqlite_layer_rejects_retired_model_decision_fields_without_echoing_values(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "current-corrupt.sqlite"
+    owner = "wsi_62345678-1234-4234-8234-123456789abc"
+    raw = _legacy_v2_layer(owner)
+    raw["schemaVersion"] = 4
+    raw["config"] = {
+        "model": {
+            "model": "gpt-candidate",
+            "credential_handle": "secret:v1:" + "c" * 32,
+        }
+    }
+    await _store_layer(database, owner, raw)
+
+    with pytest.raises(ConfigCorrupt) as captured:
+        await service(database).layer(ConfigScope.WORKSPACE, owner)
+
+    assert "secret:v1:" not in str(captured.value)

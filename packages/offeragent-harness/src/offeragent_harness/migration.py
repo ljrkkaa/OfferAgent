@@ -14,6 +14,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -106,13 +107,10 @@ _REQUIRED_COLUMNS: Mapping[str, frozenset[str]] = {
 }
 
 _DEFAULT_SETTINGS: Mapping[str, Any] = {
-    "schemaVersion": 2,
-    "provider": "deepseek",
-    "wireApi": "chat-completions",
-    "baseUrl": "",
+    "schemaVersion": 3,
     "proxyUrl": "",
-    "approvedRemoteHttpsEndpoint": None,
-    "model": "deepseek-v4-flash",
+    "model": "",
+    "modelAccountBinding": None,
     "reasoningEffort": "medium",
     "permissionMode": "normal",
     "workspaceTrusted": False,
@@ -122,6 +120,10 @@ _DEFAULT_SETTINGS: Mapping[str, Any] = {
     "hooksEnabled": False,
     "telemetryEnabled": False,
 }
+_PLUGIN_SETTINGS_KEYS = frozenset(_DEFAULT_SETTINGS)
+_PLUGIN_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high", "max"})
+_PLUGIN_PERMISSION_MODES = frozenset({"read-only", "normal", "trusted-workspace", "plan", "bypass"})
+_LOOPBACK_PROXY = re.compile(r"http://(?:127\.0\.0\.1|\[::1\]):([0-9]{1,5})/?")
 
 
 class LegacyMigrationError(RuntimeError):
@@ -637,7 +639,22 @@ def _migrated_plugin_data(
     if source is not None and source.exists():
         raw = _strict_json_file(source, "legacy plugin data")
         if raw.get("schemaVersion") == 2 and isinstance(raw.get("settings"), dict):
-            return _canonical_json(raw)
+            settings = _project_plugin_settings(raw["settings"], exclusions)
+            for key in sorted(set(raw) - {"schemaVersion", "settings", "chatTabs"}):
+                exclusions.append(
+                    LegacyMigrationExclusion(
+                        "plugin_setting",
+                        key,
+                        "unknown plugin data field is excluded without reading it into the current schema",
+                    )
+                )
+            return _canonical_json(
+                {
+                    "schemaVersion": 2,
+                    "settings": settings,
+                    "chatTabs": raw.get("chatTabs"),
+                }
+            )
         mode = raw.get("vaultPermissionMode", "trusted_vault")
         mapped = {
             "read_only": ("read-only", False, False),
@@ -659,6 +676,48 @@ def _migrated_plugin_data(
     return _canonical_json({"schemaVersion": 2, "settings": settings, "chatTabs": None})
 
 
+def _project_plugin_settings(
+    raw: Mapping[str, Any],
+    exclusions: list[LegacyMigrationExclusion],
+) -> dict[str, Any]:
+    version = raw.get("schemaVersion")
+    if type(version) is not int or version not in {2, 3}:
+        raise LegacyMigrationError("legacy plugin settings schema is unsupported")
+    result = dict(_DEFAULT_SETTINGS)
+    subscription = raw.get("provider") == "codex-subscription-experimental"
+
+    proxy = raw.get("proxyUrl")
+    if subscription and isinstance(proxy, str):
+        normalized = proxy.strip().rstrip("/")
+        match = _LOOPBACK_PROXY.fullmatch(proxy.strip())
+        if match is not None and 1 <= int(match.group(1)) <= 65_535:
+            result["proxyUrl"] = normalized
+
+    reasoning = raw.get("reasoningEffort")
+    if isinstance(reasoning, str) and reasoning in _PLUGIN_REASONING_EFFORTS:
+        result["reasoningEffort"] = reasoning
+
+    permission = raw.get("permissionMode")
+    if isinstance(permission, str) and permission in _PLUGIN_PERMISSION_MODES:
+        result["permissionMode"] = permission
+    trusted = raw.get("workspaceTrusted") is True
+    result["workspaceTrusted"] = trusted
+    if result["permissionMode"] in {"trusted-workspace", "bypass"} and not trusted:
+        result["permissionMode"] = "normal"
+    result["autoApproveVaultWrites"] = trusted and raw.get("autoApproveVaultWrites") is True
+    for key in ("shellEnabled", "subagentsEnabled", "hooksEnabled"):
+        result[key] = raw.get(key) is True
+    result["telemetryEnabled"] = False
+
+    for key in sorted(set(raw) - _PLUGIN_SETTINGS_KEYS):
+        if key == "provider":
+            reason = "retired Provider choice was used only to qualify the model candidate"
+        else:
+            reason = "retired or unknown plugin setting is excluded without exposing its value"
+        exclusions.append(LegacyMigrationExclusion("plugin_setting", key, reason))
+    return result
+
+
 def _validate_target_plugin_data(request: LegacyMigrationRequest, migrated: bytes) -> None:
     target = request.target_plugin_data
     if not target.exists():
@@ -670,7 +729,14 @@ def _validate_target_plugin_data(request: LegacyMigrationRequest, migrated: byte
         value = json.loads(existing.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:
         raise LegacyMigrationError("target plugin data conflicts with the closed migration schema") from error
-    if not isinstance(value, dict) or value.get("schemaVersion") != 2 or not isinstance(value.get("settings"), dict):
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schemaVersion", "settings", "chatTabs"}
+        or value.get("schemaVersion") != 2
+        or not isinstance(value.get("settings"), dict)
+        or set(value["settings"]) != _PLUGIN_SETTINGS_KEYS
+        or value["settings"].get("schemaVersion") != 3
+    ):
         raise LegacyMigrationError("target plugin data conflicts with the closed migration schema")
     if existing != migrated:
         raise LegacyMigrationError("target plugin settings already contain a different authoritative configuration")

@@ -12,7 +12,7 @@ from offeragent_harness.ports.network_audit import NetworkAuditSink
 from offeragent_harness.ports.secrets import SecretHandle, SecretResolver
 from offeragent_harness.ports.system import Clock
 
-from .codex_subscription import CODEX_SUBSCRIPTION_BASE_URL
+from .codex_subscription import CODEX_SUBSCRIPTION_BASE_URL, AccountBoundModelCredentialSource
 from .deepseek_chat import DEEPSEEK_BASE_URL, build_deepseek_gateway
 from .factory import ResponsesProviderKind, ResponsesProviderSelection, build_responses_provider
 from .network_audit import ModelNetworkAuditor
@@ -78,6 +78,16 @@ def compose_model_gateway(
         else selection.base_url or _OFFICIAL_BASE
     )
     endpoint = base_url.rstrip("/") + ("" if base_url.rstrip("/").endswith("/responses") else "/responses")
+    credential_source = codex_credential_source
+    if selection.kind is ResponsesProviderKind.CODEX_SUBSCRIPTION_EXPERIMENTAL:
+        if credential_source is None:
+            raise ValueError("Codex subscription requires a Runtime credential broker")
+        if settings.account_binding is None:
+            raise ValueError("Codex subscription requires a verified account binding")
+        credential_source = AccountBoundModelCredentialSource(
+            credential_source,
+            settings.account_binding,
+        )
     return build_responses_provider(
         selection,
         secrets=secrets,
@@ -85,7 +95,7 @@ def compose_model_gateway(
         transport=responses_transport,
         network_audit=network_audit,
         clock=clock,
-        credential_source=codex_credential_source,
+        credential_source=credential_source,
     )
 
 

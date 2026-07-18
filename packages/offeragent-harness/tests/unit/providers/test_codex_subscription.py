@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -41,6 +42,11 @@ from offeragent_harness.testing.cancellation import ManualCancellationToken
 from offeragent_harness.workspace import code_tool_definitions
 
 _NOW = 2_000_000_000.0
+
+
+def _account_binding(account: str) -> str:
+    fingerprint = f"account-{account}"
+    return f"sha256:{hashlib.sha256(fingerprint.encode()).hexdigest()}"
 
 
 class _UnusedSecrets:
@@ -434,6 +440,7 @@ def test_composition_preserves_harness_as_the_only_runtime() -> None:
     settings = ModelSettings(
         provider=ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL,
         model="gpt-5.6-luna",
+        account_binding=_account_binding("account-one"),
         reasoning_effort="medium",
     )
     gateway = compose_model_gateway(
@@ -447,3 +454,35 @@ def test_composition_preserves_harness_as_the_only_runtime() -> None:
         codex_credential_source=_RotatingSource([(b"access-one", "account-one")]),
     )
     assert isinstance(gateway, CodexSubscriptionProvider)
+
+
+@pytest.mark.asyncio
+async def test_composed_inference_rejects_an_account_switch_before_http() -> None:
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200, content=_completed(), request=request)
+
+    settings = ModelSettings(
+        provider=ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL,
+        model="gpt-5.6-luna",
+        account_binding=_account_binding("selected-account"),
+        reasoning_effort="medium",
+    )
+    gateway = compose_model_gateway(
+        settings,
+        secret_scope_id="workspace:wsi_test",
+        secrets=_UnusedSecrets(),  # type: ignore[arg-type]
+        network_enabled=True,
+        responses_transport=httpx.MockTransport(handler),
+        codex_credential_source=_RotatingSource([(b"access-other", "other-account")]),
+    )
+
+    events = tuple([event async for event in gateway.stream(_request(), ManualCancellationToken())])
+
+    assert requests == 0
+    assert events[-1].kind is ModelEventKind.ERROR
+    assert events[-1].error is not None
+    assert events[-1].error.code == "auth_account_changed"

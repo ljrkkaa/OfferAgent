@@ -1,5 +1,4 @@
 import { randomBytes } from "node:crypto";
-import { Buffer } from "node:buffer";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import {
@@ -19,13 +18,9 @@ import {
     LocalOfferAgentSettings,
     LocalOfferAgentSettingTab,
     SerializedOperationQueue,
-    modelCredentialProviderId,
-    modelHealthMessage,
     modelRuntimePatch,
     parseLocalSettings,
     snapshotLocalSettings,
-    usesProviderSecretStore,
-    usesUnconfiguredCompatibleFallback,
 } from "./local/settings";
 import { canBackgroundStartRuntime, RuntimeBootstrap } from "./runtime/bootstrap";
 import { ChatStore, PersistedChatTabs, parsePersistedTabs } from "./runtime/chat_store";
@@ -57,7 +52,6 @@ import type {
     ImageContentBlock,
     ProtocolCommandParams,
     ProtocolCommandResult,
-    SecretsPutParams,
 } from "./runtime/generated_protocol";
 import { loadOrCreatePortableWorkspaceIdentity } from "./runtime/workspace_identity";
 
@@ -285,6 +279,13 @@ export default class OfferAgentPlugin extends Plugin {
             const message = error === null ? "Codex 模型目录当前不可用" : requireText(error.userVisibleMessage, "目录错误");
             throw new Error(message);
         }
+        const accountBinding = typeof result.accountBinding === "string" &&
+            /^sha256:[0-9a-f]{64}$/.test(result.accountBinding)
+            ? result.accountBinding
+            : null;
+        if (freshness === "fresh" && accountBinding === null) {
+            throw new Error("Worker 返回了无效的 Codex 账户绑定");
+        }
         return result.models.map((raw) => {
             const model = requireJsonObject(raw);
             const provider = requireText(model.provider, "Model provider");
@@ -301,6 +302,7 @@ export default class OfferAgentPlugin extends Plugin {
             return {
                 provider,
                 model: modelId,
+                accountBinding,
                 displayName,
                 supportsStreaming: model.supportsStreaming,
                 supportsStructuredOutput: model.supportsStructuredOutput,
@@ -320,14 +322,22 @@ export default class OfferAgentPlugin extends Plugin {
         const candidate = model.trim();
         if (!candidate || candidate.length > 256 || candidate.includes("\0")) throw new Error("模型标识无效");
         const available = await this.listModels();
-        if (!available.some((item) => item.model === candidate)) throw new Error("所选模型不在 Worker 当前能力列表中");
-        const previous = this.settings.model;
+        const selected = available.find((item) =>
+            item.model === candidate && item.available && item.catalogFreshness === "fresh" &&
+            item.accountBinding !== null);
+        if (!selected) {
+            throw new Error("所选模型不在当前有效的 Codex 模型目录中");
+        }
+        const previousModel = this.settings.model;
+        const previousAccountBinding = this.settings.modelAccountBinding;
         this.settings.model = candidate;
+        this.settings.modelAccountBinding = selected.accountBinding;
         try {
             await this.saveLocalSettings();
             await this.applyRuntimeSettings();
         } catch (error) {
-            this.settings.model = previous;
+            this.settings.model = previousModel;
+            this.settings.modelAccountBinding = previousAccountBinding;
             await this.saveLocalSettings().catch(() => undefined);
             throw error;
         }
@@ -383,12 +393,8 @@ export default class OfferAgentPlugin extends Plugin {
         const current = requireJsonObject(await client.request("config/get", { scope: "workspace", sessionId: null }));
         if (generation !== this.settingsGeneration) return false;
         const revision = requireInteger(current.revision, "config revision");
-        const credential = usesUnconfiguredCompatibleFallback(settings) || !usesProviderSecretStore(settings)
-            ? null
-            : await this.providerCredential(settings);
-        if (generation !== this.settingsGeneration) return false;
         const patch: JsonObject = {
-            model: modelRuntimePatch(settings, credential?.handle ?? null),
+            model: modelRuntimePatch(settings),
             policy: {
                 read_only: settings.permissionMode === "read-only" || settings.permissionMode === "plan",
                 workspace_trusted: settings.workspaceTrusted,
@@ -411,7 +417,7 @@ export default class OfferAgentPlugin extends Plugin {
             expectedRevision: revision,
             patch,
         }));
-        if (result.status === "rejected") throw new Error("Runtime 拒绝了设置；请查看字段错误与模型端点配置");
+        if (result.status === "rejected") throw new Error("Runtime 拒绝了设置；请查看字段错误与 Codex 模型目录状态");
         if (result.status !== "applied" && result.status !== "restart_required") {
             throw new Error("Runtime 返回了未知的设置状态");
         }
@@ -428,81 +434,18 @@ export default class OfferAgentPlugin extends Plugin {
         return generation === this.settingsGeneration;
     }
 
-    async saveProviderCredential(secret: string): Promise<void> {
-        await this.ensureReady();
-        if (!secret || secret.includes("\0") || Buffer.byteLength(secret, "utf8") > 1_048_576) {
-            throw new Error("Provider 凭据为空或超过安全输入上限");
+    async checkModelCatalog(): Promise<string> {
+        const models = await this.listModels();
+        if (models.some((model) => model.catalogFreshness !== "fresh" || !model.available)) {
+            throw new Error("Codex 模型目录已陈旧，仅供展示；请恢复登录或网络后重新检查");
         }
-        const settings = snapshotLocalSettings(this.settings);
-        if (!usesProviderSecretStore(settings)) {
-            throw new Error("Codex 订阅使用本机 Codex 登录，不接受 Provider SecretStore 凭据");
-        }
-        const generation = this.settingsGeneration;
-        const providerId = modelCredentialProviderId(settings);
-        const existing = await this.providerCredential(settings);
-        const params: SecretsPutParams & { secret: string } = {
-            providerId,
-            kind: "model-provider",
-            secret,
-            handle: existing?.handle ?? null,
-            expectedVersion: existing?.version ?? null,
-        };
-        try {
-            if (generation !== this.settingsGeneration) {
-                throw new Error("模型设置已变化；凭据未保存，请确认当前 Provider 后重试");
-            }
-            const result = requireJsonObject(
-                await (this.runtime as RuntimeBootstrap).harness.request("secrets/put", params),
-            );
-            this.requireProviderCredentialMetadata(requireJsonObject(result.secret), providerId);
-        } finally {
-            params.secret = "";
-            secret = "";
-        }
-        if (generation !== this.settingsGeneration) {
-            throw new Error("凭据已绑定原模型端点安全保存，但当前设置已变化，因此未自动应用");
-        }
-        await this.enqueueRuntimeSettingsApply(settings, generation);
-        new Notice("Provider 凭据已安全保存并应用；有效性需通过“应用并检查”验证");
-    }
-
-    async deleteProviderCredential(): Promise<void> {
-        await this.ensureReady();
-        const settings = snapshotLocalSettings(this.settings);
-        if (!usesProviderSecretStore(settings)) {
-            throw new Error("Codex 订阅使用本机 Codex 登录，没有可删除的 Provider SecretStore 凭据");
-        }
-        const generation = this.settingsGeneration;
-        const existing = await this.providerCredential(settings);
-        if (!existing) return;
-        if (generation !== this.settingsGeneration) {
-            throw new Error("模型设置已变化；凭据未删除，请确认当前 Provider 后重试");
-        }
-        await (this.runtime as RuntimeBootstrap).harness.request("secrets/delete", {
-            handle: existing.handle,
-            expectedVersion: existing.version,
-        });
-        if (generation !== this.settingsGeneration) {
-            throw new Error("原模型端点凭据已删除，但当前设置已变化，因此未自动应用");
-        }
-        await this.enqueueRuntimeSettingsApply(settings, generation);
-        new Notice("Provider 凭据已从 Windows SecretStore 删除");
-    }
-
-    async checkModelHealth(): Promise<string> {
-        await this.ensureReady();
-        const settings = snapshotLocalSettings(this.settings);
-        const result = requireJsonObject(await (this.runtime as RuntimeBootstrap).harness.request("models/health", {
-            provider: settings.provider,
-            model: settings.model,
-            deadline: new Date(Date.now() + 30_000).toISOString(),
-            clientRequestId: opaqueId("req_model_health_"),
-        }));
-        const status = requireText(result.status, "Model health status");
-        const error = isObject(result.error) ? result.error : null;
-        const details = error && isObject(error.details) ? error.details : null;
-        const reason = details && typeof details.reason === "string" ? details.reason : null;
-        return modelHealthMessage(settings, status, reason);
+        if (models.length === 0) throw new Error("当前 Codex 订阅账户没有可见模型");
+        const selected = models.find((model) =>
+            model.model === this.settings.model &&
+            model.accountBinding === this.settings.modelAccountBinding);
+        return selected
+            ? `Codex 模型目录可用；当前选择 ${selected.displayName}`
+            : `Codex 模型目录可用（${models.length} 个模型）；请在 Agent 面板选择模型`;
     }
 
     async extensionRequest<Method extends ExtensionCommandMethod>(
@@ -810,34 +753,6 @@ export default class OfferAgentPlugin extends Plugin {
         };
         // Rewrites only the closed local schema, intentionally dropping every legacy URL/key/sync field.
         await this.persistLocalData();
-    }
-
-    private async providerCredential(
-        settings: LocalOfferAgentSettings,
-    ): Promise<{ handle: string; version: number } | null> {
-        if (!usesProviderSecretStore(settings)) return null;
-        const providerId = modelCredentialProviderId(settings);
-        const result = requireJsonObject(await (this.runtime as RuntimeBootstrap).harness.request("secrets/list", {
-            kind: "model-provider",
-            providerId,
-        }));
-        if (!Array.isArray(result.secrets)) throw new Error("SecretStore 元数据响应无效");
-        if (result.secrets.length > 1) throw new Error("同一 Provider 存在重复凭据；请在诊断中清理");
-        if (result.secrets.length === 0) return null;
-        const metadata = requireJsonObject(result.secrets[0]);
-        return this.requireProviderCredentialMetadata(metadata, providerId);
-    }
-
-    private requireProviderCredentialMetadata(
-        metadata: JsonObject,
-        providerId: string,
-    ): { handle: string; version: number } {
-        if (metadata.kind !== "model-provider" || metadata.providerId !== providerId) {
-            throw new Error("SecretStore 返回了与当前模型端点不匹配的凭据元数据");
-        }
-        const handle = requireText(metadata.handle, "Secret handle");
-        if (!/^secret:v1:[0-9a-f]{32}$/.test(handle)) throw new Error("Secret handle 无效");
-        return { handle, version: requireInteger(metadata.version, "Secret version") };
     }
 
     private persistLocalData(): Promise<void> {

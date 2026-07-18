@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from offeragent_harness import __version__
 from offeragent_harness.adapters.local_artifacts import LocalArtifactStore
 from offeragent_harness.adapters.sqlite_stores import SqliteUnitOfWorkFactory
-from offeragent_harness.agent import BudgetLedger, RunBudget
+from offeragent_harness.agent import BudgetLedger, RunBudget, RunPreparationFailure
 from offeragent_harness.agent.context_manager import (
     ContextBudget,
     ContextFragment,
@@ -38,7 +38,16 @@ from offeragent_harness.agent.loop import ToolKernel
 from offeragent_harness.agent.model_planner import AgentStepCatalog, ModelPlanner, PlannerModelConfig
 from offeragent_harness.agent.state import RunState
 from offeragent_harness.app import ApplicationIdentity, HarnessApplication
-from offeragent_harness.config import ConfigPatch, ConfigScope, HarnessConfig, ModelProvider, ModelSettings
+from offeragent_harness.config import (
+    ConfigPatch,
+    ConfigScope,
+    HarnessConfig,
+    ModelProvider,
+    ModelSettings,
+    ModelWireApi,
+)
+from offeragent_harness.config.migrations import project_legacy_codex_config, validate_current_codex_config
+from offeragent_harness.error_codes import ErrorCode
 from offeragent_harness.hooks import HookDecision, HookEvent, HookInvocation, HookLayer, HookScope
 from offeragent_harness.models import ModelContentBlock, thaw_json
 from offeragent_harness.observability import (
@@ -94,7 +103,10 @@ from offeragent_harness.protocol.messages import RuntimeArch, RuntimeStatusResul
 from offeragent_harness.protocol.schemas import PROTOCOL_VERSION, schema_hash
 from offeragent_harness.providers import compose_model_gateway
 from offeragent_harness.providers.codex_subscription import (
+    CODEX_SUBSCRIPTION_PROVIDER_ID,
     CodexCatalogHttpAdapter,
+    CodexRunBinding,
+    CodexRunBindingError,
     CodexSubscriptionModelModule,
     HttpxCodexCatalogHttpAdapter,
 )
@@ -294,6 +306,22 @@ _ROOT_PRODUCT_RULES = (
 
 class ProductionWorkerError(RuntimeError):
     """Fail-closed Worker bootstrap/composition error."""
+
+
+def _production_bootstrap_config_patch(config: HarnessConfig) -> ConfigPatch:
+    """Project trusted bootstrap defaults into the same current persisted shape as user updates."""
+
+    projected = project_legacy_codex_config(config.model_dump(mode="python")).payload()
+    if config.model.model and config.model.account_binding:
+        model = dict(cast(Mapping[str, Any], projected.get("model", {})))
+        model.update(
+            {
+                "model": config.model.model,
+                "account_binding": config.model.account_binding,
+            }
+        )
+        projected["model"] = model
+    return validate_current_codex_config(projected)
 
 
 class _WorkerProcessSupervisor(ProcessSupervisor, Protocol):
@@ -497,6 +525,7 @@ class _PreparedProductionCapabilities:
     inputs: ContextInputs
     effective_config: HarnessConfig
     budget: RunBudget
+    model_binding: CodexRunBinding | None
     permission: PermissionMode
     scope: CapabilityScope
     definitions: tuple[ToolDefinition, ...]
@@ -523,6 +552,7 @@ class ProductionRunComponentsFactory(
         clock: Clock,
         ids: IdGenerator,
         gateway_factory: ModelGatewayFactory,
+        codex_models: CodexSubscriptionModelModule | None = None,
         default_config: HarnessConfig,
         approvals: ApprovalManager,
         policy_audit: PolicyAuditSink,
@@ -549,6 +579,7 @@ class ProductionRunComponentsFactory(
         self._clock = clock
         self._ids = ids
         self._gateway_factory = gateway_factory
+        self._codex_models = codex_models
         self._default_config = default_config
         self._approvals = approvals
         self._policy_audit = policy_audit
@@ -607,6 +638,42 @@ class ProductionRunComponentsFactory(
         config = validate_wire(WireRunConfigSnapshot, thaw_json(command.run_config))
         effective_config = command.effective_config or self._default_config
         self._ensure_worker_read_limit(effective_config)
+        model_binding: CodexRunBinding | None = None
+        if self._codex_models is not None:
+            if not effective_config.network.model_provider_enabled:
+                raise ValueError("Codex model network is disabled by the effective persisted configuration")
+            if config.provider != CODEX_SUBSCRIPTION_PROVIDER_ID:
+                raise ValueError("new Runs require the internal Codex subscription provider")
+            if effective_config.model.provider is not ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL:
+                raise ValueError("persisted model settings are not migrated to Codex subscription")
+            if not effective_config.model.model or effective_config.model.model != config.model:
+                raise ValueError("Run model must exactly match the persisted catalog selection")
+            account_binding = effective_config.model.account_binding
+            if account_binding is None:
+                raise ValueError("Run model selection has no verified Codex account binding")
+            if durable_snapshot is None:
+                try:
+                    model_binding = await asyncio.to_thread(
+                        self._codex_models.bind_for_run,
+                        config.model,
+                        account_binding,
+                    )
+                except CodexRunBindingError as error:
+                    raise _codex_run_binding_preparation_failure(error) from error
+            else:
+                raw_binding = durable_snapshot.get("modelBinding")
+                if not isinstance(raw_binding, Mapping):
+                    raise ValueError("durable Codex model binding is missing or invalid")
+                try:
+                    model_binding = await asyncio.to_thread(
+                        self._codex_models.restore_for_run,
+                        raw_binding,
+                        model_id=config.model,
+                        account_binding=account_binding,
+                    )
+                except CodexRunBindingError as error:
+                    raise _codex_run_binding_preparation_failure(error) from error
+            cancellation.checkpoint()
         permission = _effective_permission(config, effective_config)
         hooks: PreparedHookBundle | None = None
         if self._hooks is not None:
@@ -678,6 +745,7 @@ class ProductionRunComponentsFactory(
                 effective_config,
                 worker_max_parallel_reads=self._effect_gate.max_readers,
             ),
+            model_binding=model_binding,
             permission=permission,
             scope=scope,
             definitions=tuple(definitions),
@@ -735,6 +803,8 @@ class ProductionRunComponentsFactory(
             raise ValueError("child Run Tool scope refers to a different root Registry snapshot")
         selected = _child_tool_definitions(root_registry.definitions, execution.tool_scope.allowed_versions)
         config = validate_wire(WireRunConfigSnapshot, thaw_json(execution.run_config))
+        if root.model_binding is not None and config.model != root.model_binding.model.model_id:
+            raise ValueError("child Run model differs from its root Codex model binding")
         scope = root.scope.intersect(execution.record.effective_scope)
         permission = execution.record.permission_mode
         effective_config = root.effective_config
@@ -809,6 +879,7 @@ class ProductionRunComponentsFactory(
                 execution,
                 parent_max_parallel_reads=parent_parallel_reads,
             ),
+            model_binding=root.model_binding,
             permission=permission,
             scope=scope,
             definitions=definitions,
@@ -1167,12 +1238,32 @@ class ProductionRunComponentsFactory(
             self._run_observability.run_depth_registered(state.lineage.depth)
         if not effective_config.network.model_provider_enabled:
             raise ValueError("Model provider is disabled by the effective persisted configuration")
-        if config.provider != effective_config.model.provider.value:
-            raise ValueError("Run provider must match the persisted Workspace provider")
         selected_model = config.model
-        settings = effective_config.model.model_copy(
-            update={"model": selected_model, "reasoning_effort": config.reasoning_effort.value}
-        )
+        if prepared_capabilities is not None and prepared_capabilities.model_binding is not None:
+            binding = prepared_capabilities.model_binding
+            if binding.model.model_id != selected_model:
+                raise ValueError("prepared Codex model binding differs from the immutable Run model")
+            settings = effective_config.model.model_copy(
+                update={
+                    "provider": ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL,
+                    "wire_api": ModelWireApi.RESPONSES,
+                    "model": binding.model.model_id,
+                    "reasoning_effort": config.reasoning_effort.value,
+                    "service_tier": binding.model.default_service_tier or "default",
+                    "temperature": 0.0,
+                    "credential_handle": None,
+                    "base_url": "",
+                    "organization_id": None,
+                    "project_id": None,
+                    "allow_remote_https": False,
+                }
+            )
+        else:
+            if config.provider != effective_config.model.provider.value:
+                raise ValueError("Run provider must match the persisted Workspace provider")
+            settings = effective_config.model.model_copy(
+                update={"model": selected_model, "reasoning_effort": config.reasoning_effort.value}
+            )
         gateway = self._gateway_factory(settings)
         budget = budget_override or _run_budget(
             config,
@@ -1460,6 +1551,29 @@ class ProductionRunComponentsFactory(
         )
 
 
+def _codex_run_binding_preparation_failure(error: CodexRunBindingError) -> RunPreparationFailure:
+    if error.code in {"auth_required", "auth_account_changed"}:
+        wire_code = ErrorCode.AUTH_REQUIRED
+        message = "Codex sign-in is unavailable or changed; sign in again, refresh the model catalog, and retry."
+    elif error.retryable:
+        wire_code = ErrorCode.PROVIDER_UNREACHABLE
+        message = "The Codex model catalog is temporarily unavailable; retry after connectivity is restored."
+    elif error.code == "model_unavailable":
+        wire_code = ErrorCode.PROVIDER_UNSUPPORTED
+        message = "The selected Codex model is no longer available; refresh the model catalog and select again."
+    else:
+        wire_code = ErrorCode.PROVIDER_UNSUPPORTED
+        message = "The Codex model catalog cannot verify this selection; refresh or update Codex and try again."
+    return RunPreparationFailure(
+        error.code,
+        message,
+        retryable=error.retryable,
+        error_code=wire_code,
+        failure_category="model",
+        details={"runBindingCode": error.code},
+    )
+
+
 def _prepared_capability_snapshot(prepared: _PreparedProductionCapabilities) -> dict[str, Any]:
     skills: dict[str, Any] | None = None
     if prepared.skills is not None:
@@ -1541,6 +1655,7 @@ def _prepared_capability_snapshot(prepared: _PreparedProductionCapabilities) -> 
             "allowSecretHandles": prepared.scope.allow_secret_handles,
         },
         "budget": _budget_snapshot(prepared.budget),
+        "modelBinding": None if prepared.model_binding is None else prepared.model_binding.durable_snapshot(),
         "definitions": _definition_proofs(prepared.definitions),
         "baseDefinitions": _definition_proofs(prepared.base_definitions),
         "skillDefinitions": _definition_proofs(prepared.skill_definitions),
@@ -2579,7 +2694,7 @@ class ProductionWorkerApplication(WorkerApplication):
                     expected_revision=0,
                     idempotency_key="production-worker-bootstrap",
                     actor_id="config-bootstrap",
-                    patch=ConfigPatch.model_validate(self.runtime_config.model_dump(mode="python")),
+                    patch=_production_bootstrap_config_patch(self.runtime_config),
                 )
             )
         worker_config = await self.config_service.snapshot(
@@ -2871,6 +2986,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
         if parent_pid < 1 or parent_pid == os.getpid():
             raise ProductionWorkerError("Worker parent process PID is invalid")
         config = self._overrides.runtime_config or HarnessConfig()
+        config_activation = WorkerConfigActivation()
         secret_store = self._overrides.secret_store
         if secret_store is None:
             if os.name != "nt":
@@ -2882,9 +2998,12 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             credentials=codex_credentials,
             http=self._overrides.codex_catalog_http or HttpxCodexCatalogHttpAdapter(),
             now=clock.utcnow,
+            proxy_url=config_activation.codex_proxy_url,
         )
 
         def configured_gateway_factory(settings: ModelSettings, network_enabled: bool) -> ModelGateway:
+            if settings.provider is ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL:
+                settings = config_activation.codex_model_transport_settings(settings)
             custom = self._overrides.model_gateway_factory
             if custom is not None:
                 gateway = custom(settings)
@@ -3020,7 +3139,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             clock=clock,
             ids=ids,
         )
-        config_activation = WorkerConfigActivation()
         attachments = ConversationAttachmentStore(
             state_directory / "conversation-attachments",
             workspace_id=workspace_id,
@@ -3078,6 +3196,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             clock=clock,
             ids=ids,
             gateway_factory=gateway_factory,
+            codex_models=codex_models,
             default_config=config,
             approvals=approvals,
             policy_audit=EntityPolicyAuditSink(uow),

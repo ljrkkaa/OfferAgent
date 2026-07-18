@@ -24,6 +24,7 @@ from pydantic import (
 
 _SECRET_HANDLE = re.compile(r"secret:v1:[0-9a-f]{32}")
 _PROVIDER_HEADER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_ACCOUNT_BINDING = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 class ConfigScope(str, Enum):
@@ -65,9 +66,10 @@ class RuntimeSettings(_StrictModel):
 
 
 class ModelSettings(_StrictModel):
-    provider: ModelProvider = ModelProvider.CODEX
+    provider: ModelProvider = ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL
     wire_api: ModelWireApi = ModelWireApi.RESPONSES
     model: StrictStr = ""
+    account_binding: StrictStr | None = None
     reasoning_effort: StrictStr = "medium"
     service_tier: StrictStr = "default"
     temperature: Annotated[StrictFloat, Field(ge=0, le=2)] = 0.0
@@ -83,6 +85,13 @@ class ModelSettings(_StrictModel):
     def _opaque_handle(cls, value: str | None) -> str | None:
         if value is not None and _SECRET_HANDLE.fullmatch(value) is None:
             raise ValueError("credential_handle must be an opaque SecretHandle")
+        return value
+
+    @field_validator("account_binding")
+    @classmethod
+    def _account_binding(cls, value: str | None) -> str | None:
+        if value is not None and _ACCOUNT_BINDING.fullmatch(value) is None:
+            raise ValueError("account_binding must be a SHA-256 account proof")
         return value
 
     @field_validator("organization_id", "project_id")
@@ -198,6 +207,7 @@ class ModelPatch(_StrictModel):
     provider: ModelProvider | None = None
     wire_api: ModelWireApi | None = None
     model: StrictStr | None = None
+    account_binding: StrictStr | None = None
     reasoning_effort: StrictStr | None = None
     service_tier: StrictStr | None = None
     temperature: Annotated[StrictFloat, Field(ge=0, le=2)] | None = None
@@ -213,6 +223,13 @@ class ModelPatch(_StrictModel):
     def _opaque_handle(cls, value: str | None) -> str | None:
         if value is not None and _SECRET_HANDLE.fullmatch(value) is None:
             raise ValueError("credential_handle must be an opaque SecretHandle")
+        return value
+
+    @field_validator("account_binding")
+    @classmethod
+    def _account_binding(cls, value: str | None) -> str | None:
+        if value is not None and _ACCOUNT_BINDING.fullmatch(value) is None:
+            raise ValueError("account_binding must be a SHA-256 account proof")
         return value
 
     @field_validator("organization_id", "project_id")

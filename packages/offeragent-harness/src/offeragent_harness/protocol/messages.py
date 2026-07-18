@@ -872,6 +872,7 @@ class ModelsListResult(WireModel):
     catalog_freshness: Literal["fresh", "stale", "unavailable"] = "unavailable"
     catalog_revision: Sha256Digest | None = None
     fetched_at: Rfc3339DateTime | None = None
+    account_binding: Sha256Digest | None = None
     error: ErrorEnvelope | None = None
 
 

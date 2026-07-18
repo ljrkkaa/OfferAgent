@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import MappingProxyType
@@ -21,7 +21,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from .openai_responses import ModelCredentialSource, ModelCredentialSourceError
+from .openai_responses import ModelCredentialLease, ModelCredentialSource, ModelCredentialSourceError
 
 CODEX_SUBSCRIPTION_BASE_URL = "https://chatgpt.com/backend-api/codex"
 CODEX_SUBSCRIPTION_PROVIDER_ID = "codex-subscription-experimental"
@@ -36,6 +36,7 @@ CODEX_SUBSCRIPTION_MODELS_ENDPOINT = (
 _MAX_CATALOG_BYTES = 8 * 1024 * 1024
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _CAPABILITY_ID = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_ACCOUNT_BINDING = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CatalogFreshness = Literal["fresh", "stale", "unavailable"]
 _CatalogErrorCode = Literal[
     "auth_account_changed",
@@ -46,6 +47,16 @@ _CatalogErrorCode = Literal[
     "catalog_unavailable",
     "catalog_unreachable",
 ]
+_RunBindingErrorCode = Literal[
+    "auth_account_changed",
+    "auth_required",
+    "catalog_empty",
+    "catalog_invalid_response",
+    "catalog_rate_limited",
+    "catalog_unavailable",
+    "catalog_unreachable",
+    "model_unavailable",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +66,11 @@ class CodexCatalogHttpRequest:
     endpoint: str
     headers: Mapping[str, str] = field(repr=False)
     timeout_seconds: float = 5.0
+    proxy_url: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.proxy_url is not None:
+            _normalize_loopback_proxy(self.proxy_url)
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +98,23 @@ class CodexCatalogHttpAdapter(Protocol):
     def get(self, request: CodexCatalogHttpRequest) -> CodexCatalogHttpResponse: ...
 
 
+class AccountBoundModelCredentialSource:
+    """Fail closed before inference when the current Codex account no longer matches a Run."""
+
+    def __init__(self, source: ModelCredentialSource, account_binding: str) -> None:
+        if _ACCOUNT_BINDING.fullmatch(account_binding) is None:
+            raise ValueError("Codex account binding is invalid")
+        self._source = source
+        self._account_binding = account_binding
+
+    @contextmanager
+    def lease(self) -> Iterator[ModelCredentialLease]:
+        with self._source.lease() as lease:
+            if _account_binding(lease.account_fingerprint) != self._account_binding:
+                raise ModelCredentialSourceError("auth_account_changed")
+            yield lease
+
+
 class HttpxCodexCatalogHttpAdapter:
     """Production synchronous adapter; callers run the deep module off-loop."""
 
@@ -92,20 +125,17 @@ class HttpxCodexCatalogHttpAdapter:
         proxy_url: str | None = None,
     ) -> None:
         self._transport = transport
-        self._proxy_url = (
-            _normalize_loopback_proxy(proxy_url)
-            if proxy_url is not None
-            else None if transport is not None else _environment_loopback_proxy()
-        )
+        self._proxy_url = _normalize_loopback_proxy(proxy_url) if proxy_url is not None else None
 
     def get(self, request: CodexCatalogHttpRequest) -> CodexCatalogHttpResponse:
+        proxy_url = request.proxy_url if request.proxy_url is not None else self._proxy_url
         try:
             with httpx.Client(
                 transport=self._transport,
                 timeout=httpx.Timeout(request.timeout_seconds),
                 follow_redirects=False,
                 trust_env=False,
-                proxy=self._proxy_url,
+                proxy=proxy_url,
             ) as client:
                 with client.stream("GET", request.endpoint, headers=request.headers) as response:
                     body = bytearray()
@@ -168,11 +198,116 @@ class CodexModelCatalogSnapshot:
     freshness: _CatalogFreshness
     catalog_revision: str | None
     fetched_at: datetime | None
+    account_binding: str | None
     error: CodexCatalogError | None
 
     @property
     def display_only(self) -> bool:
         return self.freshness != "fresh"
+
+
+@dataclass(frozen=True, slots=True)
+class CodexRunBinding:
+    """An exact model selection proven against one fresh account catalog."""
+
+    model: CodexCatalogModel
+    catalog_revision: str
+    bound_at: datetime
+    account_binding: str
+
+    def durable_snapshot(self) -> dict[str, object]:
+        """Return the complete non-secret proof needed to resume without reselection."""
+
+        return {
+            "schemaVersion": 1,
+            "modelId": self.model.model_id,
+            "catalogRevision": self.catalog_revision,
+            "boundAt": self.bound_at.isoformat(),
+            "accountBinding": self.account_binding,
+            "modelCapabilities": {
+                "displayName": self.model.display_name,
+                "description": self.model.description,
+                "inputModalities": list(self.model.input_modalities),
+                "supportsImageDetailOriginal": self.model.supports_image_detail_original,
+                "supportsHostedSearch": self.model.supports_hosted_search,
+                "webSearchToolType": self.model.web_search_tool_type,
+                "contextWindow": self.model.context_window,
+                "maxContextWindow": self.model.max_context_window,
+                "effectiveContextWindowPercent": self.model.effective_context_window_percent,
+                "additionalSpeedTiers": list(self.model.additional_speed_tiers),
+                "serviceTiers": [
+                    {"id": tier.id, "name": tier.name, "description": tier.description}
+                    for tier in self.model.service_tiers
+                ],
+                "defaultServiceTier": self.model.default_service_tier,
+            },
+        }
+
+    @classmethod
+    def from_durable_snapshot(
+        cls,
+        value: Mapping[str, object],
+        *,
+        expected_model_id: str,
+        expected_account_binding: str,
+    ) -> CodexRunBinding:
+        """Strictly restore a fingerprinted historical binding for Run recovery."""
+
+        if value.get("schemaVersion") != 1 or value.get("modelId") != expected_model_id:
+            raise ValueError("durable Codex model binding does not match the immutable Run model")
+        account_binding = value.get("accountBinding")
+        if account_binding != expected_account_binding or not isinstance(account_binding, str):
+            raise ValueError("durable Codex model binding does not match the selected account")
+        if _ACCOUNT_BINDING.fullmatch(account_binding) is None:
+            raise ValueError("durable Codex model account binding is invalid")
+        revision = value.get("catalogRevision")
+        if not isinstance(revision, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", revision) is None:
+            raise ValueError("durable Codex model binding catalog revision is invalid")
+        raw_bound_at = value.get("boundAt")
+        if not isinstance(raw_bound_at, str):
+            raise ValueError("durable Codex model binding timestamp is invalid")
+        try:
+            bound_at = _aware_utc(datetime.fromisoformat(raw_bound_at))
+        except ValueError as error:
+            raise ValueError("durable Codex model binding timestamp is invalid") from error
+        capabilities = value.get("modelCapabilities")
+        if not isinstance(capabilities, Mapping):
+            raise ValueError("durable Codex model binding capabilities are invalid")
+        try:
+            model = _decode_model(
+                {
+                    "slug": expected_model_id,
+                    "display_name": capabilities.get("displayName"),
+                    "description": capabilities.get("description"),
+                    "input_modalities": _plain_list(capabilities.get("inputModalities")),
+                    "supports_image_detail_original": capabilities.get("supportsImageDetailOriginal"),
+                    "supports_search_tool": capabilities.get("supportsHostedSearch"),
+                    "web_search_tool_type": capabilities.get("webSearchToolType"),
+                    "context_window": capabilities.get("contextWindow"),
+                    "max_context_window": capabilities.get("maxContextWindow"),
+                    "effective_context_window_percent": capabilities.get("effectiveContextWindowPercent"),
+                    "additional_speed_tiers": _plain_list(capabilities.get("additionalSpeedTiers")),
+                    "service_tiers": _plain_mapping_list(capabilities.get("serviceTiers")),
+                    "default_service_tier": capabilities.get("defaultServiceTier"),
+                }
+            )
+        except _CatalogDecodeError as error:
+            raise ValueError("durable Codex model binding capabilities are invalid") from error
+        return cls(
+            model=model,
+            catalog_revision=revision,
+            bound_at=bound_at,
+            account_binding=account_binding,
+        )
+
+
+class CodexRunBindingError(RuntimeError):
+    """Stable, non-secret failure to bind a new Run to the live catalog."""
+
+    def __init__(self, code: _RunBindingErrorCode, *, retryable: bool = False) -> None:
+        self.code = code
+        self.retryable = retryable
+        super().__init__("Codex model selection could not be verified")
 
 
 class CodexSubscriptionModelModule:
@@ -184,10 +319,12 @@ class CodexSubscriptionModelModule:
         credentials: ModelCredentialSource,
         http: CodexCatalogHttpAdapter,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        proxy_url: Callable[[], str | None] = lambda: None,
     ) -> None:
         self._credentials = credentials
         self._http = http
         self._now = now
+        self._proxy_url = proxy_url
         self._lock = threading.Lock()
         self._bound_account_fingerprint: str | None = None
         self._last_success: CodexModelCatalogSnapshot | None = None
@@ -198,14 +335,70 @@ class CodexSubscriptionModelModule:
         with self._lock:
             return self._refresh_locked()
 
-    def _refresh_locked(self) -> CodexModelCatalogSnapshot:
+    def bind_for_run(self, model_id: str, account_binding: str) -> CodexRunBinding:
+        """Refresh and freeze one exact model; display-only snapshots never bind."""
+
+        if _MODEL_ID.fullmatch(model_id) is None or _ACCOUNT_BINDING.fullmatch(account_binding) is None:
+            raise CodexRunBindingError("model_unavailable")
+        with self._lock:
+            snapshot = self._refresh_locked(expected_account_binding=account_binding)
+        if snapshot.freshness != "fresh":
+            if snapshot.error is None:
+                raise CodexRunBindingError("catalog_unavailable")
+            raise CodexRunBindingError(
+                cast(_RunBindingErrorCode, snapshot.error.code),
+                retryable=snapshot.error.retryable,
+            )
+        model = next((candidate for candidate in snapshot.models if candidate.model_id == model_id), None)
+        if model is None:
+            raise CodexRunBindingError("model_unavailable")
+        assert snapshot.catalog_revision is not None
+        assert snapshot.fetched_at is not None
+        assert snapshot.account_binding is not None
+        return CodexRunBinding(
+            model,
+            snapshot.catalog_revision,
+            snapshot.fetched_at,
+            snapshot.account_binding,
+        )
+
+    def restore_for_run(
+        self,
+        value: Mapping[str, object],
+        *,
+        model_id: str,
+        account_binding: str,
+    ) -> CodexRunBinding:
+        """Restore an immutable proof without making Worker startup depend on current auth."""
+
+        return CodexRunBinding.from_durable_snapshot(
+            value,
+            expected_model_id=model_id,
+            expected_account_binding=account_binding,
+        )
+
+    def _refresh_locked(self, *, expected_account_binding: str | None = None) -> CodexModelCatalogSnapshot:
+        try:
+            raw_proxy = self._proxy_url()
+            if raw_proxy is not None and not isinstance(raw_proxy, str):
+                raise ValueError("Codex catalog proxy source is invalid")
+            proxy_url = None if not raw_proxy else _normalize_loopback_proxy(raw_proxy)
+        except (TypeError, ValueError):
+            return self._failure("catalog_unavailable", retryable=False)
         try:
             with self._credentials.lease() as lease:
+                lease_account_binding = _account_binding(lease.account_fingerprint)
+                if expected_account_binding is not None and lease_account_binding != expected_account_binding:
+                    return self._failure("auth_account_changed", retryable=False, allow_stale=False)
                 if (
                     self._bound_account_fingerprint is not None
                     and lease.account_fingerprint != self._bound_account_fingerprint
                 ):
-                    return self._failure("auth_account_changed", retryable=False, allow_stale=False)
+                    # A display refresh may follow the current Codex account so
+                    # the user can explicitly reselect. Never show account A's
+                    # stale catalog while fetching or failing under account B.
+                    self._last_success = None
+                self._bound_account_fingerprint = lease.account_fingerprint
                 try:
                     token = lease.material.tobytes().decode("ascii", errors="strict")
                 except UnicodeDecodeError:
@@ -225,6 +418,7 @@ class CodexSubscriptionModelModule:
                 request = CodexCatalogHttpRequest(
                     endpoint=CODEX_SUBSCRIPTION_MODELS_ENDPOINT,
                     headers=MappingProxyType(headers),
+                    proxy_url=proxy_url,
                 )
                 try:
                     response = self._http.get(request)
@@ -247,9 +441,9 @@ class CodexSubscriptionModelModule:
                     freshness="fresh",
                     catalog_revision=_catalog_revision(models),
                     fetched_at=_aware_utc(self._now()),
+                    account_binding=lease_account_binding,
                     error=None,
                 )
-                self._bound_account_fingerprint = lease.account_fingerprint
                 self._last_success = snapshot
                 return snapshot
         except ModelCredentialSourceError as error:
@@ -270,9 +464,10 @@ class CodexSubscriptionModelModule:
                 freshness="stale",
                 catalog_revision=cached.catalog_revision,
                 fetched_at=cached.fetched_at,
+                account_binding=cached.account_binding,
                 error=error,
             )
-        return CodexModelCatalogSnapshot((), "unavailable", None, None, error)
+        return CodexModelCatalogSnapshot((), "unavailable", None, None, None, error)
 
 
 class _CatalogDecodeError(ValueError):
@@ -372,6 +567,21 @@ def _service_tiers(value: object) -> tuple[CodexModelServiceTier, ...]:
     return tuple(tiers)
 
 
+def _plain_list(value: object) -> list[object]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise _CatalogDecodeError("durable sequence is invalid")
+    return list(value)
+
+
+def _plain_mapping_list(value: object) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for item in _plain_list(value):
+        if not isinstance(item, Mapping):
+            raise _CatalogDecodeError("durable mapping sequence is invalid")
+        result.append(dict(item))
+    return result
+
+
 def _identifier_list(
     value: object,
     *,
@@ -455,8 +665,7 @@ def _catalog_revision(models: Sequence[CodexCatalogModel]) -> str:
             "effectiveContextWindowPercent": model.effective_context_window_percent,
             "additionalSpeedTiers": model.additional_speed_tiers,
             "serviceTiers": [
-                {"id": tier.id, "name": tier.name, "description": tier.description}
-                for tier in model.service_tiers
+                {"id": tier.id, "name": tier.name, "description": tier.description} for tier in model.service_tiers
             ],
             "defaultServiceTier": model.default_service_tier,
         }
@@ -464,6 +673,13 @@ def _catalog_revision(models: Sequence[CodexCatalogModel]) -> str:
     ]
     raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
     return f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
+def _account_binding(account_fingerprint: str) -> str:
+    if not account_fingerprint or len(account_fingerprint) > 512 or "\x00" in account_fingerprint:
+        raise ValueError("Codex account fingerprint is invalid")
+    digest = hashlib.sha256(account_fingerprint.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
 
 
 def _safe_account_header(value: object) -> bool:
@@ -474,18 +690,6 @@ def _safe_account_header(value: object) -> bool:
         and value.isascii()
         and all(0x21 <= ord(character) <= 0x7E for character in value)
     )
-
-
-def _environment_loopback_proxy() -> str | None:
-    for name in ("HTTPS_PROXY", "https_proxy"):
-        value = os.environ.get(name)
-        if value is None:
-            continue
-        try:
-            return _normalize_loopback_proxy(value)
-        except ValueError:
-            return None
-    return None
 
 
 def _normalize_loopback_proxy(value: str) -> str:
@@ -550,6 +754,8 @@ __all__ = [
     "CodexCatalogTransportError",
     "CodexModelCatalogSnapshot",
     "CodexModelServiceTier",
+    "CodexRunBinding",
+    "CodexRunBindingError",
     "CodexSubscriptionModelModule",
     "HttpxCodexCatalogHttpAdapter",
 ]

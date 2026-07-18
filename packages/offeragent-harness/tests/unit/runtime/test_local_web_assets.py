@@ -114,10 +114,33 @@ def test_web_client_uses_runtime_model_catalog() -> None:
     source = (WEB / "app.js").read_text(encoding="utf-8")
     for command in ("models/list", "models/health"):
         assert f'command("{command}"' in source
-    assert "provider: model.provider" in source
+    assert 'command("config/get", { scope: "workspace" })' in source
+    assert 'const CODEX_SUBSCRIPTION_PROVIDER = "codex-subscription-experimental"' in source
+    assert 'command("models/list", { includeUnavailable: true })' in source
+    assert "if (provider !== CODEX_SUBSCRIPTION_PROVIDER)" in source
+    assert "provider: CODEX_SUBSCRIPTION_PROVIDER" in source
+    assert "provider: model.provider" not in source
     assert "model: model.model" in source
+    assert "const key = model" in source
+    assert "modelKey(" not in source
+    assert ".find(([, descriptor]) => descriptor.available)" not in source
+    assert "key === state.configuredModelId" in source
+    assert "configSnapshot?.values?.model?.account_binding" in source
+    assert "result?.accountBinding" in source
+    assert "descriptor.accountBinding === state.configuredAccountBinding" in source
+    assert "为当前 Codex 账户重新选择模型" in source
     assert "gpt-5.4" not in source
     assert "gpt-5.5" not in source
+
+
+def test_web_model_control_has_no_provider_endpoint_or_free_text_choice() -> None:
+    index = (WEB / "index.html").read_text(encoding="utf-8")
+    source = (WEB / "app.js").read_text(encoding="utf-8")
+
+    assert re.search(r'<select\s+id="model"', index) is not None
+    assert re.search(r'<input[^>]+id="model"', index) is None
+    for retired_choice in ("apiKey", "baseUrl", "endpointUrl", "providerEl"):
+        assert retired_choice not in source
 
 
 def test_web_client_reads_artifacts_in_bounded_text_only_pages() -> None:

@@ -196,7 +196,10 @@ async def test_failed_turn_start_releases_only_the_claim_created_by_that_attempt
             del keys
             return SimpleNamespace(
                 config=SimpleNamespace(
-                    model=SimpleNamespace(provider=SimpleNamespace(value="codex"), model="gpt-test"),
+                    model=SimpleNamespace(
+                        provider=SimpleNamespace(value="codex-subscription-experimental"),
+                        model="gpt-test",
+                    ),
                     policy=SimpleNamespace(allow_bypass=False, read_only=False, workspace_trusted=True),
                 ),
                 fingerprint="sha256:" + "a" * 64,
@@ -234,7 +237,7 @@ async def test_failed_turn_start_releases_only_the_claim_created_by_that_attempt
                     },
                 }
             ],
-            "runConfig": {"provider": "codex", "model": "gpt-test"},
+            "runConfig": {"provider": "codex-subscription-experimental", "model": "gpt-test"},
         },
     )
     assert isinstance(params, TurnStartParams)

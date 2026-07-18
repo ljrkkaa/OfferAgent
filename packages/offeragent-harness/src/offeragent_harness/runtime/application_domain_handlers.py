@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, cast
 
-from offeragent_harness.config import ConfigPatch
+from offeragent_harness.config import ConfigPatch, ModelProvider
 from offeragent_harness.config import ConfigScope as DomainConfigScope
 from offeragent_harness.hooks import HookDecision, HookEvent
 from offeragent_harness.models import thaw_json
@@ -551,8 +551,11 @@ def _turn_handlers(
             workspace_id=identity.workspace_id,
             session_id=params.session_id,
         )
-        if params.run_config.provider != snapshot.config.model.provider.value:
-            raise ValueError("Run provider differs from the effective persisted configuration")
+        required_provider = ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL.value
+        if params.run_config.provider != required_provider or snapshot.config.model.provider.value != required_provider:
+            raise ValueError("New Runs require the internal Codex Subscription provider")
+        if params.run_config.model != snapshot.config.model.model:
+            raise ValueError("Run model differs from the effective persisted configuration")
         requested_mode = params.run_config.permission_mode
         if requested_mode is PermissionMode.BYPASS and not snapshot.config.policy.allow_bypass:
             raise PermissionError("bypass permission is disabled by the persisted Workspace policy")
@@ -571,8 +574,6 @@ def _turn_handlers(
         )
         run_config = params.run_config.model_copy(
             update={
-                "provider": snapshot.config.model.provider.value,
-                "model": snapshot.config.model.model or params.run_config.model,
                 "permission_mode": route.permission_mode,
             }
         )

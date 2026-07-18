@@ -5,8 +5,13 @@ from pathlib import Path
 
 import pytest
 
+from offeragent_harness.config import HarnessConfig
 from offeragent_harness.runtime import development_composition, production_worker_composition
-from offeragent_harness.runtime.production_worker_composition import WorkerCommandLine, _protocol_capabilities
+from offeragent_harness.runtime.production_worker_composition import (
+    WorkerCommandLine,
+    _production_bootstrap_config_patch,
+    _protocol_capabilities,
+)
 from offeragent_harness.runtime.startup import RuntimeStartupBlocked, StartupFailurePhase
 
 
@@ -21,6 +26,17 @@ def test_production_worker_enables_the_root_agent_contract_gate() -> None:
     source = Path(production_worker_composition.__file__).read_text(encoding="utf-8")
 
     assert 'required_root_initial_tool="agent_contract.read"' in source
+
+
+def test_production_bootstrap_persists_only_current_codex_configuration_fields() -> None:
+    payload = _production_bootstrap_config_patch(HarnessConfig()).payload()
+
+    assert payload["model"] == {
+        "model": "",
+        "reasoning_effort": "medium",
+        "proxy_url": None,
+    }
+    assert "policy" in payload and "budgets" in payload
 
 
 def test_fused_production_worker_has_no_worker_local_vault_evidence_adapter() -> None:

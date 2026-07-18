@@ -4,6 +4,7 @@
   const PROTOCOL_VERSION = "1.0";
   const SCHEMA_HASH = "sha256:28c500ce7f0557958ee320492ac2f001ad4dcb4ba279992a4772d12b31308493";
   const CLIENT_VERSION = "0.1.0";
+  const CODEX_SUBSCRIPTION_PROVIDER = "codex-subscription-experimental";
   const ARTIFACT_PAGE_BYTES = 65_536;
   const ARTIFACT_TOTAL_BYTES = 524_288;
   const POLL_INTERVAL_MS = 750;
@@ -22,6 +23,9 @@
     cursors: new Map(),
     artifacts: new Map(),
     models: new Map(),
+    configuredModelId: null,
+    configuredAccountBinding: null,
+    catalogAccountBinding: null,
     selectedModelKey: null,
     modelHealth: null,
     skillCatalog: null,
@@ -154,16 +158,34 @@
   }
 
   async function loadModels() {
-    const result = await command("models/list", { provider: null, includeUnavailable: true });
+    const [result, configSnapshot] = await Promise.all([
+      command("models/list", { includeUnavailable: true }),
+      command("config/get", { scope: "workspace" }),
+    ]);
     const models = Array.isArray(result.models) ? result.models : [];
+    const configuredModel = configSnapshot?.values?.model?.model;
+    const configuredAccountBinding = configSnapshot?.values?.model?.account_binding;
+    const catalogAccountBinding = result?.accountBinding;
+    state.configuredModelId =
+      typeof configuredModel === "string" && configuredModel.length > 0 && configuredModel.length <= 256
+        ? configuredModel
+        : null;
+    state.configuredAccountBinding = /^sha256:[0-9a-f]{64}$/.test(configuredAccountBinding ?? "")
+      ? configuredAccountBinding
+      : null;
+    state.catalogAccountBinding = /^sha256:[0-9a-f]{64}$/.test(catalogAccountBinding ?? "")
+      ? catalogAccountBinding
+      : null;
     state.models.clear();
     for (const descriptor of models) {
       if (!descriptor || typeof descriptor !== "object") continue;
       const provider = requiredText(descriptor.provider, "model.provider");
+      if (provider !== CODEX_SUBSCRIPTION_PROVIDER) {
+        throw new Error("Runtime 模型目录包含非 Codex Subscription Provider");
+      }
       const model = requiredText(descriptor.model, "model.model");
-      const key = modelKey(provider, model);
+      const key = model;
       state.models.set(key, {
-        provider,
         model,
         displayName: requiredText(descriptor.displayName, "model.displayName"),
         local: descriptor.local === true,
@@ -171,24 +193,22 @@
         supportsStreaming: descriptor.supportsStreaming === true,
         supportsStructuredOutput: descriptor.supportsStructuredOutput === true,
         maxContextTokens: descriptor.maxContextTokens ?? null,
+        accountBinding: state.catalogAccountBinding,
       });
     }
     renderModels();
-    const remembered = sessionStorage.getItem(modelStorageKey());
-    const selected =
-      (remembered && state.models.get(remembered)?.available ? remembered : null) ??
-      [...state.models.entries()].find(([, descriptor]) => descriptor.available)?.[0] ??
-      null;
-    selectModel(selected);
+    selectModel(state.configuredModelId);
   }
 
   function renderModels() {
     const options = [];
     for (const [key, descriptor] of state.models) {
-      const suffix = `${descriptor.local ? "本地" : descriptor.provider}${descriptor.available ? "" : " · 不可用"}`;
+      const suffix = `Codex Subscription${descriptor.available ? "" : " · 不可用"}`;
       const option = node("option", `${descriptor.displayName} — ${suffix}`);
       option.value = key;
-      option.disabled = !descriptor.available;
+      option.disabled = !descriptor.available ||
+        key !== state.configuredModelId ||
+        descriptor.accountBinding !== state.configuredAccountBinding;
       options.push(option);
     }
     if (!options.length) {
@@ -201,18 +221,25 @@
   }
 
   function selectModel(key) {
-    state.selectedModelKey = key && state.models.get(key)?.available ? key : null;
-    modelEl.disabled = state.models.size === 0;
+    const descriptor = key ? state.models.get(key) : null;
+    state.selectedModelKey =
+      key &&
+      key === state.configuredModelId &&
+      descriptor?.available &&
+      descriptor.accountBinding === state.configuredAccountBinding
+        ? key
+        : null;
+    modelEl.disabled = true;
     modelEl.value = state.selectedModelKey ?? "";
     modelHealthEl.disabled = state.selectedModelKey === null;
     state.modelHealth = null;
     if (state.selectedModelKey) {
-      sessionStorage.setItem(modelStorageKey(), state.selectedModelKey);
-      const descriptor = state.models.get(state.selectedModelKey);
-      modelStatusEl.textContent = descriptor.local ? "本地模型 · 尚未检查" : "外部模型 Provider · 尚未检查";
+      modelStatusEl.textContent = "Codex Subscription 模型 · 尚未检查";
       modelStatusEl.classList.remove("error", "healthy");
     } else {
-      modelStatusEl.textContent = "请先在 Runtime/Obsidian 中配置一个可用模型";
+      modelStatusEl.textContent = state.configuredModelId
+        ? "请在 Obsidian 中为当前 Codex 账户重新选择模型"
+        : "请先在 Obsidian 设置中选择当前目录中的模型";
       modelStatusEl.classList.add("error");
     }
     updateControls();
@@ -221,15 +248,15 @@
   async function checkModelHealth() {
     const descriptor = selectedModel();
     if (!descriptor) throw new Error("尚未选择可用模型");
-    modelStatusEl.textContent = "正在检查模型 Provider…";
+    modelStatusEl.textContent = "正在检查 Codex Subscription 模型…";
     modelStatusEl.classList.remove("error", "healthy");
     const result = await command("models/health", {
-      provider: descriptor.provider,
+      provider: CODEX_SUBSCRIPTION_PROVIDER,
       model: descriptor.model,
       deadline: null,
       clientRequestId: opaque("req_model_health_"),
     });
-    if (result.provider !== descriptor.provider || result.model !== descriptor.model) {
+    if (result.provider !== CODEX_SUBSCRIPTION_PROVIDER || result.model !== descriptor.model) {
       throw new Error("模型健康结果身份不匹配");
     }
     state.modelHealth = result;
@@ -385,7 +412,6 @@
         idempotencyKey: opaque("turn_"),
         input: [{ type: "text", text: textValue }],
         runConfig: {
-          provider: model.provider,
           model: model.model,
           reasoningEffort: el("reasoning").value,
           permissionMode: el("permission").value,
@@ -1118,7 +1144,7 @@
     );
     inspectorEl.append(intro);
     const managed = [
-      ["模型", "可用", "使用 models/list 与 models/health；在输入区选择。"],
+      ["模型", "可用", "使用当前 Codex Subscription 目录；在输入区选择精确模型。"],
       ["Skills", state.capabilities.skills === true ? "目录已读取" : "未协商", "可在下方选择本页面新 Run 使用的已信任 Skills；信任确认在 Obsidian 设置中完成。"],
       ["Shell", state.capabilities.shell === true ? "目录已读取" : "未协商", "下方显示持久 profile、revision、信任与启停状态。"],
       ["Hooks", state.capabilities.hooks === true ? "目录已读取" : "未协商", "下方显示 layer、contentHash trust 与 Workspace command definitionHash 确认状态。"],
@@ -1244,7 +1270,7 @@
     steerEl.disabled = busy || active === null || !promptEl.value.trim();
     cancelEl.disabled = busy || active === null;
     modelHealthEl.disabled = busy || selectedModel() === null;
-    modelEl.disabled = busy || state.models.size === 0;
+    modelEl.disabled = true;
     for (const id of ["rename-session", "compact-session", "delete-session"]) {
       el(id).disabled = busy || !state.sessionId;
     }
@@ -1505,14 +1531,6 @@
     return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
   }
 
-  function modelKey(provider, model) {
-    return `${encodeURIComponent(provider)}::${encodeURIComponent(model)}`;
-  }
-
-  function modelStorageKey() {
-    return `offeragent.model.${state.workspaceId}`;
-  }
-
   function sessionStorageKey() {
     return `offeragent.session.${state.workspaceId}`;
   }
@@ -1542,7 +1560,6 @@
       else sendTurn(promptEl.value).catch(showError);
     }
   });
-  modelEl.addEventListener("change", () => selectModel(modelEl.value));
   modelHealthEl.addEventListener("click", () => checkModelHealth().catch(showError));
   el("new-session").addEventListener("click", () => createSession().catch(showError));
   el("rename-session").addEventListener("click", () => renameSession().catch(showError));

@@ -3898,6 +3898,17 @@
     "ModelsListResult": {
       "additionalProperties": false,
       "properties": {
+        "accountBinding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sha256Digest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "catalogFreshness": {
           "default": "unavailable",
           "enum": [
@@ -5559,7 +5570,7 @@
           "default": "normal"
         },
         "provider": {
-          "default": "codex",
+          "default": "codex-subscription-experimental",
           "maxLength": 128,
           "minLength": 1,
           "title": "Provider",

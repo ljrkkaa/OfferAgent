@@ -78,6 +78,27 @@ test("model capability labels come from the live catalog instead of a vision pro
     }), "流式 · 结构化 · 文本 · 无托管搜索 · 标准速度");
 });
 
+test("the composer treats a model id from another Codex account as an unselected choice", () => {
+    const { modelChoiceMatchesSelection } = loadModule();
+    const choice = {
+        model: "shared-model",
+        accountBinding: `sha256:${"a".repeat(64)}`,
+    };
+
+    assert.equal(modelChoiceMatchesSelection(choice, {
+        model: "shared-model",
+        modelAccountBinding: choice.accountBinding,
+    }), true);
+    assert.equal(modelChoiceMatchesSelection(choice, {
+        model: "shared-model",
+        modelAccountBinding: `sha256:${"b".repeat(64)}`,
+    }), false);
+    assert.equal(modelChoiceMatchesSelection(choice, {
+        model: "different-model",
+        modelAccountBinding: choice.accountBinding,
+    }), false);
+});
+
 test("a late Store bind cannot attach an obsolete Worker generation after restart", async () => {
     const { LocalChatView } = loadModule();
     const originalWindow = global.window;

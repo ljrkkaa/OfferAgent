@@ -18,18 +18,19 @@ from offeragent_harness.config import (
     ConfigPatch,
     ConfigScope,
     HarnessConfig,
+    ModelSettings,
     RunConfigSnapshot,
 )
 from offeragent_harness.config.files import ConfigFileLoad, ConfigFileStore
-from offeragent_harness.config.migrations import strip_retired_update_fields
+from offeragent_harness.config.migrations import project_legacy_codex_config, validate_current_codex_config
 from offeragent_harness.config.resolver import changed_paths, merge_patch, resolve_config
 from offeragent_harness.error_codes import ResourceConflictCause
 from offeragent_harness.ports import Clock, EventSink, IdGenerator, NewEvent, StoredEvent, UnitOfWorkFactory
 
 _CONFIG_COLLECTION = "config_layers"
 _RECEIPT_COLLECTION = "config_receipts"
-_SCHEMA_VERSION = 3
-_LEGACY_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 4
+_LEGACY_SCHEMA_VERSIONS = frozenset({2, 3})
 _LAYER_FIELDS = frozenset({"config", "eventSequence", "ownerId", "revision", "schemaVersion", "scope", "updatedAt"})
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}")
 
@@ -81,6 +82,7 @@ class ConfigUpdateCommand:
             raise ValueError("expected_revision cannot be negative")
         if not self.patch.payload():
             raise ValueError("configuration patch cannot be empty")
+        validate_current_codex_config(self.patch.payload())
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +147,7 @@ class WorkerConfigActivation:
 
     def __init__(self, active_config: HarnessConfig | None = None) -> None:
         self._active: tuple[tuple[str, str], ...] | None = None
+        self._codex_proxy_url: str | None = None
         if active_config is not None:
             self.freeze(active_config)
 
@@ -156,9 +159,22 @@ class WorkerConfigActivation:
         projection = _restart_sensitive_projection(active_config)
         if self._active is None:
             self._active = projection
+            self._codex_proxy_url = active_config.model.proxy_url
             return
         if self._active != projection:
             raise ConfigServiceError("active Worker configuration is already frozen")
+
+    def codex_proxy_url(self) -> str | None:
+        if self._active is None:
+            raise ConfigServiceError("active Worker configuration has not been frozen")
+        return self._codex_proxy_url
+
+    def codex_model_transport_settings(self, desired: ModelSettings) -> ModelSettings:
+        """Project the active proxy onto a Run so catalog and inference cannot split before restart."""
+
+        if self._active is None:
+            raise ConfigServiceError("active Worker configuration has not been frozen")
+        return desired.model_copy(update={"proxy_url": self._codex_proxy_url})
 
     def restart_pending(self, desired_config: HarnessConfig) -> bool:
         if self._active is None:
@@ -416,7 +432,7 @@ def _decode_layer(raw: Any, scope: ConfigScope, owner_id: str) -> ConfigLayer:
         if set(raw) != _LAYER_FIELDS:
             raise ValueError("configuration layer fields are incompatible")
         schema_version = raw.get("schemaVersion")
-        if schema_version not in {_LEGACY_SCHEMA_VERSION, _SCHEMA_VERSION} or raw.get("scope") != scope.value:
+        if schema_version not in {*_LEGACY_SCHEMA_VERSIONS, _SCHEMA_VERSION} or raw.get("scope") != scope.value:
             raise ValueError("incompatible configuration layer")
         if raw.get("ownerId") != owner_id:
             raise ValueError("configuration owner mismatch")
@@ -425,13 +441,15 @@ def _decode_layer(raw: Any, scope: ConfigScope, owner_id: str) -> ConfigLayer:
         if type(revision) is not int or type(event_sequence) is not int or revision < 1 or event_sequence < 1:
             raise ValueError("configuration revision is invalid")
         config = raw["config"]
-        if schema_version == _LEGACY_SCHEMA_VERSION:
-            config = strip_retired_update_fields(config)
+        if schema_version in _LEGACY_SCHEMA_VERSIONS:
+            patch = project_legacy_codex_config(config)
+        else:
+            patch = validate_current_codex_config(config)
         return ConfigLayer(
             scope,
             owner_id,
             revision,
-            ConfigPatch.model_validate(config),
+            patch,
             event_sequence,
         )
     except (KeyError, TypeError, ValueError) as error:

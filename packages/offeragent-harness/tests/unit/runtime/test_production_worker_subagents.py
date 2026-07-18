@@ -262,7 +262,7 @@ def _execution(record: SubagentRunRecord) -> ChildRunExecution:
         context=context,
         tool_scope=record.tool_scope,
         run_config={
-            "provider": "codex",
+            "provider": "codex-subscription-experimental",
             "model": "gpt-test",
             "permissionMode": "normal",
         },
@@ -386,7 +386,7 @@ def test_worker_factory_injects_one_gate_and_lock_pool_across_sessions_and_root_
             idempotency_key=f"idem-{run_id}",
             input_blocks=({"type": "text", "text": run_id},),
             run_config={
-                "provider": "codex",
+                "provider": "codex-subscription-experimental",
                 "model": "gpt-test",
                 "permissionMode": "normal",
                 "budgets": {
@@ -490,7 +490,7 @@ def test_child_components_fail_closed_on_registry_drift_or_ungranted_tool() -> N
     )
     factory = _CapturingFactory(registry)
     execution = SimpleNamespace(
-        run_config={"provider": "codex", "model": "gpt-test"},
+        run_config={"provider": "codex-subscription-experimental", "model": "gpt-test"},
         context=SimpleNamespace(content={}),
         tool_scope=SimpleNamespace(
             registry_snapshot_hash="sha256:" + "0" * 64,

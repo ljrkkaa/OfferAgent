@@ -26,6 +26,7 @@ export const LOCAL_CHAT_VIEW = "offeragent-local-chat";
 export interface ChatModelChoice {
     readonly provider: string;
     readonly model: string;
+    readonly accountBinding: string | null;
     readonly displayName: string;
     readonly supportsStreaming: boolean;
     readonly supportsStructuredOutput: boolean;
@@ -36,6 +37,13 @@ export interface ChatModelChoice {
     readonly contextWindow: number | null;
     readonly available: boolean;
     readonly catalogFreshness: "fresh" | "stale";
+}
+
+export function modelChoiceMatchesSelection(
+    choice: Pick<ChatModelChoice, "model" | "accountBinding">,
+    settings: Pick<LocalOfferAgentSettings, "model" | "modelAccountBinding">,
+): boolean {
+    return choice.model === settings.model && choice.accountBinding === settings.modelAccountBinding;
 }
 
 export interface LocalChatHost {
@@ -783,14 +791,22 @@ export class LocalChatView extends ItemView {
         const modelControl = controls.createDiv({ cls: "offeragent-model-control" });
         const model = modelControl.createEl("select", { attr: { "aria-label": "选择模型" } });
         const choices = this.models;
+        const boundSelection = choices.find((choice) => modelChoiceMatchesSelection(choice, this.host.settings));
+        if (!boundSelection) {
+            const placeholder = model.createEl("option", {
+                value: "",
+                text: this.host.settings.model ? "请为当前 Codex 账户重新选择模型" : "请选择模型",
+            });
+            placeholder.disabled = true;
+        }
         for (const choice of choices) {
             model.createEl("option", { value: choice.model, text: choice.displayName });
         }
-        model.value = this.host.settings.model;
+        model.value = boundSelection?.model ?? "";
         model.disabled = snapshot.busy || this.sendPending || hasActiveRun || !this.modelsLoaded ||
             this.modelError !== null || choices.length === 0;
         model.onchange = () => void this.chooseModel(model.value);
-        const selectedModel = choices.find((choice) => choice.model === model.value);
+        const selectedModel = boundSelection;
         const modelReady = selectedModel?.available === true && selectedModel.catalogFreshness === "fresh";
         model.title = this.modelError ?? (!this.modelsLoaded ? "正在从 Worker 查询模型能力" : selectedModel
             ? `${selectedModel.provider} · ${modelCapabilityLabel(selectedModel)}`
@@ -1027,7 +1043,8 @@ export class LocalChatView extends ItemView {
     }
 
     private async chooseModel(model: string): Promise<void> {
-        if (!model || model === this.host.settings.model) return;
+        const choice = this.models.find((candidate) => candidate.model === model);
+        if (!model || (choice && modelChoiceMatchesSelection(choice, this.host.settings))) return;
         try {
             await this.host.selectModel(model);
             await this.refreshModels(this.boundRuntimeAttempt);

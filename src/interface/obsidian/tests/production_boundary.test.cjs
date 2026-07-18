@@ -42,46 +42,54 @@ test("UI adapters do not own an Agent loop, Planner, model gateway, or direct mo
     }
 });
 
-test("DeepSeek UI is fixed configuration and delegates credentials to the authenticated Worker", async () => {
+test("production settings expose only the Codex Subscription catalog selection", async () => {
     const main = await readFile(path.join(__dirname, "../src/main.ts"), "utf8");
     const settings = await readFile(path.join(__dirname, "../src/local/settings.ts"), "utf8");
 
-    assert.match(settings, /DeepSeek API（API Key）/);
-    assert.match(settings, /provider:\s*"deepseek"/);
-    assert.match(settings, /wireApi:\s*"chat-completions"/);
-    assert.match(settings, /model:\s*"deepseek-v4-flash"/);
-    assert.match(settings, /schemaVersion:\s*2/);
-    assert.match(main, /interface LocalPluginData[\s\S]*schemaVersion:\s*2/);
-    assert.match(settings, /if \(provider === DEEPSEEK_PROVIDER\) return "chat-completions"/);
-    assert.match(settings, /if \(settings\.provider !== "openai-compatible"\) return settings\.provider/);
-    assert.match(main, /request\("secrets\/put", params\)/);
-    assert.doesNotMatch(main, /migrateUnconfiguredLegacyCodexSubscription/);
+    assert.match(settings, /schemaVersion:\s*3/);
+    assert.match(settings, /model:\s*""/);
+    assert.match(settings, /实时 Codex 模型目录/);
+    const runtimePatch = settings.slice(
+        settings.indexOf("export function modelRuntimePatch"),
+        settings.indexOf("export function snapshotLocalSettings"),
+    );
+    assert.match(runtimePatch, /model:\s*settings\.model/);
+    assert.match(runtimePatch, /reasoning_effort:\s*settings\.reasoningEffort/);
+    assert.match(runtimePatch, /proxy_url:\s*settings\.proxyUrl/);
+    assert.doesNotMatch(runtimePatch, /provider|wire_api|base_url|credential_handle|allow_remote_https/);
+    for (const retired of ["DeepSeek", "Ollama", "OpenAI-compatible", "模型 Provider", "模型协议", "模型端点"]) {
+        assert.equal(settings.includes(retired), false, retired);
+    }
     assert.doesNotMatch(main, /process\.env\.(?:HTTPS_PROXY|HTTP_PROXY)/);
 });
 
-test("Codex subscription UI delegates login and transport to Worker without SecretStore calls", async () => {
+test("Codex subscription login and transport have no production model SecretStore path", async () => {
     const main = await readFile(path.join(__dirname, "../src/main.ts"), "utf8");
     const settings = await readFile(path.join(__dirname, "../src/local/settings.ts"), "utf8");
     const apply = main.slice(
         main.indexOf("private async applyRuntimeSettingsToReadyRuntime"),
-        main.indexOf("async saveProviderCredential"),
-    );
-    const saveCredential = main.slice(
-        main.indexOf("async saveProviderCredential"),
-        main.indexOf("async deleteProviderCredential"),
-    );
-    const deleteCredential = main.slice(
-        main.indexOf("async deleteProviderCredential"),
-        main.indexOf("async checkModelHealth"),
+        main.indexOf("async checkModelCatalog"),
     );
 
-    assert.match(settings, /Codex 订阅（实验，本机登录）/);
-    assert.match(settings, /Codex\/OpenAI API（API Key）/);
-    assert.match(settings, /if \(usesProviderSecretStore\(this\.host\.settings\)\)/);
-    assert.match(apply, /!usesProviderSecretStore\(settings\)[\s\S]*\? null/);
-    assert.match(saveCredential, /if \(!usesProviderSecretStore\(settings\)\)[\s\S]*throw new Error/);
-    assert.match(deleteCredential, /if \(!usesProviderSecretStore\(settings\)\)[\s\S]*throw new Error/);
-    assert.match(settings, /credential_handle: subscription \? null : credentialHandle/);
+    assert.match(settings, /Codex CLI 的 ChatGPT 登录/);
+    assert.doesNotMatch(settings, /Provider 凭据|SecretStore|API Key/);
+    assert.match(apply, /modelRuntimePatch\(settings\)/);
+    assert.doesNotMatch(apply, /providerCredential|credentialHandle|usesProviderSecretStore/);
+    assert.doesNotMatch(main, /saveProviderCredential|deleteProviderCredential|modelCredentialProviderId/);
+    assert.doesNotMatch(main, /request\("secrets\/(?:put|delete)"/);
+    assert.doesNotMatch(main, /checkModelHealth/);
+});
+
+test("model selection and catalog health accept only a fresh visible Codex model", async () => {
+    const main = await readFile(path.join(__dirname, "../src/main.ts"), "utf8");
+    const select = main.slice(main.indexOf("async selectModel"), main.indexOf("openSettings():"));
+    const health = main.slice(main.indexOf("async checkModelCatalog"), main.indexOf("async extensionRequest"));
+
+    assert.match(select, /item\.model === candidate && item\.available && item\.catalogFreshness === "fresh"/);
+    assert.match(main, /async checkModelCatalog/);
+    assert.match(health, /await this\.listModels\(\)/);
+    assert.match(health, /catalogFreshness !== "fresh"|!model\.available/);
+    assert.doesNotMatch(main, /request\("models\/health"/);
 });
 
 test("chat history delegates Session hydration and replay to the single ChatStore path", async () => {
@@ -132,27 +140,18 @@ test("bypass mode is rendered explicitly and cannot be mistaken for planning", a
     assert.match(view, /mode === "bypass"\) return "免审批执行"/);
 });
 
-test("model settings apply is serialized, generation-checked, and credential metadata is endpoint-bound", async () => {
+test("Codex model settings apply is serialized and generation-checked without credentials", async () => {
     const main = await readFile(path.join(__dirname, "../src/main.ts"), "utf8");
     const apply = main.slice(
         main.indexOf("private enqueueRuntimeSettingsApply"),
-        main.indexOf("async saveProviderCredential"),
-    );
-    const credentials = main.slice(
-        main.indexOf("async saveProviderCredential"),
-        main.indexOf("private persistLocalData"),
+        main.indexOf("async checkModelCatalog"),
     );
 
     assert.match(main, /runtimeSettingsWrites\s*=\s*new SerializedOperationQueue/);
     assert.match(apply, /runtimeSettingsWrites\.run/);
     assert.match(apply, /generation !== this\.settingsGeneration/);
-    assert.match(apply, /modelRuntimePatch\(settings,/);
-    assert.doesNotMatch(apply, /modelRuntimePatch\(this\.settings,/);
-    assert.match(credentials, /modelCredentialProviderId\(settings\)/);
-    assert.match(credentials, /metadata\.kind !== "model-provider"/);
-    assert.match(credentials, /metadata\.providerId !== providerId/);
-    assert.match(credentials, /details\.reason/);
-    assert.match(credentials, /modelHealthMessage\(settings, status, reason\)/);
+    assert.match(apply, /modelRuntimePatch\(settings\)/);
+    assert.doesNotMatch(apply, /credential|SecretStore|secrets\//i);
 });
 
 test("Subagent protocol support is structural while execution remains configuration-controlled", async () => {

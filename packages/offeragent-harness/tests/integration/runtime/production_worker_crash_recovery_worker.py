@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import shutil
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, cast
 
 from offeragent_harness.config import HarnessConfig
@@ -23,6 +26,13 @@ from offeragent_harness.permissions import ApprovalRequest
 from offeragent_harness.ports import ApplicationCommandContext, CancellationToken
 from offeragent_harness.ports.worker_runtime import WorkerApplication, WorkerBootstrap, WorkerCompositionRoot
 from offeragent_harness.protocol._base import WireModel
+from offeragent_harness.providers import (
+    CODEX_SUBSCRIPTION_PROVIDER_ID,
+    CodexCatalogHttpRequest,
+    CodexCatalogHttpResponse,
+    ModelCredentialLease,
+    ModelCredentialSourceError,
+)
 from offeragent_harness.runtime.production_worker_composition import (
     ProductionWorkerApplication,
     ProductionWorkerCompositionRoot,
@@ -39,6 +49,67 @@ NO_CRASH_EXIT = 74
 WORKSPACE_INSTANCE_ID = "wsi_5814036c-4192-49ea-9e75-b458bd7a53aa"
 BEFORE_CONTENT = b"BEFORE_PAYLOAD\n"
 AFTER_CONTENT = b"BEFORE_PAYLOAD\nAFTER_PAYLOAD\n"
+MODEL_ID = "gpt-crash-recovery"
+ACCOUNT_FINGERPRINT = "account-crash-recovery"
+ACCOUNT_BINDING = "sha256:" + hashlib.sha256(ACCOUNT_FINGERPRINT.encode()).hexdigest()
+
+
+class _CodexCredentials:
+    @contextmanager
+    def lease(self) -> Iterator[ModelCredentialLease]:
+        token = bytearray(b"fixture-access-token")
+        view = memoryview(token)
+        try:
+            yield ModelCredentialLease(
+                material=view,
+                headers=MappingProxyType(
+                    {
+                        "ChatGPT-Account-ID": "fixture-account-id",
+                        "originator": "codex_cli_rs",
+                        "User-Agent": "codex_cli_rs/test (OfferAgent)",
+                    }
+                ),
+                credential_fingerprint="credential-crash-recovery",
+                account_fingerprint=ACCOUNT_FINGERPRINT,
+            )
+        finally:
+            view.release()
+            token[:] = b"\0" * len(token)
+
+
+class _MissingCodexCredentials:
+    def lease(self) -> Any:
+        raise ModelCredentialSourceError("auth_required")
+
+
+class _CodexCatalog:
+    def get(self, request: CodexCatalogHttpRequest) -> CodexCatalogHttpResponse:
+        del request
+        body = {
+            "models": [
+                {
+                    "slug": MODEL_ID,
+                    "display_name": "Crash Recovery Model",
+                    "description": "Deterministic production recovery fixture",
+                    "visibility": "list",
+                    "input_modalities": ["text"],
+                    "supports_image_detail_original": False,
+                    "supports_search_tool": False,
+                    "web_search_tool_type": None,
+                    "context_window": 128000,
+                    "max_context_window": 128000,
+                    "effective_context_window_percent": 95,
+                    "additional_speed_tiers": [],
+                    "service_tiers": [],
+                    "default_service_tier": None,
+                }
+            ]
+        }
+        return CodexCatalogHttpResponse(
+            status=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(body, separators=(",", ":")).encode(),
+        )
 
 
 def _ripgrep_executable() -> Path:
@@ -168,14 +239,21 @@ class _ObservedCompositionRoot(WorkerCompositionRoot):
         return application
 
 
-def _composition(root: Path, barrier: _CrashAndRecoveryBarrier, model: _CrashRecoveryModel) -> WorkerEntrypoint:
+def _composition(
+    root: Path,
+    barrier: _CrashAndRecoveryBarrier,
+    model: _CrashRecoveryModel,
+    *,
+    authenticated: bool = True,
+) -> WorkerEntrypoint:
     vault = root / "vault"
     runtime_config = HarnessConfig.model_validate(
         {
+            "model": {"model": MODEL_ID, "account_binding": ACCOUNT_BINDING},
             "policy": {
                 "workspace_trusted": True,
                 "read_only": False,
-            }
+            },
         }
     )
     composition = ProductionWorkerCompositionRoot(
@@ -185,6 +263,8 @@ def _composition(root: Path, barrier: _CrashAndRecoveryBarrier, model: _CrashRec
         build_commit="abcdef0",
         overrides=ProductionWorkerOverrides(
             model_gateway_factory=lambda _settings: model,
+            codex_credential_source=_CodexCredentials() if authenticated else _MissingCodexCredentials(),
+            codex_catalog_http=_CodexCatalog(),
             runtime_config=runtime_config,
             vault_cas_barrier=cast(VaultCasBarrier, barrier),
             legacy_vault_transaction_test_mode=True,
@@ -308,7 +388,11 @@ async def _crash(root: Path, stage: str) -> int:
                 "turnId": "turn_production_crash",
                 "idempotencyKey": "production-crash-turn",
                 "input": [{"type": "text", "text": "在 note.md 末尾追加指定内容。"}],
-                "runConfig": {"provider": "codex", "model": "fake", "permissionMode": "normal"},
+                "runConfig": {
+                    "provider": CODEX_SUBSCRIPTION_PROVIDER_ID,
+                    "model": MODEL_ID,
+                    "permissionMode": "normal",
+                },
             },
             context,
         )
@@ -377,7 +461,7 @@ async def _wait_recovered_runs(application: ProductionWorkerApplication) -> list
 async def _recover(root: Path) -> int:
     barrier = _CrashAndRecoveryBarrier(None)
     model = _CrashRecoveryModel()
-    entrypoint = _composition(root, barrier, model)
+    entrypoint = _composition(root, barrier, model, authenticated=False)
     application = cast(
         ProductionWorkerApplication,
         await entrypoint.start(WorkerBootstrap(WORKSPACE_INSTANCE_ID, root / "vault", root / "state")),

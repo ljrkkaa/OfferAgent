@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, cast
 
+from offeragent_harness.config import ModelProvider
 from offeragent_harness.error_codes import ErrorCode
 from offeragent_harness.models import thaw_json
 from offeragent_harness.observability import DiagnosticsService
@@ -300,8 +301,11 @@ def conversation_control_handlers(
         if run_config is None:
             source_run = await harness.get_run(params.source_run_id)
             run_config = validate_wire(RunConfigSnapshot, thaw_json(source_run.config_snapshot))
-        if run_config.provider != snapshot.config.model.provider.value:
-            raise ValueError("Run provider differs from the effective persisted configuration")
+        required_provider = ModelProvider.CODEX_SUBSCRIPTION_EXPERIMENTAL.value
+        if run_config.provider != required_provider or snapshot.config.model.provider.value != required_provider:
+            raise ValueError("Retry requires the internal Codex Subscription provider")
+        if run_config.model != snapshot.config.model.model:
+            raise ValueError("Retry model differs from the effective persisted configuration")
         if run_config.permission_mode is PermissionMode.BYPASS and not snapshot.config.policy.allow_bypass:
             raise ValueError("bypass permission is disabled by the persisted Workspace policy")
         effective_mode = run_config.permission_mode
@@ -314,7 +318,7 @@ def conversation_control_handlers(
         run_config = run_config.model_copy(
             update={
                 "provider": snapshot.config.model.provider.value,
-                "model": snapshot.config.model.model or run_config.model,
+                "model": snapshot.config.model.model,
                 "permission_mode": route.permission_mode,
             }
         )

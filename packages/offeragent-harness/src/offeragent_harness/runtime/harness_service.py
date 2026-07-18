@@ -13,12 +13,19 @@ from typing import Any, Protocol, cast
 
 from pydantic import TypeAdapter
 
-from offeragent_harness.agent import BudgetCheckpoint, BudgetExceeded, BudgetLedger, RunBudget, RunPreparationPort
+from offeragent_harness.agent import (
+    BudgetCheckpoint,
+    BudgetExceeded,
+    BudgetLedger,
+    RunBudget,
+    RunPreparationFailure,
+    RunPreparationPort,
+)
 from offeragent_harness.agent.loop import AgentLoopFailure, RecoveredToolBatch, ToolKernel, run_agent_loop
 from offeragent_harness.agent.planner import Planner
 from offeragent_harness.agent.state import RunPhase, RunState
 from offeragent_harness.config import HarnessConfig
-from offeragent_harness.error_codes import ResourceConflictCause, ResourceNotFoundCause
+from offeragent_harness.error_codes import ErrorCode, ResourceConflictCause, ResourceNotFoundCause
 from offeragent_harness.hooks import HookExecutionContext
 from offeragent_harness.models.json_types import FrozenJsonObject, freeze_json, thaw_json
 from offeragent_harness.permissions import ApprovalResolution
@@ -392,13 +399,14 @@ class HarnessDiagnostics:
 class _PreparedRecoveredRun:
     result: RecoveryApplyResult
     budget: BudgetLedger
-    planner: Planner
-    tool_kernel: ToolKernel
+    planner: Planner | None
+    tool_kernel: ToolKernel | None
     recorder: UowRunRecorder
     recovered_batch: RecoveredToolBatch
     hooks: HookLifecyclePort | None
     hook_context: HookExecutionContext | None
     run_preparation: RunPreparationPort | None
+    preparation_error: BaseException | None = None
 
 
 class HarnessService:
@@ -1261,9 +1269,20 @@ class HarnessService:
                     control_inbox: RunControlInbox = controls,
                 ) -> RunState:
                     await release
+                    if prepared_run.preparation_error is not None:
+                        terminal = await self._terminalize_component_preparation_failure(
+                            prepared_run.result.state,
+                            prepared_run.recorder,
+                            prepared_run.budget,
+                            prepared_run.preparation_error,
+                        )
+                        await self._release_prepared_components(prepared_run.result.run.run_id)
+                        return terminal
                     run = prepared_run.result.run
                     deadline_at = run.deadline_at
                     assert deadline_at is not None
+                    assert prepared_run.planner is not None
+                    assert prepared_run.tool_kernel is not None
                     return await self._execute_agent_run(
                         state=prepared_run.result.state,
                         planner=prepared_run.planner,
@@ -1418,11 +1437,13 @@ class HarnessService:
                 effective_config_fingerprint=effective_fingerprint,
             )
         except (TypeError, ValueError) as error:
-            raise RecoveryResumeRejected(
+            failure = RecoveryResumeRejected(
                 "persisted_run_config_invalid",
                 result.run.run_id,
                 "Persisted Turn input or Run config no longer passes the command schema.",
-            ) from error
+            )
+            failure.__cause__ = error
+            return self._failed_recovered_run(result, checkpoint, failure)
         deferred_components = self._async_components
         try:
             if deferred_components is None:
@@ -1455,11 +1476,13 @@ class HarnessService:
             raise
         except Exception as error:
             await self._release_prepared_components(result.run.run_id)
-            raise RecoveryResumeRejected(
+            failure = RecoveryResumeRejected(
                 "component_build_failed",
                 result.run.run_id,
                 f"Recovered Run components could not be prepared/built: {type(error).__name__}",
-            ) from error
+            )
+            failure.__cause__ = error
+            return self._failed_recovered_run(result, checkpoint, failure)
         if components.budget != checkpoint.budget:
             raise RecoveryResumeRejected(
                 "budget_config_drift",
@@ -1481,11 +1504,14 @@ class HarnessService:
             planner = components.planner_factory(budget)
             parsed_event = parse_persisted_domain_event(result.event.payload)
         except Exception as error:
-            raise RecoveryResumeRejected(
+            await self._release_prepared_components(result.run.run_id)
+            failure = RecoveryResumeRejected(
                 "component_factory_failed",
                 result.run.run_id,
                 f"Recovered Planner/ToolKernel factory failed: {type(error).__name__}",
-            ) from error
+            )
+            failure.__cause__ = error
+            return self._failed_recovered_run(result, checkpoint, failure)
         run_preparation = self._prepare_run_context(
             state=result.state,
             profile_id=session_value.profile_id,
@@ -1515,6 +1541,41 @@ class HarnessService:
             hooks=hook_binding.hooks,
             hook_context=hook_binding.context,
             run_preparation=run_preparation,
+        )
+
+    def _failed_recovered_run(
+        self,
+        result: RecoveryApplyResult,
+        checkpoint: BudgetCheckpoint,
+        error: BaseException,
+    ) -> _PreparedRecoveredRun:
+        """Degrade one incompatible historical Run without blocking Runtime readiness."""
+
+        budget = checkpoint.restore_ledger()
+        parsed_event = parse_persisted_domain_event(result.event.payload)
+        recorder = UowRunRecorder(
+            unit_of_work=self._unit_of_work,
+            event_sink=self._event_sink,
+            clock=self._clock,
+            ids=self._ids,
+            run_id=result.run.run_id,
+            trace_id=parsed_event.trace_id,
+            budget=budget,
+            expected_entity_revision=result.state_entity_revision,
+            expected_event_sequence=result.run.event_sequence,
+            expected_run_revision=result.run_entity_revision,
+        )
+        return _PreparedRecoveredRun(
+            result=result,
+            budget=budget,
+            planner=None,
+            tool_kernel=None,
+            recorder=recorder,
+            recovered_batch=RecoveredToolBatch(result.accepted_tool_call_ids, result.replay_calls),
+            hooks=None,
+            hook_context=None,
+            run_preparation=None,
+            preparation_error=error,
         )
 
     async def _commit_prepared_components(
@@ -1613,20 +1674,35 @@ class HarnessService:
             return state
         terminal = state.transition(RunPhase.FAILED)
         snapshot = await budget.snapshot(now=self._clock.utcnow())
+        if isinstance(cause, RunPreparationFailure):
+            error_code = cause.error_code
+            retryable = cause.retryable
+            user_message = str(cause)
+            details = {
+                "errorType": type(cause).__name__,
+                "failureCategory": cause.failure_category,
+                "preparationErrorCode": cause.code,
+                **cause.details,
+            }
+        else:
+            error_code = ErrorCode.INTERNAL_ERROR
+            retryable = False
+            user_message = "Run capability preparation failed closed"
+            details = {
+                "errorType": type(cause).__name__,
+                "failureCategory": "runtime",
+                "preparationStage": "run_capabilities",
+            }
         await recorder.commit(
             terminal,
             event_type="turn.failed",
             payload={
                 "error": {
-                    "code": "internal.error",
-                    "retryable": False,
+                    "code": error_code.value,
+                    "retryable": retryable,
                     "cancelled": isinstance(cause, asyncio.CancelledError),
-                    "userVisibleMessage": "Run capability preparation failed closed",
-                    "details": {
-                        "errorType": type(cause).__name__,
-                        "failureCategory": "runtime",
-                        "preparationStage": "run_capabilities",
-                    },
+                    "userVisibleMessage": user_message,
+                    "details": details,
                     "retryAfterMs": None,
                     "traceId": None,
                 },

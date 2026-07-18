@@ -21,7 +21,7 @@ function loadModule() {
     return compiled.exports;
 }
 
-test("obsolete settings schemas fail closed instead of being migrated", () => {
+test("obsolete settings schemas fail closed to the Codex-only schema", () => {
     const { DEFAULT_LOCAL_SETTINGS, parseLocalSettings } = loadModule();
     const settings = parseLocalSettings({
         schemaVersion: 1,
@@ -36,46 +36,98 @@ test("obsolete settings schemas fail closed instead of being migrated", () => {
     assert.equal("khojApiKey" in settings, false);
 });
 
-test("invalid enum/list values fail closed to safe defaults", () => {
+test("unversioned settings cannot smuggle a free-text model or permission state", () => {
+    const { DEFAULT_LOCAL_SETTINGS, parseLocalSettings } = loadModule();
+    assert.deepEqual(parseLocalSettings({
+        model: "attacker-selected-model",
+        proxyUrl: "http://127.0.0.1:7896",
+        workspaceTrusted: true,
+        permissionMode: "bypass",
+    }), DEFAULT_LOCAL_SETTINGS);
+});
+
+test("schema v2 migration requires fresh catalog reselection and keeps safe non-model settings", () => {
     const { parseLocalSettings } = loadModule();
-    const settings = parseLocalSettings({
+    const migrated = parseLocalSettings({
         schemaVersion: 2,
-        provider: "remote-agent",
-        permissionMode: "skip-approval",
+        provider: "codex-subscription-experimental",
+        wireApi: "ollama-chat",
+        baseUrl: "https://models.example/v1?api_key=must-not-survive",
+        approvedRemoteHttpsEndpoint: "https://models.example/v1?api_key=must-not-survive",
+        apiKey: "must-not-survive",
+        credential: "must-not-survive",
+        model: "gpt-catalog-candidate",
+        proxyUrl: "http://127.0.0.1:7896",
+        reasoningEffort: "high",
+        permissionMode: "normal",
+        workspaceTrusted: true,
+        autoApproveVaultWrites: true,
+        shellEnabled: true,
+        subagentsEnabled: true,
+        hooksEnabled: true,
     });
-    assert.equal(settings.schemaVersion, 2);
-    assert.equal(settings.provider, "deepseek");
-    assert.equal(settings.wireApi, "chat-completions");
-    assert.equal(settings.model, "deepseek-v4-flash");
-    assert.equal(settings.reasoningEffort, "medium");
-    assert.equal(settings.permissionMode, "normal");
-    assert.equal(settings.workspaceTrusted, false);
+    assert.deepEqual(migrated, {
+        schemaVersion: 3,
+        model: "",
+        modelAccountBinding: null,
+        proxyUrl: "http://127.0.0.1:7896",
+        reasoningEffort: "high",
+        permissionMode: "normal",
+        workspaceTrusted: true,
+        autoApproveVaultWrites: true,
+        shellEnabled: true,
+        subagentsEnabled: true,
+        hooksEnabled: true,
+        telemetryEnabled: false,
+    });
+    assert.equal(JSON.stringify(migrated).includes("must-not-survive"), false);
+    for (const retired of ["provider", "wireApi", "baseUrl", "approvedRemoteHttpsEndpoint", "apiKey", "credential"]) {
+        assert.equal(retired in migrated, false, retired);
+    }
+    assert.deepEqual(parseLocalSettings(migrated), migrated);
 });
 
-test("current provider settings retain their explicit credential identity", () => {
-    const {
-        DEFAULT_LOCAL_SETTINGS,
-        modelCredentialProviderId,
-        parseLocalSettings,
-        usesProviderSecretStore,
-    } = loadModule();
-    assert.equal(DEFAULT_LOCAL_SETTINGS.schemaVersion, 2);
-    assert.equal(DEFAULT_LOCAL_SETTINGS.provider, "deepseek");
-    assert.equal(DEFAULT_LOCAL_SETTINGS.wireApi, "chat-completions");
-    assert.equal(DEFAULT_LOCAL_SETTINGS.model, "deepseek-v4-flash");
-    assert.equal(parseLocalSettings(undefined).provider, "deepseek");
-
-    const configured = parseLocalSettings({ schemaVersion: 2, provider: "codex", wireApi: "responses" });
-    assert.equal(configured.provider, "codex");
-    assert.equal(configured.wireApi, "responses");
-    assert.equal(usesProviderSecretStore(configured), true);
-    assert.equal(modelCredentialProviderId(configured), "codex");
+test("retired provider selections cannot migrate a free-text model into production settings", () => {
+    const { DEFAULT_LOCAL_SETTINGS, parseLocalSettings } = loadModule();
+    assert.equal(DEFAULT_LOCAL_SETTINGS.schemaVersion, 3);
+    assert.equal(DEFAULT_LOCAL_SETTINGS.model, "");
+    assert.equal(DEFAULT_LOCAL_SETTINGS.modelAccountBinding, null);
+    for (const provider of ["deepseek", "codex", "openai", "openai-compatible", "local", "remote-agent"]) {
+        const migrated = parseLocalSettings({
+            schemaVersion: 2,
+            provider,
+            model: "attacker-selected-model",
+            proxyUrl: "http://127.0.0.1:7896",
+        });
+        assert.equal(migrated.model, "", provider);
+        assert.equal(migrated.proxyUrl, "", provider);
+        assert.equal("provider" in migrated, false, provider);
+    }
 });
 
-test("Run config has no per-Skill selection state", () => {
-    const { parseLocalSettings, runConfig, snapshotLocalSettings } = loadModule();
-    const settings = parseLocalSettings({ schemaVersion: 2 });
+test("Run config fixes Codex Subscription internally and requires an account-bound catalog selection", () => {
+    const { CODEX_SUBSCRIPTION_PROVIDER, parseLocalSettings, runConfig, snapshotLocalSettings } = loadModule();
+    assert.throws(() => runConfig(parseLocalSettings({ schemaVersion: 3 })), /目录选择/);
+    assert.throws(() => runConfig({
+        ...parseLocalSettings({ schemaVersion: 3 }),
+        model: "gpt-catalog-model",
+    }), /目录选择/);
+    assert.throws(() => runConfig({
+        ...parseLocalSettings({ schemaVersion: 3 }),
+        modelAccountBinding: `sha256:${"a".repeat(64)}`,
+    }), /目录选择/);
+    const settings = parseLocalSettings({
+        schemaVersion: 3,
+        model: "gpt-catalog-model",
+        modelAccountBinding: `sha256:${"a".repeat(64)}`,
+    });
     const config = runConfig(settings);
+    assert.deepEqual(config, {
+        provider: CODEX_SUBSCRIPTION_PROVIDER,
+        model: "gpt-catalog-model",
+        reasoningEffort: "medium",
+        permissionMode: "normal",
+    });
     assert.equal("enabledSkills" in config, false);
     const snapshot = snapshotLocalSettings(settings);
     assert.equal(Object.isFrozen(snapshot), true);
@@ -134,75 +186,52 @@ test("Workspace trust is independent, explicit, and fail-closed for effective pe
     assert.equal(vaultWriteAvailable(plan), false);
 });
 
-test("model endpoints are restricted to HTTPS remote or literal loopback local URLs", () => {
-    const { parseLocalSettings } = loadModule();
-    const local = parseLocalSettings({ schemaVersion: 2, provider: "local", baseUrl: "http://127.0.0.1:11434/api/" });
-    assert.equal(local.wireApi, "ollama-chat");
-    assert.equal(local.baseUrl, "http://127.0.0.1:11434/api");
-    assert.equal(parseLocalSettings({ provider: "local" }).baseUrl, "http://127.0.0.1:11434/api");
-    assert.equal(parseLocalSettings({ schemaVersion: 2, provider: "local", baseUrl: "http://127.0.0.1:11434" }).baseUrl, "");
-    assert.equal(parseLocalSettings({ provider: "local", baseUrl: "http://192.168.1.2:11434" }).baseUrl, "");
-    assert.equal(parseLocalSettings({ provider: "openai-compatible", baseUrl: "http://remote.example/v1" }).baseUrl, "");
-    assert.equal(parseLocalSettings({ provider: "openai-compatible", baseUrl: "https://models.example/v1" }).baseUrl,
-        "https://models.example/v1");
-    assert.equal(parseLocalSettings({
-        provider: "openai-compatible",
-        baseUrl: "https://MODELS.example:443//v1//",
-    }).baseUrl, "https://models.example/v1");
-    assert.equal(parseLocalSettings({
-        provider: "openai-compatible",
-        baseUrl: "https://models.example/%76%31",
-    }).baseUrl, "");
-    assert.equal(parseLocalSettings({ provider: "openai", baseUrl: "https://evil.example" }).baseUrl, "");
-    assert.equal(parseLocalSettings({
-        schemaVersion: 2,
-        provider: "codex-subscription-experimental",
-        wireApi: "ollama-chat",
-        baseUrl: "https://evil.example",
-    }).baseUrl, "");
-    assert.equal(parseLocalSettings({
-        schemaVersion: 2,
-        provider: "codex-subscription-experimental",
-        wireApi: "ollama-chat",
-    }).wireApi, "responses");
+test("Runtime model patch contains only current Codex catalog selection fields", () => {
+    const { modelRuntimePatch, parseLocalSettings } = loadModule();
+    const binding = `sha256:${"a".repeat(64)}`;
+    const settings = parseLocalSettings({
+        schemaVersion: 3,
+        model: "gpt-catalog-model",
+        modelAccountBinding: binding,
+        proxyUrl: "http://127.0.0.1:7896",
+        provider: "deepseek",
+        wireApi: "chat-completions",
+        baseUrl: "https://attacker.example/v1",
+        credential: "must-not-survive",
+    });
+    assert.deepEqual(modelRuntimePatch(settings), {
+        model: "gpt-catalog-model",
+        account_binding: binding,
+        reasoning_effort: "medium",
+        proxy_url: "http://127.0.0.1:7896",
+    });
+    assert.equal(modelRuntimePatch.length, 1);
 });
 
-test("DeepSeek is a fixed Chat Completions provider bound to its own SecretStore identity", () => {
-    const {
-        modelCredentialProviderId,
-        modelHealthMessage,
-        modelRuntimePatch,
-        parseLocalSettings,
-        usesProviderSecretStore,
-    } = loadModule();
-    const settings = parseLocalSettings({
-        schemaVersion: 2,
-        provider: "deepseek",
-        wireApi: "responses",
-        baseUrl: "https://attacker.example/v1",
-        proxyUrl: "http://127.0.0.1:7896",
-        model: "deepseek-v4-flash",
-    });
-    assert.equal(settings.wireApi, "chat-completions");
-    assert.equal(settings.baseUrl, "");
-    assert.equal(settings.proxyUrl, "");
-    assert.equal(usesProviderSecretStore(settings), true);
-    assert.equal(modelCredentialProviderId(settings), "deepseek");
-    assert.deepEqual(modelRuntimePatch(settings, "secret:v1:0123456789abcdef0123456789abcdef"), {
-        provider: "deepseek",
-        wire_api: "chat-completions",
-        model: "deepseek-v4-flash",
-        reasoning_effort: "medium",
-        base_url: "",
-        proxy_url: null,
-        credential_handle: "secret:v1:0123456789abcdef0123456789abcdef",
-        allow_remote_https: false,
-    });
-    assert.match(modelHealthMessage(settings, "healthy"), /DeepSeek/);
-    assert.match(modelHealthMessage(settings, "auth_required", "credential_unavailable"), /尚未安全保存/);
-    assert.match(modelHealthMessage(settings, "auth_required", "auth_required"), /拒绝当前 API Key/);
-    assert.match(modelHealthMessage(settings, "auth_required"), /认证失败/);
-    assert.match(modelHealthMessage(settings, "unreachable"), /本机网络/);
+test("schema v3 preserves only a bounded model and valid SHA-256 account binding pair", () => {
+    const { parseLocalSettings } = loadModule();
+    const binding = `sha256:${"a".repeat(64)}`;
+    assert.deepEqual(
+        (({ model, modelAccountBinding }) => ({ model, modelAccountBinding }))(parseLocalSettings({
+            schemaVersion: 3,
+            model: "  gpt-catalog-model  ",
+            modelAccountBinding: binding,
+        })),
+        { model: "gpt-catalog-model", modelAccountBinding: binding },
+    );
+    for (const raw of [
+        { model: "gpt-catalog-model" },
+        { modelAccountBinding: binding },
+        { model: "gpt-catalog-model", modelAccountBinding: `sha256:${"A".repeat(64)}` },
+        { model: "gpt-catalog-model", modelAccountBinding: `sha256:${"a".repeat(63)}` },
+        { model: `gpt${"x".repeat(254)}`, modelAccountBinding: binding },
+        { model: "gpt\0injected", modelAccountBinding: binding },
+        { model: 42, modelAccountBinding: binding },
+    ]) {
+        const parsed = parseLocalSettings({ schemaVersion: 3, ...raw });
+        assert.equal(parsed.model, "");
+        assert.equal(parsed.modelAccountBinding, null);
+    }
 });
 
 test("subscription proxy accepts only explicit literal-loopback HTTP ports", () => {
@@ -229,115 +258,64 @@ test("subscription proxy accepts only explicit literal-loopback HTTP ports", () 
     }).proxyUrl, "");
 });
 
-test("subscription Runtime patch is credential-free and pins the Responses dialect", () => {
-    const {
-        modelCredentialProviderId,
-        modelRuntimePatch,
-        parseLocalSettings,
-        usesProviderSecretStore,
-    } = loadModule();
+test("an empty catalog selection remains empty without a model or Provider fallback", () => {
+    const module = loadModule();
+    const { modelRuntimePatch, parseLocalSettings } = module;
     const settings = parseLocalSettings({
-        schemaVersion: 2,
+        schemaVersion: 3,
         provider: "codex-subscription-experimental",
         wireApi: "ollama-chat",
         baseUrl: "https://untrusted.example/v1",
         proxyUrl: "http://127.0.0.1:7896",
     });
     assert.deepEqual(
-        modelRuntimePatch(settings, "secret:v1:0123456789abcdef0123456789abcdef"),
+        modelRuntimePatch(settings),
         {
-            provider: "codex-subscription-experimental",
-            wire_api: "responses",
-            model: "gpt-5.6-luna",
+            model: "",
+            account_binding: null,
             reasoning_effort: "medium",
-            base_url: "",
             proxy_url: "http://127.0.0.1:7896",
-            credential_handle: null,
-            allow_remote_https: false,
         },
     );
-    assert.equal(usesProviderSecretStore(settings), false);
-    assert.throws(() => modelCredentialProviderId(settings), /不使用 Provider SecretStore/);
+    for (const retiredExport of [
+        "modelCredentialProviderId",
+        "usesProviderSecretStore",
+        "usesUnconfiguredCompatibleFallback",
+        "isRemoteHttpsEndpointApproved",
+        "requiresRemoteHttpsApproval",
+        "modelHealthMessage",
+    ]) assert.equal(retiredExport in module, false, retiredExport);
 });
 
-test("subscription health messages distinguish login and loopback proxy recovery", () => {
-    const { modelHealthMessage, parseLocalSettings } = loadModule();
-    const direct = parseLocalSettings({ schemaVersion: 2, provider: "codex-subscription-experimental" });
-    assert.match(modelHealthMessage(direct, "healthy"), /本机 Codex 登录/);
-    assert.match(modelHealthMessage(direct, "auth_required"), /codex login/);
-    assert.match(modelHealthMessage(direct, "unreachable"), /配置本机回环 HTTP 代理/);
-
-    const proxied = parseLocalSettings({
-        schemaVersion: 2,
-        provider: "codex-subscription-experimental",
-        proxyUrl: "http://127.0.0.1:7896",
-    });
-    assert.match(modelHealthMessage(proxied, "unreachable"), /确认本机 HTTP 代理正在运行/);
-    assert.match(modelHealthMessage(proxied, "unsupported"), /更新本地 Runtime/);
-});
-
-test("remote HTTPS authorization is default-deny and bound to the exact canonical endpoint", () => {
-    const { isRemoteHttpsEndpointApproved, modelRuntimePatch, parseLocalSettings, runConfig } = loadModule();
-    const endpoint = "https://models.example/v1";
-    const unapproved = parseLocalSettings({ provider: "openai-compatible", baseUrl: endpoint });
-    assert.equal(unapproved.approvedRemoteHttpsEndpoint, null);
-    assert.equal(isRemoteHttpsEndpointApproved(unapproved), false);
-    assert.deepEqual(modelRuntimePatch(unapproved, "secret:v1:0123456789abcdef0123456789abcdef"), {
-        provider: "codex",
-        wire_api: "responses",
-        model: "gpt-5.6-luna",
-        reasoning_effort: "medium",
-        base_url: "",
-        proxy_url: null,
-        credential_handle: null,
-        allow_remote_https: false,
-    });
-    assert.throws(() => runConfig(unapproved), /尚未确认/);
-
-    const approved = parseLocalSettings({
+test("current settings discard retired model configuration and secret-shaped values", () => {
+    const { parseLocalSettings, snapshotLocalSettings } = loadModule();
+    const parsed = parseLocalSettings({
+        schemaVersion: 3,
+        model: "gpt-catalog-model",
+        modelAccountBinding: `sha256:${"a".repeat(64)}`,
         provider: "openai-compatible",
-        baseUrl: `${endpoint}/`,
-        approvedRemoteHttpsEndpoint: endpoint,
+        wireApi: "chat-completions",
+        baseUrl: "https://user:secret@models.example/v1",
+        approvedRemoteHttpsEndpoint: "https://models.example/v1",
+        apiKey: "must-not-survive",
+        credentialHandle: "secret:v1:must-not-survive",
     });
-    assert.equal(approved.baseUrl, endpoint);
-    assert.equal(approved.approvedRemoteHttpsEndpoint, endpoint);
-    assert.equal(isRemoteHttpsEndpointApproved(approved), true);
-    assert.equal(modelRuntimePatch(approved, null).allow_remote_https, true);
-    assert.equal(runConfig(approved).provider, "openai-compatible");
-
-    const changed = parseLocalSettings({
-        provider: "openai-compatible",
-        baseUrl: "https://other.example/v1",
-        approvedRemoteHttpsEndpoint: endpoint,
-    });
-    assert.equal(changed.approvedRemoteHttpsEndpoint, null);
-    assert.equal(modelRuntimePatch(changed, null).provider, "codex");
-    assert.equal(modelRuntimePatch(changed, null).base_url, "");
-});
-
-test("compatible credential identity is endpoint-scoped with a fixed cross-language vector", () => {
-    const { modelCredentialProviderId, parseLocalSettings } = loadModule();
-    const endpoint = parseLocalSettings({
-        provider: "openai-compatible",
-        baseUrl: "https://MODELS.example:443//v1//",
-    });
-    assert.equal(
-        modelCredentialProviderId(endpoint),
-        "openai-compatible.00a98afb5b4eaaf4f9a877f0f3683900",
-    );
-    assert.match(modelCredentialProviderId(endpoint), /^[a-z][a-z0-9_.-]{0,63}$/);
-    assert.notEqual(
-        modelCredentialProviderId(endpoint),
-        modelCredentialProviderId(parseLocalSettings({
-            provider: "openai-compatible",
-            baseUrl: "https://other.example/v1",
-        })),
-    );
-    assert.equal(modelCredentialProviderId(parseLocalSettings({ provider: "openai" })), "openai");
-    assert.throws(
-        () => modelCredentialProviderId(parseLocalSettings({ provider: "openai-compatible" })),
-        /先配置有效/,
-    );
+    assert.deepEqual(snapshotLocalSettings(parsed), parsed);
+    assert.deepEqual(Object.keys(parsed).sort(), [
+        "autoApproveVaultWrites",
+        "hooksEnabled",
+        "model",
+        "modelAccountBinding",
+        "permissionMode",
+        "proxyUrl",
+        "reasoningEffort",
+        "schemaVersion",
+        "shellEnabled",
+        "subagentsEnabled",
+        "telemetryEnabled",
+        "workspaceTrusted",
+    ]);
+    assert.equal(JSON.stringify(parsed).includes("must-not-survive"), false);
 });
 
 test("serialized settings operations cannot let a later apply overtake an earlier apply", async () => {
@@ -369,38 +347,33 @@ test("serialized settings operations continue after a rejected operation", async
     assert.equal(await queue.run(async () => "recovered"), "recovered");
 });
 
-test("only a remote compatible endpoint can carry remote HTTPS authorization", () => {
-    const { modelRuntimePatch, parseLocalSettings } = loadModule();
-    const local = parseLocalSettings({
-        provider: "local",
-        approvedRemoteHttpsEndpoint: "https://models.example/v1",
-    });
-    assert.equal(local.approvedRemoteHttpsEndpoint, null);
-    assert.equal(modelRuntimePatch(local, null).allow_remote_https, false);
-
-    const loopback = parseLocalSettings({
-        provider: "openai-compatible",
-        baseUrl: "https://127.0.0.1:8443/v1",
-        approvedRemoteHttpsEndpoint: "https://127.0.0.1:8443/v1",
-    });
-    assert.equal(loopback.approvedRemoteHttpsEndpoint, null);
-    assert.equal(modelRuntimePatch(loopback, null).allow_remote_https, false);
-});
-
-test("remote compatible endpoint approval is gated by an explicit UI confirmation", () => {
+test("settings UI has no Provider, protocol, endpoint, credential, or free-text model controls", () => {
     const source = require("node:fs").readFileSync(path.join(__dirname, "../src/local/settings.ts"), "utf8");
-    assert.match(source, /允许远程兼容模型端点/);
-    assert.match(source, /window\.confirm\(/);
-    assert.match(source, /approvedRemoteHttpsEndpoint = endpoint/);
-    assert.match(source, /const wasApproved = isRemoteHttpsEndpointApproved/);
-    assert.match(source, /if \(wasApproved && changed\)[\s\S]*await this\.persistAndApply/);
-    assert.match(source, /usesUnconfiguredCompatibleFallback\(this\.host\.settings\)/);
+    for (const retiredSurface of [
+        "模型 Provider",
+        "模型协议",
+        "模型端点",
+        "Provider 凭据",
+        "OpenAI-compatible",
+        "DeepSeek",
+        "Ollama",
+        "saveProviderCredential",
+        "deleteProviderCredential",
+        "approvedRemoteHttpsEndpoint",
+    ]) assert.equal(source.includes(retiredSurface), false, retiredSurface);
+    const modelStart = source.indexOf('.setName("模型")');
+    const modelEnd = source.indexOf('.setName("Codex 登录")', modelStart);
+    assert.notEqual(modelStart, -1);
+    assert.notEqual(modelEnd, -1);
+    assert.doesNotMatch(source.slice(modelStart, modelEnd), /\.addText|\.addDropdown/);
+    assert.match(source.slice(modelStart, modelEnd), /实时 Codex 模型目录/);
+    assert.match(source, /本机 HTTP 代理（可选）/);
 });
 
 test("trusted Workspace can explicitly disable only Vault write prompts", () => {
     const { parseLocalSettings } = loadModule();
-    const enabled = parseLocalSettings({ workspaceTrusted: true, autoApproveVaultWrites: true });
-    const revoked = parseLocalSettings({ workspaceTrusted: false, autoApproveVaultWrites: true });
+    const enabled = parseLocalSettings({ schemaVersion: 3, workspaceTrusted: true, autoApproveVaultWrites: true });
+    const revoked = parseLocalSettings({ schemaVersion: 3, workspaceTrusted: false, autoApproveVaultWrites: true });
     const settingsSource = require("node:fs").readFileSync(path.join(__dirname, "../src/local/settings.ts"), "utf8");
     const mainSource = require("node:fs").readFileSync(path.join(__dirname, "../src/main.ts"), "utf8");
 

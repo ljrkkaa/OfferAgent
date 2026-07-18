@@ -125,6 +125,7 @@ class ProductionModelCommandService:
                 catalog_freshness=catalog.freshness,
                 catalog_revision=catalog.catalog_revision,
                 fetched_at=None if catalog.fetched_at is None else catalog.fetched_at.isoformat(),
+                account_binding=catalog.account_binding,
                 error=None if catalog.error is None else _catalog_error(catalog.error),
             )
         snapshot = await self._snapshot()

@@ -217,6 +217,13 @@ class _Components:
         )
 
 
+class _IncompatibleHistoricalComponents(_Components):
+    def build(self, command: StartTurnCommand, state: RunState) -> RunComponents:
+        del command, state
+        self.build_count += 1
+        raise ValueError("retired historical provider")
+
+
 class _BlockingSecondRegistrationTurnManager(TurnManager):
     def __init__(self) -> None:
         super().__init__(max_active_runs=4)
@@ -671,6 +678,45 @@ async def test_sqlite_bootstrap_persists_recovered_result_then_replays_original_
     second_report = await second.bootstrap()
     assert second_report.plans_scanned == 0
     assert second_report.active_runs == ()
+
+
+@pytest.mark.asyncio
+async def test_incompatible_historical_run_fails_in_isolation_without_blocking_startup(
+    tmp_path: Path,
+) -> None:
+    factory = SqliteUnitOfWorkFactory(tmp_path / "incompatible-historical.sqlite")
+    fixture = _fixture("incompatible_historical")
+    await _persist_fixture(factory, fixture)
+    clock = ManualClock(RECOVERY_NOW)
+    planner = _GateStopPlanner(blocked=False)
+    kernel = _ReplayKernel(factory=factory, clock=clock, definitions={}, results={})
+    components = _IncompatibleHistoricalComponents(planner=planner, kernel=kernel)
+    harness, manager = _harness(
+        factory=factory,
+        clock=clock,
+        sink=RecordingEventSink(),
+        components=components,
+    )
+    startup = _startup(
+        factory=factory,
+        clock=clock,
+        registry=_registry(fixture),
+        harness=harness,
+    )
+
+    report = await startup.bootstrap()
+    terminal = await report.active_runs[0].task
+
+    assert report.resumed_run_ids == (fixture.run.run_id,)
+    assert terminal.phase is RunPhase.FAILED
+    assert planner.calls == 0
+    assert kernel.batches == []
+    await asyncio.sleep(0)
+    assert await manager.active_runs() == ()
+    assert await factory.get_entity("active_root_runs", fixture.run.session_id) is None
+    events = await factory.event_store.read(fixture.run.run_id)
+    assert events[-1].event_type == EventType.TURN_FAILED.value
+    assert events[-1].terminal
 
 
 @pytest.mark.asyncio
