@@ -702,7 +702,7 @@ async def test_completed_historical_turn_rematerializes_ordered_images_on_user_o
             cancellation=token,
         )
     assert corrupt_history.value.error_code.value == "input.image_invalid"
-    assert corrupt_history.value.details["imageIndex"] == 1
+    assert corrupt_history.value.details["imageIndex"] == 2
     second_path.write_bytes(SECOND_IMAGE)
 
     await reopened.claim_submission("ses_main", "turn_orphan_claim", (claims[0],), token)

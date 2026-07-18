@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from datetime import datetime, timezone
+import json
+from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -42,6 +43,9 @@ from offeragent_harness.testing import DeterministicIdGenerator, ManualCancellat
 
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP8zwACTGCSAQANHQEDgslx/wAAAABJRU5ErkJggg=="
+)
+PNG_ALT = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC"
 )
 
 
@@ -182,6 +186,7 @@ async def test_run_context_resolves_claimed_image_bytes_and_explicit_pin_guidanc
         turn_id="turn_one",
         attachments=store,
         cancellation=token,
+        captured_on=date(2026, 7, 17),
         model_binding=cast(
             Any,
             SimpleNamespace(
@@ -198,6 +203,98 @@ async def test_run_context_resolves_claimed_image_bytes_and_explicit_pin_guidanc
     assert fragment.image_provenance is UserImageProvenance.CURRENT_SUBMISSION
     assert fragment.artifact_ids == (artifact.artifact_id,)
     assert "read the exact current version before relying" in fragment.text
+
+
+@pytest.mark.asyncio
+async def test_run_context_projects_ordered_interview_submission_manifest_without_image_bytes(
+    tmp_path: Path,
+) -> None:
+    store = ConversationAttachmentStore(
+        tmp_path / "attachments",
+        workspace_id="ws_one",
+        clock=ManualClock(datetime(2026, 7, 18, tzinfo=timezone.utc)),
+        ids=DeterministicIdGenerator(),
+    )
+    token = ManualCancellationToken()
+    artifacts = []
+    for request_id, file_name, content in (
+        ("req_first", "first.png", PNG),
+        ("req_second", "second.png", PNG_ALT),
+    ):
+        begun = await store.begin(
+            AttachmentUploadRequest(
+                "ses_one",
+                request_id,
+                file_name,
+                "image/png",
+                len(content),
+                digest(content),
+            ),
+            token,
+        )
+        await store.append(begun.upload_id, 0, content, token)
+        artifacts.append((await store.commit(begun.upload_id, token)).artifact)
+
+    model_binding = cast(
+        Any,
+        SimpleNamespace(
+            model=SimpleNamespace(
+                input_modalities=("text", "image"),
+                supports_image_detail_original=True,
+            )
+        ),
+    )
+
+    async def resolve(order: tuple[int, int], turn_id: str) -> object:
+        ordered = tuple(artifacts[index] for index in order)
+        await store.claim_submission(
+            "ses_one",
+            turn_id,
+            tuple(
+                AttachmentClaim(
+                    artifact.artifact_id,
+                    image_order,
+                    artifact.content_hash,
+                    artifact.media_type,
+                    artifact.size_bytes,
+                )
+                for image_order, artifact in enumerate(ordered)
+            ),
+            token,
+        )
+        return await _resolved_context_inputs(
+            (
+                {"type": "text", "text": "ingest these pages", "format": "markdown", "references": []},
+                *({"type": "image", "artifact": artifact.to_wire(), "altText": artifact.title} for artifact in ordered),
+            ),
+            session_id="ses_one",
+            turn_id=turn_id,
+            attachments=store,
+            cancellation=token,
+            model_binding=model_binding,
+            captured_on=date(2026, 7, 18),
+        )
+
+    ordered_inputs = cast(Any, await resolve((0, 1), "turn_ordered"))
+    reversed_inputs = cast(Any, await resolve((1, 0), "turn_reversed"))
+    ordered_fragment = ordered_inputs.user_input[0]
+    reversed_fragment = reversed_inputs.user_input[0]
+    ordered_manifest = next(
+        item for item in json.loads(ordered_fragment.text) if item.get("type") == "runtimeOrderedImageSource"
+    )
+    reversed_manifest = next(
+        item for item in json.loads(reversed_fragment.text) if item.get("type") == "runtimeOrderedImageSource"
+    )
+
+    assert ordered_manifest["capturedOn"] == "2026-07-18"
+    assert ordered_manifest["imageCount"] == 2
+    assert ordered_manifest["orderedImageContentHashes"] == [item.content_hash for item in artifacts]
+    assert reversed_manifest["orderedImageContentHashes"] == [item.content_hash for item in reversed(artifacts)]
+    assert ordered_manifest["sourceFingerprint"] != reversed_manifest["sourceFingerprint"]
+    serialized_manifest = json.dumps(ordered_manifest, sort_keys=True)
+    assert base64.b64encode(PNG).decode("ascii") not in serialized_manifest
+    assert base64.b64encode(PNG_ALT).decode("ascii") not in serialized_manifest
+    assert [block.binary_data for block in ordered_fragment.model_blocks] == [PNG, PNG_ALT]
 
 
 @pytest.mark.asyncio
@@ -230,6 +327,7 @@ async def test_run_context_rejects_images_without_verified_model_binding_before_
             turn_id="turn_one",
             attachments=cast(Any, attachments),
             cancellation=ManualCancellationToken(),
+            captured_on=date(2026, 7, 17),
             model_binding=None,
         )
 

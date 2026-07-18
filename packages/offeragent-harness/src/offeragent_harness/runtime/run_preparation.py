@@ -247,13 +247,16 @@ class ConversationHistoryLimits:
     max_attempts: int = 2
 
     def __post_init__(self) -> None:
-        if min(
-            self.max_turns,
-            self.max_turn_bytes,
-            self.max_total_bytes,
-            self.max_scanned_entities,
-            self.max_attempts,
-        ) < 1:
+        if (
+            min(
+                self.max_turns,
+                self.max_turn_bytes,
+                self.max_total_bytes,
+                self.max_scanned_entities,
+                self.max_attempts,
+            )
+            < 1
+        ):
             raise ValueError("conversation history limits must be positive")
         if self.max_turn_bytes > self.max_total_bytes:
             raise ValueError("conversation history turn limit cannot exceed total limit")
@@ -553,10 +556,7 @@ class ConversationHistoryRunPreparationAdapter:
                     details={"reason": "metadata_invalid"},
                 ) from error
             turn_image_bytes = sum(claim.byte_length for claim in claims)
-            if (
-                used_images + len(claims) > image_limit
-                or used_image_bytes + turn_image_bytes > image_byte_limit
-            ):
+            if used_images + len(claims) > image_limit or used_image_bytes + turn_image_bytes > image_byte_limit:
                 break
             retained_reversed.append(
                 _HistoricalTurnCandidate(
@@ -609,7 +609,7 @@ class ConversationHistoryRunPreparationAdapter:
                 except AttachmentError as error:
                     inspection_details: dict[str, Any] = {"reason": error.code}
                     if error.item_order is not None:
-                        inspection_details["imageIndex"] = error.item_order
+                        inspection_details["imageIndex"] = error.item_order + 1
                     raise RunPreparationFailure(
                         "conversation_history_image_invalid",
                         "A retained Conversation image is unavailable or invalid",
@@ -648,7 +648,7 @@ class ConversationHistoryRunPreparationAdapter:
                 except AttachmentError as error:
                     details: dict[str, Any] = {"reason": error.code}
                     if error.item_order is not None:
-                        details["imageIndex"] = error.item_order
+                        details["imageIndex"] = error.item_order + 1
                     raise RunPreparationFailure(
                         "conversation_history_image_invalid",
                         "A retained Conversation image is unavailable or invalid",
@@ -657,11 +657,8 @@ class ConversationHistoryRunPreparationAdapter:
                         failure_category="model",
                         details=details,
                     ) from error
-            if tuple(
-                (item.attachment.artifact_id, item.width, item.height) for item in materialized
-            ) != tuple(
-                (item.attachment.artifact_id, item.width, item.height)
-                for item in retained_candidate.attachments
+            if tuple((item.attachment.artifact_id, item.width, item.height) for item in materialized) != tuple(
+                (item.attachment.artifact_id, item.width, item.height) for item in retained_candidate.attachments
             ):
                 raise RunPreparationFailure(
                     "conversation_history_image_invalid",
@@ -1270,9 +1267,7 @@ def _bounded_fragments(
     used = 0
     selected_count = 0
     indexed_units = list(enumerate(units))
-    conversation_units = [
-        item for item in indexed_units if item[1][0][0].layer is ContextLayer.CONVERSATION
-    ]
+    conversation_units = [item for item in indexed_units if item[1][0][0].layer is ContextLayer.CONVERSATION]
     other_units = [item for item in indexed_units if item[1][0][0].layer is not ContextLayer.CONVERSATION]
     for unit_index, unit in reversed(conversation_units):
         unit_size = sum(item[1] for item in unit)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 
@@ -31,6 +32,8 @@ from offeragent_harness.tools import (
     ToolDefinition,
     ToolResult,
     ToolResultStatus,
+    ToolValidationError,
+    ToolValidator,
     canonical_json_sha256,
 )
 
@@ -381,7 +384,31 @@ def test_vault_evidence_definitions_preserve_the_plugin_read_boundary() -> None:
         "follow",
         "paginate",
     }
-    assert definitions["interview_catalog.search"].output_schema["properties"]["questionCandidates"]["maxItems"] == 100
+    interview_catalog = definitions["interview_catalog.search"]
+    catalog_input = interview_catalog.input_schema["properties"]
+    assert catalog_input["sourceUrls"]["maxItems"] == 8
+    assert catalog_input["orderedImageContentHashes"]["maxItems"] == 20
+    assert catalog_input["orderedImageContentHashes"]["items"]["pattern"] == r"^sha256:[0-9a-f]{64}$"
+    assert set(catalog_input) == {
+        "sourceUrls",
+        "orderedImageContentHashes",
+        "company",
+        "role",
+        "questionTerms",
+    }
+    catalog_output = interview_catalog.output_schema["properties"]
+    normalized_source = catalog_output["normalizedSource"]
+    assert normalized_source["required"] == (
+        "canonicalUrls",
+        "sourceFingerprint",
+        "orderedImageContentHashes",
+    )
+    assert normalized_source["properties"]["canonicalUrls"]["maxItems"] == 8
+    assert normalized_source["properties"]["orderedImageContentHashes"]["maxItems"] == 20
+    assert normalized_source["properties"]["sourceFingerprint"]["anyOf"][1] == {"type": "null"}
+    indexes = catalog_output["indexes"]
+    assert (indexes["minItems"], indexes["maxItems"]) == (2, 2)
+    assert catalog_output["questionCandidates"]["maxItems"] == 100
     write = definitions["vault.changes.apply"]
     operations = write.input_schema["properties"]["operations"]
     assert operations["maxItems"] == 20
@@ -392,3 +419,182 @@ def test_vault_evidence_definitions_preserve_the_plugin_read_boundary() -> None:
         "patch",
         "delete",
     }
+
+
+def test_interview_catalog_definition_validates_normalized_sources_and_fixed_indexes() -> None:
+    definition = {item.name: item for item in plugin_tool_definitions()}["interview_catalog.search"]
+    validator = ToolValidator()
+    digest = "sha256:" + "a" * 64
+    output: dict[str, Any] = {
+        "normalizedSource": {
+            "canonicalUrls": ["https://example.com/interview"],
+            "sourceFingerprint": digest,
+            "orderedImageContentHashes": [digest],
+        },
+        "experienceCandidates": [],
+        "questionCandidates": [],
+        "indexes": [
+            {
+                "kind": "experience",
+                "path": "experiences/index.md",
+                "exists": True,
+                "modifiedVersion": "mtime:1:size:24",
+                "contentHash": digest,
+            },
+            {
+                "kind": "question",
+                "path": "interview/index.md",
+                "exists": False,
+                "modifiedVersion": "missing",
+            },
+        ],
+        "truncated": False,
+    }
+
+    assert validator.validate_output(definition, output) is not None
+    with pytest.raises(ToolValidationError):
+        validator.validate_output(
+            definition,
+            {
+                **output,
+                "indexes": [
+                    output["indexes"][0],
+                    {
+                        "kind": "question",
+                        "path": "interviews/questions/INDEX.md",
+                        "exists": False,
+                        "modifiedVersion": "missing",
+                    },
+                ],
+            },
+        )
+
+
+def test_vault_changes_definition_requires_versions_for_interview_submission_targets() -> None:
+    definition = {item.name: item for item in plugin_tool_definitions()}["vault.changes.apply"]
+    validator = ToolValidator()
+    digest = "sha256:" + "a" * 64
+    interview: dict[str, Any] = {
+        "batchId": "batch_interview",
+        "task": "Persist one Interview Submission",
+        "changeKind": "interview_submission",
+        "sourceBindings": [],
+        "interviewSubmission": {
+            "sourceKind": "text",
+            "capturedOn": "2026-07-18",
+            "canonicalUrls": [],
+            "orderedImageContentHashes": [],
+            "sourceFingerprint": None,
+        },
+        "operations": [
+            {
+                "op": "create",
+                "path": "experiences/acme.md",
+                "content": "# Acme\n",
+                "expectedContentHash": "absent",
+                "expectedModifiedVersion": "missing",
+            },
+            {
+                "op": "append",
+                "path": "interview/index.md",
+                "content": "- [[experiences/acme]]\n",
+                "expectedContentHash": digest,
+                "expectedModifiedVersion": "mtime:1:size:13",
+            },
+        ],
+    }
+
+    assert validator.validate_arguments(definition, interview) is not None
+
+    create_without_version = {**interview["operations"][0]}
+    del create_without_version["expectedModifiedVersion"]
+    with pytest.raises(ToolValidationError):
+        validator.validate_arguments(
+            definition,
+            {**interview, "operations": [create_without_version, interview["operations"][1]]},
+        )
+
+    with pytest.raises(ToolValidationError):
+        validator.validate_arguments(
+            definition,
+            {
+                **interview,
+                "operations": [
+                    {**interview["operations"][0], "expectedModifiedVersion": "absent"},
+                    interview["operations"][1],
+                ],
+            },
+        )
+
+    with pytest.raises(ToolValidationError):
+        validator.validate_arguments(
+            definition,
+            {
+                **interview,
+                "operations": [
+                    interview["operations"][0],
+                    {**interview["operations"][1], "expectedModifiedVersion": "missing"},
+                ],
+            },
+        )
+
+    with pytest.raises(ToolValidationError):
+        validator.validate_arguments(
+            definition,
+            {
+                **interview,
+                "operations": [
+                    interview["operations"][0],
+                    {**interview["operations"][1], "expectedModifiedVersion": "absent"},
+                ],
+            },
+        )
+
+    with pytest.raises(ToolValidationError):
+        validator.validate_arguments(
+            definition,
+            {
+                **interview,
+                "sourceBindings": [
+                    {
+                        "path": "interview/source.md",
+                        "expectedModifiedVersion": "absent",
+                        "expectedContentHash": digest,
+                    }
+                ],
+            },
+        )
+
+    general: dict[str, Any] = {
+        "batchId": "batch_general",
+        "task": "Append a note",
+        "changeKind": "general",
+        "sourceBindings": [],
+        "interviewSubmission": None,
+        "operations": [
+            {
+                "op": "append",
+                "path": "notes/a.md",
+                "content": "next\n",
+                "expectedContentHash": digest,
+                "expectedModifiedVersion": "mtime:2:size:6",
+            }
+        ],
+    }
+    assert validator.validate_arguments(definition, general) is not None
+    general_without_version = {**general["operations"][0]}
+    del general_without_version["expectedModifiedVersion"]
+    with pytest.raises(ToolValidationError):
+        validator.validate_arguments(definition, {**general, "operations": [general_without_version]})
+    with pytest.raises(ToolValidationError):
+        validator.validate_arguments(
+            definition,
+            {**general, "interviewSubmission": interview["interviewSubmission"]},
+        )
+    with pytest.raises(ToolValidationError):
+        validator.validate_arguments(
+            definition,
+            {key: value for key, value in general.items() if key != "interviewSubmission"},
+        )
+    with pytest.raises(ToolValidationError):
+        validator.validate_arguments(definition, {**interview, "interviewSubmission": None})

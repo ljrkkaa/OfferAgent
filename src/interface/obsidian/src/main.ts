@@ -614,13 +614,32 @@ export default class OfferAgentPlugin extends Plugin {
 
     private authorizeVaultChange(proposal: VaultChangeAuthorizationProposal): boolean {
         const flags = [
+            proposal.changeKind === "interview_submission" ? "Interview Submission（始终需要确认）" : "",
             proposal.controlFiles ? "包含控制文件" : "",
             proposal.memoryDelete ? "包含 Planning Memory 删除" : "",
         ].filter(Boolean).join("；");
+        const categoryLabel = {
+            experience: "Experience",
+            question: "Question",
+            index: "Index",
+            other: "Other",
+        } as const;
+        const categorizedTargets = proposal.categorizedTargets.map((target) =>
+            `- ${categoryLabel[target.category]} · ${target.operation}: ${target.path}` +
+            ` · version ${target.expectedModifiedVersion}` +
+            ` · hash ${target.expectedContentHash}`,
+        ).join("\n");
+        const sourceBindings = proposal.sourceBindings.map((source) =>
+            `- ${source.path} · ${source.expectedModifiedVersion} · ${source.expectedContentHash}`,
+        ).join("\n");
         return window.confirm([
             `OfferAgent 请求应用 Vault Change Batch：${proposal.task}`,
-            `目标：${proposal.paths.join(", ")}`,
+            `批次：${proposal.batchId}`,
+            `参数绑定：${proposal.argsHash}`,
             flags,
+            "分类目标：",
+            categorizedTargets,
+            ...(sourceBindings ? ["来源绑定：", sourceBindings] : []),
             "",
             proposal.diff,
         ].filter((line) => line !== "").join("\n"));

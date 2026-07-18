@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
+import { isIP } from "node:net";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual, promisify } from "node:util";
 import * as os from "node:os";
@@ -25,13 +26,63 @@ const MAX_PATH_LENGTH = 512;
 const MAX_TASK_BYTES = 512;
 const BATCH_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
 const DIGEST = /^sha256:[0-9a-f]{64}$/u;
+const MODIFIED_VERSION = /^[^\0\r\n]{1,128}$/u;
+const EXPERIENCE_PATH = /^experiences\/(?!index\.md$)[^/.][^/]*\.md$/u;
+const QUESTION_PATH = /^interview\/(?!index\.md$)[^/.][^/]*\.md$/u;
+const EXPERIENCE_INDEX_PATH = "experiences/index.md";
+const QUESTION_INDEX_PATH = "interview/index.md";
+const LEGACY_EXPERIENCE_PATH = /^interviews\/experiences\/[^/.][^/]*\.md$/u;
+const LEGACY_QUESTION_PATH = /^interviews\/questions\/[^/.][^/]*\.md$/u;
+const LEGACY_INTERVIEW_INDEX_PATH = /^interviews\/(?:INDEX|index)\.md$/u;
+const PERSONAL_IDENTITY_FRONTMATTER =
+    /(?:candidate|name|account|handle|username|avatar|contact|email|phone|mobile|telephone|social|linkedin|github|wechat|qq)/u;
 
 export type VaultPermissionMode = "ask_every_time" | "read_only" | "trusted_vault";
+export type VaultChangeKind = "general" | "interview_submission";
+
+export interface VaultChangeSnapshot {
+    readonly content: string | undefined;
+    readonly modifiedVersion: string;
+}
+
+export interface VaultIdentity {
+    readonly contentHash: string;
+    readonly modifiedVersion: string;
+}
+
+export type ConditionalVaultMutation =
+    | {
+        readonly kind: "create";
+        readonly path: string;
+        readonly expected: VaultIdentity & {
+            readonly contentHash: "absent";
+            readonly modifiedVersion: "missing";
+        };
+        readonly afterContent: string;
+    }
+    | {
+        readonly kind: "modify";
+        readonly path: string;
+        readonly expected: VaultIdentity;
+        readonly afterContent: string;
+    }
+    | {
+        readonly kind: "delete";
+        readonly path: string;
+        readonly expected: VaultIdentity;
+    };
+
+export type ConditionalMutationOutcome =
+    | { readonly status: "applied" }
+    | { readonly status: "conflict"; readonly observed: VaultIdentity }
+    | { readonly status: "unknown"; readonly observed: VaultIdentity | null }
+    | { readonly status: "unsupported"; readonly operation: "delete" };
 
 export interface VaultChangePort {
     read(path: string): Promise<string | undefined>;
-    write(path: string, content: string): Promise<void>;
-    remove(path: string): Promise<void>;
+    snapshot(path: string): Promise<VaultChangeSnapshot>;
+    applyConditional(mutation: ConditionalVaultMutation): Promise<ConditionalMutationOutcome>;
+    restore(path: string, content: string | undefined): Promise<void>;
 }
 
 export interface VaultCheckpointStore {
@@ -47,11 +98,37 @@ export interface VaultChangeJournalStore {
 
 export interface VaultChangeAuthorizationProposal {
     readonly batchId: string;
+    readonly argsHash: string;
+    readonly changeKind: VaultChangeKind;
     readonly task: string;
     readonly paths: readonly string[];
+    readonly categorizedTargets: readonly VaultChangeCategorizedTarget[];
+    readonly sourceBindings: readonly VaultChangeSourceBinding[];
     readonly diff: string;
     readonly controlFiles: boolean;
     readonly memoryDelete: boolean;
+}
+
+export interface VaultChangeCategorizedTarget {
+    readonly path: string;
+    readonly category: "experience" | "question" | "index" | "other";
+    readonly operation: Operation["op"];
+    readonly expectedModifiedVersion: string;
+    readonly expectedContentHash: string;
+}
+
+export interface VaultChangeSourceBinding {
+    readonly path: string;
+    readonly expectedModifiedVersion: string;
+    readonly expectedContentHash: string;
+}
+
+interface InterviewSubmissionMetadata {
+    readonly sourceKind: "text" | "public_url" | "ordered_images" | "mixed";
+    readonly capturedOn: string;
+    readonly canonicalUrls: readonly string[];
+    readonly orderedImageContentHashes: readonly string[];
+    readonly sourceFingerprint: string | null;
 }
 
 export interface VaultChangeCoordinatorOptions {
@@ -75,22 +152,41 @@ export type VaultChangeCrashPoint =
     | "after-undo-target-journal";
 
 type Operation =
-    | { readonly op: "create"; readonly path: string; readonly content: string; readonly expectedContentHash: "absent" }
-    | { readonly op: "append"; readonly path: string; readonly content: string; readonly expectedContentHash: string }
+    | {
+        readonly op: "create";
+        readonly path: string;
+        readonly content: string;
+        readonly expectedContentHash: "absent";
+        readonly expectedModifiedVersion: string;
+    }
+    | {
+        readonly op: "append";
+        readonly path: string;
+        readonly content: string;
+        readonly expectedContentHash: string;
+        readonly expectedModifiedVersion: string;
+    }
     | {
         readonly op: "replace";
         readonly path: string;
         readonly find: string;
         readonly replacement: string;
         readonly expectedContentHash: string;
+        readonly expectedModifiedVersion: string;
     }
     | {
         readonly op: "patch";
         readonly path: string;
         readonly edits: readonly { readonly startLine: number; readonly endLine: number; readonly replacement: string }[];
         readonly expectedContentHash: string;
+        readonly expectedModifiedVersion: string;
     }
-    | { readonly op: "delete"; readonly path: string; readonly expectedContentHash: string };
+    | {
+        readonly op: "delete";
+        readonly path: string;
+        readonly expectedContentHash: string;
+        readonly expectedModifiedVersion: string;
+    };
 
 interface PreparedTarget {
     readonly operation: Operation["op"];
@@ -99,12 +195,18 @@ interface PreparedTarget {
     readonly afterHash: string;
     readonly beforeContent: string | undefined;
     readonly afterContent: string | undefined;
+    readonly beforeModifiedVersion: string;
+    readonly expectedModifiedVersion: string;
 }
 
 interface PreparedBatch {
     readonly batchId: string;
+    readonly changeKind: VaultChangeKind;
     readonly task: string;
     readonly targets: readonly PreparedTarget[];
+    readonly categorizedTargets: readonly VaultChangeCategorizedTarget[];
+    readonly sourceBindings: readonly VaultChangeSourceBinding[];
+    readonly interviewSubmission?: InterviewSubmissionMetadata;
     readonly diff: string;
     readonly controlFiles: boolean;
     readonly memoryDelete: boolean;
@@ -163,6 +265,13 @@ class ChangeValidationError extends Error {
     constructor(readonly code: ErrorCode, message: string) {
         super(message);
         this.name = "ChangeValidationError";
+    }
+}
+
+class AmbiguousWriteOutcomeError extends Error {
+    constructor(readonly path: string) {
+        super(`Vault write ownership is ambiguous for '${path}'.`);
+        this.name = "AmbiguousWriteOutcomeError";
     }
 }
 
@@ -230,12 +339,16 @@ export class VaultChangeCoordinator {
             return validationFailure(call, error);
         }
         const confirmationRequired = this.options.permissionMode() === "ask_every_time" ||
-            prepared.controlFiles || prepared.memoryDelete;
+            prepared.changeKind === "interview_submission" || prepared.controlFiles || prepared.memoryDelete;
         if (confirmationRequired) {
             const accepted = this.options.authorize === undefined ? false : await this.options.authorize({
                 batchId: prepared.batchId,
+                argsHash: call.argsHash,
+                changeKind: prepared.changeKind,
                 task: prepared.task,
                 paths: prepared.targets.map((target) => target.path),
+                categorizedTargets: prepared.categorizedTargets,
+                sourceBindings: prepared.sourceBindings,
                 diff: prepared.diff,
                 controlFiles: prepared.controlFiles,
                 memoryDelete: prepared.memoryDelete,
@@ -285,9 +398,9 @@ export class VaultChangeCoordinator {
             await this.options.journal.save(record);
             this.inject("after-applying-journal");
             for (const target of prepared.targets) {
+                await this.revalidateSources(prepared, new Set(record.appliedPaths.map((path) => path.toLocaleLowerCase())));
                 await this.revalidateTarget(target);
-                if (target.afterContent === undefined) await this.options.vault.remove(target.path);
-                else await this.options.vault.write(target.path, target.afterContent);
+                await this.applyConditional(target);
                 this.inject("after-target-write", target.path);
                 record = { ...record, appliedPaths: [...record.appliedPaths, target.path] };
                 await this.options.journal.save(record);
@@ -302,8 +415,31 @@ export class VaultChangeCoordinator {
                 this.writesLatched = true;
                 throw error;
             }
+            if (error instanceof AmbiguousWriteOutcomeError) {
+                let manualReviewPaths = [error.path];
+                try {
+                    await this.rollback(record, true);
+                    record = { ...record, appliedPaths: [] };
+                } catch {
+                    manualReviewPaths = [...new Set([
+                        error.path,
+                        ...record.appliedPaths,
+                        ...await this.unexpectedPaths(record),
+                    ])];
+                }
+                this.writesLatched = true;
+                record = { ...record, state: "recovery_failed", manualReviewPaths };
+                await this.options.journal.save(record);
+                return failed(
+                    call,
+                    "tool.unknown_outcome",
+                    "Vault Change Batch has an ambiguous write outcome requiring manual review.",
+                    false,
+                    "unknown_outcome",
+                );
+            }
             try {
-                await this.rollback(record);
+                await this.rollback(record, true);
                 record = { ...record, state: "rolled_back", appliedPaths: [] };
                 await this.options.journal.save(record);
                 return error instanceof ChangeValidationError
@@ -328,6 +464,14 @@ export class VaultChangeCoordinator {
     async reconcile(): Promise<VaultChangeReconciliation[]> {
         const reports: VaultChangeReconciliation[] = [];
         for (let record of await this.options.journal.listUnresolved()) {
+            if (record.state === "recovery_failed") {
+                reports.push({
+                    batchId: record.batchId,
+                    state: "recovery_failed",
+                    manualReviewPaths: record.manualReviewPaths,
+                });
+                continue;
+            }
             if (record.state === "prepared") {
                 record = { ...record, state: "rolled_back", appliedPaths: [], manualReviewPaths: [] };
                 await this.options.journal.save(record);
@@ -436,12 +580,28 @@ export class VaultChangeCoordinator {
     }
 
     private async prepare(input: Readonly<Record<string, unknown>>): Promise<PreparedBatch> {
-        if (hasExtraKeys(input, ["batchId", "task", "operations"])) invalid("Vault Change Batch fields are invalid.");
+        if (hasExtraKeys(input, [
+            "batchId", "task", "changeKind", "sourceBindings", "interviewSubmission", "operations",
+        ])) invalid("Vault Change Batch fields are invalid.");
         const batchId = typeof input.batchId === "string" && BATCH_ID.test(input.batchId) ? input.batchId : undefined;
         const task = typeof input.task === "string" && input.task.trim() ? input.task.trim() : undefined;
+        const changeKind = input.changeKind === "general" || input.changeKind === "interview_submission"
+            ? input.changeKind : undefined;
         if (!batchId || !task || Buffer.byteLength(task, "utf8") > MAX_TASK_BYTES ||
+            changeKind === undefined || !Array.isArray(input.sourceBindings) ||
+            !Object.prototype.hasOwnProperty.call(input, "interviewSubmission") ||
             !Array.isArray(input.operations) || input.operations.length < 1 || input.operations.length > MAX_ACTIONS) {
             invalid("Vault Change Batch identity, task, or operation count is invalid.");
+        }
+        const sourceBindings = input.sourceBindings.map(parseSourceBinding);
+        const sourcePaths = sourceBindings.map((binding) => binding.path.toLocaleLowerCase());
+        if (new Set(sourcePaths).size !== sourcePaths.length) {
+            invalid("Each Vault Change source path may appear only once.");
+        }
+        const interviewSubmission = input.interviewSubmission === null
+            ? undefined : parseInterviewSubmission(input.interviewSubmission);
+        if ((changeKind === "interview_submission") !== (interviewSubmission !== undefined)) {
+            invalid("Interview Submission metadata must appear exactly on Interview Submission batches.");
         }
         const operations = input.operations.map(parseOperation);
         const paths = operations.map((operation) => operation.path);
@@ -454,15 +614,21 @@ export class VaultChangeCoordinator {
             invalid("Delete is restricted to Planning Memory topics and must synchronize memory/MEMORY.md.");
         }
         const targets: PreparedTarget[] = [];
+        await this.revalidateOriginalSources(sourceBindings);
         let batchBytes = 0;
         for (const operation of operations) {
-            const beforeContent = await this.options.vault.read(operation.path);
+            const before = await this.options.vault.snapshot(operation.path);
+            const beforeContent = before.content;
             if (beforeContent !== undefined && Buffer.byteLength(beforeContent, "utf8") > MAX_FILE_BYTES) {
                 throw new ChangeValidationError("protocol.message_too_large", "Vault target exceeds the file limit.");
             }
             const beforeHash = contentIdentity(beforeContent);
             if (operation.expectedContentHash !== beforeHash) {
                 throw new ChangeValidationError("resource.conflict", `Vault target '${operation.path}' changed before apply.`);
+            }
+            if (operation.expectedModifiedVersion !== undefined &&
+                operation.expectedModifiedVersion !== before.modifiedVersion) {
+                throw new ChangeValidationError("resource.conflict", `Vault target '${operation.path}' version changed before apply.`);
             }
             const afterContent = applyOperation(operation, beforeContent);
             if (afterContent !== undefined && Buffer.byteLength(afterContent, "utf8") > MAX_FILE_BYTES) {
@@ -482,14 +648,31 @@ export class VaultChangeCoordinator {
                 afterHash: contentIdentity(afterContent),
                 beforeContent,
                 afterContent,
+                beforeModifiedVersion: before.modifiedVersion,
+                expectedModifiedVersion: operation.expectedModifiedVersion,
             });
         }
         validatePlanningMemoryDeletes(targets);
+        if (changeKind === "interview_submission") {
+            assertInterviewSubmission(targets, interviewSubmission as InterviewSubmissionMetadata);
+        } else if (targets.some(isInterviewExperienceTarget)) {
+            invalid("Interview Experience ingestion must use changeKind 'interview_submission'.");
+        }
         const diff = batchDiff(targets);
         return {
             batchId,
+            changeKind,
             task,
             targets,
+            categorizedTargets: targets.map(({ path, operation, beforeHash, expectedModifiedVersion }) => ({
+                path,
+                operation,
+                category: categorizeTarget(path),
+                expectedModifiedVersion,
+                expectedContentHash: beforeHash,
+            })),
+            sourceBindings,
+            interviewSubmission,
             diff,
             controlFiles: paths.some(isControlPath),
             memoryDelete: deletes.length > 0,
@@ -497,14 +680,99 @@ export class VaultChangeCoordinator {
     }
 
     private async revalidate(prepared: PreparedBatch): Promise<void> {
+        await this.revalidateOriginalSources(prepared.sourceBindings);
         for (const target of prepared.targets) {
             await this.revalidateTarget(target);
         }
     }
 
-    private async revalidateTarget(target: Pick<PreparedTarget, "path" | "beforeHash">): Promise<void> {
-        if (contentIdentity(await this.options.vault.read(target.path)) !== target.beforeHash) {
+    private async revalidateTarget(target: Pick<
+        PreparedTarget, "path" | "beforeHash" | "beforeModifiedVersion" | "expectedModifiedVersion"
+    >): Promise<void> {
+        const current = await this.options.vault.snapshot(target.path);
+        if (contentIdentity(current.content) !== target.beforeHash ||
+            current.modifiedVersion !== target.beforeModifiedVersion) {
             throw new ChangeValidationError("resource.conflict", `Vault target '${target.path}' changed before apply.`);
+        }
+    }
+
+    private async classifyMutationFailure(target: PreparedTarget, cause: unknown): Promise<never> {
+        let current: VaultChangeSnapshot;
+        try {
+            current = await this.options.vault.snapshot(target.path);
+        } catch {
+            throw new AmbiguousWriteOutcomeError(target.path);
+        }
+        const identity = contentIdentity(current.content);
+        if (identity === target.afterHash) throw new AmbiguousWriteOutcomeError(target.path);
+        if (identity === target.beforeHash) throw cause;
+        throw new ChangeValidationError(
+            "resource.conflict",
+            `Vault target '${target.path}' changed during apply.`,
+        );
+    }
+
+    private async applyConditional(target: PreparedTarget): Promise<void> {
+        const expected = {
+            contentHash: target.beforeHash,
+            modifiedVersion: target.beforeModifiedVersion,
+        };
+        const mutation: ConditionalVaultMutation = target.afterContent === undefined
+            ? { kind: "delete", path: target.path, expected }
+            : target.operation === "create"
+                ? {
+                    kind: "create",
+                    path: target.path,
+                    expected: { contentHash: "absent", modifiedVersion: "missing" },
+                    afterContent: target.afterContent,
+                }
+                : { kind: "modify", path: target.path, expected, afterContent: target.afterContent };
+        let outcome: ConditionalMutationOutcome;
+        try {
+            outcome = await this.options.vault.applyConditional(mutation);
+        } catch (error) {
+            return this.classifyMutationFailure(target, error);
+        }
+        if (outcome.status === "applied") return;
+        if (outcome.status === "unknown") throw new AmbiguousWriteOutcomeError(target.path);
+        if (outcome.status === "unsupported") {
+            throw new ChangeValidationError(
+                "tool.failed",
+                "This Vault adapter cannot safely apply a conditional delete.",
+            );
+        }
+        throw new ChangeValidationError(
+            "resource.conflict",
+            `Vault target '${target.path}' changed during conditional apply.`,
+        );
+    }
+
+    private async revalidateOriginalSources(bindings: readonly VaultChangeSourceBinding[]): Promise<void> {
+        for (const binding of bindings) {
+            const current = await this.options.vault.snapshot(binding.path);
+            if (current.modifiedVersion !== binding.expectedModifiedVersion ||
+                contentIdentity(current.content) !== binding.expectedContentHash) {
+                throw new ChangeValidationError("resource.conflict", `Vault source '${binding.path}' changed before apply.`);
+            }
+        }
+    }
+
+    private async revalidateSources(prepared: PreparedBatch, appliedPaths: ReadonlySet<string>): Promise<void> {
+        for (const binding of prepared.sourceBindings) {
+            const target = prepared.targets.find((candidate) =>
+                candidate.path.toLocaleLowerCase() === binding.path.toLocaleLowerCase(),
+            );
+            if (target !== undefined && appliedPaths.has(target.path.toLocaleLowerCase())) {
+                if (contentIdentity(await this.options.vault.read(binding.path)) !== target.afterHash) {
+                    throw new ChangeValidationError("resource.conflict", `Applied Vault source '${binding.path}' changed during apply.`);
+                }
+                continue;
+            }
+            const current = await this.options.vault.snapshot(binding.path);
+            if (current.modifiedVersion !== binding.expectedModifiedVersion ||
+                contentIdentity(current.content) !== binding.expectedContentHash) {
+                throw new ChangeValidationError("resource.conflict", `Vault source '${binding.path}' changed during apply.`);
+            }
         }
     }
 
@@ -538,13 +806,11 @@ export class VaultChangeCoordinator {
             }
             if (identity === target.afterHash) {
                 const before = await this.options.checkpoints.read(record.checkpointRef, target.path);
-                if (target.beforeHash === "absent") await this.options.vault.remove(target.path);
-                else {
-                    if (before === undefined || contentIdentity(before) !== target.beforeHash) {
-                        throw new Error(`checkpoint mismatch: ${target.path}`);
-                    }
-                    await this.options.vault.write(target.path, before);
+                if (target.beforeHash !== "absent" &&
+                    (before === undefined || contentIdentity(before) !== target.beforeHash)) {
+                    throw new Error(`checkpoint mismatch: ${target.path}`);
                 }
+                await this.options.vault.restore(target.path, before);
                 this.inject("after-undo-target-write", target.path);
                 if (contentIdentity(await this.options.vault.read(target.path)) !== target.beforeHash) {
                     throw new Error(`undo verification failed: ${target.path}`);
@@ -562,7 +828,7 @@ export class VaultChangeCoordinator {
         return currentRecord;
     }
 
-    private async rollback(record: VaultChangeJournalRecord): Promise<void> {
+    private async rollback(record: VaultChangeJournalRecord, recordedOnly = false): Promise<void> {
         if (record.checkpointRef === null) {
             const states = await this.observedTargetStates(record);
             if (states.some((state) => state !== "before")) throw new Error("checkpoint missing after mutation");
@@ -577,14 +843,13 @@ export class VaultChangeCoordinator {
                 if (!applied.has(target.path.toLocaleLowerCase())) continue;
                 throw new Error(`unexpected target state: ${target.path}`);
             }
+            if (recordedOnly && !applied.has(target.path.toLocaleLowerCase())) continue;
             const before = await this.options.checkpoints.read(record.checkpointRef, target.path);
-            if (target.beforeHash === "absent") await this.options.vault.remove(target.path);
-            else {
-                if (before === undefined || contentIdentity(before) !== target.beforeHash) {
-                    throw new Error(`checkpoint mismatch: ${target.path}`);
-                }
-                await this.options.vault.write(target.path, before);
+            if (target.beforeHash !== "absent" &&
+                (before === undefined || contentIdentity(before) !== target.beforeHash)) {
+                throw new Error(`checkpoint mismatch: ${target.path}`);
             }
+            await this.options.vault.restore(target.path, before);
             if (contentIdentity(await this.options.vault.read(target.path)) !== target.beforeHash) {
                 throw new Error(`rollback verification failed: ${target.path}`);
             }
@@ -625,40 +890,357 @@ function parseOperation(value: unknown): Operation {
         invalid("Vault Change operation or path is invalid.");
     }
     const expected = value.expectedContentHash;
+    const expectedModifiedVersion = value.expectedModifiedVersion;
+    if (typeof expectedModifiedVersion !== "string" || !MODIFIED_VERSION.test(expectedModifiedVersion)) {
+        invalid("Vault expected modified version is invalid.");
+    }
     if (op === "create") {
-        if (expected !== "absent" || !boundedContent(value.content) || hasExtraKeys(value, ["op", "path", "content", "expectedContentHash"])) {
+        if (expected !== "absent" || expectedModifiedVersion !== "missing" ||
+            !boundedContent(value.content) || hasExtraKeys(value, [
+                "op", "path", "content", "expectedContentHash", "expectedModifiedVersion",
+            ])) {
             invalid("Vault create operation is invalid.");
         }
-        return { op, path, content: value.content, expectedContentHash: expected };
+        return { op, path, content: value.content, expectedContentHash: expected, expectedModifiedVersion };
     }
     if (typeof expected !== "string" || !DIGEST.test(expected)) invalid("Vault expected content hash is invalid.");
+    if (expectedModifiedVersion === "missing" || expectedModifiedVersion === "absent") {
+        invalid("Existing Vault targets require an observed modified version.");
+    }
     if (op === "append") {
-        if (!boundedContent(value.content) || hasExtraKeys(value, ["op", "path", "content", "expectedContentHash"])) {
+        if (!boundedContent(value.content) || hasExtraKeys(value, [
+            "op", "path", "content", "expectedContentHash", "expectedModifiedVersion",
+        ])) {
             invalid("Vault append operation is invalid.");
         }
-        return { op, path, content: value.content, expectedContentHash: expected };
+        return { op, path, content: value.content, expectedContentHash: expected, expectedModifiedVersion };
     }
     if (op === "replace") {
         if (typeof value.find !== "string" || !value.find || !boundedContent(value.replacement) ||
             Buffer.byteLength(value.find, "utf8") > MAX_FILE_BYTES ||
-            hasExtraKeys(value, ["op", "path", "find", "replacement", "expectedContentHash"])) {
+            hasExtraKeys(value, [
+                "op", "path", "find", "replacement", "expectedContentHash", "expectedModifiedVersion",
+            ])) {
             invalid("Vault exact replace operation is invalid.");
         }
-        return { op, path, find: value.find, replacement: value.replacement, expectedContentHash: expected };
+        return {
+            op, path, find: value.find, replacement: value.replacement,
+            expectedContentHash: expected, expectedModifiedVersion,
+        };
     }
     if (op === "patch") {
         if (!Array.isArray(value.edits) || value.edits.length < 1 || value.edits.length > 256 ||
-            hasExtraKeys(value, ["op", "path", "edits", "expectedContentHash"])) invalid("Vault patch operation is invalid.");
+            hasExtraKeys(value, [
+                "op", "path", "edits", "expectedContentHash", "expectedModifiedVersion",
+            ])) invalid("Vault patch operation is invalid.");
         const edits = value.edits.map((edit) => {
             if (!isRecord(edit) || !positiveInteger(edit.startLine) || !positiveInteger(edit.endLine) ||
                 Number(edit.endLine) < Number(edit.startLine) || !boundedContent(edit.replacement) ||
                 hasExtraKeys(edit, ["startLine", "endLine", "replacement"])) invalid("Vault patch edit is invalid.");
             return { startLine: Number(edit.startLine), endLine: Number(edit.endLine), replacement: edit.replacement };
         });
-        return { op, path, edits, expectedContentHash: expected };
+        return { op, path, edits, expectedContentHash: expected, expectedModifiedVersion };
     }
-    if (hasExtraKeys(value, ["op", "path", "expectedContentHash"])) invalid("Vault delete operation is invalid.");
-    return { op: "delete", path, expectedContentHash: expected };
+    if (hasExtraKeys(value, ["op", "path", "expectedContentHash", "expectedModifiedVersion"])) {
+        invalid("Vault delete operation is invalid.");
+    }
+    return { op: "delete", path, expectedContentHash: expected, expectedModifiedVersion };
+}
+
+function parseSourceBinding(value: unknown): VaultChangeSourceBinding {
+    if (!isRecord(value) || hasExtraKeys(value, [
+        "path", "expectedModifiedVersion", "expectedContentHash",
+    ])) invalid("Vault Change source binding is invalid.");
+    const path = safeVaultPath(value.path);
+    if (path === undefined || typeof value.expectedModifiedVersion !== "string" ||
+        !MODIFIED_VERSION.test(value.expectedModifiedVersion) ||
+        value.expectedModifiedVersion === "missing" || value.expectedModifiedVersion === "absent" ||
+        typeof value.expectedContentHash !== "string" || !DIGEST.test(value.expectedContentHash)) {
+        invalid("Vault Change source binding identity is invalid.");
+    }
+    return {
+        path,
+        expectedModifiedVersion: value.expectedModifiedVersion,
+        expectedContentHash: value.expectedContentHash,
+    };
+}
+
+function parseInterviewSubmission(value: unknown): InterviewSubmissionMetadata {
+    if (!isRecord(value) || hasExtraKeys(value, [
+        "sourceKind", "capturedOn", "canonicalUrls", "orderedImageContentHashes", "sourceFingerprint",
+    ])) invalid("Interview Submission metadata is invalid.");
+    const sourceKind = value.sourceKind;
+    if (!["text", "public_url", "ordered_images", "mixed"].includes(String(sourceKind)) ||
+        typeof value.capturedOn !== "string" || !calendarDate(value.capturedOn) ||
+        !Array.isArray(value.canonicalUrls) || value.canonicalUrls.length > 20 ||
+        !Array.isArray(value.orderedImageContentHashes) || value.orderedImageContentHashes.length > 20 ||
+        value.canonicalUrls.some((url) => !canonicalPublicUrl(url)) ||
+        value.orderedImageContentHashes.some((hash) => typeof hash !== "string" || !DIGEST.test(hash)) ||
+        new Set(value.canonicalUrls).size !== value.canonicalUrls.length ||
+        (value.sourceFingerprint !== null &&
+            (typeof value.sourceFingerprint !== "string" || !DIGEST.test(value.sourceFingerprint)))) {
+        invalid("Interview Submission source manifest is invalid.");
+    }
+    const canonicalUrls = value.canonicalUrls as string[];
+    const orderedImageContentHashes = value.orderedImageContentHashes as string[];
+    if ((sourceKind === "text" && (canonicalUrls.length > 0 || orderedImageContentHashes.length > 0)) ||
+        (sourceKind === "public_url" && (canonicalUrls.length < 1 || orderedImageContentHashes.length > 0)) ||
+        (sourceKind === "ordered_images" && (canonicalUrls.length > 0 || orderedImageContentHashes.length < 1 ||
+            value.sourceFingerprint === null)) ||
+        (sourceKind === "mixed" && canonicalUrls.length + orderedImageContentHashes.length < 1)) {
+        invalid("Interview Submission source kind does not match its manifest.");
+    }
+    if ((orderedImageContentHashes.length === 0 && value.sourceFingerprint !== null) ||
+        (orderedImageContentHashes.length > 0 &&
+            value.sourceFingerprint !== orderedImageFingerprint(orderedImageContentHashes))) {
+        invalid("Interview Submission image fingerprint does not match its ordered image manifest.");
+    }
+    return {
+        sourceKind: sourceKind as InterviewSubmissionMetadata["sourceKind"],
+        capturedOn: value.capturedOn,
+        canonicalUrls,
+        orderedImageContentHashes,
+        sourceFingerprint: value.sourceFingerprint as string | null,
+    };
+}
+
+function orderedImageFingerprint(contentHashes: readonly string[]): string {
+    const hash = createHash("sha256");
+    contentHashes.forEach((contentHash, order) => {
+        hash.update(`${order}\0${contentHash}\n`, "utf8");
+    });
+    return `sha256:${hash.digest("hex")}`;
+}
+
+function canonicalPublicUrl(value: unknown): boolean {
+    if (typeof value !== "string" || !value || Buffer.byteLength(value, "utf8") > 2_048) return false;
+    try {
+        const url = new URL(value);
+        if (!["http:", "https:"].includes(url.protocol) || url.username || url.password ||
+            !publicHostname(url.hostname)) return false;
+        url.hash = "";
+        url.hostname = url.hostname.toLocaleLowerCase();
+        const retained = [...url.searchParams.entries()]
+            .map(([key, item], index) => ({ key, item, index }))
+            .filter(({ key }) => !isDiscardedQueryParameter(key))
+            .sort((left, right) => compareCodePoints(left.key, right.key) ||
+                compareCodePoints(left.item, right.item) || left.index - right.index);
+        url.search = "";
+        for (const { key, item } of retained) url.searchParams.append(key, item);
+        return url.href === value;
+    } catch {
+        return false;
+    }
+}
+
+function compareCodePoints(left: string, right: string): number {
+    return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function publicHostname(value: string): boolean {
+    const hostname = value.toLocaleLowerCase().replace(/^\[|\]$/gu, "");
+    const version = isIP(hostname);
+    if (version === 4) return publicIpv4(hostname);
+    if (version === 6) return publicIpv6(hostname);
+    if (!hostname.includes(".") || hostname.startsWith(".") || hostname.endsWith(".")) return false;
+    return !/\.(?:home|internal|invalid|lan|local|localhost|test|example)$/iu.test(hostname);
+}
+
+function publicIpv4(value: string): boolean {
+    const [first, second, third] = value.split(".").map(Number);
+    return first !== 0 && first !== 10 && first !== 127 && first < 224 &&
+        !(first === 100 && second >= 64 && second <= 127) &&
+        !(first === 169 && second === 254) &&
+        !(first === 172 && second >= 16 && second <= 31) &&
+        !(first === 192 && (second === 0 || second === 168)) &&
+        !(first === 198 && (second === 18 || second === 19 || (second === 51 && third === 100))) &&
+        !(first === 203 && second === 0 && third === 113);
+}
+
+function publicIpv6(value: string): boolean {
+    if (value === "::" || value === "::1") return false;
+    if (value.startsWith("::ffff:")) {
+        const tail = value.slice("::ffff:".length);
+        if (isIP(tail) === 4) return publicIpv4(tail);
+        const mapped = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/iu.exec(tail);
+        if (mapped === null) return false;
+        const high = Number.parseInt(mapped[1], 16);
+        const low = Number.parseInt(mapped[2], 16);
+        return publicIpv4(`${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`);
+    }
+    if (value.startsWith("::")) return false;
+    const first = Number.parseInt(value.split(":", 1)[0] || "0", 16);
+    return !(first >= 0xfc00 && first <= 0xfdff) &&
+        !(first >= 0xfe80 && first <= 0xfebf) &&
+        !(first >= 0xff00) &&
+        !value.startsWith("2001:db8:");
+}
+
+function isDiscardedQueryParameter(value: string): boolean {
+    return /^(utm_.+|spm|from|source|ref|fbclid|gclid|dclid|yclid|mc_cid|mc_eid|igshid|msclkid|ttclid|twclid)$/iu.test(value) ||
+        /^(token|(?:access|refresh|id|session|security)[_-]?token|auth(?:orization)?|api[_-]?key|credential|signature|sig|expires?|expiry|awsaccesskeyid|googleaccessid|key-pair-id|policy|x-amz-.+|x-goog-.+)$/iu.test(value);
+}
+
+function assertInterviewSubmission(
+    targets: readonly PreparedTarget[],
+    submission: InterviewSubmissionMetadata,
+): void {
+    const experiences = targets.filter(isInterviewExperienceTarget);
+    if (experiences.length !== 1 || experiences[0].operation !== "create" ||
+        experiences[0].beforeContent !== undefined || experiences[0].afterContent === undefined ||
+        !EXPERIENCE_PATH.test(experiences[0].path)) {
+        invalid("An Interview Submission must create exactly one new Interview Experience.");
+    }
+    const experienceMetadata = markdownFrontmatter(experiences[0].afterContent);
+    if (experienceMetadata === null || experienceMetadata.get("type") !== "interview-experience" ||
+        !BATCH_ID.test(experienceMetadata.get("experience-id") ?? "") ||
+        experienceMetadata.get("source-kind") !== submission.sourceKind ||
+        experienceMetadata.get("captured-on") !== submission.capturedOn ||
+        experienceMetadata.get("source-url") !== submission.canonicalUrls[0] ||
+        (submission.canonicalUrls.length === 0 && experienceMetadata.has("source-url")) ||
+        experienceMetadata.get("source-fingerprint") !== (submission.sourceFingerprint ?? undefined) ||
+        (submission.sourceFingerprint === null && experienceMetadata.has("source-fingerprint"))) {
+        invalid("Interview Experience Source Metadata does not match the submission manifest.");
+    }
+    if (!["company", "role", "event-date", "round"].every((key) => Boolean(experienceMetadata.get(key))) ||
+        !calendarDateOrUnknown(experienceMetadata.get("event-date"))) {
+        invalid("Interview Experience identity metadata must be present and non-empty.");
+    }
+    if ([...experienceMetadata.keys()].some(isPersonalIdentityFrontmatter)) {
+        invalid("Interview Experience frontmatter must not retain candidate personal information.");
+    }
+    const questions = targets.filter((target) => QUESTION_PATH.test(target.path));
+    if (questions.length < 1 || targets.some((target) => !isPrimaryInterviewTarget(target.path))) {
+        invalid("An Interview Submission must contain only Experience, Question, and index targets.");
+    }
+    for (const question of questions) {
+        if (question.operation === "delete" || question.afterContent === undefined) {
+            invalid("An Interview Submission cannot delete an Interview Question.");
+        }
+        const metadata = markdownFrontmatter(question.afterContent);
+        if (metadata === null || metadata.get("type") !== "interview-question" ||
+            !BATCH_ID.test(metadata.get("question-id") ?? "") ||
+            !boundedMetadata(metadata.get("title"), 512) ||
+            !positiveFrontmatterInteger(metadata.get("frequency")) ||
+            !["needs-research", "draft", "verified"].includes(metadata.get("answer-state") ?? "")) {
+            invalid("Every Interview Question target must remain structurally discoverable by the Catalog.");
+        }
+        if (!hasVaultWikiLink(question.afterContent, experiences[0].path, question.path)) {
+            invalid("Every Interview Question target must link this Interview Experience occurrence.");
+        }
+        if (question.operation === "create" &&
+            (metadata.get("frequency") !== "1" || metadata.get("answer-state") !== "needs-research" ||
+                [...metadata.keys()].some(isAnswerContentFrontmatter) ||
+                hasStandardAnswerSection(question.afterContent))) {
+            invalid("A new Interview Question must start needs-research without a standard answer.");
+        }
+    }
+    if (questions.some((question) =>
+        !hasVaultWikiLink(experiences[0].afterContent as string, question.path, experiences[0].path))) {
+        invalid("The Interview Experience must link every Question target in its batch.");
+    }
+    if (!targets.some((target) => target.path === EXPERIENCE_INDEX_PATH) ||
+        !targets.some((target) => target.path === QUESTION_INDEX_PATH)) {
+        invalid("An Interview Submission must update both primary Interview indexes in the same batch.");
+    }
+    const experienceIndex = targets.find((target) => target.path === EXPERIENCE_INDEX_PATH);
+    const questionIndex = targets.find((target) => target.path === QUESTION_INDEX_PATH);
+    if (experienceIndex?.afterContent === undefined || questionIndex?.afterContent === undefined ||
+        !hasVaultWikiLink(experienceIndex.afterContent, experiences[0].path, EXPERIENCE_INDEX_PATH) ||
+        questions.some((question) => question.operation === "create" &&
+            !hasVaultWikiLink(questionIndex.afterContent as string, question.path, QUESTION_INDEX_PATH))) {
+        invalid("Interview primary indexes must link every newly created Interview target.");
+    }
+}
+
+function isInterviewExperienceTarget(target: Pick<PreparedTarget, "path" | "afterContent">): boolean {
+    return EXPERIENCE_PATH.test(target.path) || LEGACY_EXPERIENCE_PATH.test(target.path) ||
+        (target.afterContent !== undefined && markdownFrontmatter(target.afterContent)?.get("type") === "interview-experience");
+}
+
+function categorizeTarget(path: string): VaultChangeCategorizedTarget["category"] {
+    if (path === EXPERIENCE_INDEX_PATH || path === QUESTION_INDEX_PATH || LEGACY_INTERVIEW_INDEX_PATH.test(path)) {
+        return "index";
+    }
+    if (EXPERIENCE_PATH.test(path) || LEGACY_EXPERIENCE_PATH.test(path)) return "experience";
+    if (QUESTION_PATH.test(path) || LEGACY_QUESTION_PATH.test(path)) return "question";
+    return "other";
+}
+
+function isPrimaryInterviewTarget(path: string): boolean {
+    return EXPERIENCE_PATH.test(path) || QUESTION_PATH.test(path) ||
+        path === EXPERIENCE_INDEX_PATH || path === QUESTION_INDEX_PATH;
+}
+
+function isPersonalIdentityFrontmatter(key: string): boolean {
+    return PERSONAL_IDENTITY_FRONTMATTER.test(key.replace(/-/gu, ""));
+}
+
+function isAnswerContentFrontmatter(key: string): boolean {
+    return /^(?:(?:standard|model|reference|suggested|sample|draft)-)?answer$/u.test(key);
+}
+
+function boundedMetadata(value: string | undefined, maximumBytes: number): boolean {
+    return value !== undefined && Boolean(value) && Buffer.byteLength(value, "utf8") <= maximumBytes;
+}
+
+function positiveFrontmatterInteger(value: string | undefined): boolean {
+    const parsed = Number(value);
+    return value !== undefined && Number.isSafeInteger(parsed) && parsed >= 1;
+}
+
+function calendarDateOrUnknown(value: string | undefined): boolean {
+    return value === "unknown" || (value !== undefined && calendarDate(value));
+}
+
+function calendarDate(value: string): boolean {
+    if (!/^\d{4}-\d{2}-\d{2}$/u.test(value)) return false;
+    const instant = new Date(`${value}T00:00:00.000Z`);
+    return !Number.isNaN(instant.getTime()) && instant.toISOString().slice(0, 10) === value;
+}
+
+function hasVaultWikiLink(content: string, targetPath: string, sourcePath: string): boolean {
+    const withoutExtension = targetPath.replace(/\.md$/u, "");
+    for (const match of content.matchAll(/\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]/gu)) {
+        const linked = match[1].trim().replace(/^\.\//u, "").replace(/\.md$/u, "");
+        if (linked === withoutExtension || resolveVaultWikiLink(sourcePath, linked) === withoutExtension) return true;
+    }
+    return false;
+}
+
+function resolveVaultWikiLink(sourcePath: string, linked: string): string {
+    const resolved = sourcePath.split("/").slice(0, -1);
+    for (const segment of linked.split("/")) {
+        if (!segment || segment === ".") continue;
+        if (segment === "..") resolved.pop();
+        else resolved.push(segment);
+    }
+    return resolved.join("/");
+}
+
+function markdownFrontmatter(content: string): Map<string, string> | null {
+    const normalized = content.replace(/\r\n/gu, "\n");
+    if (!normalized.startsWith("---\n")) return null;
+    const closing = normalized.indexOf("\n---\n", 4);
+    if (closing < 0) return null;
+    const metadata = new Map<string, string>();
+    for (const line of normalized.slice(4, closing).split("\n")) {
+        const separator = line.indexOf(":");
+        if (separator <= 0) return null;
+        const key = line.slice(0, separator).trim().toLocaleLowerCase();
+        let item = line.slice(separator + 1).trim();
+        if (!/^[a-z][a-z0-9-]*$/u.test(key) || metadata.has(key) || /[{}\r\n]/u.test(item) ||
+            (key !== "source-url" && /[\[\]]/u.test(item))) return null;
+        if ((item.startsWith('"') && item.endsWith('"')) || (item.startsWith("'") && item.endsWith("'"))) {
+            item = item.slice(1, -1);
+        }
+        metadata.set(key, item);
+    }
+    return metadata;
+}
+
+function hasStandardAnswerSection(content: string): boolean {
+    return /^#{1,6}\s*(?:(?:standard|model|reference|suggested|sample|draft)\s+answer|answer|标准答案|参考答案|示例答案|答案)\s*$/imu.test(content);
 }
 
 function applyOperation(operation: Operation, before: string | undefined): string | undefined {
@@ -1057,12 +1639,80 @@ function validStateIdentity(value: string): boolean {
 export class ObsidianVaultChangePort implements VaultChangePort {
     constructor(private readonly vault: Pick<
         Vault,
-        "cachedRead" | "create" | "createFolder" | "delete" | "getAbstractFileByPath" | "getFileByPath" | "modify"
+        "cachedRead" | "create" | "createFolder" | "delete" | "getAbstractFileByPath" | "getFileByPath" |
+        "modify" | "process"
     >) {}
 
     async read(path: string): Promise<string | undefined> {
         const file = this.vault.getFileByPath(path);
         return file === null ? undefined : this.vault.cachedRead(file);
+    }
+
+    async snapshot(path: string): Promise<VaultChangeSnapshot> {
+        const file = this.vault.getFileByPath(path);
+        if (file === null) return { content: undefined, modifiedVersion: "missing" };
+        const before = modifiedVersion(file);
+        const content = await this.vault.cachedRead(file);
+        const current = this.vault.getFileByPath(path);
+        if (current === null || modifiedVersion(current) !== before) {
+            throw new ChangeValidationError("resource.conflict", `Vault target '${path}' changed while being read.`);
+        }
+        return { content, modifiedVersion: before };
+    }
+
+    async create(path: string, content: string): Promise<void> {
+        await this.ensureParentFolders(path);
+        await this.vault.create(path, content);
+    }
+
+    async applyConditional(mutation: ConditionalVaultMutation): Promise<ConditionalMutationOutcome> {
+        if (mutation.kind === "delete") return { status: "unsupported", operation: "delete" };
+        if (mutation.kind === "create") {
+            try {
+                await this.create(mutation.path, mutation.afterContent);
+                return { status: "applied" };
+            } catch (error) {
+                return this.classifyConditionalFailure(mutation, error);
+            }
+        }
+
+        const file = this.vault.getFileByPath(mutation.path);
+        if (file === null) {
+            return {
+                status: "conflict",
+                observed: { contentHash: "absent", modifiedVersion: "missing" },
+            };
+        }
+        let callbackConflict: VaultIdentity | null = null;
+        const conflictSentinel = Object.freeze({ conditionalConflict: mutation.path });
+        try {
+            const written = await this.vault.process(file, (currentContent) => {
+                const currentFile = this.vault.getFileByPath(mutation.path);
+                const observed: VaultIdentity = currentFile === null
+                    ? { contentHash: "absent", modifiedVersion: "missing" }
+                    : { contentHash: contentIdentity(currentContent), modifiedVersion: modifiedVersion(currentFile) };
+                if (!sameVaultIdentity(observed, mutation.expected)) {
+                    callbackConflict = observed;
+                    throw conflictSentinel;
+                }
+                return mutation.afterContent;
+            });
+            if (contentIdentity(written) !== contentIdentity(mutation.afterContent)) {
+                return { status: "unknown", observed: await this.observedIdentity(mutation.path) };
+            }
+            return { status: "applied" };
+        } catch (error) {
+            if (error === conflictSentinel && callbackConflict !== null) {
+                return { status: "conflict", observed: callbackConflict };
+            }
+            return this.classifyConditionalFailure(mutation, error);
+        }
+    }
+
+    async modify(path: string, content: string): Promise<void> {
+        const file = this.vault.getFileByPath(path);
+        if (file === null) throw new Error(`Vault modify target is missing: ${path}`);
+        await this.vault.modify(file, content);
     }
 
     async write(path: string, content: string): Promise<void> {
@@ -1071,19 +1721,62 @@ export class ObsidianVaultChangePort implements VaultChangePort {
             await this.vault.modify(file, content);
             return;
         }
+        await this.ensureParentFolders(path);
+        await this.vault.create(path, content);
+    }
+
+    async restore(path: string, content: string | undefined): Promise<void> {
+        if (content === undefined) await this.remove(path);
+        else await this.write(path, content);
+    }
+
+    private async ensureParentFolders(path: string): Promise<void> {
         const segments = path.split("/").slice(0, -1);
         let current = "";
         for (const segment of segments) {
             current = current ? `${current}/${segment}` : segment;
             if (this.vault.getAbstractFileByPath(current) === null) await this.vault.createFolder(current);
         }
-        await this.vault.create(path, content);
     }
 
     async remove(path: string): Promise<void> {
         const file = this.vault.getFileByPath(path);
         if (file !== null) await this.vault.delete(file, true);
     }
+
+    private async observedIdentity(path: string): Promise<VaultIdentity | null> {
+        try {
+            const snapshot = await this.snapshot(path);
+            return {
+                contentHash: contentIdentity(snapshot.content),
+                modifiedVersion: snapshot.modifiedVersion,
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    private async classifyConditionalFailure(
+        mutation: ConditionalVaultMutation,
+        cause: unknown,
+    ): Promise<ConditionalMutationOutcome> {
+        const observed = await this.observedIdentity(mutation.path);
+        if (observed === null) return { status: "unknown", observed: null };
+        if (sameVaultIdentity(observed, mutation.expected)) throw cause;
+        if (mutation.kind !== "delete" &&
+            observed.contentHash === contentIdentity(mutation.afterContent)) {
+            return { status: "unknown", observed };
+        }
+        return { status: "conflict", observed };
+    }
+}
+
+function sameVaultIdentity(left: VaultIdentity, right: VaultIdentity): boolean {
+    return left.contentHash === right.contentHash && left.modifiedVersion === right.modifiedVersion;
+}
+
+function modifiedVersion(file: TFile): string {
+    return `mtime:${file.stat.mtime}:size:${file.stat.size}`;
 }
 
 function samePath(left: string, right: string): boolean {

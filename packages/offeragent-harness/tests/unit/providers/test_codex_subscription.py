@@ -10,6 +10,7 @@ from types import MappingProxyType
 
 import httpx
 import pytest
+from jsonschema import Draft202012Validator
 
 from offeragent_harness.agent.model_planner import AgentStepCatalog
 from offeragent_harness.config import ModelProvider, ModelSettings
@@ -37,6 +38,7 @@ from offeragent_harness.providers import (
     compose_model_gateway,
 )
 from offeragent_harness.runtime.codex_credentials import CodexFileCredentialSource
+from offeragent_harness.runtime.plugin_tools import plugin_tool_definitions
 from offeragent_harness.subagents.tools import subagent_tool_definitions
 from offeragent_harness.testing.cancellation import ManualCancellationToken
 from offeragent_harness.workspace import code_tool_definitions
@@ -337,6 +339,70 @@ async def test_subscription_projects_production_tool_plan_to_supported_strict_sc
             "required": [],
             "additionalProperties": False,
         }
+
+
+@pytest.mark.asyncio
+async def test_subscription_projection_can_express_an_honest_pure_screenshot_catalog_search() -> None:
+    captured: dict[str, object] = {}
+    digest = "sha256:" + "a" * 64
+    output_value = {
+        "requiresWriteOutcome": False,
+        "calls": [
+            {
+                "name": "interview_catalog.search",
+                "version": "1",
+                "arguments": {
+                    "sourceUrls": [],
+                    "orderedImageContentHashes": [digest],
+                    "company": "unknown",
+                    "role": "unknown",
+                    "questionTerms": ["Node.js event loop"],
+                },
+                "reason": "Find duplicate source events and semantically related questions.",
+            }
+        ],
+        "finalResponse": None,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, content=_completed(json.dumps(output_value)), request=request)
+
+    catalog = AgentStepCatalog(plugin_tool_definitions(), max_calls=32)
+    request = ModelRequest(
+        request_id="req_subscription_screenshot_catalog",
+        model="gpt-5.6-luna",
+        purpose=ModelPurpose.PLANNING,
+        messages=(ModelMessage(ModelRole.USER, (ModelContentBlock.text("Catalog these screenshots"),)),),
+        output_mode=ModelOutputMode.JSON,
+        output_schema=thaw_json(catalog.schema),
+        max_output_tokens=1_024,
+        reasoning_effort="medium",
+        temperature=0.0,
+        seed=None,
+        trace_context=TraceContext("trace_subscription_screenshot_catalog"),
+    )
+    gateway = _provider(_RotatingSource([(b"access-one", "account-one")]), handler)
+    events = tuple([event async for event in gateway.stream(request, ManualCancellationToken())])
+
+    assert any(event.kind is ModelEventKind.STRUCTURED_OUTPUT for event in events)
+    assert catalog.violations(output_value) == ()
+    body = captured["body"]
+    assert isinstance(body, dict)
+    schema = body["text"]["format"]["schema"]
+    Draft202012Validator(schema).validate(output_value)
+    variants = schema["properties"]["calls"]["items"]["anyOf"]
+    catalog_call = next(item for item in variants if item["properties"]["name"]["const"] == "interview_catalog.search")
+    definition_key = catalog_call["properties"]["arguments"]["$ref"].rsplit("/", 1)[-1]
+    catalog_arguments = schema["$defs"][definition_key]
+    assert set(catalog_arguments["properties"]) == {
+        "sourceUrls",
+        "orderedImageContentHashes",
+        "company",
+        "role",
+        "questionTerms",
+    }
+    assert set(catalog_arguments["required"]) == set(catalog_arguments["properties"])
 
 
 @pytest.mark.asyncio

@@ -295,6 +295,38 @@ def plugin_tool_completion_handlers(*, executor: PluginToolExecutor) -> Mapping[
     return {"plugin-tools/complete": complete}
 
 
+def _catalog_index_schema(kind: str, path: str) -> dict[str, object]:
+    identity = {
+        "kind": {"const": kind},
+        "path": {"const": path},
+    }
+    return {
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    **identity,
+                    "exists": {"const": True},
+                    "modifiedVersion": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "contentHash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                },
+                "required": ["kind", "path", "exists", "modifiedVersion", "contentHash"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    **identity,
+                    "exists": {"const": False},
+                    "modifiedVersion": {"const": "missing"},
+                },
+                "required": ["kind", "path", "exists", "modifiedVersion"],
+                "additionalProperties": False,
+            },
+        ]
+    }
+
+
 def plugin_tool_definitions() -> tuple[ToolDefinition, ...]:
     """Definitions implemented only by the connected Obsidian plugin."""
 
@@ -524,8 +556,16 @@ def plugin_tool_definitions() -> tuple[ToolDefinition, ...]:
             input_schema={
                 "type": "object",
                 "properties": {
-                    "sourceUrl": {"type": "string", "minLength": 1, "maxLength": 2_048},
-                    "sourceFingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                    "sourceUrls": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 2_048},
+                    },
+                    "orderedImageContentHashes": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                    },
                     "company": {"type": "string", "minLength": 1, "maxLength": 128},
                     "role": {"type": "string", "minLength": 1, "maxLength": 128},
                     "questionTerms": {
@@ -539,11 +579,50 @@ def plugin_tool_definitions() -> tuple[ToolDefinition, ...]:
             output_schema={
                 "type": "object",
                 "properties": {
+                    "normalizedSource": {
+                        "type": "object",
+                        "properties": {
+                            "canonicalUrls": {
+                                "type": "array",
+                                "maxItems": 8,
+                                "items": {"type": "string", "minLength": 1, "maxLength": 2_048},
+                            },
+                            "sourceFingerprint": {
+                                "anyOf": [
+                                    {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                                    {"type": "null"},
+                                ]
+                            },
+                            "orderedImageContentHashes": {
+                                "type": "array",
+                                "maxItems": 20,
+                                "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+                            },
+                        },
+                        "required": ["canonicalUrls", "sourceFingerprint", "orderedImageContentHashes"],
+                        "additionalProperties": False,
+                    },
                     "experienceCandidates": {"type": "array", "maxItems": 50, "items": {"type": "object"}},
                     "questionCandidates": {"type": "array", "maxItems": 100, "items": {"type": "object"}},
+                    "indexes": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "prefixItems": [
+                            _catalog_index_schema("experience", "experiences/index.md"),
+                            _catalog_index_schema("question", "interview/index.md"),
+                        ],
+                        "items": False,
+                    },
                     "truncated": {"type": "boolean"},
                 },
-                "required": ["experienceCandidates", "questionCandidates", "truncated"],
+                "required": [
+                    "normalizedSource",
+                    "experienceCandidates",
+                    "questionCandidates",
+                    "indexes",
+                    "truncated",
+                ],
                 "additionalProperties": False,
             },
             output_limit_bytes=131_072,
@@ -806,6 +885,13 @@ def _plugin_write_definition() -> ToolDefinition:
     path = {"type": "string", "minLength": 1, "maxLength": 512}
     digest = {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
     content = {"type": "string", "maxLength": 262_144}
+    missing_version = {"const": "missing"}
+    existing_version = {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "not": {"enum": ["missing", "absent"]},
+    }
 
     def operation(properties: Mapping[str, object], required: list[str]) -> dict[str, object]:
         return {
@@ -815,50 +901,108 @@ def _plugin_write_definition() -> ToolDefinition:
             "additionalProperties": False,
         }
 
-    operations = (
-        operation(
-            {"op": {"const": "create"}, "path": path, "content": content, "expectedContentHash": {"const": "absent"}},
-            ["op", "path", "content", "expectedContentHash"],
-        ),
-        operation(
-            {"op": {"const": "append"}, "path": path, "content": content, "expectedContentHash": digest},
-            ["op", "path", "content", "expectedContentHash"],
-        ),
-        operation(
-            {
-                "op": {"const": "replace"},
-                "path": path,
-                "find": {"type": "string", "minLength": 1, "maxLength": 262_144},
-                "replacement": content,
-                "expectedContentHash": digest,
-            },
-            ["op", "path", "find", "replacement", "expectedContentHash"],
-        ),
-        operation(
-            {
-                "op": {"const": "patch"},
-                "path": path,
-                "edits": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 256,
-                    "items": operation(
-                        {
-                            "startLine": {"type": "integer", "minimum": 1},
-                            "endLine": {"type": "integer", "minimum": 1},
-                            "replacement": content,
-                        },
-                        ["startLine", "endLine", "replacement"],
-                    ),
+    def operation_variants() -> tuple[dict[str, object], ...]:
+        def required(*fields: str) -> list[str]:
+            return ["op", "path", *fields, "expectedContentHash", "expectedModifiedVersion"]
+
+        return (
+            operation(
+                {
+                    "op": {"const": "create"},
+                    "path": path,
+                    "content": content,
+                    "expectedContentHash": {"const": "absent"},
+                    "expectedModifiedVersion": missing_version,
                 },
-                "expectedContentHash": digest,
+                required("content"),
+            ),
+            operation(
+                {
+                    "op": {"const": "append"},
+                    "path": path,
+                    "content": content,
+                    "expectedContentHash": digest,
+                    "expectedModifiedVersion": existing_version,
+                },
+                required("content"),
+            ),
+            operation(
+                {
+                    "op": {"const": "replace"},
+                    "path": path,
+                    "find": {"type": "string", "minLength": 1, "maxLength": 262_144},
+                    "replacement": content,
+                    "expectedContentHash": digest,
+                    "expectedModifiedVersion": existing_version,
+                },
+                required("find", "replacement"),
+            ),
+            operation(
+                {
+                    "op": {"const": "patch"},
+                    "path": path,
+                    "edits": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 256,
+                        "items": operation(
+                            {
+                                "startLine": {"type": "integer", "minimum": 1},
+                                "endLine": {"type": "integer", "minimum": 1},
+                                "replacement": content,
+                            },
+                            ["startLine", "endLine", "replacement"],
+                        ),
+                    },
+                    "expectedContentHash": digest,
+                    "expectedModifiedVersion": existing_version,
+                },
+                required("edits"),
+            ),
+            operation(
+                {
+                    "op": {"const": "delete"},
+                    "path": path,
+                    "expectedContentHash": digest,
+                    "expectedModifiedVersion": existing_version,
+                },
+                required(),
+            ),
+        )
+
+    operations = operation_variants()
+    source_binding = operation(
+        {
+            "path": path,
+            "expectedModifiedVersion": existing_version,
+            "expectedContentHash": digest,
+        },
+        ["path", "expectedModifiedVersion", "expectedContentHash"],
+    )
+    interview_submission = operation(
+        {
+            "sourceKind": {"enum": ["text", "public_url", "ordered_images", "mixed"]},
+            "capturedOn": {"type": "string", "pattern": r"^\d{4}-\d{2}-\d{2}$"},
+            "canonicalUrls": {
+                "type": "array",
+                "maxItems": 20,
+                "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1, "maxLength": 2_048},
             },
-            ["op", "path", "edits", "expectedContentHash"],
-        ),
-        operation(
-            {"op": {"const": "delete"}, "path": path, "expectedContentHash": digest},
-            ["op", "path", "expectedContentHash"],
-        ),
+            "orderedImageContentHashes": {
+                "type": "array",
+                "maxItems": 20,
+                "items": digest,
+            },
+            "sourceFingerprint": {"anyOf": [digest, {"type": "null"}]},
+        },
+        [
+            "sourceKind",
+            "capturedOn",
+            "canonicalUrls",
+            "orderedImageContentHashes",
+            "sourceFingerprint",
+        ],
     )
     return ToolDefinition(
         name="vault.changes.apply",
@@ -877,6 +1021,13 @@ def _plugin_write_definition() -> ToolDefinition:
                     "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$",
                 },
                 "task": {"type": "string", "minLength": 1, "maxLength": 512},
+                "changeKind": {"enum": ["general", "interview_submission"]},
+                "sourceBindings": {
+                    "type": "array",
+                    "maxItems": 20,
+                    "items": source_binding,
+                },
+                "interviewSubmission": {"anyOf": [{"type": "null"}, interview_submission]},
                 "operations": {
                     "type": "array",
                     "minItems": 1,
@@ -884,7 +1035,28 @@ def _plugin_write_definition() -> ToolDefinition:
                     "items": {"oneOf": list(operations)},
                 },
             },
-            "required": ["batchId", "task", "operations"],
+            "required": [
+                "batchId",
+                "task",
+                "changeKind",
+                "sourceBindings",
+                "interviewSubmission",
+                "operations",
+            ],
+            "oneOf": [
+                {
+                    "properties": {
+                        "changeKind": {"const": "general"},
+                        "interviewSubmission": {"type": "null"},
+                    },
+                },
+                {
+                    "properties": {
+                        "changeKind": {"const": "interview_submission"},
+                        "interviewSubmission": interview_submission,
+                    },
+                },
+            ],
             "additionalProperties": False,
         },
         output_schema={

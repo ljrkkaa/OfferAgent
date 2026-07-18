@@ -28,6 +28,10 @@ function digest(content) {
     return `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
 }
 
+function initialModifiedVersion(position, content) {
+    return `mtime:${position}:size:${Buffer.byteLength(content)}`;
+}
+
 function memoryTopic(type = "user") {
     return [
         "---",
@@ -40,8 +44,16 @@ function memoryTopic(type = "user") {
     ].join("\n");
 }
 
-function call(batchId, operations, overrides = {}) {
-    const arguments_ = { batchId, task: `Apply ${batchId}`, operations };
+function call(batchId, operations, argumentOverrides = {}, overrides = {}) {
+    const arguments_ = {
+        batchId,
+        task: `Apply ${batchId}`,
+        changeKind: "general",
+        sourceBindings: [],
+        interviewSubmission: null,
+        operations,
+        ...argumentOverrides,
+    };
     return {
         toolCallId: `call_${batchId}`,
         workspaceId: "ws_vault",
@@ -65,14 +77,50 @@ function call(batchId, operations, overrides = {}) {
 class MemoryVault {
     constructor(entries) {
         this.entries = new Map(Object.entries(entries));
+        this.versions = new Map([...this.entries].map(([target, content], index) => [
+            target, `mtime:${index + 1}:size:${Buffer.byteLength(content)}`,
+        ]));
         this.failPath = null;
     }
     async read(target) { return this.entries.has(target) ? this.entries.get(target) : undefined; }
+    async snapshot(target) {
+        return this.entries.has(target)
+            ? { content: this.entries.get(target), modifiedVersion: this.versions.get(target) }
+            : { content: undefined, modifiedVersion: "missing" };
+    }
+    async applyConditional(mutation) {
+        const snapshot = await this.snapshot(mutation.path);
+        const observed = {
+            contentHash: snapshot.content === undefined ? "absent" : digest(snapshot.content),
+            modifiedVersion: snapshot.modifiedVersion,
+        };
+        if (observed.contentHash !== mutation.expected.contentHash ||
+            observed.modifiedVersion !== mutation.expected.modifiedVersion) {
+            return { status: "conflict", observed };
+        }
+        if (mutation.kind === "create") await this.create(mutation.path, mutation.afterContent);
+        else if (mutation.kind === "modify") await this.modify(mutation.path, mutation.afterContent);
+        else await this.remove(mutation.path);
+        return { status: "applied" };
+    }
+    async restore(target, content) {
+        if (content === undefined) await this.remove(target);
+        else await this.write(target, content);
+    }
+    async create(target, content) {
+        if (this.entries.has(target)) throw new Error(`create target already exists: ${target}`);
+        await this.write(target, content);
+    }
+    async modify(target, content) {
+        if (!this.entries.has(target)) throw new Error(`modify target is missing: ${target}`);
+        await this.write(target, content);
+    }
     async write(target, content) {
         if (target === this.failPath) throw new Error(`injected write failure: ${target}`);
         this.entries.set(target, content);
+        this.versions.set(target, `mtime:write:size:${Buffer.byteLength(content)}`);
     }
-    async remove(target) { this.entries.delete(target); }
+    async remove(target) { this.entries.delete(target); this.versions.delete(target); }
 }
 
 class MemoryJournal {
@@ -95,6 +143,1143 @@ class MemoryCheckpoints {
     async read(ref, target) { return this.snapshots.get(ref)?.get(target); }
 }
 
+function interviewFixture() {
+    const sourcePath = "interview/catalog-candidate.md";
+    const sourceContent = "---\ntype: interview-question\nquestion-id: catalog_candidate\n---\n# Candidate\n";
+    const experienceIndexPath = "experiences/index.md";
+    const experienceIndexContent = "# Experiences\n";
+    const questionIndexPath = "interview/index.md";
+    const questionIndexContent = "# Questions\n";
+    const sourceFingerprint = "sha256:ba16ab9e53946934b5cb4e3f89e3977c905d09c1960ec45a03867f57a8411545";
+    const imageHashes = [`sha256:${"1".repeat(64)}`, `sha256:${"2".repeat(64)}`];
+    const experiencePath = "experiences/acme-backend-2026-07-18.md";
+    const questionPath = "interview/database-isolation.md";
+    const experienceContent = [
+        "---",
+        "type: interview-experience",
+        "experience-id: exp_acme_backend_20260718",
+        "source-kind: mixed",
+        "captured-on: 2026-07-18",
+        "source-url: https://example.com/interview/42",
+        `source-fingerprint: ${sourceFingerprint}`,
+        "company: Acme",
+        "role: Backend Engineer",
+        "event-date: unknown",
+        "round: unknown",
+        "---",
+        "# Acme Backend Interview",
+        "",
+        "## Questions",
+        "- [[../interview/database-isolation]]",
+        "",
+    ].join("\n");
+    const questionContent = [
+        "---",
+        "type: interview-question",
+        "question-id: question_database_isolation",
+        "title: Explain database isolation",
+        "answer-state: needs-research",
+        "frequency: 1",
+        "---",
+        "# Explain database isolation",
+        "",
+        "## Occurrences",
+        "- [[../experiences/acme-backend-2026-07-18]]",
+        "",
+    ].join("\n");
+    const entries = {
+        [sourcePath]: sourceContent,
+        [experienceIndexPath]: experienceIndexContent,
+        [questionIndexPath]: questionIndexContent,
+    };
+    const operations = [
+        {
+            op: "create", path: experiencePath, content: experienceContent,
+            expectedContentHash: "absent", expectedModifiedVersion: "missing",
+        },
+        {
+            op: "create", path: questionPath, content: questionContent,
+            expectedContentHash: "absent", expectedModifiedVersion: "missing",
+        },
+        {
+            op: "append", path: experienceIndexPath,
+            content: "- [[acme-backend-2026-07-18]]\n",
+            expectedContentHash: digest(experienceIndexContent),
+            expectedModifiedVersion: `mtime:2:size:${Buffer.byteLength(experienceIndexContent)}`,
+        },
+        {
+            op: "append", path: questionIndexPath,
+            content: "- [[database-isolation]]\n",
+            expectedContentHash: digest(questionIndexContent),
+            expectedModifiedVersion: `mtime:3:size:${Buffer.byteLength(questionIndexContent)}`,
+        },
+    ];
+    return {
+        entries,
+        operations,
+        argumentOverrides: {
+            changeKind: "interview_submission",
+            sourceBindings: [{
+                path: sourcePath,
+                expectedModifiedVersion: `mtime:1:size:${Buffer.byteLength(sourceContent)}`,
+                expectedContentHash: digest(sourceContent),
+            }],
+            interviewSubmission: {
+                sourceKind: "mixed",
+                capturedOn: "2026-07-18",
+                canonicalUrls: ["https://example.com/interview/42"],
+                orderedImageContentHashes: imageHashes,
+                sourceFingerprint,
+            },
+        },
+        experiencePath,
+        questionPath,
+        experienceIndexPath,
+        questionIndexPath,
+    };
+}
+
+test("trusted Vault previews and confirms one categorized Interview Submission batch", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const vault = new MemoryVault(fixture.entries);
+    const journal = new MemoryJournal();
+    let proposal;
+    let approvals = 0;
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async (candidate) => {
+            approvals += 1;
+            proposal = candidate;
+            return true;
+        },
+    });
+    const request = call("batch_interview_preview", fixture.operations, fixture.argumentOverrides);
+
+    const result = await coordinator.execute(request);
+
+    assert.equal(result.status, "succeeded");
+    assert.equal(approvals, 1);
+    assert.equal(proposal.batchId, "batch_interview_preview");
+    assert.equal(proposal.argsHash, request.argsHash);
+    assert.equal(proposal.changeKind, "interview_submission");
+    assert.deepEqual(proposal.categorizedTargets, [
+        {
+            path: fixture.experiencePath, category: "experience", operation: "create",
+            expectedModifiedVersion: "missing", expectedContentHash: "absent",
+        },
+        {
+            path: fixture.questionPath, category: "question", operation: "create",
+            expectedModifiedVersion: "missing", expectedContentHash: "absent",
+        },
+        {
+            path: fixture.experienceIndexPath, category: "index", operation: "append",
+            expectedModifiedVersion: fixture.operations[2].expectedModifiedVersion,
+            expectedContentHash: fixture.operations[2].expectedContentHash,
+        },
+        {
+            path: fixture.questionIndexPath, category: "index", operation: "append",
+            expectedModifiedVersion: fixture.operations[3].expectedModifiedVersion,
+            expectedContentHash: fixture.operations[3].expectedContentHash,
+        },
+    ]);
+    assert.deepEqual(proposal.sourceBindings, fixture.argumentOverrides.sourceBindings);
+    assert.match(proposal.diff, /experiences\/acme-backend-2026-07-18\.md/u);
+    assert.match(proposal.diff, /interview\/database-isolation\.md/u);
+    assert.match(proposal.diff, /experiences\/index\.md/u);
+    assert.match(proposal.diff, /interview\/index\.md/u);
+    assert.equal(vault.entries.get(fixture.experiencePath), fixture.operations[0].content);
+    assert.equal(vault.entries.get(fixture.questionPath), fixture.operations[1].content);
+    assert.match(vault.entries.get(fixture.experienceIndexPath), /acme-backend/u);
+    assert.match(vault.entries.get(fixture.questionIndexPath), /database-isolation/u);
+});
+
+test("Interview Submission accepts the Catalog's deterministic code-point URL ordering", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const canonicalUrl = "https://example.com/interview/42?Z=1&a=2";
+    const operations = fixture.operations.map((operation, index) => index === 0
+        ? { ...operation, content: operation.content.replace("https://example.com/interview/42", canonicalUrl) }
+        : operation);
+    const argumentOverrides = {
+        ...fixture.argumentOverrides,
+        interviewSubmission: {
+            ...fixture.argumentOverrides.interviewSubmission,
+            canonicalUrls: [canonicalUrl],
+        },
+    };
+    const vault = new MemoryVault(fixture.entries);
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal: new MemoryJournal(),
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async () => true,
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_canonical_query", operations, argumentOverrides,
+    ));
+
+    assert.equal(result.status, "succeeded");
+});
+
+test("Interview Submission accepts the Catalog's canonical public IPv6 URL", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const canonicalUrl = "https://[2001:4860:4860::8888]/interview/42";
+    const operations = fixture.operations.map((operation, index) => index === 0
+        ? { ...operation, content: operation.content.replace("https://example.com/interview/42", canonicalUrl) }
+        : operation);
+    const argumentOverrides = {
+        ...fixture.argumentOverrides,
+        interviewSubmission: {
+            ...fixture.argumentOverrides.interviewSubmission,
+            canonicalUrls: [canonicalUrl],
+        },
+    };
+    const vault = new MemoryVault(fixture.entries);
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal: new MemoryJournal(),
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async () => true,
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_canonical_ipv6", operations, argumentOverrides,
+    ));
+
+    assert.equal(result.status, "succeeded");
+});
+
+test("Interview Submission accepts a linked existing Question with a positive accumulated frequency", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const existingQuestionContent = fixture.operations[1].content.replace("frequency: 1", "frequency: 2");
+    const entries = {
+        ...fixture.entries,
+        [fixture.questionPath]: existingQuestionContent,
+    };
+    const operations = fixture.operations.map((operation, index) => index === 1
+        ? {
+            op: "append",
+            path: operation.path,
+            content: "\n## Source Notes\n- Additional source context.\n",
+            expectedContentHash: digest(existingQuestionContent),
+            expectedModifiedVersion: initialModifiedVersion(4, existingQuestionContent),
+        }
+        : operation);
+    const vault = new MemoryVault(entries);
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal: new MemoryJournal(),
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async () => true,
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_existing_question", operations, fixture.argumentOverrides,
+    ));
+
+    assert.equal(result.status, "succeeded");
+    assert.match(vault.entries.get(fixture.questionPath), /Additional source context/u);
+});
+
+test("rejecting an Interview Submission preview leaves every Vault target unchanged", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const vault = new MemoryVault(fixture.entries);
+    const journal = new MemoryJournal();
+    let approvals = 0;
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async () => { approvals += 1; return false; },
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_rejected", fixture.operations, fixture.argumentOverrides,
+    ));
+
+    assert.equal(result.status, "denied");
+    assert.equal(approvals, 1);
+    assert.deepEqual(Object.fromEntries(vault.entries), fixture.entries);
+    assert.equal(await journal.load("batch_interview_rejected"), undefined);
+});
+
+test("Interview Submission create never overwrites a user file raced into the final missing check", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const vault = new MemoryVault(fixture.entries);
+    const journal = new MemoryJournal();
+    const originalWrite = vault.write.bind(vault);
+    let raced = false;
+    const raceUserCreate = () => {
+        if (raced) return;
+        raced = true;
+        vault.entries.set(fixture.experiencePath, "user-created experience\n");
+        vault.versions.set(fixture.experiencePath, "mtime:user:size:24");
+    };
+    vault.write = async (target, content) => {
+        if (target === fixture.experiencePath) raceUserCreate();
+        await originalWrite(target, content);
+    };
+    vault.create = async (target, content) => {
+        if (target === fixture.experiencePath) raceUserCreate();
+        if (vault.entries.has(target)) throw new Error(`create target already exists: ${target}`);
+        await originalWrite(target, content);
+    };
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async () => true,
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_create_race", fixture.operations, fixture.argumentOverrides,
+    ));
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "resource.conflict");
+    assert.equal(vault.entries.get(fixture.experiencePath), "user-created experience\n");
+    assert.equal(vault.entries.has(fixture.questionPath), false);
+    assert.equal(vault.entries.get(fixture.experienceIndexPath), fixture.entries[fixture.experienceIndexPath]);
+    assert.equal(vault.entries.get(fixture.questionIndexPath), fixture.entries[fixture.questionIndexPath]);
+    assert.equal((await journal.load("batch_interview_create_race")).state, "rolled_back");
+});
+
+test("Interview Submission preserves an identical user file raced into a create conflict", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const vault = new MemoryVault(fixture.entries);
+    const journal = new MemoryJournal();
+    const originalWrite = vault.write.bind(vault);
+    vault.create = async (target, content) => {
+        if (target === fixture.experiencePath) {
+            vault.entries.set(target, content);
+            vault.versions.set(target, `mtime:user:size:${Buffer.byteLength(content)}`);
+        }
+        if (vault.entries.has(target)) throw new Error(`create target already exists: ${target}`);
+        await originalWrite(target, content);
+    };
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async () => true,
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_identical_create_race", fixture.operations, fixture.argumentOverrides,
+    ));
+
+    assert.equal(result.status, "unknown_outcome");
+    assert.equal(result.error.code, "tool.unknown_outcome");
+    assert.equal(vault.entries.get(fixture.experiencePath), fixture.operations[0].content);
+    assert.equal((await journal.load("batch_interview_identical_create_race")).state, "recovery_failed");
+    assert.deepEqual(
+        (await journal.load("batch_interview_identical_create_race")).manualReviewPaths,
+        [fixture.experiencePath],
+    );
+    const recovered = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+    });
+    assert.deepEqual(await recovered.reconcile(), [{
+        batchId: "batch_interview_identical_create_race",
+        state: "recovery_failed",
+        manualReviewPaths: [fixture.experiencePath],
+    }]);
+    assert.equal(vault.entries.get(fixture.experiencePath), fixture.operations[0].content);
+});
+
+test("Interview Submission reports unknown outcome when modify writes and then rejects", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const vault = new MemoryVault(fixture.entries);
+    const journal = new MemoryJournal();
+    const originalModify = vault.modify.bind(vault);
+    vault.modify = async (target, content) => {
+        await originalModify(target, content);
+        if (target === fixture.questionIndexPath) throw new Error("modify completion was lost");
+    };
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async () => true,
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_modify_unknown", fixture.operations, fixture.argumentOverrides,
+    ));
+
+    assert.equal(result.status, "unknown_outcome");
+    assert.equal(result.error.code, "tool.unknown_outcome");
+    assert.equal(vault.entries.has(fixture.experiencePath), false);
+    assert.equal(vault.entries.has(fixture.questionPath), false);
+    assert.equal(vault.entries.get(fixture.experienceIndexPath), fixture.entries[fixture.experienceIndexPath]);
+    assert.match(vault.entries.get(fixture.questionIndexPath), /database-isolation/u);
+    assert.equal((await journal.load("batch_interview_modify_unknown")).state, "recovery_failed");
+    assert.deepEqual(
+        (await journal.load("batch_interview_modify_unknown")).manualReviewPaths,
+        [fixture.questionIndexPath],
+    );
+});
+
+test("Vault conditional apply rejects a user edit after coordinator revalidation", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const before = "alpha\n";
+    const userEdit = "manual edit\n";
+    const vault = new MemoryVault({ "notes/a.md": before });
+    vault.applyConditional = async (mutation) => {
+        vault.entries.set(mutation.path, userEdit);
+        vault.versions.set(mutation.path, "mtime:user:size:12");
+        return {
+            status: "conflict",
+            observed: {
+                contentHash: digest(userEdit),
+                modifiedVersion: "mtime:user:size:12",
+            },
+        };
+    };
+    const journal = new MemoryJournal();
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+    });
+
+    const result = await coordinator.execute(call("batch_conditional_modify_race", [{
+        op: "append",
+        path: "notes/a.md",
+        content: "agent edit\n",
+        expectedContentHash: digest(before),
+        expectedModifiedVersion: initialModifiedVersion(1, before),
+    }]));
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "resource.conflict");
+    assert.equal(vault.entries.get("notes/a.md"), userEdit);
+    assert.equal((await journal.load("batch_conditional_modify_race")).state, "rolled_back");
+});
+
+test("Interview Submission never recreates an existing target deleted after its final check", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const vault = new MemoryVault(fixture.entries);
+    const journal = new MemoryJournal();
+    const originalWrite = vault.write.bind(vault);
+    let raced = false;
+    const raceUserDelete = (target) => {
+        if (target !== fixture.questionIndexPath || raced) return;
+        raced = true;
+        vault.entries.delete(target);
+        vault.versions.delete(target);
+    };
+    vault.write = async (target, content) => {
+        raceUserDelete(target);
+        await originalWrite(target, content);
+    };
+    vault.modify = async (target, content) => {
+        raceUserDelete(target);
+        if (!vault.entries.has(target)) throw new Error(`modify target is missing: ${target}`);
+        await originalWrite(target, content);
+    };
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async () => true,
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_modify_delete_race", fixture.operations, fixture.argumentOverrides,
+    ));
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "resource.conflict");
+    assert.equal(vault.entries.has(fixture.questionIndexPath), false);
+    assert.equal(vault.entries.has(fixture.experiencePath), false);
+    assert.equal(vault.entries.has(fixture.questionPath), false);
+    assert.equal(vault.entries.get(fixture.experienceIndexPath), fixture.entries[fixture.experienceIndexPath]);
+    assert.equal((await journal.load("batch_interview_modify_delete_race")).state, "rolled_back");
+});
+
+test("Vault delete reports unknown outcome when removal succeeds and then rejects", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const indexContent = "[[memory/user/old]]\n";
+    const topicContent = memoryTopic();
+    const vault = new MemoryVault({
+        "memory/MEMORY.md": indexContent,
+        "memory/user/old.md": topicContent,
+    });
+    const journal = new MemoryJournal();
+    const originalRemove = vault.remove.bind(vault);
+    vault.remove = async (target) => {
+        await originalRemove(target);
+        throw new Error("delete completion was lost");
+    };
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async () => true,
+    });
+
+    const result = await coordinator.execute(call("batch_delete_unknown", [
+        {
+            op: "delete",
+            path: "memory/user/old.md",
+            expectedContentHash: digest(topicContent),
+            expectedModifiedVersion: initialModifiedVersion(2, topicContent),
+        },
+        {
+            op: "replace",
+            path: "memory/MEMORY.md",
+            find: indexContent,
+            replacement: "",
+            expectedContentHash: digest(indexContent),
+            expectedModifiedVersion: initialModifiedVersion(1, indexContent),
+        },
+    ]));
+
+    assert.equal(result.status, "unknown_outcome");
+    assert.equal(result.error.code, "tool.unknown_outcome");
+    assert.equal(vault.entries.has("memory/user/old.md"), false);
+    assert.equal(vault.entries.get("memory/MEMORY.md"), indexContent);
+    assert.equal((await journal.load("batch_delete_unknown")).state, "recovery_failed");
+    assert.deepEqual((await journal.load("batch_delete_unknown")).manualReviewPaths, ["memory/user/old.md"]);
+});
+
+test("Obsidian Vault conditional modify uses process and compares the callback-time version", async () => {
+    const { ObsidianVaultChangePort } = loadModule();
+    const before = "alpha\n";
+    const after = "alpha\nagent\n";
+    const file = {
+        path: "notes/a.md",
+        stat: { mtime: 1, size: Buffer.byteLength(before) },
+    };
+    let content = before;
+    let processCalls = 0;
+    let modifyCalls = 0;
+    const vault = {
+        getFileByPath: () => file,
+        getAbstractFileByPath: () => file,
+        cachedRead: async () => content,
+        create: async () => { throw new Error("unexpected create"); },
+        createFolder: async () => { throw new Error("unexpected folder create"); },
+        delete: async () => { throw new Error("unexpected delete"); },
+        modify: async () => { modifyCalls += 1; },
+        process: async (_file, callback) => {
+            processCalls += 1;
+            file.stat.mtime = 2;
+            content = callback(content);
+            return content;
+        },
+    };
+    const port = new ObsidianVaultChangePort(vault);
+
+    const outcome = await port.applyConditional({
+        kind: "modify",
+        path: file.path,
+        expected: {
+            contentHash: digest(before),
+            modifiedVersion: `mtime:1:size:${Buffer.byteLength(before)}`,
+        },
+        afterContent: after,
+    });
+
+    assert.equal(outcome.status, "conflict");
+    assert.equal(content, before);
+    assert.equal(processCalls, 1);
+    assert.equal(modifyCalls, 0);
+});
+
+test("Obsidian Vault conditional modify reports applied and ambiguous process outcomes", async () => {
+    const { ObsidianVaultChangePort } = loadModule();
+    const before = "alpha\n";
+    const after = "alpha\nagent\n";
+
+    async function execute(rejectAfterWrite) {
+        const file = {
+            path: "notes/a.md",
+            stat: { mtime: 1, size: Buffer.byteLength(before) },
+        };
+        let content = before;
+        const port = new ObsidianVaultChangePort({
+            getFileByPath: () => file,
+            getAbstractFileByPath: () => file,
+            cachedRead: async () => content,
+            create: async () => { throw new Error("unexpected create"); },
+            createFolder: async () => { throw new Error("unexpected folder create"); },
+            delete: async () => { throw new Error("unexpected delete"); },
+            modify: async () => { throw new Error("Vault.modify must not be used"); },
+            process: async (_file, callback) => {
+                content = callback(content);
+                file.stat = { mtime: 2, size: Buffer.byteLength(content) };
+                if (rejectAfterWrite) throw new Error("process completion was lost");
+                return content;
+            },
+        });
+        const outcome = await port.applyConditional({
+            kind: "modify",
+            path: file.path,
+            expected: {
+                contentHash: digest(before),
+                modifiedVersion: `mtime:1:size:${Buffer.byteLength(before)}`,
+            },
+            afterContent: after,
+        });
+        return { content, outcome };
+    }
+
+    assert.deepEqual(await execute(false), { content: after, outcome: { status: "applied" } });
+    const ambiguous = await execute(true);
+    assert.equal(ambiguous.content, after);
+    assert.equal(ambiguous.outcome.status, "unknown");
+    assert.equal(ambiguous.outcome.observed.contentHash, digest(after));
+});
+
+test("Obsidian Vault conditional delete is unsupported and never invokes Vault.delete", async () => {
+    const { ObsidianVaultChangePort } = loadModule();
+    const before = memoryTopic();
+    const file = {
+        path: "memory/user/old.md",
+        stat: { mtime: 1, size: Buffer.byteLength(before) },
+    };
+    let deleteCalls = 0;
+    const port = new ObsidianVaultChangePort({
+        getFileByPath: () => file,
+        getAbstractFileByPath: () => file,
+        cachedRead: async () => before,
+        create: async () => { throw new Error("unexpected create"); },
+        createFolder: async () => { throw new Error("unexpected folder create"); },
+        delete: async () => { deleteCalls += 1; },
+        modify: async () => { throw new Error("unexpected modify"); },
+        process: async () => { throw new Error("unexpected process"); },
+    });
+
+    const outcome = await port.applyConditional({
+        kind: "delete",
+        path: file.path,
+        expected: {
+            contentHash: digest(before),
+            modifiedVersion: `mtime:1:size:${Buffer.byteLength(before)}`,
+        },
+    });
+
+    assert.deepEqual(outcome, { status: "unsupported", operation: "delete" });
+    assert.equal(deleteCalls, 0);
+});
+
+test("Interview Submission source version drift after confirmation invalidates the whole batch", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const vault = new MemoryVault(fixture.entries);
+    const journal = new MemoryJournal();
+    const sourcePath = fixture.argumentOverrides.sourceBindings[0].path;
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async () => {
+            vault.versions.set(sourcePath, "mtime:manual:size:76");
+            return true;
+        },
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_source_drift", fixture.operations, fixture.argumentOverrides,
+    ));
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "resource.conflict");
+    assert.deepEqual(Object.fromEntries(vault.entries), fixture.entries);
+    assert.equal(await journal.load("batch_interview_source_drift"), undefined);
+});
+
+test("Interview Submission target version drift after checkpoint invalidates the whole batch", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const vault = new MemoryVault(fixture.entries);
+    const journal = new MemoryJournal();
+    const checkpoints = new MemoryCheckpoints(vault);
+    const originalCreate = checkpoints.create.bind(checkpoints);
+    checkpoints.create = async (...arguments_) => {
+        const checkpoint = await originalCreate(...arguments_);
+        vault.versions.set(fixture.questionIndexPath, "mtime:manual:size:12");
+        return checkpoint;
+    };
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints,
+        permissionMode: () => "trusted_vault",
+        authorize: async () => true,
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_target_drift", fixture.operations, fixture.argumentOverrides,
+    ));
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "resource.conflict");
+    assert.deepEqual(Object.fromEntries(vault.entries), fixture.entries);
+    assert.equal((await journal.load("batch_interview_target_drift")).state, "rolled_back");
+});
+
+test("Interview Submission rolls back an earlier Experience when a later Question write fails", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const vault = new MemoryVault(fixture.entries);
+    vault.failPath = fixture.questionPath;
+    const journal = new MemoryJournal();
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async () => true,
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_atomic_failure", fixture.operations, fixture.argumentOverrides,
+    ));
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "tool.failed");
+    assert.deepEqual(Object.fromEntries(vault.entries), fixture.entries);
+    assert.equal((await journal.load("batch_interview_atomic_failure")).state, "rolled_back");
+});
+
+test("structural Interview Experience ingestion cannot be mislabeled as a general Vault change", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const vault = new MemoryVault(fixture.entries);
+    const journal = new MemoryJournal();
+    let approvals = 0;
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async () => { approvals += 1; return true; },
+    });
+
+    const result = await coordinator.execute(call("batch_interview_mislabeled", fixture.operations));
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "protocol.invalid_params");
+    assert.equal(approvals, 0);
+    assert.deepEqual(Object.fromEntries(vault.entries), fixture.entries);
+    assert.equal(await journal.load("batch_interview_mislabeled"), undefined);
+});
+
+test("unsafe Interview Submission structure is rejected before preview or mutation", async (t) => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const existingQuestionContent = fixture.operations[1].content
+        .replace("frequency: 1", "frequency: 2")
+        .replace(
+            "- [[../experiences/acme-backend-2026-07-18]]",
+            "- [[../experiences/older-experience]]",
+        );
+    const entriesWithExistingQuestion = {
+        ...fixture.entries,
+        [fixture.questionPath]: existingQuestionContent,
+    };
+    const existingQuestionVersion = initialModifiedVersion(4, existingQuestionContent);
+    const invalidStateQuestionContent = existingQuestionContent.replace(
+        "answer-state: needs-research",
+        "answer-state: unsupported",
+    );
+    const cases = [
+        {
+            name: "mismatched source manifest",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, content: operation.content.replace(
+                    "source-url: https://example.com/interview/42",
+                    "source-url: https://example.com/interview/other",
+                ) }
+                : operation),
+        },
+        {
+            name: "new Question with a standard answer",
+            operations: fixture.operations.map((operation, index) => index === 1
+                ? { ...operation, content: `${operation.content}\n## Standard Answer\nDo not store this.\n` }
+                : operation),
+        },
+        {
+            name: "second new Experience",
+            operations: [
+                ...fixture.operations,
+                {
+                    ...fixture.operations[0],
+                    path: "experiences/acme-second.md",
+                    content: fixture.operations[0].content.replace(
+                        "experience-id: exp_acme_backend_20260718",
+                        "experience-id: exp_acme_second",
+                    ),
+                },
+            ],
+        },
+        {
+            name: "fingerprint inconsistent with ordered image hashes",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, content: operation.content.replace(
+                    fixture.argumentOverrides.interviewSubmission.sourceFingerprint,
+                    `sha256:${"9".repeat(64)}`,
+                ) }
+                : operation),
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    sourceFingerprint: `sha256:${"9".repeat(64)}`,
+                },
+            },
+        },
+        {
+            name: "source fingerprint is supplied without ordered images",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, content: operation.content.replace("source-kind: mixed", "source-kind: public_url") }
+                : operation),
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    sourceKind: "public_url",
+                    orderedImageContentHashes: [],
+                },
+            },
+        },
+        {
+            name: "create target uses the obsolete absent modified version",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, expectedModifiedVersion: "absent" }
+                : operation),
+        },
+        {
+            name: "Experience omits a required identity field",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, content: operation.content.replace("round: unknown\n", "") }
+                : operation),
+        },
+        {
+            name: "Experience omits its Catalog identity",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, content: operation.content.replace(
+                    "experience-id: exp_acme_backend_20260718\n",
+                    "",
+                ) }
+                : operation),
+        },
+        {
+            name: "Experience has an impossible event date",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, content: operation.content.replace(
+                    "event-date: unknown",
+                    "event-date: 2026-02-30",
+                ) }
+                : operation),
+        },
+        {
+            name: "Experience stores candidate PII in frontmatter",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, content: operation.content.replace(
+                    "round: unknown\n",
+                    "round: unknown\ncandidate-name: Alice Example\n",
+                ) }
+                : operation),
+        },
+        {
+            name: "Experience stores a candidate email in frontmatter",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, content: operation.content.replace(
+                    "round: unknown\n",
+                    "round: unknown\ncandidate-email: alice@example.com\n",
+                ) }
+                : operation),
+        },
+        {
+            name: "Experience stores an e-mail alias in frontmatter",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, content: operation.content.replace(
+                    "round: unknown\n",
+                    "round: unknown\ne-mail: alice@example.com\n",
+                ) }
+                : operation),
+        },
+        {
+            name: "source binding uses the obsolete absent modified version",
+            operations: fixture.operations,
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                sourceBindings: fixture.argumentOverrides.sourceBindings.map((binding) => ({
+                    ...binding,
+                    expectedModifiedVersion: "absent",
+                })),
+            },
+        },
+        {
+            name: "new Question omits its Catalog identity",
+            operations: fixture.operations.map((operation, index) => index === 1
+                ? { ...operation, content: operation.content.replace(
+                    "question-id: question_database_isolation\n",
+                    "",
+                ) }
+                : operation),
+        },
+        {
+            name: "new Question has no title",
+            operations: fixture.operations.map((operation, index) => index === 1
+                ? { ...operation, content: operation.content.replace(
+                    "title: Explain database isolation",
+                    "title: ",
+                ) }
+                : operation),
+        },
+        {
+            name: "new Question does not start at frequency one",
+            operations: fixture.operations.map((operation, index) => index === 1
+                ? { ...operation, content: operation.content.replace("frequency: 1", "frequency: 2") }
+                : operation),
+        },
+        {
+            name: "new Question contains a reference answer",
+            operations: fixture.operations.map((operation, index) => index === 1
+                ? { ...operation, content: `${operation.content}\n## Reference Answer\nDo not store this.\n` }
+                : operation),
+        },
+        {
+            name: "canonical URL retains a tracking parameter",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, content: operation.content.replace(
+                    "https://example.com/interview/42",
+                    "https://example.com/interview/42?utm_source=feed",
+                ) }
+                : operation),
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    canonicalUrls: ["https://example.com/interview/42?utm_source=feed"],
+                },
+            },
+        },
+        {
+            name: "canonical URL retains a temporary token",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, content: operation.content.replace(
+                    "https://example.com/interview/42",
+                    "https://example.com/interview/42?token=temporary",
+                ) }
+                : operation),
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    canonicalUrls: ["https://example.com/interview/42?token=temporary"],
+                },
+            },
+        },
+        {
+            name: "canonical URL is IPv4-mapped loopback",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, content: operation.content.replace(
+                    "https://example.com/interview/42",
+                    "http://[::ffff:7f00:1]/",
+                ) }
+                : operation),
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    canonicalUrls: ["http://[::ffff:7f00:1]/"],
+                },
+            },
+        },
+        {
+            name: "canonical URL is IPv6 unspecified-prefix space",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, content: operation.content.replace(
+                    "https://example.com/interview/42",
+                    "http://[::2]/",
+                ) }
+                : operation),
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    canonicalUrls: ["http://[::2]/"],
+                },
+            },
+        },
+        {
+            name: "legacy Interview path is used as a new target",
+            operations: fixture.operations.map((operation, index) => index === 1
+                ? { ...operation, path: "interviews/questions/database-isolation.md" }
+                : operation),
+        },
+        {
+            name: "one primary index is omitted",
+            operations: fixture.operations.slice(0, -1),
+        },
+        {
+            name: "primary index does not link its new target",
+            operations: fixture.operations.map((operation, index) => index === 2
+                ? { ...operation, content: "- unrelated\n" }
+                : operation),
+        },
+        {
+            name: "Experience does not link its Question",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, content: operation.content.replace(
+                    "- [[../interview/database-isolation]]",
+                    "- relationship omitted",
+                ) }
+                : operation),
+        },
+        {
+            name: "Question does not link its Experience occurrence",
+            operations: fixture.operations.map((operation, index) => index === 1
+                ? { ...operation, content: operation.content.replace(
+                    "- [[../experiences/acme-backend-2026-07-18]]",
+                    "- occurrence omitted",
+                ) }
+                : operation),
+        },
+        {
+            name: "existing Question update omits the new Experience occurrence",
+            entries: entriesWithExistingQuestion,
+            operations: fixture.operations.map((operation, index) => index === 1
+                ? {
+                    op: "append",
+                    path: operation.path,
+                    content: "\n## Source Notes\n- Additional context.\n",
+                    expectedContentHash: digest(existingQuestionContent),
+                    expectedModifiedVersion: existingQuestionVersion,
+                }
+                : operation),
+        },
+        {
+            name: "existing Question update leaves an invalid answer state",
+            entries: {
+                ...fixture.entries,
+                [fixture.questionPath]: invalidStateQuestionContent,
+            },
+            operations: fixture.operations.map((operation, index) => index === 1
+                ? {
+                    op: "append",
+                    path: operation.path,
+                    content: "\n## Source Notes\n- Additional context.\n",
+                    expectedContentHash: digest(invalidStateQuestionContent),
+                    expectedModifiedVersion: initialModifiedVersion(4, invalidStateQuestionContent),
+                }
+                : operation),
+        },
+        {
+            name: "Interview batch deletes a Question",
+            entries: entriesWithExistingQuestion,
+            operations: fixture.operations.map((operation, index) => index === 1
+                ? {
+                    op: "delete",
+                    path: operation.path,
+                    expectedContentHash: digest(existingQuestionContent),
+                    expectedModifiedVersion: existingQuestionVersion,
+                }
+                : operation),
+        },
+        {
+            name: "general batch carries Interview metadata",
+            operations: fixture.operations,
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                changeKind: "general",
+            },
+        },
+        {
+            name: "Interview batch carries null metadata",
+            operations: fixture.operations,
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: null,
+            },
+        },
+        {
+            name: "Interview metadata field is missing",
+            operations: fixture.operations,
+            removeInterviewSubmission: true,
+        },
+    ];
+    for (const candidate of cases) {
+        await t.test(candidate.name, async () => {
+            const initialEntries = candidate.entries ?? fixture.entries;
+            const vault = new MemoryVault(initialEntries);
+            const journal = new MemoryJournal();
+            let approvals = 0;
+            const coordinator = new VaultChangeCoordinator({
+                vault,
+                journal,
+                checkpoints: new MemoryCheckpoints(vault),
+                permissionMode: () => "trusted_vault",
+                authorize: async () => { approvals += 1; return true; },
+            });
+
+            const request = call(
+                `batch_unsafe_${candidate.name.replaceAll(" ", "_")}`,
+                candidate.operations,
+                candidate.argumentOverrides ?? fixture.argumentOverrides,
+            );
+            if (candidate.removeInterviewSubmission) delete request.arguments.interviewSubmission;
+            const result = await coordinator.execute(request);
+
+            assert.equal(result.status, "failed");
+            assert.equal(result.error.code, "protocol.invalid_params");
+            assert.equal(approvals, 0);
+            assert.deepEqual(Object.fromEntries(vault.entries), initialEntries);
+        });
+    }
+});
+
+test("every general Vault operation requires an explicit modified-version precondition", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const vault = new MemoryVault({ "notes/a.md": "alpha\n" });
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal: new MemoryJournal(),
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+    });
+
+    const result = await coordinator.execute(call("batch_general_missing_version", [{
+        op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n"),
+    }]));
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "protocol.invalid_params");
+    assert.equal(vault.entries.get("notes/a.md"), "alpha\n");
+});
+
 test("Vault Change Batch validates every target before mutation and rolls back a partial failure", async () => {
     const { VaultChangeCoordinator } = loadModule();
     const vault = new MemoryVault({ "notes/a.md": "alpha\n", "notes/b.md": "beta\n" });
@@ -106,8 +1291,14 @@ test("Vault Change Batch validates every target before mutation and rolls back a
     });
 
     const result = await coordinator.execute(call("batch_failure", [
-        { op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n") },
-        { op: "replace", path: "notes/b.md", find: "beta", replacement: "changed", expectedContentHash: digest("beta\n") },
+        {
+            op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n"),
+            expectedModifiedVersion: initialModifiedVersion(1, "alpha\n"),
+        },
+        {
+            op: "replace", path: "notes/b.md", find: "beta", replacement: "changed",
+            expectedContentHash: digest("beta\n"), expectedModifiedVersion: initialModifiedVersion(2, "beta\n"),
+        },
     ]));
 
     assert.equal(result.status, "failed");
@@ -132,11 +1323,20 @@ test("an unresolved apply outcome latches the current coordinator fail-closed", 
     });
 
     const unresolved = await coordinator.execute(call("batch_unresolved_apply", [
-        { op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n") },
-        { op: "append", path: "notes/b.md", content: "next\n", expectedContentHash: digest("beta\n") },
+        {
+            op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n"),
+            expectedModifiedVersion: initialModifiedVersion(1, "alpha\n"),
+        },
+        {
+            op: "append", path: "notes/b.md", content: "next\n", expectedContentHash: digest("beta\n"),
+            expectedModifiedVersion: initialModifiedVersion(2, "beta\n"),
+        },
     ]));
     const blocked = await coordinator.execute(call("batch_after_unresolved_apply", [
-        { op: "append", path: "notes/c.md", content: "later\n", expectedContentHash: digest("gamma\n") },
+        {
+            op: "append", path: "notes/c.md", content: "later\n", expectedContentHash: digest("gamma\n"),
+            expectedModifiedVersion: initialModifiedVersion(3, "gamma\n"),
+        },
     ]));
 
     assert.equal(unresolved.status, "unknown_outcome");
@@ -162,7 +1362,10 @@ test("Vault Change Batch revalidates after checkpoint and never overwrites a rac
     });
 
     const result = await coordinator.execute(call("batch_checkpoint_race", [
-        { op: "append", path: "notes/a.md", content: "agent edit\n", expectedContentHash: digest("alpha\n") },
+        {
+            op: "append", path: "notes/a.md", content: "agent edit\n", expectedContentHash: digest("alpha\n"),
+            expectedModifiedVersion: initialModifiedVersion(1, "alpha\n"),
+        },
     ]));
 
     assert.equal(result.status, "failed");
@@ -186,8 +1389,14 @@ test("Vault Change Batch revalidates each target and rolls back earlier writes a
     });
 
     const result = await coordinator.execute(call("batch_target_race", [
-        { op: "append", path: "notes/a.md", content: "agent alpha\n", expectedContentHash: digest("alpha\n") },
-        { op: "append", path: "notes/b.md", content: "agent beta\n", expectedContentHash: digest("beta\n") },
+        {
+            op: "append", path: "notes/a.md", content: "agent alpha\n", expectedContentHash: digest("alpha\n"),
+            expectedModifiedVersion: initialModifiedVersion(1, "alpha\n"),
+        },
+        {
+            op: "append", path: "notes/b.md", content: "agent beta\n", expectedContentHash: digest("beta\n"),
+            expectedModifiedVersion: initialModifiedVersion(2, "beta\n"),
+        },
     ]));
 
     assert.equal(result.status, "failed");
@@ -212,7 +1421,10 @@ test("plugin permission is fail-closed and control or memory-delete batches alwa
         authorize: async () => { approvals += 1; return true; },
     });
     const denied = await readOnly.execute(call("batch_denied", [
-        { op: "append", path: "agent.md", content: "new\n", expectedContentHash: digest("old contract\n") },
+        {
+            op: "append", path: "agent.md", content: "new\n", expectedContentHash: digest("old contract\n"),
+            expectedModifiedVersion: initialModifiedVersion(1, "old contract\n"),
+        },
     ]));
     assert.equal(denied.status, "denied");
     assert.equal(approvals, 0);
@@ -226,10 +1438,14 @@ test("plugin permission is fail-closed and control or memory-delete batches alwa
         },
     });
     const applied = await trusted.execute(call("batch_memory_delete", [
-        { op: "delete", path: "memory/user/old.md", expectedContentHash: digest(memoryTopic()) },
+        {
+            op: "delete", path: "memory/user/old.md", expectedContentHash: digest(memoryTopic()),
+            expectedModifiedVersion: initialModifiedVersion(3, memoryTopic()),
+        },
         {
             op: "replace", path: "memory/MEMORY.md", find: "[[memory/user/old]]\n", replacement: "",
             expectedContentHash: digest("[[memory/user/old]]\n"),
+            expectedModifiedVersion: initialModifiedVersion(2, "[[memory/user/old]]\n"),
         },
     ]));
     assert.equal(applied.status, "succeeded");
@@ -257,10 +1473,14 @@ test("Planning Memory delete rejects malformed topic metadata or a missing index
             authorize: async () => { throw new Error("invalid delete must not ask for authorization"); },
         });
         const request = call(`batch_bad_memory_${suffix}`, [
-            { op: "delete", path: "memory/user/old.md", expectedContentHash: digest(topic) },
+            {
+                op: "delete", path: "memory/user/old.md", expectedContentHash: digest(topic),
+                expectedModifiedVersion: initialModifiedVersion(2, topic),
+            },
             {
                 op: "replace", path: "memory/MEMORY.md", find: index, replacement: "",
                 expectedContentHash: digest(index),
+                expectedModifiedVersion: initialModifiedVersion(1, index),
             },
         ]);
 
@@ -294,6 +1514,7 @@ test("Daily plan create fill append rewrite stale and no-op scenarios preserve u
     const createdContent = "---\ndate: 2026-07-17\n---\n\n## 今日计划\n\n- [ ] Agentic RL\n";
     const created = await apply("daily_create", undefined, {
         op: "create", path: target, content: createdContent, expectedContentHash: "absent",
+        expectedModifiedVersion: "missing",
     });
     assert.equal(created.result.status, "succeeded");
     assert.equal(created.content, createdContent);
@@ -308,6 +1529,7 @@ test("Daily plan create fill append rewrite stale and no-op scenarios preserve u
         find: "## 今日计划\n\n<!-- offeragent-plan -->",
         replacement: "## 今日计划\n\n- [ ] Reward modeling",
         expectedContentHash: digest(fillBefore),
+        expectedModifiedVersion: initialModifiedVersion(1, fillBefore),
     });
     assert.equal(filled.result.status, "succeeded");
     assert.match(filled.content, /- \[x\] Completed review/u);
@@ -320,6 +1542,7 @@ test("Daily plan create fill append rewrite stale and no-op scenarios preserve u
         path: target,
         content: "\n## 今日计划\n\n- [ ] Policy optimization\n",
         expectedContentHash: digest(appendBefore),
+        expectedModifiedVersion: initialModifiedVersion(1, appendBefore),
     });
     assert.equal(appended.result.status, "succeeded");
     assert.match(appended.content, /- \[x\] Evidence/u);
@@ -334,6 +1557,7 @@ test("Daily plan create fill append rewrite stale and no-op scenarios preserve u
         find: oldPlan,
         replacement: "## 今日计划\n\n- [ ] Explicitly rescheduled task",
         expectedContentHash: digest(rewriteBefore),
+        expectedModifiedVersion: initialModifiedVersion(1, rewriteBefore),
     });
     assert.equal(rewritten.result.status, "succeeded");
     assert.match(rewritten.content, /- \[x\] Study Evidence/u);
@@ -345,6 +1569,7 @@ test("Daily plan create fill append rewrite stale and no-op scenarios preserve u
         path: target,
         content: "\n- [ ] Must not apply\n",
         expectedContentHash: digest("stale version"),
+        expectedModifiedVersion: initialModifiedVersion(1, appendBefore),
     });
     assert.equal(stale.result.status, "failed");
     assert.equal(stale.result.error.code, "resource.conflict");
@@ -356,6 +1581,7 @@ test("Daily plan create fill append rewrite stale and no-op scenarios preserve u
         find: "Unrelated note.",
         replacement: "Unrelated note.",
         expectedContentHash: digest(appendBefore),
+        expectedModifiedVersion: initialModifiedVersion(1, appendBefore),
     });
     assert.equal(noOp.result.status, "failed");
     assert.equal(noOp.result.error.code, "protocol.invalid_params");
@@ -382,8 +1608,14 @@ test("crash reconciliation reaches a stable rolled-back state and exact replay i
         },
     });
     const request = call("batch_crash", [
-        { op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n") },
-        { op: "append", path: "notes/b.md", content: "next\n", expectedContentHash: digest("beta\n") },
+        {
+            op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n"),
+            expectedModifiedVersion: initialModifiedVersion(1, "alpha\n"),
+        },
+        {
+            op: "append", path: "notes/b.md", content: "next\n", expectedContentHash: digest("beta\n"),
+            expectedModifiedVersion: initialModifiedVersion(2, "beta\n"),
+        },
     ]);
     await assert.rejects(crashing.execute(request), VaultChangeCrashInjectionError);
     assert.equal((await journal.load("batch_crash")).state, "applying");
@@ -414,7 +1646,10 @@ test("lost completion acknowledgement replays the exact applied result and rejec
         vault, journal, checkpoints, permissionMode: () => "trusted_vault",
     });
     const request = call("batch_lost_ack", [
-        { op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n") },
+        {
+            op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n"),
+            expectedModifiedVersion: initialModifiedVersion(1, "alpha\n"),
+        },
     ]);
 
     const applied = await coordinator.execute(request);
@@ -434,8 +1669,14 @@ test("restart reconciliation recognizes an all-applied crash and preserves exact
     const journal = new MemoryJournal();
     const checkpoints = new MemoryCheckpoints(vault);
     const request = call("batch_all_after", [
-        { op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n") },
-        { op: "append", path: "notes/b.md", content: "next\n", expectedContentHash: digest("beta\n") },
+        {
+            op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n"),
+            expectedModifiedVersion: initialModifiedVersion(1, "alpha\n"),
+        },
+        {
+            op: "append", path: "notes/b.md", content: "next\n", expectedContentHash: digest("beta\n"),
+            expectedModifiedVersion: initialModifiedVersion(2, "beta\n"),
+        },
     ]);
     const crashing = new VaultChangeCoordinator({
         vault, journal, checkpoints, permissionMode: () => "trusted_vault",
@@ -474,8 +1715,14 @@ test("restart reconciliation reports unexpected target state for manual review w
         },
     });
     const request = call("batch_manual", [
-        { op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n") },
-        { op: "append", path: "notes/b.md", content: "next\n", expectedContentHash: digest("beta\n") },
+        {
+            op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n"),
+            expectedModifiedVersion: initialModifiedVersion(1, "alpha\n"),
+        },
+        {
+            op: "append", path: "notes/b.md", content: "next\n", expectedContentHash: digest("beta\n"),
+            expectedModifiedVersion: initialModifiedVersion(2, "beta\n"),
+        },
     ]);
     await assert.rejects(crashing.execute(request), VaultChangeCrashInjectionError);
     vault.entries.set("notes/a.md", "user changed after crash\n");
@@ -494,7 +1741,10 @@ test("restart reconciliation reports unexpected target state for manual review w
     });
     await assert.rejects(gated.beginRecovery(), /manual review/);
     const blocked = await gated.execute(call("batch_blocked_by_recovery", [
-        { op: "append", path: "notes/b.md", content: "later\n", expectedContentHash: digest("beta\n") },
+        {
+            op: "append", path: "notes/b.md", content: "later\n", expectedContentHash: digest("beta\n"),
+            expectedModifiedVersion: initialModifiedVersion(2, "beta\n"),
+        },
     ]));
     assert.equal(blocked.status, "unknown_outcome");
     assert.equal(blocked.retryable, false);
@@ -510,7 +1760,10 @@ test("guarded undo restores only an unchanged applied batch", async () => {
         vault, journal, checkpoints, permissionMode: () => "trusted_vault",
     });
     const applied = await coordinator.execute(call("batch_undo", [
-        { op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n") },
+        {
+            op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n"),
+            expectedModifiedVersion: initialModifiedVersion(1, "alpha\n"),
+        },
     ]));
     assert.equal(applied.status, "succeeded");
     vault.entries.set("notes/a.md", "user changed\n");
@@ -532,7 +1785,10 @@ test("an unresolved guarded undo latches later writes in the current coordinator
         vault, journal, checkpoints: new MemoryCheckpoints(vault), permissionMode: () => "trusted_vault",
     });
     await coordinator.execute(call("batch_unresolved_undo", [
-        { op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n") },
+        {
+            op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n"),
+            expectedModifiedVersion: initialModifiedVersion(1, "alpha\n"),
+        },
     ]));
     const originalRead = vault.read.bind(vault);
     let appliedReads = 0;
@@ -548,7 +1804,10 @@ test("an unresolved guarded undo latches later writes in the current coordinator
     const conflict = await coordinator.undo("batch_unresolved_undo");
     vault.read = originalRead;
     const blocked = await coordinator.execute(call("batch_after_unresolved_undo", [
-        { op: "append", path: "notes/b.md", content: "later\n", expectedContentHash: digest("beta\n") },
+        {
+            op: "append", path: "notes/b.md", content: "later\n", expectedContentHash: digest("beta\n"),
+            expectedModifiedVersion: initialModifiedVersion(2, "beta\n"),
+        },
     ]));
 
     assert.equal(conflict.status, "conflict");
@@ -574,8 +1833,14 @@ test("guarded undo journals progress and completes safely after a crash", async 
         },
     });
     await coordinator.execute(call("batch_undo_crash", [
-        { op: "append", path: "notes/a.md", content: "A2\n", expectedContentHash: digest("alpha\n") },
-        { op: "append", path: "notes/b.md", content: "B2\n", expectedContentHash: digest("beta\n") },
+        {
+            op: "append", path: "notes/a.md", content: "A2\n", expectedContentHash: digest("alpha\n"),
+            expectedModifiedVersion: initialModifiedVersion(1, "alpha\n"),
+        },
+        {
+            op: "append", path: "notes/b.md", content: "B2\n", expectedContentHash: digest("beta\n"),
+            expectedModifiedVersion: initialModifiedVersion(2, "beta\n"),
+        },
     ]));
 
     await assert.rejects(coordinator.undo("batch_undo_crash"), VaultChangeCrashInjectionError);
