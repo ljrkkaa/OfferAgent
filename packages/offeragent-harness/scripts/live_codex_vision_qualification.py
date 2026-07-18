@@ -17,6 +17,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Protocol
 
+from jsonschema import Draft202012Validator
 from PIL import Image, ImageDraw, ImageFont
 
 from offeragent_harness.adapters.local_artifacts import LocalArtifactStore
@@ -27,6 +28,7 @@ from offeragent_harness.agent.state import RunPhase, RunState
 from offeragent_harness.config import HarnessConfig, ModelSettings
 from offeragent_harness.models import ModelEvent, ModelRequest, ModelRole
 from offeragent_harness.ports import CancellationToken
+from offeragent_harness.protocol.content import ArtifactRef
 from offeragent_harness.providers import compose_model_gateway
 from offeragent_harness.providers.codex_subscription import (
     CODEX_CATALOG_CLIENT_VERSION,
@@ -49,8 +51,47 @@ from offeragent_harness.runtime.conversation_attachments import (
 from offeragent_harness.runtime.harness_service import StartTurnCommand
 from offeragent_harness.runtime.production_worker_composition import ProductionRunComponentsFactory
 from offeragent_harness.sessions import AgentLineage
-from offeragent_harness.testing import DeterministicIdGenerator, InMemoryUnitOfWorkFactory, ManualClock
+from offeragent_harness.testing import (
+    DeterministicIdGenerator,
+    InMemoryUnitOfWorkFactory,
+    ManualClock,
+    RecordingNetworkAuditSink,
+)
 from offeragent_harness.tools import canonical_json_sha256
+
+_SEMANTIC_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "company": {"type": "string", "minLength": 1, "maxLength": 256},
+        "role": {"type": "string", "minLength": 1, "maxLength": 256},
+        "rounds": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {"type": "string", "minLength": 1, "maxLength": 64},
+        },
+        "pageOrder": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {"type": "integer"},
+        },
+        "crossPageQuestionId": {"type": "string", "minLength": 1, "maxLength": 64},
+        "crossPageQuestion": {"type": "string", "minLength": 1, "maxLength": 2_048},
+        "finalPageTopic": {"type": "string", "minLength": 1, "maxLength": 2_048},
+    },
+    "required": [
+        "company",
+        "role",
+        "rounds",
+        "pageOrder",
+        "crossPageQuestionId",
+        "crossPageQuestion",
+        "finalPageTopic",
+    ],
+    "additionalProperties": False,
+}
+_SEMANTIC_OUTPUT_VALIDATOR = Draft202012Validator(_SEMANTIC_OUTPUT_SCHEMA)
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +179,7 @@ class TextModelGateEvidence:
     error_code: str
     attachment_materialization_count: int
     response_send_count: int
+    gateway_factory_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +187,7 @@ class ImageModelEvidence:
     semantics: Mapping[str, object] | None
     response_send_count: int
     attachment_materialization_count: int
+    gateway_factory_count: int
     error_code: str | None = None
 
 
@@ -162,6 +205,7 @@ class ModelQualificationResult:
     detail: Literal["high", "original"] | None
     response_send_count: int
     attachment_materialization_count: int
+    gateway_factory_count: int
     error_code: str | None = None
     missing_facts: tuple[str, ...] = ()
 
@@ -201,6 +245,7 @@ class QualificationReport:
                     "detail": item.detail,
                     "responseSendCount": item.response_send_count,
                     "attachmentMaterializationCount": item.attachment_materialization_count,
+                    "gatewayFactoryCount": item.gateway_factory_count,
                     "errorCode": item.error_code,
                     "missingFacts": list(item.missing_facts),
                 }
@@ -245,6 +290,37 @@ class QualificationFailure(RuntimeError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class _ExecutionCounts:
+    response_send_count: int
+    attachment_materialization_count: int
+    gateway_factory_count: int
+
+    def __post_init__(self) -> None:
+        if (
+            min(
+                self.response_send_count,
+                self.attachment_materialization_count,
+                self.gateway_factory_count,
+            )
+            < 0
+        ):
+            raise ValueError("qualification execution counts cannot be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelExecutionResult:
+    semantics: Mapping[str, object] | None
+    counts: _ExecutionCounts
+
+
+class _ModelExecutionFailure(QualificationFailure):
+    def __init__(self, error_code: str, counts: _ExecutionCounts) -> None:
+        self.error_code = error_code
+        self.counts = counts
+        super().__init__("qualification model execution failed")
+
+
 class CodexVisionQualification:
     """Qualify one frozen live catalog and return value-safe evidence."""
 
@@ -277,6 +353,7 @@ class CodexVisionQualification:
                         text_evidence.error_code == "image_modality_unsupported"
                         and text_evidence.attachment_materialization_count == 0
                         and text_evidence.response_send_count == 0
+                        and text_evidence.gateway_factory_count == 0
                     )
                     results.append(
                         ModelQualificationResult(
@@ -286,6 +363,7 @@ class CodexVisionQualification:
                             detail=None,
                             response_send_count=text_evidence.response_send_count,
                             attachment_materialization_count=text_evidence.attachment_materialization_count,
+                            gateway_factory_count=text_evidence.gateway_factory_count,
                             error_code=text_evidence.error_code,
                         )
                     )
@@ -304,6 +382,7 @@ class CodexVisionQualification:
                     and not missing
                     and image_evidence.response_send_count > 0
                     and image_evidence.attachment_materialization_count > 0
+                    and image_evidence.gateway_factory_count > 0
                 )
                 results.append(
                     ModelQualificationResult(
@@ -313,6 +392,7 @@ class CodexVisionQualification:
                         detail=detail,
                         response_send_count=image_evidence.response_send_count,
                         attachment_materialization_count=image_evidence.attachment_materialization_count,
+                        gateway_factory_count=image_evidence.gateway_factory_count,
                         error_code=image_evidence.error_code,
                         missing_facts=missing,
                     )
@@ -344,6 +424,8 @@ class CodexVisionQualification:
 
 def _missing_semantic_facts(value: Mapping[str, object]) -> tuple[str, ...]:
     missing: list[str] = []
+    if not _SEMANTIC_OUTPUT_VALIDATOR.is_valid(value):
+        missing.append("semanticSchema")
     company = value.get("company")
     if not isinstance(company, str) or "星河科技" not in company:
         missing.append("company")
@@ -367,6 +449,22 @@ def _missing_semantic_facts(value: Mapping[str, object]) -> tuple[str, ...]:
     if not isinstance(final_topic, str) or any(token not in final_topic for token in ("灰度", "回滚")):
         missing.append("finalPageTopic")
     return tuple(missing)
+
+
+def _qualification_prompt() -> str:
+    schema = json.dumps(
+        _SEMANTIC_OUTPUT_SCHEMA,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (
+        "这是显式视觉资格测试。只读取三张用户图片，不调用任何工具。"
+        "按图片页码顺序合并跨页内容。最终回答只能是一个 JSON 对象，不要 Markdown。"
+        "下面的 JSON Schema 只说明输出字段和类型，不包含答案；必须逐字段从图片读取并满足它。"
+        f"不要返回 Schema 本身，不得省略、更名或增加字段：{schema}"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,6 +495,30 @@ class _AuthFileSnapshot:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _OwnedQualificationRoot:
+    path: Path
+    device: int
+    inode: int
+
+    @classmethod
+    def create(cls, path: Path) -> _OwnedQualificationRoot:
+        if path.exists():
+            raise QualificationFailure("qualification root must not already exist")
+        if not path.parent.is_dir():
+            raise QualificationFailure("qualification root parent must be an existing directory")
+        path.mkdir()
+        identity = path.lstat()
+        return cls(path, identity.st_dev, identity.st_ino)
+
+    def still_owns_path(self) -> bool:
+        try:
+            identity = self.path.lstat()
+        except FileNotFoundError:
+            return False
+        return not self.path.is_symlink() and identity.st_dev == self.device and identity.st_ino == self.inode
+
+
 class _CountingAttachmentStore(ConversationAttachmentStore):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -413,10 +535,9 @@ class _CountingAttachmentStore(ConversationAttachmentStore):
         return await super().materialize_claimed_submission(session_id, turn_id, expected_claims, cancellation)
 
 
-class _CountingGateway:
+class _CapturingGateway:
     def __init__(self, delegate: Any) -> None:
         self._delegate = delegate
-        self.send_count = 0
         self.requests: list[ModelRequest] = []
 
     async def stream(
@@ -424,7 +545,6 @@ class _CountingGateway:
         request: ModelRequest,
         cancellation: CancellationToken,
     ) -> AsyncIterator[ModelEvent]:
-        self.send_count += 1
         self.requests.append(request)
         async for event in self._delegate.stream(request, cancellation):
             yield event
@@ -472,11 +592,11 @@ class LiveOfferAgentQualificationEnvironment:
         self._auth_path = default_codex_auth_path()
         self._auth_before: _AuthFileSnapshot | None = None
         self._catalog: CodexModelCatalogSnapshot | None = None
-        self._working_root: Path | None = None
+        self._working_root: _OwnedQualificationRoot | None = None
         self._execution_index = 0
 
     def generate_fixture(self, root: Path) -> SyntheticInterviewFixture:
-        self._working_root = root
+        self._working_root = _OwnedQualificationRoot.create(root)
         return self._generator.generate(root / "fixture")
 
     def fetch_catalog(self) -> CodexModelCatalogSnapshot:
@@ -492,20 +612,43 @@ class LiveOfferAgentQualificationEnvironment:
         detail: str,
     ) -> ImageModelEvidence:
         try:
-            semantics, sends, materializations = await self._execute_model(
+            execution = await self._execute_model(
                 model,
                 account_binding,
                 fixture,
                 expected_detail=detail,
                 run_agent=True,
             )
-        except RunPreparationFailure as error:
-            return ImageModelEvidence(None, 0, 0, error_code=error.code)
+        except _ModelExecutionFailure as error:
+            return ImageModelEvidence(
+                None,
+                error.counts.response_send_count,
+                error.counts.attachment_materialization_count,
+                error.counts.gateway_factory_count,
+                error_code=error.error_code,
+            )
         except Exception as error:
-            return ImageModelEvidence(None, 0, 0, error_code=f"qualification_{type(error).__name__}")
-        if semantics is None:
-            return ImageModelEvidence(None, sends, materializations, error_code="agent_run_failed")
-        return ImageModelEvidence(semantics, sends, materializations)
+            return ImageModelEvidence(
+                None,
+                0,
+                0,
+                0,
+                error_code=f"qualification_{type(error).__name__}",
+            )
+        if execution.semantics is None:
+            return ImageModelEvidence(
+                None,
+                execution.counts.response_send_count,
+                execution.counts.attachment_materialization_count,
+                execution.counts.gateway_factory_count,
+                error_code="agent_run_failed",
+            )
+        return ImageModelEvidence(
+            execution.semantics,
+            execution.counts.response_send_count,
+            execution.counts.attachment_materialization_count,
+            execution.counts.gateway_factory_count,
+        )
 
     async def exercise_text_model_gate(
         self,
@@ -514,30 +657,38 @@ class LiveOfferAgentQualificationEnvironment:
         fixture: SyntheticInterviewFixture,
     ) -> TextModelGateEvidence:
         try:
-            _, sends, materializations = await self._execute_model(
+            execution = await self._execute_model(
                 model,
                 account_binding,
                 fixture,
                 expected_detail=None,
                 run_agent=False,
             )
-        except RunPreparationFailure as error:
-            sends = int(getattr(error, "qualification_send_count", 0))
-            materializations = int(getattr(error, "qualification_materialization_count", 0))
-            return TextModelGateEvidence(error.code, materializations, sends)
-        return TextModelGateEvidence("image_modality_gate_missing", materializations, sends)
+        except _ModelExecutionFailure as error:
+            return TextModelGateEvidence(
+                error.error_code,
+                error.counts.attachment_materialization_count,
+                error.counts.response_send_count,
+                error.counts.gateway_factory_count,
+            )
+        return TextModelGateEvidence(
+            "image_modality_gate_missing",
+            execution.counts.attachment_materialization_count,
+            execution.counts.response_send_count,
+            execution.counts.gateway_factory_count,
+        )
 
     def verify_teardown(self) -> QualificationTeardownEvidence:
         auth_unchanged = self._auth_before is not None and self._auth_before == _AuthFileSnapshot.capture(
             self._auth_path
         )
-        root = self._working_root
-        if root is not None and root.exists():
+        owned_root = self._working_root
+        if owned_root is not None and owned_root.still_owns_path():
             gc.collect()
-            shutil.rmtree(root)
+            shutil.rmtree(owned_root.path)
         return QualificationTeardownEvidence(
             auth_unchanged=auth_unchanged,
-            temporary_state_removed=root is not None and not root.exists(),
+            temporary_state_removed=owned_root is not None and not owned_root.path.exists(),
         )
 
     def report_metadata(self) -> Mapping[str, str]:
@@ -551,39 +702,16 @@ class LiveOfferAgentQualificationEnvironment:
             }
         )
 
-    async def _execute_model(
+    async def _store_fixture_pages(
         self,
-        model: CodexCatalogModel,
-        account_binding: str,
+        attachments: _CountingAttachmentStore,
         fixture: SyntheticInterviewFixture,
         *,
-        expected_detail: str | None,
-        run_agent: bool,
-    ) -> tuple[Mapping[str, object] | None, int, int]:
-        catalog = self._catalog
-        root = self._working_root
-        if (
-            catalog is None
-            or catalog.catalog_revision is None
-            or catalog.fetched_at is None
-            or root is None
-            or model not in catalog.models
-        ):
-            raise QualificationFailure("qualification execution lacks its frozen catalog or fixture root")
-        self._execution_index += 1
-        execution_root = root / f"model-{self._execution_index:03d}"
-        clock = ManualClock(catalog.fetched_at)
-        token = CancellationScope(name=f"live-vision:{model.model_id}")
-        attachments = _CountingAttachmentStore(
-            execution_root / "attachments",
-            workspace_id="ws_live_vision",
-            clock=clock,
-            ids=DeterministicIdGenerator(),
-        )
-        session_id = f"ses_live_{self._execution_index:03d}"
-        turn_id = f"turn_live_{self._execution_index:03d}"
-        run_id = f"run_live_{self._execution_index:03d}"
-        artifacts = []
+        session_id: str,
+        turn_id: str,
+        cancellation: CancellationToken,
+    ) -> tuple[ArtifactRef, ...]:
+        artifacts: list[ArtifactRef] = []
         for page in fixture.pages:
             payload = page.path.read_bytes()
             begun = await attachments.begin(
@@ -595,12 +723,17 @@ class LiveOfferAgentQualificationEnvironment:
                     byte_length=len(payload),
                     content_hash=page.content_hash,
                 ),
-                token,
+                cancellation,
             )
             chunk_bytes = AttachmentLimits().max_chunk_bytes
             for offset in range(0, len(payload), chunk_bytes):
-                await attachments.append(begun.upload_id, offset, payload[offset : offset + chunk_bytes], token)
-            artifacts.append((await attachments.commit(begun.upload_id, token)).artifact)
+                await attachments.append(
+                    begun.upload_id,
+                    offset,
+                    payload[offset : offset + chunk_bytes],
+                    cancellation,
+                )
+            artifacts.append((await attachments.commit(begun.upload_id, cancellation)).artifact)
         await attachments.claim_submission(
             session_id,
             turn_id,
@@ -614,29 +747,26 @@ class LiveOfferAgentQualificationEnvironment:
                 )
                 for index, artifact in enumerate(artifacts)
             ),
-            token,
+            cancellation,
         )
-        config = HarnessConfig(
-            model=ModelSettings(
-                model=model.model_id,
-                account_binding=account_binding,
-                reasoning_effort="medium",
-                proxy_url=self._proxy_url,
-            )
-        )
-        prompt = (
-            "这是显式视觉资格测试。只读取三张用户图片，不调用任何工具。"
-            "按图片页码顺序合并跨页内容；最终回答只能是一个 JSON 对象，不要 Markdown。"
-            "字段必须是 company、role、rounds、pageOrder、crossPageQuestionId、"
-            "crossPageQuestion、finalPageTopic。不要从字段名猜值。"
-        )
-        command = StartTurnCommand(
+        return tuple(artifacts)
+
+    def _start_turn_command(
+        self,
+        model: CodexCatalogModel,
+        artifacts: Sequence[ArtifactRef],
+        *,
+        session_id: str,
+        turn_id: str,
+        config: HarnessConfig,
+    ) -> StartTurnCommand:
+        return StartTurnCommand(
             workspace_id="ws_live_vision",
             session_id=session_id,
             turn_id=turn_id,
             idempotency_key=f"qualification-{self._execution_index:03d}",
             input_blocks=(
-                {"type": "text", "text": prompt, "format": "markdown", "references": []},
+                {"type": "text", "text": _qualification_prompt(), "format": "markdown", "references": []},
                 *(
                     {"type": "image", "artifact": artifact.to_wire(), "altText": f"page {index}"}
                     for index, artifact in enumerate(artifacts, start=1)
@@ -644,21 +774,100 @@ class LiveOfferAgentQualificationEnvironment:
             ),
             run_config={
                 "model": model.model_id,
-                "reasoningEffort": "medium",
+                "reasoningEffort": "high",
                 "permissionMode": "read-only",
             },
             effective_config=config,
             effective_config_fingerprint=canonical_json_sha256(config.model_dump(mode="json")),
         )
-        binding = CodexRunBinding(model, catalog.catalog_revision, catalog.fetched_at, account_binding)
-        gateways: list[_CountingGateway] = []
 
-        def gateway_factory(settings: ModelSettings) -> _CountingGateway:
-            gateway = _CountingGateway(
+    @staticmethod
+    def _assert_ordered_user_images(
+        gateways: Sequence[_CapturingGateway],
+        fixture: SyntheticInterviewFixture,
+        expected_detail: str,
+    ) -> None:
+        first_request = next((request for gateway in gateways for request in gateway.requests), None)
+        if first_request is None:
+            raise QualificationFailure("completed qualification Run sent no model request")
+        image_messages = [
+            message for message in first_request.messages if any(block.kind == "image" for block in message.content)
+        ]
+        if len(image_messages) != 1 or image_messages[0].role is not ModelRole.USER:
+            raise QualificationFailure("qualification images were not bound to one USER message")
+        image_blocks = [block for block in image_messages[0].content if block.kind == "image"]
+        if [block.data.get("detail") for block in image_blocks] != [expected_detail] * len(fixture.pages):
+            raise QualificationFailure("qualification images did not use the catalog-selected detail")
+        if [block.data.get("contentHash") for block in image_blocks] != [page.content_hash for page in fixture.pages]:
+            raise QualificationFailure("qualification image order or content hashes changed before inference")
+
+    async def _execute_model(
+        self,
+        model: CodexCatalogModel,
+        account_binding: str,
+        fixture: SyntheticInterviewFixture,
+        *,
+        expected_detail: str | None,
+        run_agent: bool,
+    ) -> _ModelExecutionResult:
+        catalog = self._catalog
+        owned_root = self._working_root
+        if (
+            catalog is None
+            or catalog.catalog_revision is None
+            or catalog.fetched_at is None
+            or owned_root is None
+            or model not in catalog.models
+        ):
+            raise QualificationFailure("qualification execution lacks its frozen catalog or fixture root")
+        root = owned_root.path
+        self._execution_index += 1
+        execution_root = root / f"model-{self._execution_index:03d}"
+        clock = ManualClock(catalog.fetched_at)
+        token = CancellationScope(name=f"live-vision:{model.model_id}")
+        attachments = _CountingAttachmentStore(
+            execution_root / "attachments",
+            workspace_id="ws_live_vision",
+            clock=clock,
+            ids=DeterministicIdGenerator(),
+        )
+        session_id = f"ses_live_{self._execution_index:03d}"
+        turn_id = f"turn_live_{self._execution_index:03d}"
+        run_id = f"run_live_{self._execution_index:03d}"
+        artifacts = await self._store_fixture_pages(
+            attachments,
+            fixture,
+            session_id=session_id,
+            turn_id=turn_id,
+            cancellation=token,
+        )
+        config = HarnessConfig(
+            model=ModelSettings(
+                model=model.model_id,
+                account_binding=account_binding,
+                reasoning_effort="high",
+                proxy_url=self._proxy_url,
+            )
+        )
+        command = self._start_turn_command(
+            model,
+            artifacts,
+            session_id=session_id,
+            turn_id=turn_id,
+            config=config,
+        )
+        binding = CodexRunBinding(model, catalog.catalog_revision, catalog.fetched_at, account_binding)
+        gateways: list[_CapturingGateway] = []
+        network_audit = RecordingNetworkAuditSink()
+
+        def gateway_factory(settings: ModelSettings) -> _CapturingGateway:
+            gateway = _CapturingGateway(
                 compose_model_gateway(
                     settings,
-                    workspace_id="workspace:ws_live_vision",
+                    workspace_id="ws_live_vision",
                     network_enabled=True,
+                    network_audit=network_audit,
+                    clock=clock,
                     codex_credential_source=self._credentials,
                 )
             )
@@ -686,45 +895,42 @@ class LiveOfferAgentQualificationEnvironment:
             run_id=run_id,
             lineage=AgentLineage.root(run_id),
         )
+
+        def execution_counts() -> _ExecutionCounts:
+            return _ExecutionCounts(
+                response_send_count=sum(record.stage == "intent" for record in network_audit.records),
+                attachment_materialization_count=attachments.materialization_count,
+                gateway_factory_count=len(gateways),
+            )
+
         try:
             prepared = await factory.prepare_root(command, state, token, None)
         except RunPreparationFailure as error:
-            object.__setattr__(error, "qualification_send_count", sum(item.send_count for item in gateways))
-            object.__setattr__(error, "qualification_materialization_count", attachments.materialization_count)
-            raise
-        if expected_detail is None:
-            return None, sum(item.send_count for item in gateways), attachments.materialization_count
-        if not run_agent:
-            return None, sum(item.send_count for item in gateways), attachments.materialization_count
-        components = factory.build_prepared_root(command, state, prepared)
-        budget = BudgetLedger(components.budget, started_at=catalog.fetched_at)
-        state = replace(state, budget_checkpoint=await BudgetCheckpoint.capture(budget, now=catalog.fetched_at))
-        result = await run_agent_loop(
-            state,
-            planner=components.planner_factory(budget),
-            tool_kernel=components.tool_kernel_factory(budget),
-            recorder=_Recorder(),
-            budget=budget,
-            cancellation=token,
-            now=clock.utcnow,
-        )
-        sends = sum(item.send_count for item in gateways)
-        if result.phase is not RunPhase.COMPLETED:
-            return None, sends, attachments.materialization_count
-        first_request = next((request for gateway in gateways for request in gateway.requests), None)
-        if first_request is None:
-            raise QualificationFailure("completed qualification Run sent no model request")
-        image_messages = [
-            message for message in first_request.messages if any(block.kind == "image" for block in message.content)
-        ]
-        if len(image_messages) != 1 or image_messages[0].role is not ModelRole.USER:
-            raise QualificationFailure("qualification images were not bound to one USER message")
-        image_blocks = [block for block in image_messages[0].content if block.kind == "image"]
-        if [block.data.get("detail") for block in image_blocks] != [expected_detail] * len(fixture.pages):
-            raise QualificationFailure("qualification images did not use the catalog-selected detail")
-        if [block.data.get("contentHash") for block in image_blocks] != [page.content_hash for page in fixture.pages]:
-            raise QualificationFailure("qualification image order or content hashes changed before inference")
-        return _strict_semantic_json(result.assistant_text), sends, attachments.materialization_count
+            raise _ModelExecutionFailure(error.code, execution_counts()) from error
+        try:
+            if expected_detail is None or not run_agent:
+                return _ModelExecutionResult(None, execution_counts())
+            components = factory.build_prepared_root(command, state, prepared)
+            budget = BudgetLedger(components.budget, started_at=catalog.fetched_at)
+            state = replace(state, budget_checkpoint=await BudgetCheckpoint.capture(budget, now=catalog.fetched_at))
+            result = await run_agent_loop(
+                state,
+                planner=components.planner_factory(budget),
+                tool_kernel=components.tool_kernel_factory(budget),
+                recorder=_Recorder(),
+                budget=budget,
+                cancellation=token,
+                now=clock.utcnow,
+            )
+            if result.phase is not RunPhase.COMPLETED:
+                return _ModelExecutionResult(None, execution_counts())
+            self._assert_ordered_user_images(gateways, fixture, expected_detail)
+            return _ModelExecutionResult(_strict_semantic_json(result.assistant_text), execution_counts())
+        except Exception as error:
+            raise _ModelExecutionFailure(
+                f"qualification_{type(error).__name__}",
+                execution_counts(),
+            ) from error
 
 
 def _strict_semantic_json(value: str) -> Mapping[str, object]:

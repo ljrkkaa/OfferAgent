@@ -8,11 +8,14 @@ import pytest
 from scripts.live_codex_vision_qualification import (
     CodexVisionQualification,
     ImageModelEvidence,
+    LiveOfferAgentQualificationEnvironment,
     QualificationFailure,
     QualificationTeardownEvidence,
     SyntheticInterviewFixture,
     SyntheticInterviewFixtureGenerator,
     TextModelGateEvidence,
+    _missing_semantic_facts,
+    _qualification_prompt,
 )
 
 from offeragent_harness.providers.codex_subscription import (
@@ -77,6 +80,27 @@ def _valid_semantics() -> dict[str, object]:
     }
 
 
+def test_semantic_contract_names_every_field_without_disclosing_expected_facts() -> None:
+    prompt = _qualification_prompt()
+
+    for field in _valid_semantics():
+        assert f'"{field}"' in prompt
+    for expected_fact in ("星河科技", "后端工程师", "一面", "Q2", "订单", "灰度"):
+        assert expected_fact not in prompt
+    assert '"required"' in prompt
+    assert '"additionalProperties":false' in prompt
+
+
+def test_semantic_contract_rejects_extra_or_missing_fields() -> None:
+    extra = _valid_semantics()
+    extra["unexpected"] = "not allowed"
+    missing = _valid_semantics()
+    del missing["pageOrder"]
+
+    assert _missing_semantic_facts(extra) == ("semanticSchema",)
+    assert _missing_semantic_facts(missing) == ("semanticSchema", "pageOrder")
+
+
 class _MatrixEnvironment:
     def __init__(self, *, semantics: dict[str, dict[str, object]] | None = None) -> None:
         self.models: tuple[CodexCatalogModel, ...] = (
@@ -114,7 +138,7 @@ class _MatrixEnvironment:
     ) -> ImageModelEvidence:
         del account_binding, fixture
         self.image_calls.append((model.model_id, detail))
-        return ImageModelEvidence(self.semantics[model.model_id], 1, 3)
+        return ImageModelEvidence(self.semantics[model.model_id], 1, 3, 1)
 
     async def exercise_text_model_gate(
         self,
@@ -124,7 +148,7 @@ class _MatrixEnvironment:
     ) -> TextModelGateEvidence:
         del account_binding, fixture
         self.text_calls.append(model.model_id)
-        return TextModelGateEvidence("image_modality_unsupported", 0, 0)
+        return TextModelGateEvidence("image_modality_unsupported", 0, 0, 0)
 
     def verify_teardown(self) -> QualificationTeardownEvidence:
         return QualificationTeardownEvidence(auth_unchanged=True, temporary_state_removed=True)
@@ -187,7 +211,7 @@ async def test_provider_failure_is_reported_for_its_model_and_teardown_still_run
             detail: str,
         ) -> ImageModelEvidence:
             if model.model_id == "vision-high":
-                return ImageModelEvidence(None, 1, 3, error_code="provider_unreachable")
+                return ImageModelEvidence(None, 1, 3, 1, error_code="provider_unreachable")
             return await super().execute_image_model(model, account_binding, fixture, detail)
 
         def verify_teardown(self) -> QualificationTeardownEvidence:
@@ -215,7 +239,7 @@ async def test_text_model_with_any_send_does_not_count_as_locally_blocked(tmp_pa
             fixture: SyntheticInterviewFixture,
         ) -> TextModelGateEvidence:
             del model, account_binding, fixture
-            return TextModelGateEvidence("image_modality_unsupported", 0, 1)
+            return TextModelGateEvidence("image_modality_unsupported", 0, 1, 0)
 
     report = await CodexVisionQualification(_LeakyTextGateEnvironment()).run(tmp_path / "qualification")
 
@@ -223,6 +247,31 @@ async def test_text_model_with_any_send_does_not_count_as_locally_blocked(tmp_pa
     assert report.status == "failed"
     assert text_model.status == "failed"
     assert text_model.response_send_count == 1
+
+
+@pytest.mark.asyncio
+async def test_text_model_with_gateway_factory_activity_does_not_count_as_locally_blocked(tmp_path: Path) -> None:
+    class _LeakyTextFactoryEnvironment(_MatrixEnvironment):
+        async def exercise_text_model_gate(
+            self,
+            model: CodexCatalogModel,
+            account_binding: str,
+            fixture: SyntheticInterviewFixture,
+        ) -> TextModelGateEvidence:
+            del model, account_binding, fixture
+            return TextModelGateEvidence(
+                "image_modality_unsupported",
+                0,
+                0,
+                gateway_factory_count=1,
+            )
+
+    report = await CodexVisionQualification(_LeakyTextFactoryEnvironment()).run(tmp_path / "qualification")
+
+    text_model = next(item for item in report.models if item.model_id == "text-only")
+    assert report.status == "failed"
+    assert text_model.status == "failed"
+    assert text_model.gateway_factory_count == 1
 
 
 @pytest.mark.asyncio
@@ -264,3 +313,20 @@ async def test_unexpected_execution_failure_still_invokes_teardown(tmp_path: Pat
         await CodexVisionQualification(environment).run(tmp_path / "qualification")
 
     assert environment.teardown_calls == 1
+
+
+def test_live_environment_refuses_to_own_or_delete_an_existing_root(tmp_path: Path) -> None:
+    root = tmp_path / "existing"
+    root.mkdir()
+    sentinel = root / "user-owned.txt"
+    sentinel.write_text("preserve", encoding="utf-8")
+    environment = LiveOfferAgentQualificationEnvironment(
+        proxy_url="http://127.0.0.1:7896",
+        font_path=_test_font(),
+    )
+
+    with pytest.raises(QualificationFailure, match="must not already exist"):
+        environment.generate_fixture(root)
+
+    environment.verify_teardown()
+    assert sentinel.read_text(encoding="utf-8") == "preserve"

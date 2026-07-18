@@ -55,8 +55,9 @@ uv run pytest tests/acceptance/test_live_codex_vision.py -q -s
 启用后，缺失登录、代理、字体、实时目录或网络均为失败而不是 skip。测试在临时目录生成三页虚构中文面经，
 通过真实 `ConversationAttachmentStore`、`ProductionRunComponentsFactory`、canonical Agent Loop 和 Codex
 Subscription Responses gateway 验证每个目录声明的图片模型；文本模型必须在附件物化和网络发送前返回
-`image_modality_unsupported`。stdout 报告只包含模型、目录、素材 hash、发送计数和清理状态，不包含认证、
-原始后端响应或图片内容。素材和运行状态在结束时删除，Codex `auth.json` 必须保持不变。
+`image_modality_unsupported`，且 gateway factory 计数也必须为零。视觉回答由不含答案的固定 JSON Schema
+约束字段和类型，再由本地事实断言验证跨页语义。stdout 报告只包含模型、目录、素材 hash、工厂/网络发送计数
+和清理状态，不包含认证、原始后端响应或图片内容。素材和运行状态在结束时删除，Codex `auth.json` 必须保持不变。
 
 ## 执行和文件工具
 
