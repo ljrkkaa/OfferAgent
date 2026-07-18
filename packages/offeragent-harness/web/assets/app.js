@@ -2,7 +2,7 @@
   "use strict";
 
   const PROTOCOL_VERSION = "1.0";
-  const SCHEMA_HASH = "sha256:80d269d2ccf312c998f3d1eec68ab6340c983b42b2114481c5a8ffe0e885be79";
+  const SCHEMA_HASH = "sha256:c4a1b88139aa40ddcdf98b991a6d6aaa0b3dbc38f366e665679592066512d1b7";
   const CLIENT_VERSION = "0.1.0";
   const CODEX_SUBSCRIPTION_PROVIDER = "codex-subscription-experimental";
   const ARTIFACT_PAGE_BYTES = 65_536;

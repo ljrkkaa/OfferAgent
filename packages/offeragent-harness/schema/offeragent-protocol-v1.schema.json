@@ -1712,9 +1712,13 @@
         "tool.failed",
         "tool.unknown_outcome",
         "provider.unreachable",
+        "provider.rate_limited",
+        "provider.protocol_error",
         "provider.auth_required",
         "provider.context_overflow",
+        "provider.image_unsupported",
         "provider.unsupported",
+        "input.image_invalid",
         "internal.error"
       ],
       "title": "ErrorCode",

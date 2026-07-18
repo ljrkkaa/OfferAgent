@@ -54,6 +54,7 @@ class ContextFragment:
     content_hash: str | None = None
     role: ModelRole = ModelRole.USER
     model_blocks: tuple[ModelContentBlock, ...] = ()
+    verified_current_images: bool = False
 
     def __post_init__(self) -> None:
         if not self.fragment_id or not self.text:
@@ -82,6 +83,12 @@ class ContextFragment:
             or any(block.kind != "image" or block.binary_data is None for block in self.model_blocks)
         ):
             raise ValueError("ephemeral model blocks are supported only for user-input images")
+        if self.verified_current_images and (
+            not self.model_blocks
+            or self.layer is not ContextLayer.USER_INPUT
+            or self.sensitivity is not Sensitivity.PRIVATE
+        ):
+            raise ValueError("verified current images require private user-input image blocks")
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,7 +436,13 @@ class ContextManager:
         ):
             for fragment in fragments:
                 required = fragment.layer is ContextLayer.USER_INPUT
-                if not self._visibility.allows(fragment.sensitivity):
+                explicit_user_image = (
+                    required
+                    and fragment.sensitivity is Sensitivity.PRIVATE
+                    and bool(fragment.model_blocks)
+                    and fragment.verified_current_images
+                )
+                if not self._visibility.allows(fragment.sensitivity) and not explicit_user_image:
                     omitted.append(
                         OmittedContext(
                             fragment.fragment_id,
@@ -460,7 +473,11 @@ class ContextManager:
                     message = self._fragment_message(fragment)
                     projected = False
                 if _message_size(message) > self._budget.max_item_bytes:
-                    if can_reference and (not required or projection is ContextProjection.NORMAL):
+                    if (
+                        can_reference
+                        and not explicit_user_image
+                        and (not required or projection is ContextProjection.NORMAL)
+                    ):
                         message = self._fragment_reference_message(fragment, reason="item_budget")
                         projected = True
                     else:

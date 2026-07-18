@@ -141,6 +141,21 @@ async def test_dispatcher_checks_readiness_before_command_validation() -> None:
             ErrorCode.RESOURCE_CONFLICT,
             {"reason": "capacity_exceeded"},
         ),
+        (
+            lambda: AttachmentError("invalid_image", "private decoder detail"),
+            ErrorCode.INPUT_IMAGE_INVALID,
+            {"reason": "invalid_image"},
+        ),
+        (
+            lambda: AttachmentError("attachment_corrupt", "private integrity detail"),
+            ErrorCode.INPUT_IMAGE_INVALID,
+            {"reason": "attachment_corrupt"},
+        ),
+        (
+            lambda: AttachmentError("submission_too_large", "private capacity detail"),
+            ErrorCode.INPUT_IMAGE_INVALID,
+            {"reason": "submission_too_large"},
+        ),
         (lambda: asyncio.CancelledError("private cancellation reason"), ErrorCode.REQUEST_CANCELLED, {}),
         (lambda: RuntimeError("private internal failure"), ErrorCode.INTERNAL_ERROR, {}),
     ],

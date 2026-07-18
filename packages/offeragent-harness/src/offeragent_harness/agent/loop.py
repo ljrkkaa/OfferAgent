@@ -15,9 +15,10 @@ from offeragent_harness.ports import CancellationToken, HookLifecyclePort, Opera
 from offeragent_harness.tools import ToolCall, ToolDefinition, ToolResult, ToolResultStatus
 
 from .budgets import BudgetDelta, BudgetExceeded, BudgetLedger
+from .context_manager import ContextBudgetExceeded, ContextCompactionRequired
 from .model_planner import ModelProviderFailure
 from .planner import AuditedPlanningFailure, Planner, PlanningAttempt
-from .preparation import RunPreparationFailure, RunPreparationPort
+from .preparation import RunPreparationFailure, RunPreparationPort, safe_preparation_failure_details
 from .state import ALLOWED_PHASE_TRANSITIONS, RunControlMessage, RunPhase, RunState
 from .termination import evaluate_response_readiness
 
@@ -212,13 +213,22 @@ def _apply_hook_context_hints(target: object, outcome: HookOutcome) -> None:
 
 _MODEL_PROVIDER_ERROR_CODES: Mapping[str, ErrorCode] = {
     "auth_required": ErrorCode.AUTH_REQUIRED,
+    "auth_account_changed": ErrorCode.AUTH_REQUIRED,
     "insufficient_balance": ErrorCode.PROVIDER_UNREACHABLE,
     "provider_unreachable": ErrorCode.PROVIDER_UNREACHABLE,
     "provider_unavailable": ErrorCode.PROVIDER_UNREACHABLE,
-    "provider_rate_limited": ErrorCode.PROVIDER_UNREACHABLE,
+    "provider_rate_limited": ErrorCode.PROVIDER_RATE_LIMITED,
+    "provider_protocol_error": ErrorCode.PROVIDER_PROTOCOL_ERROR,
+    "provider_response_failed": ErrorCode.PROVIDER_PROTOCOL_ERROR,
+    "provider_http_error": ErrorCode.PROVIDER_PROTOCOL_ERROR,
+    "provider_audit_unavailable": ErrorCode.PROVIDER_PROTOCOL_ERROR,
+    "provider_internal_error": ErrorCode.PROVIDER_PROTOCOL_ERROR,
+    "provider_cancelled": ErrorCode.REQUEST_CANCELLED,
     "context_overflow": ErrorCode.PROVIDER_CONTEXT_OVERFLOW,
     "provider_configuration": ErrorCode.PROVIDER_UNSUPPORTED,
     "model_unsupported": ErrorCode.PROVIDER_UNSUPPORTED,
+    "image_unsupported": ErrorCode.PROVIDER_IMAGE_UNSUPPORTED,
+    "image_invalid": ErrorCode.INPUT_IMAGE_INVALID,
 }
 
 _PROVIDER_PROTOCOL_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -227,6 +237,10 @@ _PROVIDER_PROTOCOL_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 def _error_payload(cause: BaseException, *, category: str, cancelled: bool = False) -> dict[str, object]:
     if isinstance(cause, BudgetExceeded):
         code = ErrorCode.REQUEST_DEADLINE_EXCEEDED
+    elif isinstance(cause, (ContextBudgetExceeded, ContextCompactionRequired)):
+        code = ErrorCode.PROVIDER_CONTEXT_OVERFLOW
+    elif isinstance(cause, RunPreparationFailure):
+        code = cause.error_code
     elif isinstance(cause, ModelProviderFailure):
         code = _MODEL_PROVIDER_ERROR_CODES.get(cause.error.code, ErrorCode.INTERNAL_ERROR)
     else:
@@ -239,6 +253,7 @@ def _error_payload(cause: BaseException, *, category: str, cancelled: bool = Fal
     details: dict[str, object] = {"errorType": type(cause).__name__, "failureCategory": category}
     if isinstance(cause, RunPreparationFailure):
         details["preparationErrorCode"] = cause.code
+        details.update(safe_preparation_failure_details(cause))
     elif isinstance(cause, ModelProviderFailure):
         details["providerErrorCode"] = cause.error.code
         details["modelRequestId"] = cause.request_id

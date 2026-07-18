@@ -2,7 +2,7 @@
 
 from .budget_checkpoint import BudgetCheckpoint
 from .budgets import ArtifactByteReservation, BudgetDelta, BudgetExceeded, BudgetLedger, RunBudget
-from .preparation import RunPreparationFailure, RunPreparationPort
+from .preparation import RunPreparationFailure, RunPreparationPort, safe_preparation_failure_details
 
 __all__ = [
     "ArtifactByteReservation",
@@ -13,4 +13,5 @@ __all__ = [
     "RunBudget",
     "RunPreparationFailure",
     "RunPreparationPort",
+    "safe_preparation_failure_details",
 ]

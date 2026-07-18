@@ -29,7 +29,7 @@ from offeragent_harness.ports import (
 )
 from offeragent_harness.protocol._base import WireModel
 from offeragent_harness.protocol.common import PermissionMode, TurnSnapshot
-from offeragent_harness.protocol.content import ImageContentBlock
+from offeragent_harness.protocol.content import ArtifactSensitivity, ArtifactState, ImageContentBlock
 from offeragent_harness.protocol.messages import (
     COMMAND_REGISTRY,
     ApprovalResolveParams,
@@ -101,6 +101,7 @@ from .application_handlers import (
     web_launch_handlers,
 )
 from .approval_manager import ApprovalManager, ApprovalNotFound
+from .attachment_errors import AttachmentError
 from .config_service import ConfigService, ConfigUpdateCommand, WorkerConfigActivation
 from .conversation_attachments import (
     AttachmentClaim,
@@ -581,6 +582,16 @@ def _turn_handlers(
         input_blocks = tuple(item.to_wire() for item in params.input)
         if pinned is not None:
             input_blocks = (*input_blocks, pinned)
+        image_blocks = tuple(item for item in params.input if isinstance(item, ImageContentBlock))
+        if any(
+            block.artifact.sensitivity is not ArtifactSensitivity.PRIVATE
+            or block.artifact.state is not ArtifactState.COMPLETE
+            for block in image_blocks
+        ):
+            raise AttachmentError(
+                "metadata_conflict",
+                "Conversation images must reference complete private attachments",
+            )
         attachment_claims = tuple(
             AttachmentClaim(
                 artifact_id=block.artifact.artifact_id,
@@ -589,7 +600,7 @@ def _turn_handlers(
                 media_type=block.artifact.media_type,
                 byte_length=block.artifact.size_bytes,
             )
-            for order, block in enumerate(item for item in params.input if isinstance(item, ImageContentBlock))
+            for order, block in enumerate(image_blocks)
         )
         attachment_claim_created = False
         if attachment_claims:

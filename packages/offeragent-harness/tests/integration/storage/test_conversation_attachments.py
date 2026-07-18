@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from offeragent_harness.runtime import conversation_attachments as attachment_module
 from offeragent_harness.runtime.conversation_attachments import (
     AttachmentClaim,
     AttachmentError,
@@ -15,11 +19,26 @@ from offeragent_harness.runtime.conversation_attachments import (
 )
 from offeragent_harness.testing import DeterministicIdGenerator, ManualCancellationToken, ManualClock
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"offeragent-image"
-JPEG = b"\xff\xd8\xff\xe0" + b"offeragent-jpeg" + b"\xff\xd9"
-GIF_IMAGE = b"\x2c" + b"\x00\x00\x00\x00\x01\x00\x01\x00\x00" + b"\x02\x03\x02\x2c\x01\x00"
-STATIC_GIF = b"GIF89a" + b"\x01\x00\x01\x00\x80\x00\x00" + b"\x00\x00\x00\xff\xff\xff" + GIF_IMAGE + b"\x3b"
-ANIMATED_GIF = STATIC_GIF[:-1] + GIF_IMAGE + b"\x3b"
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP8zwACTGCSAQANHQEDgslx/wAAAABJRU5ErkJggg=="
+)
+JPEG = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0"
+    "Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy"
+    "MjL/wAARCAACAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQID"
+    "AAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlq"
+    "c3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3"
+    "+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEI"
+    "FEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImK"
+    "kpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDi"
+    "6KKK+ZP3E//Z"
+)
+WEBP = base64.b64decode("UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoCAAIAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=")
+STATIC_GIF = base64.b64decode("R0lGODdhAgACAIEAAP8AAAAAAAAAAAAAACwAAAAAAgACAAAIBgABCAQQEAA7")
+ANIMATED_GIF = base64.b64decode(
+    "R0lGODlhAgACAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAgACAAAIBgABCAQQEAAh+QQBCgAB"
+    "ACwAAAAAAgACAIEA/wAAAAAAAAAAAAAIBgABCAQQEAA7"
+)
 
 
 def digest(value: bytes) -> str:
@@ -42,6 +61,28 @@ def request(
         byte_length=len(payload),
         content_hash=digest(payload),
     )
+
+
+def test_decode_attestation_cache_is_bounded_lru(tmp_path: Path) -> None:
+    store = ConversationAttachmentStore(
+        tmp_path / "attachments",
+        workspace_id="ws_one",
+        clock=ManualClock(datetime(2026, 7, 17, tzinfo=timezone.utc)),
+        ids=DeterministicIdGenerator(),
+    )
+    maximum = attachment_module._MAX_DECODE_ATTESTATIONS
+
+    for index in range(maximum + 3):
+        store._remember_verified(  # type: ignore[arg-type]
+            SimpleNamespace(
+                artifact_id=f"art_{index:04d}",
+                content_hash=f"sha256:{index:064x}",
+            )
+        )
+
+    assert len(store._verified_files) == maximum
+    assert "art_0000" not in store._verified_files
+    assert f"art_{maximum + 2:04d}" in store._verified_files
 
 
 @pytest.mark.asyncio
@@ -84,6 +125,109 @@ async def test_chunked_upload_is_exactly_replayable_and_survives_restart(tmp_pat
     assert read.content == PNG[3:10]
     assert read.next_offset == 10
     assert read.complete is False
+    materialized = await reopened.read_all_for_conversation("ses_one", begun.artifact_id, token)
+    assert materialized.offset == 0
+    assert materialized.next_offset == len(PNG)
+    assert materialized.content == PNG
+    assert materialized.complete is True
+
+
+@pytest.mark.asyncio
+async def test_range_reads_decode_an_unchanged_committed_image_only_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock(datetime(2026, 7, 17, tzinfo=timezone.utc))
+    ids = DeterministicIdGenerator()
+    store = ConversationAttachmentStore(tmp_path / "attachments", workspace_id="ws_one", clock=clock, ids=ids)
+    token = ManualCancellationToken()
+    begun = await store.begin(request(), token)
+    await store.append(begun.upload_id, 0, PNG, token)
+    await store.commit(begun.upload_id, token)
+
+    reopened = ConversationAttachmentStore(tmp_path / "attachments", workspace_id="ws_one", clock=clock, ids=ids)
+    original = attachment_module._verify_decodable_static_image
+    decode_calls = 0
+
+    def count_decode(content: bytes, media_type: str) -> None:
+        nonlocal decode_calls
+        decode_calls += 1
+        original(content, media_type)
+
+    monkeypatch.setattr(attachment_module, "_verify_decodable_static_image", count_decode)
+
+    first = await reopened.read_for_conversation("ses_one", begun.artifact_id, 0, 8, token)
+    second = await reopened.read_for_conversation("ses_one", begun.artifact_id, first.next_offset, 8, token)
+
+    assert first.content + second.content == PNG[:16]
+    assert decode_calls == 1
+    assert len(reopened._verified_files) == 1
+
+    object_path = reopened.root / "objects" / begun.artifact_id
+    original_stat = object_path.stat()
+    corrupted = bytearray(PNG)
+    corrupted[-10] ^= 0x01
+    object_path.write_bytes(corrupted)
+    os.utime(object_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    with pytest.raises(AttachmentError) as corrupt:
+        await reopened.read_for_conversation("ses_one", begun.artifact_id, 0, 8, token)
+    assert corrupt.value.code == "attachment_corrupt"
+
+    await reopened.abort(begun.upload_id, token, session_id="ses_one")
+    assert reopened._verified_files == {}
+
+    second_upload = await reopened.begin(
+        request(session_id="ses_two", client_request_id="req_second"),
+        token,
+    )
+    await reopened.append(second_upload.upload_id, 0, PNG, token)
+    await reopened.commit(second_upload.upload_id, token)
+    await reopened.read_for_conversation("ses_two", second_upload.artifact_id, 0, 8, token)
+    assert len(reopened._verified_files) == 1
+
+    await reopened.delete_conversation("ses_two", token)
+    assert reopened._verified_files == {}
+
+
+@pytest.mark.asyncio
+async def test_claim_and_materialization_rehash_but_do_not_repeat_expensive_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = attachment_module._verify_decodable_static_image
+    decode_calls = 0
+
+    def count_decode(content: bytes, media_type: str) -> None:
+        nonlocal decode_calls
+        decode_calls += 1
+        original(content, media_type)
+
+    monkeypatch.setattr(attachment_module, "_verify_decodable_static_image", count_decode)
+    store = ConversationAttachmentStore(
+        tmp_path / "attachments",
+        workspace_id="ws_one",
+        clock=ManualClock(datetime(2026, 7, 17, tzinfo=timezone.utc)),
+        ids=DeterministicIdGenerator(),
+    )
+    token = ManualCancellationToken()
+    begun = await store.begin(request(), token)
+    await store.append(begun.upload_id, 0, PNG, token)
+    artifact = (await store.commit(begun.upload_id, token)).artifact
+    claim = AttachmentClaim(
+        artifact_id=artifact.artifact_id,
+        order=0,
+        content_hash=artifact.content_hash,
+        media_type=artifact.media_type,
+        byte_length=artifact.size_bytes,
+    )
+
+    await store.claim_submission("ses_one", "turn_one", (claim,), token)
+    first = await store.read_all_for_conversation("ses_one", artifact.artifact_id, token)
+    await store.claim_submission("ses_one", "turn_one", (claim,), token)
+    second = await store.read_all_for_conversation("ses_one", artifact.artifact_id, token)
+
+    assert first.content == second.content == PNG
+    assert decode_calls == 1
 
 
 @pytest.mark.asyncio
@@ -112,8 +256,33 @@ async def test_upload_limits_signatures_abort_and_expiry_fail_safely(tmp_path: P
     await store.append(wrong.upload_id, 0, b"not-an-image".ljust(len(PNG), b"!"), token)
     with pytest.raises(AttachmentError, match="signature"):
         await store.commit(wrong.upload_id, token)
-
     await store.abort(wrong.upload_id, token)
+
+    wrong_hash_request = AttachmentUploadRequest(
+        session_id="ses_one",
+        client_request_id="req_wrong_hash",
+        file_name="wrong-hash.png",
+        media_type="image/png",
+        byte_length=len(PNG),
+        content_hash="sha256:" + "0" * 64,
+    )
+    wrong_hash = await store.begin(wrong_hash_request, token)
+    await store.append(wrong_hash.upload_id, 0, PNG, token)
+    with pytest.raises(AttachmentError) as caught:
+        await store.commit(wrong_hash.upload_id, token)
+    assert caught.value.code == "invalid_image"
+    await store.abort(wrong_hash.upload_id, token)
+
+    malformed_payload = b"\x89PNG\r\n\x1a\n" + b"x" * (len(PNG) - 8)
+    malformed = await store.begin(
+        request(malformed_payload, client_request_id="req_malformed", file_name="malformed.png"),
+        token,
+    )
+    await store.append(malformed.upload_id, 0, malformed_payload, token)
+    with pytest.raises(AttachmentError, match=r"format|decode"):
+        await store.commit(malformed.upload_id, token)
+    await store.abort(malformed.upload_id, token)
+
     with pytest.raises(AttachmentError, match="unavailable"):
         await store.commit(wrong.upload_id, token)
 
@@ -133,7 +302,7 @@ async def test_upload_limits_signatures_abort_and_expiry_fail_safely(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_gif_validation_reads_frame_blocks_instead_of_compressed_payload_bytes(tmp_path: Path) -> None:
+async def test_image_decoder_accepts_static_gif_and_rejects_animation(tmp_path: Path) -> None:
     store = ConversationAttachmentStore(
         tmp_path / "attachments",
         workspace_id="ws_one",
@@ -153,7 +322,7 @@ async def test_gif_validation_reads_frame_blocks_instead_of_compressed_payload_b
         token,
     )
     await store.append(animated.upload_id, 0, ANIMATED_GIF, token)
-    with pytest.raises(AttachmentError, match="Animated GIF"):
+    with pytest.raises(AttachmentError, match="Animated image"):
         await store.commit(animated.upload_id, token)
 
 
@@ -168,7 +337,11 @@ async def test_claims_preserve_order_support_reuse_and_delete_only_with_the_conv
     token = ManualCancellationToken()
     committed = []
     for index, (payload, media_type, name) in enumerate(
-        ((PNG, "image/png", "first.png"), (JPEG, "image/jpeg", "second.jpg"))
+        (
+            (PNG, "image/png", "first.png"),
+            (JPEG, "image/jpeg", "second.jpg"),
+            (WEBP, "image/webp", "third.webp"),
+        )
     ):
         begun = await store.begin(
             request(
@@ -195,7 +368,7 @@ async def test_claims_preserve_order_support_reuse_and_delete_only_with_the_conv
     first_claim = await store.claim_submission_with_receipt("ses_one", "turn_one", claims, token)
     assert first_claim.created is True
     claimed = first_claim.attachments
-    assert [item.order for item in claimed] == [0, 1]
+    assert [item.order for item in claimed] == [0, 1, 2]
     duplicate_claim = await store.claim_submission_with_receipt("ses_one", "turn_one", claims, token)
     assert duplicate_claim.attachments == claimed
     assert duplicate_claim.created is False
@@ -219,6 +392,58 @@ async def test_claims_preserve_order_support_reuse_and_delete_only_with_the_conv
     await store.delete_conversation("ses_one", token)
     with pytest.raises(AttachmentError, match="unavailable"):
         await store.read(claimed[1].artifact_id, 0, 1024, token)
+
+
+@pytest.mark.parametrize(
+    ("max_images", "max_bytes"),
+    [(1, len(PNG) * 2), (2, len(PNG))],
+)
+@pytest.mark.asyncio
+async def test_invalid_submission_capacity_rejects_the_whole_ordered_batch(
+    tmp_path: Path,
+    max_images: int,
+    max_bytes: int,
+) -> None:
+    store = ConversationAttachmentStore(
+        tmp_path / f"attachments-{max_images}-{max_bytes}",
+        workspace_id="ws_one",
+        clock=ManualClock(datetime(2026, 7, 17, tzinfo=timezone.utc)),
+        ids=DeterministicIdGenerator(),
+        limits=AttachmentLimits(
+            max_image_bytes=len(PNG),
+            max_submission_images=max_images,
+            max_submission_bytes=max_bytes,
+            max_conversation_bytes=len(PNG) * 2,
+            max_total_bytes=len(PNG) * 2,
+        ),
+    )
+    token = ManualCancellationToken()
+    committed = []
+    for index in range(2):
+        begun = await store.begin(
+            request(PNG, client_request_id=f"req_capacity_{index}", file_name=f"page-{index}.png"),
+            token,
+        )
+        await store.append(begun.upload_id, 0, PNG, token)
+        committed.append((await store.commit(begun.upload_id, token)).artifact)
+    claims = tuple(
+        AttachmentClaim(
+            artifact_id=artifact.artifact_id,
+            order=index,
+            content_hash=artifact.content_hash,
+            media_type=artifact.media_type,
+            byte_length=artifact.size_bytes,
+        )
+        for index, artifact in enumerate(committed)
+    )
+
+    with pytest.raises(AttachmentError) as caught:
+        await store.claim_submission("ses_one", "turn_capacity", claims, token)
+
+    assert caught.value.code == "submission_too_large"
+    accepted = await store.claim_submission_with_receipt("ses_one", "turn_capacity", claims[:1], token)
+    assert accepted.created is True
+    assert [item.artifact_id for item in accepted.attachments] == [committed[0].artifact_id]
 
 
 @pytest.mark.asyncio

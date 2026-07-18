@@ -20,6 +20,7 @@ from offeragent_harness.agent import (
     RunBudget,
     RunPreparationFailure,
     RunPreparationPort,
+    safe_preparation_failure_details,
 )
 from offeragent_harness.agent.loop import AgentLoopFailure, RecoveredToolBatch, ToolKernel, run_agent_loop
 from offeragent_harness.agent.planner import Planner
@@ -1682,7 +1683,7 @@ class HarnessService:
                 "errorType": type(cause).__name__,
                 "failureCategory": cause.failure_category,
                 "preparationErrorCode": cause.code,
-                **cause.details,
+                **safe_preparation_failure_details(cause),
             }
         else:
             error_code = ErrorCode.INTERNAL_ERROR

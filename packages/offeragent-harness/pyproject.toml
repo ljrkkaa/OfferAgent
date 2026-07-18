@@ -23,6 +23,7 @@ dependencies = [
   "anyio>=4.8,<5",
   "httpx>=0.28,<1",
   "jsonschema>=4.23,<5",
+  "pillow>=11.3,<13",
   "pydantic>=2.11,<3",
   "typing-extensions>=4.12,<5; python_version < '3.11'",
 ]

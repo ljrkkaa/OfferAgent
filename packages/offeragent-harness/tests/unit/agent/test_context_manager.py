@@ -426,11 +426,12 @@ def test_user_input_keeps_ephemeral_image_bytes_out_of_projection_identity() -> 
         '{"type":"image","artifactId":"art_one"}',
         Sensitivity.PRIVATE,
         model_blocks=(image,),
+        verified_current_images=True,
     )
     manager = ContextManager(
         system_rules=("rule",),
         inputs=ContextInputs(user_input=(fragment,)),
-        visibility=ContextVisibilityPolicy.local_model(),
+        visibility=ContextVisibilityPolicy.cloud_model(),
         budget=ContextBudget.generous_default(),
     )
 
@@ -439,6 +440,116 @@ def test_user_input_keeps_ephemeral_image_bytes_out_of_projection_identity() -> 
     assert message.content[-1].kind == "image"
     assert message.content[-1].binary_data == b"\x89PNG\r\n\x1a\nimage"
     assert "binary_data" not in repr(message)
+
+
+def test_private_user_image_without_verified_current_attachment_provenance_is_denied() -> None:
+    image = ModelContentBlock(
+        "image",
+        {
+            "artifactId": "art_unverified",
+            "mediaType": "image/png",
+            "contentHash": "sha256:" + "5" * 64,
+        },
+        binary_data=b"\x89PNG\r\n\x1a\nunverified",
+    )
+    fragment = ContextFragment(
+        "unverified-private-image",
+        ContextLayer.USER_INPUT,
+        '{"type":"image"}',
+        Sensitivity.PRIVATE,
+        model_blocks=(image,),
+    )
+    manager = ContextManager(
+        system_rules=("rule",),
+        inputs=ContextInputs(user_input=(fragment,)),
+        visibility=ContextVisibilityPolicy.cloud_model(),
+        budget=ContextBudget.generous_default(),
+    )
+
+    window = manager.build(
+        replace(_state(), tool_results=(), tool_result_sensitivities={}),
+        purpose=ModelPurpose.PLANNING,
+    )
+
+    assert "unverified-private-image" not in window.included_context_ids
+    assert all(block.kind != "image" for message in window.messages for block in message.content)
+    with pytest.raises(ContextCompactionRequired):
+        window.ensure_model_ready()
+
+
+def test_oversized_current_user_image_requires_compaction_without_reference_downgrade() -> None:
+    image = ModelContentBlock(
+        "image",
+        {
+            "artifactId": "art_large",
+            "mediaType": "image/png",
+            "contentHash": "sha256:" + "3" * 64,
+        },
+        binary_data=b"\x89PNG\r\n\x1a\nimage",
+    )
+    fragment = ContextFragment(
+        "large-user-image",
+        ContextLayer.USER_INPUT,
+        "x" * 300_000,
+        Sensitivity.PRIVATE,
+        artifact_ids=("art_large",),
+        content_hash="sha256:" + "4" * 64,
+        model_blocks=(image,),
+        verified_current_images=True,
+    )
+    manager = ContextManager(
+        system_rules=("rule",),
+        inputs=ContextInputs(user_input=(fragment,)),
+        visibility=ContextVisibilityPolicy.cloud_model(),
+        budget=ContextBudget.generous_default(),
+    )
+
+    state = replace(_state(), tool_results=(), tool_result_sensitivities={})
+    window = manager.build(state, purpose=ModelPurpose.PLANNING)
+
+    assert "large-user-image" not in window.included_context_ids
+    assert any(
+        item.context_id == "large-user-image" and item.reason == "artifactization_required"
+        for item in window.omitted
+    )
+    assert all(block.kind != "context_reference" for message in window.messages for block in message.content)
+    with pytest.raises(ContextCompactionRequired):
+        window.ensure_model_ready()
+
+
+def test_secret_user_image_never_bypasses_cloud_visibility() -> None:
+    image = ModelContentBlock(
+        "image",
+        {
+            "artifactId": "art_secret",
+            "mediaType": "image/png",
+            "contentHash": "sha256:" + "2" * 64,
+        },
+        binary_data=b"\x89PNG\r\n\x1a\nsecret",
+    )
+    fragment = ContextFragment(
+        "secret-user-image",
+        ContextLayer.USER_INPUT,
+        '{"type":"image","artifactId":"art_secret"}',
+        Sensitivity.SECRET,
+        model_blocks=(image,),
+    )
+    manager = ContextManager(
+        system_rules=("rule",),
+        inputs=ContextInputs(user_input=(fragment,)),
+        visibility=ContextVisibilityPolicy.cloud_model(),
+        budget=ContextBudget.generous_default(),
+    )
+
+    window = manager.build(_state(), purpose=ModelPurpose.PLANNING)
+
+    assert "secret-user-image" not in window.included_context_ids
+    assert any(
+        item.context_id == "secret-user-image" and item.reason == "sensitivity_policy" for item in window.omitted
+    )
+    assert all(block.kind != "image" for message in window.messages for block in message.content)
+    with pytest.raises(ContextCompactionRequired):
+        window.ensure_model_ready()
 
 
 def test_overflow_reference_projection_preserves_control_and_structural_tool_evidence() -> None:

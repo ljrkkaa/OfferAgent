@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -69,6 +70,8 @@ class CodexCatalogHttpRequest:
     proxy_url: str | None = None
 
     def __post_init__(self) -> None:
+        if not math.isfinite(self.timeout_seconds) or not 0 < self.timeout_seconds <= 60:
+            raise ValueError("catalog HTTP timeout must be finite and within 60 seconds")
         if self.proxy_url is not None:
             _normalize_loopback_proxy(self.proxy_url)
 
@@ -329,11 +332,11 @@ class CodexSubscriptionModelModule:
         self._bound_account_fingerprint: str | None = None
         self._last_success: CodexModelCatalogSnapshot | None = None
 
-    def refresh(self) -> CodexModelCatalogSnapshot:
+    def refresh(self, *, timeout_seconds: float = 5.0) -> CodexModelCatalogSnapshot:
         """Return a fresh catalog or an explicitly display-only prior success."""
 
         with self._lock:
-            return self._refresh_locked()
+            return self._refresh_locked(timeout_seconds=timeout_seconds)
 
     def bind_for_run(self, model_id: str, account_binding: str) -> CodexRunBinding:
         """Refresh and freeze one exact model; display-only snapshots never bind."""
@@ -377,7 +380,12 @@ class CodexSubscriptionModelModule:
             expected_account_binding=account_binding,
         )
 
-    def _refresh_locked(self, *, expected_account_binding: str | None = None) -> CodexModelCatalogSnapshot:
+    def _refresh_locked(
+        self,
+        *,
+        expected_account_binding: str | None = None,
+        timeout_seconds: float = 5.0,
+    ) -> CodexModelCatalogSnapshot:
         try:
             raw_proxy = self._proxy_url()
             if raw_proxy is not None and not isinstance(raw_proxy, str):
@@ -418,6 +426,7 @@ class CodexSubscriptionModelModule:
                 request = CodexCatalogHttpRequest(
                     endpoint=CODEX_SUBSCRIPTION_MODELS_ENDPOINT,
                     headers=MappingProxyType(headers),
+                    timeout_seconds=timeout_seconds,
                     proxy_url=proxy_url,
                 )
                 try:

@@ -9,6 +9,7 @@ from typing import cast
 import pytest
 
 from offeragent_harness.agent.budgets import BudgetLedger, RunBudget
+from offeragent_harness.agent.context_manager import ContextCompactionRequired, ContextWindow
 from offeragent_harness.agent.loop import AgentLoopFailure, ToolExecution, run_agent_loop
 from offeragent_harness.agent.model_planner import ModelProviderFailure
 from offeragent_harness.agent.planner import PlanningAttempt, PlanningAttemptOutcome, PlanningStep
@@ -56,23 +57,39 @@ class ScriptedPlanner:
 
 
 class FailingPlanner:
+    def __init__(
+        self,
+        error_code: str = "provider_protocol_error",
+        *,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        self.error_code = error_code
+        self.details = details or {
+            "providerId": "deepseek",
+            "protocolReason": "terminal_metadata_missing",
+            "untrustedDetail": "must-not-cross-runtime-boundary",
+        }
+
     async def plan(self, state: RunState, cancellation: CancellationToken) -> PlanningStep:
         del state
         cancellation.checkpoint()
         raise ModelProviderFailure(
             "request-provider-failure",
             ModelError(
-                "provider_protocol_error",
+                self.error_code,
                 "model provider protocol failed",
                 False,
                 False,
-                {
-                    "providerId": "deepseek",
-                    "protocolReason": "terminal_metadata_missing",
-                    "untrustedDetail": "must-not-cross-runtime-boundary",
-                },
+                self.details,
             ),
         )
+
+
+class ContextFailingPlanner:
+    async def plan(self, state: RunState, cancellation: CancellationToken) -> PlanningStep:
+        del state
+        cancellation.checkpoint()
+        raise ContextCompactionRequired(cast(ContextWindow, object()))
 
 
 class Recorder:
@@ -378,6 +395,7 @@ async def test_provider_protocol_failure_persists_only_stable_safe_discriminator
     event, payload, terminal = recorder.events[-1]
     assert event == "turn.failed" and terminal
     error = cast(Mapping[str, object], payload["error"])
+    assert error["code"] == "provider.protocol_error"
     assert error["details"] == {
         "errorType": "ModelProviderFailure",
         "failureCategory": "model",
@@ -386,3 +404,61 @@ async def test_provider_protocol_failure_persists_only_stable_safe_discriminator
         "providerProtocolReason": "terminal_metadata_missing",
     }
     assert "must-not-cross-runtime-boundary" not in repr(payload)
+
+
+@pytest.mark.asyncio
+async def test_context_compaction_failure_maps_to_stable_context_overflow() -> None:
+    recorder = Recorder()
+
+    with pytest.raises(AgentLoopFailure):
+        await run_agent_loop(
+            _state(),
+            planner=ContextFailingPlanner(),
+            tool_kernel=Kernel(),
+            recorder=recorder,
+            budget=_budget(),
+            cancellation=CancellationScope(name="test-run"),
+            now=lambda: datetime.now(timezone.utc),
+        )
+
+    error = cast(Mapping[str, object], recorder.events[-1][1]["error"])
+    assert error["code"] == "provider.context_overflow"
+
+
+@pytest.mark.parametrize(
+    ("provider_code", "wire_code"),
+    [
+        ("auth_required", "provider.auth_required"),
+        ("auth_account_changed", "provider.auth_required"),
+        ("model_unsupported", "provider.unsupported"),
+        ("image_unsupported", "provider.image_unsupported"),
+        ("image_invalid", "input.image_invalid"),
+        ("context_overflow", "provider.context_overflow"),
+        ("provider_rate_limited", "provider.rate_limited"),
+        ("provider_unreachable", "provider.unreachable"),
+        ("provider_unavailable", "provider.unreachable"),
+        ("provider_protocol_error", "provider.protocol_error"),
+        ("provider_response_failed", "provider.protocol_error"),
+        ("provider_http_error", "provider.protocol_error"),
+        ("provider_audit_unavailable", "provider.protocol_error"),
+        ("provider_internal_error", "provider.protocol_error"),
+        ("provider_cancelled", "request.cancelled"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_provider_failures_have_stable_wire_categories(provider_code: str, wire_code: str) -> None:
+    recorder = Recorder()
+
+    with pytest.raises(AgentLoopFailure):
+        await run_agent_loop(
+            _state(),
+            planner=FailingPlanner(provider_code, details={"providerId": "codex"}),
+            tool_kernel=Kernel(),
+            recorder=recorder,
+            budget=_budget(),
+            cancellation=CancellationScope(name="test-run"),
+            now=lambda: datetime.now(timezone.utc),
+        )
+
+    error = cast(Mapping[str, object], recorder.events[-1][1]["error"])
+    assert error["code"] == wire_code

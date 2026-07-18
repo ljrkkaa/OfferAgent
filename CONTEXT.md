@@ -229,8 +229,8 @@ _Avoid_: CLI 包装器、Runtime 直接文件访问、模型执行 Shell
 _Avoid_: 根据模型名称猜测能力、把内部后端当成公开稳定协议
 
 **Vision Capability**:
-Provider 在当前后端和模型上经过实际探测后可用的原生图片理解能力；它读取用户明确提供的 Run Attachment，不依赖本地 OCR，也不能因其他模型支持图片而推断当前模型可用。
-_Avoid_: OCR Pipeline、按模型名称假定支持、把附件永久上传为知识库素材
+当前账户绑定的 Provider 模型目录为所选模型声明的原生图片理解能力；它只适用于该目录修订中的精确模型选择，并允许读取用户明确提供的 Run Attachment。目录未知或未声明图片输入时不得推断支持，也不依赖本地 OCR。
+_Avoid_: Synthetic Vision Probe、Vision Cache、OCR Pipeline、按模型名称假定支持、把附件永久上传为知识库素材
 
 **Research Browser**:
 OfferAgent 为用户发起的研究任务使用的隔离登录浏览器；它拥有独立于日常 Chrome 的 Profile，可根据研究目标自主跨站搜索、跳转、翻页和读取，但不发布内容或进行社交互动。

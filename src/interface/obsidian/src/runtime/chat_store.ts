@@ -329,9 +329,6 @@ export class ChatStore {
                 sessionSendKey = `session:${sessionId}`;
                 this.sendsInFlight.add(sessionSendKey);
                 const idempotencyKey = opaqueId("turn_");
-                if (options.attachments?.some((item) => item.type === "image")) {
-                    await this.client.requireVision(options.runConfig.provider, options.runConfig.model);
-                }
                 const input: ContentBlock[] = [{ type: "text", text: normalized }, ...(options.attachments ?? [])];
                 const result = requireJsonObject(await this.client.request("turn/start", {
                     sessionId,

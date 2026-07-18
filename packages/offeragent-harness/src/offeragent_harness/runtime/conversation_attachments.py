@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import os
 import re
 import sqlite3
 import threading
+import warnings
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from PIL import Image
 
 from offeragent_harness.ports import CancellationToken, Clock, IdGenerator
 from offeragent_harness.protocol.content import ArtifactRef, ArtifactSensitivity, ArtifactState
@@ -25,6 +30,14 @@ _UPLOAD_ID = re.compile(r"^upload_[A-Za-z0-9][A-Za-z0-9_-]{0,120}$")
 _ARTIFACT_ID = re.compile(r"^art_[A-Za-z0-9][A-Za-z0-9_-]{0,123}$")
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+_PIL_FORMATS = {
+    "image/png": "PNG",
+    "image/jpeg": "JPEG",
+    "image/gif": "GIF",
+    "image/webp": "WEBP",
+}
+_MAX_IMAGE_PIXELS = 40_000_000
+_MAX_DECODE_ATTESTATIONS = 256
 _FILE_NAME_FORBIDDEN = frozenset("/\\\x00\r\n")
 
 
@@ -196,6 +209,7 @@ class ConversationAttachmentStore:
         self._ids = ids
         self._limits = limits or AttachmentLimits()
         self._lock = threading.RLock()
+        self._verified_files: OrderedDict[str, str] = OrderedDict()
         self._ensure_layout()
 
     @property
@@ -285,6 +299,20 @@ class ConversationAttachmentStore:
         if offset < 0 or max_bytes < 1 or max_bytes > self._limits.max_chunk_bytes:
             raise ValueError("attachment read range is invalid")
         result = await asyncio.to_thread(self._read_sync, artifact_id, offset, max_bytes, session_id)
+        cancellation.checkpoint()
+        return result
+
+    async def read_all_for_conversation(
+        self,
+        session_id: str,
+        artifact_id: str,
+        cancellation: CancellationToken,
+    ) -> AttachmentReadReceipt:
+        """Materialize one owned immutable image with exactly one integrity/decode pass."""
+
+        cancellation.checkpoint()
+        _require_match(_SESSION_ID, session_id, "Session ID")
+        result = await asyncio.to_thread(self._read_all_sync, artifact_id, session_id)
         cancellation.checkpoint()
         return result
 
@@ -492,7 +520,7 @@ class ConversationAttachmentStore:
                     f"Attachment upload is incomplete at offset {record.received_bytes}",
                 )
             source = staging if staging.exists() else final
-            self._verify_image(source, record)
+            self._verify_image(source, record, hash_error_code="invalid_image")
             if staging.exists():
                 if final.exists():
                     self._verify_image(final, record)
@@ -516,6 +544,7 @@ class ConversationAttachmentStore:
                 record = self._by_upload(connection, upload_id)
                 if record is None:
                     raise AttachmentError("attachment_corrupt", "Committed attachment metadata disappeared")
+            self._remember_verified(record)
         return AttachmentCommitReceipt(upload_id, _artifact_ref(record), False)
 
     def _abort_sync(self, upload_id: str, session_id: str | None = None) -> None:
@@ -535,6 +564,7 @@ class ConversationAttachmentStore:
                 raise AttachmentError("attachment_claimed", "A claimed Conversation attachment cannot be aborted")
             for path in self._possible_paths(record.artifact_id):
                 path.unlink(missing_ok=True)
+            self._verified_files.pop(record.artifact_id, None)
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("DELETE FROM attachments WHERE upload_id = ?", (upload_id,))
             connection.commit()
@@ -552,14 +582,11 @@ class ConversationAttachmentStore:
             if record is None or record.status != "ready":
                 raise AttachmentError("attachment_unavailable", "Conversation attachment is unavailable")
             self._require_conversation(record, session_id)
-            self._verify_ready(record)
+            verified_content = self._verify_ready(record)
             if offset > record.byte_length:
                 raise AttachmentError("invalid_range", "Attachment read offset exceeds its byte length")
-            content = self._read_range(
-                self._final_path(artifact_id),
-                offset,
-                min(max_bytes, record.byte_length - offset),
-            )
+            length = min(max_bytes, record.byte_length - offset)
+            content = verified_content[offset : offset + length]
             next_offset = offset + len(content)
             return AttachmentReadReceipt(
                 _artifact_ref(record),
@@ -567,6 +594,22 @@ class ConversationAttachmentStore:
                 next_offset,
                 content,
                 next_offset == record.byte_length,
+            )
+
+    def _read_all_sync(self, artifact_id: str, session_id: str) -> AttachmentReadReceipt:
+        _require_match(_ARTIFACT_ID, artifact_id, "Artifact ID")
+        with self._lock, self._connect() as connection:
+            record = self._by_artifact(connection, artifact_id)
+            if record is None or record.status != "ready":
+                raise AttachmentError("attachment_unavailable", "Conversation attachment is unavailable")
+            self._require_conversation(record, session_id)
+            content = self._verify_ready(record)
+            return AttachmentReadReceipt(
+                _artifact_ref(record),
+                0,
+                record.byte_length,
+                content,
+                True,
             )
 
     def _claim_submission_sync(
@@ -653,6 +696,7 @@ class ConversationAttachmentStore:
             )
             connection.commit()
             for record in records:
+                self._verified_files.pop(record.artifact_id, None)
                 tombstone = self._deleting_path(record.artifact_id)
                 if tombstone.exists():
                     continue
@@ -668,6 +712,7 @@ class ConversationAttachmentStore:
             for record in records:
                 for path in self._possible_paths(record.artifact_id):
                     path.unlink(missing_ok=True)
+                self._verified_files.pop(record.artifact_id, None)
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("DELETE FROM attachments WHERE session_id = ?", (session_id,))
             connection.commit()
@@ -858,11 +903,29 @@ class ConversationAttachmentStore:
                 stream.flush()
                 os.fsync(stream.fileno())
 
-    def _verify_ready(self, record: _StoredAttachment) -> None:
-        self._verify_image(self._final_path(record.artifact_id), record)
+    def _verify_ready(self, record: _StoredAttachment) -> bytes:
+        content = self._verify_image(
+            self._final_path(record.artifact_id),
+            record,
+            decode=self._verified_files.get(record.artifact_id) != record.content_hash,
+        )
+        self._remember_verified(record)
+        return content
+
+    def _remember_verified(self, record: _StoredAttachment) -> None:
+        self._verified_files[record.artifact_id] = record.content_hash
+        self._verified_files.move_to_end(record.artifact_id)
+        while len(self._verified_files) > _MAX_DECODE_ATTESTATIONS:
+            self._verified_files.popitem(last=False)
 
     @staticmethod
-    def _verify_image(path: Path, record: _StoredAttachment) -> None:
+    def _verify_image(
+        path: Path,
+        record: _StoredAttachment,
+        *,
+        hash_error_code: str = "attachment_corrupt",
+        decode: bool = True,
+    ) -> bytes:
         try:
             content = path.read_bytes()
         except FileNotFoundError as error:
@@ -873,13 +936,10 @@ class ConversationAttachmentStore:
         if not _has_image_signature(content, record.media_type):
             raise AttachmentError("invalid_image", "Attachment bytes do not match the claimed image signature")
         if actual_hash != record.content_hash:
-            raise AttachmentError("attachment_corrupt", "Attachment content hash differs from committed metadata")
-        if record.media_type == "image/gif":
-            frame_count = _gif_frame_count(content)
-            if frame_count is None or frame_count == 0:
-                raise AttachmentError("invalid_image", "GIF attachment block structure is invalid")
-            if frame_count > 1:
-                raise AttachmentError("invalid_image", "Animated GIF attachments are not supported")
+            raise AttachmentError(hash_error_code, "Attachment content hash differs from committed metadata")
+        if decode:
+            _verify_decodable_static_image(content, record.media_type)
+        return content
 
     @staticmethod
     def _read_range(path: Path, offset: int, length: int) -> bytes:
@@ -977,53 +1037,28 @@ def _has_image_signature(content: bytes, media_type: str) -> bool:
     return False
 
 
-def _gif_frame_count(content: bytes) -> int | None:
-    """Count GIF image descriptors without inspecting compressed payload bytes."""
-    if len(content) < 13 or not content.startswith((b"GIF87a", b"GIF89a")):
-        return None
-    packed = content[10]
-    offset = 13
-    if packed & 0x80:
-        offset += 3 * (2 << (packed & 0x07))
-    frames = 0
-    while offset < len(content):
-        marker = content[offset]
-        if marker == 0x3B:
-            return frames if offset == len(content) - 1 else None
-        if marker == 0x21:
-            if offset + 2 > len(content):
-                return None
-            next_offset = _skip_gif_subblocks(content, offset + 2)
-            if next_offset is None:
-                return None
-            offset = next_offset
-            continue
-        if marker != 0x2C or offset + 10 > len(content):
-            return None
-        frames += 1
-        descriptor_packed = content[offset + 9]
-        offset += 10
-        if descriptor_packed & 0x80:
-            offset += 3 * (2 << (descriptor_packed & 0x07))
-        if offset >= len(content):
-            return None
-        next_offset = _skip_gif_subblocks(content, offset + 1)
-        if next_offset is None:
-            return None
-        offset = next_offset
-    return None
-
-
-def _skip_gif_subblocks(content: bytes, offset: int) -> int | None:
-    while offset < len(content):
-        byte_length = content[offset]
-        offset += 1
-        if byte_length == 0:
-            return offset
-        offset += byte_length
-        if offset > len(content):
-            return None
-    return None
+def _verify_decodable_static_image(content: bytes, media_type: str) -> None:
+    expected_format = _PIL_FORMATS[media_type]
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(content)) as image:
+                if image.format != expected_format:
+                    raise AttachmentError("invalid_image", "Attachment container does not match its media type")
+                width, height = image.size
+                if width < 1 or height < 1 or width * height > _MAX_IMAGE_PIXELS:
+                    raise AttachmentError("invalid_image", "Attachment image dimensions exceed the safe decode limit")
+                if getattr(image, "is_animated", False) or getattr(image, "n_frames", 1) != 1:
+                    raise AttachmentError("invalid_image", "Animated image attachments are not supported")
+                image.verify()
+            with Image.open(io.BytesIO(content)) as decoded:
+                decoded.load()
+    except AttachmentError:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as error:
+        raise AttachmentError("invalid_image", "Attachment image dimensions exceed the safe decode limit") from error
+    except (OSError, SyntaxError, ValueError) as error:
+        raise AttachmentError("invalid_image", "Attachment image format cannot be decoded safely") from error
 
 
 def _require_match(pattern: re.Pattern[str], value: str, label: str) -> None:

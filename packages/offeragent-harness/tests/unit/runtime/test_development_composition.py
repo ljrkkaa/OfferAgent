@@ -32,7 +32,6 @@ def test_production_bootstrap_persists_only_current_codex_configuration_fields()
     payload = _production_bootstrap_config_patch(HarnessConfig()).payload()
 
     assert payload["model"] == {
-        "model": "",
         "reasoning_effort": "medium",
         "proxy_url": None,
     }

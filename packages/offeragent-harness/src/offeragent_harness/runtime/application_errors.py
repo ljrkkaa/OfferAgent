@@ -35,6 +35,20 @@ def map_application_exception(error: BaseException) -> ProtocolViolation:
     if isinstance(error, ProtocolViolation):
         return error
     if isinstance(error, AttachmentError):
+        if error.code in {
+            "attachment_corrupt",
+            "attachment_too_large",
+            "invalid_image",
+            "invalid_order",
+            "metadata_conflict",
+            "ownership_mismatch",
+            "submission_too_large",
+        }:
+            return protocol_error(
+                ErrorCode.INPUT_IMAGE_INVALID,
+                "Conversation image input is invalid",
+                details={"reason": error.code},
+            )
         if error.code == "attachment_unavailable":
             return protocol_error(
                 ErrorCode.RESOURCE_NOT_FOUND,
@@ -123,6 +137,10 @@ def application_error_http_status(error: ErrorEnvelope) -> int:
         return 499
     if error.code is ErrorCode.REQUEST_DEADLINE_EXCEEDED:
         return 504
+    if error.code is ErrorCode.PROVIDER_RATE_LIMITED:
+        return 429
+    if error.code is ErrorCode.PROVIDER_PROTOCOL_ERROR:
+        return 502
     if error.code in {
         ErrorCode.RUNTIME_NOT_READY,
         ErrorCode.RUNTIME_SHUTTING_DOWN,

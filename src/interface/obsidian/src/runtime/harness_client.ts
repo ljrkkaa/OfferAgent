@@ -129,7 +129,6 @@ export class HarnessClient {
     private pingActive = false;
     private closeOperation: Promise<void> | null = null;
     private retiringPeer: JsonRpcPeer | null = null;
-    private readonly visionSupported = new Set<string>();
     private readonly attachmentUploads = new Map<string, { sessionId: string; uploadId: string }>();
 
     constructor(
@@ -301,29 +300,6 @@ export class HarnessClient {
             throw new Error("Retained attachment no longer matches its immutable metadata");
         }
         return new Uint8Array(content.buffer, content.byteOffset, content.byteLength);
-    }
-
-    /** Probe the selected model with fixed runtime-owned image content before a user image Run. */
-    async requireVision(provider: string, model: string, signal?: AbortSignal): Promise<void> {
-        if (!provider || !model) throw new TypeError("vision probe requires a provider and model");
-        const key = `${provider}\0${model}`;
-        if (this.visionSupported.has(key)) return;
-        const result = await this.request("models/health", {
-            provider,
-            model,
-            clientRequestId: `req_${randomBytes(16).toString("hex")}`,
-            deadline: new Date(Date.now() + 30_000).toISOString(),
-            capability: "vision",
-        }, { signal, timeoutMs: 35_000 });
-        if (result.capability !== "vision") throw new Error("Worker returned the wrong model capability probe");
-        if (result.status === "healthy") {
-            this.visionSupported.add(key);
-            return;
-        }
-        if (result.status === "unsupported") {
-            throw new Error("当前模型不支持图片输入；请改用文字描述或选择支持视觉的模型");
-        }
-        throw new Error("暂时无法确认当前模型的图片能力；请检查模型连接后重试，或改用文字描述");
     }
 
     async discardUploadedAttachment(sessionId: string, artifactId: string): Promise<boolean> {

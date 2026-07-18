@@ -1,10 +1,8 @@
-"""Config-snapshot model discovery and fixed-content provider health probes."""
+"""Catalog-backed model discovery and bounded text health checks."""
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from datetime import datetime, timedelta
@@ -38,6 +36,7 @@ from offeragent_harness.providers import model_secret_provider_id
 from offeragent_harness.providers.codex_subscription import (
     CODEX_SUBSCRIPTION_PROVIDER_ID,
     CodexCatalogError,
+    CodexModelCatalogSnapshot,
     CodexSubscriptionModelModule,
 )
 
@@ -50,7 +49,7 @@ _MAX_HEALTH_TIMEOUT = timedelta(seconds=60)
 
 
 class ProductionModelCommandService:
-    """Read current Config and probe only through the sole ModelGateway port."""
+    """Project the live catalog and run only an explicit text health request."""
 
     def __init__(
         self,
@@ -76,7 +75,6 @@ class ProductionModelCommandService:
         self._clock = clock
         self._ids = ids
         self._catalog = catalog
-        self._vision_status: dict[tuple[str, str], Literal["supported", "unsupported", "unverified"]] = {}
 
     async def list_models(
         self,
@@ -142,10 +140,7 @@ class ProductionModelCommandService:
             local=settings.provider is ModelProvider.LOCAL,
             supports_streaming=True,
             supports_structured_output=True,
-            input_modalities=[
-                "text",
-                *(("image",) if self._vision_status.get((provider, settings.model)) == "supported" else ()),
-            ],
+            input_modalities=["text"],
             supports_image_detail_original=False,
             supports_hosted_search=False,
             supports_fast_mode=False,
@@ -175,6 +170,77 @@ class ProductionModelCommandService:
                 "model_selection_unavailable",
                 capability=params.capability,
             )
+        if not snapshot.config.network.model_provider_enabled:
+            return self._result(
+                params.provider,
+                model,
+                "unreachable",
+                None,
+                "model_provider_network_disabled",
+                code=ErrorCode.PROVIDER_UNREACHABLE,
+                capability=params.capability,
+            )
+
+        now = self._clock.utcnow()
+        started = self._clock.monotonic()
+        deadline = _deadline(params.deadline, now)
+        if deadline <= now:
+            return self._result(
+                params.provider,
+                model,
+                "unreachable",
+                0,
+                "health_deadline_expired",
+                code=ErrorCode.REQUEST_DEADLINE_EXCEEDED,
+                capability=params.capability,
+            )
+        if self._catalog is not None:
+            remaining = max(0.0, (deadline - self._clock.utcnow()).total_seconds())
+            catalog, timed_out = await _refresh_catalog(
+                self._catalog,
+                cancellation,
+                timeout_seconds=remaining,
+            )
+            catalog_latency = _latency_ms(started, self._clock.monotonic())
+            if timed_out or self._clock.utcnow() >= deadline:
+                return self._result(
+                    params.provider,
+                    model,
+                    "unreachable",
+                    catalog_latency,
+                    "health_deadline_exceeded",
+                    code=ErrorCode.REQUEST_DEADLINE_EXCEEDED,
+                    capability=params.capability,
+                )
+            assert catalog is not None
+            catalog_failure = self._validate_catalog_selection(
+                catalog,
+                model=model,
+                account_binding=settings.account_binding,
+                capability=params.capability,
+                latency_ms=catalog_latency,
+            )
+            if catalog_failure is not None:
+                return catalog_failure
+            if params.capability == "vision":
+                return self._result(
+                    params.provider,
+                    model,
+                    "healthy",
+                    catalog_latency,
+                    None,
+                    capability="vision",
+                )
+        elif params.capability == "vision":
+            return self._result(
+                params.provider,
+                model,
+                "unsupported",
+                None,
+                "image_capability_unverified",
+                code=ErrorCode.PROVIDER_IMAGE_UNSUPPORTED,
+                capability="vision",
+            )
         available, availability_code = await self._availability(
             settings,
             snapshot.config.network.model_provider_enabled,
@@ -194,18 +260,6 @@ class ProductionModelCommandService:
                 capability=params.capability,
             )
 
-        now = self._clock.utcnow()
-        deadline = _deadline(params.deadline, now)
-        if deadline <= now:
-            return self._result(
-                params.provider,
-                model,
-                "unreachable",
-                0,
-                "health_deadline_expired",
-                code=ErrorCode.REQUEST_DEADLINE_EXCEEDED,
-                capability=params.capability,
-            )
         try:
             gateway = self._gateway_factory(settings, snapshot.config.network.model_provider_enabled)
         except Exception:
@@ -218,9 +272,6 @@ class ProductionModelCommandService:
                 capability=params.capability,
             )
 
-        probe_content = [ModelContentBlock.text("OfferAgent provider health probe. Reply exactly OK.")]
-        if params.capability == "vision":
-            probe_content.append(_vision_probe_block())
         request = ModelRequest(
             request_id=self._ids.new_id("model-health"),
             model=settings.model,
@@ -228,7 +279,7 @@ class ProductionModelCommandService:
             messages=(
                 ModelMessage(
                     ModelRole.SYSTEM,
-                    tuple(probe_content),
+                    (ModelContentBlock.text("OfferAgent provider health probe. Reply exactly OK."),),
                     name="offeragent-health-probe",
                 ),
             ),
@@ -246,7 +297,6 @@ class ProductionModelCommandService:
                 "capability": params.capability,
             },
         )
-        started = self._clock.monotonic()
         terminal: ModelEvent | None = None
         timed_out = False
         try:
@@ -287,8 +337,6 @@ class ProductionModelCommandService:
                 capability=params.capability,
             )
         if terminal.kind is ModelEventKind.COMPLETED:
-            if params.capability == "vision" and model is not None:
-                self._vision_status[(params.provider, model)] = "supported"
             return self._result(
                 params.provider,
                 model,
@@ -310,10 +358,6 @@ class ProductionModelCommandService:
         assert terminal.kind is ModelEventKind.ERROR and terminal.error is not None
         status, code = _error_status(terminal.error.code)
         reason = terminal.error.code
-        if params.capability == "vision" and status in {"degraded", "unsupported"}:
-            status, reason = "unsupported", "vision_unsupported"
-            if model is not None:
-                self._vision_status[(params.provider, model)] = "unsupported"
         return self._result(
             params.provider,
             model,
@@ -322,7 +366,68 @@ class ProductionModelCommandService:
             reason,
             code=code,
             capability=params.capability,
+            retryable=terminal.error.retryable,
         )
+
+    def _validate_catalog_selection(
+        self,
+        catalog: CodexModelCatalogSnapshot,
+        *,
+        model: str | None,
+        account_binding: str | None,
+        capability: Literal["text", "vision"],
+        latency_ms: int,
+    ) -> ModelsHealthResult | None:
+        if catalog.freshness != "fresh":
+            error = catalog.error
+            reason = error.code if error is not None else "catalog_unavailable"
+            auth = reason in {"auth_account_changed", "auth_required"}
+            return self._result(
+                CODEX_SUBSCRIPTION_PROVIDER_ID,
+                model,
+                "auth_required" if auth else "unreachable",
+                latency_ms,
+                reason,
+                code=ErrorCode.AUTH_REQUIRED if auth else ErrorCode.PROVIDER_UNREACHABLE,
+                capability=capability,
+            )
+        if catalog.account_binding != account_binding:
+            return self._result(
+                CODEX_SUBSCRIPTION_PROVIDER_ID,
+                model,
+                "auth_required",
+                latency_ms,
+                "auth_account_changed",
+                code=ErrorCode.AUTH_REQUIRED,
+                capability=capability,
+            )
+        selected = next((item for item in catalog.models if item.model_id == model), None)
+        if selected is None:
+            return self._result(
+                CODEX_SUBSCRIPTION_PROVIDER_ID,
+                model,
+                "unsupported",
+                latency_ms,
+                "model_unavailable",
+                code=ErrorCode.PROVIDER_UNSUPPORTED,
+                capability=capability,
+            )
+        required_modality = "image" if capability == "vision" else "text"
+        if required_modality not in selected.input_modalities:
+            return self._result(
+                CODEX_SUBSCRIPTION_PROVIDER_ID,
+                model,
+                "unsupported",
+                latency_ms,
+                "image_unsupported" if capability == "vision" else "text_unsupported",
+                code=(
+                    ErrorCode.PROVIDER_IMAGE_UNSUPPORTED
+                    if capability == "vision"
+                    else ErrorCode.PROVIDER_UNSUPPORTED
+                ),
+                capability=capability,
+            )
+        return None
 
     async def _snapshot(self) -> RunConfigSnapshot:
         return await self._config.snapshot(
@@ -366,12 +471,13 @@ class ProductionModelCommandService:
         *,
         code: ErrorCode | None = None,
         capability: Literal["text", "vision"] = "text",
+        retryable: bool | None = None,
     ) -> ModelsHealthResult:
         error = None
         if reason is not None:
             error = ErrorEnvelope(
                 code=code or ErrorCode.INTERNAL_ERROR,
-                retryable=status in {"degraded", "unreachable"},
+                retryable=status in {"degraded", "unreachable"} if retryable is None else retryable,
                 cancelled=False,
                 user_visible_message=_health_message(status),
                 details={"reason": reason},
@@ -387,21 +493,37 @@ class ProductionModelCommandService:
         )
 
 
-def _vision_probe_block() -> ModelContentBlock:
-    content = base64.b64decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-        validate=True,
+async def _refresh_catalog(
+    catalog: CodexSubscriptionModelModule,
+    cancellation: CancellationToken,
+    *,
+    timeout_seconds: float,
+) -> tuple[CodexModelCatalogSnapshot | None, bool]:
+    if timeout_seconds <= 0:
+        return None, True
+    refresh = asyncio.create_task(
+        asyncio.to_thread(catalog.refresh, timeout_seconds=min(timeout_seconds, 60.0))
     )
-    return ModelContentBlock(
-        "image",
-        {
-            "artifactId": "art_runtime_vision_probe",
-            "mediaType": "image/png",
-            "contentHash": f"sha256:{hashlib.sha256(content).hexdigest()}",
-            "fixedRuntimeProbe": True,
-        },
-        binary_data=content,
-    )
+    cancel_wait = asyncio.create_task(cancellation.wait())
+    try:
+        done, _ = await asyncio.wait(
+            (refresh, cancel_wait),
+            timeout=timeout_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if cancel_wait in done:
+            refresh.cancel()
+            await asyncio.gather(refresh, return_exceptions=True)
+            cancellation.checkpoint()
+        if refresh not in done:
+            refresh.cancel()
+            await asyncio.gather(refresh, return_exceptions=True)
+            return None, True
+        return await refresh, False
+    finally:
+        if not cancel_wait.done():
+            cancel_wait.cancel()
+        await asyncio.gather(cancel_wait, return_exceptions=True)
 
 
 async def _consume_probe(
@@ -467,16 +589,21 @@ def _latency_ms(started: float, finished: float) -> int:
 def _error_status(code: str) -> tuple[ModelHealthStatus, ErrorCode]:
     if code in {"auth_account_changed", "auth_required"}:
         return "auth_required", ErrorCode.AUTH_REQUIRED
-    if code in {
-        "insufficient_balance",
-        "provider_unreachable",
-        "provider_unavailable",
-        "provider_rate_limited",
-    }:
+    if code == "provider_rate_limited":
+        return "unreachable", ErrorCode.PROVIDER_RATE_LIMITED
+    if code in {"insufficient_balance", "provider_unreachable", "provider_unavailable"}:
         return "unreachable", ErrorCode.PROVIDER_UNREACHABLE
     if code in {"provider_configuration", "model_unsupported"}:
-        return "unsupported", ErrorCode.INTERNAL_ERROR
-    return "degraded", ErrorCode.INTERNAL_ERROR
+        return "unsupported", ErrorCode.PROVIDER_UNSUPPORTED
+    if code == "image_unsupported":
+        return "unsupported", ErrorCode.PROVIDER_IMAGE_UNSUPPORTED
+    if code == "image_invalid":
+        return "degraded", ErrorCode.INPUT_IMAGE_INVALID
+    if code == "context_overflow":
+        return "degraded", ErrorCode.PROVIDER_CONTEXT_OVERFLOW
+    if code == "provider_cancelled":
+        return "degraded", ErrorCode.REQUEST_CANCELLED
+    return "degraded", ErrorCode.PROVIDER_PROTOCOL_ERROR
 
 
 def _health_message(status: ModelHealthStatus) -> str:

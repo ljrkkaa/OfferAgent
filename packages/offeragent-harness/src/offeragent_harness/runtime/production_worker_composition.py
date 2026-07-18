@@ -97,7 +97,7 @@ from offeragent_harness.protocol._base import validate_wire
 from offeragent_harness.protocol.capabilities import CapabilitySet, ProtocolRange
 from offeragent_harness.protocol.common import PermissionMode as WirePermissionMode
 from offeragent_harness.protocol.common import RunConfigSnapshot as WireRunConfigSnapshot
-from offeragent_harness.protocol.content import ImageContentBlock
+from offeragent_harness.protocol.content import ArtifactSensitivity, ArtifactState, ImageContentBlock
 from offeragent_harness.protocol.events import stored_event_to_envelope
 from offeragent_harness.protocol.messages import RuntimeArch, RuntimeStatusResult, ShutdownResult
 from offeragent_harness.protocol.schemas import PROTOCOL_VERSION, schema_hash
@@ -129,6 +129,7 @@ from offeragent_harness.runtime.application_handlers import (
     compose_application_command_handlers,
 )
 from offeragent_harness.runtime.approval_manager import ApprovalManager
+from offeragent_harness.runtime.attachment_errors import AttachmentError
 from offeragent_harness.runtime.backpressure import BufferedEventSink
 from offeragent_harness.runtime.cancellation import CancellationScope
 from offeragent_harness.runtime.codex_credentials import CodexFileCredentialSource
@@ -734,6 +735,7 @@ class ProductionRunComponentsFactory(
             session_id=state.session_id,
             attachments=self._attachments,
             cancellation=cancellation,
+            model_binding=model_binding,
         )
         prepared = _PreparedProductionCapabilities(
             run_id=state.run_id,
@@ -1812,13 +1814,46 @@ async def _resolved_context_inputs(
     session_id: str,
     attachments: ConversationAttachmentStore | None,
     cancellation: CancellationToken,
+    model_binding: CodexRunBinding | None = None,
 ) -> ContextInputs:
+    has_images = any(block.get("type") == "image" for block in blocks)
+    if has_images:
+        if model_binding is None:
+            raise RunPreparationFailure(
+                "image_capability_unverified",
+                "Image input requires a verified Codex model binding",
+                retryable=False,
+                error_code=ErrorCode.PROVIDER_IMAGE_UNSUPPORTED,
+                failure_category="model",
+                details={"reason": "catalog_binding_unavailable"},
+            )
+        if "image" not in model_binding.model.input_modalities:
+            raise RunPreparationFailure(
+                "image_modality_unsupported",
+                "The selected Codex model does not support image input",
+                retryable=False,
+                error_code=ErrorCode.PROVIDER_IMAGE_UNSUPPORTED,
+                failure_category="model",
+                details={"modelId": model_binding.model.model_id},
+            )
+    image_detail = (
+        "original" if model_binding is not None and model_binding.model.supports_image_detail_original else "high"
+    )
     metadata: list[dict[str, Any]] = []
     images: list[ModelContentBlock] = []
     artifact_ids: list[str] = []
     for raw in blocks:
         cancellation.checkpoint()
-        block = dict(raw)
+        thawed = thaw_json(raw)
+        if not isinstance(thawed, Mapping):
+            raise RunPreparationFailure(
+                "image_input_invalid",
+                "The image submission metadata is invalid",
+                retryable=False,
+                error_code=ErrorCode.INPUT_IMAGE_INVALID,
+                failure_category="model",
+            )
+        block = dict(thawed)
         if block.get("type") == "pinnedContext":
             block["guidance"] = (
                 "Pinned Context is additive preferred context, not a whitelist and not evidence. "
@@ -1830,28 +1865,43 @@ async def _resolved_context_inputs(
             continue
         if attachments is None:
             raise ValueError("production image attachment resolver is unavailable")
-        image = validate_wire(ImageContentBlock, block)
-        artifact = image.artifact
-        content = bytearray()
-        offset = 0
-        while offset < artifact.size_bytes:
-            receipt = await attachments.read_for_conversation(
+        image_index = len(images)
+        try:
+            image = validate_wire(ImageContentBlock, block)
+            artifact = image.artifact
+            if artifact.sensitivity is not ArtifactSensitivity.PRIVATE or artifact.state is not ArtifactState.COMPLETE:
+                raise ValueError("Conversation image must be a complete private attachment")
+            receipt = await attachments.read_all_for_conversation(
                 session_id,
                 artifact.artifact_id,
-                offset,
-                min(65_536, artifact.size_bytes - offset),
                 cancellation,
             )
-            if receipt.offset != offset or receipt.next_offset <= offset:
-                raise ValueError("Conversation attachment read did not advance")
-            content.extend(receipt.content)
-            offset = receipt.next_offset
-        payload = bytes(content)
-        if (
-            len(payload) != artifact.size_bytes
-            or f"sha256:{hashlib.sha256(payload).hexdigest()}" != artifact.content_hash
-        ):
-            raise ValueError("Conversation attachment bytes differ from durable Turn metadata")
+            if receipt.offset != 0 or receipt.next_offset != artifact.size_bytes or not receipt.complete:
+                raise ValueError("Conversation attachment materialization is incomplete")
+            payload = receipt.content
+            if (
+                len(payload) != artifact.size_bytes
+                or f"sha256:{hashlib.sha256(payload).hexdigest()}" != artifact.content_hash
+            ):
+                raise ValueError("Conversation attachment bytes differ from durable Turn metadata")
+        except AttachmentError as error:
+            raise RunPreparationFailure(
+                "image_input_invalid",
+                "A Conversation image is unavailable or invalid",
+                retryable=False,
+                error_code=ErrorCode.INPUT_IMAGE_INVALID,
+                failure_category="model",
+                details={"imageIndex": image_index, "reason": error.code},
+            ) from error
+        except (TypeError, ValueError) as error:
+            raise RunPreparationFailure(
+                "image_input_invalid",
+                "A Conversation image is unavailable or invalid",
+                retryable=False,
+                error_code=ErrorCode.INPUT_IMAGE_INVALID,
+                failure_category="model",
+                details={"imageIndex": image_index, "reason": "metadata_or_bytes_invalid"},
+            ) from error
         images.append(
             ModelContentBlock(
                 "image",
@@ -1861,6 +1911,7 @@ async def _resolved_context_inputs(
                     "contentHash": artifact.content_hash,
                     "sizeBytes": artifact.size_bytes,
                     "altText": image.alt_text,
+                    "detail": image_detail,
                 },
                 binary_data=payload,
             )
@@ -1879,6 +1930,7 @@ async def _resolved_context_inputs(
                 artifact_ids=tuple(artifact_ids),
                 content_hash=canonical_json_sha256(metadata),
                 model_blocks=tuple(images),
+                verified_current_images=bool(images),
             ),
         )
     )

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -12,7 +14,7 @@ from offeragent_harness.adapters.local_artifacts import LocalArtifactStore
 from offeragent_harness.agent import BudgetCheckpoint, BudgetLedger, RunPreparationFailure
 from offeragent_harness.agent.state import RunState
 from offeragent_harness.config import HarnessConfig, ModelProvider
-from offeragent_harness.models import ModelEvent, ModelRequest
+from offeragent_harness.models import ModelEvent, ModelRequest, ModelRole
 from offeragent_harness.ports import CancellationToken
 from offeragent_harness.providers.codex_subscription import (
     CodexCatalogModel,
@@ -89,14 +91,19 @@ class _PolicyAudit:
         del record
 
 
-def _binding(model_id: str = "gpt-selected") -> CodexRunBinding:
+def _binding(
+    model_id: str = "gpt-selected",
+    *,
+    input_modalities: tuple[str, ...] = ("text",),
+    supports_image_detail_original: bool = False,
+) -> CodexRunBinding:
     return CodexRunBinding(
         model=CodexCatalogModel(
             model_id=model_id,
             display_name="GPT Selected",
             description=None,
-            input_modalities=("text",),
-            supports_image_detail_original=False,
+            input_modalities=input_modalities,
+            supports_image_detail_original=supports_image_detail_original,
             supports_hosted_search=True,
             web_search_tool_type="text",
             context_window=128_000,
@@ -160,6 +167,8 @@ def _factory(
     tmp_path: Path,
     module: _ModelModule,
     gateway_calls: list[Any],
+    *,
+    attachments: object | None = None,
 ) -> ProductionRunComponentsFactory:
     clock = ManualClock(NOW)
 
@@ -178,6 +187,7 @@ def _factory(
         policy_audit=_PolicyAudit(),  # type: ignore[arg-type]
         journal=object(),
         artifacts=LocalArtifactStore(tmp_path / "artifacts", workspace_id="ws_test"),
+        attachments=attachments,  # type: ignore[arg-type]
         local_transaction=None,
         parent_authorities=object(),  # type: ignore[arg-type]
     )
@@ -319,3 +329,135 @@ async def test_new_run_rejects_provider_or_model_drift_before_catalog_and_gatewa
 
     assert module.bind_calls == []
     assert gateway_calls == []
+
+
+@pytest.mark.asyncio
+async def test_text_only_catalog_model_rejects_images_before_attachment_or_inference_io(
+    tmp_path: Path,
+) -> None:
+    class _UnreadAttachments:
+        calls = 0
+
+        async def read_all_for_conversation(self, *args: object) -> object:
+            del args
+            self.calls += 1
+            raise AssertionError("text-only capability gate must run before attachment I/O")
+
+    attachments = _UnreadAttachments()
+    module = _ModelModule(_binding(input_modalities=("text",)))
+    gateway_calls: list[Any] = []
+    factory = _factory(tmp_path, module, gateway_calls, attachments=attachments)
+    command = replace(
+        _command(_config()),
+        input_blocks=(
+            {"type": "text", "text": "inspect", "format": "markdown", "references": []},
+            {
+                "type": "image",
+                "artifact": {
+                    "artifactId": "art_one",
+                    "contentHash": "sha256:" + "1" * 64,
+                    "mediaType": "image/png",
+                    "sizeBytes": 16,
+                    "sensitivity": "private",
+                },
+                "altText": "page one",
+            },
+        ),
+    )
+
+    with pytest.raises(RunPreparationFailure) as caught:
+        await factory.prepare_root(command, _state(), ManualCancellationToken(), None)  # type: ignore[arg-type]
+
+    assert caught.value.code == "image_modality_unsupported"
+    assert caught.value.error_code.value == "provider.image_unsupported"
+    assert attachments.calls == 0
+    assert gateway_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("supports_original", "expected_detail"),
+    [(False, "high"), (True, "original")],
+)
+async def test_current_turn_images_reach_one_user_request_in_order_with_catalog_detail(
+    tmp_path: Path,
+    supports_original: bool,
+    expected_detail: str,
+) -> None:
+    first = b"\x89PNG\r\n\x1a\nfirst-image"
+    second = b"\x89PNG\r\n\x1a\nsecond-image"
+
+    class _Attachments:
+        def __init__(self) -> None:
+            self.blobs = {"art_one": first, "art_two": second}
+            self.calls: list[str] = []
+
+        async def read_all_for_conversation(
+            self,
+            session_id: str,
+            artifact_id: str,
+            cancellation: CancellationToken,
+        ) -> object:
+            assert session_id == "ses_test"
+            cancellation.checkpoint()
+            blob = self.blobs[artifact_id]
+            self.calls.append(artifact_id)
+            return SimpleNamespace(
+                offset=0,
+                next_offset=len(blob),
+                content=blob,
+                complete=True,
+            )
+
+    def image_block(artifact_id: str, payload: bytes, alt_text: str) -> dict[str, object]:
+        return {
+            "type": "image",
+            "artifact": {
+                "artifactId": artifact_id,
+                "contentHash": "sha256:" + hashlib.sha256(payload).hexdigest(),
+                "mediaType": "image/png",
+                "sizeBytes": len(payload),
+                "sensitivity": "private",
+                "state": "complete",
+            },
+            "altText": alt_text,
+        }
+
+    attachments = _Attachments()
+    module = _ModelModule(
+        _binding(
+            input_modalities=("text", "image"),
+            supports_image_detail_original=supports_original,
+        )
+    )
+    gateway_calls: list[Any] = []
+    factory = _factory(tmp_path, module, gateway_calls, attachments=attachments)
+    command = replace(
+        _command(_config()),
+        input_blocks=(
+            {"type": "text", "text": "compare", "format": "markdown", "references": []},
+            image_block("art_one", first, "first"),
+            image_block("art_two", second, "second"),
+        ),
+    )
+
+    prepared = await factory.prepare_root(command, _state(), ManualCancellationToken(), None)  # type: ignore[arg-type]
+    components = factory.build_prepared_root(command, _state(), prepared)
+    ledger = BudgetLedger(components.budget, started_at=NOW)
+    request_state = replace(
+        _state(),
+        budget_checkpoint=await BudgetCheckpoint.capture(ledger, now=NOW),
+    )
+    request = components.planner_factory(ledger).create_request(request_state)
+
+    image_messages = [
+        message for message in request.messages if any(block.kind == "image" for block in message.content)
+    ]
+    assert len(image_messages) == 1
+    assert image_messages[0].role is ModelRole.USER
+    images = [block for block in image_messages[0].content if block.kind == "image"]
+    assert [block.binary_data for block in images] == [first, second]
+    assert [block.data["artifactId"] for block in images] == ["art_one", "art_two"]
+    assert [block.data["detail"] for block in images] == [expected_detail, expected_detail]
+    assert attachments.calls == ["art_one", "art_two"]
+    assert len(gateway_calls) == 1

@@ -39,6 +39,7 @@ from offeragent_harness.providers import (
     compose_model_gateway,
     model_secret_provider_id,
 )
+from offeragent_harness.runtime.conversation_attachments import AttachmentLimits
 from offeragent_harness.testing.cancellation import ManualCancellationToken
 from offeragent_harness.testing.errors import FakeRunCancelled
 
@@ -127,6 +128,13 @@ def _gateway(
         endpoint_policy=StaticModelEndpointPolicy(frozenset({config.endpoint})),
         transport=handler,
     )
+
+
+def test_default_request_ceiling_covers_one_maximum_attachment_batch_as_data_urls() -> None:
+    raw_image_bytes = AttachmentLimits().max_submission_bytes
+    base64_bytes = 4 * ((raw_image_bytes + 2) // 3)
+
+    assert _config().max_request_bytes >= base64_bytes + 8 * 1024 * 1024
 
 
 def _sse(*events: dict[str, object]) -> bytes:
@@ -277,8 +285,19 @@ async def test_structured_output_is_parsed_and_schema_validated_before_emission(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status,retryable", [(401, False), (429, True), (503, True)])
-async def test_http_errors_are_redacted_and_classified(status: int, retryable: bool) -> None:
+@pytest.mark.parametrize(
+    ("status", "expected_code", "retryable"),
+    [
+        (401, "auth_required", False),
+        (429, "provider_rate_limited", True),
+        (503, "provider_unavailable", True),
+    ],
+)
+async def test_http_errors_are_redacted_and_classified(
+    status: int,
+    expected_code: str,
+    retryable: bool,
+) -> None:
     secret = "must-never-appear"
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -288,7 +307,35 @@ async def test_http_errors_are_redacted_and_classified(status: int, retryable: b
     events = await _collect(_gateway(httpx.MockTransport(handler), resolver), _request())
 
     assert [event.kind for event in events] == [ModelEventKind.STARTED, ModelEventKind.ERROR]
-    assert events[-1].error is not None and events[-1].error.retryable is retryable
+    assert events[-1].error is not None and events[-1].error.code == expected_code
+    assert events[-1].error.retryable is retryable
+    assert secret not in repr(events[-1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_code", "expected_code"),
+    [
+        ("invalid_image", "image_invalid"),
+        ("invalid_image_format", "image_invalid"),
+        ("unsupported_image_media_type", "image_unsupported"),
+        ("image_not_supported", "image_unsupported"),
+        ("unknown_bounded_failure", "provider_protocol_error"),
+    ],
+)
+async def test_http_image_and_unknown_failures_use_bounded_typed_discriminators(
+    provider_code: str,
+    expected_code: str,
+) -> None:
+    secret = "must-not-cross-the-provider-boundary"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"code": provider_code, "message": secret}})
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request())
+
+    assert events[-1].error is not None and events[-1].error.code == expected_code
+    assert events[-1].error.retryable is False
     assert secret not in repr(events[-1])
 
 
@@ -345,6 +392,47 @@ async def test_sse_context_overflow_is_typed_and_body_message_is_not_exposed() -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_code", "expected_code", "retryable"),
+    [
+        ("authentication_error", "auth_required", False),
+        ("model_not_found", "model_unsupported", False),
+        ("invalid_image_url", "image_invalid", False),
+        ("unsupported_image", "image_unsupported", False),
+        ("rate_limit_exceeded", "provider_rate_limited", True),
+        ("server_error", "provider_unavailable", True),
+        ("unknown_bounded_failure", "provider_protocol_error", False),
+    ],
+)
+async def test_sse_provider_failures_share_stable_redacted_classification(
+    provider_code: str,
+    expected_code: str,
+    retryable: bool,
+) -> None:
+    secret = "private response body"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.failed",
+                    "sequence_number": 1,
+                    "response": {"status": "failed", "error": {"code": provider_code, "message": secret}},
+                },
+            ),
+        )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request())
+
+    assert events[-1].error is not None and events[-1].error.code == expected_code
+    assert events[-1].error.retryable is retryable
+    assert secret not in repr(events[-1])
+
+
+@pytest.mark.asyncio
 async def test_unstructured_overflow_words_never_trigger_typed_context_overflow() -> None:
     secret = "context_length_exceeded plus private prompt"
 
@@ -363,7 +451,7 @@ async def test_unstructured_overflow_words_never_trigger_typed_context_overflow(
 
     events = await _collect(_gateway(httpx.MockTransport(handler)), _request())
 
-    assert events[-1].error is not None and events[-1].error.code == "provider_response_failed"
+    assert events[-1].error is not None and events[-1].error.code == "provider_protocol_error"
     assert secret not in repr(events[-1])
 
 
@@ -407,7 +495,8 @@ async def test_schema_invalid_object_is_emitted_for_canonical_agent_step_validat
 
 
 @pytest.mark.asyncio
-async def test_image_block_is_encoded_as_an_ephemeral_responses_data_url() -> None:
+@pytest.mark.parametrize("detail", ["high", "original"])
+async def test_image_block_is_encoded_as_an_ephemeral_responses_data_url(detail: str) -> None:
     captured: dict[str, object] = {}
     png = b"\x89PNG\r\n\x1a\n" + b"offeragent-image"
 
@@ -436,6 +525,7 @@ async def test_image_block_is_encoded_as_an_ephemeral_responses_data_url() -> No
                             "artifactId": "art_one",
                             "mediaType": "image/png",
                             "contentHash": "sha256:" + hashlib.sha256(png).hexdigest(),
+                            "detail": detail,
                         },
                         binary_data=png,
                     ),
@@ -451,9 +541,47 @@ async def test_image_block_is_encoded_as_an_ephemeral_responses_data_url() -> No
     assert content[1] == {
         "type": "input_image",
         "image_url": "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
-        "detail": "auto",
+        "detail": detail,
     }
     assert "binary_data" not in repr(request.messages)
+
+
+@pytest.mark.parametrize("role", [ModelRole.SYSTEM, ModelRole.ASSISTANT])
+@pytest.mark.asyncio
+async def test_non_user_image_is_rejected_before_provider_http(role: ModelRole) -> None:
+    calls = 0
+    png = b"\x89PNG\r\n\x1a\n" + b"offeragent-image"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=_sse(_completed("must-not-run")), request=request)
+
+    request = replace(
+        _request(),
+        messages=(
+            ModelMessage(
+                role,
+                (
+                    ModelContentBlock(
+                        "image",
+                        {
+                            "mediaType": "image/png",
+                            "contentHash": "sha256:" + hashlib.sha256(png).hexdigest(),
+                            "detail": "high",
+                        },
+                        binary_data=png,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), request)
+
+    assert calls == 0
+    assert events[-1].kind is ModelEventKind.ERROR
+    assert events[-1].error is not None and events[-1].error.code == "provider_protocol_error"
 
 
 @pytest.mark.asyncio
@@ -560,6 +688,70 @@ async def test_transport_failure_after_output_is_never_retried_or_duplicated() -
         ModelEventKind.ERROR,
     ]
     assert events[-1].error is not None and events[-1].error.code == "provider_unreachable"
+
+
+@pytest.mark.asyncio
+async def test_http_conflict_remains_retryable_without_reflecting_response_body() -> None:
+    calls = 0
+    secret = "private conflict body"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                409,
+                headers={"content-type": "application/json"},
+                json={"error": {"code": "conflict", "message": secret}},
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.output_text.delta",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "recovered",
+                },
+                {
+                    "type": "response.output_text.done",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": "recovered",
+                },
+                _completed("recovered"),
+            ),
+        )
+
+    config = replace(
+        _config(),
+        max_retries=1,
+        retry_base_seconds=0,
+        retry_max_seconds=0,
+        retry_jitter_ratio=0,
+    )
+    events = await _collect(_gateway(httpx.MockTransport(handler), config=config), _request())
+
+    assert calls == 2
+    assert events[-1].kind is ModelEventKind.COMPLETED
+    assert secret not in repr(events)
+
+
+@pytest.mark.asyncio
+async def test_remote_protocol_failure_is_not_misclassified_as_network_unreachable() -> None:
+    secret = "private remote protocol text"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError(secret, request=request)
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request())
+
+    assert events[-1].error is not None and events[-1].error.code == "provider_protocol_error"
+    assert secret not in repr(events[-1])
 
 
 class _BlockingStream(httpx.SyncByteStream):

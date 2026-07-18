@@ -41,10 +41,6 @@ function createClient(handler, options = {}) {
             for (const event of page.events ?? []) reducer.accept(event);
             return structuredClone(page.runCursors ?? runCursors);
         },
-        async requireVision(provider, model) {
-            options.onVisionProbe?.(provider, model);
-            if (options.visionError) throw options.visionError;
-        },
     };
 }
 
@@ -453,10 +449,9 @@ test("send creates a Session then submits one typed turn/start command", async (
     assert.equal(store.activeTab.sessionId, "ses_01J00000000000000000000000");
 });
 
-test("ordered images remain in one submission after a vision capability probe", async () => {
+test("ordered images remain in one submission without a capability probe", async () => {
     const { ChatStore } = loadModule("chat_store.ts");
     const calls = [];
-    const probes = [];
     const client = createClient(async (method, params) => {
         calls.push([method, params]);
         if (method === "session/create") return {
@@ -471,7 +466,7 @@ test("ordered images remain in one submission after a vision capability probe", 
             duplicate: false,
         };
         throw new Error(`unexpected method: ${method}`);
-    }, { onVisionProbe: (provider, model) => probes.push([provider, model]) });
+    });
     const store = new ChatStore(client, memoryPersistence());
     await store.initialize();
     const artifact = (id) => ({
@@ -491,7 +486,7 @@ test("ordered images remain in one submission after a vision capability probe", 
         attachments: [artifact("art_one"), artifact("art_two")],
     });
 
-    assert.deepEqual(probes, [["openai", "gpt-vision"]]);
+    assert.deepEqual(calls.map(([method]) => method), ["session/create", "turn/start"]);
     const start = calls.find(([method]) => method === "turn/start")[1];
     assert.deepEqual(start.input.map((item) => item.type), ["text", "image", "image"]);
     assert.deepEqual(start.input.slice(1).map((item) => item.artifact.artifactId), ["art_one", "art_two"]);

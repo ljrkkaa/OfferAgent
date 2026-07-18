@@ -55,9 +55,13 @@ class ErrorCode(str, Enum):
     TOOL_FAILED = "tool.failed"
     TOOL_UNKNOWN_OUTCOME = "tool.unknown_outcome"
     PROVIDER_UNREACHABLE = "provider.unreachable"
+    PROVIDER_RATE_LIMITED = "provider.rate_limited"
+    PROVIDER_PROTOCOL_ERROR = "provider.protocol_error"
     AUTH_REQUIRED = "provider.auth_required"
     PROVIDER_CONTEXT_OVERFLOW = "provider.context_overflow"
+    PROVIDER_IMAGE_UNSUPPORTED = "provider.image_unsupported"
     PROVIDER_UNSUPPORTED = "provider.unsupported"
+    INPUT_IMAGE_INVALID = "input.image_invalid"
     INTERNAL_ERROR = "internal.error"
 
 

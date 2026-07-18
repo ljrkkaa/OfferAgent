@@ -247,39 +247,6 @@ test("attachment helper keeps ordered bytes behind bounded commands and verifies
     await client.close();
 });
 
-test("vision capability is probed once and unsupported models get an actionable choice", async () => {
-    const { HarnessClient } = loadModule("harness_client.ts");
-    let probes = 0;
-    const peer = {
-        onNotification: () => () => undefined,
-        request: async (method, params) => {
-            if (method === "initialize") return initializeResult();
-            if (method === "models/health") {
-                probes += 1;
-                assert.equal(params.capability, "vision");
-                return {
-                    provider: params.provider,
-                    model: params.model,
-                    status: params.model === "gpt-vision" ? "healthy" : "unsupported",
-                    checkedAt: "2026-07-17T00:00:00+00:00",
-                    latencyMs: 1,
-                    error: null,
-                    capability: "vision",
-                };
-            }
-            throw new Error(`unexpected method: ${method}`);
-        },
-        close: async () => undefined,
-    };
-    const client = new HarnessClient({ connect: async () => peer }, context(), { pingIntervalMs: 60_000 });
-    await client.connect();
-    await client.requireVision("openai", "gpt-vision");
-    await client.requireVision("openai", "gpt-vision");
-    await assert.rejects(client.requireVision("openai", "text-only"), /文字描述|支持视觉/);
-    assert.equal(probes, 2);
-    await client.close();
-});
-
 test("non-RPC Harness close starts transport teardown synchronously and tracks its join", async () => {
     const { HarnessClient } = loadModule("harness_client.ts");
     const joined = deferred();

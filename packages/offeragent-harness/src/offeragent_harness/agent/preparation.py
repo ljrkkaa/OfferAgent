@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Protocol
@@ -10,6 +11,9 @@ from offeragent_harness.error_codes import ErrorCode
 from offeragent_harness.ports.cancellation import CancellationToken
 
 from .state import RunPhase, RunState
+
+_DETAIL_TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 
 
 class RunPreparationFailure(RuntimeError):
@@ -46,4 +50,21 @@ class RunPreparationPort(Protocol):
     ) -> None: ...
 
 
-__all__ = ["RunPreparationFailure", "RunPreparationPort"]
+def safe_preparation_failure_details(error: RunPreparationFailure) -> dict[str, object]:
+    """Project only bounded, explicitly public preparation discriminators to durable events."""
+
+    projected: dict[str, object] = {}
+    image_index = error.details.get("imageIndex")
+    if type(image_index) is int and 0 <= image_index <= 255:
+        projected["imageIndex"] = image_index
+    for key in ("reason", "runBindingCode"):
+        value = error.details.get(key)
+        if isinstance(value, str) and _DETAIL_TOKEN.fullmatch(value):
+            projected[key] = value
+    model_id = error.details.get("modelId")
+    if isinstance(model_id, str) and _MODEL_ID.fullmatch(model_id):
+        projected["modelId"] = model_id
+    return projected
+
+
+__all__ = ["RunPreparationFailure", "RunPreparationPort", "safe_preparation_failure_details"]

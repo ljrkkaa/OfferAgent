@@ -47,7 +47,6 @@ _PROVIDER_ID = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _HEADER_ID = re.compile(r"^[\x21-\x7e]{1,256}$")
 _HEADER_VALUE = re.compile(r"^[\x20-\x7e]{1,512}$")
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
-_RETRYABLE_HTTP = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _STRUCTURED_ERROR_TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _CONTEXT_OVERFLOW_REASONS = frozenset(
     {
@@ -59,6 +58,23 @@ _CONTEXT_OVERFLOW_REASONS = frozenset(
         "prompt_too_long",
     }
 )
+_AUTH_ERROR_REASONS = frozenset({"auth_required", "authentication_error", "invalid_api_key", "unauthorized"})
+_MODEL_ERROR_REASONS = frozenset({"invalid_model", "model_not_found", "model_unsupported", "unsupported_model"})
+_IMAGE_INVALID_REASONS = frozenset(
+    {
+        "image_file_too_large",
+        "image_parse_error",
+        "image_too_large",
+        "image_too_small",
+        "invalid_base64_image",
+        "invalid_image",
+        "invalid_image_format",
+        "invalid_image_url",
+    }
+)
+_IMAGE_UNSUPPORTED_REASONS = frozenset({"image_not_supported", "unsupported_image", "unsupported_image_media_type"})
+_RATE_LIMIT_REASONS = frozenset({"rate_limit_exceeded", "rate_limited"})
+_UNAVAILABLE_REASONS = frozenset({"overloaded", "server_error", "timeout"})
 _STRUCTURED_CONTENT_BLOCKS = frozenset(
     {
         "compaction_records",
@@ -102,6 +118,12 @@ _SENTINEL = object()
 
 class ModelProviderConfigurationError(ValueError):
     pass
+
+
+class _ModelInputError(ModelProviderConfigurationError):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message)
 
 
 class ModelProviderProtocolError(RuntimeError):
@@ -186,7 +208,7 @@ class OpenAIResponsesConfig:
     read_timeout_seconds: float = 60.0
     write_timeout_seconds: float = 30.0
     pool_timeout_seconds: float = 10.0
-    max_request_bytes: int = 8 * 1024 * 1024
+    max_request_bytes: int = 80 * 1024 * 1024
     max_stream_bytes: int = 32 * 1024 * 1024
     max_event_bytes: int = 2 * 1024 * 1024
     max_output_bytes: int = 16 * 1024 * 1024
@@ -235,7 +257,7 @@ class OpenAIResponsesConfig:
         limits = (self.max_request_bytes, self.max_stream_bytes, self.max_event_bytes, self.max_output_bytes)
         if any(value <= 0 for value in limits):
             raise ModelProviderConfigurationError("model byte limits must be positive")
-        if self.max_request_bytes > 64 * 1024 * 1024 or self.max_stream_bytes > 256 * 1024 * 1024:
+        if self.max_request_bytes > 96 * 1024 * 1024 or self.max_stream_bytes > 256 * 1024 * 1024:
             raise ModelProviderConfigurationError("model request/stream limit exceeds the safety ceiling")
         if self.max_event_bytes > self.max_stream_bytes or self.max_output_bytes > self.max_stream_bytes:
             raise ModelProviderConfigurationError("model event/output limit cannot exceed the stream limit")
@@ -362,6 +384,20 @@ class OpenAIResponsesGateway:
                 provider_id=self._config.provider_id,
                 endpoint=self._config.endpoint,
             )
+        except _ModelInputError as error:
+            yield ModelEvent(
+                request.request_id,
+                sequence,
+                ModelEventKind.ERROR,
+                error=ModelError(
+                    error.code,
+                    "model input is invalid for the provider protocol",
+                    False,
+                    False,
+                    {"providerId": self._config.provider_id},
+                ),
+            )
+            return
         except Exception as error:
             yield ModelEvent(
                 request.request_id,
@@ -454,8 +490,12 @@ class OpenAIResponsesGateway:
     def _make_accumulator(self, request: ModelRequest) -> _StreamAccumulator:
         return _ResponseAccumulator(request, self._config)
 
-    def _classify_http_failure(self, error: _HttpFailure) -> _ProducerFault:
-        return _classify_http_failure(self._config.provider_id, error)
+    def _classify_http_failure(self, request: ModelRequest, error: _HttpFailure) -> _ProducerFault:
+        return _classify_http_failure(
+            self._config.provider_id,
+            error,
+            has_images=_request_has_images(request),
+        )
 
     def _produce(
         self,
@@ -630,8 +670,15 @@ class OpenAIResponsesGateway:
                 raise
             except _HttpFailure as error:
                 retry_after = error.retry_after
-                failure = self._classify_http_failure(error)
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError):
+                failure = self._classify_http_failure(request, error)
+            except httpx.RemoteProtocolError:
+                failure = _ProducerFault(
+                    "provider_protocol_error",
+                    False,
+                    {"providerId": self._config.provider_id},
+                )
+                retry_after = None
+            except (httpx.TimeoutException, httpx.NetworkError):
                 failure = _ProducerFault(
                     "provider_unreachable",
                     True,
@@ -931,7 +978,8 @@ class _ResponseAccumulator:
             return ()
         if kind in {"response.failed", "error"}:
             self.terminal = True
-            code = "context_overflow" if _is_context_overflow_error(value) else "provider_response_failed"
+            classified = _classify_structured_failure(*_structured_error_discriminators(value))
+            code, retryable = classified or ("provider_protocol_error", False)
             semantic: list[_SemanticEvent] = []
             failure_usage = _failure_usage(value)
             if failure_usage is not None:
@@ -942,7 +990,7 @@ class _ResponseAccumulator:
                     error=ModelError(
                         code,
                         "model provider reported a failed response",
-                        False if code == "context_overflow" else _provider_error_retryable(value),
+                        retryable,
                         False,
                         {"providerId": self.config.provider_id},
                     ),
@@ -1066,6 +1114,8 @@ def _encode_request(request: ModelRequest, config: OpenAIResponsesConfig) -> byt
         sort_keys=True,
     ).encode("utf-8")
     if len(encoded) > config.max_request_bytes:
+        if _request_has_images(request):
+            raise _ModelInputError("image_invalid", "model image request exceeds its byte limit")
         raise ModelProviderConfigurationError("model request exceeds its byte limit")
     return encoded
 
@@ -1185,16 +1235,24 @@ def _encode_message(message: ModelMessage) -> dict[str, Any]:
         if block.kind == "text" and set(block.data) == {"text"} and isinstance(block.data.get("text"), str):
             text = str(block.data["text"])
         elif block.kind == "image":
-            if message.role is not ModelRole.USER or block.binary_data is None:
-                raise ModelProviderConfigurationError("provider image blocks require user-owned ephemeral bytes")
+            if message.role is not ModelRole.USER:
+                raise _ModelInputError(
+                    "provider_protocol_error",
+                    "provider images are allowed only in user messages",
+                )
+            if block.binary_data is None:
+                raise _ModelInputError("image_invalid", "provider image block is missing ephemeral bytes")
             media_type = block.data.get("mediaType")
             if media_type not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
-                raise ModelProviderConfigurationError("provider image block media type is unsupported")
+                raise _ModelInputError("image_invalid", "provider image block media type is unsupported")
+            detail = block.data.get("detail", "high")
+            if detail not in {"high", "original"}:
+                raise _ModelInputError("image_invalid", "provider image detail is unsupported")
             blocks.append(
                 {
                     "type": "input_image",
                     "image_url": f"data:{media_type};base64,{base64.b64encode(block.binary_data).decode('ascii')}",
-                    "detail": "auto",
+                    "detail": detail,
                 }
             )
             continue
@@ -1305,14 +1363,23 @@ def _incomplete_finish_reason(response: Mapping[str, Any]) -> ModelFinishReason:
     return ModelFinishReason.ERROR
 
 
-def _provider_error_retryable(value: Mapping[str, Any]) -> bool:
-    code, _ = _structured_error_discriminators(value)
-    return code in {"rate_limit_exceeded", "server_error", "timeout", "overloaded"}
-
-
-def _is_context_overflow_error(value: Mapping[str, Any]) -> bool:
-    code, reason = _structured_error_discriminators(value)
-    return code in _CONTEXT_OVERFLOW_REASONS or reason in _CONTEXT_OVERFLOW_REASONS
+def _classify_structured_failure(code: str | None, reason: str | None) -> tuple[str, bool] | None:
+    tokens = {token for token in (code, reason) if token is not None}
+    if tokens & _AUTH_ERROR_REASONS:
+        return "auth_required", False
+    if tokens & _CONTEXT_OVERFLOW_REASONS:
+        return "context_overflow", False
+    if tokens & _IMAGE_INVALID_REASONS:
+        return "image_invalid", False
+    if tokens & _IMAGE_UNSUPPORTED_REASONS:
+        return "image_unsupported", False
+    if tokens & _MODEL_ERROR_REASONS:
+        return "model_unsupported", False
+    if tokens & _RATE_LIMIT_REASONS:
+        return "provider_rate_limited", True
+    if tokens & _UNAVAILABLE_REASONS:
+        return "provider_unavailable", True
+    return None
 
 
 def _structured_error_discriminators(value: Mapping[str, Any]) -> tuple[str | None, str | None]:
@@ -1386,21 +1453,38 @@ def _read_http_failure(response: httpx.Response, maximum: int) -> _HttpFailure:
     return _HttpFailure(response.status_code, provider_code, provider_reason, retry_after)
 
 
-def _classify_http_failure(provider_id: str, error: _HttpFailure) -> _ProducerFault:
+def _classify_http_failure(
+    provider_id: str,
+    error: _HttpFailure,
+    *,
+    has_images: bool,
+) -> _ProducerFault:
     details: dict[str, Any] = {"providerId": provider_id, "httpStatus": error.status}
     if error.status in {401, 403}:
         return _ProducerFault("auth_required", False, details)
     if error.status == 402:
         return _ProducerFault("insufficient_balance", False, details)
-    if error.provider_code in _CONTEXT_OVERFLOW_REASONS or error.provider_reason in _CONTEXT_OVERFLOW_REASONS:
-        return _ProducerFault("context_overflow", False, details)
+    classified = _classify_structured_failure(error.provider_code, error.provider_reason)
+    if classified is not None:
+        code, retryable = classified
+        return _ProducerFault(code, retryable, details)
     if error.status == 429:
         return _ProducerFault("provider_rate_limited", True, details)
     if error.status == 404:
         return _ProducerFault("model_unsupported", False, details)
+    if has_images and error.status in {413, 415}:
+        return _ProducerFault("image_invalid", False, details)
     if error.status >= 500:
         return _ProducerFault("provider_unavailable", True, details)
-    return _ProducerFault("provider_http_error", error.status in _RETRYABLE_HTTP, details)
+    if error.status == 409:
+        return _ProducerFault("provider_protocol_error", True, details)
+    if error.status in {408, 425}:
+        return _ProducerFault("provider_unreachable", True, details)
+    return _ProducerFault("provider_protocol_error", False, details)
+
+
+def _request_has_images(request: ModelRequest) -> bool:
+    return any(block.kind == "image" for message in request.messages for block in message.content)
 
 
 def _retry_delay(config: OpenAIResponsesConfig, attempt: int, retry_after: float | None) -> float:

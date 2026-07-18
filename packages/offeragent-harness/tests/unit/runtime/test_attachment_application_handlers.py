@@ -5,10 +5,11 @@ import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
+from offeragent_harness.agent import RunPreparationFailure
 from offeragent_harness.ports import ApplicationCommandContext
 from offeragent_harness.protocol.messages import (
     AttachmentAbortParams,
@@ -29,6 +30,7 @@ from offeragent_harness.runtime.application_domain_handlers import (
 )
 from offeragent_harness.runtime.conversation_attachments import (
     AttachmentClaimReceipt,
+    AttachmentError,
     AttachmentUploadRequest,
     ConversationAttachmentStore,
 )
@@ -36,7 +38,9 @@ from offeragent_harness.runtime.production_worker_composition import _resolved_c
 from offeragent_harness.runtime.session_service import SessionGetCommand
 from offeragent_harness.testing import DeterministicIdGenerator, ManualCancellationToken, ManualClock
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"offeragent-image"
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP8zwACTGCSAQANHQEDgslx/wAAAABJRU5ErkJggg=="
+)
 
 
 def digest(value: bytes) -> str:
@@ -161,12 +165,58 @@ async def test_run_context_resolves_claimed_image_bytes_and_explicit_pin_guidanc
         session_id="ses_one",
         attachments=store,
         cancellation=token,
+        model_binding=cast(
+            Any,
+            SimpleNamespace(
+                model=SimpleNamespace(
+                    input_modalities=("text", "image"),
+                    supports_image_detail_original=False,
+                )
+            ),
+        ),
     )
 
     fragment = inputs.user_input[0]
     assert fragment.model_blocks[0].binary_data == PNG
+    assert fragment.verified_current_images is True
     assert fragment.artifact_ids == (artifact.artifact_id,)
     assert "read the exact current version before relying" in fragment.text
+
+
+@pytest.mark.asyncio
+async def test_run_context_rejects_images_without_verified_model_binding_before_attachment_io() -> None:
+    class Attachments:
+        calls = 0
+
+        async def read_all_for_conversation(self, *args: object) -> object:
+            del args
+            self.calls += 1
+            raise AssertionError("missing model binding must fail before attachment I/O")
+
+    attachments = Attachments()
+    with pytest.raises(RunPreparationFailure) as caught:
+        await _resolved_context_inputs(
+            (
+                {
+                    "type": "image",
+                    "artifact": {
+                        "artifactId": "art_one",
+                        "contentHash": digest(PNG),
+                        "mediaType": "image/png",
+                        "sizeBytes": len(PNG),
+                        "sensitivity": "private",
+                        "state": "complete",
+                    },
+                },
+            ),
+            session_id="ses_one",
+            attachments=cast(Any, attachments),
+            cancellation=ManualCancellationToken(),
+            model_binding=None,
+        )
+
+    assert caught.value.error_code.value == "provider.image_unsupported"
+    assert attachments.calls == 0
 
 
 @pytest.mark.parametrize(("claim_created", "expected_releases"), ((True, 1), (False, 0)))
@@ -245,3 +295,93 @@ async def test_failed_turn_start_releases_only_the_claim_created_by_that_attempt
     with pytest.raises(RuntimeError, match="injected"):
         await handlers["turn/start"](params, ManualCancellationToken(), ApplicationCommandContext(transport="stdio"))
     assert attachments.releases == expected_releases
+
+
+@pytest.mark.parametrize(
+    ("sensitivity", "state"),
+    (("secret", "complete"), ("private", "unverified")),
+)
+@pytest.mark.asyncio
+async def test_turn_start_rejects_non_private_or_incomplete_image_metadata_before_claim(
+    sensitivity: str,
+    state: str,
+) -> None:
+    class Harness:
+        calls = 0
+
+        async def start_turn(self, command: object) -> object:
+            del command
+            self.calls += 1
+            raise AssertionError("invalid image metadata must not start a Run")
+
+    class Attachments:
+        calls = 0
+
+        async def claim_submission_with_receipt(self, *args: object) -> object:
+            del args
+            self.calls += 1
+            raise AssertionError("invalid image metadata must not be claimed")
+
+    class Config:
+        async def snapshot(self, **keys: str) -> object:
+            del keys
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    model=SimpleNamespace(
+                        provider=SimpleNamespace(value="codex-subscription-experimental"),
+                        model="gpt-test",
+                    ),
+                    policy=SimpleNamespace(allow_bypass=False, read_only=False, workspace_trusted=True),
+                ),
+                fingerprint="sha256:" + "a" * 64,
+            )
+
+    class TransportPolicy:
+        async def resolve_run_route(self, context: object, permission_mode: object) -> object:
+            del context
+            return SimpleNamespace(permission_mode=permission_mode)
+
+    harness = Harness()
+    attachments = Attachments()
+    handlers = _turn_handlers(
+        identity=DomainCommandIdentity("ws_one", "profile_one", "managed", "actor_one"),
+        harness=harness,  # type: ignore[arg-type]
+        projections=SimpleNamespace(),
+        config=Config(),  # type: ignore[arg-type]
+        transport_policy=TransportPolicy(),  # type: ignore[arg-type]
+        attachments=attachments,  # type: ignore[arg-type]
+    )
+    params = validate_command_params(
+        "turn/start",
+        {
+            "sessionId": "ses_one",
+            "turnId": "turn_one",
+            "idempotencyKey": "turn-one",
+            "input": [
+                {
+                    "type": "image",
+                    "artifact": {
+                        "artifactId": "art_one",
+                        "contentHash": digest(PNG),
+                        "mediaType": "image/png",
+                        "sizeBytes": len(PNG),
+                        "sensitivity": sensitivity,
+                        "state": state,
+                    },
+                }
+            ],
+            "runConfig": {"provider": "codex-subscription-experimental", "model": "gpt-test"},
+        },
+    )
+    assert isinstance(params, TurnStartParams)
+
+    with pytest.raises(AttachmentError) as caught:
+        await handlers["turn/start"](
+            params,
+            ManualCancellationToken(),
+            ApplicationCommandContext(transport="stdio"),
+        )
+
+    assert caught.value.code == "metadata_conflict"
+    assert attachments.calls == 0
+    assert harness.calls == 0
