@@ -206,6 +206,14 @@ def qualify_live_built_windows_product(
                     "paths": list(primary.review.paths),
                     "resolutionCount": 1,
                 },
+                "approval": {
+                    "approvalId": primary.approval.approval_id,
+                    "toolCallId": primary.approval.tool_call_id,
+                    "argsHash": primary.approval.args_hash,
+                    "decision": "allow_once",
+                    "scope": "once",
+                    "resolutionCount": 1,
+                },
             },
             "vault": {
                 "beforeSha256": _snapshot_hash(before_vault),

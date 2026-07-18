@@ -83,9 +83,17 @@ class ReviewEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class ApprovalEvidence:
+    approval_id: str
+    tool_call_id: str
+    args_hash: str
+
+
+@dataclass(frozen=True, slots=True)
 class InterviewSubmissionEvidence:
     run: CompletedRunEvidence
     ordered_image_content_hashes: tuple[str, ...]
+    approval: ApprovalEvidence
     review: ReviewEvidence
 
 
@@ -335,11 +343,12 @@ class BuiltProductQualificationSession:
         turn_id = _string(started, "turnId", "image qualification")
         run_id = _string(started, "runId", "image qualification")
         ordered_hashes = tuple(page.content_hash for page in pages)
-        events, review = self._wait_for_interview_terminal(run_id, ordered_hashes, timeout=timeout)
+        events, approval, review = self._wait_for_interview_terminal(run_id, ordered_hashes, timeout=timeout)
         self._primary_image_hashes = ordered_hashes
         return InterviewSubmissionEvidence(
             run=CompletedRunEvidence(session_id, turn_id, run_id, events),
             ordered_image_content_hashes=ordered_hashes,
+            approval=approval,
             review=review,
         )
 
@@ -576,10 +585,12 @@ class BuiltProductQualificationSession:
         ordered_hashes: tuple[str, ...],
         *,
         timeout: float,
-    ) -> tuple[tuple[Mapping[str, Any], ...], ReviewEvidence]:
+    ) -> tuple[tuple[Mapping[str, Any], ...], ApprovalEvidence, ReviewEvidence]:
         deadline = time.monotonic() + timeout
         seen: set[str] = set()
         events: list[Mapping[str, Any]] = []
+        approval: ApprovalEvidence | None = None
+        approval_resolved = False
         review: ReviewEvidence | None = None
         last_sequence = 0
         while True:
@@ -614,12 +625,80 @@ class BuiltProductQualificationSession:
                 continue
             seen.add(event_id)
             events.append(event)
+            if event_type == "approval.required":
+                if approval is not None:
+                    raise BuiltProductQualificationError("image qualification requested more than one approval")
+                approval = self._approve_interview_write(event, run_id, ordered_hashes)
+                continue
+            if event_type == "approval.resolved":
+                if approval is None or approval_resolved:
+                    raise BuiltProductQualificationError("image qualification emitted an unmatched approval resolution")
+                _validate_interview_approval_resolution(event, approval)
+                approval_resolved = True
+                continue
             if event_type == "turn.completed":
+                if approval is None or not approval_resolved:
+                    raise BuiltProductQualificationError(
+                        "image qualification completed without one explicit bound approval"
+                    )
                 if review is None:
                     raise BuiltProductQualificationError("image qualification completed without an explicit review")
-                return tuple(events), review
+                return tuple(events), approval, review
             if event_type in {"turn.cancelled", "turn.failed", "turn.interrupted"}:
                 raise BuiltProductQualificationError(f"sealed product image Run terminated with {event_type}")
+
+    def _approve_interview_write(
+        self,
+        event: Mapping[str, Any],
+        run_id: str,
+        ordered_hashes: tuple[str, ...],
+    ) -> ApprovalEvidence:
+        payload = event.get("payload")
+        approval = payload.get("approval") if isinstance(payload, Mapping) else None
+        if not isinstance(approval, Mapping) or approval.get("status") != "pending":
+            raise BuiltProductQualificationError("Interview Submission approval is invalid or not pending")
+        approval_id = _string(approval, "approvalId", "Interview Submission approval")
+        if approval.get("runId") != run_id or approval.get("includeDescendants") is not False:
+            raise BuiltProductQualificationError("Interview Submission approval Run or descendant scope differs")
+        tool_call = approval.get("toolCall")
+        if not isinstance(tool_call, Mapping):
+            raise BuiltProductQualificationError("Interview Submission approval tool call is missing")
+        arguments = tool_call.get("arguments")
+        submission = arguments.get("interviewSubmission") if isinstance(arguments, Mapping) else None
+        lineage = tool_call.get("agentLineage")
+        if (
+            tool_call.get("name") != "vault.changes.apply"
+            or tool_call.get("version") != "1"
+            or tool_call.get("risk") != "write"
+            or not isinstance(arguments, Mapping)
+            or arguments.get("changeKind") != "interview_submission"
+            or not isinstance(submission, Mapping)
+            or submission.get("orderedImageContentHashes") != list(ordered_hashes)
+            or not isinstance(lineage, list)
+            or lineage != [run_id]
+        ):
+            raise BuiltProductQualificationError("Interview Submission approval is not the exact bound root write")
+        tool_call_id = _string(tool_call, "toolCallId", "Interview Submission approval tool call")
+        args_hash = _sha256(tool_call, "argsHash", "Interview Submission approval tool call")
+        resolved = self._rpc(
+            "approval/resolve",
+            {
+                "approvalId": approval_id,
+                "decision": "allow_once",
+                "scope": "once",
+                "expectedArgsHash": args_hash,
+                "includeDescendants": False,
+                "comment": "Sealed qualification: approve the exact bound Interview Submission once.",
+            },
+        )
+        if resolved != {
+            "approvalId": approval_id,
+            "status": "approved",
+            "runId": run_id,
+            "resumed": True,
+        }:
+            raise BuiltProductQualificationError("Interview Submission approval did not resolve exactly once")
+        return ApprovalEvidence(approval_id, tool_call_id, args_hash)
 
     def _accept_interview_review(
         self,
@@ -887,6 +966,23 @@ def _validate_interview_review(
     if review_hash != expected_hash:
         raise BuiltProductQualificationError("Interview Submission review hash is invalid")
     return ReviewEvidence(review_id, review_hash, batch_id, tuple(paths))
+
+
+def _validate_interview_approval_resolution(
+    event: Mapping[str, Any],
+    approval: ApprovalEvidence,
+) -> None:
+    payload = event.get("payload")
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("approvalId") != approval.approval_id
+        or payload.get("decision") != "allow_once"
+        or payload.get("scope") != "once"
+        or payload.get("status") != "approved"
+        or payload.get("resolvedBy") != "user"
+        or payload.get("includeDescendants") is not False
+    ):
+        raise BuiltProductQualificationError("Interview Submission approval resolution identity differs")
 
 
 def _raise_control_failure(notification: Mapping[str, Any]) -> None:

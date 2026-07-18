@@ -403,6 +403,23 @@ def test_uploads_three_ordered_user_images_and_accepts_one_exact_review() -> Non
     pages = (b"first-page", b"second-page", b"third-page")
     page_hashes = [f"sha256:{hashlib.sha256(page).hexdigest()}" for page in pages]
     proposal = _review(page_hashes)
+    approval_id = "apr_01J00000000000000000000000"
+    approval_args_hash = "sha256:" + "e" * 64
+    approval_tool_call_id = "call_01J00000000000000000000000"
+    approval_tool_call = {
+        "toolCallId": approval_tool_call_id,
+        "name": "vault.changes.apply",
+        "version": "1",
+        "arguments": {
+            "changeKind": "interview_submission",
+            "interviewSubmission": {"orderedImageContentHashes": page_hashes},
+        },
+        "argsHash": approval_args_hash,
+        "idempotencyKey": "qualification-image-apply",
+        "risk": "write",
+        "reason": "Apply the reviewed Interview Submission",
+        "agentLineage": ["run_image"],
+    }
     driver.responses.extend(
         [
             ("rpc", "session/create", {"session": {"sessionId": "ses_image"}, "created": True}),
@@ -418,12 +435,62 @@ def test_uploads_three_ordered_user_images_and_accepts_one_exact_review() -> Non
                     "duplicate": False,
                 },
             ),
+            (
+                "rpc",
+                "approval/resolve",
+                {
+                    "approvalId": approval_id,
+                    "status": "approved",
+                    "runId": "run_image",
+                    "resumed": True,
+                },
+            ),
             ("review/resolve", None, {"resolved": True}),
         ]
     )
     driver.events.extend(
         [
             {"event": "runtime.event", "value": {"eventId": "evt_img_1", "runId": "run_image", "type": "turn.started"}},
+            {
+                "event": "runtime.event",
+                "value": {
+                    "eventId": "evt_img_approval_required",
+                    "runId": "run_image",
+                    "type": "approval.required",
+                    "payload": {
+                        "approval": {
+                            "approvalId": approval_id,
+                            "status": "pending",
+                            "toolCall": approval_tool_call,
+                            "workspaceId": "ws_qualification",
+                            "runId": "run_image",
+                            "expiresAt": "2026-07-19T00:05:00Z",
+                            "includeDescendants": False,
+                        },
+                        "explanation": "Review and apply the Interview Submission",
+                        "diffArtifactIds": [],
+                    },
+                },
+            },
+            {
+                "event": "runtime.event",
+                "value": {
+                    "eventId": "evt_img_approval_resolved",
+                    "runId": "run_image",
+                    "type": "approval.resolved",
+                    "payload": {
+                        "approvalId": approval_id,
+                        "decision": "allow_once",
+                        "scope": "once",
+                        "resolvedAt": "2026-07-19T00:00:01Z",
+                        "resolvedBy": "user",
+                        "status": "approved",
+                        "resolverId": "qualification",
+                        "includeDescendants": False,
+                        "reason": None,
+                    },
+                },
+            },
             {"event": "review.proposed", "reviewId": "review_1", "proposal": proposal},
             {
                 "event": "runtime.event",
@@ -446,14 +513,38 @@ def test_uploads_three_ordered_user_images_and_accepts_one_exact_review() -> Non
 
     assert result.run.run_id == "run_image"
     assert result.ordered_image_content_hashes == tuple(page_hashes)
+    assert result.approval.approval_id == approval_id
+    assert result.approval.tool_call_id == approval_tool_call_id
+    assert result.approval.args_hash == approval_args_hash
     assert result.review.review_id == "review_1"
     assert result.review.paths == tuple(proposal["paths"])
+    approval_resolve = next(
+        request for request in driver.requests if request[0] == "rpc" and request[1].get("method") == "approval/resolve"
+    )
+    assert approval_resolve == (
+        "rpc",
+        {
+            "method": "approval/resolve",
+            "params": {
+                "approvalId": approval_id,
+                "decision": "allow_once",
+                "scope": "once",
+                "expectedArgsHash": approval_args_hash,
+                "includeDescendants": False,
+                "comment": "Sealed qualification: approve the exact bound Interview Submission once.",
+            },
+        },
+    )
     resolve = driver.requests[-1]
     assert resolve == (
         "review/resolve",
         {"reviewId": "review_1", "decision": "accept", "reviewHash": proposal["reviewHash"]},
     )
-    turn_input = driver.requests[-2][1]["params"]["input"]
+    turn_input = next(
+        request[1]["params"]["input"]
+        for request in driver.requests
+        if request[0] == "rpc" and request[1].get("method") == "turn/start"
+    )
     assert [block["type"] for block in turn_input] == ["text", "image", "image", "image"]
     assert turn_input[1:] == [_artifact(index, page) for index, page in enumerate(pages, 1)]
     assert not driver.responses
@@ -499,6 +590,86 @@ def test_refuses_review_when_ordered_image_binding_differs() -> None:
         )
 
     assert all(command != "review/resolve" for command, _ in driver.requests)
+
+
+def test_refuses_to_approve_an_unrelated_image_run_write() -> None:
+    driver = _prepared_driver()
+    pages = (b"first-page", b"second-page", b"third-page")
+    page_hashes = [f"sha256:{hashlib.sha256(page).hexdigest()}" for page in pages]
+    driver.responses.extend(
+        [
+            ("rpc", "session/create", {"session": {"sessionId": "ses_image"}, "created": True}),
+            *(("attachment/upload", None, _artifact(index, page)) for index, page in enumerate(pages, 1)),
+            (
+                "rpc",
+                "turn/start",
+                {
+                    "sessionId": "ses_image",
+                    "turnId": "turn_image",
+                    "runId": "run_image",
+                    "accepted": True,
+                    "duplicate": False,
+                },
+            ),
+        ]
+    )
+    driver.events.append(
+        {
+            "event": "runtime.event",
+            "value": {
+                "eventId": "evt_wrong_approval",
+                "runId": "run_image",
+                "type": "approval.required",
+                "payload": {
+                    "approval": {
+                        "approvalId": "apr_01J00000000000000000000000",
+                        "status": "pending",
+                        "toolCall": {
+                            "toolCallId": "call_01J00000000000000000000000",
+                            "name": "shell.exec",
+                            "version": "1",
+                            "arguments": {
+                                "changeKind": "interview_submission",
+                                "interviewSubmission": {"orderedImageContentHashes": page_hashes},
+                            },
+                            "argsHash": "sha256:" + "e" * 64,
+                            "idempotencyKey": "unrelated-write",
+                            "risk": "write",
+                            "reason": "Unrelated write",
+                            "agentLineage": ["run_image"],
+                        },
+                        "workspaceId": "ws_qualification",
+                        "runId": "run_image",
+                        "expiresAt": "2026-07-19T00:05:00Z",
+                        "includeDescendants": False,
+                    },
+                    "explanation": "Unrelated write",
+                    "diffArtifactIds": [],
+                },
+            },
+        }
+    )
+    session = BuiltProductQualificationSession(driver, {"vaultRoot": "C:/sealed/Vault"})
+    session.prepare_live_model(
+        proxy_url="http://127.0.0.1:7896",
+        model="gpt-5.5",
+        require_image=True,
+    )
+
+    with pytest.raises(BuiltProductQualificationError, match="not the exact bound root write"):
+        session.run_interview_submission(
+            tuple(
+                InterviewImagePage(index, f"page-{index}.png", "image/png", page)
+                for index, page in enumerate(pages, 1)
+            ),
+            "请原子入库。",
+            timeout=5,
+        )
+
+    assert all(
+        command != "rpc" or params.get("method") != "approval/resolve"
+        for command, params in driver.requests
+    )
 
 
 def test_restarts_and_replays_primary_run_without_repeated_review() -> None:
