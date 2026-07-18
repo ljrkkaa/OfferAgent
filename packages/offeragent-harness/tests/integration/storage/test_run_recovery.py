@@ -342,7 +342,7 @@ async def test_batch_crash_reuses_first_completed_write_and_replays_only_unstart
 
 
 @pytest.mark.asyncio
-async def test_unknown_write_requires_manual_review_and_never_calls_lookup(tmp_path: Path) -> None:
+async def test_unknown_write_uses_definite_lookup_result_without_replay(tmp_path: Path) -> None:
     database_path = tmp_path / "state.sqlite"
     write = _definition("vault.write", SideEffectClass.WRITE)
     call = _call(write, "run-unknown", "call-unknown")
@@ -371,11 +371,50 @@ async def test_unknown_write_requires_manual_review_and_never_calls_lookup(tmp_p
         clock=ManualClock(NOW),
     ).scan()
 
+    assert plans[0].disposition is RecoveryDisposition.RESUME
+    assert not plans[0].requires_interruption
+    assert len(plans[0].actions) == 1
+    assert plans[0].actions[0].kind is RecoveryActionKind.APPLY_LOOKUP_RESULT
+    assert plans[0].actions[0].journal_state is JournalState.UNKNOWN
+    assert plans[0].actions[0].result == _result(call, write)
+    assert plans[0].original_calls_to_replay == ()
+    assert lookup.calls == [call.tool_call_id]
+
+
+@pytest.mark.asyncio
+async def test_unknown_write_without_definite_lookup_result_requires_manual_review(tmp_path: Path) -> None:
+    database_path = tmp_path / "state.sqlite"
+    write = _definition("vault.write", SideEffectClass.WRITE)
+    call = _call(write, "run-unknown-unresolved", "call-unknown-unresolved")
+    factory = SqliteUnitOfWorkFactory(database_path)
+    async with factory.begin() as unit_of_work:
+        await _persist_bundle(unit_of_work, _bundle("run-unknown-unresolved", (call,)))
+        await unit_of_work.journal.start(
+            _scope(call, write),
+            call.idempotency_key,
+            invocation_request_fingerprint(call),
+            NOW,
+        )
+        await unit_of_work.journal.mark_unknown(
+            _scope(call, write),
+            call.idempotency_key,
+            invocation_request_fingerprint(call),
+            NOW,
+        )
+        await unit_of_work.commit()
+
+    lookup = _FakeRecoveryLookup()
+    plans = await RecoveryCoordinator(
+        unit_of_work=SqliteUnitOfWorkFactory(database_path),
+        registry=ToolRegistry("restart", (write,)),
+        lookup=lookup,
+        clock=ManualClock(NOW),
+    ).scan()
+
     assert plans[0].disposition is RecoveryDisposition.MANUAL_REVIEW
-    assert plans[0].requires_interruption
     assert plans[0].actions == ()
     assert [issue.code for issue in plans[0].issues] == ["journal_unknown_effectful"]
-    assert lookup.calls == []
+    assert lookup.calls == [call.tool_call_id]
 
 
 @pytest.mark.asyncio

@@ -452,6 +452,19 @@ def test_interview_catalog_definition_validates_normalized_sources_and_fixed_ind
     }
 
     assert validator.validate_output(definition, output) is not None
+    malformed_candidate = {
+        "path": "experiences/existing.md",
+        "experienceId": "experience_existing",
+        "sourceKind": "public_url",
+        "exactSourceMatch": "yes",
+        "modifiedVersion": "mtime:1:size:24",
+        "contentHash": digest,
+    }
+    with pytest.raises(ToolValidationError):
+        validator.validate_output(
+            definition,
+            {**output, "experienceCandidates": [malformed_candidate]},
+        )
     with pytest.raises(ToolValidationError):
         validator.validate_output(
             definition,
@@ -485,6 +498,20 @@ def test_vault_changes_definition_requires_versions_for_interview_submission_tar
             "canonicalUrls": [],
             "orderedImageContentHashes": [],
             "sourceFingerprint": None,
+            "reviewItems": [
+                {
+                    "kind": "experience",
+                    "path": "experiences/acme.md",
+                    "identity": "new",
+                    "mutation": "create",
+                },
+                {
+                    "kind": "index",
+                    "path": "interview/index.md",
+                    "identity": "existing",
+                    "mutation": "modify",
+                },
+            ],
         },
         "operations": [
             {
@@ -505,6 +532,31 @@ def test_vault_changes_definition_requires_versions_for_interview_submission_tar
     }
 
     assert validator.validate_arguments(definition, interview) is not None
+
+    missing_review_items = {**interview["interviewSubmission"]}
+    del missing_review_items["reviewItems"]
+    with pytest.raises(ToolValidationError):
+        validator.validate_arguments(
+            definition,
+            {**interview, "interviewSubmission": missing_review_items},
+        )
+
+    invalid_review_items = {
+        **interview["interviewSubmission"],
+        "reviewItems": [
+            {
+                "kind": "experience",
+                "path": "experiences/acme.md",
+                "identity": "new",
+                "mutation": "none",
+            }
+        ],
+    }
+    with pytest.raises(ToolValidationError):
+        validator.validate_arguments(
+            definition,
+            {**interview, "interviewSubmission": invalid_review_items},
+        )
 
     create_without_version = {**interview["operations"][0]}
     del create_without_version["expectedModifiedVersion"]

@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual, promisify } from "node:util";
 import * as os from "node:os";
@@ -19,6 +19,7 @@ import { failed, hasExtraKeys } from "./plugin_tool_results";
 
 const execFileAsync = promisify(execFile);
 const MAX_ACTIONS = 20;
+const MAX_REVIEW_ITEMS = 40;
 const MAX_BATCH_BYTES = 131_072;
 const MAX_FILE_BYTES = 262_144;
 const MAX_DIFF_BYTES = 32_768;
@@ -146,6 +147,26 @@ export interface VaultChangeInterviewSubmissionReceipt {
     readonly canonicalUrls: readonly string[];
     readonly orderedImageContentHashes: readonly string[];
     readonly sourceFingerprint: string | null;
+    readonly reviewItems: readonly VaultChangeInterviewReviewItem[];
+}
+
+export interface VaultChangeInterviewReviewItem {
+    readonly kind: "experience" | "question" | "index";
+    readonly path: string;
+    readonly identity: "new" | "existing";
+    readonly mutation: "create" | "modify" | "none";
+}
+
+export function interviewReviewBadges(
+    item: VaultChangeInterviewReviewItem,
+): readonly [identity: string, mutation: string] {
+    const identity = item.identity === "new" ? "身份 · 新增" : "身份 · 既有";
+    const mutation = item.mutation === "create"
+        ? "新增"
+        : item.mutation === "none"
+            ? "无操作"
+            : item.kind === "experience" ? "合并" : "修改";
+    return [identity, mutation];
 }
 
 export interface VaultChangeCoordinatorOptions {
@@ -452,7 +473,7 @@ export class VaultChangeCoordinator {
             await this.options.journal.save(record);
             this.inject("after-applying-journal");
             for (const target of prepared.targets) {
-                await this.revalidateSources(prepared, new Set(record.appliedPaths.map((path) => path.toLocaleLowerCase())));
+                await this.revalidateSources(prepared, new Set(record.appliedPaths.map((path) => path.toLowerCase())));
                 await this.revalidateTarget(target);
                 const appliedIdentity = await this.applyConditional(target);
                 record = {
@@ -467,6 +488,10 @@ export class VaultChangeCoordinator {
                 await this.options.journal.save(record);
                 this.inject("after-target-journal", target.path);
             }
+            await this.revalidateSources(
+                prepared,
+                new Set(record.appliedPaths.map((path) => path.toLowerCase())),
+            );
             record = { ...record, state: "applied" };
             await this.options.journal.save(record);
             this.inject("after-applied-journal");
@@ -661,7 +686,7 @@ export class VaultChangeCoordinator {
             invalid("Vault Change Batch identity, task, or operation count is invalid.");
         }
         const sourceBindings = input.sourceBindings.map(parseSourceBinding);
-        const sourcePaths = sourceBindings.map((binding) => binding.path.toLocaleLowerCase());
+        const sourcePaths = sourceBindings.map((binding) => binding.path.toLowerCase());
         if (new Set(sourcePaths).size !== sourcePaths.length) {
             invalid("Each Vault Change source path may appear only once.");
         }
@@ -672,7 +697,7 @@ export class VaultChangeCoordinator {
         }
         const operations = input.operations.map(parseOperation);
         const paths = operations.map((operation) => operation.path);
-        if (new Set(paths.map((path) => path.toLocaleLowerCase())).size !== paths.length) {
+        if (new Set(paths.map((path) => path.toLowerCase())).size !== paths.length) {
             invalid("Each Vault Change Batch path may appear only once.");
         }
         const deletes = operations.filter((operation) => operation.op === "delete");
@@ -721,7 +746,14 @@ export class VaultChangeCoordinator {
         }
         validatePlanningMemoryDeletes(targets);
         if (changeKind === "interview_submission") {
-            assertInterviewSubmission(targets, interviewSubmission as VaultChangeInterviewSubmissionReceipt);
+            const submission = interviewSubmission as VaultChangeInterviewSubmissionReceipt;
+            const noOpContents = await prepareInterviewReviewNoOps(
+                this.options.vault,
+                targets,
+                sourceBindings,
+                submission.reviewItems,
+            );
+            assertInterviewSubmission(targets, submission, noOpContents);
         } else if (targets.some(isInterviewExperienceTarget)) {
             invalid("Interview Experience ingestion must use changeKind 'interview_submission'.");
         }
@@ -831,9 +863,9 @@ export class VaultChangeCoordinator {
     private async revalidateSources(prepared: PreparedBatch, appliedPaths: ReadonlySet<string>): Promise<void> {
         for (const binding of prepared.sourceBindings) {
             const target = prepared.targets.find((candidate) =>
-                candidate.path.toLocaleLowerCase() === binding.path.toLocaleLowerCase(),
+                candidate.path.toLowerCase() === binding.path.toLowerCase(),
             );
-            if (target !== undefined && appliedPaths.has(target.path.toLocaleLowerCase())) {
+            if (target !== undefined && appliedPaths.has(target.path.toLowerCase())) {
                 if (contentIdentity(await this.options.vault.read(binding.path)) !== target.afterHash) {
                     throw new ChangeValidationError("resource.conflict", `Applied Vault source '${binding.path}' changed during apply.`);
                 }
@@ -909,16 +941,16 @@ export class VaultChangeCoordinator {
             if (states.some((state) => state !== "before")) throw new Error("checkpoint missing after mutation");
             return;
         }
-        const applied = new Set(record.appliedPaths.map((path) => path.toLocaleLowerCase()));
+        const applied = new Set(record.appliedPaths.map((path) => path.toLowerCase()));
         for (const target of [...record.targets].reverse()) {
             const current = await this.options.vault.snapshot(target.path);
             const identity = contentIdentity(current.content);
             if (identity === target.beforeHash) continue;
             if (identity !== target.afterHash) {
-                if (!applied.has(target.path.toLocaleLowerCase())) continue;
+                if (!applied.has(target.path.toLowerCase())) continue;
                 throw new UndoConflictError([target.path]);
             }
-            if (recordedOnly && !applied.has(target.path.toLocaleLowerCase())) continue;
+            if (recordedOnly && !applied.has(target.path.toLowerCase())) continue;
             if (target.afterModifiedVersion === null || target.afterModifiedVersion === undefined ||
                 current.modifiedVersion !== target.afterModifiedVersion) {
                 throw new UndoConflictError([target.path]);
@@ -1073,7 +1105,7 @@ function parseSourceBinding(value: unknown): VaultChangeSourceBinding {
 
 function parseInterviewSubmission(value: unknown): VaultChangeInterviewSubmissionReceipt {
     if (!isRecord(value) || hasExtraKeys(value, [
-        "sourceKind", "capturedOn", "canonicalUrls", "orderedImageContentHashes", "sourceFingerprint",
+        "sourceKind", "capturedOn", "canonicalUrls", "orderedImageContentHashes", "sourceFingerprint", "reviewItems",
     ])) invalid("Interview Submission metadata is invalid.");
     const sourceKind = value.sourceKind;
     if (!["text", "public_url", "ordered_images", "mixed"].includes(String(sourceKind)) ||
@@ -1087,6 +1119,15 @@ function parseInterviewSubmission(value: unknown): VaultChangeInterviewSubmissio
     });
     if (identity === null) {
         invalid("Interview Submission source manifest is invalid.");
+    }
+    if (!Array.isArray(value.reviewItems) || value.reviewItems.length < 1 ||
+        value.reviewItems.length > MAX_REVIEW_ITEMS) {
+        invalid("Interview Submission review plan is invalid.");
+    }
+    const reviewItems = value.reviewItems.map(parseInterviewReviewItem);
+    const reviewPaths = reviewItems.map((item) => item.path.toLowerCase());
+    if (new Set(reviewPaths).size !== reviewPaths.length) {
+        invalid("Each Interview Submission review path may appear only once.");
     }
     const { canonicalUrls, orderedImageContentHashes, sourceFingerprint } = identity;
     if ((sourceKind === "text" && (canonicalUrls.length > 0 || orderedImageContentHashes.length > 0)) ||
@@ -1102,29 +1143,71 @@ function parseInterviewSubmission(value: unknown): VaultChangeInterviewSubmissio
         canonicalUrls,
         orderedImageContentHashes,
         sourceFingerprint,
+        reviewItems,
+    };
+}
+
+function parseInterviewReviewItem(value: unknown): VaultChangeInterviewReviewItem {
+    if (!isRecord(value) || hasExtraKeys(value, ["kind", "path", "identity", "mutation"])) {
+        invalid("Interview Submission review item is invalid.");
+    }
+    const path = safeVaultPath(value.path);
+    if (!["experience", "question", "index"].includes(String(value.kind)) || path === undefined ||
+        !["new", "existing"].includes(String(value.identity)) ||
+        !["create", "modify", "none"].includes(String(value.mutation))) {
+        invalid("Interview Submission review item is invalid.");
+    }
+    return {
+        kind: value.kind as VaultChangeInterviewReviewItem["kind"],
+        path,
+        identity: value.identity as VaultChangeInterviewReviewItem["identity"],
+        mutation: value.mutation as VaultChangeInterviewReviewItem["mutation"],
     };
 }
 
 function assertInterviewSubmission(
     targets: readonly PreparedTarget[],
     submission: VaultChangeInterviewSubmissionReceipt,
+    noOpContents: ReadonlyMap<string, string>,
 ): void {
-    const experiences = targets.filter(isInterviewExperienceTarget);
-    if (experiences.length !== 1 || experiences[0].operation !== "create" ||
-        experiences[0].beforeContent !== undefined || experiences[0].afterContent === undefined ||
-        !EXPERIENCE_PATH.test(experiences[0].path)) {
-        invalid("An Interview Submission must create exactly one new Interview Experience.");
+    const experienceItems = submission.reviewItems.filter((item) => item.kind === "experience");
+    const questionItems = submission.reviewItems.filter((item) => item.kind === "question");
+    if (experienceItems.length !== 1 || questionItems.length < 1 ||
+        targets.some((target) => !isPrimaryInterviewTarget(target.path))) {
+        invalid("An Interview Submission must review one Experience and its Questions using primary Catalog paths.");
     }
-    const experienceMetadata = markdownFrontmatter(experiences[0].afterContent);
+    const experienceItem = experienceItems[0];
+    const experienceTarget = targetForReviewItem(targets, experienceItem);
+    const experienceContent = experienceTarget?.afterContent ?? noOpContents.get(experienceItem.path.toLowerCase());
+    if (experienceContent === undefined || !EXPERIENCE_PATH.test(experienceItem.path)) {
+        invalid("An Interview Submission Experience review is invalid.");
+    }
+    const experienceMetadata = markdownFrontmatter(experienceContent);
     if (experienceMetadata === null || experienceMetadata.get("type") !== "interview-experience" ||
         !BATCH_ID.test(experienceMetadata.get("experience-id") ?? "") ||
-        experienceMetadata.get("source-kind") !== submission.sourceKind ||
-        experienceMetadata.get("captured-on") !== submission.capturedOn ||
-        experienceMetadata.get("source-url") !== submission.canonicalUrls[0] ||
-        (submission.canonicalUrls.length === 0 && experienceMetadata.has("source-url")) ||
-        experienceMetadata.get("source-fingerprint") !== (submission.sourceFingerprint ?? undefined) ||
-        (submission.sourceFingerprint === null && experienceMetadata.has("source-fingerprint"))) {
-        invalid("Interview Experience Source Metadata does not match the submission manifest.");
+        !validExperienceSourceMetadata(experienceMetadata)) {
+        invalid("Interview Experience Source Metadata is invalid.");
+    }
+    if (experienceItem.identity === "new" &&
+        (experienceMetadata.get("source-kind") !== submission.sourceKind ||
+            experienceMetadata.get("captured-on") !== submission.capturedOn ||
+            experienceMetadata.get("source-url") !== submission.canonicalUrls[0] ||
+            (submission.canonicalUrls.length === 0 && experienceMetadata.has("source-url")) ||
+            experienceMetadata.get("source-fingerprint") !== (submission.sourceFingerprint ?? undefined) ||
+            (submission.sourceFingerprint === null && experienceMetadata.has("source-fingerprint")))) {
+        invalid("New Interview Experience Source Metadata does not match the submission manifest.");
+    }
+    if (experienceItem.identity === "existing") {
+        const beforeContent = experienceTarget?.beforeContent ?? noOpContents.get(experienceItem.path.toLowerCase());
+        const beforeMetadata = beforeContent === undefined ? null : markdownFrontmatter(beforeContent);
+        const stableIdentityKeys = [
+            "experience-id", "source-kind", "captured-on", "source-url", "source-fingerprint",
+        ];
+        if (beforeMetadata?.get("type") !== "interview-experience" ||
+            !validExperienceSourceMetadata(beforeMetadata) ||
+            stableIdentityKeys.some((key) => beforeMetadata.get(key) !== experienceMetadata.get(key))) {
+            invalid("An existing Interview Experience must preserve its Catalog and source identity.");
+        }
     }
     if (!["company", "role", "event-date", "round"].every((key) => Boolean(experienceMetadata.get(key))) ||
         !calendarDateOrUnknown(experienceMetadata.get("event-date"))) {
@@ -1133,15 +1216,16 @@ function assertInterviewSubmission(
     if ([...experienceMetadata.keys()].some(isPersonalIdentityFrontmatter)) {
         invalid("Interview Experience frontmatter must not retain candidate personal information.");
     }
-    const questions = targets.filter((target) => QUESTION_PATH.test(target.path));
-    if (questions.length < 1 || targets.some((target) => !isPrimaryInterviewTarget(target.path))) {
-        invalid("An Interview Submission must contain only Experience, Question, and index targets.");
-    }
-    for (const question of questions) {
-        if (question.operation === "delete" || question.afterContent === undefined) {
+    for (const questionItem of questionItems) {
+        if (!QUESTION_PATH.test(questionItem.path)) {
+            invalid("An Interview Submission Question review path is invalid.");
+        }
+        const question = targetForReviewItem(targets, questionItem);
+        const afterContent = question?.afterContent ?? noOpContents.get(questionItem.path.toLowerCase());
+        if (afterContent === undefined || question?.operation === "delete") {
             invalid("An Interview Submission cannot delete an Interview Question.");
         }
-        const metadata = markdownFrontmatter(question.afterContent);
+        const metadata = markdownFrontmatter(afterContent);
         if (metadata === null || metadata.get("type") !== "interview-question" ||
             !BATCH_ID.test(metadata.get("question-id") ?? "") ||
             !boundedMetadata(metadata.get("title"), 512) ||
@@ -1149,32 +1233,113 @@ function assertInterviewSubmission(
             !["needs-research", "draft", "verified"].includes(metadata.get("answer-state") ?? "")) {
             invalid("Every Interview Question target must remain structurally discoverable by the Catalog.");
         }
-        if (!hasVaultWikiLink(question.afterContent, experiences[0].path, question.path)) {
+        if (!hasVaultWikiLink(afterContent, experienceItem.path, questionItem.path)) {
             invalid("Every Interview Question target must link this Interview Experience occurrence.");
         }
-        if (question.operation === "create" &&
+        const afterOccurrences = interviewExperienceOccurrences(afterContent, questionItem.path);
+        const afterFrequency = Number(metadata.get("frequency"));
+        if (new Set(afterOccurrences.map((path) => path.toLowerCase())).size !== afterOccurrences.length ||
+            afterFrequency !== afterOccurrences.length) {
+            invalid("Interview Question frequency must equal its unique Experience occurrences.");
+        }
+        if (question?.operation === "create" &&
             (metadata.get("frequency") !== "1" || metadata.get("answer-state") !== "needs-research" ||
                 [...metadata.keys()].some(isAnswerContentFrontmatter) ||
-                hasStandardAnswerSection(question.afterContent))) {
+                hasStandardAnswerSection(afterContent))) {
             invalid("A new Interview Question must start needs-research without a standard answer.");
         }
+        if (question !== undefined && question.operation !== "create") {
+            const beforeContent = question.beforeContent as string;
+            const beforeMetadata = markdownFrontmatter(beforeContent);
+            const beforeOccurrences = interviewExperienceOccurrences(beforeContent, questionItem.path);
+            const beforeFrequency = Number(beforeMetadata?.get("frequency"));
+            if (beforeMetadata?.get("type") !== "interview-question" ||
+                beforeMetadata.get("question-id") !== metadata.get("question-id") ||
+                new Set(beforeOccurrences.map((path) => path.toLowerCase())).size !== beforeOccurrences.length ||
+                beforeFrequency !== beforeOccurrences.length) {
+                invalid("Existing Interview Question frequency is inconsistent with its Experience occurrences.");
+            }
+            const currentExperience = experienceItem.path.toLowerCase();
+            const expectedOccurrences = new Set(beforeOccurrences.map((path) => path.toLowerCase()));
+            expectedOccurrences.add(currentExperience);
+            const actualOccurrences = new Set(afterOccurrences.map((path) => path.toLowerCase()));
+            if (expectedOccurrences.size !== actualOccurrences.size ||
+                [...expectedOccurrences].some((path) => !actualOccurrences.has(path))) {
+                invalid("An Interview Question update may add only the current Experience occurrence.");
+            }
+        }
     }
-    if (questions.some((question) =>
-        !hasVaultWikiLink(experiences[0].afterContent as string, question.path, experiences[0].path))) {
+    if (questionItems.some((question) =>
+        !hasVaultWikiLink(experienceContent, question.path, experienceItem.path))) {
         invalid("The Interview Experience must link every Question target in its batch.");
-    }
-    if (!targets.some((target) => target.path === EXPERIENCE_INDEX_PATH) ||
-        !targets.some((target) => target.path === QUESTION_INDEX_PATH)) {
-        invalid("An Interview Submission must update both primary Interview indexes in the same batch.");
     }
     const experienceIndex = targets.find((target) => target.path === EXPERIENCE_INDEX_PATH);
     const questionIndex = targets.find((target) => target.path === QUESTION_INDEX_PATH);
-    if (experienceIndex?.afterContent === undefined || questionIndex?.afterContent === undefined ||
-        !hasVaultWikiLink(experienceIndex.afterContent, experiences[0].path, EXPERIENCE_INDEX_PATH) ||
-        questions.some((question) => question.operation === "create" &&
-            !hasVaultWikiLink(questionIndex.afterContent as string, question.path, QUESTION_INDEX_PATH))) {
+    const newQuestions = questionItems.filter((item) => item.identity === "new");
+    if ((experienceItem.identity === "new" && (experienceIndex?.afterContent === undefined ||
+        !hasVaultWikiLink(experienceIndex.afterContent, experienceItem.path, EXPERIENCE_INDEX_PATH))) ||
+        (experienceItem.identity === "existing" && experienceIndex !== undefined) ||
+        (newQuestions.length > 0 && (questionIndex?.afterContent === undefined || newQuestions.some((question) =>
+            !hasVaultWikiLink(questionIndex.afterContent as string, question.path, QUESTION_INDEX_PATH)))) ||
+        (newQuestions.length === 0 && questionIndex !== undefined)) {
         invalid("Interview primary indexes must link every newly created Interview target.");
     }
+}
+
+async function prepareInterviewReviewNoOps(
+    vault: VaultChangePort,
+    targets: readonly PreparedTarget[],
+    sourceBindings: readonly VaultChangeSourceBinding[],
+    reviewItems: readonly VaultChangeInterviewReviewItem[],
+): Promise<Map<string, string>> {
+    const noOpContents = new Map<string, string>();
+    for (const target of targets) {
+        const item = reviewItems.find((candidate) => candidate.path.toLowerCase() === target.path.toLowerCase());
+        const expectedKind = categorizeTarget(target.path);
+        if (item === undefined || expectedKind === "other" || item.kind !== expectedKind ||
+            (target.operation === "create" && (item.identity !== "new" || item.mutation !== "create")) ||
+            (target.operation !== "create" && (item.identity !== "existing" || item.mutation !== "modify"))) {
+            invalid(`Interview Submission review does not match '${target.path}'.`);
+        }
+    }
+    for (const item of reviewItems) {
+        const target = targets.find((candidate) => candidate.path.toLowerCase() === item.path.toLowerCase());
+        if ((item.identity === "new") !== (item.mutation === "create") ||
+            (item.mutation === "none" && item.identity !== "existing")) {
+            invalid("Interview Submission review identity and mutation are inconsistent.");
+        }
+        if (item.mutation !== "none" && target === undefined) {
+            invalid(`Interview Submission review mutation '${item.path}' has no operation.`);
+        }
+        if (item.mutation === "none") {
+            if (target !== undefined || categorizeTarget(item.path) !== item.kind) {
+                invalid(`Interview Submission no-op review '${item.path}' is invalid.`);
+            }
+            const binding = sourceBindings.find((candidate) =>
+                candidate.path.toLowerCase() === item.path.toLowerCase(),
+            );
+            if (binding === undefined) {
+                invalid(`Interview Submission no-op review '${item.path}' requires an exact source binding.`);
+            }
+            const snapshot = await vault.snapshot(binding.path);
+            if (snapshot.content === undefined || snapshot.modifiedVersion !== binding.expectedModifiedVersion ||
+                contentIdentity(snapshot.content) !== binding.expectedContentHash) {
+                throw new ChangeValidationError(
+                    "resource.conflict",
+                    `Vault no-op review source '${binding.path}' changed before apply.`,
+                );
+            }
+            noOpContents.set(item.path.toLowerCase(), snapshot.content);
+        }
+    }
+    return noOpContents;
+}
+
+function targetForReviewItem(
+    targets: readonly PreparedTarget[],
+    item: VaultChangeInterviewReviewItem,
+): PreparedTarget | undefined {
+    return targets.find((target) => target.path.toLowerCase() === item.path.toLowerCase());
 }
 
 function isInterviewExperienceTarget(target: Pick<PreparedTarget, "path" | "afterContent">): boolean {
@@ -1208,6 +1373,25 @@ function boundedMetadata(value: string | undefined, maximumBytes: number): boole
     return value !== undefined && Boolean(value) && Buffer.byteLength(value, "utf8") <= maximumBytes;
 }
 
+function validExperienceSourceMetadata(metadata: ReadonlyMap<string, string>): boolean {
+    const sourceKind = metadata.get("source-kind");
+    const capturedOn = metadata.get("captured-on");
+    const sourceUrl = metadata.get("source-url");
+    const sourceFingerprint = metadata.get("source-fingerprint");
+    if (!sourceKind || !["text", "public_url", "ordered_images", "mixed"].includes(sourceKind) ||
+        capturedOn === undefined || !calendarDate(capturedOn) ||
+        (sourceFingerprint !== undefined && !DIGEST.test(sourceFingerprint))) return false;
+    if (sourceUrl !== undefined && validateCanonicalInterviewSourceIdentity({
+        canonicalUrls: [sourceUrl],
+        orderedImageContentHashes: [],
+        sourceFingerprint: null,
+    }) === null) return false;
+    return (sourceKind === "text" && sourceUrl === undefined && sourceFingerprint === undefined) ||
+        (sourceKind === "public_url" && sourceUrl !== undefined && sourceFingerprint === undefined) ||
+        (sourceKind === "ordered_images" && sourceUrl === undefined && sourceFingerprint !== undefined) ||
+        (sourceKind === "mixed" && (sourceUrl !== undefined || sourceFingerprint !== undefined));
+}
+
 function positiveFrontmatterInteger(value: string | undefined): boolean {
     const parsed = Number(value);
     return value !== undefined && Number.isSafeInteger(parsed) && parsed >= 1;
@@ -1232,6 +1416,18 @@ function hasVaultWikiLink(content: string, targetPath: string, sourcePath: strin
     return false;
 }
 
+function interviewExperienceOccurrences(content: string, sourcePath: string): string[] {
+    const occurrences: string[] = [];
+    for (const match of content.matchAll(/\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]/gu)) {
+        const linked = match[1].trim().replace(/^\.\//u, "").replace(/\.md$/u, "");
+        const direct = `${linked}.md`;
+        const resolved = `${resolveVaultWikiLink(sourcePath, linked)}.md`;
+        if (EXPERIENCE_PATH.test(direct) || LEGACY_EXPERIENCE_PATH.test(direct)) occurrences.push(direct);
+        else if (EXPERIENCE_PATH.test(resolved) || LEGACY_EXPERIENCE_PATH.test(resolved)) occurrences.push(resolved);
+    }
+    return occurrences;
+}
+
 function resolveVaultWikiLink(sourcePath: string, linked: string): string {
     const resolved = sourcePath.split("/").slice(0, -1);
     for (const segment of linked.split("/")) {
@@ -1251,7 +1447,7 @@ function markdownFrontmatter(content: string): Map<string, string> | null {
     for (const line of normalized.slice(4, closing).split("\n")) {
         const separator = line.indexOf(":");
         if (separator <= 0) return null;
-        const key = line.slice(0, separator).trim().toLocaleLowerCase();
+        const key = line.slice(0, separator).trim().toLowerCase();
         let item = line.slice(separator + 1).trim();
         if (!/^[a-z][a-z0-9-]*$/u.test(key) || metadata.has(key) || /[{}\r\n]/u.test(item) ||
             (key !== "source-url" && /[\[\]]/u.test(item))) return null;
@@ -1297,14 +1493,15 @@ function applyOperation(operation: Operation, before: string | undefined): strin
 
 function safeVaultPath(value: unknown): string | undefined {
     if (typeof value !== "string") return undefined;
-    const path = value.trim();
-    if (!path || path.length > MAX_PATH_LENGTH || path.includes("\\") || path.includes(":") || path.includes("\0") || path.startsWith("/")) {
+    const path = value;
+    if (!path || path.trim() !== path || path.length > MAX_PATH_LENGTH || path.includes("\\") ||
+        path.includes(":") || path.includes("\0") || path.startsWith("/")) {
         return undefined;
     }
     const segments = path.split("/");
-    if (segments.some((segment) => !segment || segment === "." || segment === ".." || segment.toLocaleLowerCase() === ".git" ||
-        segment.toLocaleLowerCase() === "node_modules")) return undefined;
-    const lower = path.toLocaleLowerCase();
+    if (segments.some((segment) => !segment || segment === "." || segment === ".." || segment.toLowerCase() === ".git" ||
+        segment.toLowerCase() === "node_modules")) return undefined;
+    const lower = path.toLowerCase();
     if (lower.startsWith(".obsidian/plugins/offeragent")) return undefined;
     if (segments.some((segment) => segment.startsWith(".")) &&
         !lower.startsWith(".codex/") && !lower.startsWith(".obsidian/")) return undefined;
@@ -1314,7 +1511,7 @@ function safeVaultPath(value: unknown): string | undefined {
 }
 
 function isControlPath(path: string): boolean {
-    const lower = path.toLocaleLowerCase();
+    const lower = path.toLowerCase();
     return lower === "agent.md" || lower.startsWith(".codex/") || lower.startsWith(".obsidian/");
 }
 
@@ -1353,7 +1550,7 @@ function validMemoryTopicMetadata(path: string, content: string): boolean {
     for (const line of normalized.slice(4, closing).split("\n")) {
         const separator = line.indexOf(":");
         if (separator <= 0) continue;
-        const key = line.slice(0, separator).trim().toLocaleLowerCase();
+        const key = line.slice(0, separator).trim().toLowerCase();
         let value = line.slice(separator + 1).trim();
         if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
             value = value.slice(1, -1).trim();
@@ -1422,7 +1619,7 @@ function conflictDiff(path: string, current: string | undefined, before: string 
 
 function stateHash(targets: readonly VaultChangeJournalTarget[], side: "before" | "after"): string {
     return digest([...targets]
-        .sort((left, right) => left.path.localeCompare(right.path))
+        .sort((left, right) => compareCodePointOrder(left.path, right.path))
         .map((target) => `${target.path}\0${side === "before" ? target.beforeHash : target.afterHash}`)
         .join("\n"));
 }
@@ -1539,6 +1736,77 @@ export class GitCheckpointStore implements VaultCheckpointStore {
 export class FileVaultChangeJournal implements VaultChangeJournalStore {
     constructor(private readonly directory: string) {}
 
+    async markRecoveryReady(recoveryToken: string): Promise<void> {
+        if (!/^[0-9a-f]{64}$/u.test(recoveryToken)) {
+            throw new TypeError("Worker recovery token is invalid");
+        }
+        await mkdir(this.directory, { recursive: true });
+        await this.publishRecoverySeals(recoveryToken);
+        const target = join(this.directory, ".recovery-ready.json");
+        const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
+        const handle = await open(temporary, "wx", 0o600);
+        try {
+            await handle.writeFile(`${JSON.stringify({ schemaVersion: 2, recoveryToken })}\n`, "utf8");
+            await handle.sync();
+        } finally {
+            await handle.close();
+        }
+        try {
+            await rename(temporary, target);
+        } finally {
+            await rm(temporary, { force: true });
+        }
+    }
+
+    private async publishRecoverySeals(recoveryToken: string): Promise<void> {
+        const sealRoot = join(this.directory, ".recovery-seals");
+        await mkdir(sealRoot, { recursive: true });
+        for (const entry of await readdir(sealRoot, { withFileTypes: true })) {
+            if (entry.name !== "current" || !entry.isDirectory()) {
+                throw new Error(`Vault Change recovery seal contains an unexpected entry: ${entry.name}`);
+            }
+            await rm(join(sealRoot, entry.name), { recursive: true });
+        }
+        const sealDirectory = join(sealRoot, "current");
+        await mkdir(sealDirectory);
+        const entries = await readdir(this.directory, { withFileTypes: true });
+        const names: string[] = [];
+        for (const entry of entries) {
+            if (entry.name === ".recovery-ready.json" || entry.name === ".recovery-seals" ||
+                /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.json\.\d+\.\d+\.tmp$/u.test(entry.name)) {
+                continue;
+            }
+            if (!entry.isFile() || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.json$/u.test(entry.name)) {
+                throw new Error(`Vault Change journal contains an unexpected recovery entry: ${entry.name}`);
+            }
+            names.push(entry.name);
+        }
+        for (const name of names.sort(compareCodePointOrder)) {
+            const raw = await readStableRecoveryRecord(join(this.directory, name));
+            const batchId = name.slice(0, -5);
+            const parsed = parseJournal(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)));
+            if (parsed.batchId !== batchId) {
+                throw new Error("Vault Change journal filename does not match its batch");
+            }
+            if (parsed.version !== 2 || parsed.changeKind !== "interview_submission") continue;
+            const seal = {
+                schemaVersion: 1,
+                recoveryToken,
+                batchId,
+                contentHash: digest(raw),
+                byteLength: raw.byteLength,
+            };
+            const sealName = `${digest(batchId).slice("sha256:".length)}.json`;
+            const handle = await open(join(sealDirectory, sealName), "wx", 0o600);
+            try {
+                await handle.writeFile(`${JSON.stringify(seal)}\n`, "utf8");
+                await handle.sync();
+            } finally {
+                await handle.close();
+            }
+        }
+    }
+
     /** Idempotently relocates recovery records preserved from the replaceable plugin tree. */
     async migrateLegacyDirectory(legacyDirectory: string): Promise<void> {
         const source = resolve(legacyDirectory);
@@ -1630,6 +1898,68 @@ export class FileVaultChangeJournal implements VaultChangeJournalStore {
     }
 }
 
+type FileSnapshot = Awaited<ReturnType<typeof lstat>>;
+
+async function readStableRecoveryRecord(path: string): Promise<Buffer> {
+    const before = await lstat(path);
+    requireRecoveryRecordFile(before);
+    const handle = await open(path, "r");
+    let opened: FileSnapshot;
+    let after: FileSnapshot;
+    let raw: Buffer;
+    try {
+        opened = await handle.stat();
+        requireRecoveryRecordFile(opened);
+        if (!sameFileIdentity(before, opened)) {
+            throw new Error("Vault Change journal record changed before it was opened");
+        }
+        raw = Buffer.alloc(opened.size);
+        let offset = 0;
+        while (offset < raw.byteLength) {
+            const read = await handle.read(raw, offset, raw.byteLength - offset, offset);
+            if (read.bytesRead === 0) break;
+            offset += read.bytesRead;
+        }
+        if (offset !== raw.byteLength) throw new Error("Vault Change journal record changed while reading");
+        after = await handle.stat();
+    } finally {
+        await handle.close();
+    }
+    const current = await lstat(path);
+    requireRecoveryRecordFile(current);
+    if (!sameFileSnapshot(before, opened) || !sameFileSnapshot(opened, after) ||
+        !sameFileSnapshot(after, current)) {
+        throw new Error("Vault Change journal record changed while reading");
+    }
+    return raw;
+}
+
+function requireRecoveryRecordFile(snapshot: FileSnapshot): void {
+    if (!snapshot.isFile() || snapshot.isSymbolicLink() || snapshot.size < 2 || snapshot.size > MAX_BATCH_BYTES) {
+        throw new Error("Vault Change journal recovery record is not a bounded real file");
+    }
+}
+
+function sameFileIdentity(left: FileSnapshot, right: FileSnapshot): boolean {
+    return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameFileSnapshot(left: FileSnapshot, right: FileSnapshot): boolean {
+    return sameFileIdentity(left, right) && left.size === right.size && left.mtimeMs === right.mtimeMs &&
+        left.ctimeMs === right.ctimeMs;
+}
+
+function compareCodePointOrder(left: string, right: string): number {
+    const leftPoints = [...left];
+    const rightPoints = [...right];
+    const length = Math.min(leftPoints.length, rightPoints.length);
+    for (let index = 0; index < length; index += 1) {
+        const difference = (leftPoints[index].codePointAt(0) as number) - (rightPoints[index].codePointAt(0) as number);
+        if (difference !== 0) return difference;
+    }
+    return leftPoints.length - rightPoints.length;
+}
+
 function parseJournal(value: unknown): VaultChangeJournalRecord {
     const malformed = (): never => { throw new Error("Vault Change journal record is malformed"); };
     if (!isRecord(value)) malformed();
@@ -1679,7 +2009,7 @@ function parseJournal(value: unknown): VaultChangeJournalRecord {
             (operation === "delete" && (beforeHash === "absent" || afterHash !== "absent")) ||
             (!["create", "delete"].includes(operation) &&
                 (beforeHash === "absent" || afterHash === "absent"))) malformed();
-        const folded = path.toLocaleLowerCase();
+        const folded = path.toLowerCase();
         if (targetPaths.has(folded)) malformed();
         targetPaths.add(folded);
     }
@@ -1687,7 +2017,7 @@ function parseJournal(value: unknown): VaultChangeJournalRecord {
         const unique = new Set<string>();
         return paths.every((candidate) => {
             if (typeof candidate !== "string" || safeVaultPath(candidate) !== candidate) return false;
-            const folded = candidate.toLocaleLowerCase();
+            const folded = candidate.toLowerCase();
             if (!targetPaths.has(folded) || unique.has(folded)) return false;
             unique.add(folded);
             return true;
@@ -1836,7 +2166,7 @@ function modifiedVersion(file: TFile): string {
 }
 
 function samePath(left: string, right: string): boolean {
-    return process.platform === "win32" ? left.toLocaleLowerCase() === right.toLocaleLowerCase() : left === right;
+    return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
 }
 
 function isNodeError(value: unknown): value is NodeJS.ErrnoException {

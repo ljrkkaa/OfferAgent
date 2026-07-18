@@ -4,7 +4,7 @@ const path = require("node:path");
 const test = require("node:test");
 const { buildSync } = require("esbuild");
 
-function loadModule(entry) {
+function loadModule(entry, moduleOverrides = {}) {
     const output = buildSync({
         entryPoints: [path.join(__dirname, "../src/runtime", entry)],
         bundle: true,
@@ -14,7 +14,10 @@ function loadModule(entry) {
         write: false,
     }).outputFiles[0].text;
     const compiled = { exports: {} };
-    new Function("require", "module", "exports", output)(require, compiled, compiled.exports);
+    const localRequire = (specifier) => Object.prototype.hasOwnProperty.call(moduleOverrides, specifier)
+        ? moduleOverrides[specifier]
+        : require(specifier);
+    new Function("require", "module", "exports", output)(localRequire, compiled, compiled.exports);
     return compiled.exports;
 }
 
@@ -104,6 +107,74 @@ class FakeChildProcess extends EventEmitter {
         this.emit("close", code, signal);
     }
 }
+
+test("stdio Worker receives the exact plugin journal binding needed for unknown-outcome recovery", async () => {
+    const child = new FakeChildProcess();
+    let spawned;
+    const childProcess = {
+        ...require("node:child_process"),
+        spawn(executable, args, options) {
+            spawned = { executable, args, options };
+            return child;
+        },
+    };
+    const { StdioWorkerTransport } = loadModule("stdio_worker.ts", {
+        "node:child_process": childProcess,
+    });
+    const executable = path.resolve("runtime", "offeragent-worker.exe");
+    const vaultRoot = path.resolve("vault");
+    const journalDirectory = path.join(vaultRoot, ".obsidian", "offeragent", "vault-change-journal");
+    const recoveryToken = "b".repeat(64);
+    const transport = new StdioWorkerTransport(
+        executable,
+        vaultRoot,
+        "1.2.3-local",
+        journalDirectory,
+        recoveryToken,
+    );
+
+    const peer = await transport.connect();
+
+    assert.equal(spawned.executable, executable);
+    assert.deepEqual(spawned.args, [
+        "stdio",
+        "--vault-root", vaultRoot,
+        "--runtime-version", "1.2.3-local",
+        "--plugin-journal-directory", journalDirectory,
+        "--plugin-recovery-token", recoveryToken,
+    ]);
+    assert.equal(spawned.options.windowsHide, true);
+    const closing = peer.close();
+    child.emitExit(0, null);
+    await closing;
+});
+
+test("stdio Worker refuses untrusted plugin recovery bindings before process creation", () => {
+    const { StdioWorkerTransport } = loadModule("stdio_worker.ts");
+    const executable = path.resolve("runtime", "offeragent-worker.exe");
+    const vaultRoot = path.resolve("vault");
+    const journalDirectory = path.join(vaultRoot, ".obsidian", "offeragent", "vault-change-journal");
+    const recoveryToken = "b".repeat(64);
+
+    assert.throws(
+        () => new StdioWorkerTransport(executable, vaultRoot, "1.2.3", "relative-journal", recoveryToken),
+        /journal directory/i,
+    );
+    assert.throws(
+        () => new StdioWorkerTransport(
+            executable,
+            vaultRoot,
+            "1.2.3",
+            path.resolve("outside", "vault-change-journal"),
+            recoveryToken,
+        ),
+        /contained in the Vault/i,
+    );
+    assert.throws(
+        () => new StdioWorkerTransport(executable, vaultRoot, "1.2.3", journalDirectory, "B".repeat(64)),
+        /recovery token/i,
+    );
+});
 
 test("stdio close gives the Worker EOF and joins a graceful exit without killing it", async () => {
     const { ChildStdioChannel } = loadModule("stdio_worker.ts");

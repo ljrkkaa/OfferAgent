@@ -249,6 +249,24 @@ function interviewFixture() {
                 canonicalUrls: ["https://example.com/interview/42"],
                 orderedImageContentHashes: imageHashes,
                 sourceFingerprint,
+                reviewItems: [
+                    {
+                        kind: "experience", path: experiencePath,
+                        identity: "new", mutation: "create",
+                    },
+                    {
+                        kind: "question", path: questionPath,
+                        identity: "new", mutation: "create",
+                    },
+                    {
+                        kind: "index", path: experienceIndexPath,
+                        identity: "existing", mutation: "modify",
+                    },
+                    {
+                        kind: "index", path: questionIndexPath,
+                        identity: "existing", mutation: "modify",
+                    },
+                ],
             },
         },
         experiencePath,
@@ -257,6 +275,23 @@ function interviewFixture() {
         questionIndexPath,
     };
 }
+
+test("structured Interview review badges distinguish new, merge, modify, and no-op outcomes", () => {
+    const { interviewReviewBadges } = loadModule();
+
+    assert.deepEqual(interviewReviewBadges({
+        kind: "experience", path: "experiences/new.md", identity: "new", mutation: "create",
+    }), ["身份 · 新增", "新增"]);
+    assert.deepEqual(interviewReviewBadges({
+        kind: "experience", path: "experiences/existing.md", identity: "existing", mutation: "modify",
+    }), ["身份 · 既有", "合并"]);
+    assert.deepEqual(interviewReviewBadges({
+        kind: "question", path: "interview/existing.md", identity: "existing", mutation: "modify",
+    }), ["身份 · 既有", "修改"]);
+    assert.deepEqual(interviewReviewBadges({
+        kind: "question", path: "interview/existing.md", identity: "existing", mutation: "none",
+    }), ["身份 · 既有", "无操作"]);
+});
 
 test("trusted Vault previews and confirms one categorized Interview Submission batch", async () => {
     const { VaultChangeCoordinator } = loadModule();
@@ -306,6 +341,10 @@ test("trusted Vault previews and confirms one categorized Interview Submission b
         },
     ]);
     assert.deepEqual(proposal.sourceBindings, fixture.argumentOverrides.sourceBindings);
+    assert.deepEqual(
+        proposal.interviewSubmission.reviewItems,
+        fixture.argumentOverrides.interviewSubmission.reviewItems,
+    );
     assert.deepEqual(proposal.reviewTargets.map((target) => target.path), [
         fixture.experiencePath,
         fixture.questionPath,
@@ -318,6 +357,36 @@ test("trusted Vault previews and confirms one categorized Interview Submission b
     assert.equal(vault.entries.get(fixture.questionPath), fixture.operations[1].content);
     assert.match(vault.entries.get(fixture.experienceIndexPath), /acme-backend/u);
     assert.match(vault.entries.get(fixture.questionIndexPath), /database-isolation/u);
+});
+
+test("result state hashes order Unicode paths by code point across runtimes", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const vault = new MemoryVault({});
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal: new MemoryJournal(),
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+    });
+    const operations = [
+        {
+            op: "create", path: "notes/ä.md", content: "umlaut\n",
+            expectedContentHash: "absent", expectedModifiedVersion: "missing",
+        },
+        {
+            op: "create", path: "notes/z.md", content: "zed\n",
+            expectedContentHash: "absent", expectedModifiedVersion: "missing",
+        },
+    ];
+
+    const result = await coordinator.execute(call("batch_unicode_state_hash", operations));
+
+    assert.equal(result.status, "succeeded");
+    assert.equal(result.data.beforeStateHash, digest("notes/z.md\0absent\nnotes/ä.md\0absent"));
+    assert.equal(
+        result.data.afterStateHash,
+        digest(`notes/z.md\0${digest("zed\n")}\nnotes/ä.md\0${digest("umlaut\n")}`),
+    );
 });
 
 test("Interview Submission review exposes every byte beyond 100 lines and 32 KiB", async () => {
@@ -501,38 +570,468 @@ test("Interview Submission accepts the Catalog's canonical public IPv6 URL", asy
     assert.equal(result.status, "succeeded");
 });
 
-test("Interview Submission accepts a linked existing Question with a positive accumulated frequency", async () => {
+test("a distinct Experience adds one existing Question occurrence without rewriting its unchanged index", async () => {
     const { VaultChangeCoordinator } = loadModule();
     const fixture = interviewFixture();
-    const existingQuestionContent = fixture.operations[1].content.replace("frequency: 1", "frequency: 2");
+    const existingQuestionContent = fixture.operations[1].content.replace(
+        "acme-backend-2026-07-18",
+        "older-experience",
+    );
     const entries = {
         ...fixture.entries,
         [fixture.questionPath]: existingQuestionContent,
     };
-    const operations = fixture.operations.map((operation, index) => index === 1
-        ? {
-            op: "append",
-            path: operation.path,
-            content: "\n## Source Notes\n- Additional source context.\n",
+    const operations = [
+        fixture.operations[0],
+        {
+            op: "patch",
+            path: fixture.questionPath,
+            edits: [
+                { startLine: 6, endLine: 6, replacement: "frequency: 2" },
+                {
+                    startLine: 11,
+                    endLine: 11,
+                    replacement: [
+                        "- [[../experiences/older-experience]]",
+                        "- [[../experiences/acme-backend-2026-07-18]]",
+                    ].join("\n"),
+                },
+            ],
             expectedContentHash: digest(existingQuestionContent),
             expectedModifiedVersion: initialModifiedVersion(4, existingQuestionContent),
-        }
-        : operation);
+        },
+        fixture.operations[2],
+    ];
+    const argumentOverrides = {
+        ...fixture.argumentOverrides,
+        sourceBindings: [
+            ...fixture.argumentOverrides.sourceBindings,
+            {
+                path: fixture.questionPath,
+                expectedContentHash: digest(existingQuestionContent),
+                expectedModifiedVersion: initialModifiedVersion(4, existingQuestionContent),
+            },
+        ],
+        interviewSubmission: {
+            ...fixture.argumentOverrides.interviewSubmission,
+            reviewItems: [
+                {
+                    kind: "experience", path: fixture.experiencePath,
+                    identity: "new", mutation: "create",
+                },
+                {
+                    kind: "question", path: fixture.questionPath,
+                    identity: "existing", mutation: "modify",
+                },
+                {
+                    kind: "index", path: fixture.experienceIndexPath,
+                    identity: "existing", mutation: "modify",
+                },
+            ],
+        },
+    };
+    let proposal;
     const vault = new MemoryVault(entries);
     const coordinator = new VaultChangeCoordinator({
         vault,
         journal: new MemoryJournal(),
         checkpoints: new MemoryCheckpoints(vault),
         permissionMode: () => "trusted_vault",
+        authorize: async (candidate) => {
+            proposal = candidate;
+            return approve(candidate);
+        },
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_existing_question", operations, argumentOverrides,
+    ));
+
+    assert.equal(result.status, "succeeded");
+    assert.match(vault.entries.get(fixture.questionPath), /frequency: 2/u);
+    assert.equal(
+        vault.entries.get(fixture.questionPath).match(/acme-backend-2026-07-18/gu)?.length,
+        1,
+    );
+    assert.equal(vault.entries.get(fixture.questionIndexPath), fixture.entries[fixture.questionIndexPath]);
+    assert.deepEqual(
+        proposal.interviewSubmission.reviewItems,
+        argumentOverrides.interviewSubmission.reviewItems,
+    );
+});
+
+test("the same source event merges one existing Experience while its linked Question and indexes remain no-ops", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const existingExperienceContent = fixture.operations[0].content;
+    const existingQuestionContent = fixture.operations[1].content;
+    const entries = {
+        ...fixture.entries,
+        [fixture.experiencePath]: existingExperienceContent,
+        [fixture.questionPath]: existingQuestionContent,
+    };
+    const experienceVersion = initialModifiedVersion(4, existingExperienceContent);
+    const questionVersion = initialModifiedVersion(5, existingQuestionContent);
+    const operations = [{
+        op: "append",
+        path: fixture.experiencePath,
+        content: "\n## Source-supported detail\n- The interviewer asked for a concrete trade-off.\n",
+        expectedContentHash: digest(existingExperienceContent),
+        expectedModifiedVersion: experienceVersion,
+    }];
+    const argumentOverrides = {
+        ...fixture.argumentOverrides,
+        sourceBindings: [
+            ...fixture.argumentOverrides.sourceBindings,
+            {
+                path: fixture.experiencePath,
+                expectedContentHash: digest(existingExperienceContent),
+                expectedModifiedVersion: experienceVersion,
+            },
+            {
+                path: fixture.questionPath,
+                expectedContentHash: digest(existingQuestionContent),
+                expectedModifiedVersion: questionVersion,
+            },
+        ],
+        interviewSubmission: {
+            ...fixture.argumentOverrides.interviewSubmission,
+            reviewItems: [
+                {
+                    kind: "experience", path: fixture.experiencePath,
+                    identity: "existing", mutation: "modify",
+                },
+                {
+                    kind: "question", path: fixture.questionPath,
+                    identity: "existing", mutation: "none",
+                },
+            ],
+        },
+    };
+    let proposal;
+    const vault = new MemoryVault(entries);
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal: new MemoryJournal(),
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async (candidate) => {
+            proposal = candidate;
+            return approve(candidate);
+        },
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_same_event_merge", operations, argumentOverrides,
+    ));
+
+    assert.equal(result.status, "succeeded");
+    assert.match(vault.entries.get(fixture.experiencePath), /concrete trade-off/u);
+    assert.equal(vault.entries.get(fixture.questionPath), existingQuestionContent);
+    assert.equal(vault.entries.get(fixture.experienceIndexPath), fixture.entries[fixture.experienceIndexPath]);
+    assert.equal(vault.entries.get(fixture.questionIndexPath), fixture.entries[fixture.questionIndexPath]);
+    assert.deepEqual(
+        proposal.interviewSubmission.reviewItems,
+        argumentOverrides.interviewSubmission.reviewItems,
+    );
+});
+
+test("a no-op Question changed during the final merge check rolls back without overwriting the user edit", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const existingExperienceContent = fixture.operations[0].content;
+    const existingQuestionContent = fixture.operations[1].content;
+    const entries = {
+        ...fixture.entries,
+        [fixture.experiencePath]: existingExperienceContent,
+        [fixture.questionPath]: existingQuestionContent,
+    };
+    const experienceVersion = initialModifiedVersion(4, existingExperienceContent);
+    const questionVersion = initialModifiedVersion(5, existingQuestionContent);
+    const operations = [{
+        op: "append",
+        path: fixture.experiencePath,
+        content: "\n## Source-supported detail\n- Merge this detail.\n",
+        expectedContentHash: digest(existingExperienceContent),
+        expectedModifiedVersion: experienceVersion,
+    }];
+    const argumentOverrides = {
+        ...fixture.argumentOverrides,
+        sourceBindings: [
+            ...fixture.argumentOverrides.sourceBindings,
+            {
+                path: fixture.experiencePath,
+                expectedContentHash: digest(existingExperienceContent),
+                expectedModifiedVersion: experienceVersion,
+            },
+            {
+                path: fixture.questionPath,
+                expectedContentHash: digest(existingQuestionContent),
+                expectedModifiedVersion: questionVersion,
+            },
+        ],
+        interviewSubmission: {
+            ...fixture.argumentOverrides.interviewSubmission,
+            reviewItems: [
+                {
+                    kind: "experience", path: fixture.experiencePath,
+                    identity: "existing", mutation: "modify",
+                },
+                {
+                    kind: "question", path: fixture.questionPath,
+                    identity: "existing", mutation: "none",
+                },
+            ],
+        },
+    };
+    const vault = new MemoryVault(entries);
+    const originalApplyConditional = vault.applyConditional.bind(vault);
+    let raced = false;
+    vault.applyConditional = async (mutation) => {
+        const outcome = await originalApplyConditional(mutation);
+        if (!raced && mutation.path === fixture.experiencePath && outcome.status === "applied") {
+            raced = true;
+            await vault.write(fixture.questionPath, "user edit during Experience merge\n");
+        }
+        return outcome;
+    };
+    const journal = new MemoryJournal();
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal,
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
         authorize: async (proposal) => approve(proposal),
     });
 
     const result = await coordinator.execute(call(
-        "batch_interview_existing_question", operations, fixture.argumentOverrides,
+        "batch_interview_noop_source_race", operations, argumentOverrides,
     ));
 
-    assert.equal(result.status, "succeeded");
-    assert.match(vault.entries.get(fixture.questionPath), /Additional source context/u);
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "resource.conflict");
+    assert.equal(vault.entries.get(fixture.experiencePath), existingExperienceContent);
+    assert.equal(vault.entries.get(fixture.questionPath), "user edit during Experience merge\n");
+    assert.equal((await journal.load("batch_interview_noop_source_race")).state, "rolled_back");
+});
+
+test("an existing Experience merge cannot replace its Catalog identity", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const existingExperienceContent = fixture.operations[0].content;
+    const existingQuestionContent = fixture.operations[1].content;
+    const entries = {
+        ...fixture.entries,
+        [fixture.experiencePath]: existingExperienceContent,
+        [fixture.questionPath]: existingQuestionContent,
+    };
+    const experienceVersion = initialModifiedVersion(4, existingExperienceContent);
+    const questionVersion = initialModifiedVersion(5, existingQuestionContent);
+    const operations = [{
+        op: "replace",
+        path: fixture.experiencePath,
+        find: "experience-id: exp_acme_backend_20260718",
+        replacement: "experience-id: exp_replaced_identity",
+        expectedContentHash: digest(existingExperienceContent),
+        expectedModifiedVersion: experienceVersion,
+    }];
+    const argumentOverrides = {
+        ...fixture.argumentOverrides,
+        sourceBindings: [
+            ...fixture.argumentOverrides.sourceBindings,
+            {
+                path: fixture.questionPath,
+                expectedContentHash: digest(existingQuestionContent),
+                expectedModifiedVersion: questionVersion,
+            },
+        ],
+        interviewSubmission: {
+            ...fixture.argumentOverrides.interviewSubmission,
+            reviewItems: [
+                {
+                    kind: "experience", path: fixture.experiencePath,
+                    identity: "existing", mutation: "modify",
+                },
+                {
+                    kind: "question", path: fixture.questionPath,
+                    identity: "existing", mutation: "none",
+                },
+            ],
+        },
+    };
+    const vault = new MemoryVault(entries);
+    let approvals = 0;
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal: new MemoryJournal(),
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async (proposal) => {
+            approvals += 1;
+            return approve(proposal);
+        },
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_existing_identity_drift", operations, argumentOverrides,
+    ));
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "protocol.invalid_params");
+    assert.equal(approvals, 0);
+    assert.equal(vault.entries.get(fixture.experiencePath), existingExperienceContent);
+});
+
+test("an existing Experience merge cannot replace its canonical source identity", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const existingExperienceContent = fixture.operations[0].content;
+    const existingQuestionContent = fixture.operations[1].content;
+    const entries = {
+        ...fixture.entries,
+        [fixture.experiencePath]: existingExperienceContent,
+        [fixture.questionPath]: existingQuestionContent,
+    };
+    const experienceVersion = initialModifiedVersion(4, existingExperienceContent);
+    const questionVersion = initialModifiedVersion(5, existingQuestionContent);
+    const operations = [{
+        op: "replace",
+        path: fixture.experiencePath,
+        find: "source-url: https://example.com/interview/42",
+        replacement: "source-url: http://127.0.0.1/private",
+        expectedContentHash: digest(existingExperienceContent),
+        expectedModifiedVersion: experienceVersion,
+    }];
+    const argumentOverrides = {
+        ...fixture.argumentOverrides,
+        sourceBindings: [
+            ...fixture.argumentOverrides.sourceBindings,
+            {
+                path: fixture.questionPath,
+                expectedContentHash: digest(existingQuestionContent),
+                expectedModifiedVersion: questionVersion,
+            },
+        ],
+        interviewSubmission: {
+            ...fixture.argumentOverrides.interviewSubmission,
+            reviewItems: [
+                {
+                    kind: "experience", path: fixture.experiencePath,
+                    identity: "existing", mutation: "modify",
+                },
+                {
+                    kind: "question", path: fixture.questionPath,
+                    identity: "existing", mutation: "none",
+                },
+            ],
+        },
+    };
+    const vault = new MemoryVault(entries);
+    let approvals = 0;
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal: new MemoryJournal(),
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async (proposal) => {
+            approvals += 1;
+            return approve(proposal);
+        },
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_existing_source_identity_drift", operations, argumentOverrides,
+    ));
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "protocol.invalid_params");
+    assert.equal(approvals, 0);
+    assert.equal(vault.entries.get(fixture.experiencePath), existingExperienceContent);
+});
+
+test("an existing Question occurrence update cannot replace its learning-unit identity", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const fixture = interviewFixture();
+    const existingQuestionContent = fixture.operations[1].content.replace(
+        "acme-backend-2026-07-18",
+        "older-experience",
+    );
+    const entries = {
+        ...fixture.entries,
+        [fixture.questionPath]: existingQuestionContent,
+    };
+    const questionVersion = initialModifiedVersion(4, existingQuestionContent);
+    const operations = [
+        fixture.operations[0],
+        {
+            op: "patch",
+            path: fixture.questionPath,
+            edits: [
+                { startLine: 3, endLine: 3, replacement: "question-id: replaced_learning_unit" },
+                { startLine: 6, endLine: 6, replacement: "frequency: 2" },
+                {
+                    startLine: 11,
+                    endLine: 11,
+                    replacement: [
+                        "- [[../experiences/older-experience]]",
+                        "- [[../experiences/acme-backend-2026-07-18]]",
+                    ].join("\n"),
+                },
+            ],
+            expectedContentHash: digest(existingQuestionContent),
+            expectedModifiedVersion: questionVersion,
+        },
+        fixture.operations[2],
+    ];
+    const argumentOverrides = {
+        ...fixture.argumentOverrides,
+        sourceBindings: [
+            ...fixture.argumentOverrides.sourceBindings,
+            {
+                path: fixture.questionPath,
+                expectedContentHash: digest(existingQuestionContent),
+                expectedModifiedVersion: questionVersion,
+            },
+        ],
+        interviewSubmission: {
+            ...fixture.argumentOverrides.interviewSubmission,
+            reviewItems: [
+                {
+                    kind: "experience", path: fixture.experiencePath,
+                    identity: "new", mutation: "create",
+                },
+                {
+                    kind: "question", path: fixture.questionPath,
+                    identity: "existing", mutation: "modify",
+                },
+                {
+                    kind: "index", path: fixture.experienceIndexPath,
+                    identity: "existing", mutation: "modify",
+                },
+            ],
+        },
+    };
+    const vault = new MemoryVault(entries);
+    let approvals = 0;
+    const coordinator = new VaultChangeCoordinator({
+        vault,
+        journal: new MemoryJournal(),
+        checkpoints: new MemoryCheckpoints(vault),
+        permissionMode: () => "trusted_vault",
+        authorize: async (proposal) => {
+            approvals += 1;
+            return approve(proposal);
+        },
+    });
+
+    const result = await coordinator.execute(call(
+        "batch_interview_existing_question_identity_drift", operations, argumentOverrides,
+    ));
+
+    assert.equal(result.status, "failed");
+    assert.equal(result.error.code, "protocol.invalid_params");
+    assert.equal(approvals, 0);
+    assert.equal(vault.entries.get(fixture.questionPath), existingQuestionContent);
 });
 
 test("rejecting an Interview Submission preview leaves every Vault target unchanged", async () => {
@@ -1118,7 +1617,6 @@ test("unsafe Interview Submission structure is rejected before preview or mutati
     const { VaultChangeCoordinator } = loadModule();
     const fixture = interviewFixture();
     const existingQuestionContent = fixture.operations[1].content
-        .replace("frequency: 1", "frequency: 2")
         .replace(
             "- [[../experiences/acme-backend-2026-07-18]]",
             "- [[../experiences/older-experience]]",
@@ -1132,7 +1630,119 @@ test("unsafe Interview Submission structure is rejected before preview or mutati
         "answer-state: needs-research",
         "answer-state: unsupported",
     );
+    const inconsistentFrequencyQuestionContent = existingQuestionContent.replace("frequency: 1", "frequency: 2");
+    const existingQuestionReviewItems = [
+        {
+            kind: "experience", path: fixture.experiencePath,
+            identity: "new", mutation: "create",
+        },
+        {
+            kind: "question", path: fixture.questionPath,
+            identity: "existing", mutation: "modify",
+        },
+        {
+            kind: "index", path: fixture.experienceIndexPath,
+            identity: "existing", mutation: "modify",
+        },
+    ];
     const cases = [
+        {
+            name: "structured review plan is missing",
+            operations: fixture.operations,
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    reviewItems: undefined,
+                },
+            },
+        },
+        {
+            name: "structured review plan repeats a case-folded path",
+            operations: fixture.operations,
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    reviewItems: [
+                        ...fixture.argumentOverrides.interviewSubmission.reviewItems,
+                        fixture.argumentOverrides.interviewSubmission.reviewItems[0],
+                    ],
+                },
+            },
+        },
+        {
+            name: "structured review identity disagrees with its mutation",
+            operations: fixture.operations,
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    reviewItems: fixture.argumentOverrides.interviewSubmission.reviewItems.map((item, index) =>
+                        index === 0 ? { ...item, mutation: "modify" } : item),
+                },
+            },
+        },
+        {
+            name: "informational no-op has no exact source binding",
+            entries: {
+                ...fixture.entries,
+                [fixture.questionPath]: fixture.operations[1].content,
+            },
+            operations: [fixture.operations[0], fixture.operations[2]],
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    reviewItems: [
+                        fixture.argumentOverrides.interviewSubmission.reviewItems[0],
+                        {
+                            kind: "question", path: fixture.questionPath,
+                            identity: "existing", mutation: "none",
+                        },
+                        fixture.argumentOverrides.interviewSubmission.reviewItems[2],
+                    ],
+                },
+            },
+        },
+        {
+            name: "complete duplicate attempts an empty Apply batch",
+            entries: {
+                ...fixture.entries,
+                [fixture.experiencePath]: fixture.operations[0].content,
+                [fixture.questionPath]: fixture.operations[1].content,
+            },
+            operations: [],
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                sourceBindings: [
+                    ...fixture.argumentOverrides.sourceBindings,
+                    {
+                        path: fixture.experiencePath,
+                        expectedContentHash: digest(fixture.operations[0].content),
+                        expectedModifiedVersion: initialModifiedVersion(4, fixture.operations[0].content),
+                    },
+                    {
+                        path: fixture.questionPath,
+                        expectedContentHash: digest(fixture.operations[1].content),
+                        expectedModifiedVersion: initialModifiedVersion(5, fixture.operations[1].content),
+                    },
+                ],
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    reviewItems: [
+                        {
+                            kind: "experience", path: fixture.experiencePath,
+                            identity: "existing", mutation: "none",
+                        },
+                        {
+                            kind: "question", path: fixture.questionPath,
+                            identity: "existing", mutation: "none",
+                        },
+                    ],
+                },
+            },
+        },
         {
             name: "mismatched source manifest",
             operations: fixture.operations.map((operation, index) => index === 0
@@ -1196,6 +1806,12 @@ test("unsafe Interview Submission structure is rejected before preview or mutati
             name: "create target uses the obsolete absent modified version",
             operations: fixture.operations.map((operation, index) => index === 0
                 ? { ...operation, expectedModifiedVersion: "absent" }
+                : operation),
+        },
+        {
+            name: "target path has surrounding whitespace",
+            operations: fixture.operations.map((operation, index) => index === 0
+                ? { ...operation, path: ` ${operation.path}` }
                 : operation),
         },
         {
@@ -1391,15 +2007,24 @@ test("unsafe Interview Submission structure is rejected before preview or mutati
         {
             name: "existing Question update omits the new Experience occurrence",
             entries: entriesWithExistingQuestion,
-            operations: fixture.operations.map((operation, index) => index === 1
-                ? {
+            operations: [
+                fixture.operations[0],
+                {
                     op: "append",
-                    path: operation.path,
+                    path: fixture.questionPath,
                     content: "\n## Source Notes\n- Additional context.\n",
                     expectedContentHash: digest(existingQuestionContent),
                     expectedModifiedVersion: existingQuestionVersion,
-                }
-                : operation),
+                },
+                fixture.operations[2],
+            ],
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    reviewItems: existingQuestionReviewItems,
+                },
+            },
         },
         {
             name: "existing Question update leaves an invalid answer state",
@@ -1407,15 +2032,89 @@ test("unsafe Interview Submission structure is rejected before preview or mutati
                 ...fixture.entries,
                 [fixture.questionPath]: invalidStateQuestionContent,
             },
-            operations: fixture.operations.map((operation, index) => index === 1
-                ? {
+            operations: [
+                fixture.operations[0],
+                {
                     op: "append",
-                    path: operation.path,
+                    path: fixture.questionPath,
                     content: "\n## Source Notes\n- Additional context.\n",
                     expectedContentHash: digest(invalidStateQuestionContent),
                     expectedModifiedVersion: initialModifiedVersion(4, invalidStateQuestionContent),
-                }
-                : operation),
+                },
+                fixture.operations[2],
+            ],
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    reviewItems: existingQuestionReviewItems,
+                },
+            },
+        },
+        {
+            name: "existing Question frequency disagrees with its unique occurrences",
+            entries: {
+                ...fixture.entries,
+                [fixture.questionPath]: inconsistentFrequencyQuestionContent,
+            },
+            operations: [
+                fixture.operations[0],
+                {
+                    op: "patch",
+                    path: fixture.questionPath,
+                    edits: [{
+                        startLine: 11,
+                        endLine: 11,
+                        replacement: [
+                            "- [[../experiences/older-experience]]",
+                            "- [[../experiences/acme-backend-2026-07-18]]",
+                        ].join("\n"),
+                    }],
+                    expectedContentHash: digest(inconsistentFrequencyQuestionContent),
+                    expectedModifiedVersion: initialModifiedVersion(4, inconsistentFrequencyQuestionContent),
+                },
+                fixture.operations[2],
+            ],
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    reviewItems: existingQuestionReviewItems,
+                },
+            },
+        },
+        {
+            name: "existing Question repeats the current Experience occurrence",
+            entries: entriesWithExistingQuestion,
+            operations: [
+                fixture.operations[0],
+                {
+                    op: "patch",
+                    path: fixture.questionPath,
+                    edits: [
+                        { startLine: 6, endLine: 6, replacement: "frequency: 3" },
+                        {
+                            startLine: 11,
+                            endLine: 11,
+                            replacement: [
+                                "- [[../experiences/older-experience]]",
+                                "- [[../experiences/acme-backend-2026-07-18]]",
+                                "- [[../experiences/acme-backend-2026-07-18]]",
+                            ].join("\n"),
+                        },
+                    ],
+                    expectedContentHash: digest(existingQuestionContent),
+                    expectedModifiedVersion: existingQuestionVersion,
+                },
+                fixture.operations[2],
+            ],
+            argumentOverrides: {
+                ...fixture.argumentOverrides,
+                interviewSubmission: {
+                    ...fixture.argumentOverrides.interviewSubmission,
+                    reviewItems: existingQuestionReviewItems,
+                },
+            },
         },
         {
             name: "Interview batch deletes a Question",
@@ -2253,6 +2952,88 @@ test("file journal atomically replaces durable state and rejects unsafe recovery
         reservation,
     );
     assert.equal(await store.findInterviewSubmissionByRootRun("another_root"), undefined);
+});
+
+test("file journal publishes the exact Worker recovery token without exposing the marker as a batch", async (t) => {
+    const { FileVaultChangeJournal } = loadModule();
+    const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-recovery-marker-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const store = new FileVaultChangeJournal(root);
+    const recoveryToken = "a".repeat(64);
+
+    await store.markRecoveryReady(recoveryToken);
+
+    assert.equal(
+        await readFile(path.join(root, ".recovery-ready.json"), "utf8"),
+        `${JSON.stringify({ schemaVersion: 2, recoveryToken })}\n`,
+    );
+    assert.deepEqual(await store.listUnresolved(), []);
+});
+
+test("file journal recovery marker seals every durable batch record by exact bytes", async (t) => {
+    const { FileVaultChangeJournal } = loadModule();
+    const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-recovery-manifest-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const store = new FileVaultChangeJournal(root);
+    const record = {
+        version: 2,
+        batchId: "batch_recovery_manifest",
+        toolCallId: "call_recovery_manifest",
+        workspaceId: "ws_vault",
+        runId: "run_recovery_manifest",
+        rootRunId: "run_recovery_manifest",
+        changeKind: "interview_submission",
+        reviewHash: digest("review"),
+        argsHash: digest("arguments"),
+        idempotencyKey: "idem_recovery_manifest",
+        state: "prepared",
+        checkpointRef: null,
+        targets: [{
+            operation: "append",
+            path: "notes/a.md",
+            beforeHash: digest("before"),
+            afterHash: digest("after"),
+            beforeModifiedVersion: "mtime:1:size:6",
+            afterModifiedVersion: null,
+        }],
+        appliedPaths: [],
+        manualReviewPaths: [],
+    };
+    await store.save(record);
+    const recordBytes = await readFile(path.join(root, "batch_recovery_manifest.json"), "utf8");
+    const recoveryToken = "b".repeat(64);
+
+    await store.markRecoveryReady(recoveryToken);
+
+    assert.deepEqual(JSON.parse(await readFile(path.join(root, ".recovery-ready.json"), "utf8")), {
+        schemaVersion: 2,
+        recoveryToken,
+    });
+    assert.deepEqual(
+        JSON.parse(await readFile(path.join(
+            root,
+            ".recovery-seals",
+            "current",
+            `${digest("batch_recovery_manifest").slice("sha256:".length)}.json`,
+        ), "utf8")),
+        {
+            schemaVersion: 1,
+            recoveryToken,
+            batchId: "batch_recovery_manifest",
+            contentHash: digest(recordBytes),
+            byteLength: Buffer.byteLength(recordBytes),
+        },
+    );
+});
+
+test("file journal refuses to publish a malformed Worker recovery token", async (t) => {
+    const { FileVaultChangeJournal } = loadModule();
+    const root = await mkdtemp(path.join(os.tmpdir(), "offeragent-invalid-recovery-marker-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const store = new FileVaultChangeJournal(root);
+
+    await assert.rejects(store.markRecoveryReady("A".repeat(64)), /recovery token is invalid/);
+    await assert.rejects(readFile(path.join(root, ".recovery-ready.json")), /ENOENT/);
 });
 
 test("file journal migrates the plugin-local journal idempotently and fails closed on conflicts", async (t) => {

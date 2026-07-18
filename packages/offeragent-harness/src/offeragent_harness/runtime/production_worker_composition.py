@@ -181,6 +181,7 @@ from offeragent_harness.runtime.plugin_tools import (
     plugin_tool_completion_handlers,
     plugin_tool_definitions,
 )
+from offeragent_harness.runtime.plugin_vault_change_recovery import PluginVaultChangeRecoveryLookup
 from offeragent_harness.runtime.policy_audit import EntityPolicyAuditSink
 from offeragent_harness.runtime.process_identity import SupervisedWorkspaceIdentity, WorkerShutdownReceipt
 from offeragent_harness.runtime.process_registration import (
@@ -3636,10 +3637,20 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                 frozenset({local_transaction.provider_id}) if local_transaction is not None else frozenset()
             ),
         )
+        plugin_recovery_lookup = (
+            None
+            if bootstrap.plugin_journal_directory is None or bootstrap.plugin_recovery_token is None
+            else PluginVaultChangeRecoveryLookup(
+                bootstrap.canonical_root,
+                bootstrap.plugin_journal_directory,
+                bootstrap.plugin_recovery_token,
+            )
+        )
         startup = RuntimeStartupCoordinator(
             recovery=RecoveryCoordinator(
                 unit_of_work=uow,
                 registry=recovery_registry,
+                lookup=plugin_recovery_lookup,
                 definition_resolver=_FingerprintDefinitionResolver(base_definitions),
                 clock=clock,
             ),
@@ -3919,15 +3930,19 @@ class WorkerCommandLine:
     canonical_root_identity: str
     database_identity: str
     runtime_version: str
+    plugin_journal_directory: Path | None = None
+    plugin_recovery_token: str | None = None
 
 
 def parse_worker_arguments(arguments: Sequence[str]) -> WorkerCommandLine:
     values = list(arguments)
     if (
-        len(values) == 5
+        len(values) == 9
         and values[:1] == ["stdio"]
         and values[1] == "--vault-root"
         and values[3] == "--runtime-version"
+        and values[5] == "--plugin-journal-directory"
+        and values[7] == "--plugin-recovery-token"
     ):
         try:
             root = Path(values[2]).expanduser().resolve(strict=True)
@@ -3941,15 +3956,21 @@ def parse_worker_arguments(arguments: Sequence[str]) -> WorkerCommandLine:
                 root,
                 portable_workspace_id=portable.portable_workspace_id,
             )
+            plugin_journal_directory = Path(os.path.abspath(Path(values[6]).expanduser()))
         except (OSError, ValueError) as error:
             raise ProductionWorkerError("Worker stdio Vault bootstrap is invalid") from error
         runtime_version = values[4]
         _semantic_version(runtime_version)
+        plugin_recovery_token = values[8]
+        if re.fullmatch(r"[0-9a-f]{64}", plugin_recovery_token) is None:
+            raise ProductionWorkerError("Worker plugin recovery token is invalid")
         return WorkerCommandLine(
             record.workspace_instance_id,
             record.root_identity.identity_hash,
             workspace_database_identity(record.workspace_instance_id),
             runtime_version,
+            plugin_journal_directory,
+            plugin_recovery_token,
         )
     raise ProductionWorkerError("Worker arguments do not match the direct stdio contract")
 
@@ -4078,6 +4099,35 @@ def _resolve_worker_bootstrap(command: WorkerCommandLine) -> WorkerBootstrap:
         raise ProductionWorkerError("Vault identity changed after the stdio bootstrap")
     if workspace_database_identity(command.workspace_instance_id) != command.database_identity:
         raise ProductionWorkerError("database identity is not derived from this Workspace instance")
+    if command.plugin_journal_directory is None or command.plugin_recovery_token is None:
+        raise ProductionWorkerError("Worker plugin journal bootstrap is missing")
+    if re.fullmatch(r"[0-9a-f]{64}", command.plugin_recovery_token) is None:
+        raise ProductionWorkerError("Worker plugin recovery token is invalid")
+    try:
+        original_journal_directory = command.plugin_journal_directory.expanduser()
+        if not original_journal_directory.is_absolute():
+            raise ProductionWorkerError("Worker plugin journal directory is unsafe")
+        relative_journal = original_journal_directory.relative_to(canonical_root)
+        if (
+            len(relative_journal.parts) < 3
+            or relative_journal.parts[-2:] != ("offeragent", "vault-change-journal")
+            or not relative_journal.parts[0].startswith(".")
+        ):
+            raise ProductionWorkerError("Worker plugin journal directory is unsafe")
+        current = canonical_root
+        for part in relative_journal.parts:
+            current = current / part
+            info = current.lstat()
+            if (
+                not current.is_dir()
+                or current.is_symlink()
+                or getattr(info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise ProductionWorkerError("Worker plugin journal directory is unsafe")
+        plugin_journal_directory = original_journal_directory.resolve(strict=True)
+        plugin_journal_directory.relative_to(canonical_root)
+    except (OSError, ValueError) as error:
+        raise ProductionWorkerError("Worker plugin journal directory escapes the selected Vault") from error
     state_parent = local_root / "workspaces"
     state_directory = state_parent / command.workspace_instance_id
     try:
@@ -4103,7 +4153,13 @@ def _resolve_worker_bootstrap(command: WorkerCommandLine) -> WorkerBootstrap:
             raise ProductionWorkerError("Worker state directory escaped the current-user Runtime root")
     except OSError as error:
         raise ProductionWorkerError("Worker state directory is unavailable") from error
-    return WorkerBootstrap(command.workspace_instance_id, canonical_root, state_directory)
+    return WorkerBootstrap(
+        command.workspace_instance_id,
+        canonical_root,
+        state_directory,
+        plugin_journal_directory,
+        command.plugin_recovery_token,
+    )
 
 
 def _verified_packaged_ripgrep(

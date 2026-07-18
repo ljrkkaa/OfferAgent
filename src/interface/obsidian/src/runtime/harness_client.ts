@@ -96,6 +96,8 @@ export interface HarnessClientOptions {
     pingIntervalMs?: number;
     pingDeadlineMs?: number;
     onDisconnected?: (error: Error) => void;
+    /** Complete plugin-owned durable recovery before a replacement Worker exists. */
+    beforeConnect?: (signal?: AbortSignal) => Promise<void>;
 }
 
 export interface AttachmentUpload {
@@ -122,6 +124,7 @@ export class HarnessClient {
     private readonly pingIntervalMs: number;
     private readonly pingDeadlineMs: number;
     private readonly onDisconnected: ((error: Error) => void) | undefined;
+    private readonly beforeConnect: ((signal?: AbortSignal) => Promise<void>) | undefined;
     private peer: JsonRpcPeer | null = null;
     private initializeResult: InitializeResult | null = null;
     private state: ClientState = "disconnected";
@@ -146,6 +149,7 @@ export class HarnessClient {
         this.pingIntervalMs = positiveInteger(options.pingIntervalMs ?? 15_000, "pingIntervalMs");
         this.pingDeadlineMs = positiveInteger(options.pingDeadlineMs ?? 45_000, "pingDeadlineMs");
         this.onDisconnected = options.onDisconnected;
+        this.beforeConnect = options.beforeConnect;
         this.reducer = new EventReducer(context.workspaceId);
     }
 
@@ -162,6 +166,8 @@ export class HarnessClient {
         if (this.state !== "disconnected") throw new Error(`cannot connect Harness client from ${this.state}`);
         this.state = "connecting";
         try {
+            await this.beforeConnect?.(signal);
+            signal?.throwIfAborted();
             const peer = await this.transport.connect(signal);
             this.peer = peer;
             peer.onNotification("event", (params) => this.reducer.accept(params));

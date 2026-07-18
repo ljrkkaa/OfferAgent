@@ -118,8 +118,11 @@ class RecoveryAction:
             raise ValueError("unknown outcomes cannot become automatic recovery actions")
         if self.kind is RecoveryActionKind.APPLY_JOURNAL_RESULT and self.journal_state is not JournalState.COMPLETED:
             raise ValueError("journal result action requires a COMPLETED journal")
-        if self.kind is RecoveryActionKind.APPLY_LOOKUP_RESULT and self.journal_state is not JournalState.STARTED:
-            raise ValueError("lookup result action requires a STARTED journal")
+        if self.kind is RecoveryActionKind.APPLY_LOOKUP_RESULT and self.journal_state not in {
+            JournalState.STARTED,
+            JournalState.UNKNOWN,
+        }:
+            raise ValueError("lookup result action requires a STARTED or UNKNOWN journal")
 
 
 @dataclass(frozen=True, slots=True)
@@ -524,10 +527,7 @@ class RecoveryCoordinator:
                     )
                 )
                 continue
-            if record.state is JournalState.UNKNOWN:
-                issues.append(_unknown_issue(definition, call, "Invocation Journal 已明确记录 unknown outcome。"))
-                continue
-            action, issue = await self._resolve_started(call_snapshot)
+            action, issue = await self._resolve_uncertain(call_snapshot)
             if action is not None:
                 actions.append(action)
             if issue is not None:
@@ -546,7 +546,7 @@ class RecoveryCoordinator:
             issues=tuple(issues),
         )
 
-    async def _resolve_started(
+    async def _resolve_uncertain(
         self,
         snapshot: _CallSnapshot,
     ) -> tuple[RecoveryAction | None, RecoveryIssue | None]:
@@ -574,10 +574,16 @@ class RecoveryCoordinator:
                     call,
                     definition,
                     snapshot.journal_scope,
-                    JournalState.STARTED,
+                    snapshot.journal.state if snapshot.journal is not None else JournalState.STARTED,
                     recovered,
                 ),
                 None,
+            )
+        if snapshot.journal is not None and snapshot.journal.state is JournalState.UNKNOWN:
+            return None, _unknown_issue(
+                definition,
+                call,
+                "Invocation Journal 已明确记录 unknown outcome; RecoveryLookup 未返回确定结果。",
             )
         if is_safe_crash_replay(definition):
             return (

@@ -146,3 +146,21 @@ def test_real_production_worker_process_crash_recovers_before_ready_and_is_secon
     assert _journal_rows(root) == recovered_journal
     assert _manifest_files(root) == ()
     assert _cas_residue(root) == ()
+
+
+def test_real_production_composition_adopts_unknown_plugin_apply_from_exact_journal_without_replay(
+    tmp_path: Path,
+) -> None:
+    root = _fixture(tmp_path)
+
+    recovered = _payload(_run(root, "plugin-recover"))
+
+    assert recovered["readyBeforeShutdown"] is True
+    assert recovered["plansScanned"] == 1
+    assert recovered["journalState"] == "completed"
+    assert recovered["resultStatus"] == "succeeded"
+    assert recovered["resultBatchId"] == "batch_production_plugin_recovery"
+    assert recovered["pendingToolCallCount"] == 0
+    assert recovered["recoveredToolCallCount"] == 1
+    assert recovered["pluginJournalUnchanged"] is True
+    assert recovered["vaultSentinelUnchanged"] is True

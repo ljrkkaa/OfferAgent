@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+import hashlib
+import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -32,7 +34,14 @@ from offeragent_harness.protocol.events import (
     TurnInterruptedPayload,
     parse_persisted_domain_event,
 )
-from offeragent_harness.runtime.recovery import RecoveryCoordinator, RecoveryDisposition, RecoveryPlan
+from offeragent_harness.runtime.plugin_tools import plugin_tool_definitions
+from offeragent_harness.runtime.plugin_vault_change_recovery import PluginVaultChangeRecoveryLookup
+from offeragent_harness.runtime.recovery import (
+    RecoveryCoordinator,
+    RecoveryDisposition,
+    RecoveryLookup,
+    RecoveryPlan,
+)
 from offeragent_harness.runtime.recovery_apply import RecoveryApplyBlocked, RecoveryPlanApplier
 from offeragent_harness.sessions import (
     AgentLineage,
@@ -401,7 +410,7 @@ async def _one_plan(
     factory: UnitOfWorkFactory,
     definitions: tuple[ToolDefinition, ...],
     *,
-    lookup: _FakeRecoveryLookup | None = None,
+    lookup: RecoveryLookup | None = None,
 ) -> RecoveryPlan:
     plans = await RecoveryCoordinator(
         unit_of_work=factory,
@@ -566,6 +575,170 @@ async def test_lookup_result_completes_journal_and_run_state_in_one_recovery_uow
     reference = completed.payload.result.source_refs[0]
     assert isinstance(reference, VaultSourceRef)
     assert reference.file.path == call.arguments["path"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_lookup_result_completes_journal_and_run_state_in_one_recovery_uow(tmp_path: Path) -> None:
+    factory = SqliteUnitOfWorkFactory(tmp_path / "unknown-lookup.sqlite")
+    write = _definition("vault.write.unknown.lookup", SideEffectClass.WRITE)
+    run_id = "run_unknown_lookup_apply"
+    call = _call(write, run_id, "call_unknown_lookup_write")
+    result = _result(call, write)
+    bundle = _bundle("unknown_lookup_apply", (call,))
+    async with factory.begin() as unit_of_work:
+        await _persist_bundle(unit_of_work, bundle)
+        await unit_of_work.journal.start(
+            _scope(call, write), call.idempotency_key, invocation_request_fingerprint(call), NOW
+        )
+        await unit_of_work.journal.mark_unknown(
+            _scope(call, write), call.idempotency_key, invocation_request_fingerprint(call), NOW
+        )
+        await unit_of_work.commit()
+
+    plan = await _one_plan(
+        factory,
+        (write,),
+        lookup=_FakeRecoveryLookup({call.tool_call_id: result}),
+    )
+    assert plan.actions[0].journal_state is JournalState.UNKNOWN
+
+    applied = await _applier(factory).apply(plan)
+
+    journal = await factory.get_journal(_scope(call, write), call.idempotency_key)
+    state = await factory.get_entity("run_states", run_id)
+    assert journal is not None and journal.state is JournalState.COMPLETED
+    assert journal.result == result
+    assert isinstance(state, RunState) and state == applied.state
+    assert state.tool_results == (result,)
+    assert state.pending.tool_calls == ()
+    assert applied.replay_calls == ()
+
+
+@pytest.mark.asyncio
+async def test_unknown_plugin_apply_is_adopted_from_real_vault_journal_without_replaying_write(
+    tmp_path: Path,
+) -> None:
+    factory = SqliteUnitOfWorkFactory(tmp_path / "plugin-unknown-lookup.sqlite")
+    definition = next(item for item in plugin_tool_definitions() if item.name == "vault.changes.apply")
+    run_id = "run_plugin_unknown_apply"
+    batch_id = "batch_plugin_unknown_apply"
+    arguments: dict[str, object] = {
+        "batchId": batch_id,
+        "task": "Reconcile one Interview Submission",
+        "changeKind": "interview_submission",
+        "sourceBindings": [],
+        "interviewSubmission": {
+            "sourceKind": "public_url",
+            "capturedOn": "2026-07-18",
+            "canonicalUrls": ["https://example.com/interview/42"],
+            "orderedImageContentHashes": [],
+            "sourceFingerprint": None,
+            "reviewItems": [{
+                "kind": "experience",
+                "path": "experiences/acme.md",
+                "identity": "new",
+                "mutation": "create",
+            }],
+        },
+        "operations": [{
+            "op": "create",
+            "path": "experiences/acme.md",
+            "content": "new\n",
+            "expectedContentHash": "absent",
+            "expectedModifiedVersion": "missing",
+        }],
+    }
+    call = ToolCall(
+        tool_call_id="call_plugin_unknown_apply",
+        run_id=run_id,
+        workspace_id=WORKSPACE_ID,
+        name=definition.name,
+        version=definition.version,
+        arguments=arguments,
+        args_hash=canonical_json_sha256(arguments),
+        idempotency_key="idem-plugin-unknown-apply",
+        deadline=NOW + timedelta(minutes=2),
+        lineage=AgentLineage.root(run_id),
+        definition_fingerprint=definition.fingerprint,
+        result_sensitivity=definition.result_sensitivity,
+    )
+    bundle = _bundle("plugin_unknown_apply", (call,))
+    async with factory.begin() as unit_of_work:
+        await _persist_bundle(unit_of_work, bundle)
+        await unit_of_work.journal.start(
+            _scope(call, definition), call.idempotency_key, invocation_request_fingerprint(call), NOW
+        )
+        await unit_of_work.journal.mark_unknown(
+            _scope(call, definition), call.idempotency_key, invocation_request_fingerprint(call), NOW
+        )
+        await unit_of_work.commit()
+
+    vault = tmp_path / "Vault"
+    journal_directory = vault / ".obsidian" / "offeragent" / "vault-change-journal"
+    journal_directory.mkdir(parents=True)
+    recovery_token = "a" * 64
+    applied_content = b"new\n"
+    target = {
+        "operation": "create",
+        "path": "experiences/acme.md",
+        "beforeHash": "absent",
+        "afterHash": f"sha256:{hashlib.sha256(applied_content).hexdigest()}",
+        "beforeModifiedVersion": "missing",
+        "afterModifiedVersion": "mtime:1:size:4",
+    }
+    record = {
+        "version": 2,
+        "batchId": batch_id,
+        "toolCallId": call.tool_call_id,
+        "workspaceId": call.workspace_id,
+        "runId": call.run_id,
+        "rootRunId": call.lineage.root_run_id,
+        "changeKind": "interview_submission",
+        "reviewHash": f"sha256:{'c' * 64}",
+        "argsHash": call.args_hash,
+        "idempotencyKey": call.idempotency_key,
+        "state": "applied",
+        "checkpointRef": f"refs/offeragent/checkpoints/{batch_id}",
+        "targets": [target],
+        "appliedPaths": [target["path"]],
+        "manualReviewPaths": [],
+    }
+    record_bytes = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+    (journal_directory / f"{batch_id}.json").write_bytes(record_bytes)
+    seal_directory = journal_directory / ".recovery-seals" / "current"
+    seal_directory.mkdir(parents=True)
+    seal_name = f"{hashlib.sha256(batch_id.encode()).hexdigest()}.json"
+    (seal_directory / seal_name).write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "recoveryToken": recovery_token,
+                "batchId": batch_id,
+                "contentHash": f"sha256:{hashlib.sha256(record_bytes).hexdigest()}",
+                "byteLength": len(record_bytes),
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (journal_directory / ".recovery-ready.json").write_text(
+        json.dumps({"schemaVersion": 2, "recoveryToken": recovery_token}, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    lookup = PluginVaultChangeRecoveryLookup(vault, journal_directory, recovery_token)
+
+    plan = await _one_plan(factory, (definition,), lookup=lookup)
+    applied = await _applier(factory).apply(plan)
+
+    persisted = await factory.get_journal(_scope(call, definition), call.idempotency_key)
+    assert persisted is not None and persisted.state is JournalState.COMPLETED
+    assert persisted.result is not None and persisted.result.status is ToolResultStatus.SUCCEEDED
+    assert isinstance(persisted.result.data, Mapping)
+    assert persisted.result.data["batchId"] == batch_id
+    assert applied.state.tool_results == (persisted.result,)
+    assert applied.state.pending.tool_calls == ()
+    assert applied.replay_calls == ()
 
 
 @pytest.mark.asyncio

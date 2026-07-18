@@ -14,6 +14,8 @@ class WorkerBootstrap:
     workspace_instance_id: str
     canonical_root: Path
     state_directory: Path
+    plugin_journal_directory: Path | None = None
+    plugin_recovery_token: str | None = None
 
 
 @runtime_checkable

@@ -179,15 +179,20 @@ test("Obsidian owns only the generated Vault Tool Adapter boundary", async () =>
 
 test("Vault Change recovery state survives plugin replacement and lifecycle teardown drains tools", async () => {
     const main = await readFile(path.join(__dirname, "../src/main.ts"), "utf8");
+    const createRuntime = main.slice(main.indexOf("private createRuntime"), main.indexOf("private attachVaultToolAdapter"));
     const attach = main.slice(main.indexOf("private attachVaultToolAdapter"), main.indexOf("private authorizeVaultChange"));
     const stopCurrent = main.slice(main.indexOf("private async stopLocalRuntime"), main.indexOf("private createRuntime"));
     const restart = main.slice(main.indexOf("private async performRuntimeRestartIfIdle"), main.indexOf("private scheduleRuntimeRestartCheck"));
     const unload = main.slice(main.indexOf("onunload(): void"), main.indexOf("runtimeSnapshot()"));
 
-    assert.match(attach, /resolve\(this\.vaultRoot, this\.app\.vault\.configDir, "offeragent", "vault-change-journal"\)/);
+    assert.match(createRuntime, /resolve\(this\.vaultRoot, this\.app\.vault\.configDir, "offeragent", "vault-change-journal"\)/);
     assert.doesNotMatch(attach, /new FileVaultChangeJournal\(resolve\(pluginInstallDirectory\([^)]*\), "vault-change-journal"\)\)/);
     assert.match(attach, /journal\.migrateLegacyDirectory\(resolve\(pluginInstallDirectory\(this, this\.vaultRoot\), "vault-change-journal"\)\)/);
     assert.match(attach, /new SerializedPluginToolExecutionFence\(/);
+    assert.match(createRuntime, /randomBytes\(32\)\.toString\("hex"\)/);
+    assert.match(createRuntime, /new StdioWorkerTransport\([\s\S]*journalDirectory,[\s\S]*recoveryToken/);
+    assert.match(createRuntime, /beforeConnect:[\s\S]*fence\.ready\(\)/);
+    assert.ok(attach.indexOf("changes.beginRecovery()") < attach.indexOf("journal.markRecoveryReady(recoveryToken)"));
     assert.ok(stopCurrent.indexOf("await this.disposeVaultToolAdapter()") < stopCurrent.indexOf("await runtime.stop()"));
     assert.ok(restart.indexOf("await this.disposeVaultToolAdapter()") < restart.indexOf("await this.runtime.stop()"));
     assert.match(unload, /const vaultToolRetirement = this\.disposeVaultToolAdapter\(\)/);

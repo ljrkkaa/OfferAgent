@@ -231,6 +231,32 @@ def _interview_batch() -> dict[str, object]:
             "canonicalUrls": [CANONICAL_SOURCE_URL],
             "orderedImageContentHashes": [PAGE_ONE_HASH, PAGE_TWO_HASH],
             "sourceFingerprint": SOURCE_FINGERPRINT,
+            "reviewItems": [
+                {
+                    "kind": "experience",
+                    "path": "experiences/unknown-technical-20260718.md",
+                    "identity": "new",
+                    "mutation": "create",
+                },
+                {
+                    "kind": "question",
+                    "path": "interview/node-event-loop-scheduling.md",
+                    "identity": "new",
+                    "mutation": "create",
+                },
+                {
+                    "kind": "index",
+                    "path": EXPERIENCE_INDEX_PATH,
+                    "identity": "existing",
+                    "mutation": "modify",
+                },
+                {
+                    "kind": "index",
+                    "path": QUESTION_INDEX_PATH,
+                    "identity": "existing",
+                    "mutation": "modify",
+                },
+            ],
         },
         "operations": [
             {

@@ -138,6 +138,46 @@ function runEvent(sequence, delta) {
     };
 }
 
+test("client waits for plugin recovery before spawning the Worker transport", async () => {
+    const { HarnessClient } = loadModule("harness_client.ts");
+    const order = [];
+    const peer = {
+        onNotification: () => () => undefined,
+        request: async (method) => {
+            assert.equal(method, "initialize");
+            return initializeResult();
+        },
+        close: async () => undefined,
+    };
+    const client = new HarnessClient(
+        { connect: async () => { order.push("spawn"); return peer; } },
+        context(),
+        {
+            beforeConnect: async () => { order.push("plugin-recovery"); },
+            pingIntervalMs: 60_000,
+        },
+    );
+
+    await client.connect();
+
+    assert.deepEqual(order, ["plugin-recovery", "spawn"]);
+    await client.close();
+});
+
+test("plugin recovery failure prevents Worker transport creation", async () => {
+    const { HarnessClient } = loadModule("harness_client.ts");
+    let spawned = false;
+    const client = new HarnessClient(
+        { connect: async () => { spawned = true; throw new Error("must not spawn"); } },
+        context(),
+        { beforeConnect: async () => { throw new Error("journal recovery failed"); } },
+    );
+
+    await assert.rejects(() => client.connect(), /journal recovery failed/u);
+
+    assert.equal(spawned, false);
+});
+
 test("client performs strict initialize and subscribes to Worker events", async () => {
     const { HarnessClient } = loadModule("harness_client.ts");
     const { JsonRpcPeer } = loadModule("json_rpc.ts");

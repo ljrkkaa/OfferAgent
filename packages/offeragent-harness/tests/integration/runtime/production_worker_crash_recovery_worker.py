@@ -8,10 +8,15 @@ import os
 import shutil
 from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
 
+from offeragent_harness.adapters.sqlite_stores import SqliteUnitOfWorkFactory
+from offeragent_harness.agent import BudgetCheckpoint, BudgetDelta, RunBudget
+from offeragent_harness.agent.state import RunPhase, RunState
 from offeragent_harness.config import HarnessConfig
 from offeragent_harness.models import (
     ModelEvent,
@@ -33,15 +38,33 @@ from offeragent_harness.providers import (
     ModelCredentialLease,
     ModelCredentialSourceError,
 )
+from offeragent_harness.runtime.plugin_tools import plugin_tool_definitions
 from offeragent_harness.runtime.production_worker_composition import (
     ProductionWorkerApplication,
     ProductionWorkerCompositionRoot,
     ProductionWorkerOverrides,
 )
 from offeragent_harness.runtime.worker_entrypoint import WorkerEntrypoint
+from offeragent_harness.sessions import (
+    AgentLineage,
+    Run,
+    RunKind,
+    RunStatus,
+    Session,
+    SessionStatus,
+    Turn,
+    TurnStatus,
+)
 from offeragent_harness.testing import ManualCancellationToken
+from offeragent_harness.tools import (
+    ToolCall,
+    canonical_json_sha256,
+    invocation_journal_scope,
+    invocation_request_fingerprint,
+)
 from offeragent_harness.vault import VaultCasBarrier, content_hash
 from offeragent_harness.workspace import identify_workspace_root
+from offeragent_harness.workspace.portable_config import read_portable_workspace_config
 from offeragent_harness.workspace.runtime_identity import workspace_database_identity
 
 CRASH_EXIT = 73
@@ -52,6 +75,9 @@ AFTER_CONTENT = b"BEFORE_PAYLOAD\nAFTER_PAYLOAD\n"
 MODEL_ID = "gpt-crash-recovery"
 ACCOUNT_FINGERPRINT = "account-crash-recovery"
 ACCOUNT_BINDING = "sha256:" + hashlib.sha256(ACCOUNT_FINGERPRINT.encode()).hexdigest()
+NOW = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+PLUGIN_RECOVERY_TOKEN = "a" * 64
+PLUGIN_RECOVERY_BATCH_ID = "batch_production_plugin_recovery"
 
 
 class _CodexCredentials:
@@ -488,9 +514,266 @@ async def _recover(root: Path) -> int:
     return 0
 
 
+async def _seed_plugin_unknown_recovery(
+    root: Path,
+) -> tuple[SqliteUnitOfWorkFactory, ToolCall, Path, bytes, bytes, bytes, bytes]:
+    now = datetime.now(timezone.utc)
+    vault = root / "vault"
+    workspace_id = read_portable_workspace_config(vault).portable_workspace_id
+    state_directory = root / "state"
+    state_directory.mkdir(parents=True, exist_ok=True)
+    definition = next(item for item in plugin_tool_definitions() if item.name == "vault.changes.apply")
+    run_id = "run_production_plugin_recovery"
+    session_id = "ses_production_plugin_recovery"
+    turn_id = "turn_production_plugin_recovery"
+    arguments: dict[str, object] = {
+        "batchId": PLUGIN_RECOVERY_BATCH_ID,
+        "task": "Recover one production Interview Submission",
+        "changeKind": "interview_submission",
+        "sourceBindings": [],
+        "interviewSubmission": {
+            "sourceKind": "public_url",
+            "capturedOn": "2026-07-18",
+            "canonicalUrls": ["https://example.com/interview/production-recovery"],
+            "orderedImageContentHashes": [],
+            "sourceFingerprint": None,
+            "reviewItems": [{
+                "kind": "experience",
+                "path": "experiences/production-recovery.md",
+                "identity": "new",
+                "mutation": "create",
+            }],
+        },
+        "operations": [{
+            "op": "create",
+            "path": "experiences/production-recovery.md",
+            "content": "recovered\n",
+            "expectedContentHash": "absent",
+            "expectedModifiedVersion": "missing",
+        }],
+    }
+    call = ToolCall(
+        tool_call_id="call_production_plugin_recovery",
+        run_id=run_id,
+        workspace_id=workspace_id,
+        name=definition.name,
+        version=definition.version,
+        arguments=arguments,
+        args_hash=canonical_json_sha256(arguments),
+        idempotency_key="idem-production-plugin-recovery",
+        deadline=now + timedelta(minutes=5),
+        lineage=AgentLineage.root(run_id),
+        definition_fingerprint=definition.fingerprint,
+        result_sensitivity=definition.result_sensitivity,
+    )
+    lineage = AgentLineage.root(run_id)
+    run_state = RunState(
+        workspace_id=workspace_id,
+        session_id=session_id,
+        turn_id=turn_id,
+        run_id=run_id,
+        lineage=lineage,
+        phase=RunPhase.EXECUTING_TOOLS,
+        revision=7,
+        model_rounds=1,
+        assistant_text="等待插件写入结果",
+        budget_checkpoint=BudgetCheckpoint(
+            budget=RunBudget(
+                32,
+                64,
+                4,
+                900,
+                400_000,
+                64_000,
+                Decimal("0"),
+                64 * 1024 * 1024,
+                1,
+            ),
+            started_at=now,
+            used=BudgetDelta(model_rounds=1, tool_calls=1),
+            reserved=BudgetDelta(),
+            captured_at=now,
+            elapsed_seconds=0,
+        ),
+    ).accept_tool_calls((call,))
+    run = Run(
+        run_id=run_id,
+        session_id=session_id,
+        turn_id=turn_id,
+        workspace_id=workspace_id,
+        lineage=lineage,
+        kind=RunKind.ROOT,
+        status=RunStatus.EXECUTING_TOOLS,
+        attempt=1,
+        event_sequence=0,
+        config_snapshot={"model": MODEL_ID},
+        created_at=now,
+        updated_at=now,
+        deadline_at=now + timedelta(seconds=900),
+    )
+    session = Session(
+        session_id=session_id,
+        workspace_id=workspace_id,
+        profile_id="profile_production_plugin_recovery",
+        title="Production plugin recovery",
+        status=SessionStatus.ACTIVE,
+        created_at=now,
+        updated_at=now,
+        revision=1,
+    )
+    turn = Turn(
+        turn_id=turn_id,
+        session_id=session_id,
+        ordinal=1,
+        status=TurnStatus.RUNNING,
+        input_blocks=({"type": "text", "text": "recover plugin write"},),
+        created_at=now,
+        updated_at=now,
+    )
+    factory = SqliteUnitOfWorkFactory(state_directory / "state.sqlite")
+    async with factory.begin() as unit_of_work:
+        await unit_of_work.entities.put("sessions", session_id, session, expected_revision=0)
+        await unit_of_work.entities.put("runs", run_id, run, expected_revision=0)
+        await unit_of_work.entities.put("run_states", run_id, run_state, expected_revision=0)
+        await unit_of_work.entities.put("turns", turn_id, turn, expected_revision=0)
+        await unit_of_work.entities.put(
+            "active_root_runs",
+            session_id,
+            {
+                "schemaVersion": 1,
+                "workspaceId": workspace_id,
+                "sessionId": session_id,
+                "runId": run_id,
+                "acquiredAt": now.isoformat(),
+            },
+            expected_revision=0,
+        )
+        scope = invocation_journal_scope(call, definition)
+        request_hash = invocation_request_fingerprint(call)
+        await unit_of_work.journal.start(scope, call.idempotency_key, request_hash, now)
+        await unit_of_work.journal.mark_unknown(scope, call.idempotency_key, request_hash, now)
+        await unit_of_work.commit()
+
+    applied_content = b"recovered\n"
+    applied_target = vault / "experiences" / "production-recovery.md"
+    applied_target.parent.mkdir(parents=True, exist_ok=True)
+    applied_target.write_bytes(applied_content)
+    journal_directory = vault / ".obsidian" / "offeragent" / "vault-change-journal"
+    journal_directory.mkdir(parents=True)
+    marker = json.dumps(
+        {"schemaVersion": 2, "recoveryToken": PLUGIN_RECOVERY_TOKEN}, separators=(",", ":")
+    ).encode() + b"\n"
+    record = json.dumps(
+        {
+            "version": 2,
+            "batchId": PLUGIN_RECOVERY_BATCH_ID,
+            "toolCallId": call.tool_call_id,
+            "workspaceId": call.workspace_id,
+            "runId": call.run_id,
+            "rootRunId": call.lineage.root_run_id,
+            "changeKind": "interview_submission",
+            "reviewHash": "sha256:" + "c" * 64,
+            "argsHash": call.args_hash,
+            "idempotencyKey": call.idempotency_key,
+            "state": "applied",
+            "checkpointRef": f"refs/offeragent/checkpoints/{PLUGIN_RECOVERY_BATCH_ID}",
+            "targets": [{
+                "operation": "create",
+                "path": "experiences/production-recovery.md",
+                "beforeHash": "absent",
+                "afterHash": content_hash(applied_content),
+                "beforeModifiedVersion": "missing",
+                "afterModifiedVersion": f"mtime:1:size:{len(applied_content)}",
+            }],
+            "appliedPaths": ["experiences/production-recovery.md"],
+            "manualReviewPaths": [],
+        },
+        separators=(",", ":"),
+    ).encode() + b"\n"
+    seal = json.dumps(
+        {
+            "schemaVersion": 1,
+            "recoveryToken": PLUGIN_RECOVERY_TOKEN,
+            "batchId": PLUGIN_RECOVERY_BATCH_ID,
+            "contentHash": content_hash(record),
+            "byteLength": len(record),
+        },
+        separators=(",", ":"),
+    ).encode() + b"\n"
+    marker_path = journal_directory / ".recovery-ready.json"
+    record_path = journal_directory / f"{PLUGIN_RECOVERY_BATCH_ID}.json"
+    seal_directory = journal_directory / ".recovery-seals" / "current"
+    seal_path = seal_directory / f"{hashlib.sha256(PLUGIN_RECOVERY_BATCH_ID.encode()).hexdigest()}.json"
+    seal_directory.mkdir(parents=True)
+    record_path.write_bytes(record)
+    seal_path.write_bytes(seal)
+    marker_path.write_bytes(marker)
+    sentinel = (vault / "note.md").read_bytes()
+    return factory, call, journal_directory, marker, record, seal, sentinel
+
+
+async def _recover_plugin_apply(root: Path) -> int:
+    factory, call, journal_directory, marker, record, seal, sentinel = await _seed_plugin_unknown_recovery(root)
+    barrier = _CrashAndRecoveryBarrier(None)
+    model = _CrashRecoveryModel()
+    entrypoint = _composition(root, barrier, model)
+    application = cast(
+        ProductionWorkerApplication,
+        await entrypoint.start(
+            WorkerBootstrap(
+                WORKSPACE_INSTANCE_ID,
+                root / "vault",
+                root / "state",
+                journal_directory,
+                PLUGIN_RECOVERY_TOKEN,
+            )
+        ),
+    )
+    try:
+        report = application.harness_application.startup_report
+        if report is None or len(report.applied_results) != 1:
+            raise RuntimeError("production plugin recovery report is missing")
+        applied = report.applied_results[0]
+        recovered = tuple(item for item in applied.state.tool_results if item.tool_call_id == call.tool_call_id)
+        definition = next(item for item in plugin_tool_definitions() if item.name == "vault.changes.apply")
+        persisted = await factory.get_journal(
+            invocation_journal_scope(call, definition),
+            call.idempotency_key,
+        )
+        if persisted is None or persisted.result is None:
+            raise RuntimeError("production plugin recovery journal did not complete")
+        if not isinstance(persisted.result.data, Mapping):
+            raise RuntimeError("production plugin recovery result data is malformed")
+        result = {
+            "readyBeforeShutdown": application.ready,
+            "plansScanned": report.plans_scanned,
+            "journalState": persisted.state.value,
+            "resultStatus": persisted.result.status.value,
+            "resultBatchId": persisted.result.data["batchId"],
+            "pendingToolCallCount": len(applied.state.pending.tool_calls),
+            "recoveredToolCallCount": len(recovered),
+            "pluginJournalUnchanged": (
+                (journal_directory / ".recovery-ready.json").read_bytes() == marker
+                and (journal_directory / f"{PLUGIN_RECOVERY_BATCH_ID}.json").read_bytes() == record
+                and (
+                    journal_directory
+                    / ".recovery-seals"
+                    / "current"
+                    / f"{hashlib.sha256(PLUGIN_RECOVERY_BATCH_ID.encode()).hexdigest()}.json"
+                ).read_bytes()
+                == seal
+            ),
+            "vaultSentinelUnchanged": (root / "vault" / "note.md").read_bytes() == sentinel,
+        }
+    finally:
+        await entrypoint.shutdown()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("crash", "recover"))
+    parser.add_argument("action", choices=("crash", "recover", "plugin-recover"))
     parser.add_argument("root", type=Path)
     parser.add_argument("stage", nargs="?", default="none")
     arguments = parser.parse_args()
@@ -498,6 +781,10 @@ def main() -> int:
         if arguments.stage not in {"published", "manifest_committed"}:
             raise ValueError("crash action requires a supported CAS stage")
         return asyncio.run(_crash(arguments.root, arguments.stage))
+    if arguments.action == "plugin-recover":
+        if arguments.stage != "none":
+            raise ValueError("plugin-recover action does not accept a CAS stage")
+        return asyncio.run(_recover_plugin_apply(arguments.root))
     if arguments.stage != "none":
         raise ValueError("recover action does not accept a CAS stage")
     return asyncio.run(_recover(arguments.root))

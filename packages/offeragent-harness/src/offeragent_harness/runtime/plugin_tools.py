@@ -327,6 +327,86 @@ def _catalog_index_schema(kind: str, path: str) -> dict[str, object]:
     }
 
 
+def _catalog_experience_candidate_schema() -> dict[str, object]:
+    digest = {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+    return {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "pattern": r"^(experiences|interviews/experiences)/[^/]+[.]md$",
+                "maxLength": 512,
+            },
+            "experienceId": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+            },
+            "sourceKind": {"type": "string", "minLength": 1, "maxLength": 32},
+            "sourceUrl": {"type": "string", "minLength": 1, "maxLength": 2_048},
+            "sourceFingerprint": digest,
+            "company": {"type": "string", "minLength": 1, "maxLength": 128},
+            "role": {"type": "string", "minLength": 1, "maxLength": 128},
+            "candidate": {"type": "string", "minLength": 1, "maxLength": 128},
+            "eventDate": {
+                "type": "string",
+                "pattern": r"^(unknown|[0-9]{4}-[0-9]{2}-[0-9]{2})$",
+            },
+            "round": {"type": "string", "minLength": 1, "maxLength": 128},
+            "exactSourceMatch": {"type": "boolean"},
+            "contentHash": digest,
+            "modifiedVersion": {"type": "string", "minLength": 1, "maxLength": 128},
+        },
+        "required": [
+            "path",
+            "experienceId",
+            "sourceKind",
+            "exactSourceMatch",
+            "contentHash",
+            "modifiedVersion",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def _catalog_question_candidate_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "pattern": r"^(interview|interviews/questions)/[^/]+[.]md$",
+                "maxLength": 512,
+            },
+            "questionId": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+            },
+            "title": {"type": "string", "minLength": 1, "maxLength": 512},
+            "answerState": {"enum": ["needs-research", "draft", "verified"]},
+            "frequency": {"type": "integer", "minimum": 1},
+            "matchedTerms": {
+                "type": "array",
+                "maxItems": 20,
+                "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1, "maxLength": 256},
+            },
+            "contentHash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "modifiedVersion": {"type": "string", "minLength": 1, "maxLength": 128},
+        },
+        "required": [
+            "path",
+            "questionId",
+            "title",
+            "answerState",
+            "frequency",
+            "matchedTerms",
+            "contentHash",
+            "modifiedVersion",
+        ],
+        "additionalProperties": False,
+    }
+
+
 def plugin_tool_definitions() -> tuple[ToolDefinition, ...]:
     """Definitions implemented only by the connected Obsidian plugin."""
 
@@ -602,8 +682,16 @@ def plugin_tool_definitions() -> tuple[ToolDefinition, ...]:
                         "required": ["canonicalUrls", "sourceFingerprint", "orderedImageContentHashes"],
                         "additionalProperties": False,
                     },
-                    "experienceCandidates": {"type": "array", "maxItems": 50, "items": {"type": "object"}},
-                    "questionCandidates": {"type": "array", "maxItems": 100, "items": {"type": "object"}},
+                    "experienceCandidates": {
+                        "type": "array",
+                        "maxItems": 50,
+                        "items": _catalog_experience_candidate_schema(),
+                    },
+                    "questionCandidates": {
+                        "type": "array",
+                        "maxItems": 100,
+                        "items": _catalog_question_candidate_schema(),
+                    },
                     "indexes": {
                         "type": "array",
                         "minItems": 2,
@@ -979,6 +1067,30 @@ def _plugin_write_definition() -> ToolDefinition:
         },
         ["path", "expectedModifiedVersion", "expectedContentHash"],
     )
+    review_item_identity = {
+        "kind": {"enum": ["experience", "question", "index"]},
+        "path": path,
+    }
+    review_item = {
+        "oneOf": [
+            operation(
+                {
+                    **review_item_identity,
+                    "identity": {"const": "new"},
+                    "mutation": {"const": "create"},
+                },
+                ["kind", "path", "identity", "mutation"],
+            ),
+            operation(
+                {
+                    **review_item_identity,
+                    "identity": {"const": "existing"},
+                    "mutation": {"enum": ["modify", "none"]},
+                },
+                ["kind", "path", "identity", "mutation"],
+            ),
+        ]
+    }
     interview_submission = operation(
         {
             "sourceKind": {"enum": ["text", "public_url", "ordered_images", "mixed"]},
@@ -995,6 +1107,12 @@ def _plugin_write_definition() -> ToolDefinition:
                 "items": digest,
             },
             "sourceFingerprint": {"anyOf": [digest, {"type": "null"}]},
+            "reviewItems": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 40,
+                "items": review_item,
+            },
         },
         [
             "sourceKind",
@@ -1002,6 +1120,7 @@ def _plugin_write_definition() -> ToolDefinition:
             "canonicalUrls",
             "orderedImageContentHashes",
             "sourceFingerprint",
+            "reviewItems",
         ],
     )
     return ToolDefinition(

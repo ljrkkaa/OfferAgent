@@ -43,6 +43,7 @@ import {
     VaultChangeAuthorizationProposal,
     VaultChangeCoordinator,
     assertContainedStateDirectory,
+    interviewReviewBadges,
 } from "./runtime/vault_changes";
 import {
     PROTOCOL_SCHEMA_HASH,
@@ -535,11 +536,18 @@ export default class OfferAgentPlugin extends Plugin {
         });
         return new RuntimeBootstrap(installer, {
             create: (installed, onDisconnected) => {
+                const journalDirectory = assertContainedStateDirectory(
+                    this.vaultRoot,
+                    resolve(this.vaultRoot, this.app.vault.configDir, "offeragent", "vault-change-journal"),
+                );
+                const recoveryToken = randomBytes(32).toString("hex");
                 const client = new HarnessClient(
                     new StdioWorkerTransport(
                         installed.workerExecutable,
                         this.vaultRoot,
                         installed.version,
+                        journalDirectory,
+                        recoveryToken,
                     ),
                     {
                         workspaceId: this.workspaceId,
@@ -552,21 +560,28 @@ export default class OfferAgentPlugin extends Plugin {
                         },
                         requiredCapabilities: REQUIRED_RUNTIME_CAPABILITIES,
                     },
-                    { onDisconnected },
+                    {
+                        onDisconnected,
+                        beforeConnect: async () => {
+                            const fence = this.vaultToolClient === client ? this.vaultToolFence : null;
+                            if (fence === null) throw new Error("Vault Change recovery fence is unavailable");
+                            await fence.ready();
+                        },
+                    },
                 );
-                this.attachVaultToolAdapter(client);
+                this.attachVaultToolAdapter(client, journalDirectory, recoveryToken);
                 return client;
             },
         });
     }
 
-    private attachVaultToolAdapter(client: HarnessClient): void {
+    private attachVaultToolAdapter(
+        client: HarnessClient,
+        journalDirectory: string,
+        recoveryToken: string,
+    ): void {
         if (this.vaultToolClient === client) return;
         const previousRetirement = this.disposeVaultToolAdapter();
-        const journalDirectory = assertContainedStateDirectory(
-            this.vaultRoot,
-            resolve(this.vaultRoot, this.app.vault.configDir, "offeragent", "vault-change-journal"),
-        );
         const journal = new FileVaultChangeJournal(journalDirectory);
         const changes = new VaultChangeCoordinator({
             vault: new ObsidianVaultChangePort(this.app.vault),
@@ -600,6 +615,7 @@ export default class OfferAgentPlugin extends Plugin {
             await previousRetirement;
             await journal.migrateLegacyDirectory(resolve(pluginInstallDirectory(this, this.vaultRoot), "vault-change-journal"));
             await changes.beginRecovery();
+            await journal.markRecoveryReady(recoveryToken);
         });
         void fencedAdapter.ready().catch((error) => {
             if (!this.unloading) new Notice(actionableError(error));
@@ -812,9 +828,26 @@ class VaultChangeReviewModal extends Modal {
         if (this.proposal.interviewSubmission !== null) {
             const source = scroll.createEl("section", { cls: "offeragent-vault-review-source" });
             source.createEl("h3", { text: "Interview Submission 来源" });
+            const { reviewItems, ...sourceReceipt } = this.proposal.interviewSubmission;
             source.createEl("pre", {
-                text: JSON.stringify(this.proposal.interviewSubmission, null, 2),
+                text: JSON.stringify(sourceReceipt, null, 2),
             });
+            const reviewPlan = scroll.createEl("section", { cls: "offeragent-vault-review-plan" });
+            reviewPlan.createEl("h3", { text: "结构化审阅结果" });
+            for (const item of reviewItems) {
+                const row = reviewPlan.createDiv({ cls: "offeragent-vault-review-plan-item" });
+                row.createEl("code", { text: item.path });
+                const badges = row.createDiv({ cls: "offeragent-vault-review-badges" });
+                const [identityBadge, mutationBadge] = interviewReviewBadges(item);
+                badges.createSpan({
+                    text: identityBadge,
+                    cls: "offeragent-vault-review-badge offeragent-vault-review-badge-identity",
+                });
+                badges.createSpan({
+                    text: mutationBadge,
+                    cls: `offeragent-vault-review-badge offeragent-vault-review-badge-${item.mutation}`,
+                });
+            }
         }
         if (this.proposal.sourceBindings.length > 0) {
             const sources = scroll.createEl("section", { cls: "offeragent-vault-review-source" });

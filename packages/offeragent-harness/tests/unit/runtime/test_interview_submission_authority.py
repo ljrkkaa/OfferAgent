@@ -131,8 +131,9 @@ def _policy(tmp_path: Path) -> InterviewSubmissionAuthorityPolicy:
 
 
 class _PluginBoundary:
-    def __init__(self) -> None:
+    def __init__(self, *, catalog_truncated: bool = False) -> None:
         self.calls: list[ToolCall] = []
+        self.catalog_truncated = catalog_truncated
 
     async def execute(self, call: ToolCall, cancellation: object) -> ToolResult:
         del cancellation
@@ -163,7 +164,7 @@ class _PluginBoundary:
                             "modifiedVersion": "missing",
                         },
                     ],
-                    "truncated": False,
+                    "truncated": self.catalog_truncated,
                 },
                 user_visible_summary="Catalog source normalized.",
                 artifact_ids=(),
@@ -259,6 +260,20 @@ def _interview_batch(batch_id: str) -> dict[str, Any]:
             "canonicalUrls": [CANONICAL_URL],
             "orderedImageContentHashes": [FIRST_HASH, SECOND_HASH],
             "sourceFingerprint": SOURCE_FINGERPRINT,
+            "reviewItems": [
+                {
+                    "kind": "experience",
+                    "path": "experiences/example.md",
+                    "identity": "new",
+                    "mutation": "create",
+                },
+                {
+                    "kind": "index",
+                    "path": "experiences/index.md",
+                    "identity": "new",
+                    "mutation": "create",
+                },
+            ],
         },
         "operations": [
             {
@@ -267,7 +282,14 @@ def _interview_batch(batch_id: str) -> dict[str, Any]:
                 "content": "# Interview Experience\n",
                 "expectedContentHash": "absent",
                 "expectedModifiedVersion": "missing",
-            }
+            },
+            {
+                "op": "create",
+                "path": "experiences/index.md",
+                "content": "# Interview Experiences\n\n- [[example]]\n",
+                "expectedContentHash": "absent",
+                "expectedModifiedVersion": "missing",
+            },
         ],
     }
 
@@ -388,6 +410,345 @@ async def test_catalog_receipt_binds_one_apply_slot_across_executor_reconstructi
     assert denied.disposition is PolicyDisposition.DENY
     assert denied.reason_code == "interview_submission_batch_already_claimed"
     assert [call.tool_call_id for call in plugin.calls] == ["catalog-valid", "apply-first", "apply-first"]
+
+
+@pytest.mark.asyncio
+async def test_truncated_catalog_cannot_authorize_an_interview_write(tmp_path: Path) -> None:
+    journal = SqliteUnitOfWorkFactory(tmp_path / "runtime.sqlite").invocation_journal
+    authority = InterviewSubmissionRunAuthority(
+        captured_on=date(2026, 7, 18),
+        ordered_image_content_hashes=(FIRST_HASH, SECOND_HASH),
+    )
+    clock = ManualClock(NOW)
+    policy = InterviewSubmissionAuthorityPolicy(
+        workspace_id="ws_vault",
+        root_run_id="run_root",
+        authority=authority,
+        journal=journal,
+        clock=clock,
+        downstream=_AllowPolicy(),
+        audit_sink=_PolicyAudit(),
+    )
+    plugin = _PluginBoundary(catalog_truncated=True)
+    executor = InterviewSubmissionToolExecutor(
+        workspace_id="ws_vault",
+        root_run_id="run_root",
+        authority=authority,
+        journal=journal,
+        clock=clock,
+        delegate=plugin,
+    )
+    catalog_definition = _definition("interview_catalog.search")
+    catalog_call = _call(
+        catalog_definition,
+        {
+            "sourceUrls": [CANONICAL_URL],
+            "orderedImageContentHashes": [FIRST_HASH, SECOND_HASH],
+        },
+        call_id="catalog-truncated",
+    )
+    assert (
+        await policy.evaluate(catalog_definition, catalog_call, _context(catalog_definition))
+    ).disposition is PolicyDisposition.ALLOW
+    assert (await executor.execute(catalog_call, ManualCancellationToken())).status is ToolResultStatus.SUCCEEDED
+    apply_definition = _definition("vault.changes.apply")
+    apply_call = _call(
+        apply_definition,
+        _interview_batch("interview_submission_truncated"),
+        call_id="apply-truncated",
+    )
+
+    denied = await policy.evaluate(apply_definition, apply_call, _context(apply_definition))
+
+    assert denied.disposition is PolicyDisposition.DENY
+    assert denied.reason_code == "interview_catalog_bindings_truncated"
+    assert [call.tool_call_id for call in plugin.calls] == ["catalog-truncated"]
+
+
+@pytest.mark.asyncio
+async def test_exact_catalog_source_match_rejects_a_new_experience_before_tool_started(tmp_path: Path) -> None:
+    existing_hash = "sha256:" + "c" * 64
+
+    class _ExactSourcePlugin(_PluginBoundary):
+        async def execute(self, call: ToolCall, cancellation: object) -> ToolResult:
+            result = await super().execute(call, cancellation)
+            assert isinstance(result.data, Mapping)
+            return ToolResult(
+                tool_call_id=result.tool_call_id,
+                status=ToolResultStatus.SUCCEEDED,
+                data={
+                    **dict(result.data),
+                    "experienceCandidates": [
+                        {
+                            "path": "experiences/existing.md",
+                            "experienceId": "experience_existing",
+                            "sourceKind": "mixed",
+                            "sourceUrl": CANONICAL_URL,
+                            "sourceFingerprint": SOURCE_FINGERPRINT,
+                            "exactSourceMatch": True,
+                            "contentHash": existing_hash,
+                            "modifiedVersion": "mtime:1:size:240",
+                        }
+                    ],
+                },
+                user_visible_summary=result.user_visible_summary,
+                artifact_ids=(),
+                source_refs=(),
+                side_effects=(),
+                retryable=False,
+                before_state=None,
+                after_state=None,
+                error=None,
+            )
+
+    journal = SqliteUnitOfWorkFactory(tmp_path / "runtime.sqlite").invocation_journal
+    authority = InterviewSubmissionRunAuthority(
+        captured_on=date(2026, 7, 18),
+        ordered_image_content_hashes=(FIRST_HASH, SECOND_HASH),
+    )
+    plugin = _ExactSourcePlugin()
+    executor = InterviewSubmissionToolExecutor(
+        workspace_id="ws_vault",
+        root_run_id="run_root",
+        authority=authority,
+        journal=journal,
+        clock=ManualClock(NOW),
+        delegate=plugin,
+    )
+    catalog_definition = _definition("interview_catalog.search")
+    catalog = _call(
+        catalog_definition,
+        {
+            "sourceUrls": [CANONICAL_URL],
+            "orderedImageContentHashes": [FIRST_HASH, SECOND_HASH],
+        },
+        call_id="catalog-exact-source",
+    )
+    await executor.execute(catalog, ManualCancellationToken())
+
+    apply_definition = _definition("vault.changes.apply")
+    apply = _call(
+        apply_definition,
+        _interview_batch("new-despite-exact-source"),
+        call_id="apply-new-despite-exact-source",
+    )
+    policy = InterviewSubmissionAuthorityPolicy(
+        workspace_id="ws_vault",
+        root_run_id="run_root",
+        authority=authority,
+        journal=journal,
+        clock=ManualClock(NOW),
+        downstream=_AllowPolicy(),
+        audit_sink=_PolicyAudit(),
+    )
+
+    decision = await policy.evaluate(apply_definition, apply, _context(apply_definition))
+
+    assert decision.disposition is PolicyDisposition.DENY
+    assert decision.reason_code == "interview_submission_exact_source_exists"
+    assert [item.tool_call_id for item in plugin.calls] == ["catalog-exact-source"]
+
+
+@pytest.mark.asyncio
+async def test_existing_merge_requires_a_durable_exact_full_read_receipt(tmp_path: Path) -> None:
+    existing_path = "experiences/existing.md"
+    existing_content = "# Existing Interview Experience\n"
+    existing_hash = "sha256:d949c1953334247890d30bb6ccb3e1b3835455d719bb2bbad73cafd59015cd74"
+    existing_version = "mtime:1:size:32"
+
+    class _ExistingCandidatePlugin(_PluginBoundary):
+        async def execute(self, call: ToolCall, cancellation: object) -> ToolResult:
+            result = await super().execute(call, cancellation)
+            if call.name == "interview_catalog.search":
+                assert isinstance(result.data, Mapping)
+                return ToolResult(
+                    tool_call_id=call.tool_call_id,
+                    status=ToolResultStatus.SUCCEEDED,
+                    data={
+                        **dict(result.data),
+                        "experienceCandidates": [
+                            {
+                                "path": existing_path,
+                                "experienceId": "experience_existing",
+                                "sourceKind": "public_url",
+                                "sourceUrl": "https://example.com/interview/prior",
+                                "exactSourceMatch": False,
+                                "contentHash": existing_hash,
+                                "modifiedVersion": existing_version,
+                            }
+                        ],
+                    },
+                    user_visible_summary=result.user_visible_summary,
+                    artifact_ids=(),
+                    source_refs=(),
+                    side_effects=(),
+                    retryable=False,
+                    before_state=None,
+                    after_state=None,
+                    error=None,
+                )
+            if call.name == "vault.read":
+                return ToolResult(
+                    tool_call_id=call.tool_call_id,
+                    status=ToolResultStatus.SUCCEEDED,
+                    data={
+                        "path": existing_path,
+                        "lineStart": 1,
+                        "lineEnd": 1,
+                        "modifiedVersion": existing_version,
+                        "contentHash": existing_hash,
+                        "content": existing_content,
+                        "truncated": False,
+                    },
+                    user_visible_summary="Read the exact existing Experience.",
+                    artifact_ids=(),
+                    source_refs=(),
+                    side_effects=(),
+                    retryable=False,
+                    before_state=None,
+                    after_state=None,
+                    error=None,
+                )
+            return result
+
+    journal = SqliteUnitOfWorkFactory(tmp_path / "runtime.sqlite").invocation_journal
+    authority = InterviewSubmissionRunAuthority(
+        captured_on=date(2026, 7, 18),
+        ordered_image_content_hashes=(FIRST_HASH, SECOND_HASH),
+    )
+    plugin = _ExistingCandidatePlugin()
+    executor = InterviewSubmissionToolExecutor(
+        workspace_id="ws_vault",
+        root_run_id="run_root",
+        authority=authority,
+        journal=journal,
+        clock=ManualClock(NOW),
+        delegate=plugin,
+    )
+    policy = InterviewSubmissionAuthorityPolicy(
+        workspace_id="ws_vault",
+        root_run_id="run_root",
+        authority=authority,
+        journal=journal,
+        clock=ManualClock(NOW),
+        downstream=_AllowPolicy(),
+        audit_sink=_PolicyAudit(),
+    )
+    catalog_definition = _definition("interview_catalog.search")
+    await executor.execute(
+        _call(
+            catalog_definition,
+            {
+                "sourceUrls": [CANONICAL_URL],
+                "orderedImageContentHashes": [FIRST_HASH, SECOND_HASH],
+            },
+            call_id="catalog-existing-candidate",
+        ),
+        ManualCancellationToken(),
+    )
+    apply_arguments = _interview_batch("merge-existing")
+    assert isinstance(apply_arguments["interviewSubmission"], dict)
+    apply_arguments["interviewSubmission"]["reviewItems"] = [
+        {
+            "kind": "experience",
+            "path": existing_path,
+            "identity": "existing",
+            "mutation": "modify",
+        }
+    ]
+    apply_arguments["sourceBindings"] = [
+        {
+            "path": existing_path,
+            "expectedModifiedVersion": existing_version,
+            "expectedContentHash": existing_hash,
+        }
+    ]
+    apply_arguments["operations"] = [
+        {
+            "op": "append",
+            "path": existing_path,
+            "content": "\n## Additional context\n",
+            "expectedContentHash": existing_hash,
+            "expectedModifiedVersion": existing_version,
+        }
+    ]
+    apply_definition = _definition("vault.changes.apply")
+    apply = _call(apply_definition, apply_arguments, call_id="apply-merge-existing")
+
+    missing_receipt = await policy.evaluate(apply_definition, apply, _context(apply_definition))
+
+    assert missing_receipt.disposition is PolicyDisposition.DENY
+    assert missing_receipt.reason_code == "interview_submission_exact_read_missing"
+
+    read_definition = _definition("vault.read")
+    read = _call(
+        read_definition,
+        {
+            "path": existing_path,
+            "expectedModifiedVersion": existing_version,
+            "expectedContentHash": existing_hash,
+        },
+        call_id="read-existing-candidate",
+    )
+    assert (await executor.execute(read, ManualCancellationToken())).status is ToolResultStatus.SUCCEEDED
+
+    allowed = await policy.evaluate(apply_definition, apply, _context(apply_definition))
+
+    assert allowed.disposition is PolicyDisposition.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_new_experience_without_its_primary_index_mutation_is_rejected(tmp_path: Path) -> None:
+    journal = SqliteUnitOfWorkFactory(tmp_path / "runtime.sqlite").invocation_journal
+    authority = InterviewSubmissionRunAuthority(
+        captured_on=date(2026, 7, 18),
+        ordered_image_content_hashes=(FIRST_HASH, SECOND_HASH),
+    )
+    plugin = _PluginBoundary()
+    executor = InterviewSubmissionToolExecutor(
+        workspace_id="ws_vault",
+        root_run_id="run_root",
+        authority=authority,
+        journal=journal,
+        clock=ManualClock(NOW),
+        delegate=plugin,
+    )
+    catalog_definition = _definition("interview_catalog.search")
+    await executor.execute(
+        _call(
+            catalog_definition,
+            {
+                "sourceUrls": [CANONICAL_URL],
+                "orderedImageContentHashes": [FIRST_HASH, SECOND_HASH],
+            },
+            call_id="catalog-before-orphan-create",
+        ),
+        ManualCancellationToken(),
+    )
+    arguments = _interview_batch("orphan-experience")
+    submission = arguments["interviewSubmission"]
+    assert isinstance(submission, dict)
+    submission["reviewItems"] = [submission["reviewItems"][0]]
+    arguments["operations"] = [arguments["operations"][0]]
+    apply_definition = _definition("vault.changes.apply")
+    policy = InterviewSubmissionAuthorityPolicy(
+        workspace_id="ws_vault",
+        root_run_id="run_root",
+        authority=authority,
+        journal=journal,
+        clock=ManualClock(NOW),
+        downstream=_AllowPolicy(),
+        audit_sink=_PolicyAudit(),
+    )
+
+    decision = await policy.evaluate(
+        apply_definition,
+        _call(apply_definition, arguments, call_id="apply-orphan-experience"),
+        _context(apply_definition),
+    )
+
+    assert decision.disposition is PolicyDisposition.DENY
+    assert decision.reason_code == "interview_submission_review_invalid"
 
 
 def test_run_authority_durable_snapshot_rejects_attachment_or_fingerprint_drift() -> None:

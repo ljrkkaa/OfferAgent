@@ -491,11 +491,14 @@ async def _apply_resume_journal(journal: InvocationJournal, plan: RecoveryPlan, 
             if current is not None and current.state is JournalState.COMPLETED:
                 _require_same_journal_result(plan, action, current)
                 continue
-            if current is None or current.state is not JournalState.STARTED:
+            if current is None or current.state is not action.journal_state or current.state not in {
+                JournalState.STARTED,
+                JournalState.UNKNOWN,
+            }:
                 raise RecoveryApplyBlocked(
                     "lookup_journal_state_changed",
                     plan.run_id,
-                    "Lookup recovery 要求 STARTED journal, 但当前状态已变化。",
+                    "Lookup recovery 要求原始 STARTED 或 UNKNOWN journal, 但当前状态已变化。",
                 )
             completed = await journal.complete(
                 action.journal_scope,

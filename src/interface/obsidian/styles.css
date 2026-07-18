@@ -2230,6 +2230,7 @@ button.reference-button:hover {
 }
 
 .offeragent-vault-review-source,
+.offeragent-vault-review-plan,
 .offeragent-vault-review-target {
     margin: 12px 0;
     padding: 12px;
@@ -2239,8 +2240,53 @@ button.reference-button:hover {
 }
 
 .offeragent-vault-review-source h3,
+.offeragent-vault-review-plan h3,
 .offeragent-vault-review-target h3 {
     margin-top: 0;
+}
+
+.offeragent-vault-review-plan-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 0;
+}
+
+.offeragent-vault-review-plan-item + .offeragent-vault-review-plan-item {
+    border-top: 1px solid var(--background-modifier-border);
+}
+
+.offeragent-vault-review-plan-item code {
+    overflow-wrap: anywhere;
+    user-select: text;
+}
+
+.offeragent-vault-review-badges {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 6px;
+}
+
+.offeragent-vault-review-badge {
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: var(--font-ui-smaller);
+    font-weight: var(--font-semibold);
+    color: var(--text-normal);
+    background: var(--background-modifier-hover);
+}
+
+.offeragent-vault-review-badge-create {
+    color: var(--text-success);
+}
+
+.offeragent-vault-review-badge-modify {
+    color: var(--text-accent);
+}
+
+.offeragent-vault-review-badge-none {
+    color: var(--text-muted);
 }
 
 .offeragent-vault-review-source pre,

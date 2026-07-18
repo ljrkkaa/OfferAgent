@@ -3,7 +3,7 @@
 
 const assert = require("node:assert/strict");
 const { execFileSync } = require("node:child_process");
-const { createHash, randomUUID } = require("node:crypto");
+const { createHash, randomBytes, randomUUID } = require("node:crypto");
 const {
     access,
     mkdir,
@@ -223,7 +223,22 @@ async function main() {
             FileVaultChangeJournal,
             GitCheckpointStore,
         } = loadRuntimeModules();
-        const transport = new StdioWorkerTransport(worker, vaultRoot, manifest.runtimeVersion);
+        const workerJournalDirectory = path.join(
+            vaultRoot,
+            ".obsidian",
+            "offeragent",
+            "vault-change-journal",
+        );
+        const workerJournal = new FileVaultChangeJournal(workerJournalDirectory);
+        const firstRecoveryToken = randomBytes(32).toString("hex");
+        await workerJournal.markRecoveryReady(firstRecoveryToken);
+        const transport = new StdioWorkerTransport(
+            worker,
+            vaultRoot,
+            manifest.runtimeVersion,
+            workerJournalDirectory,
+            firstRecoveryToken,
+        );
         firstPeer = await transport.connect();
         const initialized = await firstPeer.request(
             "initialize",
@@ -308,7 +323,16 @@ async function main() {
         firstPeer = undefined;
         await assertProcessExited(firstWorkerPid);
 
-        secondPeer = await transport.connect();
+        const secondRecoveryToken = randomBytes(32).toString("hex");
+        await workerJournal.markRecoveryReady(secondRecoveryToken);
+        const secondTransport = new StdioWorkerTransport(
+            worker,
+            vaultRoot,
+            manifest.runtimeVersion,
+            workerJournalDirectory,
+            secondRecoveryToken,
+        );
+        secondPeer = await secondTransport.connect();
         const restarted = await secondPeer.request(
             "initialize",
             initializeParams(workspaceId, manifest, build.pluginVersion),

@@ -1,5 +1,5 @@
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { isAbsolute } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import { ByteChannel, JsonRpcPeer, RpcDisconnectedError } from "./json_rpc";
 
@@ -27,8 +27,16 @@ export class StdioWorkerTransport implements RpcTransport {
     private readonly executable: string;
     private readonly vaultRoot: string;
     private readonly runtimeVersion: string;
+    private readonly pluginJournalDirectory: string;
+    private readonly pluginRecoveryToken: string;
 
-    constructor(executable: string, vaultRoot: string, runtimeVersion: string) {
+    constructor(
+        executable: string,
+        vaultRoot: string,
+        runtimeVersion: string,
+        pluginJournalDirectory: string,
+        pluginRecoveryToken: string,
+    ) {
         if (!isAbsolute(executable) || !/offeragent-worker\.exe$/i.test(executable)) {
             throw new TypeError("Worker executable must be an absolute offeragent-worker.exe path");
         }
@@ -36,9 +44,22 @@ export class StdioWorkerTransport implements RpcTransport {
         if (!/^\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.-]+)?$/.test(runtimeVersion)) {
             throw new TypeError("Runtime version is invalid");
         }
+        if (!isAbsolute(pluginJournalDirectory) || pluginJournalDirectory.includes("\0")) {
+            throw new TypeError("Plugin journal directory must be absolute");
+        }
+        const journalRelative = relative(resolve(vaultRoot), resolve(pluginJournalDirectory));
+        if (journalRelative === "" || journalRelative === ".." || journalRelative.startsWith(`..${sep}`) ||
+            isAbsolute(journalRelative)) {
+            throw new TypeError("Plugin journal directory must be contained in the Vault");
+        }
+        if (!/^[0-9a-f]{64}$/u.test(pluginRecoveryToken)) {
+            throw new TypeError("Plugin recovery token is invalid");
+        }
         this.executable = executable;
         this.vaultRoot = vaultRoot;
         this.runtimeVersion = runtimeVersion;
+        this.pluginJournalDirectory = pluginJournalDirectory;
+        this.pluginRecoveryToken = pluginRecoveryToken;
     }
 
     async connect(signal?: AbortSignal): Promise<JsonRpcPeer> {
@@ -47,6 +68,8 @@ export class StdioWorkerTransport implements RpcTransport {
             "stdio",
             "--vault-root", this.vaultRoot,
             "--runtime-version", this.runtimeVersion,
+            "--plugin-journal-directory", this.pluginJournalDirectory,
+            "--plugin-recovery-token", this.pluginRecoveryToken,
         ], {
             windowsHide: true,
             stdio: ["pipe", "pipe", "pipe"],
