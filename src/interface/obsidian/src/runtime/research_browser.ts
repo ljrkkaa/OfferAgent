@@ -196,7 +196,7 @@ interface ElectronSessionLike {
     on(name: "will-download", handler: (event: { preventDefault(): void }) => void): void;
     webRequest: {
         onBeforeRequest(handler: (
-            details: { url: string; method: string; uploadData?: readonly unknown[] },
+            details: { url: string; method: string; resourceType: string; uploadData?: readonly unknown[] },
             callback: (response: { cancel: boolean }) => void,
         ) => void): void;
     };
@@ -206,6 +206,7 @@ interface ElectronWebContentsLike {
     session: ElectronSessionLike;
     executeJavaScript(script: string, userGesture?: boolean): Promise<unknown>;
     setWindowOpenHandler(handler: () => { action: "deny" }): void;
+    setWebRTCIPHandlingPolicy(policy: "disable_non_proxied_udp"): void;
     on(name: "will-navigate" | "will-redirect", handler: (
         event: { preventDefault(): void },
         url: string,
@@ -468,6 +469,7 @@ export class ElectronResearchPagePort implements ResearchPagePort {
             },
         });
         window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+        window.webContents.setWebRTCIPHandlingPolicy("disable_non_proxied_udp");
         const navigationGuard = (event: { preventDefault(): void }, url: string): void => {
             if (validatedPublicUrl(url) === undefined) event.preventDefault();
         };
@@ -476,7 +478,7 @@ export class ElectronResearchPagePort implements ResearchPagePort {
         window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
         window.webContents.session.on("will-download", (event) => event.preventDefault());
         window.webContents.session.webRequest.onBeforeRequest((details, callback) => {
-            if (!readOnlyRequest(details.method, undefined, details.uploadData)) {
+            if (!readOnlyRequest(details.method, undefined, details.uploadData, details.resourceType)) {
                 callback({ cancel: true });
                 return;
             }
@@ -507,7 +509,9 @@ function readOnlyRequest(
     method: string | undefined,
     headers?: Readonly<Record<string, string | string[] | undefined>>,
     uploadData?: readonly unknown[],
+    resourceType?: string,
 ): boolean {
+    if (resourceType !== undefined && !READ_ONLY_RESOURCE_TYPES.has(resourceType)) return false;
     const normalized = (method ?? "GET").toLocaleUpperCase();
     if (normalized !== "GET" && normalized !== "HEAD") return false;
     if (uploadData !== undefined && uploadData.length > 0) return false;
@@ -517,6 +521,10 @@ function readOnlyRequest(
     const values = Array.isArray(length) ? length : [length];
     return values.every((value) => /^0+$/u.test(value.trim()));
 }
+
+const READ_ONLY_RESOURCE_TYPES = new Set([
+    "mainFrame", "subFrame", "stylesheet", "script", "image", "font", "object", "xhr", "media",
+]);
 
 class UnavailableResearchPagePort implements ResearchPagePort {
     show(): void {}

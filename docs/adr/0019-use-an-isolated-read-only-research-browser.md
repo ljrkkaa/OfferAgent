@@ -9,4 +9,5 @@ OfferAgent 使用带独立 Profile 的 Research Browser 访问牛客、小红书
 实现使用独立持久化 Electron partition，仅向 Agent 暴露公开 URL 打开、渲染内容读取、链接枚举后跟随、
 下一页/滚动和返回。所有连接通过本机代理固定到已验证的公网 DNS 结果，拒绝本机、私网和重绑定目标；
 新窗口、站点权限和下载均被拒绝。页面正文标记为不可信数据，读取结果产生可点击的 Web Source Reference，
-但页面不能提供 Agent 指令或触发发布、表单、上传及社交操作。
+WebSocket 与 WebTransport 类双向资源被请求类型白名单拒绝，WebRTC 的非代理 UDP 路径被关闭；
+页面不能提供 Agent 指令或触发发布、表单、上传及社交操作。

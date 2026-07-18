@@ -107,9 +107,11 @@ test("Research Browser exposes only isolated read navigation and treats rendered
     assert.ok(page.state.shown >= 5);
 });
 
-test("Electron Research Browser uses an isolated partition and a public-DNS-pinning proxy", async (t) => {
+test("Electron Research Browser uses an isolated partition and blocks bidirectional transports", async (t) => {
     const { ElectronResearchPagePort, RESEARCH_BROWSER_PARTITION } = loadModule();
-    const state = { options: null, proxy: null, loaded: null, permission: null, download: null, request: null };
+    const state = {
+        options: null, proxy: null, loaded: null, permission: null, download: null, request: null, webRtcPolicy: null,
+    };
     let resolutions = 0;
     let rejectResolutions = false;
     class FakeWindow {
@@ -123,6 +125,7 @@ test("Electron Research Browser uses an isolated partition and a public-DNS-pinn
                     webRequest: { onBeforeRequest: (handler) => { state.request = handler; } },
                 },
                 setWindowOpenHandler: (handler) => { this.windowOpen = handler; },
+                setWebRTCIPHandlingPolicy: (policy) => { state.webRtcPolicy = policy; },
                 on: () => undefined,
                 stop: () => undefined,
             };
@@ -148,6 +151,7 @@ test("Electron Research Browser uses an isolated partition and a public-DNS-pinn
     assert.equal(state.options.webPreferences.partition, RESEARCH_BROWSER_PARTITION);
     assert.equal(state.options.webPreferences.nodeIntegration, false);
     assert.equal(state.options.webPreferences.contextIsolation, true);
+    assert.equal(state.webRtcPolicy, "disable_non_proxied_udp");
     assert.match(state.proxy.proxyRules, /^http=127\.0\.0\.1:\d+;https=127\.0\.0\.1:\d+$/);
     assert.equal(state.loaded, "https://example.com/interviews");
     let permissionAllowed = true;
@@ -160,13 +164,20 @@ test("Electron Research Browser uses an isolated partition and a public-DNS-pinn
     const requestAllowed = async (details) => await new Promise((resolve) => {
         state.request(details, ({ cancel }) => resolve(!cancel));
     });
-    assert.equal(await requestAllowed({ url: "https://example.com/read", method: "GET" }), true);
-    assert.equal(await requestAllowed({ url: "https://example.com/read", method: "HEAD" }), true);
-    assert.equal(await requestAllowed({ url: "https://example.com/write", method: "POST" }), false);
+    assert.equal(await requestAllowed({ url: "https://example.com/read", method: "GET", resourceType: "mainFrame" }), true);
+    assert.equal(await requestAllowed({ url: "https://example.com/read", method: "HEAD", resourceType: "xhr" }), true);
+    assert.equal(await requestAllowed({ url: "https://example.com/write", method: "POST", resourceType: "xhr" }), false);
     assert.equal(await requestAllowed({
         url: "https://example.com/upload",
         method: "GET",
+        resourceType: "xhr",
         uploadData: [{ bytes: Buffer.from("payload") }],
+    }), false);
+    assert.equal(await requestAllowed({
+        url: "https://example.com/socket", method: "GET", resourceType: "webSocket",
+    }), false);
+    assert.equal(await requestAllowed({
+        url: "https://example.com/webtransport", method: "GET", resourceType: "other",
     }), false);
 
     const proxyPort = Number(state.proxy.proxyRules.match(/http=127\.0\.0\.1:(\d+)/)[1]);
