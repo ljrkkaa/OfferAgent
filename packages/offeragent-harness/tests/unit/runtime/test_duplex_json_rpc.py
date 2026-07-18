@@ -390,6 +390,26 @@ class StoppableApplication:
 
 
 @pytest.mark.asyncio
+async def test_stdio_service_registers_live_delivery_before_initialize_response_can_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, server = memory_stream_pair(fragment_bytes=2)
+    application = StoppableApplication()
+    monkeypatch.setattr(worker_composition, "_StdioWorkerStream", lambda: server)
+    serving = asyncio.create_task(worker_composition._serve_stdio_connection(application))  # type: ignore[arg-type]
+    reader = FramedReader(client)
+    try:
+        await client.write(encode_frame(initialize_request()))
+        response = await asyncio.wait_for(reader.read(), timeout=1)
+
+        assert isinstance(response, JsonRpcSuccessResponse)
+        assert application.event_hub.added.is_set()
+    finally:
+        application.stopped.set()
+        await asyncio.gather(serving, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_stdio_service_closes_after_application_shutdown_without_waiting_for_parent_eof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

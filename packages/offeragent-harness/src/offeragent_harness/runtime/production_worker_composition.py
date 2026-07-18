@@ -3890,6 +3890,8 @@ async def _serve_stdio_connection(application: ProductionWorkerApplication) -> N
     application_stopped: asyncio.Task[None] | None = None
     registered = False
     try:
+        await application.event_hub.add(connection)
+        registered = True
         await connection.start()
         initialized = asyncio.create_task(connection.wait_ready(), name="offeragent-stdio-initialize")
         connection_closed = asyncio.create_task(connection.wait_closed(), name="offeragent-stdio-closed")
@@ -3904,8 +3906,6 @@ async def _serve_stdio_connection(application: ProductionWorkerApplication) -> N
         # Preserve the initialization failure as the authoritative process
         # result when the parent disconnects before a successful initialize.
         await initialized
-        await application.event_hub.add(connection)
-        registered = True
         done, _ = await asyncio.wait(
             (connection_closed, application_stopped),
             return_when=asyncio.FIRST_COMPLETED,
