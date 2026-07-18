@@ -633,20 +633,24 @@ async def test_unknown_plugin_apply_is_adopted_from_real_vault_journal_without_r
             "canonicalUrls": ["https://example.com/interview/42"],
             "orderedImageContentHashes": [],
             "sourceFingerprint": None,
-            "reviewItems": [{
-                "kind": "experience",
-                "path": "experiences/acme.md",
-                "identity": "new",
-                "mutation": "create",
-            }],
+            "reviewItems": [
+                {
+                    "kind": "experience",
+                    "path": "experiences/acme.md",
+                    "identity": "new",
+                    "mutation": "create",
+                }
+            ],
         },
-        "operations": [{
-            "op": "create",
-            "path": "experiences/acme.md",
-            "content": "new\n",
-            "expectedContentHash": "absent",
-            "expectedModifiedVersion": "missing",
-        }],
+        "operations": [
+            {
+                "op": "create",
+                "path": "experiences/acme.md",
+                "content": "new\n",
+                "expectedContentHash": "absent",
+                "expectedModifiedVersion": "missing",
+            }
+        ],
     }
     call = ToolCall(
         tool_call_id="call_plugin_unknown_apply",

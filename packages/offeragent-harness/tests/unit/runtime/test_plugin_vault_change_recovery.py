@@ -450,13 +450,16 @@ async def test_broken_journal_symlink_is_not_authoritative_absence(tmp_path: Pat
         pytest.skip(f"symlinks are unavailable: {error}")
     seal_directory = journal / ".recovery-seals" / "current"
     seal_directory.mkdir(parents=True)
-    _write_json(seal_directory / _seal_name(BATCH_ID), {
-        "schemaVersion": 1,
-        "recoveryToken": TOKEN,
-        "batchId": BATCH_ID,
-        "contentHash": f"sha256:{'f' * 64}",
-        "byteLength": 2,
-    })
+    _write_json(
+        seal_directory / _seal_name(BATCH_ID),
+        {
+            "schemaVersion": 1,
+            "recoveryToken": TOKEN,
+            "batchId": BATCH_ID,
+            "contentHash": f"sha256:{'f' * 64}",
+            "byteLength": 2,
+        },
+    )
     _write_json(journal / ".recovery-ready.json", {"schemaVersion": 2, "recoveryToken": TOKEN})
 
     with pytest.raises(PluginVaultChangeRecoveryError, match="real file"):

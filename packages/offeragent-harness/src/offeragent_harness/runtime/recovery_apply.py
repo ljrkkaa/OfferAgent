@@ -491,10 +491,15 @@ async def _apply_resume_journal(journal: InvocationJournal, plan: RecoveryPlan, 
             if current is not None and current.state is JournalState.COMPLETED:
                 _require_same_journal_result(plan, action, current)
                 continue
-            if current is None or current.state is not action.journal_state or current.state not in {
-                JournalState.STARTED,
-                JournalState.UNKNOWN,
-            }:
+            if (
+                current is None
+                or current.state is not action.journal_state
+                or current.state
+                not in {
+                    JournalState.STARTED,
+                    JournalState.UNKNOWN,
+                }
+            ):
                 raise RecoveryApplyBlocked(
                     "lookup_journal_state_changed",
                     plan.run_id,

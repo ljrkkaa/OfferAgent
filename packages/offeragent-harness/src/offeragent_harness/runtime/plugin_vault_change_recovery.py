@@ -330,9 +330,7 @@ def _validate_record(
     if state in {"applying", "applied", "undoing", "undone"} and checkpoint is None:
         raise PluginVaultChangeRecoveryError("Vault Change journal is malformed")
     if state == "applied" and (
-        applied_paths != paths
-        or checkpoint is None
-        or any(item["afterModifiedVersion"] is None for item in targets)
+        applied_paths != paths or checkpoint is None or any(item["afterModifiedVersion"] is None for item in targets)
     ):
         raise PluginVaultChangeRecoveryError("Vault Change journal applied state is malformed")
     return targets, str(state)
@@ -364,9 +362,7 @@ def _validate_target_binding(targets: tuple[Mapping[str, Any], ...], call: ToolC
         if operation.get("op") == "create":
             content = operation.get("content")
             expected_after_hash = (
-                f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}"
-                if isinstance(content, str)
-                else None
+                f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}" if isinstance(content, str) else None
             )
             if target["afterHash"] != expected_after_hash:
                 raise PluginVaultChangeRecoveryError(
@@ -429,9 +425,7 @@ def _safe_vault_path(value: Any) -> bool:
     if any(part.startswith(".") for part in parts) and not lowered.startswith((".codex/", ".obsidian/")):
         return False
     suffix = path.suffix.lower()
-    return suffix in {".md", ".txt"} or (
-        lowered.startswith(".obsidian/") and suffix in {".json", ".css"}
-    )
+    return suffix in {".md", ".txt"} or (lowered.startswith(".obsidian/") and suffix in {".json", ".css"})
 
 
 def _state_identity(value: Any) -> bool:

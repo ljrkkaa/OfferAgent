@@ -537,20 +537,24 @@ async def _seed_plugin_unknown_recovery(
             "canonicalUrls": ["https://example.com/interview/production-recovery"],
             "orderedImageContentHashes": [],
             "sourceFingerprint": None,
-            "reviewItems": [{
-                "kind": "experience",
-                "path": "experiences/production-recovery.md",
-                "identity": "new",
-                "mutation": "create",
-            }],
+            "reviewItems": [
+                {
+                    "kind": "experience",
+                    "path": "experiences/production-recovery.md",
+                    "identity": "new",
+                    "mutation": "create",
+                }
+            ],
         },
-        "operations": [{
-            "op": "create",
-            "path": "experiences/production-recovery.md",
-            "content": "recovered\n",
-            "expectedContentHash": "absent",
-            "expectedModifiedVersion": "missing",
-        }],
+        "operations": [
+            {
+                "op": "create",
+                "path": "experiences/production-recovery.md",
+                "content": "recovered\n",
+                "expectedContentHash": "absent",
+                "expectedModifiedVersion": "missing",
+            }
+        ],
     }
     call = ToolCall(
         tool_call_id="call_production_plugin_recovery",
@@ -660,46 +664,54 @@ async def _seed_plugin_unknown_recovery(
     applied_target.write_bytes(applied_content)
     journal_directory = vault / ".obsidian" / "offeragent" / "vault-change-journal"
     journal_directory.mkdir(parents=True)
-    marker = json.dumps(
-        {"schemaVersion": 2, "recoveryToken": PLUGIN_RECOVERY_TOKEN}, separators=(",", ":")
-    ).encode() + b"\n"
-    record = json.dumps(
-        {
-            "version": 2,
-            "batchId": PLUGIN_RECOVERY_BATCH_ID,
-            "toolCallId": call.tool_call_id,
-            "workspaceId": call.workspace_id,
-            "runId": call.run_id,
-            "rootRunId": call.lineage.root_run_id,
-            "changeKind": "interview_submission",
-            "reviewHash": "sha256:" + "c" * 64,
-            "argsHash": call.args_hash,
-            "idempotencyKey": call.idempotency_key,
-            "state": "applied",
-            "checkpointRef": f"refs/offeragent/checkpoints/{PLUGIN_RECOVERY_BATCH_ID}",
-            "targets": [{
-                "operation": "create",
-                "path": "experiences/production-recovery.md",
-                "beforeHash": "absent",
-                "afterHash": content_hash(applied_content),
-                "beforeModifiedVersion": "missing",
-                "afterModifiedVersion": f"mtime:1:size:{len(applied_content)}",
-            }],
-            "appliedPaths": ["experiences/production-recovery.md"],
-            "manualReviewPaths": [],
-        },
-        separators=(",", ":"),
-    ).encode() + b"\n"
-    seal = json.dumps(
-        {
-            "schemaVersion": 1,
-            "recoveryToken": PLUGIN_RECOVERY_TOKEN,
-            "batchId": PLUGIN_RECOVERY_BATCH_ID,
-            "contentHash": content_hash(record),
-            "byteLength": len(record),
-        },
-        separators=(",", ":"),
-    ).encode() + b"\n"
+    marker = (
+        json.dumps({"schemaVersion": 2, "recoveryToken": PLUGIN_RECOVERY_TOKEN}, separators=(",", ":")).encode() + b"\n"
+    )
+    record = (
+        json.dumps(
+            {
+                "version": 2,
+                "batchId": PLUGIN_RECOVERY_BATCH_ID,
+                "toolCallId": call.tool_call_id,
+                "workspaceId": call.workspace_id,
+                "runId": call.run_id,
+                "rootRunId": call.lineage.root_run_id,
+                "changeKind": "interview_submission",
+                "reviewHash": "sha256:" + "c" * 64,
+                "argsHash": call.args_hash,
+                "idempotencyKey": call.idempotency_key,
+                "state": "applied",
+                "checkpointRef": f"refs/offeragent/checkpoints/{PLUGIN_RECOVERY_BATCH_ID}",
+                "targets": [
+                    {
+                        "operation": "create",
+                        "path": "experiences/production-recovery.md",
+                        "beforeHash": "absent",
+                        "afterHash": content_hash(applied_content),
+                        "beforeModifiedVersion": "missing",
+                        "afterModifiedVersion": f"mtime:1:size:{len(applied_content)}",
+                    }
+                ],
+                "appliedPaths": ["experiences/production-recovery.md"],
+                "manualReviewPaths": [],
+            },
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
+    seal = (
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "recoveryToken": PLUGIN_RECOVERY_TOKEN,
+                "batchId": PLUGIN_RECOVERY_BATCH_ID,
+                "contentHash": content_hash(record),
+                "byteLength": len(record),
+            },
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
     marker_path = journal_directory / ".recovery-ready.json"
     record_path = journal_directory / f"{PLUGIN_RECOVERY_BATCH_ID}.json"
     seal_directory = journal_directory / ".recovery-seals" / "current"
