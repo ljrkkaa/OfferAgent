@@ -2,14 +2,24 @@ import * as Module from "node:module";
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { createInterface } from "node:readline";
 
 import { StdioWorkerTransport } from "./runtime/stdio_worker";
-import { VaultToolAdapter } from "./runtime/vault_tool_adapter";
+import { HarnessClient, REQUIRED_RUNTIME_CAPABILITIES } from "./runtime/harness_client";
+import {
+    observePluginToolEvents,
+    PluginToolEventObserver,
+    SerializedPluginToolExecutionFence,
+    VaultToolAdapter,
+} from "./runtime/vault_tool_adapter";
 import {
     FileVaultChangeJournal,
     GitCheckpointStore,
+    VaultChangeAuthorizationDecision,
+    VaultChangeAuthorizationProposal,
     VaultChangeCoordinator,
 } from "./runtime/vault_changes";
+import { QualificationVaultPort } from "./qualification_vault";
 
 const PRODUCTION_EXPORTS = Object.freeze([
     "StdioWorkerTransport",
@@ -178,11 +188,254 @@ async function smoke(): Promise<void> {
     })}\n`);
 }
 
+type ControlRequest = {
+    readonly id: string;
+    readonly command: string;
+    readonly params: Record<string, unknown>;
+};
+
+type PendingReview = {
+    readonly proposal: VaultChangeAuthorizationProposal;
+    readonly resolve: (decision: VaultChangeAuthorizationDecision) => void;
+};
+
+type ProductState = {
+    readonly client: HarnessClient;
+    readonly observer: PluginToolEventObserver;
+    readonly fence: SerializedPluginToolExecutionFence;
+    readonly unsubscribeEvents: () => void;
+    readonly workerPid: number;
+};
+
+let product: ProductState | null = null;
+const reviews = new Map<string, PendingReview>();
+
+function controlRequest(value: unknown): ControlRequest {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new TypeError("qualification control request must be an object");
+    }
+    const candidate = value as Record<string, unknown>;
+    if (typeof candidate.id !== "string" || candidate.id.length === 0 ||
+        typeof candidate.command !== "string" || candidate.command.length === 0 ||
+        candidate.params === null || typeof candidate.params !== "object" || Array.isArray(candidate.params)) {
+        throw new TypeError("qualification control request shape is invalid");
+    }
+    return candidate as unknown as ControlRequest;
+}
+
+function writeControl(value: unknown): void {
+    process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+function requiredString(value: Record<string, unknown>, key: string): string {
+    const result = value[key];
+    if (typeof result !== "string" || result.length === 0 || result.includes("\0")) {
+        throw new TypeError(`${key} must be a non-empty string`);
+    }
+    return result;
+}
+
+async function startProduct(params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (product !== null) throw new Error("qualification product is already started");
+    const input = smokeInput(params);
+    process.env.LOCALAPPDATA = input.localAppData;
+    const journalDirectory = path.join(
+        input.vaultRoot,
+        ".obsidian",
+        "offeragent",
+        "vault-change-journal",
+    );
+    const recoveryToken = randomBytes(32).toString("hex");
+    const journal = new FileVaultChangeJournal(journalDirectory);
+    const vault = new QualificationVaultPort(input.vaultRoot);
+    const changes = new VaultChangeCoordinator({
+        vault,
+        checkpoints: new GitCheckpointStore(input.vaultRoot),
+        journal,
+        permissionMode: () => "ask_every_time",
+        authorize: proposal => new Promise<VaultChangeAuthorizationDecision>((resolve) => {
+            const reviewId = `review_${randomBytes(16).toString("hex")}`;
+            reviews.set(reviewId, { proposal, resolve });
+            writeControl({ event: "review.proposed", reviewId, proposal });
+        }),
+    });
+    const transport = new StdioWorkerTransport(
+        input.workerExecutable,
+        input.vaultRoot,
+        input.runtimeVersion,
+        journalDirectory,
+        recoveryToken,
+    );
+    let fence: SerializedPluginToolExecutionFence | null = null;
+    const client = new HarnessClient(
+        transport,
+        {
+            workspaceId: input.workspaceId,
+            identity: {
+                protocolVersion: input.protocolVersion,
+                minimumProtocolVersion: input.protocolVersion,
+                maximumProtocolVersion: input.protocolVersion,
+                schemaHash: input.schemaHash,
+                clientVersion: input.pluginVersion,
+            },
+            requiredCapabilities: REQUIRED_RUNTIME_CAPABILITIES,
+        },
+        {
+            beforeConnect: async () => fence?.ready(),
+            onDisconnected: error => writeControl({ event: "product.disconnected", error: error.message }),
+        },
+    );
+    const adapter = new VaultToolAdapter(vault, client, input.workspaceId, undefined, undefined, changes);
+    fence = new SerializedPluginToolExecutionFence(input.vaultRoot, adapter, async () => {
+        await changes.beginRecovery();
+        await journal.markRecoveryReady(recoveryToken);
+    });
+    const observer = observePluginToolEvents(client.reducer, fence, error => {
+        writeControl({ event: "adapter.error", error: error.message });
+    });
+    const unsubscribeEvents = client.reducer.subscribe(event => {
+        writeControl({ event: "runtime.event", value: event });
+    });
+    try {
+        const initialized = await client.connect();
+        product = {
+            client,
+            observer,
+            fence,
+            unsubscribeEvents,
+            workerPid: initialized.workerPid,
+        };
+        return {
+            identity: initialized,
+            reviewResolution: "explicit",
+            sourceFreeRuntime: true,
+        };
+    } catch (error) {
+        unsubscribeEvents();
+        await observer.dispose().catch(() => undefined);
+        await fence.drain().catch(() => undefined);
+        await client.close({ shutdown: false }).catch(() => undefined);
+        throw error;
+    }
+}
+
+async function stopProduct(): Promise<Record<string, unknown>> {
+    const current = product;
+    if (current === null) return { stopped: false };
+    product = null;
+    current.unsubscribeEvents();
+    for (const [reviewId, review] of reviews) {
+        review.resolve({ decision: "reject", reviewHash: review.proposal.reviewHash });
+        reviews.delete(reviewId);
+    }
+    await current.observer.dispose();
+    await current.fence.drain();
+    await current.client.close({ shutdown: true, reason: "user", gracePeriodMs: 30_000 });
+    return { stopped: true, workerPid: current.workerPid };
+}
+
+async function executeControl(request: ControlRequest): Promise<Record<string, unknown>> {
+    if (request.command === "hello") {
+        return {
+            driverProtocolVersion: 2,
+            reviewResolution: "explicit",
+            sourceFreeRuntime: true,
+        };
+    }
+    if (request.command === "product/start") return startProduct(request.params);
+    if (request.command === "product/stop") return stopProduct();
+    if (request.command === "rpc") {
+        if (product === null) throw new Error("qualification product is not started");
+        const method = requiredString(request.params, "method");
+        const params = request.params.params;
+        if (params === null || typeof params !== "object" || Array.isArray(params)) {
+            throw new TypeError("rpc params must be an object");
+        }
+        const genericClient = product.client as unknown as {
+            request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+        };
+        return genericClient.request(method, params as Record<string, unknown>);
+    }
+    if (request.command === "attachment/upload") {
+        if (product === null) throw new Error("qualification product is not started");
+        const sessionId = requiredString(request.params, "sessionId");
+        const fileName = requiredString(request.params, "fileName");
+        const mediaType = requiredString(request.params, "mediaType");
+        if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(mediaType)) {
+            throw new TypeError("attachment mediaType is unsupported");
+        }
+        const contentBase64 = requiredString(request.params, "contentBase64");
+        const bytes = Buffer.from(contentBase64, "base64");
+        if (bytes.toString("base64") !== contentBase64) throw new TypeError("attachment base64 is invalid");
+        const altText = request.params.altText;
+        if (altText !== undefined && typeof altText !== "string") throw new TypeError("attachment altText is invalid");
+        const image = await product.client.uploadAttachment(sessionId, {
+            fileName,
+            mediaType: mediaType as "image/png" | "image/jpeg" | "image/gif" | "image/webp",
+            bytes,
+            ...(typeof altText === "string" && altText.length > 0 ? { altText } : {}),
+        });
+        return image as unknown as Record<string, unknown>;
+    }
+    if (request.command === "review/resolve") {
+        const reviewId = requiredString(request.params, "reviewId");
+        const pending = reviews.get(reviewId);
+        if (pending === undefined) throw new Error("qualification review is not pending");
+        const decision = request.params.decision;
+        const reviewHash = requiredString(request.params, "reviewHash");
+        if (decision !== "accept" && decision !== "reject") throw new TypeError("review decision is invalid");
+        if (reviewHash !== pending.proposal.reviewHash) throw new Error("review hash does not match proposal");
+        reviews.delete(reviewId);
+        pending.resolve({ decision, reviewHash });
+        return { resolved: true };
+    }
+    throw new Error(`unsupported qualification control command: ${request.command}`);
+}
+
+async function serve(): Promise<void> {
+    installSourceRootGuard();
+    const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+    for await (const line of input) {
+        if (line.trim().length === 0) continue;
+        let request: ControlRequest;
+        try {
+            request = controlRequest(JSON.parse(line));
+        } catch (error) {
+            writeControl({
+                id: null,
+                ok: false,
+                error: error instanceof Error ? error.message : String(error),
+            });
+            continue;
+        }
+        if (request.command === "stop") {
+            const result = await stopProduct();
+            writeControl({ id: request.id, ok: true, result });
+            input.close();
+            break;
+        }
+        try {
+            writeControl({ id: request.id, ok: true, result: await executeControl(request) });
+        } catch (error) {
+            writeControl({ id: request.id, ok: false, error: errorMessage(error) });
+        }
+    }
+}
+
 const command = process.argv[2];
 if (command === "probe") {
     probe();
 } else if (command === "smoke") {
     void smoke().catch((error: unknown) => {
+        process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+        process.exitCode = 1;
+    });
+} else if (command === "serve") {
+    void serve().catch((error: unknown) => {
         process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
         process.exitCode = 1;
     });
