@@ -8,6 +8,7 @@ import pytest
 from offeragent_harness.qualification.windows_product_driver import (
     QualificationDriverClient,
     QualificationDriverError,
+    QualificationDriverEventTimeout,
 )
 
 
@@ -66,3 +67,17 @@ def test_driver_client_surfaces_structured_driver_failures(tmp_path: Path) -> No
     ) as client:
         with pytest.raises(QualificationDriverError, match="expected failure"):
             client.request("fail", {})
+
+
+def test_driver_client_names_a_bounded_event_poll_timeout(tmp_path: Path) -> None:
+    driver = _fake_driver(tmp_path)
+    guard = tmp_path / "source"
+    guard.mkdir()
+    with QualificationDriverClient(
+        executable=Path(sys.executable),
+        driver=driver,
+        working_directory=tmp_path,
+        source_root_guard=guard,
+    ) as client:
+        with pytest.raises(QualificationDriverEventTimeout):
+            client.next_event(timeout=0.01)

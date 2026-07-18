@@ -10,10 +10,14 @@ import json
 import os
 import secrets
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import TracebackType
 from typing import Any
 
 from offeragent_harness.qualification.synthetic_interview import SyntheticInterviewFixtureGenerator
@@ -117,16 +121,20 @@ def qualify_live_built_windows_product(
             source_root_guard=guard,
         ) as driver:
             scenario = BuiltProductQualificationSession(driver, start_params)
+            _progress("research_browser")
             browser = scenario.qualify_research_browser()
+            _progress("catalog_selection")
             selected = scenario.prepare_live_model(
                 proxy_url=proxy_url,
                 model=model,
                 require_image=True,
             )
+            _progress("text_preflight")
             text = scenario.run_text_preflight(
                 "这是 sealed OfferAgent 文本预检。不要调用写工具；请只用一句中文确认文本模型路径可用。",
                 timeout=run_timeout,
             )
+            _progress("vision_submission")
             primary = scenario.run_interview_submission(
                 pages,
                 (
@@ -145,10 +153,12 @@ def qualify_live_built_windows_product(
             checkpoint_refs = _checkpoint_refs(vault)
             if len(checkpoint_refs) != 1:
                 raise LiveBuiltProductQualificationError("primary Interview Submission did not create one checkpoint")
+            _progress("restart_replay")
             replay = scenario.restart_and_replay(primary.run.run_id, timeout=run_timeout)
             after_replay = _vault_markdown_snapshot(vault)
             if after_replay != after_primary or _checkpoint_refs(vault) != checkpoint_refs:
                 raise LiveBuiltProductQualificationError("restart replay repeated or changed a persisted side effect")
+            _progress("duplicate_source")
             duplicate = scenario.run_duplicate_source(
                 pages,
                 (
@@ -160,6 +170,7 @@ def qualify_live_built_windows_product(
             after_duplicate = _vault_markdown_snapshot(vault)
             if after_duplicate != after_primary or _checkpoint_refs(vault) != checkpoint_refs:
                 raise LiveBuiltProductQualificationError("duplicate source changed Vault content or checkpoints")
+            _progress("hosted_search")
             search = scenario.run_hosted_search(
                 "请使用 Hosted Web Search 查找一条公开的 2026 年软件工程面试趋势，并在回答中保留来源引用。",
                 timeout=run_timeout,
@@ -375,7 +386,19 @@ def _remove_owned_root(root: Path, expected_marker: bytes) -> None:
         raise LiveBuiltProductQualificationError("qualification temp ownership marker is unavailable") from error
     if marker.is_symlink() or info.st_nlink != 1 or actual != expected_marker:
         raise LiveBuiltProductQualificationError("qualification temp ownership identity differs")
-    shutil.rmtree(root)
+
+    def clear_read_only(
+        function: Callable[[str], object],
+        path: str,
+        error_info: tuple[type[BaseException], BaseException, TracebackType],
+    ) -> None:
+        error = error_info[1]
+        if not isinstance(error, PermissionError):
+            raise error
+        os.chmod(path, stat.S_IWRITE)
+        function(path)
+
+    shutil.rmtree(root, onerror=clear_read_only)
 
 
 def _product_process_ids() -> dict[str, set[int]]:
@@ -415,6 +438,10 @@ def _new_product_processes(before: dict[str, set[int]], after: dict[str, set[int
         for name, process_ids in after.items()
         for process_id in process_ids - before.get(name, set())
     )
+
+
+def _progress(stage: str) -> None:
+    print(f"qualification.stage={stage}", file=sys.stderr, flush=True)
 
 
 def main() -> int:

@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from offeragent_harness.qualification.windows_product_driver import QualificationDriverEventTimeout
 from offeragent_harness.qualification.windows_product_scenario import (
     BuiltProductQualificationError,
     BuiltProductQualificationSession,
@@ -20,7 +21,7 @@ class _ScriptedDriver:
     def __init__(
         self,
         responses: list[tuple[str, str | None, dict[str, Any]]],
-        events: list[dict[str, Any]] | None = None,
+        events: list[dict[str, Any] | BaseException] | None = None,
     ) -> None:
         self.responses = responses
         self.events = events or []
@@ -45,7 +46,10 @@ class _ScriptedDriver:
         assert timeout > 0
         if not self.events:
             raise AssertionError("test requested an unexpected product event")
-        return self.events.pop(0)
+        event = self.events.pop(0)
+        if isinstance(event, BaseException):
+            raise event
+        return event
 
 
 def _model(
@@ -246,6 +250,69 @@ def test_runs_text_preflight_with_persisted_model_and_waits_for_exact_terminal_r
     assert turn_params["input"] == [
         {"type": "text", "text": "Return one short sentence.", "format": "markdown", "references": []}
     ]
+    assert not driver.responses
+
+
+def test_text_preflight_recovers_missed_live_delivery_from_durable_replay() -> None:
+    driver = _prepared_driver()
+    driver.responses.extend(
+        [
+            (
+                "rpc",
+                "session/create",
+                {"session": {"sessionId": "ses_text"}, "created": True},
+            ),
+            (
+                "rpc",
+                "turn/start",
+                {
+                    "sessionId": "ses_text",
+                    "turnId": "turn_text",
+                    "runId": "run_text",
+                    "accepted": True,
+                    "duplicate": False,
+                },
+            ),
+            ("events/replay", None, {"lastSequence": 2}),
+        ]
+    )
+    driver.events.extend(
+        [
+            QualificationDriverEventTimeout("poll elapsed"),
+            {
+                "event": "runtime.event",
+                "value": {
+                    "eventId": "evt_1",
+                    "runId": "run_text",
+                    "sequence": 1,
+                    "type": "turn.started",
+                },
+            },
+            {
+                "event": "runtime.event",
+                "value": {
+                    "eventId": "evt_2",
+                    "runId": "run_text",
+                    "sequence": 2,
+                    "type": "turn.completed",
+                },
+            },
+        ]
+    )
+    session = BuiltProductQualificationSession(driver, {"vaultRoot": "C:/sealed/Vault"})
+    session.prepare_live_model(
+        proxy_url="http://127.0.0.1:7896",
+        model="gpt-5.5",
+        require_image=True,
+    )
+
+    result = session.run_text_preflight("Return one short sentence.", timeout=5)
+
+    assert result.events[-1]["type"] == "turn.completed"
+    assert driver.requests[-1] == (
+        "events/replay",
+        {"runId": "run_text", "afterSequence": 0, "limit": 1_000},
+    )
     assert not driver.responses
 
 

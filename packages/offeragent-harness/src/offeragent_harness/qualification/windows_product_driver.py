@@ -15,6 +15,10 @@ class QualificationDriverError(RuntimeError):
     """The sealed adapter violated its protocol or rejected a command."""
 
 
+class QualificationDriverEventTimeout(QualificationDriverError):
+    """No product event arrived within one bounded polling interval."""
+
+
 class QualificationDriverClient:
     """Own one sealed driver process while keeping product events out of RPC replies."""
 
@@ -111,7 +115,7 @@ class QualificationDriverClient:
         try:
             event = self._events.get(timeout=timeout)
         except queue.Empty as error:
-            raise QualificationDriverError("qualification product event timed out") from error
+            raise QualificationDriverEventTimeout("qualification product event timed out") from error
         if isinstance(event, BaseException):
             raise QualificationDriverError(str(event)) from event
         return event

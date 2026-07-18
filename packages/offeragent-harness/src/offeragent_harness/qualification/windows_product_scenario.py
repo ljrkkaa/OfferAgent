@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
+from offeragent_harness.qualification.windows_product_driver import QualificationDriverEventTimeout
+
 
 class BuiltProductQualificationError(RuntimeError):
     """The sealed product did not produce evidence required by the qualification."""
@@ -579,11 +581,16 @@ class BuiltProductQualificationSession:
         seen: set[str] = set()
         events: list[Mapping[str, Any]] = []
         review: ReviewEvidence | None = None
+        last_sequence = 0
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise BuiltProductQualificationError("sealed product image Run did not reach a terminal event")
-            notification = self._driver.next_event(timeout=remaining)
+                raise BuiltProductQualificationError(
+                    f"sealed product image Run timed out after events {_event_types(events)}"
+                )
+            notification = self._next_event_or_replay(run_id, deadline, last_sequence)
+            if notification is None:
+                continue
             notification_type = notification.get("event")
             if notification_type == "review.proposed":
                 if review is not None:
@@ -596,6 +603,9 @@ class BuiltProductQualificationSession:
             event = notification.get("value")
             if not isinstance(event, Mapping) or event.get("runId") != run_id:
                 continue
+            sequence = event.get("sequence")
+            if isinstance(sequence, int) and not isinstance(sequence, bool):
+                last_sequence = max(last_sequence, sequence)
             event_id = event.get("eventId")
             event_type = event.get("type")
             if not isinstance(event_id, str) or not event_id or not isinstance(event_type, str):
@@ -637,11 +647,16 @@ class BuiltProductQualificationSession:
         deadline = time.monotonic() + timeout
         seen: set[str] = set()
         events: list[Mapping[str, Any]] = []
+        last_sequence = 0
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise BuiltProductQualificationError("sealed product Run did not reach a terminal event")
-            notification = self._driver.next_event(timeout=remaining)
+                raise BuiltProductQualificationError(
+                    f"sealed product Run timed out after events {_event_types(events)}"
+                )
+            notification = self._next_event_or_replay(run_id, deadline, last_sequence)
+            if notification is None:
+                continue
             notification_type = notification.get("event")
             if notification_type == "review.proposed":
                 raise BuiltProductQualificationError(review_error)
@@ -651,6 +666,9 @@ class BuiltProductQualificationSession:
             event = notification.get("value")
             if not isinstance(event, Mapping) or event.get("runId") != run_id:
                 continue
+            sequence = event.get("sequence")
+            if isinstance(sequence, int) and not isinstance(sequence, bool):
+                last_sequence = max(last_sequence, sequence)
             event_id = event.get("eventId")
             event_type = event.get("type")
             if not isinstance(event_id, str) or not event_id or not isinstance(event_type, str):
@@ -663,6 +681,27 @@ class BuiltProductQualificationSession:
                 return tuple(events)
             if event_type in {"turn.cancelled", "turn.failed", "turn.interrupted"}:
                 raise BuiltProductQualificationError(f"sealed product Run terminated with {event_type}")
+
+    def _next_event_or_replay(
+        self,
+        run_id: str,
+        deadline: float,
+        after_sequence: int,
+    ) -> dict[str, Any] | None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            return self._driver.next_event(timeout=min(5.0, remaining))
+        except QualificationDriverEventTimeout:
+            replayed = self._driver.request(
+                "events/replay",
+                {"runId": run_id, "afterSequence": after_sequence, "limit": 1_000},
+            )
+            last_sequence = _integer(replayed, "lastSequence", "polled Run replay")
+            if last_sequence < after_sequence:
+                raise BuiltProductQualificationError("polled Run replay cursor moved backwards") from None
+            return None
 
 
 def _integer(
@@ -854,3 +893,8 @@ def _raise_control_failure(notification: Mapping[str, Any]) -> None:
     event = notification.get("event")
     if event in {"adapter.error", "product.disconnected"}:
         raise BuiltProductQualificationError(f"sealed product control plane emitted {event}")
+
+
+def _event_types(events: list[Mapping[str, Any]]) -> str:
+    values = [str(event.get("type", "invalid")) for event in events[-16:]]
+    return "[" + ",".join(values) + "]"
