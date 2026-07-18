@@ -117,6 +117,35 @@ test("Vault Change Batch validates every target before mutation and rolls back a
     assert.equal((await journal.load("batch_failure")).state, "rolled_back");
 });
 
+test("an unresolved apply outcome latches the current coordinator fail-closed", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const vault = new MemoryVault({ "notes/a.md": "alpha\n", "notes/b.md": "beta\n", "notes/c.md": "gamma\n" });
+    const originalWrite = vault.write.bind(vault);
+    vault.write = async (target, content) => {
+        if (target === "notes/b.md") throw new Error("injected apply failure");
+        if (target === "notes/a.md" && content === "alpha\n") throw new Error("injected rollback failure");
+        await originalWrite(target, content);
+    };
+    const journal = new MemoryJournal();
+    const coordinator = new VaultChangeCoordinator({
+        vault, journal, checkpoints: new MemoryCheckpoints(vault), permissionMode: () => "trusted_vault",
+    });
+
+    const unresolved = await coordinator.execute(call("batch_unresolved_apply", [
+        { op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n") },
+        { op: "append", path: "notes/b.md", content: "next\n", expectedContentHash: digest("beta\n") },
+    ]));
+    const blocked = await coordinator.execute(call("batch_after_unresolved_apply", [
+        { op: "append", path: "notes/c.md", content: "later\n", expectedContentHash: digest("gamma\n") },
+    ]));
+
+    assert.equal(unresolved.status, "unknown_outcome");
+    assert.equal((await journal.load("batch_unresolved_apply")).state, "recovery_failed");
+    assert.equal(blocked.status, "unknown_outcome");
+    assert.equal(blocked.retryable, false);
+    assert.equal(vault.entries.get("notes/c.md"), "gamma\n");
+});
+
 test("Vault Change Batch revalidates after checkpoint and never overwrites a racing user edit", async () => {
     const { VaultChangeCoordinator } = loadModule();
     const vault = new MemoryVault({ "notes/a.md": "alpha\n" });
@@ -493,6 +522,40 @@ test("guarded undo restores only an unchanged applied batch", async () => {
     const undone = await coordinator.undo("batch_undo");
     assert.equal(undone.status, "undone");
     assert.equal(vault.entries.get("notes/a.md"), "alpha\n");
+});
+
+test("an unresolved guarded undo latches later writes in the current coordinator", async () => {
+    const { VaultChangeCoordinator } = loadModule();
+    const vault = new MemoryVault({ "notes/a.md": "alpha\n", "notes/b.md": "beta\n" });
+    const journal = new MemoryJournal();
+    const coordinator = new VaultChangeCoordinator({
+        vault, journal, checkpoints: new MemoryCheckpoints(vault), permissionMode: () => "trusted_vault",
+    });
+    await coordinator.execute(call("batch_unresolved_undo", [
+        { op: "append", path: "notes/a.md", content: "next\n", expectedContentHash: digest("alpha\n") },
+    ]));
+    const originalRead = vault.read.bind(vault);
+    let appliedReads = 0;
+    vault.read = async (target) => {
+        const content = await originalRead(target);
+        if (target === "notes/a.md" && content === "alpha\nnext\n" && ++appliedReads === 2) {
+            vault.entries.set(target, "racing user edit\n");
+            return "racing user edit\n";
+        }
+        return content;
+    };
+
+    const conflict = await coordinator.undo("batch_unresolved_undo");
+    vault.read = originalRead;
+    const blocked = await coordinator.execute(call("batch_after_unresolved_undo", [
+        { op: "append", path: "notes/b.md", content: "later\n", expectedContentHash: digest("beta\n") },
+    ]));
+
+    assert.equal(conflict.status, "conflict");
+    assert.equal((await journal.load("batch_unresolved_undo")).state, "undoing");
+    assert.equal(blocked.status, "unknown_outcome");
+    assert.equal(blocked.retryable, false);
+    assert.equal(vault.entries.get("notes/b.md"), "beta\n");
 });
 
 test("guarded undo journals progress and completes safely after a crash", async () => {

@@ -175,25 +175,31 @@ class UndoConflictError extends Error {
 
 export class VaultChangeCoordinator {
     private recoveryGate: Promise<void> | null = null;
+    private writesLatched = false;
 
     constructor(private readonly options: VaultChangeCoordinatorOptions) {}
 
     beginRecovery(): Promise<void> {
-        this.recoveryGate = this.reconcile().then((reports) => {
-            const blocked = reports.filter((report) => report.state === "recovery_failed");
-            if (blocked.length > 0) {
-                const details = blocked.flatMap((report) => report.manualReviewPaths).join(", ") ||
-                    blocked.map((report) => report.batchId).join(", ");
-                throw new Error(`Vault Change recovery requires manual review: ${details}`);
-            }
-        });
+        this.writesLatched = true;
+        this.recoveryGate = this.reconcile()
+            .then((reports) => {
+                const blocked = reports.filter((report) => report.state === "recovery_failed");
+                if (blocked.length > 0) {
+                    const details = blocked.flatMap((report) => report.manualReviewPaths).join(", ") ||
+                        blocked.map((report) => report.batchId).join(", ");
+                    throw new Error(`Vault Change recovery requires manual review: ${details}`);
+                }
+                this.writesLatched = false;
+            })
+            .catch((error: unknown) => {
+                this.writesLatched = true;
+                throw error;
+            });
         return this.recoveryGate;
     }
 
     async execute(call: ExecutableToolCallDescriptor): Promise<ToolResultDescriptor> {
-        try {
-            await this.recoveryGate;
-        } catch {
+        if (!await this.writeGateOpen()) {
             return failed(
                 call,
                 "tool.unknown_outcome",
@@ -208,7 +214,11 @@ export class VaultChangeCoordinator {
         const batchId = typeof call.arguments.batchId === "string" ? call.arguments.batchId : "";
         if (!BATCH_ID.test(batchId)) return failed(call, "protocol.invalid_params", "Vault Change Batch ID is invalid.");
         const prior = await this.options.journal.load(batchId);
-        if (prior !== undefined) return this.replay(call, prior);
+        if (prior !== undefined) {
+            const replay = this.replay(call, prior);
+            if (replay.status === "unknown_outcome") this.writesLatched = true;
+            return replay;
+        }
         if (this.options.permissionMode() === "read_only") {
             return failed(call, "policy.denied", "The plugin-owned Vault permission mode is read-only.", false, "denied");
         }
@@ -288,7 +298,10 @@ export class VaultChangeCoordinator {
             this.inject("after-applied-journal");
             return success(call, record);
         } catch (error) {
-            if (error instanceof VaultChangeCrashInjectionError) throw error;
+            if (error instanceof VaultChangeCrashInjectionError) {
+                this.writesLatched = true;
+                throw error;
+            }
             try {
                 await this.rollback(record);
                 record = { ...record, state: "rolled_back", appliedPaths: [] };
@@ -297,6 +310,7 @@ export class VaultChangeCoordinator {
                     ? validationFailure(call, error)
                     : failed(call, "tool.failed", "Vault Change Batch failed and was rolled back.");
             } catch {
+                this.writesLatched = true;
                 const manualReviewPaths = await this.unexpectedPaths(record);
                 record = { ...record, state: "recovery_failed", manualReviewPaths };
                 await this.options.journal.save(record);
@@ -363,10 +377,14 @@ export class VaultChangeCoordinator {
             await this.options.journal.save(record);
             reports.push({ batchId: record.batchId, state: "recovery_failed", manualReviewPaths });
         }
+        this.writesLatched = reports.some((report) => report.state === "recovery_failed");
         return reports;
     }
 
     async undo(batchId: string): Promise<VaultUndoResult> {
+        if (!await this.writeGateOpen()) {
+            throw new Error("Vault Change recovery requires manual review before another write can run.");
+        }
         let record = await this.options.journal.load(batchId);
         if (record === undefined || record.state !== "applied" || record.checkpointRef === null) {
             return { status: "not_found", batchId };
@@ -391,10 +409,16 @@ export class VaultChangeCoordinator {
             record = await this.completeUndo(record);
             return { status: "undone", batchId, paths: record.targets.map((target) => target.path) };
         } catch (error) {
+            this.writesLatched = true;
             if (error instanceof VaultChangeCrashInjectionError) throw error;
-            if (!(error instanceof UndoConflictError)) throw error;
             if (record === undefined || record.checkpointRef === null) throw new Error("undo journal identity was lost");
             const checkpointRef = record.checkpointRef;
+            const manualReviewPaths = error instanceof UndoConflictError
+                ? [...error.paths]
+                : await this.unexpectedPaths(record);
+            record = { ...record, manualReviewPaths };
+            await this.options.journal.save(record);
+            if (!(error instanceof UndoConflictError)) throw error;
             const targets = record.targets;
             const conflictDiffs = await Promise.all(error.paths.map(async (path) => {
                 const target = targets.find((candidate) => candidate.path === path);
@@ -402,8 +426,6 @@ export class VaultChangeCoordinator {
                 const before = await this.options.checkpoints.read(checkpointRef, path);
                 return conflictDiff(target?.path ?? path, current, before);
             }));
-            record = { ...record, manualReviewPaths: [...error.paths] };
-            await this.options.journal.save(record);
             return {
                 status: "conflict",
                 batchId,
@@ -579,6 +601,15 @@ export class VaultChangeCoordinator {
     private async unexpectedPaths(record: VaultChangeJournalRecord): Promise<string[]> {
         const states = await this.observedTargetStates(record);
         return record.targets.filter((_target, index) => states[index] === "unexpected").map((target) => target.path);
+    }
+
+    private async writeGateOpen(): Promise<boolean> {
+        try {
+            await this.recoveryGate;
+        } catch {
+            return false;
+        }
+        return !this.writesLatched;
     }
 
     private inject(point: VaultChangeCrashPoint, path?: string): void {
