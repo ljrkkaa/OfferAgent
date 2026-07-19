@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from scripts.qualify_final_windows_product import (
     _executable,
     _named_skips,
     _review_phase,
+    _write_final_report,
     qualify_final_windows_product,
 )
 
@@ -192,3 +194,11 @@ def test_gate_executable_prefers_the_current_python_environment(
     monkeypatch.setattr("scripts.qualify_final_windows_product.shutil.which", lambda _name: None)
 
     assert _executable("lint-imports") == executable
+
+
+def test_final_report_is_written_as_canonical_utf8_independent_of_console_encoding() -> None:
+    output = BytesIO()
+
+    _write_final_report({"replacement": "\ufffd", "status": "passed"}, output)
+
+    assert output.getvalue() == b'{"replacement":"\xef\xbf\xbd","status":"passed"}\n'

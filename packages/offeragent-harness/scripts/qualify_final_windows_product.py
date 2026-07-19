@@ -15,7 +15,7 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, cast
 
 from offeragent_harness.qualification.windows_product_artifact import (
     VerifiedWindowsProductArtifacts,
@@ -662,6 +662,11 @@ def _canonical_json(value: object) -> bytes:
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
+def _write_final_report(report: object, stream: BinaryIO) -> None:
+    stream.write(_canonical_json(report))
+    stream.flush()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="构建并验证最终 OfferAgent Windows 候选")
     parser.add_argument("--source-root", type=Path, required=True)
@@ -689,7 +694,7 @@ def main() -> int:
         standards_review_attestation=args.standards_review_attestation,
         spec_review_attestation=args.spec_review_attestation,
     )
-    print(json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    _write_final_report(report, cast(BinaryIO, sys.stdout.buffer))
     return 0
 
 
