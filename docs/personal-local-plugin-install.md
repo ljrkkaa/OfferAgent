@@ -60,12 +60,18 @@ uv run python scripts/qualify_final_windows_product.py `
   --node-executable C:\path\to\node.exe `
   --proxy-url http://127.0.0.1:7896 `
   --temporary-parent E:\Projects\offeragent\artifacts `
-  --review-base 4cf015ae02c59a8b15420ef99d340f95e5001cc6
+  --review-base 4cf015ae02c59a8b15420ef99d340f95e5001cc6 `
+  --standards-review-attestation E:\Projects\offeragent\artifacts\standards-review.json `
+  --spec-review-attestation E:\Projects\offeragent\artifacts\spec-review.json
 ```
 
 stdout 是一个带 `schemaVersion` 的 canonical JSON：绑定两个只读来源头、本地 commits、产物与目录哈希、
-每条真实命令及退出码、命名 skip、实时模型/目录身份、迁移、离线 socket/子进程观测、安装设置哈希、认证比较、
+每条真实命令及退出码、结构化命名 skip、实时模型/目录身份、迁移、离线强制 audit trace 与存活
+socket/子进程观测、安装设置哈希、认证比较、
 临时 Vault ownership、进程前后集合与清理结果。运行期禁止解析仓库产品源码或编译 TypeScript，也不接触用户真实 Vault。
+两份审查文件必须是 canonical JSON regular file，分别声明 `axis` 为 `standards`/`spec`，绑定同一个 exact HEAD 与
+`review-base`，Spec 轴绑定 `[68,79]`，并具有 `status: "passed"` 和空 `findings`；主控会记录文件 SHA-256，拒绝旧 HEAD、
+非 canonical、符号链接/硬链接或非零 findings 的证明。
 
 产物结构：
 

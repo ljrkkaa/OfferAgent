@@ -1,9 +1,33 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 
-from scripts.qualify_final_windows_product import qualify_final_windows_product
+import pytest
+from scripts.qualify_final_windows_product import (
+    FinalWindowsProductQualificationError,
+    _named_skips,
+    _review_phase,
+    qualify_final_windows_product,
+)
+
+_BASE = "4cf015ae02c59a8b15420ef99d340f95e5001cc6"
+_HEAD = "d" * 40
+
+
+def _attestation(path: Path, *, axis: str, specs: list[int], head: str = _HEAD) -> Path:
+    payload = {
+        "axis": axis,
+        "findings": [],
+        "fixedBase": _BASE,
+        "head": head,
+        "schemaVersion": 1,
+        "specs": specs,
+        "status": "passed",
+    }
+    path.write_bytes((json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode())
+    return path.resolve()
 
 
 def test_one_final_command_composes_every_required_phase_into_a_versioned_report(tmp_path: Path) -> None:
@@ -23,12 +47,18 @@ def test_one_final_command_composes_every_required_phase_into_a_versioned_report
                         "durationMs": 1,
                     }
                 ],
-                "skips": ["credentialless live matrix is named"] if name == "gates" else [],
+                "skips": (
+                    [{"command": "python tests", "name": "credentialless live matrix", "reason": "opt-in"}]
+                    if name == "gates"
+                    else []
+                ),
             }
 
         return run
 
-    phases = {name: phase(name) for name in ("source", "gates", "build", "offline", "migrations", "install", "live")}
+    phases = {
+        name: phase(name) for name in ("source", "review", "gates", "build", "offline", "migrations", "install", "live")
+    }
 
     report = qualify_final_windows_product(
         source_root=tmp_path,
@@ -39,11 +69,13 @@ def test_one_final_command_composes_every_required_phase_into_a_versioned_report
         proxy_url="http://127.0.0.1:7896",
         model="gpt-5.5",
         temporary_parent=tmp_path,
-        review_base="4cf015ae02c59a8b15420ef99d340f95e5001cc6",
+        review_base=_BASE,
+        standards_review_attestation=tmp_path / "standards.json",
+        spec_review_attestation=tmp_path / "spec.json",
         _phase_functions=phases,
     )
 
-    assert order == ["source", "gates", "build", "offline", "migrations", "install", "live"]
+    assert order == ["source", "review", "gates", "build", "offline", "migrations", "install", "live"]
     assert report["schemaVersion"] == 1
     assert report["status"] == "passed"
     phase_report = report["phases"]
@@ -52,11 +84,54 @@ def test_one_final_command_composes_every_required_phase_into_a_versioned_report
     assert isinstance(commands, list)
     assert set(phase_report) == set(order)
     assert len(commands) == len(order)
-    assert report["skips"] == ["credentialless live matrix is named"]
-    assert report["review"] == {
-        "fixedBase": "4cf015ae02c59a8b15420ef99d340f95e5001cc6",
-        "specs": [68, 79],
-        "standardsFindings": 0,
-        "specFindings": 0,
-        "status": "passed",
-    }
+    assert report["skips"] == [{"command": "python tests", "name": "credentialless live matrix", "reason": "opt-in"}]
+    assert report["review"] == {"phase": "review", "status": "passed"}
+
+
+def test_review_phase_requires_canonical_zero_finding_attestations_bound_to_exact_head(tmp_path: Path) -> None:
+    standards = _attestation(tmp_path / "standards.json", axis="standards", specs=[])
+    spec = _attestation(tmp_path / "spec.json", axis="spec", specs=[68, 79])
+
+    phase = _review_phase(
+        head=_HEAD,
+        review_base=_BASE,
+        standards_attestation=standards,
+        spec_attestation=spec,
+        source_root=tmp_path,
+    )
+
+    assert phase["evidence"]["status"] == "passed"
+    assert phase["evidence"]["head"] == _HEAD
+    assert phase["evidence"]["standardsFindings"] == 0
+    assert phase["evidence"]["specFindings"] == 0
+    assert phase["evidence"]["attestations"]["standards"]["sha256"].startswith("sha256:")
+
+    _attestation(spec, axis="spec", specs=[68, 79], head="e" * 40)
+    with pytest.raises(FinalWindowsProductQualificationError, match="exact final HEAD"):
+        _review_phase(
+            head=_HEAD,
+            review_base=_BASE,
+            standards_attestation=standards,
+            spec_attestation=spec,
+            source_root=tmp_path,
+        )
+
+
+def test_named_skips_capture_pytest_and_tap_name_reason_and_owning_command() -> None:
+    pytest_output = "SKIPPED [1] tests/acceptance/test_live.py:17: live qualification is opt-in\n"
+    tap_output = "ok 42 - installer preserves symlinks # SKIP Windows requires Developer Mode\n"
+
+    assert _named_skips("python tests", pytest_output) == [
+        {
+            "command": "python tests",
+            "name": "tests/acceptance/test_live.py:17",
+            "reason": "live qualification is opt-in",
+        }
+    ]
+    assert _named_skips("obsidian tests", tap_output) == [
+        {
+            "command": "obsidian tests",
+            "name": "installer preserves symlinks",
+            "reason": "Windows requires Developer Mode",
+        }
+    ]

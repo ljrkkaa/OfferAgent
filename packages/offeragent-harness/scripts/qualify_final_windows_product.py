@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -33,7 +34,7 @@ except ImportError:  # pragma: no cover - direct execution from scripts/
     )
 
 PhaseFunction = Callable[[], dict[str, object]]
-_PHASES = ("source", "gates", "build", "offline", "migrations", "install", "live")
+_PHASES = ("source", "review", "gates", "build", "offline", "migrations", "install", "live")
 
 
 class FinalWindowsProductQualificationError(RuntimeError):
@@ -51,6 +52,8 @@ def qualify_final_windows_product(
     model: str,
     temporary_parent: Path,
     review_base: str,
+    standards_review_attestation: Path,
+    spec_review_attestation: Path,
     _phase_functions: Mapping[str, PhaseFunction] | None = None,
 ) -> dict[str, object]:
     """Run every completion phase in order and return one versioned report."""
@@ -61,6 +64,13 @@ def qualify_final_windows_product(
         phase_results = {name: _validate_phase_result(name, _phase_functions[name]()) for name in _PHASES}
     else:
         source = _source_phase(source_root, review_base)
+        review = _review_phase(
+            head=str(source["evidence"]["head"]),
+            review_base=review_base,
+            standards_attestation=standards_review_attestation,
+            spec_attestation=spec_review_attestation,
+            source_root=source_root,
+        )
         gates = _gate_phase(source_root)
         build, paired = _build_phase(
             source_root,
@@ -82,6 +92,7 @@ def qualify_final_windows_product(
         )
         phase_results = {
             "source": source,
+            "review": review,
             "gates": gates,
             "build": build,
             "offline": offline,
@@ -90,20 +101,19 @@ def qualify_final_windows_product(
             "live": live,
         }
     commands = [command for name in _PHASES for command in phase_results[name]["commands"]]
-    skips = sorted({skip for name in _PHASES for skip in phase_results[name]["skips"]})
+    unique_skips = {
+        json.dumps(skip, ensure_ascii=False, sort_keys=True, separators=(",", ":")): skip
+        for name in _PHASES
+        for skip in phase_results[name]["skips"]
+    }
+    skips = [unique_skips[key] for key in sorted(unique_skips)]
     return {
         "schemaVersion": 1,
         "status": "passed",
         "phases": {name: phase_results[name]["evidence"] for name in _PHASES},
         "commands": commands,
         "skips": skips,
-        "review": {
-            "fixedBase": review_base,
-            "specs": [68, 79],
-            "standardsFindings": 0,
-            "specFindings": 0,
-            "status": "passed",
-        },
+        "review": phase_results["review"]["evidence"],
     }
 
 
@@ -118,7 +128,14 @@ def _validate_phase_result(name: str, result: dict[str, object]) -> dict[str, An
         or evidence.get("status") != "passed"
         or not isinstance(commands, list)
         or not isinstance(skips, list)
-        or any(not isinstance(skip, str) or not skip for skip in skips)
+        or any(
+            not isinstance(skip, dict)
+            or set(skip) != {"command", "name", "reason"}
+            or any(
+                not isinstance(skip.get(field), str) or not skip.get(field) for field in ("command", "name", "reason")
+            )
+            for skip in skips
+        )
     ):
         raise FinalWindowsProductQualificationError(f"{name} phase did not return passed evidence")
     return {"evidence": evidence, "commands": commands, "skips": skips}
@@ -152,6 +169,85 @@ def _source_phase(source_root: Path, review_base: str) -> dict[str, Any]:
     )
 
 
+def _review_phase(
+    *,
+    head: str,
+    review_base: str,
+    standards_attestation: Path,
+    spec_attestation: Path,
+    source_root: Path,
+) -> dict[str, Any]:
+    standards = _review_attestation(
+        standards_attestation,
+        axis="standards",
+        head=head,
+        review_base=review_base,
+        specs=[],
+    )
+    spec = _review_attestation(
+        spec_attestation,
+        axis="spec",
+        head=head,
+        review_base=review_base,
+        specs=[68, 79],
+    )
+    return _phase_result(
+        {
+            "status": "passed",
+            "fixedBase": review_base,
+            "head": head,
+            "specs": [68, 79],
+            "standardsFindings": len(standards["findings"]),
+            "specFindings": len(spec["findings"]),
+            "attestations": {
+                "standards": {
+                    "sha256": standards["sha256"],
+                    "specs": standards["specs"],
+                },
+                "spec": {
+                    "sha256": spec["sha256"],
+                    "specs": spec["specs"],
+                },
+            },
+        },
+        [_in_process_command("head-bound code-review attestations", source_root, ["code-review", "standards", "spec"])],
+    )
+
+
+def _review_attestation(
+    path: Path,
+    *,
+    axis: str,
+    head: str,
+    review_base: str,
+    specs: list[int],
+) -> dict[str, Any]:
+    candidate = _file(path, f"{axis} review attestation")
+    try:
+        info = candidate.lstat()
+        payload = candidate.read_bytes()
+        value = json.loads(payload.decode("utf-8", errors="strict"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise FinalWindowsProductQualificationError(f"{axis} review attestation is malformed") from error
+    fields = {"axis", "findings", "fixedBase", "head", "schemaVersion", "specs", "status"}
+    if (
+        info.st_nlink != 1
+        or not isinstance(value, dict)
+        or set(value) != fields
+        or payload != _canonical_json(value)
+        or value.get("schemaVersion") != 1
+        or value.get("axis") != axis
+        or value.get("fixedBase") != review_base
+        or value.get("specs") != specs
+        or value.get("status") != "passed"
+        or value.get("findings") != []
+    ):
+        raise FinalWindowsProductQualificationError(f"{axis} review attestation identity differs")
+    if value.get("head") != head:
+        raise FinalWindowsProductQualificationError(f"{axis} review attestation is not bound to the exact final HEAD")
+    return {**value, "sha256": f"sha256:{hashlib.sha256(payload).hexdigest()}"}
+
+
 def _gate_phase(source_root: Path) -> dict[str, Any]:
     harness = source_root / "packages" / "offeragent-harness"
     plugin = source_root / "src" / "interface" / "obsidian"
@@ -177,11 +273,11 @@ def _gate_phase(source_root: Path) -> dict[str, Any]:
         ("obsidian tests", (corepack, "yarn", "test"), plugin, 600),
     )
     commands: list[dict[str, object]] = []
-    skips: list[str] = []
+    skips: list[dict[str, str]] = []
     for label, argv, cwd, timeout in specs:
         command, output = _run_checked(label, argv, cwd=cwd, timeout=timeout)
         commands.append(command)
-        skips.extend(line.strip() for line in output.splitlines() if line.lstrip().startswith("SKIPPED "))
+        skips.extend(_named_skips(label, output))
     return _phase_result({"status": "passed", "gateCount": len(commands)}, commands, skips)
 
 
@@ -269,7 +365,7 @@ def _migration_phase(source_root: Path) -> dict[str, Any]:
         cwd=harness,
         timeout=600,
     )
-    skips = [line.strip() for line in output.splitlines() if line.lstrip().startswith("SKIPPED ")]
+    skips = _named_skips("closed migration and upgrade proof", output)
     return _phase_result(
         {
             "status": "passed",
@@ -379,9 +475,38 @@ def _live_phase(
 def _phase_result(
     evidence: Mapping[str, object],
     commands: list[dict[str, object]],
-    skips: list[str] | None = None,
+    skips: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     return {"evidence": dict(evidence), "commands": commands, "skips": skips or []}
+
+
+def _named_skips(command: str, output: str) -> list[dict[str, str]]:
+    skips: list[dict[str, str]] = []
+    tap = re.compile(r"^\s*(?:ok|not ok)\s+\d+\s+-\s+(.*?)\s+# SKIP(?:\s+(.*?))?\s*$", re.IGNORECASE)
+    for line in output.splitlines():
+        tap_match = tap.match(line)
+        if tap_match is not None:
+            skips.append(
+                {
+                    "command": command,
+                    "name": tap_match.group(1).strip(),
+                    "reason": (tap_match.group(2) or "unspecified").strip(),
+                }
+            )
+            continue
+        stripped = line.strip()
+        if not stripped.startswith("SKIPPED "):
+            continue
+        body = re.sub(r"^SKIPPED\s+(?:\[\d+\]\s+)?", "", stripped)
+        name, separator, reason = body.rpartition(": ")
+        skips.append(
+            {
+                "command": command,
+                "name": name.strip() if separator else body.strip(),
+                "reason": reason.strip() if separator else "unspecified",
+            }
+        )
+    return skips
 
 
 def _run_checked(
@@ -509,6 +634,8 @@ def main() -> int:
     parser.add_argument("--model", default="gpt-5.5")
     parser.add_argument("--temporary-parent", type=Path, required=True)
     parser.add_argument("--review-base", required=True)
+    parser.add_argument("--standards-review-attestation", type=Path, required=True)
+    parser.add_argument("--spec-review-attestation", type=Path, required=True)
     args = parser.parse_args()
     report = qualify_final_windows_product(
         source_root=args.source_root,
@@ -520,6 +647,8 @@ def main() -> int:
         model=args.model,
         temporary_parent=args.temporary_parent,
         review_base=args.review_base,
+        standards_review_attestation=args.standards_review_attestation,
+        spec_review_attestation=args.spec_review_attestation,
     )
     print(json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     return 0
