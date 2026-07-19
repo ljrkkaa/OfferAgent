@@ -16,6 +16,7 @@ from offeragent_harness.agent import RunBudget
 from offeragent_harness.agent.loop import ToolExecution
 from offeragent_harness.agent.planner import Planner, PlanningAttempt, PlanningAttemptOutcome, PlanningStep
 from offeragent_harness.agent.state import (
+    ModelTurn,
     PendingWork,
     RunPhase,
     RunState,
@@ -23,7 +24,7 @@ from offeragent_harness.agent.state import (
     WriteOutcome,
 )
 from offeragent_harness.foundation import canonical_json_sha256
-from offeragent_harness.models import ModelUsage
+from offeragent_harness.models import ModelContinuation, ModelUsage
 from offeragent_harness.permissions import (
     ApprovalBinding,
     ApprovalRequest,
@@ -163,6 +164,35 @@ async def test_registered_domain_entities_round_trip_exactly_after_reopen(tmp_pa
         definition_fingerprint="sha256:" + ("0" * 64),
         result_sensitivity=ResultSensitivity.WORKSPACE,
     )
+    completed_arguments = {"path": "notes/result.md"}
+    completed_call = ToolCall(
+        tool_call_id="call_1",
+        run_id=run.run_id,
+        workspace_id=session.workspace_id,
+        name="workspace.read",
+        version="1",
+        arguments=completed_arguments,
+        args_hash=canonical_json_sha256(completed_arguments),
+        idempotency_key="idem_call_1",
+        deadline=NOW + timedelta(minutes=1),
+        lineage=lineage,
+        definition_fingerprint="sha256:" + ("1" * 64),
+        result_sensitivity=ResultSensitivity.WORKSPACE,
+    )
+    continuation = ModelContinuation(
+        "codex-subscription",
+        "gpt-test",
+        "request_1",
+        (
+            {"type": "reasoning", "summary": [], "encrypted_content": "opaque"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": '{"calls":[]}'}],
+            },
+        ),
+    )
     state = RunState(
         workspace_id=session.workspace_id,
         session_id=session.session_id,
@@ -191,6 +221,7 @@ async def test_registered_domain_entities_round_trip_exactly_after_reopen(tmp_pa
             ),
         ),
         tool_results=(_tool_result(),),
+        model_turns=(ModelTurn("agent-step_1", continuation, (completed_call,)),),
         assistant_text="处理中",
         tool_result_sensitivities={
             "call_2": ResultSensitivity.WORKSPACE,

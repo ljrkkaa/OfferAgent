@@ -588,7 +588,10 @@ async def test_production_worker_codex_loop_round_trips_one_plugin_tool_without_
             ]
         )
         assert all(request.headers["x-openai-internal-codex-responses-lite"] == "true" for request in response_requests)
-        assert all(("include" in body) is supports_hosted_search for body in response_bodies)
+        expected_include = ["reasoning.encrypted_content"]
+        if supports_hosted_search:
+            expected_include.append("web_search_call.action.sources")
+        assert all(body["include"] == expected_include for body in response_bodies)
         first_input = json.dumps(response_bodies[0]["input"], ensure_ascii=False)
         second_messages = cast(list[dict[str, Any]], response_bodies[1]["input"])
         assert "Read the Vault Agent Contract" in first_input
@@ -600,9 +603,19 @@ async def test_production_worker_codex_loop_round_trips_one_plugin_tool_without_
             if "structured block tool_result" in cast(str, block.get("text", ""))
         ]
         assert len(tool_blocks) == 1
+        tool_message_index = next(
+            index
+            for index, message in enumerate(second_messages)
+            if any(block is tool_blocks[0] for block in cast(list[dict[str, Any]], message.get("content", [])))
+        )
+        assert second_messages[tool_message_index - 1]["type"] == "message"
+        assert second_messages[tool_message_index]["role"] == "user"
         encoded_tool_result = cast(str, tool_blocks[0]["text"])
         tool_result = json.loads(encoded_tool_result.split("\n", 2)[2])
         assert tool_result["toolCallId"] == call["toolCallId"]
+        assert tool_result["agentStepCallId"] == call["toolCallId"]
+        assert tool_result["agentStepId"].startswith("agent-step_")
+        assert tool_result["tool"] == {"name": "agent_contract.read", "version": "1"}
         assert tool_result["status"] == "succeeded"
         assert tool_result["data"] == {
             "path": "agent.md",

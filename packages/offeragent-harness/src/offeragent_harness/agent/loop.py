@@ -1033,7 +1033,11 @@ async def run_agent_loop(
 
             await budget.consume(BudgetDelta(tool_calls=len(step.calls)))
             state = await _commit_phase(state, RunPhase.VALIDATING_CALLS, recorder)
-            state = state.accept_tool_calls(tuple(step.calls))
+            state = state.accept_tool_calls(
+                tuple(step.calls),
+                agent_step_id=step.agent_step_id,
+                continuation=step.continuation,
+            )
             await recorder.commit(
                 state,
                 event_type="tool.calls.accepted",

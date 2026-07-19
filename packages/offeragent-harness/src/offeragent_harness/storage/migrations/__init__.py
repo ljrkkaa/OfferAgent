@@ -13,6 +13,7 @@ from . import (
     v0005_remove_obsolete_write_intent_snapshots,
     v0006_canonicalize_tool_result_context,
     v0007_contract_codex_model_config,
+    v0008_add_model_turn_history,
 )
 
 
@@ -85,6 +86,11 @@ MIGRATIONS = (
         v0007_contract_codex_model_config.VERSION,
         v0007_contract_codex_model_config.NAME,
         v0007_contract_codex_model_config.STATEMENTS,
+    ),
+    Migration.create(
+        v0008_add_model_turn_history.VERSION,
+        v0008_add_model_turn_history.NAME,
+        v0008_add_model_turn_history.STATEMENTS,
     ),
 )
 

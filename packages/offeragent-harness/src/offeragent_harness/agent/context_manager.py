@@ -19,7 +19,13 @@ from typing import Any
 from offeragent_harness.models import ModelContentBlock, ModelMessage, ModelPurpose, ModelRole
 from offeragent_harness.models.json_types import thaw_json
 from offeragent_harness.ports import Sensitivity
-from offeragent_harness.tools import ResultSensitivity, ToolResult, canonical_json_bytes, canonical_json_sha256
+from offeragent_harness.tools import (
+    ResultSensitivity,
+    ToolCall,
+    ToolResult,
+    canonical_json_bytes,
+    canonical_json_sha256,
+)
 
 from .state import RunState
 
@@ -727,7 +733,134 @@ class ContextManager:
             )
             ordinal += 1
 
+        result_by_id = {result.tool_call_id: result for result in state.tool_results}
+        covered_result_ids: set[str] = set()
+        sensitivity_rank = {
+            Sensitivity.PUBLIC: 0,
+            Sensitivity.WORKSPACE: 1,
+            Sensitivity.PRIVATE: 2,
+            Sensitivity.SECRET: 3,
+        }
+        for turn in state.model_turns:
+            turn_results = tuple(result_by_id.get(call.tool_call_id) for call in turn.tool_calls)
+            if any(result is None for result in turn_results):
+                continue
+            completed_results = tuple(result for result in turn_results if result is not None)
+            covered_result_ids.update(result.tool_call_id for result in completed_results)
+            declarations = tuple(state.tool_result_sensitivities.get(call.tool_call_id) for call in turn.tool_calls)
+            group_id = f"model-turn:{turn.agent_step_id}"
+            group_context_ids = (
+                f"{group_id}:assistant",
+                *(f"tool:{result.tool_call_id}" for result in completed_results),
+            )
+            if any(item is None or item is ResultSensitivity.UNKNOWN for item in declarations):
+                for context_id in group_context_ids:
+                    omitted.append(
+                        OmittedContext(
+                            context_id,
+                            ContextLayer.TOOL_RESULTS,
+                            Sensitivity.SECRET,
+                            "unclassified_fail_closed",
+                        )
+                    )
+                    compaction_reasons.append(f"{context_id}:unclassified_fail_closed")
+                ordinal += len(group_context_ids)
+                continue
+            sensitivities = tuple(Sensitivity(item.value) for item in declarations if item is not None)
+            group_sensitivity = max(sensitivities, key=sensitivity_rank.__getitem__)
+            if not self._visibility.allows(group_sensitivity):
+                for context_id in group_context_ids:
+                    omitted.append(
+                        OmittedContext(
+                            context_id,
+                            ContextLayer.TOOL_RESULTS,
+                            group_sensitivity,
+                            "sensitivity_policy",
+                        )
+                    )
+                    compaction_reasons.append(f"{context_id}:sensitivity_policy")
+                ordinal += len(group_context_ids)
+                continue
+
+            group_candidates = [
+                _Candidate(
+                    f"{group_id}:assistant",
+                    ContextLayer.TOOL_RESULTS,
+                    ModelMessage(
+                        ModelRole.ASSISTANT,
+                        (turn.continuation.as_content_block(),),
+                        name="offeragent-model-continuation",
+                    ),
+                    group_sensitivity,
+                    1,
+                    ordinal,
+                    False,
+                    True,
+                    group_id,
+                )
+            ]
+            ordinal += 1
+            group_valid = _message_size(group_candidates[0].message) <= self._budget.max_item_bytes
+            for call, result, sensitivity in zip(turn.tool_calls, completed_results, sensitivities, strict=True):
+                if projection is ContextProjection.OVERFLOW_REFERENCES:
+                    message = self._tool_result_reference_message(
+                        result,
+                        sensitivity,
+                        reason="overflow_projection",
+                        agent_step_id=turn.agent_step_id,
+                        call=call,
+                    )
+                    projected = True
+                else:
+                    message = self._tool_result_message(
+                        result,
+                        sensitivity,
+                        agent_step_id=turn.agent_step_id,
+                        call=call,
+                    )
+                    projected = False
+                if _message_size(message) > self._budget.max_item_bytes and not projected:
+                    message = self._tool_result_reference_message(
+                        result,
+                        sensitivity,
+                        reason="item_budget",
+                        agent_step_id=turn.agent_step_id,
+                        call=call,
+                    )
+                    projected = True
+                if _message_size(message) > self._budget.max_item_bytes:
+                    group_valid = False
+                group_candidates.append(
+                    _Candidate(
+                        f"tool:{result.tool_call_id}",
+                        ContextLayer.TOOL_RESULTS,
+                        message,
+                        group_sensitivity,
+                        1,
+                        ordinal,
+                        projected,
+                        True,
+                        group_id,
+                    )
+                )
+                ordinal += 1
+            if not group_valid:
+                for candidate in group_candidates:
+                    omitted.append(
+                        OmittedContext(
+                            candidate.context_id,
+                            candidate.layer,
+                            candidate.sensitivity,
+                            "artifactization_required",
+                        )
+                    )
+                    compaction_reasons.append(f"{candidate.context_id}:artifactization_required")
+                continue
+            candidates.extend(group_candidates)
+
         for result in state.tool_results:
+            if result.tool_call_id in covered_result_ids:
+                continue
             context_id = f"tool:{result.tool_call_id}"
             declared = state.tool_result_sensitivities.get(result.tool_call_id)
             if declared is None or declared is ResultSensitivity.UNKNOWN:
@@ -984,7 +1117,15 @@ class ContextManager:
         )
 
     @staticmethod
-    def _tool_result_message(result: ToolResult, sensitivity: Sensitivity) -> ModelMessage:
+    def _tool_result_message(
+        result: ToolResult,
+        sensitivity: Sensitivity,
+        *,
+        agent_step_id: str | None = None,
+        call: ToolCall | None = None,
+    ) -> ModelMessage:
+        if (agent_step_id is None) != (call is None):
+            raise ValueError("tool result AgentStep identity and ToolCall must be present together")
         error = None
         if result.error is not None:
             error = {
@@ -993,25 +1134,35 @@ class ContextManager:
                 "retryable": result.error.retryable,
                 "cancelled": result.error.cancelled,
             }
+        data: dict[str, object] = {
+            "toolCallId": result.tool_call_id,
+            "status": result.status.value,
+            "summary": result.user_visible_summary,
+            "data": thaw_json(result.data),
+            "artifactIds": list(result.artifact_ids),
+            "sourceRefs": list(result.source_refs),
+            "contextActivations": list(result.context_activations),
+            "retryable": result.retryable,
+            "beforeState": thaw_json(result.before_state),
+            "afterState": thaw_json(result.after_state),
+            "error": error,
+            "sensitivity": sensitivity.value,
+            "untrustedData": True,
+        }
+        if agent_step_id is not None and call is not None:
+            data.update(
+                {
+                    "agentStepId": agent_step_id,
+                    "agentStepCallId": call.tool_call_id,
+                    "tool": {"name": call.name, "version": call.version},
+                }
+            )
         block = ModelContentBlock(
             kind="tool_result",
-            data={
-                "toolCallId": result.tool_call_id,
-                "status": result.status.value,
-                "summary": result.user_visible_summary,
-                "data": thaw_json(result.data),
-                "artifactIds": list(result.artifact_ids),
-                "sourceRefs": list(result.source_refs),
-                "contextActivations": list(result.context_activations),
-                "retryable": result.retryable,
-                "beforeState": thaw_json(result.before_state),
-                "afterState": thaw_json(result.after_state),
-                "error": error,
-                "sensitivity": sensitivity.value,
-                "untrustedData": True,
-            },
+            data=data,
         )
-        return ModelMessage(ModelRole.TOOL, (block,), name=result.tool_call_id)
+        name = f"{call.name}@{call.version}" if call is not None else result.tool_call_id
+        return ModelMessage(ModelRole.TOOL, (block,), name=name)
 
     @staticmethod
     def _tool_result_reference_message(
@@ -1019,7 +1170,11 @@ class ContextManager:
         sensitivity: Sensitivity,
         *,
         reason: str,
+        agent_step_id: str | None = None,
+        call: ToolCall | None = None,
     ) -> ModelMessage:
+        if (agent_step_id is None) != (call is None):
+            raise ValueError("tool result AgentStep identity and ToolCall must be present together")
         error = None
         if result.error is not None:
             error = {
@@ -1047,26 +1202,36 @@ class ContextManager:
             }
             for effect in result.side_effects
         ]
+        data: dict[str, object] = {
+            "toolCallId": result.tool_call_id,
+            "status": result.status.value,
+            "summary": _bounded_text(result.user_visible_summary, 2_048),
+            "artifactIds": list(result.artifact_ids),
+            "sourceRefs": list(result.source_refs),
+            "contextActivations": list(result.context_activations),
+            "retryable": result.retryable,
+            "criticalHashes": critical_hashes,
+            "stateHashes": state_hashes,
+            "sideEffectStates": side_effect_states,
+            "error": error,
+            "sensitivity": sensitivity.value,
+            "bodyOmitted": reason,
+            "untrustedData": True,
+        }
+        if agent_step_id is not None and call is not None:
+            data.update(
+                {
+                    "agentStepId": agent_step_id,
+                    "agentStepCallId": call.tool_call_id,
+                    "tool": {"name": call.name, "version": call.version},
+                }
+            )
         block = ModelContentBlock(
             kind="tool_result_reference",
-            data={
-                "toolCallId": result.tool_call_id,
-                "status": result.status.value,
-                "summary": _bounded_text(result.user_visible_summary, 2_048),
-                "artifactIds": list(result.artifact_ids),
-                "sourceRefs": list(result.source_refs),
-                "contextActivations": list(result.context_activations),
-                "retryable": result.retryable,
-                "criticalHashes": critical_hashes,
-                "stateHashes": state_hashes,
-                "sideEffectStates": side_effect_states,
-                "error": error,
-                "sensitivity": sensitivity.value,
-                "bodyOmitted": reason,
-                "untrustedData": True,
-            },
+            data=data,
         )
-        return ModelMessage(ModelRole.TOOL, (block,), name=result.tool_call_id)
+        name = f"{call.name}@{call.version}" if call is not None else result.tool_call_id
+        return ModelMessage(ModelRole.TOOL, (block,), name=name)
 
 
 def _message_size(message: ModelMessage) -> int:

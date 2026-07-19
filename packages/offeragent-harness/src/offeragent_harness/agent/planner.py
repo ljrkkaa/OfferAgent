@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
-from offeragent_harness.models import ModelCitation, ModelUsage
+from offeragent_harness.models import ModelCitation, ModelContinuation, ModelUsage
 from offeragent_harness.ports import CancellationToken
 from offeragent_harness.tools import ToolCall
 
@@ -62,6 +62,8 @@ class PlanningStep:
     final_response: str | None
     attempts: tuple[PlanningAttempt, ...] = ()
     citations: tuple[ModelCitation, ...] = ()
+    agent_step_id: str | None = None
+    continuation: ModelContinuation | None = None
 
     def __post_init__(self) -> None:
         call_ids = [call.tool_call_id for call in self.calls]
@@ -81,6 +83,12 @@ class PlanningStep:
                 raise ValueError("planning repair indexes must be contiguous from zero")
         if len(self.citations) > 256 or len(self.citations) != len(set(self.citations)):
             raise ValueError("planning citations must be bounded and unique")
+        if (self.agent_step_id is None) != (self.continuation is None):
+            raise ValueError("planning step identity and Provider continuation must be present together")
+        if self.agent_step_id is not None and (
+            not self.agent_step_id or len(self.agent_step_id) > 256 or "\x00" in self.agent_step_id
+        ):
+            raise ValueError("planning AgentStep identity must be bounded non-empty text")
 
 
 @runtime_checkable

@@ -1011,9 +1011,7 @@ class InterviewSubmissionAuthorityPolicy:
         return replace(
             decision,
             result_context_activations=tuple(
-                dict.fromkeys(
-                    (*decision.result_context_activations, INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT)
-                )
+                dict.fromkeys((*decision.result_context_activations, INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT))
             ),
         )
 

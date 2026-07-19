@@ -728,17 +728,13 @@ def test_refuses_to_approve_an_unrelated_image_run_write() -> None:
     with pytest.raises(BuiltProductQualificationError, match="not the exact bound root write"):
         session.run_interview_submission(
             tuple(
-                InterviewImagePage(index, f"page-{index}.png", "image/png", page)
-                for index, page in enumerate(pages, 1)
+                InterviewImagePage(index, f"page-{index}.png", "image/png", page) for index, page in enumerate(pages, 1)
             ),
             "请原子入库。",
             timeout=5,
         )
 
-    assert all(
-        command != "rpc" or params.get("method") != "approval/resolve"
-        for command, params in driver.requests
-    )
+    assert all(command != "rpc" or params.get("method") != "approval/resolve" for command, params in driver.requests)
 
 
 def test_restarts_and_replays_primary_run_without_repeated_review() -> None:

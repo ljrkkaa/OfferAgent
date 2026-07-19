@@ -15,6 +15,7 @@ from jsonschema import Draft202012Validator
 from offeragent_harness.models import (
     ModelCitation,
     ModelContentBlock,
+    ModelContinuation,
     ModelError,
     ModelEventKind,
     ModelFinishReason,
@@ -148,6 +149,7 @@ class StructuredModelResponse:
     output: FrozenJsonObject
     usage: ModelUsage
     citations: tuple[ModelCitation, ...] = ()
+    continuation: ModelContinuation | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,9 +280,7 @@ class AgentStepCatalog:
             ]
         }
         encoded_directory = canonical_json_bytes(directory).decode("utf-8")
-        encoded_fences = canonical_json_bytes(
-            {"runCallFences": [fence.identity() for fence in fences]}
-        ).decode("utf-8")
+        encoded_fences = canonical_json_bytes({"runCallFences": [fence.identity() for fence in fences]}).decode("utf-8")
         self._model_instruction = (
             "OfferAgent 的模型输出使用紧凑 AgentStep 投影。每个 calls 项必须从下列工具目录选择精确的 "
             "name/version, 并把符合该工具 inputSchema 的单个 JSON 对象编码为 argumentsJson 字符串; "
@@ -861,6 +861,8 @@ class ModelPlanner:
             requires_write_outcome=cast(bool, raw["requiresWriteOutcome"]),
             final_response=cast(str | None, raw["finalResponse"]),
             citations=response.citations,
+            agent_step_id=(self._ids.new_id("agent-step") if response.continuation is not None else None),
+            continuation=response.continuation,
         )
 
 
@@ -973,6 +975,7 @@ async def collect_structured_response(
     usage: ModelUsage | None = None
     search_phases: dict[str, ModelHostedSearchPhase] = {}
     citations: list[ModelCitation] = []
+    continuation: ModelContinuation | None = None
     async for event in gateway.stream(request, cancellation):
         cancellation.checkpoint()
         if completed:
@@ -1067,6 +1070,10 @@ async def collect_structured_response(
                     raw_output=raw,
                     usage=usage,
                 )
+            if event.continuation is not None:
+                if continuation is not None:
+                    raise ModelStreamProtocolError(request.request_id, "duplicate model continuation", usage=usage)
+                continuation = event.continuation
             if any(phase is not ModelHostedSearchPhase.COMPLETED for phase in search_phases.values()):
                 raise ModelStreamProtocolError(
                     request.request_id, "completed with unfinished hosted search", usage=usage
@@ -1097,7 +1104,7 @@ async def collect_structured_response(
             raw_output=None,
             usage=usage,
         )
-    return StructuredModelResponse(request.request_id, output, usage, tuple(citations))
+    return StructuredModelResponse(request.request_id, output, usage, tuple(citations), continuation)
 
 
 def validate_usage_progression(previous: ModelUsage | None, current: ModelUsage, request_id: str) -> None:

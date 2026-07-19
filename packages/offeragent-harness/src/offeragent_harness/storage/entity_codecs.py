@@ -18,12 +18,14 @@ from typing import Any
 from offeragent_harness.agent.budget_checkpoint import BudgetCheckpoint
 from offeragent_harness.agent.budgets import BudgetDelta, RunBudget
 from offeragent_harness.agent.state import (
+    ModelTurn,
     PendingWork,
     RunPhase,
     RunState,
     WriteObligation,
     WriteOutcome,
 )
+from offeragent_harness.models import ModelContinuation
 from offeragent_harness.models.json_types import freeze_json, thaw_json
 from offeragent_harness.permissions import (
     ApprovalBinding,
@@ -458,6 +460,53 @@ def _tool_call_from_payload(value: Any) -> ToolCall:
     )
 
 
+def _model_continuation_to_payload(continuation: ModelContinuation) -> dict[str, Any]:
+    return {
+        "providerId": continuation.provider_id,
+        "model": continuation.model,
+        "requestId": continuation.request_id,
+        "outputItems": [thaw_json(item) for item in continuation.output_items],
+        "contentHash": continuation.content_hash,
+    }
+
+
+def _model_continuation_from_payload(value: Any) -> ModelContinuation:
+    raw = _exact_object(
+        value,
+        {"providerId", "model", "requestId", "outputItems", "contentHash"},
+        "model continuation",
+    )
+    output_items: list[Mapping[str, Any]] = []
+    for item in _array(raw["outputItems"], "model continuation outputItems"):
+        output_items.append(_object(item, "model continuation output item"))
+    continuation = ModelContinuation(
+        provider_id=_string(raw["providerId"], "model continuation providerId"),
+        model=_string(raw["model"], "model continuation model"),
+        request_id=_string(raw["requestId"], "model continuation requestId"),
+        output_items=tuple(output_items),
+    )
+    if _string(raw["contentHash"], "model continuation contentHash") != continuation.content_hash:
+        raise ValueError("model continuation contentHash does not match its canonical payload")
+    return continuation
+
+
+def _model_turn_to_payload(turn: ModelTurn) -> dict[str, Any]:
+    return {
+        "agentStepId": turn.agent_step_id,
+        "continuation": _model_continuation_to_payload(turn.continuation),
+        "toolCalls": [_tool_call_to_payload(call) for call in turn.tool_calls],
+    }
+
+
+def _model_turn_from_payload(value: Any) -> ModelTurn:
+    raw = _exact_object(value, {"agentStepId", "continuation", "toolCalls"}, "model turn")
+    return ModelTurn(
+        agent_step_id=_string(raw["agentStepId"], "model turn agentStepId"),
+        continuation=_model_continuation_from_payload(raw["continuation"]),
+        tool_calls=tuple(_tool_call_from_payload(item) for item in _array(raw["toolCalls"], "model turn toolCalls")),
+    )
+
+
 def _budget_delta_to_payload(delta: BudgetDelta) -> dict[str, Any]:
     return {
         "modelRounds": delta.model_rounds,
@@ -592,6 +641,7 @@ def _run_state_to_payload(value: Any) -> Mapping[str, Any]:
             ],
         },
         "toolResults": [tool_result_to_value(result) for result in state.tool_results],
+        "modelTurns": [_model_turn_to_payload(turn) for turn in state.model_turns],
         "toolResultSensitivities": {
             tool_call_id: sensitivity.value
             for tool_call_id, sensitivity in sorted(state.tool_result_sensitivities.items())
@@ -615,6 +665,7 @@ def _run_state_from_payload(value: Mapping[str, Any]) -> RunState:
         "pending",
         "writeObligation",
         "toolResults",
+        "modelTurns",
         "toolResultSensitivities",
         "assistantText",
         "budgetCheckpoint",
@@ -671,6 +722,7 @@ def _run_state_from_payload(value: Mapping[str, Any]) -> RunState:
             outcomes=tuple(outcomes),
         ),
         tool_results=tuple(tool_result_from_value(item) for item in _array(raw["toolResults"], "toolResults")),
+        model_turns=tuple(_model_turn_from_payload(item) for item in _array(raw["modelTurns"], "modelTurns")),
         assistant_text=_string(raw["assistantText"], "assistantText"),
         budget_checkpoint=_budget_checkpoint_from_payload(raw["budgetCheckpoint"]),
         tool_result_sensitivities={
@@ -891,7 +943,7 @@ def core_entity_codec_registry() -> EntityCodecRegistry:
             EntityCodec(
                 "run_states",
                 "offeragent.run_state",
-                5,
+                6,
                 RunState,
                 _run_state_to_payload,
                 _run_state_from_payload,

@@ -340,8 +340,9 @@ async def test_tool_result_context_migration_rewrites_terminal_state_and_interru
             tool_results=(result,),
         )
         envelope = json.loads(codecs.encode("run_states", state))
-        assert envelope["schemaVersion"] == 5
+        assert envelope["schemaVersion"] == 6
         envelope["schemaVersion"] = 4
+        del envelope["payload"]["modelTurns"]
         del envelope["payload"]["toolResults"][0]["contextActivations"]
         return json.dumps(envelope, separators=(",", ":"))
 
@@ -424,8 +425,8 @@ async def test_tool_result_context_migration_rewrites_terminal_state_and_interru
             "SELECT json_extract(value_json, '$.schemaVersion') FROM entities "
             "WHERE collection = 'run_states' AND entity_id = 'run_terminal'"
         ).fetchone()[0]
-    assert schema_version == 7
-    assert terminal_codec == 5
+    assert schema_version == 8
+    assert terminal_codec == 6
 
 
 @pytest.mark.asyncio
@@ -550,7 +551,92 @@ async def test_codex_config_contraction_removes_retired_decisions_and_preserves_
     assert "sensitive.invalid" not in json.dumps(legacy_report)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+
+
+@pytest.mark.asyncio
+async def test_model_turn_history_migration_preserves_terminal_state_and_interrupts_active_legacy_state(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "model-turn-history-v7.sqlite"
+    codecs = core_entity_codec_registry()
+
+    def legacy_state(run_id: str, phase: RunPhase) -> str:
+        state = RunState(
+            workspace_id="ws_migration",
+            session_id="session_migration",
+            turn_id=f"turn_{run_id}",
+            run_id=run_id,
+            lineage=AgentLineage.root(run_id),
+            phase=phase,
+            model_rounds=1,
+        )
+        envelope = json.loads(codecs.encode("run_states", state))
+        envelope["schemaVersion"] = 5
+        envelope["payload"].pop("modelTurns")
+        return json.dumps(envelope, separators=(",", ":"))
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY CHECK (version >= 1),
+                name TEXT NOT NULL UNIQUE,
+                checksum TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            ) STRICT
+            """
+        )
+        for migration in MIGRATIONS[:7]:
+            for statement in migration.statements:
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
+                (migration.version, migration.name, migration.checksum, "2026-07-19T00:00:00Z"),
+            )
+        connection.execute("PRAGMA user_version = 7")
+        for run_id, status, phase in (
+            ("run_terminal", "completed", RunPhase.COMPLETED),
+            ("run_active", "planning", RunPhase.PLANNING),
+        ):
+            connection.execute(
+                "INSERT INTO entities(collection, entity_id, revision, value_json) VALUES ('runs', ?, 1, ?)",
+                (
+                    run_id,
+                    json.dumps(
+                        {"schemaVersion": 1, "codec": "migration.run", "payload": {"status": status}},
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO entities(collection, entity_id, revision, value_json) VALUES ('run_states', ?, 1, ?)",
+                (run_id, legacy_state(run_id, phase)),
+            )
+            for collection in ("run_effective_configs", "run_capability_snapshots"):
+                connection.execute(
+                    "INSERT INTO entities(collection, entity_id, revision, value_json) VALUES (?, ?, 1, ?)",
+                    (collection, run_id, '{"schemaVersion":1,"codec":"json","payload":{}}'),
+                )
+
+    factory = SqliteUnitOfWorkFactory(database_path)
+    await factory.initialize()
+
+    terminal = await factory.get_entity("run_states", "run_terminal")
+    assert isinstance(terminal, RunState)
+    assert terminal.model_turns == ()
+    assert await factory.get_entity("run_states", "run_active") is None
+    assert await factory.get_entity("run_effective_configs", "run_active") is None
+    assert await factory.get_entity("run_capability_snapshots", "run_active") is None
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert (
+            connection.execute(
+                "SELECT json_extract(value_json, '$.schemaVersion') FROM entities "
+                "WHERE collection = 'run_states' AND entity_id = 'run_terminal'"
+            ).fetchone()[0]
+            == 6
+        )
 
 
 @pytest.mark.asyncio

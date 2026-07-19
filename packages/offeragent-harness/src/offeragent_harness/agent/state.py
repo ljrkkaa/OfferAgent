@@ -6,6 +6,7 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any
 
+from offeragent_harness.models import ModelContinuation
 from offeragent_harness.models.json_types import FrozenJsonObject, freeze_json
 from offeragent_harness.sessions import AgentLineage
 from offeragent_harness.tools import (
@@ -209,6 +210,34 @@ class PendingWork:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelTurn:
+    """One accepted model step and the exact local calls it authorized."""
+
+    agent_step_id: str
+    continuation: ModelContinuation
+    tool_calls: tuple[ToolCall, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.agent_step_id, str)
+            or not self.agent_step_id
+            or self.agent_step_id != self.agent_step_id.strip()
+            or len(self.agent_step_id) > 256
+            or any(ord(character) < 32 for character in self.agent_step_id)
+        ):
+            raise ValueError("model turn agent_step_id must be bounded non-empty text")
+        if not isinstance(self.continuation, ModelContinuation):
+            raise TypeError("model turn continuation must be a ModelContinuation")
+        calls = tuple(self.tool_calls)
+        if not calls or any(not isinstance(call, ToolCall) for call in calls):
+            raise TypeError("model turn requires a non-empty ToolCall tuple")
+        call_ids = tuple(call.tool_call_id for call in calls)
+        if len(call_ids) != len(set(call_ids)):
+            raise ValueError("model turn ToolCalls contain duplicate IDs")
+        object.__setattr__(self, "tool_calls", calls)
+
+
+@dataclass(frozen=True, slots=True)
 class RunControlMessage:
     message_id: str
     input_blocks: tuple[Mapping[str, Any], ...]
@@ -240,6 +269,7 @@ class RunState:
     pending: PendingWork = PendingWork()
     write_obligation: WriteObligation = WriteObligation()
     tool_results: tuple[ToolResult, ...] = ()
+    model_turns: tuple[ModelTurn, ...] = ()
     assistant_text: str = ""
     control_messages: tuple[RunControlMessage, ...] = ()
     budget_checkpoint: BudgetCheckpoint | None = None
@@ -252,9 +282,31 @@ class RunState:
             raise ValueError("run counters cannot be negative")
         if self.budget_checkpoint is not None and not isinstance(self.budget_checkpoint, BudgetCheckpoint):
             raise TypeError("budget_checkpoint must be a BudgetCheckpoint or None")
+        if any(not isinstance(turn, ModelTurn) for turn in self.model_turns):
+            raise TypeError("model_turns must contain only ModelTurn values")
+        step_ids = tuple(turn.agent_step_id for turn in self.model_turns)
+        continuation_ids = tuple(turn.continuation.request_id for turn in self.model_turns)
+        turn_call_ids = tuple(call.tool_call_id for turn in self.model_turns for call in turn.tool_calls)
+        if (
+            len(step_ids) != len(set(step_ids))
+            or len(continuation_ids) != len(set(continuation_ids))
+            or len(turn_call_ids) != len(set(turn_call_ids))
+        ):
+            raise ValueError("model turn identities must be unique within a Run")
         sensitivities = dict(self.tool_result_sensitivities)
         if any(not key or not isinstance(value, ResultSensitivity) for key, value in sensitivities.items()):
             raise TypeError("tool result sensitivity bindings require non-empty IDs and domain enum values")
+        durable_call_ids = self.pending.tool_call_ids | {result.tool_call_id for result in self.tool_results}
+        for turn in self.model_turns:
+            for call in turn.tool_calls:
+                if call.run_id != self.run_id or call.workspace_id != self.workspace_id:
+                    raise ValueError("model turn ToolCall must belong to its durable Run and Workspace")
+                if (
+                    call.tool_call_id not in durable_call_ids
+                    or call.result_sensitivity is ResultSensitivity.UNKNOWN
+                    or sensitivities.get(call.tool_call_id) is not call.result_sensitivity
+                ):
+                    raise ValueError("model turn ToolCall requires its exact result sensitivity binding")
         object.__setattr__(self, "tool_result_sensitivities", MappingProxyType(sensitivities))
 
     def __deepcopy__(self, memo: dict[int, Any]) -> RunState:
@@ -319,11 +371,19 @@ class RunState:
             revision=self.revision + 1,
         )
 
-    def accept_tool_calls(self, calls: tuple[ToolCall, ...]) -> RunState:
+    def accept_tool_calls(
+        self,
+        calls: tuple[ToolCall, ...],
+        *,
+        agent_step_id: str | None = None,
+        continuation: ModelContinuation | None = None,
+    ) -> RunState:
         """Persist immutable per-call result classifications before execution."""
 
         if not calls:
             raise ValueError("accepted ToolCall batch must not be empty")
+        if (agent_step_id is None) != (continuation is None):
+            raise ValueError("accepted model step identity and continuation must be present together")
         if self.pending.tool_call_ids or self.pending.tool_calls:
             raise ValueError("cannot replace an existing pending ToolCall batch")
         call_ids = tuple(call.tool_call_id for call in calls)
@@ -338,6 +398,9 @@ class RunState:
             if call.tool_call_id in completed_ids or call.tool_call_id in bindings:
                 raise ValueError("ToolCall ID cannot reuse completed or previously bound state")
             bindings[call.tool_call_id] = sensitivity
+        model_turns = self.model_turns
+        if agent_step_id is not None and continuation is not None:
+            model_turns = (*model_turns, ModelTurn(agent_step_id, continuation, calls))
         return replace(
             self,
             pending=replace(
@@ -346,6 +409,7 @@ class RunState:
                 tool_calls=calls,
             ),
             tool_calls=self.tool_calls + len(calls),
+            model_turns=model_turns,
             tool_result_sensitivities=bindings,
             revision=self.revision + 1,
         )

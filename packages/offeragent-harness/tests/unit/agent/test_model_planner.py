@@ -37,6 +37,7 @@ from offeragent_harness.agent.state import RunState
 from offeragent_harness.models import (
     FrozenJsonObject,
     ModelCitation,
+    ModelContinuation,
     ModelError,
     ModelEvent,
     ModelEventKind,
@@ -451,12 +452,19 @@ def _events(
     *,
     usage: ModelUsage = USAGE,
     finish: ModelFinishReason = ModelFinishReason.STOP,
+    continuation: ModelContinuation | None = None,
 ) -> tuple[ModelEvent, ...]:
     return (
         ModelEvent(request.request_id, 1, ModelEventKind.STARTED),
         ModelEvent(request.request_id, 2, ModelEventKind.STRUCTURED_OUTPUT, data=output),
         ModelEvent(request.request_id, 3, ModelEventKind.USAGE, usage=usage),
-        ModelEvent(request.request_id, 4, ModelEventKind.COMPLETED, finish_reason=finish),
+        ModelEvent(
+            request.request_id,
+            4,
+            ModelEventKind.COMPLETED,
+            finish_reason=finish,
+            continuation=continuation,
+        ),
     )
 
 
@@ -510,7 +518,7 @@ def test_catalog_is_canonical_immutable_and_excludes_harness_security_fields() -
             "lineage",
             "risk",
         } & set(properties)
-    embedded = cast(dict[str, Any], schema["$defs"])
+    embedded = schema["$defs"]
     assert all(str(value["$id"]).startswith("urn:offeragent:tool-input:") for value in embedded.values())
     with pytest.raises(TypeError):
         left.schema["unsafe"] = "mutation"  # type: ignore[index]
@@ -521,10 +529,7 @@ def test_catalog_projects_a_bounded_model_schema_without_weakening_the_execution
 
     execution_schema = cast(dict[str, Any], thaw_json(catalog.schema))
     model_schema = cast(dict[str, Any], thaw_json(catalog.model_schema))
-    execution_variant = cast(
-        dict[str, Any],
-        cast(list[dict[str, Any]], execution_schema["properties"]["calls"]["items"]["oneOf"])[0],
-    )
+    execution_variant = cast(list[dict[str, Any]], execution_schema["properties"]["calls"]["items"]["oneOf"])[0]
     model_call_properties = cast(dict[str, Any], model_schema["properties"]["calls"]["items"]["properties"])
 
     assert "arguments" in execution_variant["properties"]
@@ -572,6 +577,34 @@ async def test_projected_arguments_json_is_strictly_decoded_before_tool_call_con
         "path": "notes/a.md",
         "options": {"includeHash": True},
     }
+
+
+@pytest.mark.asyncio
+async def test_planner_preserves_provider_continuation_under_an_offeragent_step_identity() -> None:
+    builder = _planner(ScriptedModelGateway(()))
+    request = builder.create_request(_state())
+    continuation = ModelContinuation(
+        "codex-subscription",
+        request.model,
+        request.request_id,
+        (
+            {"type": "reasoning", "summary": [], "encrypted_content": "opaque"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": json.dumps(_tool_plan())}],
+            },
+        ),
+    )
+    gateway = ScriptedModelGateway(
+        (ModelScriptStep.from_events(request, _events(request, _tool_plan(), continuation=continuation)),)
+    )
+
+    step = await _planner(gateway).plan(_state(), ManualCancellationToken())
+
+    assert step.continuation == continuation
+    assert step.agent_step_id is not None and step.agent_step_id.startswith("agent-step_")
 
 
 @pytest.mark.asyncio

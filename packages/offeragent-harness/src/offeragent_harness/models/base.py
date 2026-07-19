@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator
 
+from offeragent_harness.foundation import canonical_json_bytes, canonical_json_sha256
+
 from .json_types import FrozenJsonObject, JsonValue, freeze_json
 
 
@@ -145,6 +147,77 @@ class ModelContentBlock:
 
 
 @dataclass(frozen=True)
+class ModelContinuation:
+    """Opaque, locally durable Provider output replayed only by its owning adapter."""
+
+    provider_id: str
+    model: str
+    request_id: str
+    output_items: tuple[Mapping[str, Any], ...] = field(repr=False)
+    content_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        for value, label, maximum in (
+            (self.provider_id, "continuation provider_id", 128),
+            (self.model, "continuation model", 256),
+            (self.request_id, "continuation request_id", 256),
+        ):
+            _validate_bounded_text(value, label, maximum=maximum)
+        if not 1 <= len(self.output_items) <= 128:
+            raise ValueError("model continuation requires a bounded non-empty output item sequence")
+        items: list[FrozenJsonObject] = []
+        for item in self.output_items:
+            frozen = freeze_json(item)
+            if not isinstance(frozen, FrozenJsonObject):
+                raise TypeError("model continuation output items must be JSON objects")
+            items.append(frozen)
+        payload = {
+            "providerId": self.provider_id,
+            "model": self.model,
+            "requestId": self.request_id,
+            "outputItems": items,
+        }
+        if len(canonical_json_bytes(payload)) > 16 * 1024 * 1024:
+            raise ValueError("model continuation exceeds its durable byte limit")
+        object.__setattr__(self, "output_items", tuple(items))
+        object.__setattr__(self, "content_hash", canonical_json_sha256(payload))
+
+    def as_content_block(self) -> ModelContentBlock:
+        return ModelContentBlock(
+            kind="model_continuation",
+            data={
+                "providerId": self.provider_id,
+                "model": self.model,
+                "requestId": self.request_id,
+                "outputItems": self.output_items,
+                "contentHash": self.content_hash,
+            },
+        )
+
+    @classmethod
+    def from_content_block(cls, block: ModelContentBlock) -> ModelContinuation:
+        if block.kind != "model_continuation" or block.binary_data is not None:
+            raise ValueError("model continuation requires its exact opaque content block")
+        data = block.data
+        if set(data) != {"providerId", "model", "requestId", "outputItems", "contentHash"}:
+            raise ValueError("model continuation content block has an invalid shape")
+        if any(not isinstance(data[field], str) for field in ("providerId", "model", "requestId", "contentHash")):
+            raise TypeError("model continuation identity fields and contentHash must be strings")
+        items = data["outputItems"]
+        if not isinstance(items, tuple) or any(not isinstance(item, Mapping) for item in items):
+            raise TypeError("model continuation content block outputItems must be objects")
+        continuation = cls(
+            provider_id=data["providerId"],
+            model=data["model"],
+            request_id=data["requestId"],
+            output_items=tuple(items),
+        )
+        if data["contentHash"] != continuation.content_hash:
+            raise ValueError("model continuation content hash does not match its output items")
+        return continuation
+
+
+@dataclass(frozen=True)
 class ModelMessage:
     role: ModelRole
     content: tuple[ModelContentBlock, ...]
@@ -272,6 +345,7 @@ class ModelEvent:
     error: ModelError | None = None
     hosted_search: ModelHostedSearch | None = None
     citation: ModelCitation | None = None
+    continuation: ModelContinuation | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -300,13 +374,14 @@ class ModelEvent:
             "error": self.error,
             "hosted_search": self.hosted_search,
             "citation": self.citation,
+            "continuation": self.continuation,
         }
         missing = [name for name in required.get(self.kind, ()) if fields[name] is None]
         if missing:
             raise ValueError(f"{self.kind.value} event missing fields: {', '.join(missing)}")
         allowed = set(required.get(self.kind, ()))
         if self.kind is ModelEventKind.COMPLETED:
-            allowed.add("usage")
+            allowed.update({"usage", "continuation"})
         unexpected = [name for name, value in fields.items() if value is not None and name not in allowed]
         if unexpected:
             raise ValueError(f"{self.kind.value} event has unexpected fields: {', '.join(unexpected)}")
@@ -355,6 +430,7 @@ def _validate_public_url(value: str) -> None:
 __all__ = [
     "ModelCitation",
     "ModelContentBlock",
+    "ModelContinuation",
     "ModelError",
     "ModelEvent",
     "ModelEventKind",

@@ -22,15 +22,16 @@ from offeragent_harness.agent.context_manager import (
     UserImageProvenance,
 )
 from offeragent_harness.agent.state import (
+    ModelTurn,
     PendingWork,
     RunControlMessage,
     RunPhase,
     RunState,
 )
-from offeragent_harness.models import ModelContentBlock, ModelPurpose, ModelRole, thaw_json
+from offeragent_harness.models import ModelContentBlock, ModelContinuation, ModelPurpose, ModelRole, thaw_json
 from offeragent_harness.ports import Sensitivity
 from offeragent_harness.sessions import AgentLineage
-from offeragent_harness.tools import ResultSensitivity, ToolResult, ToolResultStatus
+from offeragent_harness.tools import ResultSensitivity, ToolCall, ToolResult, ToolResultStatus, canonical_json_sha256
 
 
 def _fragment(
@@ -189,6 +190,67 @@ def test_context_has_fixed_layers_snapshot_sources_and_fail_closed_filtering() -
     assert "private memory" not in serialized
     assert "secret skill" not in serialized
     assert "must stay hidden" not in serialized
+
+
+def test_completed_model_turn_replays_assistant_continuation_before_named_local_result() -> None:
+    lineage = AgentLineage.root("run")
+    call = ToolCall(
+        tool_call_id="call-planning-memory",
+        run_id="run",
+        workspace_id="ws",
+        name="planning_memory.list",
+        version="1",
+        arguments={},
+        args_hash=canonical_json_sha256({}),
+        idempotency_key="idempotency-planning-memory",
+        deadline=datetime(2030, 1, 2, tzinfo=timezone.utc),
+        lineage=lineage,
+        definition_fingerprint="sha256:" + "c" * 64,
+        result_sensitivity=ResultSensitivity.WORKSPACE,
+    )
+    continuation = ModelContinuation(
+        "codex-subscription",
+        "gpt-test",
+        "request-1",
+        (
+            {"type": "reasoning", "summary": [], "encrypted_content": "opaque"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": '{"calls":[{"name":"planning_memory.list"}]}'}],
+            },
+        ),
+    )
+    state = replace(
+        _state(),
+        pending=PendingWork(),
+        model_turns=(ModelTurn("agent-step_1", continuation, (call,)),),
+        tool_results=(_result(call.tool_call_id, "no planning topics exist"),),
+        tool_result_sensitivities={call.tool_call_id: ResultSensitivity.WORKSPACE},
+    )
+    manager = ContextManager(
+        system_rules=("use the ordered local model transcript",),
+        inputs=ContextInputs(
+            user_input=(_fragment("user-turn", ContextLayer.USER_INPUT, "ingest interview", Sensitivity.PUBLIC),)
+        ),
+        visibility=ContextVisibilityPolicy.cloud_model(),
+        budget=ContextBudget.generous_default(),
+    )
+
+    window = manager.build(state, purpose=ModelPurpose.PLANNING)
+
+    continuation_index = next(
+        index for index, message in enumerate(window.messages) if message.content[0].kind == "model_continuation"
+    )
+    result_message = window.messages[continuation_index + 1]
+    assert window.messages[continuation_index].role is ModelRole.ASSISTANT
+    assert result_message.role is ModelRole.TOOL
+    assert result_message.name == "planning_memory.list@1"
+    result = thaw_json(result_message.content[0].data)
+    assert result["agentStepId"] == "agent-step_1"
+    assert result["agentStepCallId"] == call.tool_call_id
+    assert result["tool"] == {"name": "planning_memory.list", "version": "1"}
 
 
 def test_run_snapshot_exposes_authoritative_local_date_and_iso_week() -> None:

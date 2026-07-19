@@ -73,7 +73,7 @@ async def test_budget_checkpoint_round_trips_after_sqlite_reopen_and_old_codec_f
         ).fetchone()
         assert row is not None
         envelope = json.loads(row[0])
-        assert envelope["schemaVersion"] == 5
+        assert envelope["schemaVersion"] == 6
         assert envelope["payload"]["budgetCheckpoint"]["limits"]["maxCost"] == "25.1250"
         assert envelope["payload"]["budgetCheckpoint"]["used"]["cost"] == "2.1250"
         envelope["schemaVersion"] = 3
@@ -82,7 +82,7 @@ async def test_budget_checkpoint_round_trips_after_sqlite_reopen_and_old_codec_f
             (json.dumps(envelope), state.run_id),
         )
 
-    with pytest.raises(EntityCodecVersionError, match=r"v5, found .* v3"):
+    with pytest.raises(EntityCodecVersionError, match=r"v6, found .* v3"):
         await SqliteUnitOfWorkFactory(database_path).get_entity("run_states", state.run_id)
 
 

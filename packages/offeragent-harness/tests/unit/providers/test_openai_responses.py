@@ -16,6 +16,7 @@ import pytest
 from offeragent_harness.models import (
     ModelCitation,
     ModelContentBlock,
+    ModelContinuation,
     ModelEvent,
     ModelEventKind,
     ModelFinishReason,
@@ -28,6 +29,7 @@ from offeragent_harness.models import (
     ModelRequest,
     ModelRole,
     TraceContext,
+    thaw_json,
 )
 from offeragent_harness.providers import (
     ModelCredentialLease,
@@ -302,6 +304,114 @@ async def test_responses_lite_moves_catalog_baseline_and_tools_into_input_and_se
 
 
 @pytest.mark.asyncio
+async def test_stateless_continuation_replays_exact_output_before_named_local_result() -> None:
+    first_output: list[dict[str, Any]] = [
+        {
+            "id": "rs_private",
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "opaque-encrypted-reasoning",
+        },
+        {
+            "id": "msg_private",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": '{"calls":[]}'}],
+        },
+    ]
+    fallback_response = cast(dict[str, Any], _completed("ok")["response"])
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert isinstance(body, dict)
+        bodies.append(body)
+        output = first_output if len(bodies) == 1 else fallback_response["output"]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.output_text.delta",
+                    "sequence_number": 1,
+                    "output_index": 1,
+                    "content_index": 0,
+                    "delta": '{"calls":[]}' if len(bodies) == 1 else "ok",
+                },
+                {
+                    "type": "response.completed",
+                    "sequence_number": 2,
+                    "response": {
+                        "status": "completed",
+                        "output": output,
+                        "usage": fallback_response["usage"],
+                    },
+                },
+            ),
+            request=request,
+        )
+
+    gateway = _gateway(httpx.MockTransport(handler))
+    first_events = await _collect(gateway, _request())
+    completed_events = [event for event in first_events if event.kind is ModelEventKind.COMPLETED]
+    assert len(completed_events) == 1
+    continuation = completed_events[0].continuation
+    assert isinstance(continuation, ModelContinuation)
+    assert thaw_json(continuation.output_items) == first_output
+
+    second = replace(
+        _request(),
+        request_id="req_test_2",
+        messages=(
+            ModelMessage(ModelRole.SYSTEM, (ModelContentBlock.text("system boundary"),)),
+            ModelMessage(ModelRole.USER, (ModelContentBlock.text("user prompt"),)),
+            ModelMessage(ModelRole.ASSISTANT, (continuation.as_content_block(),)),
+            ModelMessage(
+                ModelRole.TOOL,
+                (ModelContentBlock.text('{"agentStepId":"step_1","status":"succeeded"}'),),
+                name="planning_memory.list@1",
+            ),
+        ),
+    )
+    second_events = await _collect(_gateway(httpx.MockTransport(handler)), second)
+    assert second_events[-1].kind is ModelEventKind.COMPLETED, second_events[-1]
+
+    assert bodies[0]["include"] == ["reasoning.encrypted_content"]
+    replayed = bodies[1]["input"][-3:]
+    assert replayed[0] == {key: value for key, value in first_output[0].items() if key != "id"}
+    assert replayed[1] == {key: value for key, value in first_output[1].items() if key != "id"}
+    assert replayed[1]["phase"] == "final_answer"
+    assert replayed[2]["role"] == "user"
+    assert "Local tool result planning_memory.list@1" in replayed[2]["content"][0]["text"]
+    assert "function_call_output" not in json.dumps(bodies[1])
+
+
+def test_model_continuation_rejects_coerced_identity_fields() -> None:
+    block = ModelContentBlock(
+        "model_continuation",
+        {
+            "providerId": 1,
+            "model": "gpt-test",
+            "requestId": "request-1",
+            "outputItems": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                }
+            ],
+            "contentHash": "sha256:" + "0" * 64,
+        },
+    )
+
+    with pytest.raises(TypeError, match="identity fields"):
+        ModelContinuation.from_content_block(block)
+
+
+@pytest.mark.asyncio
 async def test_hosted_search_request_and_stream_are_typed_bounded_and_citation_preserving() -> None:
     captured: dict[str, object] = {}
 
@@ -465,7 +575,7 @@ async def test_hosted_search_request_and_stream_are_typed_bounded_and_citation_p
     assert isinstance(body, dict)
     assert body["tools"] == [{"type": "web_search"}]
     assert body["tool_choice"] == "auto"
-    assert body["include"] == ["web_search_call.action.sources"]
+    assert body["include"] == ["reasoning.encrypted_content", "web_search_call.action.sources"]
     assert [event.kind for event in events] == [
         ModelEventKind.STARTED,
         ModelEventKind.HOSTED_SEARCH,

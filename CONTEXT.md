@@ -236,6 +236,10 @@ _Avoid_: Provider 配置、Prompt 覆盖、模型名称映射、失败后切换�
 Python AgentStepCatalog 为模型提供的紧凑结构化输出信封；每个调用只携带精确工具名、版本、理由和编码单个 JSON 对象的 `argumentsJson`。同一 Catalog 把完整工具目录作为受上下文预算约束的可信应用规则，并在任何 ToolCall 产生前严格解码、拒绝重复键与非标准 JSON，再用原始完整工具 schema 和跨调用规则重新校验。该投影只约束模型输出形状，不授予执行权限。
 _Avoid_: 把 Provider schema 当成权限边界、按轮猜测工具子集、跳过本地工具参数校验、直接执行字符串参数、让模型生成 callId、hash、deadline 或权限身份
 
+**Model Turn Continuation**:
+一个 Agent Run 内已被 Python 接受的模型回合历史：Provider 返回的完整有序 `response.output` 与 Provider、模型、请求身份和内容哈希绑定，并与 Harness 创建的 AgentStep 身份及其精确 ToolCall 一起持久化。下一次无状态请求必须先按 assistant 输出重放该 continuation，再紧邻加入具名、带版本且明确不可信的本地工具结果；Responses Provider 将该本地结果投影为 USER 数据。它不是 Conversation Context、原生 Provider tool call、服务端 Response 链或执行授权。
+_Avoid_: 只保留解析后的 AgentStep、丢弃 encrypted reasoning 或 assistant phase、把本地结果编码成 `role=tool`、伪造 `function_call_output`、依赖 `previous_response_id`、跨 Provider 或模型重放
+
 **Hosted Search Citation**:
 Codex Hosted Web Search 在 Responses 输出中为答案提供的 Provider 证明型公共 URL 引用；它保存标题、Provider、模型和模型请求身份，但没有网页正文字节，因此不伪造内容哈希。需要精确网页证据时仍使用 `web_read` 读取并产生带真实内容哈希的 Web 来源。
 _Avoid_: 用 URL 或标题生成虚假 content hash、把搜索候选列表全部描述为已使用证据、网页镜像

@@ -3,6 +3,7 @@
 from .base import (
     ModelCitation,
     ModelContentBlock,
+    ModelContinuation,
     ModelError,
     ModelEvent,
     ModelEventKind,
@@ -26,6 +27,7 @@ __all__ = [
     "JsonValue",
     "ModelCitation",
     "ModelContentBlock",
+    "ModelContinuation",
     "ModelError",
     "ModelEvent",
     "ModelEventKind",

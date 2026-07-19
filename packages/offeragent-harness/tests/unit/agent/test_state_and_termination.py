@@ -7,6 +7,7 @@ import pytest
 from offeragent_harness.agent.state import PendingWork, RunState
 from offeragent_harness.agent.termination import evaluate_response_readiness
 from offeragent_harness.foundation import canonical_json_sha256
+from offeragent_harness.models import ModelContinuation
 from offeragent_harness.permissions import RiskClass
 from offeragent_harness.sessions import AgentLineage
 from offeragent_harness.tools import (
@@ -139,6 +140,35 @@ def test_tool_result_binding_is_exactly_once_and_call_ids_cannot_be_reused() -> 
         )
     with pytest.raises(ValueError, match="cannot reuse completed or previously bound state"):
         completed.accept_tool_calls((tool_call,))
+
+
+def test_model_turn_acceptance_persists_exact_authority_and_rejects_a_lost_binding() -> None:
+    tool_call = call(definition(SideEffectClass.READ), "model-call")
+    continuation = ModelContinuation(
+        "codex-subscription",
+        "gpt-test",
+        "request-1",
+        (
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": '{"calls":[]}'}],
+            },
+        ),
+    )
+
+    accepted = state().accept_tool_calls(
+        (tool_call,),
+        agent_step_id="agent-step_1",
+        continuation=continuation,
+    )
+
+    assert accepted.model_turns[0].agent_step_id == "agent-step_1"
+    assert accepted.model_turns[0].continuation is continuation
+    assert accepted.model_turns[0].tool_calls == (tool_call,)
+    with pytest.raises(ValueError, match="exact result sensitivity binding"):
+        replace(accepted, tool_result_sensitivities={})
 
 
 def test_pending_work_blocks_final_response_without_a_write_obligation() -> None:
