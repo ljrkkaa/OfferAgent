@@ -645,7 +645,7 @@ class BuiltProductQualificationSession:
                     raise BuiltProductQualificationError("image qualification completed without an explicit review")
                 return tuple(events), approval, review
             if event_type in {"turn.cancelled", "turn.failed", "turn.interrupted"}:
-                raise BuiltProductQualificationError(f"sealed product image Run terminated with {event_type}")
+                raise BuiltProductQualificationError(_terminal_failure_message(event, events, label="image Run"))
 
     def _approve_interview_write(
         self,
@@ -759,7 +759,7 @@ class BuiltProductQualificationSession:
             if event_type == "turn.completed":
                 return tuple(events)
             if event_type in {"turn.cancelled", "turn.failed", "turn.interrupted"}:
-                raise BuiltProductQualificationError(f"sealed product Run terminated with {event_type}")
+                raise BuiltProductQualificationError(_terminal_failure_message(event, events, label="Run"))
 
     def _next_event_or_replay(
         self,
@@ -994,3 +994,61 @@ def _raise_control_failure(notification: Mapping[str, Any]) -> None:
 def _event_types(events: list[Mapping[str, Any]]) -> str:
     values = [str(event.get("type", "invalid")) for event in events[-16:]]
     return "[" + ",".join(values) + "]"
+
+
+def _terminal_failure_message(
+    terminal: Mapping[str, Any],
+    events: list[Mapping[str, Any]],
+    *,
+    label: str,
+) -> str:
+    event_type = terminal.get("type")
+    payload = terminal.get("payload")
+    error = payload.get("error") if isinstance(payload, Mapping) else None
+    fields = [f"sealed product {label} terminated with {event_type}"]
+    if isinstance(error, Mapping):
+        code = error.get("code")
+        retryable = error.get("retryable")
+        message = error.get("userVisibleMessage")
+        if isinstance(code, str) and code:
+            fields.append(f"code={_diagnostic_text(code)}")
+        if isinstance(retryable, bool):
+            fields.append(f"retryable={str(retryable).lower()}")
+        if isinstance(message, str) and message:
+            fields.append(f"message={_diagnostic_text(message)}")
+    elif isinstance(payload, Mapping):
+        code = payload.get("code")
+        reason = payload.get("reason")
+        if isinstance(code, str) and code:
+            fields.append(f"code={_diagnostic_text(code)}")
+        if isinstance(reason, str) and reason:
+            fields.append(f"message={_diagnostic_text(reason)}")
+    last_tool = _last_tool_name(events)
+    if last_tool is not None:
+        fields.append(f"lastTool={last_tool}")
+    return " ".join(fields)
+
+
+def _last_tool_name(events: list[Mapping[str, Any]]) -> str | None:
+    for event in reversed(events):
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        call = payload.get("call")
+        if isinstance(call, Mapping):
+            name = call.get("name")
+            if isinstance(name, str) and name:
+                return _diagnostic_text(name)
+        calls = payload.get("calls")
+        if isinstance(calls, list):
+            for candidate in reversed(calls):
+                if not isinstance(candidate, Mapping):
+                    continue
+                name = candidate.get("name")
+                if isinstance(name, str) and name:
+                    return _diagnostic_text(name)
+    return None
+
+
+def _diagnostic_text(value: str) -> str:
+    return " ".join(value.replace("\x00", "").split())[:512]

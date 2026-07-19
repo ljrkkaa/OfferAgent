@@ -316,6 +316,75 @@ def test_text_preflight_recovers_missed_live_delivery_from_durable_replay() -> N
     assert not driver.responses
 
 
+def test_terminal_failure_reports_stable_error_and_last_tool_identity() -> None:
+    driver = _prepared_driver()
+    driver.responses.extend(
+        [
+            ("rpc", "session/create", {"session": {"sessionId": "ses_text"}, "created": True}),
+            (
+                "rpc",
+                "turn/start",
+                {
+                    "sessionId": "ses_text",
+                    "turnId": "turn_text",
+                    "runId": "run_text",
+                    "accepted": True,
+                    "duplicate": False,
+                },
+            ),
+        ]
+    )
+    driver.events.extend(
+        [
+            {
+                "event": "runtime.event",
+                "value": {
+                    "eventId": "evt_calls",
+                    "runId": "run_text",
+                    "type": "tool.calls.accepted",
+                    "payload": {"calls": [{"name": "vault.changes.apply"}]},
+                },
+            },
+            {
+                "event": "runtime.event",
+                "value": {
+                    "eventId": "evt_failed",
+                    "runId": "run_text",
+                    "type": "turn.failed",
+                    "payload": {
+                        "error": {
+                            "code": "provider_timeout",
+                            "retryable": True,
+                            "cancelled": False,
+                            "userVisibleMessage": "Provider continuation timed out.",
+                            "details": {"provider": "codex", "secret": "must-not-leak"},
+                        },
+                        "usage": {},
+                        "partialContent": [],
+                    },
+                },
+            },
+        ]
+    )
+    session = BuiltProductQualificationSession(driver, {"vaultRoot": "C:/sealed/Vault"})
+    session.prepare_live_model(
+        proxy_url="http://127.0.0.1:7896",
+        model="gpt-5.5",
+        require_image=True,
+    )
+
+    with pytest.raises(
+        BuiltProductQualificationError,
+        match=(
+            r"turn.failed code=provider_timeout retryable=true "
+            r"message=Provider continuation timed out\. lastTool=vault\.changes\.apply"
+        ),
+    ) as captured:
+        session.run_text_preflight("Return one short sentence.", timeout=5)
+
+    assert "must-not-leak" not in str(captured.value)
+
+
 def _artifact(index: int, payload: bytes) -> dict[str, Any]:
     return {
         "type": "image",
