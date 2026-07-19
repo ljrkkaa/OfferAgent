@@ -43,7 +43,7 @@ export interface PluginToolEventSource {
 
 export interface PluginToolExecutionPort {
     claim(call: ExecutableToolCallDescriptor): Promise<boolean>;
-    execute(call: ExecutableToolCallDescriptor): Promise<PluginToolCompleteResult>;
+    execute(call: ExecutableToolCallDescriptor): Promise<PluginToolCompleteResult | undefined>;
     cancelRun?(runId: string): void;
 }
 
@@ -108,8 +108,13 @@ export class SerializedPluginToolExecutionFence implements PluginToolExecutionPo
         return this.executor.claim(call);
     }
 
-    execute(call: ExecutableToolCallDescriptor): Promise<PluginToolCompleteResult> {
-        return this.runExclusive(() => this.executor.execute(call));
+    execute(call: ExecutableToolCallDescriptor): Promise<PluginToolCompleteResult | undefined> {
+        return this.runExclusive(async () => {
+            // The observer's first claim filters stale replay without occupying this Vault-wide queue.
+            // Revalidate here so cancellation or a duplicate completion cannot race the actual Vault operation.
+            if (!await this.executor.claim(call)) return undefined;
+            return this.executor.execute(call);
+        });
     }
 
     runExclusive<T>(operation: () => Promise<T>): Promise<T> {

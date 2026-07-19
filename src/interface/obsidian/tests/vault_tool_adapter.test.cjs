@@ -184,34 +184,80 @@ test("same-process Vault execution fence serializes replacement adapters and rec
     assert.deepEqual(events, ["first:recover", "first:start", "first:end", "second:recover", "second:execute"]);
 });
 
-test("pending-call claims do not occupy the Vault execution fence", async () => {
-    const { SerializedPluginToolExecutionFence } = loadModule();
-    const events = [];
-    let releaseClaim;
-    const claimGate = new Promise((resolve) => { releaseClaim = resolve; });
+test("duplicate live and replay deliveries claim and execute only once inside the Vault fence", async () => {
+    const { SerializedPluginToolExecutionFence, observePluginToolEvents } = loadModule();
+    let listener;
+    let pending = true;
+    let executions = 0;
     const fence = new SerializedPluginToolExecutionFence("C:/claim-vault", {
-        claim: async () => {
-            events.push("claim:start");
-            await claimGate;
-            events.push("claim:end");
-            return false;
-        },
+        claim: async () => pending,
         execute: async () => {
-            events.push("execute");
+            executions += 1;
+            pending = false;
             return { accepted: true, replayed: false };
         },
     });
-    await fence.ready();
+    const observer = observePluginToolEvents({
+        subscribe: (candidate) => {
+            listener = candidate;
+            return () => { listener = undefined; };
+        },
+    }, fence, (error) => { throw error; });
 
-    const claiming = fence.claim(call({ toolCallId: "call_historical" }));
+    const duplicate = call({ toolCallId: "call_duplicate" });
+    listener({ type: "tool.started", payload: { call: duplicate } }, undefined, "live");
+    listener({ type: "tool.started", payload: { call: duplicate } }, undefined, "replay");
+    await observer.dispose();
+
+    assert.equal(executions, 1);
+});
+
+test("a plugin Tool cancelled while queued is revalidated before it can touch the Vault", async () => {
+    const { SerializedPluginToolExecutionFence, observePluginToolEvents } = loadModule();
+    let listener;
+    let releaseBlocker;
+    const blocker = new Promise((resolve) => { releaseBlocker = resolve; });
+    const pending = new Map([
+        ["call_blocker", "run_blocker"],
+        ["call_cancelled", "run_cancelled"],
+    ]);
+    const executions = [];
+    const fence = new SerializedPluginToolExecutionFence("C:/cancel-vault", {
+        claim: async (candidate) => pending.has(candidate.toolCallId),
+        execute: async (candidate) => {
+            executions.push(candidate.toolCallId);
+            if (candidate.toolCallId === "call_blocker") await blocker;
+            pending.delete(candidate.toolCallId);
+            return { accepted: true, replayed: false };
+        },
+        cancelRun: (runId) => {
+            for (const [toolCallId, pendingRunId] of pending.entries()) {
+                if (pendingRunId === runId) pending.delete(toolCallId);
+            }
+        },
+    });
+    const observer = observePluginToolEvents({
+        subscribe: (candidate) => {
+            listener = candidate;
+            return () => { listener = undefined; };
+        },
+    }, fence, (error) => { throw error; });
+
+    listener({
+        type: "tool.started",
+        payload: { call: call({ toolCallId: "call_blocker", runId: "run_blocker" }) },
+    }, undefined, "live");
     await new Promise((resolve) => setImmediate(resolve));
-    const executing = fence.execute(call({ toolCallId: "call_current" }));
-    await executing;
-    assert.deepEqual(events, ["claim:start", "execute"]);
+    listener({
+        type: "tool.started",
+        payload: { call: call({ toolCallId: "call_cancelled", runId: "run_cancelled" }) },
+    }, undefined, "live");
+    await new Promise((resolve) => setImmediate(resolve));
+    listener({ type: "turn.interrupted", runId: "run_cancelled", payload: {} }, undefined, "live");
+    releaseBlocker();
+    await observer.dispose();
 
-    releaseClaim();
-    assert.equal(await claiming, false);
-    assert.deepEqual(events, ["claim:start", "execute", "claim:end"]);
+    assert.deepEqual(executions, ["call_blocker"]);
 });
 
 test("Vault Tool Adapter rejects a cross-Vault call before reading or completing", async () => {
