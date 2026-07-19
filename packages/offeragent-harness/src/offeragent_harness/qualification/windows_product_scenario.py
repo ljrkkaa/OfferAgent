@@ -17,6 +17,18 @@ from offeragent_harness.qualification.windows_product_driver import Qualificatio
 
 _PROVIDER_PROTOCOL_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _BLOCKER_DIAGNOSTIC = re.compile(r"^[a-z][a-z0-9_.:-]{0,127}$")
+_TOOL_RESULT_STATUSES = frozenset(
+    {
+        "succeeded",
+        "failed",
+        "denied",
+        "cancelled",
+        "timed_out",
+        "conflict",
+        "partial",
+        "unknown_outcome",
+    }
+)
 
 
 class BuiltProductQualificationError(RuntimeError):
@@ -600,9 +612,7 @@ class BuiltProductQualificationSession:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise BuiltProductQualificationError(
-                    f"sealed product image Run timed out after events {_event_types(events)}"
-                )
+                raise BuiltProductQualificationError(_timeout_failure_message("image Run", events))
             notification = self._next_event_or_replay(run_id, deadline, last_sequence)
             if notification is None:
                 continue
@@ -734,9 +744,7 @@ class BuiltProductQualificationSession:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise BuiltProductQualificationError(
-                    f"sealed product Run timed out after events {_event_types(events)}"
-                )
+                raise BuiltProductQualificationError(_timeout_failure_message("Run", events))
             notification = self._next_event_or_replay(run_id, deadline, last_sequence)
             if notification is None:
                 continue
@@ -1050,6 +1058,17 @@ def _terminal_failure_message(
     return " ".join(fields)
 
 
+def _timeout_failure_message(label: str, events: list[Mapping[str, Any]]) -> str:
+    fields = [f"sealed product {label} timed out after events {_event_types(events)}"]
+    tool_results = _tool_result_trace(events)
+    if tool_results:
+        fields.append(f"toolResultTrace={'>'.join(tool_results)}")
+    blocker_trace = _blocker_trace(events)
+    if blocker_trace:
+        fields.append(f"blockerTrace={'>'.join(blocker_trace)}")
+    return " ".join(fields)
+
+
 def _tool_trace(events: list[Mapping[str, Any]]) -> tuple[str, ...]:
     names: list[str] = []
     for event in events:
@@ -1098,12 +1117,41 @@ def _blocker_trace(events: list[Mapping[str, Any]]) -> tuple[str, ...]:
         values = payload.get("blockers") if isinstance(payload, Mapping) else None
         if not isinstance(values, list):
             continue
-        blockers.extend(
-            value
-            for value in values
-            if isinstance(value, str) and _BLOCKER_DIAGNOSTIC.fullmatch(value)
-        )
+        blockers.extend(value for value in values if isinstance(value, str) and _BLOCKER_DIAGNOSTIC.fullmatch(value))
     return tuple(blockers[-16:])
+
+
+def _tool_result_trace(events: list[Mapping[str, Any]]) -> tuple[str, ...]:
+    call_names: dict[str, str] = {}
+    results: list[str] = []
+    for event in events:
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        if event.get("type") == "tool.calls.accepted":
+            calls = payload.get("calls")
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                call_id = call.get("toolCallId") if isinstance(call, Mapping) else None
+                name = call.get("name") if isinstance(call, Mapping) else None
+                if (
+                    isinstance(call_id, str)
+                    and call_id
+                    and isinstance(name, str)
+                    and _BLOCKER_DIAGNOSTIC.fullmatch(name)
+                ):
+                    call_names.setdefault(call_id, name)
+            continue
+        if event.get("type") not in {"tool.completed", "tool.failed"}:
+            continue
+        result = payload.get("result")
+        call_id = result.get("toolCallId") if isinstance(result, Mapping) else None
+        status = result.get("status") if isinstance(result, Mapping) else None
+        name = call_names.get(call_id) if isinstance(call_id, str) else None
+        if name is not None and isinstance(status, str) and status in _TOOL_RESULT_STATUSES:
+            results.append(f"{name}:{status}")
+    return tuple(results[-16:])
 
 
 def _diagnostic_text(value: str) -> str:
