@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from itertools import count
 from typing import Any
@@ -45,6 +45,7 @@ _EXPERIENCE_PATH = re.compile(r"^(?:experiences|interviews/experiences)/[^/]+[.]
 _QUESTION_PATH = re.compile(r"^(?:interview|interviews/questions)/[^/]+[.]md$")
 _INDEX_PATHS = frozenset({"experiences/index.md", "interview/index.md"})
 _MAX_EXACT_READ_RECEIPTS_PER_TARGET = 512
+INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT = "interview_submission.apply_consumed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1117,6 +1118,15 @@ class InterviewSubmissionToolExecutor:
             return result
         if call.name == "vault.changes.apply" and call.arguments.get("changeKind") == "interview_submission":
             await self._store.verify_apply_claim(call)
+            result = await self._delegate.execute(call, cancellation)
+            return replace(
+                result,
+                context_activations=tuple(
+                    dict.fromkeys(
+                        (*result.context_activations, INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT)
+                    )
+                ),
+            )
         return await self._delegate.execute(call, cancellation)
 
 
@@ -1250,6 +1260,7 @@ def _guard_error(code: str, message: str) -> ToolDispatchError:
 
 
 __all__ = [
+    "INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT",
     "InterviewSubmissionAuthorityPolicy",
     "InterviewSubmissionRunAuthority",
     "InterviewSubmissionToolExecutor",

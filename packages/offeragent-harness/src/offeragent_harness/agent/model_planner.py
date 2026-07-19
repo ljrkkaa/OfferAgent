@@ -150,10 +150,59 @@ class StructuredModelResponse:
     citations: tuple[ModelCitation, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class RunCallFence:
+    """A catalog-owned dynamic prohibition activated by one prior ToolResult."""
+
+    activation: str
+    tool_name: str
+    tool_version: str
+    argument_name: str
+    argument_value: str
+    violation: str
+
+    def __post_init__(self) -> None:
+        values = (
+            self.activation,
+            self.tool_name,
+            self.tool_version,
+            self.argument_name,
+            self.argument_value,
+            self.violation,
+        )
+        if any(not value or "\x00" in value or len(value) > 512 for value in values):
+            raise ValueError("Run call fence fields must be non-empty bounded strings")
+
+    def matches(self, call: Mapping[str, Any]) -> bool:
+        arguments = call.get("arguments")
+        return (
+            call.get("name") == self.tool_name
+            and call.get("version") == self.tool_version
+            and isinstance(arguments, Mapping)
+            and arguments.get(self.argument_name) == self.argument_value
+        )
+
+    def identity(self) -> dict[str, str]:
+        return {
+            "activation": self.activation,
+            "toolName": self.tool_name,
+            "toolVersion": self.tool_version,
+            "argumentName": self.argument_name,
+            "argumentValue": self.argument_value,
+            "violation": self.violation,
+        }
+
+
 class AgentStepCatalog:
     """Exact execution authority plus a bounded model-facing AgentStep codec."""
 
-    def __init__(self, definitions: Sequence[ToolDefinition], *, max_calls: int) -> None:
+    def __init__(
+        self,
+        definitions: Sequence[ToolDefinition],
+        *,
+        max_calls: int,
+        run_call_fences: Sequence[RunCallFence] = (),
+    ) -> None:
         if max_calls < 1:
             raise ValueError("max_calls must be positive")
         ordered = tuple(sorted(definitions, key=lambda item: (item.name, item.version)))
@@ -162,6 +211,24 @@ class AgentStepCatalog:
             raise AgentStepCatalogError("tool catalog contains duplicate name/version entries")
         self._definitions = ordered
         self._by_key = MappingProxyType(dict(zip(keys, ordered, strict=True)))
+        fences = tuple(
+            sorted(
+                run_call_fences,
+                key=lambda item: (
+                    item.activation,
+                    item.tool_name,
+                    item.tool_version,
+                    item.argument_name,
+                    item.argument_value,
+                ),
+            )
+        )
+        fence_identities = tuple(tuple(item.identity().items()) for item in fences)
+        if len(fence_identities) != len(set(fence_identities)):
+            raise AgentStepCatalogError("Run call fences contain duplicate identities")
+        if any((fence.tool_name, fence.tool_version) not in self._by_key for fence in fences):
+            raise AgentStepCatalogError("Run call fence references an unknown tool/version")
+        self._run_call_fences = fences
         self._input_validators = MappingProxyType(
             {
                 key: Draft202012Validator(thaw_json(definition.input_schema))
@@ -182,6 +249,7 @@ class AgentStepCatalog:
                     }
                     for definition in ordered
                 ],
+                "runCallFences": [fence.identity() for fence in fences],
             }
         )
         schema = self._build_schema()
@@ -210,11 +278,14 @@ class AgentStepCatalog:
             ]
         }
         encoded_directory = canonical_json_bytes(directory).decode("utf-8")
+        encoded_fences = canonical_json_bytes(
+            {"runCallFences": [fence.identity() for fence in fences]}
+        ).decode("utf-8")
         self._model_instruction = (
             "OfferAgent 的模型输出使用紧凑 AgentStep 投影。每个 calls 项必须从下列工具目录选择精确的 "
             "name/version, 并把符合该工具 inputSchema 的单个 JSON 对象编码为 argumentsJson 字符串; "
             "不要把参数对象放在其他字段中。Harness 会在执行前重新解析并按完整目录严格校验。工具目录: "
-            f"{encoded_directory}"
+            f"{encoded_directory}。run_snapshot.activeContexts 激活后的调用栅栏: {encoded_fences}"
         )
 
     @property
@@ -294,6 +365,13 @@ class AgentStepCatalog:
             arguments = call.get("arguments")
             if isinstance(arguments, Mapping) and f"skill:{arguments.get('name')}" in context_activations:
                 return ("$.calls: an already activated Skill cannot be invoked again in the same Run",)
+        fenced = tuple(
+            f"$.calls: {fence.violation}"
+            for fence in self._run_call_fences
+            if fence.activation in context_activations and any(fence.matches(call) for call in calls)
+        )
+        if fenced:
+            return fenced
         return ()
 
     def decode_model_step(
@@ -1073,6 +1151,7 @@ __all__ = [
     "ModelProviderFailure",
     "ModelStreamProtocolError",
     "PlannerModelConfig",
+    "RunCallFence",
     "SchemaRepairFailed",
     "SchemaRepairUnavailable",
     "StructuredModelResponse",

@@ -17,6 +17,7 @@ from offeragent_harness.permissions import (
     PolicyDisposition,
 )
 from offeragent_harness.runtime.interview_submission_authority import (
+    INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT,
     InterviewSubmissionAuthorityPolicy,
     InterviewSubmissionRunAuthority,
     InterviewSubmissionToolExecutor,
@@ -394,7 +395,9 @@ async def test_catalog_receipt_binds_one_apply_slot_across_executor_reconstructi
     assert (await policy.evaluate(apply_definition, first, _context(apply_definition))).disposition is (
         PolicyDisposition.ALLOW
     )
-    assert (await executor.execute(first, ManualCancellationToken())).status is ToolResultStatus.FAILED
+    first_result = await executor.execute(first, ManualCancellationToken())
+    assert first_result.status is ToolResultStatus.FAILED
+    assert first_result.context_activations == (INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT,)
     assert (await policy.evaluate(apply_definition, first, _context(apply_definition))).disposition is (
         PolicyDisposition.ALLOW
     )

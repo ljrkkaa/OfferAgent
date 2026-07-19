@@ -37,7 +37,7 @@ from offeragent_harness.agent.context_manager import (
     estimate_context_fragment_tokens,
 )
 from offeragent_harness.agent.loop import ToolKernel
-from offeragent_harness.agent.model_planner import AgentStepCatalog, ModelPlanner, PlannerModelConfig
+from offeragent_harness.agent.model_planner import AgentStepCatalog, ModelPlanner, PlannerModelConfig, RunCallFence
 from offeragent_harness.agent.state import RunState
 from offeragent_harness.app import ApplicationIdentity, HarnessApplication
 from offeragent_harness.config import (
@@ -163,6 +163,7 @@ from offeragent_harness.runtime.harness_service import (
     StartTurnCommand,
 )
 from offeragent_harness.runtime.interview_submission_authority import (
+    INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT,
     InterviewSubmissionAuthorityPolicy,
     InterviewSubmissionRunAuthority,
     InterviewSubmissionToolExecutor,
@@ -1652,7 +1653,28 @@ class ProductionRunComponentsFactory(
             )
             return bound_kernel
 
-        catalog = AgentStepCatalog(definitions, max_calls=max(1, budget.max_tool_calls))
+        run_call_fences: tuple[RunCallFence, ...] = ()
+        if (
+            prepared_capabilities is not None
+            and state.lineage.depth == 0
+            and prepared_capabilities.interview_submission_authority.ordered_image_content_hashes
+            and any(item.name == "vault.changes.apply" and item.version == "1" for item in definitions)
+        ):
+            run_call_fences = (
+                RunCallFence(
+                    activation=INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT,
+                    tool_name="vault.changes.apply",
+                    tool_version="1",
+                    argument_name="changeKind",
+                    argument_value="interview_submission",
+                    violation="the root Run already consumed its one Interview Submission apply proposal",
+                ),
+            )
+        catalog = AgentStepCatalog(
+            definitions,
+            max_calls=max(1, budget.max_tool_calls),
+            run_call_fences=run_call_fences,
+        )
         planner_config = PlannerModelConfig(
             model=selected_model,
             max_output_tokens=min(16_384, budget.max_output_tokens),

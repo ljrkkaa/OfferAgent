@@ -27,6 +27,7 @@ from offeragent_harness.agent.model_planner import (
     ModelProviderFailure,
     ModelStreamProtocolError,
     PlannerModelConfig,
+    RunCallFence,
     SchemaRepairFailed,
     SchemaRepairUnavailable,
     collect_structured_response,
@@ -687,6 +688,47 @@ def test_already_activated_skill_cannot_be_loaded_twice_in_one_run() -> None:
         plan,
         context_activations=frozenset({"skill:daily-study-workflow"}),
     ) == ("$.calls: an already activated Skill cannot be invoked again in the same Run",)
+
+
+def test_run_call_fence_blocks_a_consumed_domain_operation_and_changes_catalog_identity() -> None:
+    write = replace(
+        _definition("vault.changes.apply"),
+        input_schema={
+            "type": "object",
+            "properties": {"changeKind": {"enum": ["general", "interview_submission"]}},
+            "required": ["changeKind"],
+            "additionalProperties": False,
+        },
+    )
+    fence = RunCallFence(
+        activation="interview_submission.apply_consumed",
+        tool_name="vault.changes.apply",
+        tool_version="1",
+        argument_name="changeKind",
+        argument_value="interview_submission",
+        violation="the root Run already consumed its one Interview Submission apply proposal",
+    )
+    catalog = AgentStepCatalog((write,), max_calls=2, run_call_fences=(fence,))
+    plan = {
+        "requiresWriteOutcome": True,
+        "calls": [
+            {
+                "name": "vault.changes.apply",
+                "version": "1",
+                "arguments": {"changeKind": "interview_submission"},
+                "reason": "repeat the already consumed proposal",
+            }
+        ],
+        "finalResponse": None,
+    }
+
+    assert catalog.violations(plan) == ()
+    assert catalog.violations(
+        plan,
+        context_activations=frozenset({"interview_submission.apply_consumed"}),
+    ) == ("$.calls: the root Run already consumed its one Interview Submission apply proposal",)
+    assert catalog.fingerprint != AgentStepCatalog((write,), max_calls=2).fingerprint
+    assert "interview_submission.apply_consumed" in catalog.model_instruction
 
 
 @pytest.mark.asyncio
