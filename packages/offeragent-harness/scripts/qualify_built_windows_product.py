@@ -538,36 +538,66 @@ def _unspecified_address(value: str) -> bool:
 def _alive_owned_processes(owned: dict[int, str]) -> list[str]:
     if not owned:
         return []
-    target_ids = ",".join(str(process_id) for process_id in sorted(owned))
     script = (
-        f"$targets=@({target_ids}); "
-        "$items = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
-        "Where-Object { $targets -contains [int]$_.ProcessId } | "
-        "ForEach-Object { [pscustomobject]@{ name=$_.Name; pid=[int]$_.ProcessId } }); "
+        "$ErrorActionPreference='Stop'; "
+        "$items = @(Get-CimInstance Win32_Process -ErrorAction Stop | "
+        "Where-Object { [int]$_.ProcessId -gt 0 } | "
+        "ForEach-Object { [pscustomobject]@{ name=[string]$_.Name; pid=[int]$_.ProcessId; "
+        "parent=[int]$_.ParentProcessId } }); "
         "$items | ConvertTo-Json -Compress"
     )
-    raw = subprocess.check_output(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-        text=True,
-        encoding="utf-8",
-        timeout=30,
-    ).strip()
-    if not raw:
-        return []
-    value = json.loads(raw)
+    try:
+        raw = subprocess.check_output(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        ).strip()
+        value = json.loads(raw)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        raise BuiltWindowsProductQualificationError("qualification process leak audit failed") from error
     records = value if isinstance(value, list) else [value]
-    result: list[str] = []
+    return _owned_process_tree(records, owned)
+
+
+def _owned_process_tree(records: Sequence[object], roots: dict[int, str]) -> list[str]:
+    processes: dict[int, tuple[str, int]] = {}
     for record in records:
-        if not isinstance(record, dict):
-            continue
-        name = record.get("name")
-        process_id = record.get("pid")
+        if not isinstance(record, dict) or set(record) != {"name", "parent", "pid"}:
+            raise BuiltWindowsProductQualificationError("qualification process leak audit shape differs")
+        name = record["name"]
+        process_id = record["pid"]
+        parent_id = record["parent"]
         if (
-            isinstance(name, str)
-            and isinstance(process_id, int)
-            and process_id in owned
-            and name.casefold() == owned[process_id].casefold()
+            not isinstance(name, str)
+            or not name
+            or not isinstance(process_id, int)
+            or isinstance(process_id, bool)
+            or process_id < 1
+            or not isinstance(parent_id, int)
+            or isinstance(parent_id, bool)
+            or parent_id < 0
+            or process_id in processes
         ):
+            raise BuiltWindowsProductQualificationError("qualification process leak audit record differs")
+        processes[process_id] = (name, parent_id)
+    owned_ids = set(roots)
+    while True:
+        descendants = {
+            process_id
+            for process_id, (_name, parent_id) in processes.items()
+            if parent_id in owned_ids and process_id not in owned_ids
+        }
+        if not descendants:
+            break
+        owned_ids.update(descendants)
+    result: list[str] = []
+    for process_id in sorted(owned_ids):
+        process = processes.get(process_id)
+        if process is None:
+            continue
+        name, _parent_id = process
+        if process_id not in roots or name.casefold() == roots[process_id].casefold():
             result.append(f"{name}:{process_id}")
     return sorted(result)
 

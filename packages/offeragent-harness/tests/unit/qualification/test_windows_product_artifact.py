@@ -426,6 +426,31 @@ def test_offline_smoke_failure_still_audits_process_leaks_and_removes_owned_root
     assert list(runs.iterdir()) == []
 
 
+def test_owned_process_tree_recovers_unknown_worker_and_process_host_from_driver_parentage() -> None:
+    records = [
+        {"name": "unrelated.exe", "pid": 10, "parent": 1},
+        {"name": "offeragent-worker.exe", "pid": 4242, "parent": 30392},
+        {"name": "offeragent-process-host.exe", "pid": 4343, "parent": 4242},
+        {"name": "conhost.exe", "pid": 4444, "parent": 4242},
+    ]
+
+    leaked = qualify_built_windows_product._owned_process_tree(records, {30392: "node.exe"})
+
+    assert leaked == ["conhost.exe:4444", "offeragent-process-host.exe:4343", "offeragent-worker.exe:4242"]
+
+
+def test_owned_process_audit_fails_closed_when_cim_query_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> str:
+        raise subprocess.CalledProcessError(1, "powershell.exe")
+
+    monkeypatch.setattr("scripts.qualify_built_windows_product.subprocess.check_output", fail)
+
+    with pytest.raises(qualify_built_windows_product.BuiltWindowsProductQualificationError, match="process leak audit"):
+        qualify_built_windows_product._alive_owned_processes({30392: "node.exe"})
+
+
 def test_offline_socket_audit_allows_only_the_worker_event_loop_pair() -> None:
     records = [
         {
