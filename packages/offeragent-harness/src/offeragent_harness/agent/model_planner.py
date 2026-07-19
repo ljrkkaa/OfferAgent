@@ -856,6 +856,12 @@ class ModelPlanner:
                     result_sensitivity=definition.result_sensitivity,
                 )
             )
+        if calls and response.continuation is None:
+            raise ModelStreamProtocolError(
+                response.request_id,
+                "tool-call response omitted durable continuation",
+                usage=response.usage,
+            )
         return PlanningStep(
             calls=tuple(calls),
             requires_write_outcome=cast(bool, raw["requiresWriteOutcome"]),

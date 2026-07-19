@@ -446,14 +446,36 @@ def _tool_plan(*, extra_call_fields: Mapping[str, Any] | None = None) -> dict[st
     return {"requiresWriteOutcome": False, "calls": [call], "finalResponse": None}
 
 
+_AUTO_CONTINUATION = object()
+
+
 def _events(
     request: ModelRequest,
     output: Mapping[str, Any],
     *,
     usage: ModelUsage = USAGE,
     finish: ModelFinishReason = ModelFinishReason.STOP,
-    continuation: ModelContinuation | None = None,
+    continuation: ModelContinuation | None | object = _AUTO_CONTINUATION,
 ) -> tuple[ModelEvent, ...]:
+    if continuation is _AUTO_CONTINUATION:
+        continuation = (
+            ModelContinuation(
+                "codex-subscription",
+                request.model,
+                request.request_id,
+                (
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": json.dumps(output)}],
+                    },
+                ),
+            )
+            if output.get("calls")
+            else None
+        )
+    assert continuation is None or isinstance(continuation, ModelContinuation)
     return (
         ModelEvent(request.request_id, 1, ModelEventKind.STARTED),
         ModelEvent(request.request_id, 2, ModelEventKind.STRUCTURED_OUTPUT, data=output),
@@ -623,6 +645,18 @@ async def test_planner_preserves_provider_continuation_under_an_offeragent_step_
 
     assert step.continuation == continuation
     assert step.agent_step_id is not None and step.agent_step_id.startswith("agent-step_")
+
+
+@pytest.mark.asyncio
+async def test_planner_rejects_tool_calls_without_a_durable_provider_continuation() -> None:
+    builder = _planner(ScriptedModelGateway(()))
+    request = builder.create_request(_state())
+    gateway = ScriptedModelGateway(
+        (ModelScriptStep.from_events(request, _events(request, _tool_plan(), continuation=None)),)
+    )
+
+    with pytest.raises(ModelStreamProtocolError, match="tool-call response omitted durable continuation"):
+        await _planner(gateway).plan(_state(), ManualCancellationToken())
 
 
 @pytest.mark.asyncio
