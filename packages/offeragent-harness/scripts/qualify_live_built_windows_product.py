@@ -172,7 +172,11 @@ def qualify_live_built_windows_product(
                 raise LiveBuiltProductQualificationError("duplicate source changed Vault content or checkpoints")
             _progress("hosted_search")
             search = scenario.run_hosted_search(
-                "请使用 Hosted Web Search 查找一条公开的 2026 年软件工程面试趋势，并在回答中保留来源引用。",
+                (
+                    "这是 Hosted Web Search 资格验证。必须实际调用已提供的 Hosted Web Search，禁止仅凭已有知识回答。"
+                    "请查找 OpenAI 官方 Responses Web Search 文档当前列出的一个 Web Search 工具类型，"
+                    "用一句中文回答并保留 Provider 返回的内联来源引用；若无法实际搜索，请明确说明无法完成。"
+                ),
                 timeout=run_timeout,
             )
         auth_unchanged = auth_before == _FileSnapshot.capture(auth_path)
@@ -234,6 +238,7 @@ def qualify_live_built_windows_product(
             "duplicateRun": _run_report(duplicate),
             "hostedSearch": {
                 "supported": search.supported,
+                "attemptCount": search.attempt_count,
                 "run": _run_report(search.run),
                 "citations": [asdict(citation) for citation in search.citations],
             },

@@ -1101,6 +1101,82 @@ def test_hosted_search_is_attributed_to_selected_model_and_provider_request() ->
     assert result.citations[0].provider_id == "codex_subscription"
     assert result.citations[0].model == "gpt-5.5"
     assert result.citations[0].model_request_id == "resp_search_1"
+    assert result.attempt_count == 1
+    assert not driver.responses
+
+
+def test_supported_hosted_search_retries_one_uncited_auto_selection() -> None:
+    driver = _prepared_driver()
+    driver.responses.extend(
+        [
+            ("rpc", "session/create", {"session": {"sessionId": "ses_search_1"}, "created": True}),
+            (
+                "rpc",
+                "turn/start",
+                {
+                    "sessionId": "ses_search_1",
+                    "turnId": "turn_search_1",
+                    "runId": "run_search_1",
+                    "accepted": True,
+                    "duplicate": False,
+                },
+            ),
+            ("rpc", "session/create", {"session": {"sessionId": "ses_search_2"}, "created": True}),
+            (
+                "rpc",
+                "turn/start",
+                {
+                    "sessionId": "ses_search_2",
+                    "turnId": "turn_search_2",
+                    "runId": "run_search_2",
+                    "accepted": True,
+                    "duplicate": False,
+                },
+            ),
+        ]
+    )
+    citation = {
+        "type": "hostedWeb",
+        "url": "https://platform.openai.com/docs/guides/tools-web-search",
+        "title": "Web search",
+        "providerId": "codex_subscription",
+        "model": "gpt-5.5",
+        "modelRequestId": "resp_search_2",
+        "freshness": "fresh",
+    }
+    driver.events.extend(
+        [
+            {
+                "event": "runtime.event",
+                "value": {"eventId": "evt_search_1", "runId": "run_search_1", "type": "turn.completed"},
+            },
+            {
+                "event": "runtime.event",
+                "value": {
+                    "eventId": "evt_search_2",
+                    "runId": "run_search_2",
+                    "type": "references.updated",
+                    "payload": {"references": [citation], "replace": False},
+                },
+            },
+            {
+                "event": "runtime.event",
+                "value": {"eventId": "evt_search_3", "runId": "run_search_2", "type": "turn.completed"},
+            },
+        ]
+    )
+    session = BuiltProductQualificationSession(driver, {"vaultRoot": "C:/sealed/Vault"})
+    session.prepare_live_model(
+        proxy_url="http://127.0.0.1:7896",
+        model="gpt-5.5",
+        require_image=True,
+    )
+
+    result = session.run_hosted_search("必须实际搜索并引用来源。", timeout=5)
+
+    assert result.attempt_count == 2
+    assert result.run.run_id == "run_search_2"
+    assert result.citations[0].model_request_id == "resp_search_2"
     assert not driver.responses
 
 
@@ -1136,7 +1212,7 @@ def test_supported_hosted_search_fails_without_provider_attributed_citation() ->
     )
 
     with pytest.raises(BuiltProductQualificationError, match="provider-attributed citation"):
-        session.run_hosted_search("请搜索并引用来源。", timeout=5)
+        session.run_hosted_search("请搜索并引用来源。", timeout=5, max_attempts=1)
 
 
 def test_research_browser_adapter_has_independent_read_only_attribution() -> None:

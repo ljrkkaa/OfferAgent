@@ -57,6 +57,10 @@ visible Provider failure; it never triggers a request without search. See
   `store: false`, and requests `web_search_call.action.sources` in `include`.
 - No health request, minimal prompt, capability probe, cached capability status, model-name allowlist, or retry
   without the tool is permitted.
+- Because production deliberately uses automatic tool selection, the billed live qualification may run at most
+  two independent search-specific Runs when the first completes without selecting Web Search. It reports the
+  successful attempt and still passes only on a real provider-attributed citation; this evaluator retry neither
+  changes production tool selection nor retries a Provider rejection without search.
 - Local Function Tools remain Harness-owned AgentStep calls. A Provider function call is still a protocol error;
   enabling Hosted Web Search does not give the Provider a Vault or local executor.
 

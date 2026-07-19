@@ -133,6 +133,7 @@ class HostedSearchEvidence:
     supported: bool
     run: CompletedRunEvidence
     citations: tuple[HostedCitationEvidence, ...]
+    attempt_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,15 +476,53 @@ class BuiltProductQualificationSession:
         )
         return CompletedRunEvidence(session_id, turn_id, run_id, events)
 
-    def run_hosted_search(self, prompt: str, *, timeout: float) -> HostedSearchEvidence:
+    def run_hosted_search(
+        self,
+        prompt: str,
+        *,
+        timeout: float,
+        max_attempts: int = 2,
+    ) -> HostedSearchEvidence:
         """Attribute provider-hosted citations to the exact persisted catalog selection."""
 
         selection = self._require_selection()
-        if not prompt or timeout <= 0:
-            raise ValueError("hosted-search prompt and timeout must be positive")
+        if (
+            not prompt
+            or timeout <= 0
+            or isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int)
+            or not 1 <= max_attempts <= 3
+        ):
+            raise ValueError("hosted-search prompt, timeout, and bounded attempt count must be positive")
+        attempt_limit = max_attempts if selection.supports_hosted_search else 1
+        for attempt in range(1, attempt_limit + 1):
+            run = self._run_hosted_search_attempt(prompt, timeout=timeout, attempt=attempt)
+            citations = _hosted_citations(run.events, selection.model)
+            if citations:
+                if not selection.supports_hosted_search:
+                    raise BuiltProductQualificationError("unsupported Hosted Web Search emitted a provider citation")
+                return HostedSearchEvidence(True, run, citations, attempt)
+            if not selection.supports_hosted_search:
+                return HostedSearchEvidence(False, run, (), attempt)
+        raise BuiltProductQualificationError(
+            f"supported Hosted Web Search returned no provider-attributed citation after {attempt_limit} attempts"
+        )
+
+    def _run_hosted_search_attempt(
+        self,
+        prompt: str,
+        *,
+        timeout: float,
+        attempt: int,
+    ) -> CompletedRunEvidence:
+        selection = self._require_selection()
+        suffix = "" if attempt == 1 else f"-{attempt}"
         created = self._rpc(
             "session/create",
-            {"title": "Sealed product hosted search", "clientRequestId": "req_qualification_search"},
+            {
+                "title": f"Sealed product hosted search attempt {attempt}",
+                "clientRequestId": f"req_qualification_search{suffix}",
+            },
         )
         session = created.get("session")
         session_id = _string(session, "sessionId", "hosted-search session")
@@ -491,8 +530,8 @@ class BuiltProductQualificationSession:
             "turn/start",
             {
                 "sessionId": session_id,
-                "turnId": "turn_qualification_search",
-                "idempotencyKey": "qualification-search-v1",
+                "turnId": f"turn_qualification_search{suffix}",
+                "idempotencyKey": f"qualification-search-v1{suffix}",
                 "input": [
                     {"type": "text", "text": prompt, "format": "markdown", "references": []},
                 ],
@@ -508,16 +547,7 @@ class BuiltProductQualificationSession:
         turn_id = _string(started, "turnId", "hosted-search qualification")
         run_id = _string(started, "runId", "hosted-search qualification")
         events = self._wait_for_terminal(run_id, timeout=timeout)
-        citations = _hosted_citations(events, selection.model)
-        if selection.supports_hosted_search and not citations:
-            raise BuiltProductQualificationError("supported Hosted Web Search returned no provider-attributed citation")
-        if not selection.supports_hosted_search and citations:
-            raise BuiltProductQualificationError("unsupported Hosted Web Search emitted a provider citation")
-        return HostedSearchEvidence(
-            supported=selection.supports_hosted_search,
-            run=CompletedRunEvidence(session_id, turn_id, run_id, events),
-            citations=citations,
-        )
+        return CompletedRunEvidence(session_id, turn_id, run_id, events)
 
     def qualify_research_browser(self) -> ResearchBrowserEvidence:
         """Exercise the production adapter against its declared qualification PagePort."""
