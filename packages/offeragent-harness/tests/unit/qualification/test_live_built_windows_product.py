@@ -4,11 +4,12 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from scripts.qualify_built_windows_product import _remove_owned_root as _remove_built_owned_root
 from scripts.qualify_live_built_windows_product import (
     LiveBuiltProductQualificationError,
     _canonical_json,
@@ -103,6 +104,28 @@ def test_owned_root_cleanup_clears_read_only_git_objects(tmp_path: Path) -> None
     (root / ".offeragent-qualification-owner.json").write_bytes(marker_payload)
 
     _remove_owned_root(root, marker_payload)
+
+    assert not root.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path regression")
+@pytest.mark.parametrize("remove_owned_root", (_remove_owned_root, _remove_built_owned_root))
+def test_owned_root_cleanup_removes_paths_beyond_the_legacy_windows_limit(
+    tmp_path: Path,
+    remove_owned_root: Callable[[Path, bytes], None],
+) -> None:
+    root = tmp_path / "qualification"
+    deep_parent = root / "Vault" / ".obsidian" / "plugins" / "offeragent-obsidian-plugin" / "runtime"
+    leaf = "a" * (270 - len(str(deep_parent)) - 1)
+    deep_file = deep_parent / leaf
+    assert len(str(deep_file)) == 270
+    filesystem_file = Path(f"\\\\?\\{deep_file}")
+    filesystem_file.parent.mkdir(parents=True)
+    filesystem_file.write_bytes(b"deep-runtime-asset")
+    marker_payload = _canonical_json({"schemaVersion": 1, "token": "a" * 64})
+    (root / ".offeragent-qualification-owner.json").write_bytes(marker_payload)
+
+    remove_owned_root(root, marker_payload)
 
     assert not root.exists()
 

@@ -15,6 +15,10 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from offeragent_harness.qualification.owned_temporary_root import (
+    OwnedTemporaryRootError,
+    remove_owned_temporary_root,
+)
 from offeragent_harness.qualification.windows_product_artifact import verify_paired_windows_artifacts
 from offeragent_harness.qualification.windows_product_driver import QualificationDriverClient
 from offeragent_harness.workspace.portable_config import ensure_portable_workspace_config
@@ -328,15 +332,10 @@ def _canonical_json(value: object) -> bytes:
 
 
 def _remove_owned_root(root: Path, expected_marker: bytes) -> None:
-    marker = root / ".offeragent-qualification-owner.json"
     try:
-        info = marker.lstat()
-        actual = marker.read_bytes()
-    except OSError as error:
-        raise BuiltWindowsProductQualificationError("qualification temp ownership marker is unavailable") from error
-    if marker.is_symlink() or info.st_nlink != 1 or actual != expected_marker:
-        raise BuiltWindowsProductQualificationError("qualification temp ownership identity differs")
-    shutil.rmtree(root)
+        remove_owned_temporary_root(root, expected_marker)
+    except OwnedTemporaryRootError as error:
+        raise BuiltWindowsProductQualificationError(str(error)) from error
 
 
 def _offline_environment(trace_path: Path, token: str) -> dict[str, str]:

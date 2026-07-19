@@ -19,6 +19,7 @@ from offeragent_harness.runtime.development_runtime_manifest import (
     development_runtime_content_digest,
 )
 from offeragent_harness.runtime.runtime_manifest import ProtocolCompatibility, RuntimeFileRecord
+from offeragent_harness.runtime.windows_paths import windows_extended_path
 
 
 def _digest(payload: bytes) -> str:
@@ -154,7 +155,7 @@ def test_installer_supports_runtime_paths_beyond_the_legacy_windows_limit(
     installed = install_local_plugin(artifact, vault)
 
     assert installed == target
-    assert installer._windows_extended_path(target_file).read_bytes() == b"deep-runtime-asset"
+    assert windows_extended_path(target_file).read_bytes() == b"deep-runtime-asset"
 
 
 def test_transaction_directory_names_do_not_exceed_the_final_plugin_path_budget(

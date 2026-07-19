@@ -18,22 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from offeragent_harness.runtime.development_runtime_manifest import InstalledDevelopmentRuntimeTrust
+from offeragent_harness.runtime.windows_paths import windows_extended_path as _windows_extended_path
 from offeragent_harness.workspace import WorkspaceRegistry
 from offeragent_harness.workspace.portable_config import ensure_portable_workspace_config
 
 PLUGIN_DIRECTORY_NAME = "offeragent-obsidian-plugin"
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
-
-
-def _windows_extended_path(path: Path) -> Path:
-    """Use Win32 extended syntax only at the filesystem-operation boundary."""
-
-    absolute = os.path.abspath(path)
-    if os.name != "nt" or absolute.startswith("\\\\?\\"):
-        return Path(absolute)
-    if absolute.startswith("\\\\"):
-        return Path(f"\\\\?\\UNC\\{absolute[2:]}")
-    return Path(f"\\\\?\\{absolute}")
 
 
 def _lexists(path: Path) -> bool:

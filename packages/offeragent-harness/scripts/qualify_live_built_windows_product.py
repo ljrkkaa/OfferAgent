@@ -10,16 +10,17 @@ import json
 import os
 import secrets
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from types import TracebackType
 from typing import Any
 
+from offeragent_harness.qualification.owned_temporary_root import (
+    OwnedTemporaryRootError,
+    remove_owned_temporary_root,
+)
 from offeragent_harness.qualification.synthetic_interview import (
     SyntheticInterviewFixtureGenerator,
     SyntheticInterviewSemanticError,
@@ -456,27 +457,10 @@ def _canonical_json(value: object) -> bytes:
 
 
 def _remove_owned_root(root: Path, expected_marker: bytes) -> None:
-    marker = root / ".offeragent-qualification-owner.json"
     try:
-        info = marker.lstat()
-        actual = marker.read_bytes()
-    except OSError as error:
-        raise LiveBuiltProductQualificationError("qualification temp ownership marker is unavailable") from error
-    if marker.is_symlink() or info.st_nlink != 1 or actual != expected_marker:
-        raise LiveBuiltProductQualificationError("qualification temp ownership identity differs")
-
-    def clear_read_only(
-        function: Callable[[str], object],
-        path: str,
-        error_info: tuple[type[BaseException], BaseException, TracebackType],
-    ) -> None:
-        error = error_info[1]
-        if not isinstance(error, PermissionError):
-            raise error
-        os.chmod(path, stat.S_IWRITE)
-        function(path)
-
-    shutil.rmtree(root, onerror=clear_read_only)
+        remove_owned_temporary_root(root, expected_marker)
+    except OwnedTemporaryRootError as error:
+        raise LiveBuiltProductQualificationError(str(error)) from error
 
 
 def _product_process_ids() -> dict[str, set[int]]:
