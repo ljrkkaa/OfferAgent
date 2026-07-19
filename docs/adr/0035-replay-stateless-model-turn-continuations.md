@@ -65,9 +65,14 @@ independent.
 - Native Responses tool calls remain a separate future vertical slice. The
   Harness must never synthesize `function_call_output` or
   `custom_tool_call_output` for a compact JSON AgentStep.
-- Continuation bytes consume the existing context budget. Raising token limits,
-  adding per-tool behavioral fences, or replaying only assistant text would hide
-  the protocol defect and are rejected alternatives.
+- Continuation bytes consume the existing context budget. Raising cumulative
+  input capacity before restoring causal replay, adding per-tool behavioral
+  fences, or replaying only assistant text would hide the protocol defect and
+  are rejected alternatives. After replay was fixed, a sealed run proved four
+  unique tool executions with no repetition but used 373,051 cumulative input
+  tokens before its final request; the root cumulative ceiling is therefore
+  800,000 while model-round, tool-call, per-request context and deadline limits
+  remain unchanged.
 - Tests must prove exact wire replay, named USER result projection, atomic
   context grouping, durable round-trip, migration interruption, recovery and a
   real sealed-product multi-round run.

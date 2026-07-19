@@ -276,6 +276,10 @@ _LOCAL_PROFILE_ID = "profile_local"
 _LOCAL_MANAGED_ID = "managed_local"
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _HISTORY_CONTEXT_BASE_RESERVE_TOKENS = 16_384
+# Run input usage is cumulative across bounded Provider attempts.  A sealed
+# multimodal qualification reaches four unique tools and its final response
+# after more than 400k cumulative input without repeating an execution.
+_DEFAULT_ROOT_MAX_INPUT_TOKENS = 800_000
 _ROOT_PRODUCT_RULES = (
     "Agent Contract 加载后, 先调用 planning_memory.list 取得主题元数据, 再依据当前请求与 Conversation "
     "语义选择最多五个相关主题并用 planning_memory.read 精读; 不得把 memory/MEMORY.md、完整索引或"
@@ -2242,7 +2246,11 @@ def _run_budget(
             requested_parallel_reads,
         ),
         max_wall_seconds=min(configured.max_wall_seconds, requested_wall_seconds),
-        max_input_tokens=400_000 if value is None or value.max_input_tokens is None else value.max_input_tokens,
+        max_input_tokens=(
+            _DEFAULT_ROOT_MAX_INPUT_TOKENS
+            if value is None or value.max_input_tokens is None
+            else value.max_input_tokens
+        ),
         max_output_tokens=64_000 if value is None or value.max_output_tokens is None else value.max_output_tokens,
         max_cost=Decimal(min(configured.max_cost_microunits, requested_cost)) / Decimal(1_000_000),
         max_artifact_bytes=64 * 1024 * 1024 if value is None else max(1, value.max_artifact_bytes),
