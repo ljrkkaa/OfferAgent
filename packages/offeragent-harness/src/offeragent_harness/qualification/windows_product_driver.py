@@ -7,6 +7,7 @@ import os
 import queue
 import subprocess
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from typing import IO, Any
 
@@ -29,6 +30,7 @@ class QualificationDriverClient:
         driver: Path,
         working_directory: Path,
         source_root_guard: Path,
+        environment_overrides: Mapping[str, str] | None = None,
     ) -> None:
         self._executable = _regular_file(executable, "qualification executable")
         self._driver = _regular_file(driver, "qualification driver")
@@ -37,6 +39,10 @@ class QualificationDriverClient:
         environment = os.environ.copy()
         environment["NODE_PATH"] = ""
         environment["OFFERAGENT_QUALIFICATION_FORBID_SOURCE_ROOT"] = str(self._source_root_guard)
+        for key, value in (environment_overrides or {}).items():
+            if not key or any(marker in key or marker in value for marker in ("\x00", "\r", "\n")):
+                raise ValueError("qualification environment override is invalid")
+            environment[key] = value
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         self._process = subprocess.Popen(
             [str(self._executable), str(self._driver), "serve"],

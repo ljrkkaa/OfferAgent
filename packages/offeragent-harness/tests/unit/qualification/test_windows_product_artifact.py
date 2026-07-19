@@ -219,41 +219,57 @@ def test_smoke_owns_the_temporary_vault_and_drives_frozen_worker_lifecycle(
     temporary_parent = tmp_path / "qualification-runs"
     source.mkdir()
     temporary_parent.mkdir()
-    calls: list[tuple[list[str], dict[str, object]]] = []
+    client_options: dict[str, object] = {}
+    requests: list[tuple[str, dict[str, object]]] = []
 
-    def run(command: list[str], **options: object) -> object:
-        calls.append((command, options))
-        payload = json.loads(str(options["input"]))
-        assert Path(payload["workerExecutable"]) == (
-            plugin / "runtime" / "windows-x64" / "local-development" / "offeragent-worker.exe"
-        )
-        assert Path(payload["vaultRoot"]).parent.parent == temporary_parent
-        assert Path(payload["localAppData"]).parent == Path(payload["vaultRoot"]).parent
-        assert re.fullmatch(
-            r"ws_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-            payload["workspaceId"],
-        )
-        workspace_config = json.loads(
-            (Path(payload["vaultRoot"]) / ".offeragent" / "workspace.json").read_text(encoding="utf-8")
-        )
-        assert workspace_config["portableWorkspaceId"] == payload["workspaceId"]
-        return type(
-            "Completed",
-            (),
-            {
-                "stdout": json.dumps(
-                    {
-                        "driverProtocolVersion": 1,
-                        "sourceFreeRuntime": True,
-                        "transport": "stdio",
-                        "workerPid": 4242,
-                    }
+    class Driver:
+        def __enter__(self) -> Driver:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def request(self, command: str, params: dict[str, object], **_options: object) -> dict[str, object]:
+            requests.append((command, params))
+            if command == "hello":
+                return {"driverProtocolVersion": 2, "reviewResolution": "explicit", "sourceFreeRuntime": True}
+            if command == "product/start":
+                assert Path(str(params["workerExecutable"])) == (
+                    plugin / "runtime" / "windows-x64" / "local-development" / "offeragent-worker.exe"
                 )
-                + "\n",
-            },
-        )()
+                assert Path(str(params["vaultRoot"])).parent.parent == temporary_parent
+                assert Path(str(params["localAppData"])).parent == Path(str(params["vaultRoot"])).parent
+                assert re.fullmatch(
+                    r"ws_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                    str(params["workspaceId"]),
+                )
+                workspace_config = json.loads(
+                    (Path(str(params["vaultRoot"])) / ".offeragent" / "workspace.json").read_text(encoding="utf-8")
+                )
+                assert workspace_config["portableWorkspaceId"] == params["workspaceId"]
+                return {
+                    "identity": {"workerPid": 4242, "transport": "stdio"},
+                    "reviewResolution": "explicit",
+                    "sourceFreeRuntime": True,
+                }
+            if command == "product/stop":
+                return {"stopped": True, "workerPid": 4242}
+            raise AssertionError(command)
 
-    monkeypatch.setattr("scripts.qualify_built_windows_product.subprocess.run", run)
+    def client(**options: object) -> Driver:
+        client_options.update(options)
+        return Driver()
+
+    monkeypatch.setattr("scripts.qualify_built_windows_product.QualificationDriverClient", client)
+    monkeypatch.setattr(
+        "scripts.qualify_built_windows_product._offline_process_observation",
+        lambda _pid: {
+            "allowedLoopbackSockets": [],
+            "allowedSystemDescendants": [],
+            "unexpectedSockets": [],
+            "workerDescendants": [],
+        },
+    )
     monkeypatch.setattr(
         "scripts.qualify_built_windows_product._offeragent_process_ids",
         lambda: {"offeragent-process-host.exe": set(), "offeragent-worker.exe": set()},
@@ -270,5 +286,70 @@ def test_smoke_owns_the_temporary_vault_and_drives_frozen_worker_lifecycle(
     assert report["workerPid"] == 4242
     assert report["temporaryRootRemoved"] is True
     assert report["leakedProcesses"] == []
+    assert report["offlineStartup"] == {
+        "networkBoundary": "closed-loopback-proxy-plus-active-socket-audit",
+        "allowedLoopbackSockets": [],
+        "allowedSystemDescendants": [],
+        "unexpectedSockets": [],
+        "workerDescendants": [],
+        "systemPythonInvoked": False,
+        "pipInvoked": False,
+        "startupDownloadAttempted": False,
+    }
     assert list(temporary_parent.iterdir()) == []
-    assert calls[0][0][-1] == "smoke"
+    assert [command for command, _params in requests] == ["hello", "product/start", "product/stop"]
+    environment = client_options["environment_overrides"]
+    assert isinstance(environment, dict)
+    assert environment["HTTP_PROXY"] == "http://127.0.0.1:9"
+    assert environment["HTTPS_PROXY"] == "http://127.0.0.1:9"
+    assert environment["ALL_PROXY"] == "http://127.0.0.1:9"
+    assert environment["NO_PROXY"] == ""
+    assert environment["PIP_NO_INDEX"] == "1"
+    assert environment["UV_OFFLINE"] == "1"
+
+
+def test_offline_socket_audit_allows_only_the_worker_event_loop_pair() -> None:
+    records = [
+        {
+            "protocol": "tcp",
+            "pid": 4242,
+            "state": "Bound",
+            "localAddress": "0.0.0.0",
+            "localPort": 50001,
+            "remoteAddress": "0.0.0.0",
+            "remotePort": 0,
+        },
+        {
+            "protocol": "tcp",
+            "pid": 4242,
+            "state": "Established",
+            "localAddress": "127.0.0.1",
+            "localPort": 50000,
+            "remoteAddress": "127.0.0.1",
+            "remotePort": 50001,
+        },
+        {
+            "protocol": "tcp",
+            "pid": 4242,
+            "state": "Established",
+            "localAddress": "127.0.0.1",
+            "localPort": 50001,
+            "remoteAddress": "127.0.0.1",
+            "remotePort": 50000,
+        },
+        {
+            "protocol": "tcp",
+            "pid": 4242,
+            "state": "Established",
+            "localAddress": "10.0.0.5",
+            "localPort": 50002,
+            "remoteAddress": "203.0.113.10",
+            "remotePort": 443,
+        },
+    ]
+
+    allowed, unexpected = qualify_built_windows_product._classify_offline_sockets(records)
+
+    assert len(allowed) == 3
+    assert len(unexpected) == 1
+    assert "203.0.113.10" in unexpected[0]

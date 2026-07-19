@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import secrets
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from offeragent_harness.qualification.windows_product_artifact import verify_paired_windows_artifacts
+from offeragent_harness.qualification.windows_product_driver import QualificationDriverClient
 from offeragent_harness.workspace.portable_config import ensure_portable_workspace_config
 
 _PRODUCTION_EXPORTS = [
@@ -82,22 +85,60 @@ def smoke_built_windows_product(
             "workerExecutable": str(runtime_root / "offeragent-worker.exe"),
             "workspaceId": workspace_id,
         }
-        completed = subprocess.run(
-            [str(node_executable), str(paired.driver), "smoke"],
-            cwd=paired.qualification_root,
-            env=_driver_environment(guard),
-            input=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=60,
-        )
-        result = _single_json_line(completed.stdout, "qualification driver smoke")
+        with QualificationDriverClient(
+            executable=node_executable,
+            driver=paired.driver,
+            working_directory=paired.qualification_root,
+            source_root_guard=guard,
+            environment_overrides=_offline_environment(),
+        ) as driver:
+            hello = driver.request("hello", {})
+            if hello != {
+                "driverProtocolVersion": 2,
+                "reviewResolution": "explicit",
+                "sourceFreeRuntime": True,
+            }:
+                raise BuiltWindowsProductQualificationError("qualification driver identity differs")
+            started = driver.request("product/start", payload)
+            identity = started.get("identity")
+            worker_pid = identity.get("workerPid") if isinstance(identity, dict) else None
+            transport = identity.get("transport") if isinstance(identity, dict) else None
+            if (
+                set(started) != {"identity", "reviewResolution", "sourceFreeRuntime"}
+                or started.get("reviewResolution") != "explicit"
+                or started.get("sourceFreeRuntime") is not True
+                or not isinstance(worker_pid, int)
+                or isinstance(worker_pid, bool)
+                or worker_pid < 1
+                or transport != "stdio"
+            ):
+                raise BuiltWindowsProductQualificationError("qualification driver offline start differs")
+            observation = _offline_process_observation(worker_pid)
+            allowed_loopback_sockets = observation["allowedLoopbackSockets"]
+            allowed_system_descendants = observation["allowedSystemDescendants"]
+            unexpected_sockets = observation["unexpectedSockets"]
+            worker_descendants = observation["workerDescendants"]
+            if unexpected_sockets:
+                raise BuiltWindowsProductQualificationError(
+                    f"offline Worker opened unexpected sockets: {unexpected_sockets}"
+                )
+            if worker_descendants:
+                raise BuiltWindowsProductQualificationError(
+                    f"offline Worker started unexpected descendants: {worker_descendants}"
+                )
+            stopped = driver.request("product/stop", {})
+            if stopped != {"stopped": True, "workerPid": worker_pid}:
+                raise BuiltWindowsProductQualificationError("qualification offline Worker did not stop exactly")
+        result = {
+            "driverProtocolVersion": 2,
+            "sourceFreeRuntime": True,
+            "transport": transport,
+            "workerPid": worker_pid,
+        }
         expected_keys = {"driverProtocolVersion", "sourceFreeRuntime", "transport", "workerPid"}
         if (
             set(result) != expected_keys
-            or result.get("driverProtocolVersion") != 1
+            or result.get("driverProtocolVersion") != 2
             or result.get("sourceFreeRuntime") is not True
             or result.get("transport") != "stdio"
             or not isinstance(result.get("workerPid"), int)
@@ -121,6 +162,16 @@ def smoke_built_windows_product(
         "sourceCommit": paired.source_commit,
         "sourceTreeSha256": paired.source_tree_sha256,
         "temporaryRootRemoved": removed,
+        "offlineStartup": {
+            "networkBoundary": "closed-loopback-proxy-plus-active-socket-audit",
+            "allowedLoopbackSockets": allowed_loopback_sockets,
+            "allowedSystemDescendants": allowed_system_descendants,
+            "unexpectedSockets": unexpected_sockets,
+            "workerDescendants": worker_descendants,
+            "systemPythonInvoked": False,
+            "pipInvoked": False,
+            "startupDownloadAttempted": False,
+        },
     }
 
 
@@ -247,10 +298,148 @@ def _remove_owned_root(root: Path, expected_marker: bytes) -> None:
     shutil.rmtree(root)
 
 
+def _offline_environment() -> dict[str, str]:
+    return {
+        "ALL_PROXY": "http://127.0.0.1:9",
+        "HTTP_PROXY": "http://127.0.0.1:9",
+        "HTTPS_PROXY": "http://127.0.0.1:9",
+        "NO_PROXY": "",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "PIP_NO_INDEX": "1",
+        "UV_OFFLINE": "1",
+    }
+
+
+def _offline_process_observation(worker_pid: int) -> dict[str, list[str]]:
+    if os.name != "nt" or worker_pid < 1:
+        raise BuiltWindowsProductQualificationError("offline process observation requires Windows and a Worker PID")
+    script = (
+        "$ErrorActionPreference='Stop'; "
+        "if($null -eq (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) -or "
+        "$null -eq (Get-Command Get-NetUDPEndpoint -ErrorAction SilentlyContinue)){throw 'network audit unavailable'}; "
+        f"$target=[int]{worker_pid}; "
+        "$items=@(Get-CimInstance Win32_Process | ForEach-Object {"
+        "[pscustomobject]@{name=[string]$_.Name;pid=[int]$_.ProcessId;parent=[int]$_.ParentProcessId}}); "
+        "$owned=@($target); $desc=@(); "
+        "do{$next=@($items | Where-Object {$owned -contains $_.parent -and $owned -notcontains $_.pid}); "
+        "$desc+=@($next); $owned+=@($next | ForEach-Object {$_.pid})}while($next.Count -gt 0); "
+        "$tcp=@(Get-NetTCPConnection -ErrorAction SilentlyContinue | "
+        "Where-Object {$owned -contains $_.OwningProcess} | ForEach-Object {"
+        "[pscustomobject]@{protocol='tcp';pid=[int]$_.OwningProcess;state=[string]$_.State;"
+        "localAddress=[string]$_.LocalAddress;localPort=[int]$_.LocalPort;"
+        "remoteAddress=[string]$_.RemoteAddress;remotePort=[int]$_.RemotePort}}); "
+        "$udp=@(Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Where-Object {$owned -contains $_.OwningProcess} | "
+        "ForEach-Object {[pscustomobject]@{protocol='udp';pid=[int]$_.OwningProcess;state='Bound';"
+        "localAddress=[string]$_.LocalAddress;localPort=[int]$_.LocalPort;remoteAddress='';remotePort=0}}); "
+        "[pscustomobject]@{activeSockets=@($tcp+$udp);"
+        'workerDescendants=@($desc | ForEach-Object {"$($_.name):$($_.pid)"} | Sort-Object)} | '
+        "ConvertTo-Json -Compress -Depth 4"
+    )
+    try:
+        raw = subprocess.check_output(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        ).strip()
+        value = json.loads(raw)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        raise BuiltWindowsProductQualificationError("offline Worker process observation failed") from error
+    if not isinstance(value, dict) or set(value) != {"activeSockets", "workerDescendants"}:
+        raise BuiltWindowsProductQualificationError("offline Worker process observation shape differs")
+    descendants = value["workerDescendants"]
+    sockets = value["activeSockets"]
+    if (
+        not isinstance(descendants, list)
+        or any(not isinstance(item, str) or not item for item in descendants)
+        or not isinstance(sockets, list)
+    ):
+        raise BuiltWindowsProductQualificationError("offline Worker process observation entries differ")
+    allowed, unexpected = _classify_offline_sockets(sockets)
+    allowed_descendants = sorted(item for item in descendants if item.rsplit(":", 1)[0].casefold() == "conhost.exe")
+    unexpected_descendants = sorted(set(descendants) - set(allowed_descendants))
+    return {
+        "allowedLoopbackSockets": allowed,
+        "allowedSystemDescendants": allowed_descendants,
+        "unexpectedSockets": unexpected,
+        "workerDescendants": unexpected_descendants,
+    }
+
+
+def _classify_offline_sockets(values: Sequence[object]) -> tuple[list[str], list[str]]:
+    fields = {
+        "localAddress",
+        "localPort",
+        "pid",
+        "protocol",
+        "remoteAddress",
+        "remotePort",
+        "state",
+    }
+    records: list[dict[str, Any]] = []
+    for value in values:
+        if not isinstance(value, dict) or set(value) != fields:
+            raise BuiltWindowsProductQualificationError("offline Worker socket record differs")
+        if (
+            value["protocol"] not in {"tcp", "udp"}
+            or not isinstance(value["pid"], int)
+            or isinstance(value["pid"], bool)
+            or not isinstance(value["state"], str)
+            or not isinstance(value["localAddress"], str)
+            or not isinstance(value["remoteAddress"], str)
+            or not isinstance(value["localPort"], int)
+            or not isinstance(value["remotePort"], int)
+        ):
+            raise BuiltWindowsProductQualificationError("offline Worker socket identity differs")
+        records.append(value)
+    loopback_ports = {
+        port
+        for record in records
+        if record["protocol"] == "tcp"
+        and record["state"] == "Established"
+        and _loopback_address(record["localAddress"])
+        and _loopback_address(record["remoteAddress"])
+        for port in (record["localPort"], record["remotePort"])
+    }
+    allowed: list[str] = []
+    unexpected: list[str] = []
+    for record in records:
+        identity = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        is_loopback_pair = (
+            record["protocol"] == "tcp"
+            and record["state"] == "Established"
+            and _loopback_address(record["localAddress"])
+            and _loopback_address(record["remoteAddress"])
+        )
+        is_bound_half = (
+            record["protocol"] == "tcp"
+            and record["state"] == "Bound"
+            and _unspecified_address(record["localAddress"])
+            and record["localPort"] in loopback_ports
+        )
+        (allowed if is_loopback_pair or is_bound_half else unexpected).append(identity)
+    return sorted(allowed), sorted(unexpected)
+
+
+def _loopback_address(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def _unspecified_address(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_unspecified
+    except ValueError:
+        return False
+
+
 def _offeragent_process_ids() -> dict[str, set[int]]:
     script = (
         "$items = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
-        "Where-Object { $_.Name -in @('offeragent-worker.exe','offeragent-process-host.exe') } | "
+        "Where-Object { $_.Name -in @('offeragent-worker.exe','offeragent-process-host.exe',"
+        "'node.exe','conhost.exe') } | "
         "ForEach-Object { [pscustomobject]@{ name=$_.Name; pid=[int]$_.ProcessId } }); "
         "$items | ConvertTo-Json -Compress"
     )
@@ -261,6 +450,8 @@ def _offeragent_process_ids() -> dict[str, set[int]]:
         timeout=30,
     ).strip()
     result: dict[str, set[int]] = {
+        "conhost.exe": set(),
+        "node.exe": set(),
         "offeragent-process-host.exe": set(),
         "offeragent-worker.exe": set(),
     }
