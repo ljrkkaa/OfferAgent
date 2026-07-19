@@ -1063,6 +1063,9 @@ def _timeout_failure_message(label: str, events: list[Mapping[str, Any]]) -> str
     tool_results = _tool_result_trace(events)
     if tool_results:
         fields.append(f"toolResultTrace={'>'.join(tool_results)}")
+    tool_failure_message = _last_tool_failure_message(events)
+    if tool_failure_message is not None:
+        fields.append(f"toolFailureMessage={tool_failure_message}")
     blocker_trace = _blocker_trace(events)
     if blocker_trace:
         fields.append(f"blockerTrace={'>'.join(blocker_trace)}")
@@ -1158,6 +1161,40 @@ def _tool_result_trace(events: list[Mapping[str, Any]]) -> tuple[str, ...]:
                 diagnostic = f"{diagnostic}:{tool_error_code}"
             results.append(diagnostic)
     return tuple(results[-16:])
+
+
+def _last_tool_failure_message(events: list[Mapping[str, Any]]) -> str | None:
+    call_names: dict[str, str] = {}
+    failure: str | None = None
+    for event in events:
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        if event.get("type") == "tool.calls.accepted":
+            calls = payload.get("calls")
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                call_id = call.get("toolCallId") if isinstance(call, Mapping) else None
+                name = call.get("name") if isinstance(call, Mapping) else None
+                if (
+                    isinstance(call_id, str)
+                    and call_id
+                    and isinstance(name, str)
+                    and _BLOCKER_DIAGNOSTIC.fullmatch(name)
+                ):
+                    call_names.setdefault(call_id, name)
+            continue
+        if event.get("type") != "tool.failed":
+            continue
+        result = payload.get("result")
+        call_id = result.get("toolCallId") if isinstance(result, Mapping) else None
+        error = result.get("error") if isinstance(result, Mapping) else None
+        message = error.get("userVisibleMessage") if isinstance(error, Mapping) else None
+        name = call_names.get(call_id) if isinstance(call_id, str) else None
+        if name is not None and isinstance(message, str) and message:
+            failure = f"{name}:{json.dumps(_diagnostic_text(message), ensure_ascii=False)}"
+    return failure
 
 
 def _diagnostic_text(value: str) -> str:

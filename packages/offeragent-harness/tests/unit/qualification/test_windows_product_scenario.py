@@ -453,6 +453,9 @@ def test_run_timeout_reports_safe_tool_results_and_response_blockers(
                             "data": {"secret": "must-not-leak"},
                             "error": {
                                 "code": "tool.failed",
+                                "userVisibleMessage": (
+                                    "Vault Change Batch identity, task, or operation count is invalid."
+                                ),
                                 "details": {
                                     "toolErrorCode": "resource.conflict",
                                     "toolErrorDetails": {"secret": "must-not-leak"},
@@ -490,6 +493,8 @@ def test_run_timeout_reports_safe_tool_results_and_response_blockers(
         match=(
             r"Run timed out after events \[tool\.calls\.accepted,tool\.failed,run\.continuation_required\] "
             r"toolResultTrace=vault\.changes\.apply:failed:resource\.conflict "
+            r'toolFailureMessage=vault\.changes\.apply:"Vault Change Batch identity, task, '
+            r'or operation count is invalid\." '
             r"blockerTrace=write_outcome_required"
         ),
     ) as captured:
