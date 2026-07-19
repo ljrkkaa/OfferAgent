@@ -468,29 +468,44 @@ def _product_process_ids() -> dict[str, set[int]]:
     if os.name != "nt":
         return {name: set() for name in names}
     script = (
-        "$items = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+        "$ErrorActionPreference='Stop'; "
+        "$items = @(Get-CimInstance Win32_Process -ErrorAction Stop | "
         "Where-Object { $_.Name -in @('offeragent-worker.exe','offeragent-process-host.exe') } | "
-        "ForEach-Object { [pscustomobject]@{ name=$_.Name; pid=[int]$_.ProcessId } }); "
-        "$items | ConvertTo-Json -Compress"
+        "ForEach-Object { [pscustomobject]@{ name=$_.Name.ToLowerInvariant(); pid=[int]$_.ProcessId } }); "
+        "ConvertTo-Json -InputObject $items -Compress"
     )
-    raw = subprocess.check_output(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-        text=True,
-        encoding="utf-8",
-        timeout=30,
-    ).strip()
+    try:
+        raw = subprocess.check_output(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+        ).strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise LiveBuiltProductQualificationError("product process snapshot is unavailable") from error
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise LiveBuiltProductQualificationError("product process snapshot is malformed") from error
+    if not isinstance(value, list):
+        raise LiveBuiltProductQualificationError("product process snapshot has an invalid shape")
     result: dict[str, set[int]] = {name: set() for name in names}
-    if not raw:
-        return result
-    value = json.loads(raw)
-    records = value if isinstance(value, list) else [value]
-    for record in records:
-        if not isinstance(record, dict):
-            continue
+    seen_process_ids: set[int] = set()
+    for record in value:
+        if not isinstance(record, dict) or set(record) != {"name", "pid"}:
+            raise LiveBuiltProductQualificationError("product process snapshot has an invalid record")
         name = record.get("name")
         process_id = record.get("pid")
-        if name in result and isinstance(process_id, int):
-            result[name].add(process_id)
+        if (
+            not isinstance(name, str)
+            or name not in result
+            or type(process_id) is not int
+            or process_id <= 0
+            or process_id in seen_process_ids
+        ):
+            raise LiveBuiltProductQualificationError("product process snapshot has an invalid process identity")
+        result[name].add(process_id)
+        seen_process_ids.add(process_id)
     return result
 
 

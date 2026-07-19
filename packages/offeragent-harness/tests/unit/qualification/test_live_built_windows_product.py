@@ -13,6 +13,7 @@ from scripts.qualify_built_windows_product import _remove_owned_root as _remove_
 from scripts.qualify_live_built_windows_product import (
     LiveBuiltProductQualificationError,
     _canonical_json,
+    _product_process_ids,
     _remove_owned_root,
     _vault_markdown_documents,
     _vault_markdown_snapshot,
@@ -140,6 +141,65 @@ def test_owned_root_cleanup_refuses_a_changed_marker(tmp_path: Path) -> None:
 
     with pytest.raises(LiveBuiltProductQualificationError, match="ownership identity differs"):
         _remove_owned_root(root, expected)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CIM process audit")
+def test_product_process_snapshot_uses_a_fail_closed_cim_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[list[str]] = []
+
+    def snapshot(argv: list[str], **_kwargs: object) -> str:
+        captured.append(argv)
+        return '[{"name":"offeragent-worker.exe","pid":4242}]'
+
+    monkeypatch.setattr("scripts.qualify_live_built_windows_product.subprocess.check_output", snapshot)
+
+    assert _product_process_ids() == {
+        "offeragent-worker.exe": {4242},
+        "offeragent-process-host.exe": set(),
+    }
+    assert len(captured) == 1
+    script = captured[0][-1]
+    assert "$ErrorActionPreference='Stop'" in script
+    assert "Get-CimInstance Win32_Process -ErrorAction Stop" in script
+    assert "ConvertTo-Json -InputObject $items -Compress" in script
+    assert "SilentlyContinue" not in script
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CIM process audit")
+@pytest.mark.parametrize(
+    "payload",
+    (
+        "",
+        "{}",
+        "{",
+        "[{}]",
+        '[{"name":[],"pid":4242}]',
+        '[{"name":"offeragent-worker.exe","pid":true}]',
+        '[{"name":"unknown.exe","pid":4242}]',
+    ),
+)
+def test_product_process_snapshot_rejects_missing_or_malformed_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: str,
+) -> None:
+    monkeypatch.setattr(
+        "scripts.qualify_live_built_windows_product.subprocess.check_output",
+        lambda *_args, **_kwargs: payload,
+    )
+
+    with pytest.raises(LiveBuiltProductQualificationError, match="process snapshot"):
+        _product_process_ids()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CIM process audit")
+def test_product_process_snapshot_rejects_a_failed_cim_query(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_query(*_args: object, **_kwargs: object) -> str:
+        raise OSError("CIM unavailable")
+
+    monkeypatch.setattr("scripts.qualify_live_built_windows_product.subprocess.check_output", fail_query)
+
+    with pytest.raises(LiveBuiltProductQualificationError, match="process snapshot is unavailable"):
+        _product_process_ids()
 
 
 def test_live_failure_still_audits_auth_processes_and_owned_root(
