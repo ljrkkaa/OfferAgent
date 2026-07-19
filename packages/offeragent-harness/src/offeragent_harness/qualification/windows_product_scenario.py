@@ -10,7 +10,7 @@ import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
 from offeragent_harness.qualification.windows_product_driver import QualificationDriverEventTimeout
@@ -96,6 +96,7 @@ class ReviewEvidence:
     review_hash: str
     batch_id: str
     paths: tuple[str, ...]
+    after_content_hashes: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -967,6 +968,7 @@ def _validate_interview_review(
         raise BuiltProductQualificationError("Interview Submission review targets differ from reviewed paths")
     if len(categorized) != len(paths) or len(targets) != len(paths):
         raise BuiltProductQualificationError("Interview Submission review target count is invalid")
+    after_content_hashes: list[tuple[str, str]] = []
     for categorized_target, review_target in zip(categorized, targets, strict=True):
         if not isinstance(categorized_target, Mapping) or not isinstance(review_target, Mapping):
             raise BuiltProductQualificationError("Interview Submission review target is invalid")
@@ -985,6 +987,7 @@ def _validate_interview_review(
             or categorized_target.get("expectedModifiedVersion") != review_target.get("beforeModifiedVersion")
         ):
             raise BuiltProductQualificationError("Interview Submission review content identity is invalid")
+        after_content_hashes.append((cast(str, review_target["path"]), after_hash))
     binding_paths: set[str] = set()
     for binding in bindings:
         if not isinstance(binding, Mapping):
@@ -1006,7 +1009,7 @@ def _validate_interview_review(
     )
     if review_hash != expected_hash:
         raise BuiltProductQualificationError("Interview Submission review hash is invalid")
-    return ReviewEvidence(review_id, review_hash, batch_id, tuple(paths))
+    return ReviewEvidence(review_id, review_hash, batch_id, tuple(paths), tuple(after_content_hashes))
 
 
 def _validate_interview_approval_resolution(

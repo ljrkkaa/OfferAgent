@@ -140,7 +140,7 @@ class QualificationReport:
     status: Literal["passed", "failed"]
     catalog_revision: str
     catalog_freshness: str
-    font_sha256: str
+    fixture_sha256: str
     page_hashes: tuple[str, ...]
     models: tuple[ModelQualificationResult, ...]
     image_models_qualified: int
@@ -159,7 +159,7 @@ class QualificationReport:
                 "modelCount": len(self.models),
             },
             "fixture": {
-                "fontSha256": self.font_sha256,
+                "fixtureSha256": self.fixture_sha256,
                 "pageHashes": list(self.page_hashes),
             },
             "models": [
@@ -336,7 +336,7 @@ class CodexVisionQualification:
             status="passed" if passed else "failed",
             catalog_revision=catalog.catalog_revision,
             catalog_freshness=catalog.freshness,
-            font_sha256=fixture.font_sha256,
+            fixture_sha256=fixture.fixture_sha256,
             page_hashes=tuple(page.content_hash for page in fixture.pages),
             models=tuple(results),
             image_models_qualified=image_qualified,
@@ -509,10 +509,10 @@ class _Recorder:
 class LiveOfferAgentQualificationEnvironment:
     """Use the real attachment, Run preparation, Agent Loop, and Codex gateway path."""
 
-    def __init__(self, *, proxy_url: str, font_path: Path) -> None:
+    def __init__(self, *, proxy_url: str) -> None:
         ModelSettings(proxy_url=proxy_url)
         self._proxy_url = proxy_url
-        self._generator = SyntheticInterviewFixtureGenerator(font_path=font_path)
+        self._generator = SyntheticInterviewFixtureGenerator()
         self._credentials = CodexFileCredentialSource()
         self._catalog_module = CodexSubscriptionModelModule(
             credentials=self._credentials,

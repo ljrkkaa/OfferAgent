@@ -28,20 +28,17 @@ from offeragent_harness.providers.codex_subscription import (
 )
 
 
-def _test_font() -> Path:
-    candidates = (
-        Path(r"C:\Windows\Fonts\NotoSansSC-VF.ttf"),
-        Path(r"C:\Windows\Fonts\arial.ttf"),
-    )
-    return next(path for path in candidates if path.is_file())
-
-
 def test_synthetic_interview_pages_are_repeatable_ordered_and_private(tmp_path: Path) -> None:
-    first = SyntheticInterviewFixtureGenerator(font_path=_test_font()).generate(tmp_path / "first")
-    second = SyntheticInterviewFixtureGenerator(font_path=_test_font()).generate(tmp_path / "second")
+    first = SyntheticInterviewFixtureGenerator().generate(tmp_path / "first")
+    second = SyntheticInterviewFixtureGenerator().generate(tmp_path / "second")
 
-    assert first.font_sha256 == second.font_sha256
+    assert first.fixture_sha256 == second.fixture_sha256
     assert [page.index for page in first.pages] == [1, 2, 3]
+    assert [page.content_hash for page in first.pages] == [
+        "sha256:58fc39a75f39afd5dee5ef1eb50aadacdb5fdaeb7ddce67b807cc9aa97fc9e0d",
+        "sha256:e818a610b96125c112e4c22c0a54f93239bfbe37a711fa19ef0c7dd567e240f3",
+        "sha256:e6b3fe971fbe73b19d4b40854525b1ae49acfd0c9ab9e5145ba1e5da7b8f0bba",
+    ]
     assert [page.content_hash for page in first.pages] == [page.content_hash for page in second.pages]
     assert [page.byte_length for page in first.pages] == [page.byte_length for page in second.pages]
     assert all(page.media_type == "image/png" for page in first.pages)
@@ -133,7 +130,7 @@ class _MatrixEnvironment:
         }
         self.image_calls: list[tuple[str, str]] = []
         self.text_calls: list[str] = []
-        self.generator = SyntheticInterviewFixtureGenerator(font_path=_test_font())
+        self.generator = SyntheticInterviewFixtureGenerator()
 
     def generate_fixture(self, root: Path) -> SyntheticInterviewFixture:
         return self.generator.generate(root)
@@ -341,7 +338,6 @@ def test_live_environment_refuses_to_own_or_delete_an_existing_root(tmp_path: Pa
     sentinel.write_text("preserve", encoding="utf-8")
     environment = LiveOfferAgentQualificationEnvironment(
         proxy_url="http://127.0.0.1:7896",
-        font_path=_test_font(),
     )
 
     with pytest.raises(QualificationFailure, match="must not already exist"):

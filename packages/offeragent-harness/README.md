@@ -47,12 +47,10 @@ uv build
 ```powershell
 $env:OFFERAGENT_RUN_LIVE_CODEX_VISION = '1'
 $env:OFFERAGENT_CODEX_PROXY_URL = 'http://127.0.0.1:7896'
-# 可选；默认使用 C:\Windows\Fonts\NotoSansSC-VF.ttf
-$env:OFFERAGENT_QUALIFICATION_CJK_FONT = 'C:\Windows\Fonts\NotoSansSC-VF.ttf'
 uv run pytest tests/acceptance/test_live_codex_vision.py -q -s
 ```
 
-启用后，缺失登录、代理、字体、实时目录或网络均为失败而不是 skip。测试在临时目录生成三页虚构中文面经，
+启用后，缺失登录、代理、实时目录或网络均为失败而不是 skip。测试把仓库内哈希固定的三页虚构中文面经复制到临时目录，
 通过真实 `ConversationAttachmentStore`、`ProductionRunComponentsFactory`、canonical Agent Loop 和 Codex
 Subscription Responses gateway 验证每个目录声明的图片模型；文本模型必须在附件物化和网络发送前返回
 `image_modality_unsupported`，且 gateway factory 计数也必须为零。视觉回答由不含答案的固定 JSON Schema

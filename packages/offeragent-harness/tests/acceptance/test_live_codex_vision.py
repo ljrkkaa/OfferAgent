@@ -18,10 +18,8 @@ async def test_every_live_codex_image_model_understands_the_same_ordered_intervi
     proxy_url = os.environ.get("OFFERAGENT_CODEX_PROXY_URL")
     if not proxy_url:
         pytest.fail("enabled live qualification requires OFFERAGENT_CODEX_PROXY_URL")
-    font_path = Path(os.environ.get("OFFERAGENT_QUALIFICATION_CJK_FONT", r"C:\Windows\Fonts\NotoSansSC-VF.ttf"))
     environment = LiveOfferAgentQualificationEnvironment(
         proxy_url=proxy_url,
-        font_path=font_path,
     )
 
     report = await CodexVisionQualification(environment).run(tmp_path / "live-codex-vision")

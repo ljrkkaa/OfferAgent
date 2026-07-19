@@ -20,7 +20,11 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any
 
-from offeragent_harness.qualification.synthetic_interview import SyntheticInterviewFixtureGenerator
+from offeragent_harness.qualification.synthetic_interview import (
+    SyntheticInterviewFixtureGenerator,
+    SyntheticInterviewSemanticError,
+    validate_synthetic_interview_vault,
+)
 from offeragent_harness.qualification.windows_product_artifact import verify_paired_windows_artifacts
 from offeragent_harness.qualification.windows_product_driver import QualificationDriverClient
 from offeragent_harness.qualification.windows_product_scenario import (
@@ -77,7 +81,6 @@ def qualify_live_built_windows_product(
     node_executable: Path,
     proxy_url: str,
     model: str,
-    font_path: Path,
     run_timeout: float = 300,
     temporary_parent: Path | None = None,
 ) -> dict[str, Any]:
@@ -107,7 +110,7 @@ def qualify_live_built_windows_product(
         local_app_data.mkdir()
         workspace_id = ensure_portable_workspace_config(vault).portable_workspace_id
         _initialize_vault_git(vault)
-        fixture = SyntheticInterviewFixtureGenerator(font_path=font_path).generate(fixture_root)
+        fixture = SyntheticInterviewFixtureGenerator().generate(fixture_root)
         pages = tuple(
             InterviewImagePage(page.index, page.path.name, page.media_type, page.path.read_bytes())
             for page in fixture.pages
@@ -150,6 +153,14 @@ def qualify_live_built_windows_product(
                 raise LiveBuiltProductQualificationError(
                     "primary Vault changes differ from the exactly reviewed target set"
                 )
+            try:
+                validate_synthetic_interview_vault(
+                    after_primary,
+                    changed_paths,
+                    reviewed_content_hashes=dict(primary.review.after_content_hashes),
+                )
+            except SyntheticInterviewSemanticError as error:
+                raise LiveBuiltProductQualificationError(str(error)) from error
             checkpoint_refs = _checkpoint_refs(vault)
             if len(checkpoint_refs) != 1:
                 raise LiveBuiltProductQualificationError("primary Interview Submission did not create one checkpoint")
@@ -202,7 +213,7 @@ def qualify_live_built_windows_product(
             "textRun": _run_report(text),
             "visionRun": {
                 **_run_report(primary.run),
-                "fontSha256": fixture.font_sha256,
+                "fixtureSha256": fixture.fixture_sha256,
                 "orderedImageContentHashes": list(primary.ordered_image_content_hashes),
                 "review": {
                     "batchId": primary.review.batch_id,
@@ -225,6 +236,7 @@ def qualify_live_built_windows_product(
                 "afterReplaySha256": _snapshot_hash(after_replay),
                 "afterDuplicateSha256": _snapshot_hash(after_duplicate),
                 "changedPaths": changed_paths,
+                "semanticFactsVerified": ["company", "role", "rounds", "Q1", "cross-page Q2", "Q3", "Q4"],
                 "checkpointRefs": checkpoint_refs,
                 "conditionalApply": True,
                 "duplicateSourceNoChange": True,
@@ -464,7 +476,6 @@ def main() -> int:
     parser.add_argument("--source-root-guard", type=Path, required=True)
     parser.add_argument("--proxy-url", required=True)
     parser.add_argument("--model", default="gpt-5.5")
-    parser.add_argument("--font-path", type=Path, required=True)
     parser.add_argument("--node-executable", type=Path)
     parser.add_argument("--run-timeout", type=float, default=300)
     args = parser.parse_args()
@@ -481,7 +492,6 @@ def main() -> int:
         node_executable=node,
         proxy_url=args.proxy_url,
         model=args.model,
-        font_path=args.font_path,
         run_timeout=args.run_timeout,
     )
     print(json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
