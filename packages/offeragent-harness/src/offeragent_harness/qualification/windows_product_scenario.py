@@ -1030,10 +1030,38 @@ def _terminal_failure_message(
             fields.append(f"code={_diagnostic_text(code)}")
         if isinstance(reason, str) and reason:
             fields.append(f"message={_diagnostic_text(reason)}")
+    if isinstance(payload, Mapping):
+        usage = payload.get("usage")
+        if isinstance(usage, Mapping):
+            for key in ("inputTokens", "modelCalls", "toolCalls"):
+                value = usage.get(key)
+                if type(value) is int and value >= 0:
+                    fields.append(f"{key}={value}")
+    tool_trace = _tool_trace(events)
+    if tool_trace:
+        fields.append(f"toolTrace={'>'.join(tool_trace)}")
     last_tool = _last_tool_name(events)
     if last_tool is not None:
         fields.append(f"lastTool={last_tool}")
     return " ".join(fields)
+
+
+def _tool_trace(events: list[Mapping[str, Any]]) -> tuple[str, ...]:
+    names: list[str] = []
+    for event in events:
+        if event.get("type") != "tool.calls.accepted":
+            continue
+        payload = event.get("payload")
+        calls = payload.get("calls") if isinstance(payload, Mapping) else None
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            name = call.get("name") if isinstance(call, Mapping) else None
+            if isinstance(name, str) and name:
+                names.append(_diagnostic_text(name))
+                if len(names) == 16:
+                    return tuple(names)
+    return tuple(names)
 
 
 def _last_tool_name(events: list[Mapping[str, Any]]) -> str | None:

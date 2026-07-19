@@ -362,7 +362,7 @@ def test_terminal_failure_reports_stable_error_and_last_tool_identity() -> None:
                                 "secret": "must-not-leak",
                             },
                         },
-                        "usage": {},
+                        "usage": {"inputTokens": 404_079, "modelCalls": 5, "toolCalls": 4},
                         "partialContent": [],
                     },
                 },
@@ -381,7 +381,8 @@ def test_terminal_failure_reports_stable_error_and_last_tool_identity() -> None:
         match=(
             r"turn.failed code=provider_timeout retryable=true "
             r"message=Provider continuation timed out\. "
-            r"protocolReason=unsupported_continuation_item lastTool=vault\.changes\.apply"
+            r"protocolReason=unsupported_continuation_item inputTokens=404079 modelCalls=5 toolCalls=4 "
+            r"toolTrace=vault\.changes\.apply lastTool=vault\.changes\.apply"
         ),
     ) as captured:
         session.run_text_preflight("Return one short sentence.", timeout=5)
