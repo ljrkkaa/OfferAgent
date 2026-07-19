@@ -412,7 +412,32 @@ class _DeterministicScriptedGateway:
     def __init__(self, script: Sequence[Mapping[str, object]], expected_tool_result_counts: Sequence[int]) -> None:
         self._script = tuple(dict(step) for step in script)
         self._expected_tool_result_counts = tuple(expected_tool_result_counts)
+        self._completed_model_turns: list[tuple[ModelContinuation, tuple[str, ...]]] = []
         self.requests: list[ModelRequest] = []
+
+    def _assert_completed_model_turns_replayed(self, request: ModelRequest) -> None:
+        replayed: list[tuple[int, ModelContinuation]] = []
+        for message_index, message in enumerate(request.messages):
+            continuation_blocks = tuple(block for block in message.content if block.kind == "model_continuation")
+            if not continuation_blocks:
+                continue
+            assert message.role is ModelRole.ASSISTANT
+            assert message.name == "offeragent-model-continuation"
+            assert len(message.content) == 1
+            replayed.append((message_index, ModelContinuation.from_content_block(continuation_blocks[0])))
+
+        assert tuple(continuation for _, continuation in replayed) == tuple(
+            continuation for continuation, _ in self._completed_model_turns
+        )
+        for (message_index, continuation), (expected_continuation, expected_tools) in zip(
+            replayed,
+            self._completed_model_turns,
+            strict=True,
+        ):
+            assert continuation == expected_continuation
+            tool_messages = request.messages[message_index + 1 : message_index + 1 + len(expected_tools)]
+            assert tuple(message.role for message in tool_messages) == (ModelRole.TOOL,) * len(expected_tools)
+            assert tuple(message.name for message in tool_messages) == expected_tools
 
     async def stream(
         self,
@@ -427,8 +452,10 @@ class _DeterministicScriptedGateway:
         assert request.output_schema is not None
         tool_results = [message for message in request.messages if message.role is ModelRole.TOOL]
         assert len(tool_results) == self._expected_tool_result_counts[index]
+        self._assert_completed_model_turns_replayed(request)
         self.requests.append(request)
         step = self._script[index]
+        calls = cast(Sequence[Mapping[str, object]], step["calls"])
         continuation = (
             ModelContinuation(
                 provider_id="codex-subscription",
@@ -443,7 +470,7 @@ class _DeterministicScriptedGateway:
                     },
                 ),
             )
-            if step["calls"]
+            if calls
             else None
         )
         yield ModelEvent(request.request_id, 1, ModelEventKind.STARTED)
@@ -459,6 +486,13 @@ class _DeterministicScriptedGateway:
             ModelEventKind.USAGE,
             usage=ModelUsage(32, 16, 0, 0),
         )
+        if continuation is not None:
+            self._completed_model_turns.append(
+                (
+                    continuation,
+                    tuple(f"{cast(str, call['name'])}@{cast(str, call['version'])}" for call in calls),
+                )
+            )
         yield ModelEvent(
             request.request_id,
             4,
