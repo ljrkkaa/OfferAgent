@@ -565,6 +565,8 @@ def source_tree_identity() -> SourceTreeIdentity:
             ROOT / "scripts" / "frozen_payload.py",
             ROOT / "scripts" / "local_windows_runtime_build.py",
             ROOT / "scripts" / "qualify_built_windows_product.py",
+            ROOT / "scripts" / "qualify_final_windows_product.py",
+            ROOT / "scripts" / "qualify_live_built_windows_product.py",
             ROOT / "scripts" / "runtime_sbom.py",
             PLUGIN / "package.json",
             PLUGIN / "yarn.lock",

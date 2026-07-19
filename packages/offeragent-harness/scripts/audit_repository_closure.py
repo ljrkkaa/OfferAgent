@@ -95,6 +95,9 @@ REQUIRED_PATHS = (
     "packages/offeragent-harness/scripts/build_local_windows_plugin.py",
     "packages/offeragent-harness/scripts/frozen_payload.py",
     "packages/offeragent-harness/scripts/local_windows_runtime_build.py",
+    "packages/offeragent-harness/scripts/qualify_built_windows_product.py",
+    "packages/offeragent-harness/scripts/qualify_final_windows_product.py",
+    "packages/offeragent-harness/scripts/qualify_live_built_windows_product.py",
     "src/interface/obsidian/manifest.json",
     "src/interface/obsidian/package.json",
     "src/interface/obsidian/yarn.lock",
@@ -457,6 +460,8 @@ def _local_build_gate_problems(repository_root: Path) -> list[str]:
         "frozen_payload.py",
         "local_windows_runtime_build.py",
         "qualify_built_windows_product.py",
+        "qualify_final_windows_product.py",
+        "qualify_live_built_windows_product.py",
         "runtime_sbom.py",
     ):
         if helper not in digest_literals:

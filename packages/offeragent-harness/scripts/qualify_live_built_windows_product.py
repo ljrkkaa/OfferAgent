@@ -193,6 +193,7 @@ def qualify_live_built_windows_product(
                 timeout=run_timeout,
             )
         report = {
+            "schemaVersion": 1,
             "status": "passed",
             "artifact": {
                 "sourceCommit": paired.source_commit,
@@ -262,7 +263,10 @@ def qualify_live_built_windows_product(
                 "authFilesSnapshotted": ["Codex broker-selected auth.json"],
                 "authUnchanged": True,
                 "externalVaultAccepted": False,
+                "ownershipMarkerSha256": f"sha256:{hashlib.sha256(marker_payload).hexdigest()}",
                 "realVaultUnopened": True,
+                "temporaryRootName": root.name,
+                "temporaryVaultWorkspaceId": workspace_id,
             },
         }
     except LiveBuiltProductQualificationError as error:
@@ -287,8 +291,10 @@ def qualify_live_built_windows_product(
     except BaseException as error:
         audit_errors.append(f"qualification owned-root cleanup failed: {type(error).__name__}")
     leaked: list[str] = []
+    final_processes: dict[str, set[int]] = {}
     try:
-        leaked = _new_product_processes(baseline_processes, _product_process_ids())
+        final_processes = _product_process_ids()
+        leaked = _new_product_processes(baseline_processes, final_processes)
         if leaked:
             audit_errors.append(f"qualification leaked product processes: {leaked}")
     except BaseException as error:
@@ -309,6 +315,8 @@ def qualify_live_built_windows_product(
     assert report is not None
     report["safety"]["authUnchanged"] = auth_unchanged
     report["safety"]["leakedProcesses"] = leaked
+    report["safety"]["processBaseline"] = _process_snapshot_report(baseline_processes)
+    report["safety"]["processFinal"] = _process_snapshot_report(final_processes)
     report["safety"]["temporaryRootRemoved"] = True
     return report
 
@@ -495,6 +503,10 @@ def _new_product_processes(before: dict[str, set[int]], after: dict[str, set[int
         for name, process_ids in after.items()
         for process_id in process_ids - before.get(name, set())
     )
+
+
+def _process_snapshot_report(snapshot: dict[str, set[int]]) -> dict[str, list[int]]:
+    return {name: sorted(process_ids) for name, process_ids in sorted(snapshot.items())}
 
 
 def _progress(stage: str) -> None:

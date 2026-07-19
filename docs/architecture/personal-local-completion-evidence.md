@@ -84,13 +84,15 @@ corepack yarn test
 更新必须由 `scripts/update_local_windows_plugin.py` 执行。它应在 Obsidian 和 Runtime 进程退出后重新
 构建、复验并原子切换插件目录，同时把 `data.json` 当作不可读取的不透明文件保护和回滚。
 
-完整构建还必须生成独立的资格驱动目录，并运行
-`scripts/qualify_built_windows_product.py --plugin-artifact <plugin> --qualification-artifact <qualification> --source-root-guard <repo>`。
+完整构建还必须生成独立的资格驱动目录。最终证据由
+`scripts/qualify_final_windows_product.py` 这一条 Python 命令从干净 checkout 依次执行全部门禁、构建、离线启动、
+迁移、安装和真实 Codex 阶段；`qualify_built_windows_product.py` 只保留为开发中的快速离线 smoke。
 Python 主控先验证插件精确布局、完整 Runtime manifest、bundle anchor，以及资格驱动对同一 build receipt、
 Runtime manifest、Git commit 和源码树摘要的绑定。TypeScript 驱动只在构建时编译；执行时仅加载密封 CJS、
 manifest 固定的真实冻结 Worker 和 direct stdio，不解析仓库源码。基础 smoke 在 ownership marker 约束的一次性
-Vault 中完成 initialize/shutdown，并证明 Worker/Process Host 零泄漏。真实模型、Vault Change 和恢复阶段继续
-复用同一 Python 资格入口，不给 Worker 注入隐藏模型后门。
+Vault 中完成 initialize/shutdown，主动观测网络 socket 与子进程，并证明 Worker/Process Host 零泄漏。版本化
+canonical JSON 记录实际命令/退出、命名 skip、来源头、local commits、迁移、安装、认证、临时 Vault 和进程证据；
+真实模型、Vault Change 和恢复阶段复用同一 Python 资格入口，不给 Worker 注入隐藏模型后门。
 
 ## 已安装插件 E2E
 

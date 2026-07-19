@@ -47,20 +47,25 @@ uv run python scripts/build_local_windows_plugin.py `
 脚本会执行静态门禁，构建 Worker/Process Host，调用插件内部 `build:local`，生成并复验 manifest，
 然后写入一个新的输出目录。不要直接调用 esbuild，也不要恢复无 manifest 锚点的 `build`/`dev`。
 
-构建完成后，使用 Python 主控对两份密封产物执行融合产品资格烟测：
+开发中的快速离线检查可以使用 `qualify_built_windows_product.py`。最终候选只使用一个 Python 主控命令；
+它依次运行全部 Python/Obsidian 门禁，从不存在的目录构建两份产物，再执行离线、迁移、安装和真实 Codex 验收：
 
 ```powershell
 cd E:\Projects\offeragent\repo\packages\offeragent-harness
-uv run python scripts/qualify_built_windows_product.py `
-  --plugin-artifact E:\Projects\offeragent\artifacts\offeragent-obsidian-plugin `
-  --qualification-artifact E:\Projects\offeragent\artifacts\offeragent-product-qualification `
-  --source-root-guard E:\Projects\offeragent\repo
+uv run python scripts/qualify_final_windows_product.py `
+  --source-root E:\Projects\offeragent\repo `
+  --plugin-output E:\Projects\offeragent\artifacts\offeragent-final-plugin `
+  --qualification-output E:\Projects\offeragent\artifacts\offeragent-final-qualification `
+  --ripgrep-executable C:\path\to\rg.exe `
+  --node-executable C:\path\to\node.exe `
+  --proxy-url http://127.0.0.1:7896 `
+  --temporary-parent E:\Projects\offeragent\artifacts `
+  --review-base 4cf015ae02c59a8b15420ef99d340f95e5001cc6
 ```
 
-主控先验证插件精确布局、完整 Runtime manifest、bundle anchor 和资格 manifest 的同源绑定，再从预编译
-TypeScript 驱动启动真实冻结 Worker。运行期禁止解析仓库源码或编译 TypeScript；临时 Vault 由随机 ownership
-marker 约束创建和删除，结束时比较 Worker/Process Host 进程集合。后续真实模型阶段同样通过此 Python 入口，
-不会给安装版 Worker 注入测试模型通道，也不接触用户真实 Vault。
+stdout 是一个带 `schemaVersion` 的 canonical JSON：绑定两个只读来源头、本地 commits、产物与目录哈希、
+每条真实命令及退出码、命名 skip、实时模型/目录身份、迁移、离线 socket/子进程观测、安装设置哈希、认证比较、
+临时 Vault ownership、进程前后集合与清理结果。运行期禁止解析仓库产品源码或编译 TypeScript，也不接触用户真实 Vault。
 
 产物结构：
 
