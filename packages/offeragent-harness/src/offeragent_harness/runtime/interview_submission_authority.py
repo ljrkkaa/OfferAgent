@@ -990,6 +990,7 @@ class InterviewSubmissionAuthorityPolicy:
         call: ToolCall,
         context: PolicyContext,
     ) -> PolicyDecision:
+        apply_claimed = False
         try:
             self._store.validate_identity(call)
             if context.workspace_id != self._store.workspace_id or context.run_id != call.run_id:
@@ -1001,9 +1002,20 @@ class InterviewSubmissionAuthorityPolicy:
                 self._store.validate_catalog_call(call)
             elif call.name == "vault.changes.apply" and call.arguments.get("changeKind") == "interview_submission":
                 await self._store.claim_apply(call)
+                apply_claimed = True
         except ToolDispatchError as error:
             return await self._deny(definition, call, context, error)
-        return await self._downstream.evaluate(definition, call, context)
+        decision = await self._downstream.evaluate(definition, call, context)
+        if not apply_claimed:
+            return decision
+        return replace(
+            decision,
+            result_context_activations=tuple(
+                dict.fromkeys(
+                    (*decision.result_context_activations, INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT)
+                )
+            ),
+        )
 
     async def _deny(
         self,
@@ -1018,6 +1030,11 @@ class InterviewSubmissionAuthorityPolicy:
             error.code,
             str(error),
             {"interviewSubmissionAuthority": True},
+            result_context_activations=(
+                (INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT,)
+                if error.code == "interview_submission_batch_already_claimed"
+                else ()
+            ),
         )
         await self._audit.record(
             PolicyAuditRecord(
@@ -1118,15 +1135,6 @@ class InterviewSubmissionToolExecutor:
             return result
         if call.name == "vault.changes.apply" and call.arguments.get("changeKind") == "interview_submission":
             await self._store.verify_apply_claim(call)
-            result = await self._delegate.execute(call, cancellation)
-            return replace(
-                result,
-                context_activations=tuple(
-                    dict.fromkeys(
-                        (*result.context_activations, INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT)
-                    )
-                ),
-            )
         return await self._delegate.execute(call, cancellation)
 
 

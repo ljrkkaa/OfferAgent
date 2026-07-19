@@ -421,7 +421,7 @@ class UnifiedToolKernel:
             return self._precomputed(
                 call,
                 definition,
-                self._denied(call, decision.reason_code, decision.user_message),
+                self._policy_denied(call, decision),
             )
 
         original_call = call
@@ -490,7 +490,7 @@ class UnifiedToolKernel:
                     return self._precomputed(
                         call,
                         definition,
-                        self._denied(call, "hook_mutation_policy_denied", decision.user_message),
+                        self._policy_denied(call, decision, code="hook_mutation_policy_denied"),
                     )
 
         if hook_ask and decision.disposition is PolicyDisposition.ALLOW:
@@ -531,6 +531,7 @@ class UnifiedToolKernel:
                 await self._abort_preflight(definition, call, prepared_preflight)
                 raise
             if approval_result is not None:
+                approval_result = self._with_policy_result_context(approval_result, decision)
                 await self._complete_preflight(definition, call, prepared_preflight, approval_result)
                 return self._precomputed(call, definition, approval_result)
             if durable_binding is None:
@@ -564,6 +565,7 @@ class UnifiedToolKernel:
             return await self._execute_attempt(definition, call, token)
 
         async def finalize(result: ToolResult) -> ToolResult:
+            result = self._with_policy_result_context(result, decision)
             try:
                 finalized = await self._finalize_journal(scope, call, result)
             except Exception as error:
@@ -971,7 +973,7 @@ class UnifiedToolKernel:
                 None,
             )
         if revalidated.disposition is PolicyDisposition.DENY:
-            return self._denied(call, "approval_revalidation_denied", revalidated.user_message), None
+            return self._policy_denied(call, revalidated, code="approval_revalidation_denied"), None
         if revalidated.disposition is PolicyDisposition.ASK:
             revalidated = self._bind_preflight_evidence(revalidated, prepared_preflight)
             fresh_binding = revalidated.approval_binding
@@ -1042,7 +1044,7 @@ class UnifiedToolKernel:
         except Exception as error:
             return self._denied(call, "execution_policy_unavailable", f"执行前 Policy 复验失败: {type(error).__name__}")
         if decision.disposition is PolicyDisposition.DENY:
-            return self._denied(call, "execution_policy_denied", decision.user_message)
+            return self._policy_denied(call, decision, code="execution_policy_denied")
         if decision.disposition is PolicyDisposition.ALLOW:
             return None
 
@@ -1420,6 +1422,25 @@ class UnifiedToolKernel:
             None,
             None,
             ToolError(code, message, False, False),
+        )
+
+    @staticmethod
+    def _policy_denied(
+        call: ToolCall,
+        decision: PolicyDecision,
+        *,
+        code: str | None = None,
+    ) -> ToolResult:
+        result = UnifiedToolKernel._denied(call, code or decision.reason_code, decision.user_message)
+        return UnifiedToolKernel._with_policy_result_context(result, decision)
+
+    @staticmethod
+    def _with_policy_result_context(result: ToolResult, decision: PolicyDecision) -> ToolResult:
+        return replace(
+            result,
+            context_activations=tuple(
+                dict.fromkeys((*result.context_activations, *decision.result_context_activations))
+            ),
         )
 
     @staticmethod

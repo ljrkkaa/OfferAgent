@@ -20,6 +20,8 @@ from offeragent_harness.permissions import (
     CapabilityScope,
     PermissionMode,
     PolicyContext,
+    PolicyDecision,
+    PolicyDisposition,
     RiskClass,
     approval_id_for,
 )
@@ -35,6 +37,7 @@ from offeragent_harness.ports import (
     InvocationJournalConflict,
     InvocationRecord,
     JournalState,
+    PolicyEvaluator,
     ToolExecutor,
     ToolObservabilitySink,
 )
@@ -332,13 +335,14 @@ def kernel(
     clock: ManualClock | None = None,
     hooks: HookLifecyclePort | None = None,
     observability: ToolObservabilitySink | None = None,
+    policy: PolicyEvaluator | None = None,
 ) -> UnifiedToolKernel:
     context = policy_context or make_context(tools, mode)
     runtime_clock = clock or ManualClock(NOW)
     return UnifiedToolKernel(
         registry=ToolRegistry("snapshot_1", tools),
         validator=ToolValidator(),
-        policy=RuleBasedPolicyEvaluator(rules, audit_sink=NullPolicyAuditSink()),
+        policy=policy or RuleBasedPolicyEvaluator(rules, audit_sink=NullPolicyAuditSink()),
         policy_context=policy_context_factory or (lambda _: context),
         scheduler=ToolScheduler(
             clock=runtime_clock,
@@ -354,6 +358,73 @@ def kernel(
         hooks=hooks,
         observability=observability,
     )
+
+
+class _ActivationDenyPolicy:
+    async def evaluate(
+        self,
+        definition: ToolDefinition,
+        tool_call: ToolCall,
+        context: PolicyContext,
+    ) -> PolicyDecision:
+        del tool_call, context
+        return PolicyDecision(
+            PolicyDisposition.DENY,
+            definition.risk,
+            "one_shot_consumed",
+            "This Run already consumed the one-shot operation.",
+            result_context_activations=("one-shot.consumed",),
+        )
+
+
+class _ActivationAllowPolicy:
+    async def evaluate(
+        self,
+        definition: ToolDefinition,
+        tool_call: ToolCall,
+        context: PolicyContext,
+    ) -> PolicyDecision:
+        del tool_call, context
+        return PolicyDecision(
+            PolicyDisposition.ALLOW,
+            definition.risk,
+            "one_shot_claimed",
+            "The one-shot operation is claimed.",
+            result_context_activations=("one-shot.consumed",),
+        )
+
+
+@pytest.mark.asyncio
+async def test_policy_denial_can_activate_a_run_call_fence_without_dispatch() -> None:
+    tool = definition("workspace.read")
+    execution = await kernel(
+        (tool,),
+        ExactAttemptExecutor(()),
+        MemoryJournal(),
+        mode=PermissionMode.NORMAL,
+        policy=_ActivationDenyPolicy(),
+    ).execute_batch((call(tool, 1),), ManualCancellationToken())
+
+    assert execution[0].result.status is ToolResultStatus.DENIED
+    assert execution[0].result.error is not None
+    assert execution[0].result.error.code == "one_shot_consumed"
+    assert execution[0].result.context_activations == ("one-shot.consumed",)
+
+
+@pytest.mark.asyncio
+async def test_policy_claim_activation_is_persisted_on_the_dispatched_result() -> None:
+    tool = definition("workspace.read")
+    tool_call = call(tool, 1)
+    execution = await kernel(
+        (tool,),
+        ExactAttemptExecutor((Attempt(tool_call, success(tool_call.tool_call_id, 1)),)),
+        MemoryJournal(),
+        mode=PermissionMode.NORMAL,
+        policy=_ActivationAllowPolicy(),
+    ).execute_batch((tool_call,), ManualCancellationToken())
+
+    assert execution[0].result.status is ToolResultStatus.SUCCEEDED
+    assert execution[0].result.context_activations == ("one-shot.consumed",)
 
 
 class PathPreflight:

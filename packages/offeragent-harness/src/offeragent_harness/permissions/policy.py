@@ -183,12 +183,19 @@ class PolicyDecision:
     user_message: str
     audit_facts: Mapping[str, Any] = field(default_factory=dict)
     approval_binding: ApprovalBinding | None = None
+    result_context_activations: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.reason_code or not self.user_message:
             raise ValueError("policy decisions require a reason code and user message")
         if (self.disposition is PolicyDisposition.ASK) != (self.approval_binding is not None):
             raise ValueError("only ask decisions carry an approval binding")
+        activations = tuple(self.result_context_activations)
+        if len(activations) != len(set(activations)) or any(
+            not value or len(value) > 256 or "\x00" in value for value in activations
+        ):
+            raise ValueError("policy result context activations must be unique bounded identifiers")
+        object.__setattr__(self, "result_context_activations", activations)
         frozen = freeze_json(self.audit_facts)
         if not isinstance(frozen, FrozenJsonObject):
             raise TypeError("audit_facts must be a JSON object")

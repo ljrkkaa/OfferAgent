@@ -392,12 +392,10 @@ async def test_catalog_receipt_binds_one_apply_slot_across_executor_reconstructi
         call_id="apply-first",
     )
 
-    assert (await policy.evaluate(apply_definition, first, _context(apply_definition))).disposition is (
-        PolicyDisposition.ALLOW
-    )
-    first_result = await executor.execute(first, ManualCancellationToken())
-    assert first_result.status is ToolResultStatus.FAILED
-    assert first_result.context_activations == (INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT,)
+    first_decision = await policy.evaluate(apply_definition, first, _context(apply_definition))
+    assert first_decision.disposition is PolicyDisposition.ALLOW
+    assert first_decision.result_context_activations == (INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT,)
+    assert (await executor.execute(first, ManualCancellationToken())).status is ToolResultStatus.FAILED
     assert (await policy.evaluate(apply_definition, first, _context(apply_definition))).disposition is (
         PolicyDisposition.ALLOW
     )
@@ -412,6 +410,7 @@ async def test_catalog_receipt_binds_one_apply_slot_across_executor_reconstructi
 
     assert denied.disposition is PolicyDisposition.DENY
     assert denied.reason_code == "interview_submission_batch_already_claimed"
+    assert denied.result_context_activations == (INTERVIEW_SUBMISSION_APPLY_CONSUMED_CONTEXT,)
     assert [call.tool_call_id for call in plugin.calls] == ["catalog-valid", "apply-first", "apply-first"]
 
 
