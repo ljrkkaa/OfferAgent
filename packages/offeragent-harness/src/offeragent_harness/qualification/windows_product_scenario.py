@@ -929,7 +929,6 @@ def _validate_interview_review(
         or not isinstance(categorized, list)
         or not isinstance(targets, list)
         or not isinstance(bindings, list)
-        or not bindings
     ):
         raise BuiltProductQualificationError("Interview Submission review targets or sources are invalid")
     if [item.get("path") for item in categorized if isinstance(item, Mapping)] != paths:

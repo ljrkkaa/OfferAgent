@@ -546,13 +546,7 @@ def _review(page_hashes: list[str]) -> dict[str, Any]:
                 "expectedContentHash": "absent",
             },
         ],
-        "sourceBindings": [
-            {
-                "path": "Interview Experience/README.md",
-                "expectedModifiedVersion": "mtime:1:size:1",
-                "expectedContentHash": "sha256:" + "c" * 64,
-            }
-        ],
+        "sourceBindings": [],
         "interviewSubmission": {
             "sourceFingerprint": "sha256:" + "d" * 64,
             "orderedImageContentHashes": page_hashes,
