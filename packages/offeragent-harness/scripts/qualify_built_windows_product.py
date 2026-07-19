@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
@@ -51,10 +52,15 @@ def smoke_built_windows_product(
     marker = root / ".offeragent-qualification-owner.json"
     marker_payload = _canonical_json({"schemaVersion": 1, "token": ownership_token})
     marker.write_bytes(marker_payload)
+    trace_path = root / "offline-audit.jsonl"
+    trace_token = secrets.token_hex(32)
     vault = root / "Vault"
     local_app_data = root / "LocalAppData"
     baseline = _offeragent_process_ids()
-    result: dict[str, Any]
+    result: dict[str, Any] | None = None
+    offline_audit: dict[str, Any] | None = None
+    primary_error: BaseException | None = None
+    primary_cause: BaseException | None = None
     removed = False
     try:
         vault.mkdir()
@@ -90,7 +96,7 @@ def smoke_built_windows_product(
             driver=paired.driver,
             working_directory=paired.qualification_root,
             source_root_guard=guard,
-            environment_overrides=_offline_environment(),
+            environment_overrides=_offline_environment(trace_path, trace_token),
         ) as driver:
             hello = driver.request("hello", {})
             if hello != {
@@ -129,6 +135,7 @@ def smoke_built_windows_product(
             stopped = driver.request("product/stop", {})
             if stopped != {"stopped": True, "workerPid": worker_pid}:
                 raise BuiltWindowsProductQualificationError("qualification offline Worker did not stop exactly")
+        offline_audit = _offline_audit_report(trace_path, trace_token)
         result = {
             "driverProtocolVersion": 2,
             "sourceFreeRuntime": True,
@@ -144,17 +151,51 @@ def smoke_built_windows_product(
             or not isinstance(result.get("workerPid"), int)
         ):
             raise BuiltWindowsProductQualificationError("qualification driver smoke contract differs")
-    finally:
+    except BuiltWindowsProductQualificationError as error:
+        primary_error = error
+    except (OSError, subprocess.SubprocessError) as error:
+        primary_error = BuiltWindowsProductQualificationError(str(error))
+        primary_cause = error
+    except BaseException as error:
+        primary_error = error
+
+    audit_errors: list[str] = []
+    if offline_audit is None:
+        try:
+            offline_audit = _offline_audit_report(trace_path, trace_token)
+        except BaseException as error:
+            audit_errors.append(f"offline guard audit failed: {type(error).__name__}")
+    try:
         _remove_owned_root(root, marker_payload)
         removed = not root.exists()
-    final = _offeragent_process_ids()
-    leaked = sorted(
-        f"{image}:{process_id}"
-        for image, process_ids in final.items()
-        for process_id in process_ids - baseline.get(image, set())
-    )
-    if leaked:
-        raise BuiltWindowsProductQualificationError(f"qualification leaked product processes: {leaked}")
+    except BaseException as error:
+        audit_errors.append(f"qualification owned-root cleanup failed: {type(error).__name__}")
+    leaked: list[str] = []
+    try:
+        final = _offeragent_process_ids()
+        leaked = sorted(
+            f"{image}:{process_id}"
+            for image, process_ids in final.items()
+            for process_id in process_ids - baseline.get(image, set())
+        )
+        if leaked:
+            audit_errors.append(f"qualification leaked product processes: {leaked}")
+    except BaseException as error:
+        audit_errors.append(f"qualification process safety audit failed: {type(error).__name__}")
+    if not removed:
+        audit_errors.append("qualification temporary root was not removed")
+    if audit_errors:
+        audit_summary = "; ".join(audit_errors)
+        if primary_error is not None:
+            raise BuiltWindowsProductQualificationError(f"{primary_error}; safety audit: {audit_summary}") from (
+                primary_cause or primary_error
+            )
+        raise BuiltWindowsProductQualificationError(f"qualification safety audit failed: {audit_summary}")
+    if primary_error is not None:
+        if primary_cause is not None:
+            raise primary_error from primary_cause
+        raise primary_error
+    assert result is not None and offline_audit is not None
     return {
         **result,
         "leakedProcesses": leaked,
@@ -163,14 +204,12 @@ def smoke_built_windows_product(
         "sourceTreeSha256": paired.source_tree_sha256,
         "temporaryRootRemoved": removed,
         "offlineStartup": {
-            "networkBoundary": "closed-loopback-proxy-plus-active-socket-audit",
+            **offline_audit,
+            "networkBoundary": "pre-import-python-audit-deny-plus-active-socket-audit",
             "allowedLoopbackSockets": allowed_loopback_sockets,
             "allowedSystemDescendants": allowed_system_descendants,
             "unexpectedSockets": unexpected_sockets,
             "workerDescendants": worker_descendants,
-            "systemPythonInvoked": False,
-            "pipInvoked": False,
-            "startupDownloadAttempted": False,
         },
     }
 
@@ -298,7 +337,7 @@ def _remove_owned_root(root: Path, expected_marker: bytes) -> None:
     shutil.rmtree(root)
 
 
-def _offline_environment() -> dict[str, str]:
+def _offline_environment(trace_path: Path, token: str) -> dict[str, str]:
     return {
         "ALL_PROXY": "http://127.0.0.1:9",
         "HTTP_PROXY": "http://127.0.0.1:9",
@@ -307,6 +346,65 @@ def _offline_environment() -> dict[str, str]:
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         "PIP_NO_INDEX": "1",
         "UV_OFFLINE": "1",
+        "OFFERAGENT_OFFLINE_QUALIFICATION_TRACE": str(trace_path),
+        "OFFERAGENT_OFFLINE_QUALIFICATION_TOKEN": token,
+    }
+
+
+def _offline_audit_report(trace_path: Path, token: str) -> dict[str, Any]:
+    try:
+        info = trace_path.lstat()
+        payload = trace_path.read_bytes()
+    except OSError as error:
+        raise BuiltWindowsProductQualificationError("offline guard trace is unavailable") from error
+    if trace_path.is_symlink() or info.st_nlink != 1 or not payload.endswith(b"\n"):
+        raise BuiltWindowsProductQualificationError("offline guard trace identity differs")
+    token_sha256 = f"sha256:{hashlib.sha256(token.encode()).hexdigest()}"
+    records: list[dict[str, Any]] = []
+    fields = {
+        "decision",
+        "event",
+        "pipInvoked",
+        "schemaVersion",
+        "sequence",
+        "startupDownloadAttempted",
+        "systemPythonInvoked",
+        "target",
+        "tokenSha256",
+    }
+    for sequence, line in enumerate(payload.splitlines(keepends=True)):
+        try:
+            record = json.loads(line.decode("utf-8", errors="strict"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise BuiltWindowsProductQualificationError("offline guard trace is malformed") from error
+        if (
+            not isinstance(record, dict)
+            or set(record) != fields
+            or record.get("schemaVersion") != 1
+            or record.get("sequence") != sequence
+            or record.get("tokenSha256") != token_sha256
+            or record.get("decision") not in {"allow", "deny"}
+            or any(
+                not isinstance(record.get(field), bool)
+                for field in ("pipInvoked", "startupDownloadAttempted", "systemPythonInvoked")
+            )
+            or not isinstance(record.get("event"), str)
+            or not isinstance(record.get("target"), str)
+            or line != _canonical_json(record)
+        ):
+            raise BuiltWindowsProductQualificationError("offline guard trace record differs")
+        records.append(record)
+    if not records or records[0]["event"] != "guard.installed" or records[0]["decision"] != "allow":
+        raise BuiltWindowsProductQualificationError("offline guard was not installed before Worker startup")
+    denied = [record for record in records if record["decision"] == "deny"]
+    if denied:
+        raise BuiltWindowsProductQualificationError("offline guard captured a denied startup attempt")
+    return {
+        "auditEventCount": len(records),
+        "auditTraceSha256": f"sha256:{hashlib.sha256(payload).hexdigest()}",
+        "pipInvoked": any(record["pipInvoked"] for record in records),
+        "startupDownloadAttempted": any(record["startupDownloadAttempted"] for record in records),
+        "systemPythonInvoked": any(record["systemPythonInvoked"] for record in records),
     }
 
 

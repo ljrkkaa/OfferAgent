@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -274,6 +277,16 @@ def test_smoke_owns_the_temporary_vault_and_drives_frozen_worker_lifecycle(
         "scripts.qualify_built_windows_product._offeragent_process_ids",
         lambda: {"offeragent-process-host.exe": set(), "offeragent-worker.exe": set()},
     )
+    monkeypatch.setattr(
+        "scripts.qualify_built_windows_product._offline_audit_report",
+        lambda _path, _token: {
+            "auditEventCount": 1,
+            "auditTraceSha256": "sha256:" + "d" * 64,
+            "pipInvoked": False,
+            "startupDownloadAttempted": False,
+            "systemPythonInvoked": False,
+        },
+    )
 
     report = qualify_built_windows_product.smoke_built_windows_product(
         plugin,
@@ -287,7 +300,9 @@ def test_smoke_owns_the_temporary_vault_and_drives_frozen_worker_lifecycle(
     assert report["temporaryRootRemoved"] is True
     assert report["leakedProcesses"] == []
     assert report["offlineStartup"] == {
-        "networkBoundary": "closed-loopback-proxy-plus-active-socket-audit",
+        "auditEventCount": 1,
+        "auditTraceSha256": "sha256:" + "d" * 64,
+        "networkBoundary": "pre-import-python-audit-deny-plus-active-socket-audit",
         "allowedLoopbackSockets": [],
         "allowedSystemDescendants": [],
         "unexpectedSockets": [],
@@ -306,6 +321,95 @@ def test_smoke_owns_the_temporary_vault_and_drives_frozen_worker_lifecycle(
     assert environment["NO_PROXY"] == ""
     assert environment["PIP_NO_INDEX"] == "1"
     assert environment["UV_OFFLINE"] == "1"
+    assert Path(environment["OFFERAGENT_OFFLINE_QUALIFICATION_TRACE"]).name == "offline-audit.jsonl"
+    assert len(environment["OFFERAGENT_OFFLINE_QUALIFICATION_TOKEN"]) == 64
+
+
+def test_offline_guard_continuously_denies_external_sockets_and_child_processes(tmp_path: Path) -> None:
+    trace = (tmp_path / "offline-audit.jsonl").resolve()
+    environment = os.environ.copy()
+    environment["OFFERAGENT_OFFLINE_QUALIFICATION_TRACE"] = str(trace)
+    environment["OFFERAGENT_OFFLINE_QUALIFICATION_TOKEN"] = "a" * 64
+    program = """
+import sys
+from offeragent_harness.runtime.offline_qualification_guard import install_offline_qualification_guard
+install_offline_qualification_guard()
+attempts = [
+    ("socket.connect", (None, ("203.0.113.10", 443))),
+    ("subprocess.Popen", ("python.exe", ["python.exe", "-m", "pip"], None, None)),
+]
+for event, arguments in attempts:
+    try:
+        sys.audit(event, *arguments)
+    except PermissionError:
+        continue
+    raise AssertionError(f"{event} was not denied")
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=Path(__file__).parents[3],
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    records = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    assert [record["event"] for record in records] == [
+        "guard.installed",
+        "socket.connect",
+        "subprocess.Popen",
+    ]
+    assert records[1]["decision"] == "deny"
+    assert records[2]["decision"] == "deny"
+
+
+def test_offline_smoke_failure_still_audits_process_leaks_and_removes_owned_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin, qualification = _paired_artifacts(tmp_path)
+    source = tmp_path / "repository"
+    runs = tmp_path / "qualification-runs"
+    source.mkdir()
+    runs.mkdir()
+    snapshots = iter(
+        (
+            {"offeragent-process-host.exe": set[int](), "offeragent-worker.exe": set[int]()},
+            {"offeragent-process-host.exe": set[int](), "offeragent-worker.exe": {4242}},
+        )
+    )
+
+    class FailingDriver:
+        def __enter__(self) -> FailingDriver:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def request(self, _command: str, _params: dict[str, object], **_options: object) -> dict[str, object]:
+            raise OSError("primary offline failure")
+
+    monkeypatch.setattr(
+        "scripts.qualify_built_windows_product.QualificationDriverClient", lambda **_kwargs: FailingDriver()
+    )
+    monkeypatch.setattr("scripts.qualify_built_windows_product._offeragent_process_ids", lambda: next(snapshots))
+
+    with pytest.raises(qualify_built_windows_product.BuiltWindowsProductQualificationError) as captured:
+        qualify_built_windows_product.smoke_built_windows_product(
+            plugin,
+            qualification,
+            source_root_guard=source,
+            node_executable=Path("C:/node/node.exe"),
+            temporary_parent=runs,
+        )
+
+    assert "primary offline failure" in str(captured.value)
+    assert "offeragent-worker.exe:4242" in str(captured.value)
+    assert list(runs.iterdir()) == []
 
 
 def test_offline_socket_audit_allows_only_the_worker_event_loop_pair() -> None:
