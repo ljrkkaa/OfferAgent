@@ -276,10 +276,10 @@ _LOCAL_PROFILE_ID = "profile_local"
 _LOCAL_MANAGED_ID = "managed_local"
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _HISTORY_CONTEXT_BASE_RESERVE_TOKENS = 16_384
-# Run input usage is cumulative across bounded Provider attempts.  A sealed
-# multimodal qualification reaches four unique tools and its final response
-# after more than 400k cumulative input without repeating an execution.
-_DEFAULT_ROOT_MAX_INPUT_TOKENS = 800_000
+# Run input usage is cumulative across bounded Provider attempts. Keep a causal
+# multimodal Run bounded; behavioral contract gaps must not be hidden by
+# increasing the cumulative input ceiling.
+_DEFAULT_ROOT_MAX_INPUT_TOKENS = 400_000
 _ROOT_PRODUCT_RULES = (
     "Agent Contract 加载后, 先调用 planning_memory.list 取得主题元数据, 再依据当前请求与 Conversation "
     "语义选择最多五个相关主题并用 planning_memory.read 精读; 不得把 memory/MEMORY.md、完整索引或"

@@ -1133,12 +1133,27 @@ def _plugin_write_definition() -> ToolDefinition:
             "reviewItems",
         ],
     )
+    interview_submission_contract = (
+        " For changeKind interview_submission, author one Experience at experiences/*.md and one or more Questions "
+        "at interview/*.md, with reviewItems exactly matching every mutation or source-bound no-op. The Experience "
+        "YAML frontmatter must contain type: interview-experience, a bounded experience-id, non-empty company, role, "
+        "round, and event-date (YYYY-MM-DD or literal unknown). Its source-kind, captured-on, optional source-url, and "
+        "optional source-fingerprint must exactly match interviewSubmission: source-kind: ordered_images requires the "
+        "manifest fingerprint and must omit source-url. The Experience body must link every Question. Each Question "
+        "must contain type: interview-question, a stable bounded question-id, non-empty title, positive frequency "
+        "equal to its unique Experience links, and answer-state. A new Question must use frequency: 1 and "
+        "answer-state: needs-research, link the current Experience, and contain no answer frontmatter or "
+        "standard-answer section; an "
+        "existing Question preserves its identity and existing Experience links and adds only the current Experience. "
+        "When creating an Experience, update experiences/index.md to link it; when creating Questions, update "
+        "interview/index.md to link each one. Do not mutate an index when it has no new target."
+    )
     return ToolDefinition(
         name="vault.changes.apply",
         version="1",
         description=(
             "Apply one logical, hash-bound Vault Change Batch through the Obsidian plugin. "
-            "Delete is restricted by the plugin to Planning Memory topics."
+            "Delete is restricted by the plugin to Planning Memory topics." + interview_submission_contract
         ),
         input_schema={
             "type": "object",

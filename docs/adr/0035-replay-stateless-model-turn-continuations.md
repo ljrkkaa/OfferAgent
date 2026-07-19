@@ -66,13 +66,15 @@ independent.
   Harness must never synthesize `function_call_output` or
   `custom_tool_call_output` for a compact JSON AgentStep.
 - Continuation bytes consume the existing context budget. Raising cumulative
-  input capacity before restoring causal replay, adding per-tool behavioral
-  fences, or replaying only assistant text would hide the protocol defect and
-  are rejected alternatives. After replay was fixed, a sealed run proved four
-  unique tool executions with no repetition but used 373,051 cumulative input
-  tokens before its final request; the root cumulative ceiling is therefore
-  800,000 while model-round, tool-call, per-request context and deadline limits
-  remain unchanged.
+  input capacity before restoring causal replay, publishing the enforced tool
+  contract, adding per-tool behavioral fences, or replaying only assistant text
+  would hide a protocol defect and are rejected alternatives. A diagnostic
+  sealed run used 373,051 cumulative input tokens before exposing that the
+  model-facing `vault.changes.apply` directory omitted the plugin's mandatory
+  Interview Submission Markdown contract. The contract is now published at
+  that call seam, and the root cumulative ceiling remains 400,000 while
+  model-round, tool-call, per-request context and deadline limits remain
+  unchanged.
 - Tests must prove exact wire replay, named USER result projection, atomic
   context grouping, durable round-trip, migration interruption, recovery and a
   real sealed-product multi-round run.

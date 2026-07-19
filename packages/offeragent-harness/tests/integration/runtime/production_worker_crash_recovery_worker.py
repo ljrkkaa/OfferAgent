@@ -587,7 +587,7 @@ async def _seed_plugin_unknown_recovery(
                 64,
                 4,
                 900,
-                800_000,
+                400_000,
                 64_000,
                 Decimal("0"),
                 64 * 1024 * 1024,

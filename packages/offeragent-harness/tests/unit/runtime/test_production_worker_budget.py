@@ -5,14 +5,14 @@ from offeragent_harness.protocol.common import BudgetSnapshot, RunConfigSnapshot
 from offeragent_harness.runtime.production_worker_composition import _run_budget
 
 
-def test_default_root_budget_covers_bounded_cumulative_multimodal_attempts() -> None:
+def test_default_root_budget_keeps_cumulative_multimodal_attempts_bounded() -> None:
     budget = _run_budget(
         RunConfigSnapshot(model="gpt-5.5"),
         HarnessConfig(),
         worker_max_parallel_reads=4,
     )
 
-    assert budget.max_input_tokens == 800_000
+    assert budget.max_input_tokens == 400_000
 
 
 def test_explicit_root_input_budget_remains_authoritative() -> None:

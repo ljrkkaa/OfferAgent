@@ -553,6 +553,24 @@ def test_planner_binds_the_compact_projection_and_exact_tool_directory_into_one_
     assert "argsHash" not in system_text
 
 
+def test_model_tool_directory_publishes_the_interview_submission_markdown_contract() -> None:
+    catalog = AgentStepCatalog(plugin_tool_definitions(), max_calls=16)
+
+    instruction = catalog.model_instruction
+
+    assert "type: interview-experience" in instruction
+    assert "experience-id" in instruction
+    assert "source-kind: ordered_images" in instruction
+    assert "captured-on" in instruction
+    assert "source-fingerprint" in instruction
+    assert "omit source-url" in instruction
+    assert "type: interview-question" in instruction
+    assert "frequency: 1" in instruction
+    assert "answer-state: needs-research" in instruction
+    assert "experiences/index.md" in instruction
+    assert "interview/index.md" in instruction
+
+
 @pytest.mark.asyncio
 async def test_projected_arguments_json_is_strictly_decoded_before_tool_call_construction() -> None:
     projected = {
