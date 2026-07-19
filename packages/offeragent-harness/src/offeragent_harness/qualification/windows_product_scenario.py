@@ -1051,6 +1051,12 @@ def _terminal_failure_message(
     last_tool = _last_tool_name(events)
     if last_tool is not None:
         fields.append(f"lastTool={last_tool}")
+    tool_results = _tool_result_trace(events)
+    if tool_results:
+        fields.append(f"toolResultTrace={'>'.join(tool_results)}")
+    tool_failure_message = _last_tool_failure_message(events)
+    if tool_failure_message is not None:
+        fields.append(f"toolFailureMessage={tool_failure_message}")
     blocker_trace = _blocker_trace(events)
     if blocker_trace:
         fields.append(f"blockerTrace={'>'.join(blocker_trace)}")

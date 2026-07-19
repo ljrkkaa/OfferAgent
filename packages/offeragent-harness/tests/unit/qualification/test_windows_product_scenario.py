@@ -342,7 +342,32 @@ def test_terminal_failure_reports_stable_error_and_last_tool_identity() -> None:
                     "eventId": "evt_calls",
                     "runId": "run_text",
                     "type": "tool.calls.accepted",
-                    "payload": {"calls": [{"name": "vault.changes.apply"}]},
+                    "payload": {
+                        "calls": [
+                            {
+                                "toolCallId": "call_apply_secret",
+                                "name": "vault.changes.apply",
+                                "arguments": {"secret": "must-not-leak"},
+                            }
+                        ]
+                    },
+                },
+            },
+            {
+                "event": "runtime.event",
+                "value": {
+                    "eventId": "evt_result",
+                    "runId": "run_text",
+                    "type": "tool.completed",
+                    "payload": {
+                        "result": {
+                            "toolCallId": "call_apply_secret",
+                            "status": "succeeded",
+                            "summary": "must-not-leak",
+                            "data": {"secret": "must-not-leak"},
+                            "error": None,
+                        }
+                    },
                 },
             },
             {
@@ -392,12 +417,14 @@ def test_terminal_failure_reports_stable_error_and_last_tool_identity() -> None:
             r"message=Provider continuation timed out\. "
             r"protocolReason=unsupported_continuation_item inputTokens=404079 modelCalls=5 toolCalls=4 "
             r"toolTrace=vault\.changes\.apply lastTool=vault\.changes\.apply "
+            r"toolResultTrace=vault\.changes\.apply:succeeded "
             r"blockerTrace=write_outcome_required"
         ),
     ) as captured:
         session.run_text_preflight("Return one short sentence.", timeout=5)
 
     assert "must-not-leak" not in str(captured.value)
+    assert "call_apply_secret" not in str(captured.value)
 
 
 def test_run_timeout_reports_safe_tool_results_and_response_blockers(
