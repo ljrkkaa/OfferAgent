@@ -150,6 +150,8 @@ export class EventReducer {
         state: ProjectionState,
         origin: EventDeliveryOrigin,
     ) => void>();
+    private readonly liveListeners = new Set<(event: EventEnvelope) => void>();
+    private readonly liveSeenIds = new Map<string, true>();
 
     constructor(workspaceId: string, options: EventReducerOptions = {}) {
         requireIdentifier(workspaceId, "workspaceId");
@@ -170,7 +172,6 @@ export class EventReducer {
         if (event.workspaceId !== this.state.workspaceId) {
             throw new EventProjectionError("event belongs to a different Workspace");
         }
-        if (this.seenIds.has(event.eventId)) return false;
         const key = streamKey(event);
         const stream = this.streams.get(key) ?? {
             lastSequence: 0,
@@ -179,12 +180,20 @@ export class EventReducer {
         };
         this.streams.set(key, stream);
         const appliedId = stream.appliedBySequence.get(event.sequence);
+        const pending = stream.pending.get(event.sequence);
+        if (this.seenIds.has(event.eventId)) {
+            if ((appliedId !== undefined && appliedId !== event.eventId) ||
+                (pending !== undefined && pending.event.eventId !== event.eventId)) {
+                throw new EventProjectionError("event id was reused at another stream position");
+            }
+            this.deliverLive(event, origin);
+            return false;
+        }
         if (appliedId !== undefined) {
             if (appliedId !== event.eventId) throw new EventProjectionError("event sequence was reused with another id");
             this.rememberId(event.eventId);
             return false;
         }
-        const pending = stream.pending.get(event.sequence);
         if (pending !== undefined) {
             if (pending.event.eventId !== event.eventId) {
                 throw new EventProjectionError("pending event sequence collision");
@@ -198,6 +207,7 @@ export class EventReducer {
         }
         stream.pending.set(event.sequence, { event, origin });
         this.rememberId(event.eventId);
+        this.deliverLive(event, origin);
         const applied = this.drain(key, stream);
         if (stream.pending.size > 0 && !stream.pending.has(stream.lastSequence + 1)) {
             this.onGap?.(key, stream.lastSequence);
@@ -238,6 +248,22 @@ export class EventReducer {
     ) => void): () => void {
         this.listeners.add(listener);
         return () => this.listeners.delete(listener);
+    }
+
+    subscribeLive(listener: (event: EventEnvelope) => void): () => void {
+        this.liveListeners.add(listener);
+        return () => this.liveListeners.delete(listener);
+    }
+
+    private deliverLive(event: EventEnvelope, origin: EventDeliveryOrigin): void {
+        if (origin !== "live" || this.liveSeenIds.has(event.eventId)) return;
+        this.liveSeenIds.set(event.eventId, true);
+        while (this.liveSeenIds.size > this.maxSeenEventIds) {
+            const oldest = this.liveSeenIds.keys().next().value;
+            if (oldest === undefined) break;
+            this.liveSeenIds.delete(oldest);
+        }
+        for (const listener of this.liveListeners) listener(event);
     }
 
     private drain(key: string, stream: EventStream): boolean {

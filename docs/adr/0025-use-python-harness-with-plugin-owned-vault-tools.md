@@ -8,7 +8,7 @@ OfferAgent 以 `codex/windows-local-harness` 的 Python Harness 为唯一 Agent 
 
 插件只拥有一个隐藏 Python Worker 子进程。双方只使用一条长度前缀 JSON-RPC stdio 流：Worker 先持久化带完整 Workspace、Run、Tool、定义指纹、参数 Hash 和幂等键绑定的 `tool.started` Event；插件执行 `executorLocation=plugin` 的调用，并用 `plugin-tools/complete` Application Command 回传同一绑定的结果。完全相同的回执可重放，绑定冲突必须拒绝。读取在断线时视为 interrupted；无法证明是否提交的写入视为 unknown outcome，不能自动重试。
 
-Obsidian 的 Event Reducer 还必须为每次本地交付保留 `live` 或 `replay` 来源。历史 Event 仍进入相同 UI 投影，但插件工具 observer 只消费 `live` 的 `tool.started` 和终止 Event；`events/replay` 不得重新执行工具、回传旧 completion 或取消当前执行。
+Obsidian 的 Event Reducer 还必须为每次本地交付保留 `live` 或 `replay` 来源，并提供独立、按 Event ID 去重的 `subscribeLive` 通道。历史 Event 仍进入相同 UI 投影；插件工具 observer 只消费 live 通道的 `tool.started` 和终止 Event。这样 replay 先于同一 live 通知到达时仍会执行一次真实工具，而纯 `events/replay` 不会重新执行工具、回传旧 completion 或取消当前执行。
 
 Conversation Attachment 的二进制不进入 Run Event 历史。插件通过同一 stdio 连接使用有界 begin/chunk/commit/read Application Command 传输，Event 只保存 Attachment ID、Hash 和元数据。
 

@@ -87,8 +87,10 @@ test("reducer buffers gaps, applies in order, and ignores exact event duplicates
     const { EventReducer } = loadModule();
     const gaps = [];
     const delivered = [];
+    const live = [];
     const reducer = new EventReducer(WORKSPACE, { onGap: (key, after) => gaps.push([key, after]) });
     reducer.subscribe((value, _state, origin) => delivered.push([value.sequence, origin]));
+    reducer.subscribeLive((value) => live.push(value.sequence));
     const second = event(2, "assistant.delta", { blockIndex: 0, offset: 3, delta: "lo" });
     const first = event(1, "assistant.delta", { blockIndex: 0, offset: 0, delta: "hel" });
 
@@ -99,6 +101,10 @@ test("reducer buffers gaps, applies in order, and ignores exact event duplicates
     assert.equal(reducer.pendingCount(), 0);
     assert.equal(item(reducer.state.runs.get(RUN), "assistant_message").blocks[0], "hello");
     assert.deepEqual(delivered, [[1, "live"], [2, "replay"]]);
+    assert.deepEqual(live, [1]);
+    assert.equal(reducer.accept(second, "live"), false);
+    assert.equal(reducer.accept(second, "live"), false);
+    assert.deepEqual(live, [1, 2]);
     assert.equal(reducer.accept(first), false);
 });
 

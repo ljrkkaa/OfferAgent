@@ -72,11 +72,11 @@ test("Vault Tool Adapter reads agent.md and completes the bound plugin call", as
     assert.equal(requests[0].params.result.sourceRefs[0].file.path, "agent.md");
 });
 
-test("plugin tool event observer delegates only plugin-owned started calls", async () => {
+test("plugin tool event observer delegates only plugin-owned live started calls", async () => {
     const { observePluginToolEvents } = loadModule();
     let listener;
     const events = {
-        subscribe: (candidate) => {
+        subscribeLive: (candidate) => {
             listener = candidate;
             return () => { listener = undefined; };
         },
@@ -91,9 +91,7 @@ test("plugin tool event observer delegates only plugin-owned started calls", asy
         cancelRun: (runId) => cancelled.push(runId),
     }, (error) => { throw error; });
 
-    listener({ type: "tool.started", payload: { call: call({ toolCallId: "call_replayed" }) } }, undefined, "replay");
-    listener({ type: "turn.interrupted", runId: "run_replayed", payload: {} }, undefined, "replay");
-    listener({ type: "tool.started", payload: { call: { ...call(), executorLocation: "local" } } }, undefined, "live");
+    listener({ type: "tool.started", payload: { call: { ...call(), executorLocation: "local" } } });
     listener({ type: "tool.started", payload: { call: call() } });
     listener({ type: "turn.interrupted", runId: "run_contract", payload: {} });
     await new Promise((resolve) => setImmediate(resolve));
@@ -112,7 +110,7 @@ test("plugin tool event observer unsubscribes immediately and drains in-flight e
     let executionStarted = false;
     const executionGate = new Promise((resolve) => { releaseExecution = resolve; });
     const observer = observePluginToolEvents({
-        subscribe: (candidate) => {
+        subscribeLive: (candidate) => {
             listener = candidate;
             return () => { listener = undefined; };
         },
@@ -243,7 +241,7 @@ test("plugin tool event observer reports malformed plugin calls without executin
     let listener;
     const errors = [];
     let executions = 0;
-    observePluginToolEvents({ subscribe: (candidate) => { listener = candidate; return () => undefined; } }, {
+    observePluginToolEvents({ subscribeLive: (candidate) => { listener = candidate; return () => undefined; } }, {
         execute: async () => { executions += 1; return { accepted: true, replayed: false }; },
     }, (error) => errors.push(error));
 

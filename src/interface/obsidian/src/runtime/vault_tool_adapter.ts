@@ -15,7 +15,6 @@ import { PlanningMemoryAdapter } from "./planning_memory";
 import { InterviewCatalogAdapter } from "./interview_catalog";
 import type { ResearchBrowserAdapter } from "./research_browser";
 import { VaultChangeCoordinator } from "./vault_changes";
-import type { EventDeliveryOrigin } from "./event_reducer";
 
 export interface VaultReadPort {
     getFiles(): TFile[];
@@ -32,11 +31,11 @@ export interface PluginToolCompletionClient {
 }
 
 export interface PluginToolEventSource {
-    subscribe(listener: (event: {
+    subscribeLive(listener: (event: {
         readonly type: string;
         readonly payload: unknown;
         readonly runId?: unknown;
-    }, state: unknown, origin: EventDeliveryOrigin) => void): () => void;
+    }) => void): () => void;
 }
 
 export interface PluginToolExecutionPort {
@@ -211,8 +210,7 @@ export function observePluginToolEvents(
 ): PluginToolEventObserver {
     const inFlight = new Set<Promise<void>>();
     let disposed = false;
-    const unsubscribe = source.subscribe((event, _state, origin) => {
-        if (origin === "replay") return;
+    const unsubscribe = source.subscribeLive((event) => {
         if (["turn.cancelled", "turn.failed", "turn.interrupted"].includes(event.type)) {
             if (typeof event.runId === "string") executor.cancelRun?.(event.runId);
             return;
