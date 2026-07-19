@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -13,12 +17,45 @@ from offeragent_harness.adapters.sqlite_stores import (
     SqliteUnitOfWorkFactory,
 )
 from offeragent_harness.agent.state import RunPhase, RunState
-from offeragent_harness.ports import EntityStore, EventStore, InvocationJournal, UnitOfWorkFactory
-from offeragent_harness.sessions import AgentLineage
+from offeragent_harness.ports import (
+    ApplicationCommandContext,
+    EntityStore,
+    EventStore,
+    InvocationJournal,
+    NewEvent,
+    UnitOfWorkFactory,
+)
+from offeragent_harness.protocol.events import EventType, make_domain_event_record, stored_event_to_envelope
+from offeragent_harness.protocol.messages import AttachmentBeginParams, AttachmentBeginResult
+from offeragent_harness.runtime.application_domain_handlers import _attachment_handlers
+from offeragent_harness.runtime.approval_manager import ApprovalManager
+from offeragent_harness.runtime.conversation_attachments import ConversationAttachmentStore
+from offeragent_harness.runtime.session_service import (
+    SessionCreateCommand,
+    SessionGetCommand,
+    SessionLifecycleService,
+    SessionListCommand,
+)
+from offeragent_harness.runtime.turn_manager import TurnManager
+from offeragent_harness.sessions import (
+    AgentLineage,
+    Run,
+    RunKind,
+    RunStatus,
+    TerminationReason,
+    Turn,
+    TurnStatus,
+)
 from offeragent_harness.storage import SqliteMigrationChecksumError, SqliteMigrationError
 from offeragent_harness.storage.entity_codecs import core_entity_codec_registry
 from offeragent_harness.storage.migrations import LATEST_SCHEMA_VERSION, MIGRATIONS
 from offeragent_harness.storage.serialization import tool_result_to_value
+from offeragent_harness.testing import (
+    DeterministicIdGenerator,
+    ManualCancellationToken,
+    ManualClock,
+    RecordingEventSink,
+)
 from offeragent_harness.tools import ToolResult, ToolResultStatus
 
 
@@ -425,7 +462,7 @@ async def test_tool_result_context_migration_rewrites_terminal_state_and_interru
             "SELECT json_extract(value_json, '$.schemaVersion') FROM entities "
             "WHERE collection = 'run_states' AND entity_id = 'run_terminal'"
         ).fetchone()[0]
-    assert schema_version == 8
+    assert schema_version == LATEST_SCHEMA_VERSION
     assert terminal_codec == 6
 
 
@@ -551,7 +588,7 @@ async def test_codex_config_contraction_removes_retired_decisions_and_preserves_
     assert "sensitive.invalid" not in json.dumps(legacy_report)
 
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == LATEST_SCHEMA_VERSION
 
 
 @pytest.mark.asyncio
@@ -629,7 +666,7 @@ async def test_model_turn_history_migration_preserves_terminal_state_and_interru
     assert await factory.get_entity("run_effective_configs", "run_active") is None
     assert await factory.get_entity("run_capability_snapshots", "run_active") is None
     with sqlite3.connect(database_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == LATEST_SCHEMA_VERSION
         assert (
             connection.execute(
                 "SELECT json_extract(value_json, '$.schemaVersion') FROM entities "
@@ -637,6 +674,242 @@ async def test_model_turn_history_migration_preserves_terminal_state_and_interru
             ).fetchone()[0]
             == 6
         )
+
+
+@pytest.mark.asyncio
+async def test_retired_document_extraction_events_migrate_before_session_and_attachment_commands(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "document-extraction-v8.sqlite"
+    workspace_id = "ws_migration"
+    now = datetime(2026, 7, 18, 7, 34, 16, tzinfo=timezone.utc)
+    clock = ManualClock(now)
+    factory = SqliteUnitOfWorkFactory(database_path)
+    service = SessionLifecycleService(
+        unit_of_work=factory,
+        event_sink=RecordingEventSink(),
+        clock=clock,
+        ids=DeterministicIdGenerator(),
+        turn_manager=TurnManager(),
+        approval_manager=ApprovalManager(unit_of_work=factory, clock=clock),
+    )
+    created = await service.create(
+        SessionCreateCommand(workspace_id, "profile_local", "Legacy extraction", "create-legacy")
+    )
+    session_id = created.session.session_id
+    turn_id = "turn_legacy_extraction"
+    run_id = "run_legacy_extraction"
+    turn = Turn(
+        turn_id=turn_id,
+        session_id=session_id,
+        ordinal=1,
+        status=TurnStatus.FAILED,
+        input_blocks=({"type": "text", "text": "read the document"},),
+        created_at=now,
+        updated_at=now,
+    )
+    run = Run(
+        run_id=run_id,
+        session_id=session_id,
+        turn_id=turn_id,
+        workspace_id=workspace_id,
+        lineage=AgentLineage.root(run_id),
+        kind=RunKind.ROOT,
+        status=RunStatus.FAILED,
+        attempt=1,
+        event_sequence=2,
+        config_snapshot={"model": "legacy-model"},
+        created_at=now,
+        updated_at=now,
+        deadline_at=None,
+        termination_reason=TerminationReason.MODEL_ERROR,
+    )
+    warning = make_domain_event_record(
+        event_type=EventType.RUNTIME_WARNING,
+        payload={
+            "code": "legacy.document_extraction_failed",
+            "message": "The historical document extraction attempt failed.",
+            "recommendedAction": None,
+            "disabledCapabilities": [],
+        },
+        trace_id="trace_legacy_extraction",
+        workspace_id=workspace_id,
+        session_id=session_id,
+        turn_id=turn_id,
+        run_id=run_id,
+        root_run_id=run_id,
+        parent_run_id=None,
+        state_revision=1,
+    )
+    failed = make_domain_event_record(
+        event_type=EventType.TURN_FAILED,
+        payload={
+            "error": {
+                "code": "internal.error",
+                "retryable": True,
+                "cancelled": False,
+                "userVisibleMessage": "Document extraction failed.",
+                "details": {
+                    "failureCategory": "document_ingestion",
+                    "failureCodes": ["parser_unavailable"],
+                    "preparationStage": "document_extraction",
+                },
+            },
+            "usage": {"inputTokens": 0, "outputTokens": 0},
+            "partialContent": [],
+        },
+        trace_id="trace_legacy_extraction",
+        workspace_id=workspace_id,
+        session_id=session_id,
+        turn_id=turn_id,
+        run_id=run_id,
+        root_run_id=run_id,
+        parent_run_id=None,
+        state_revision=2,
+    )
+    async with factory.begin() as uow:
+        await uow.entities.put("turns", turn_id, turn, expected_revision=0)
+        await uow.entities.put("runs", run_id, run, expected_revision=0)
+        await uow.events.append(
+            run_id,
+            0,
+            (
+                NewEvent(
+                    event_id="evt_legacy_extraction_warning",
+                    event_type=EventType.RUNTIME_WARNING.value,
+                    payload=warning.to_wire(),
+                    occurred_at=now,
+                    terminal=False,
+                    idempotency_key="legacy-extraction-warning",
+                ),
+                NewEvent(
+                    event_id="evt_legacy_extraction_terminal",
+                    event_type=EventType.TURN_FAILED.value,
+                    payload=failed.to_wire(),
+                    occurred_at=now,
+                    terminal=True,
+                    idempotency_key="legacy-extraction-terminal",
+                ),
+            ),
+        )
+        await uow.commit()
+
+    retired_payload = {
+        "attempt": 1,
+        "documentId": "doc_legacy",
+        "failure": {
+            "category": "document_ingestion",
+            "codes": ["parser_unavailable"],
+            "stage": "document_extraction",
+        },
+    }
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DELETE FROM schema_migrations WHERE version > 8")
+        connection.execute("PRAGMA user_version = 8")
+        connection.execute(
+            """
+            UPDATE events
+            SET event_type = 'document.extraction_failed',
+                payload_json = json_set(
+                    payload_json,
+                    '$.type',
+                    'document.extraction_failed',
+                    '$.payload',
+                    json(?)
+                )
+            WHERE event_id = 'evt_legacy_extraction_warning'
+            """,
+            (json.dumps(retired_payload, separators=(",", ":")),),
+        )
+        connection.execute(
+            """
+            UPDATE events
+            SET payload_json = json_set(
+                payload_json,
+                '$.payload.error.code',
+                'document.extraction_failed'
+            )
+            WHERE event_id = 'evt_legacy_extraction_terminal'
+            """
+        )
+        before = connection.execute(
+            """
+            SELECT event_id, sequence, occurred_at, terminal, idempotency_key
+            FROM events
+            WHERE stream_id = ?
+            ORDER BY sequence
+            """,
+            (run_id,),
+        ).fetchall()
+
+    reopened = SqliteUnitOfWorkFactory(database_path)
+    await reopened.initialize()
+    migrated_service = SessionLifecycleService(
+        unit_of_work=reopened,
+        event_sink=RecordingEventSink(),
+        clock=clock,
+        ids=DeterministicIdGenerator(),
+        turn_manager=TurnManager(),
+        approval_manager=ApprovalManager(unit_of_work=reopened, clock=clock),
+    )
+    assert (await migrated_service.get(SessionGetCommand(workspace_id, session_id))).session.session_id == session_id
+    assert [item.session_id for item in (await migrated_service.list(SessionListCommand(workspace_id))).sessions] == [
+        session_id
+    ]
+
+    attachment_bytes = b"migration attachment"
+    attachments = ConversationAttachmentStore(
+        tmp_path / "conversation-attachments",
+        workspace_id=workspace_id,
+        clock=clock,
+        ids=DeterministicIdGenerator(),
+    )
+    handlers = _attachment_handlers(
+        workspace_id=workspace_id,
+        harness=SimpleNamespace(sessions=migrated_service),  # type: ignore[arg-type]
+        attachments=attachments,
+    )
+    begun = cast(
+        AttachmentBeginResult,
+        await handlers["attachments/begin"](
+            AttachmentBeginParams(
+                session_id=session_id,
+                client_request_id="req_after_migration",
+                file_name="evidence.png",
+                media_type="image/png",
+                byte_length=len(attachment_bytes),
+                content_hash=f"sha256:{sha256(attachment_bytes).hexdigest()}",
+            ),
+            ManualCancellationToken(),
+            ApplicationCommandContext(transport="stdio"),
+        ),
+    )
+    assert begun.next_offset == 0
+
+    async with reopened.begin() as uow:
+        migrated_events = await uow.events.read(run_id)
+    envelopes = tuple(stored_event_to_envelope(event) for event in migrated_events)
+    assert [event.type for event in envelopes] == [EventType.RUNTIME_WARNING, EventType.TURN_FAILED]
+    assert envelopes[1].payload.error.code.value == "internal.error"  # type: ignore[union-attr]
+
+    with sqlite3.connect(database_path) as connection:
+        after = connection.execute(
+            """
+            SELECT event_id, sequence, occurred_at, terminal, idempotency_key
+            FROM events
+            WHERE stream_id = ?
+            ORDER BY sequence
+            """,
+            (run_id,),
+        ).fetchall()
+        terminal_sequence = connection.execute(
+            "SELECT terminal_sequence FROM event_streams WHERE stream_id = ?",
+            (run_id,),
+        ).fetchone()[0]
+        schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
+    assert after == before
+    assert terminal_sequence == 2
+    assert schema_version == 9
 
 
 @pytest.mark.asyncio
