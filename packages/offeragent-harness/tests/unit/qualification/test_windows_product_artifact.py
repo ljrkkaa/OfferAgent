@@ -94,7 +94,7 @@ def _paired_artifacts(tmp_path: Path) -> tuple[Path, Path]:
             "runtimeVersion": "0.1.0-test",
             "schemaVersion": 1,
             "sourceTreeSha256": "sha256:" + "a" * 64,
-            "targetVaultTemplateSha256": "sha256:" + "b" * 64,
+            "targetVaultTemplateSha256": "sha256:5d30618e7c290489839b3ae6b1c050c1197e5574c36f1d2f5e619ca4255a4843",
         }
     )
     (plugin / "local-development-build.json").write_bytes(receipt)
@@ -143,6 +143,14 @@ def test_verifier_rejects_plugin_layout_and_bundle_anchor_tampering(tmp_path: Pa
     (plugin / "unexpected.txt").unlink()
     (plugin / "main.js").write_text("tampered\n", encoding="utf-8")
     with pytest.raises(WindowsProductArtifactError, match="bundle anchor"):
+        verify_paired_windows_artifacts(plugin, qualification)
+
+
+def test_verifier_rejects_tampered_migration_template_content(tmp_path: Path) -> None:
+    plugin, qualification = _paired_artifacts(tmp_path)
+    (plugin / "migration" / "target-vault" / "agent.md").write_text("# Tampered\n", encoding="utf-8")
+
+    with pytest.raises(WindowsProductArtifactError, match="migration template digest"):
         verify_paired_windows_artifacts(plugin, qualification)
 
 

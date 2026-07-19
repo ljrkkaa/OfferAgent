@@ -257,6 +257,20 @@ def _verify_plugin_artifact(
     }
     if migration_files != {"target-vault/agent.md", "target-vault/obsidian-cli/SKILL.md"}:
         raise WindowsProductArtifactError("plugin migration template file set is not exact")
+    template_root = migration_root / "target-vault"
+    entries = []
+    for relative in ("agent.md", "obsidian-cli/SKILL.md"):
+        payload = _regular_bytes(template_root.joinpath(*relative.split("/")), "migration template")
+        entries.append({"path": relative, "sha256": _sha256(payload), "size": len(payload)})
+    canonical = json.dumps(
+        {"files": entries},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    if _sha256(canonical) != receipt.get("targetVaultTemplateSha256"):
+        raise WindowsProductArtifactError("plugin migration template digest differs from its receipt")
 
 
 def _json_object(path: Path, label: str) -> dict[str, Any]:
