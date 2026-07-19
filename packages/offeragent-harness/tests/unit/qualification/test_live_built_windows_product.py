@@ -4,13 +4,16 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from scripts.qualify_live_built_windows_product import (
     LiveBuiltProductQualificationError,
     _canonical_json,
     _remove_owned_root,
+    qualify_live_built_windows_product,
 )
 
 from offeragent_harness.qualification.synthetic_interview import (
@@ -96,3 +99,79 @@ def test_owned_root_cleanup_refuses_a_changed_marker(tmp_path: Path) -> None:
 
     with pytest.raises(LiveBuiltProductQualificationError, match="ownership identity differs"):
         _remove_owned_root(root, expected)
+
+
+def test_live_failure_still_audits_auth_processes_and_owned_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin = tmp_path / "plugin"
+    templates = plugin / "migration" / "target-vault" / "obsidian-cli"
+    templates.mkdir(parents=True)
+    (templates.parent / "agent.md").write_text("# Agent\n", encoding="utf-8")
+    (templates / "SKILL.md").write_text("# Skill\n", encoding="utf-8")
+    qualification = tmp_path / "qualification"
+    qualification.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"access_token":"opaque"}\n', encoding="utf-8")
+    paired = SimpleNamespace(
+        plugin_root=plugin,
+        qualification_root=qualification,
+        driver=qualification / "driver.cjs",
+        plugin_version="2.0.0-test",
+        runtime_version="0.1.0-test",
+        runtime_manifest_sha256="sha256:" + "a" * 64,
+        source_commit="c" * 40,
+        source_tree_sha256="sha256:" + "b" * 64,
+    )
+    process_snapshots: Iterator[dict[str, set[int]]] = iter(
+        (
+            {
+                "offeragent-worker.exe": set[int](),
+                "offeragent-process-host.exe": set[int](),
+                "obsidian.exe": set[int](),
+            },
+            {
+                "offeragent-worker.exe": {4242},
+                "offeragent-process-host.exe": set[int](),
+                "obsidian.exe": set[int](),
+            },
+        )
+    )
+
+    monkeypatch.setattr("scripts.qualify_live_built_windows_product.verify_paired_windows_artifacts", lambda *_: paired)
+    monkeypatch.setattr("scripts.qualify_live_built_windows_product.default_codex_auth_path", lambda: auth)
+    monkeypatch.setattr(
+        "scripts.qualify_live_built_windows_product._product_process_ids", lambda: next(process_snapshots)
+    )
+    monkeypatch.setattr("scripts.qualify_live_built_windows_product._initialize_vault_git", lambda *_: None)
+
+    def fail_after_auth_drift(_self: object, _root: Path) -> object:
+        auth.write_text('{"access_token":"changed"}\n', encoding="utf-8")
+        raise OSError("primary qualification failure")
+
+    monkeypatch.setattr(
+        "scripts.qualify_live_built_windows_product.SyntheticInterviewFixtureGenerator.generate",
+        fail_after_auth_drift,
+    )
+
+    with pytest.raises(LiveBuiltProductQualificationError) as captured:
+        qualify_live_built_windows_product(
+            plugin,
+            qualification,
+            source_root_guard=source,
+            node_executable=tmp_path / "node.exe",
+            proxy_url="http://127.0.0.1:7896",
+            model="gpt-5.5",
+            temporary_parent=runs,
+        )
+
+    message = str(captured.value)
+    assert "primary qualification failure" in message
+    assert "auth" in message.casefold()
+    assert "offeragent-worker.exe:4242" in message
+    assert list(runs.iterdir()) == []

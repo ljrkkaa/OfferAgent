@@ -101,7 +101,9 @@ def qualify_live_built_windows_product(
     marker_payload = _canonical_json({"schemaVersion": 1, "token": ownership_token})
     marker.write_bytes(marker_payload)
     removed = False
-    report: dict[str, Any]
+    report: dict[str, Any] | None = None
+    primary_error: BaseException | None = None
+    primary_cause: BaseException | None = None
     try:
         vault = root / "Vault"
         local_app_data = root / "LocalAppData"
@@ -190,9 +192,6 @@ def qualify_live_built_windows_product(
                 ),
                 timeout=run_timeout,
             )
-        auth_unchanged = auth_before == _FileSnapshot.capture(auth_path)
-        if not auth_unchanged:
-            raise LiveBuiltProductQualificationError("Codex broker-selected auth file changed")
         report = {
             "status": "passed",
             "artifact": {
@@ -266,16 +265,49 @@ def qualify_live_built_windows_product(
                 "realVaultUnopened": True,
             },
         }
+    except LiveBuiltProductQualificationError as error:
+        primary_error = error
     except (BuiltProductQualificationError, OSError, subprocess.SubprocessError) as error:
-        raise LiveBuiltProductQualificationError(str(error)) from error
-    finally:
+        primary_error = LiveBuiltProductQualificationError(str(error))
+        primary_cause = error
+    except BaseException as error:
+        primary_error = error
+
+    audit_errors: list[str] = []
+    auth_unchanged = False
+    try:
+        auth_unchanged = auth_before == _FileSnapshot.capture(auth_path)
+        if not auth_unchanged:
+            audit_errors.append("Codex broker-selected auth file changed")
+    except BaseException as error:
+        audit_errors.append(f"Codex auth safety audit failed: {type(error).__name__}")
+    try:
         _remove_owned_root(root, marker_payload)
         removed = not root.exists()
-    leaked = _new_product_processes(baseline_processes, _product_process_ids())
-    if leaked:
-        raise LiveBuiltProductQualificationError(f"qualification leaked product processes: {leaked}")
+    except BaseException as error:
+        audit_errors.append(f"qualification owned-root cleanup failed: {type(error).__name__}")
+    leaked: list[str] = []
+    try:
+        leaked = _new_product_processes(baseline_processes, _product_process_ids())
+        if leaked:
+            audit_errors.append(f"qualification leaked product processes: {leaked}")
+    except BaseException as error:
+        audit_errors.append(f"qualification process safety audit failed: {type(error).__name__}")
     if not removed:
-        raise LiveBuiltProductQualificationError("qualification temporary root was not removed")
+        audit_errors.append("qualification temporary root was not removed")
+    if audit_errors:
+        audit_summary = "; ".join(audit_errors)
+        if primary_error is not None:
+            raise LiveBuiltProductQualificationError(f"{primary_error}; safety audit: {audit_summary}") from (
+                primary_cause or primary_error
+            )
+        raise LiveBuiltProductQualificationError(f"qualification safety audit failed: {audit_summary}")
+    if primary_error is not None:
+        if primary_cause is not None:
+            raise primary_error from primary_cause
+        raise primary_error
+    assert report is not None
+    report["safety"]["authUnchanged"] = auth_unchanged
     report["safety"]["leakedProcesses"] = leaked
     report["safety"]["temporaryRootRemoved"] = True
     return report
