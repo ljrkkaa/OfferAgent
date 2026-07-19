@@ -124,7 +124,27 @@ def test_installer_atomically_preserves_opaque_data_json(
     assert installed == target
     assert (target / "data.json").read_bytes() == secret
     assert "OFFERAGENT_LOCAL_DEVELOPMENT_RUNTIME_V1" in (target / "main.js").read_text(encoding="utf-8")
-    assert not tuple(target.parent.glob(".offeragent-obsidian-plugin.backup-*"))
+    assert not tuple(target.parent.glob(".oa-*"))
+
+
+def test_transaction_directory_names_do_not_exceed_the_final_plugin_path_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "scripts.install_local_windows_plugin.secrets.token_hex",
+        lambda size: "a" * (size * 2),
+    )
+    parent = Path("C:/Vault/.obsidian/plugins")
+
+    staging, backup = installer._transaction_paths(parent)
+    failed = installer._failed_transaction_path(parent)
+
+    assert {staging.name, backup.name, failed.name} == {
+        ".oa-i-aaaaaaaaaaaaaaaa",
+        ".oa-b-aaaaaaaaaaaaaaaa",
+        ".oa-f-aaaaaaaaaaaaaaaa",
+    }
+    assert all(len(path.name) <= len(installer.PLUGIN_DIRECTORY_NAME) for path in (staging, backup, failed))
 
 
 def test_installer_preserves_legacy_vault_change_journal_for_first_start_migration(
@@ -148,7 +168,7 @@ def test_installer_preserves_legacy_vault_change_journal_for_first_start_migrati
 
     assert installed == target
     assert (target / "vault-change-journal" / "batch_pending.json").read_bytes() == record
-    assert not tuple(target.parent.glob(".offeragent-obsidian-plugin.backup-*"))
+    assert not tuple(target.parent.glob(".oa-*"))
 
 
 def test_installer_rolls_back_old_plugin_and_data_on_post_activation_failure(

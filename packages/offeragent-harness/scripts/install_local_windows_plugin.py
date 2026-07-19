@@ -11,9 +11,9 @@ import argparse
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import stat
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -55,9 +55,7 @@ def install_local_plugin(artifact: Path, vault_root: Path) -> Path:
         pass
     else:
         raise LocalPluginInstallError("build artifact must remain outside the Vault")
-    token = uuid.uuid4().hex
-    staging = plugin_parent / f".{PLUGIN_DIRECTORY_NAME}.install-{token}"
-    backup = plugin_parent / f".{PLUGIN_DIRECTORY_NAME}.backup-{token}"
+    staging, backup = _transaction_paths(plugin_parent)
     if staging.exists() or backup.exists():
         raise LocalPluginInstallError("install staging identity collided")
     activated = False
@@ -98,7 +96,7 @@ def _rollback_install(
     activated: bool,
     backed_up: bool,
 ) -> None:
-    failed = target.parent / f".{PLUGIN_DIRECTORY_NAME}.failed-{uuid.uuid4().hex}"
+    failed = _failed_transaction_path(target.parent)
     candidate = target if activated and target.exists() else staging
     errors: list[BaseException] = []
     if activated and os.path.lexists(target):
@@ -134,6 +132,17 @@ def _rollback_install(
         raise LocalPluginInstallError(
             f"automatic rollback was incomplete; preserved data.json recovery location(s): {suffix}"
         ) from errors[0]
+
+
+def _transaction_paths(plugin_parent: Path) -> tuple[Path, Path]:
+    """Keep transaction siblings within the final plugin directory's Windows path budget."""
+
+    token = secrets.token_hex(8)
+    return plugin_parent / f".oa-i-{token}", plugin_parent / f".oa-b-{token}"
+
+
+def _failed_transaction_path(plugin_parent: Path) -> Path:
+    return plugin_parent / f".oa-f-{secrets.token_hex(8)}"
 
 
 def _verify_artifact(root: Path, *, allow_data_json: bool = False) -> None:
