@@ -642,6 +642,12 @@ def _nonexistent_absolute(path: Path, label: str) -> Path:
 
 
 def _executable(name: str) -> Path:
+    environment_directory = Path(sys.executable).parent
+    local_names = (f"{name}.exe", name) if not name.casefold().endswith(".exe") else (name,)
+    for local_name in local_names:
+        candidate = environment_directory / local_name
+        if candidate.is_file() and not candidate.is_symlink():
+            return candidate
     found = shutil.which(name)
     if found is None:
         raise FinalWindowsProductQualificationError(f"required executable is unavailable: {name}")

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from scripts.qualify_final_windows_product import (
     FinalWindowsProductQualificationError,
+    _executable,
     _named_skips,
     _review_phase,
     qualify_final_windows_product,
@@ -177,3 +178,17 @@ def test_final_gate_rejects_a_caller_selected_review_base(tmp_path: Path) -> Non
             spec_review_attestation=tmp_path / "spec.json",
             _phase_functions=phases,
         )
+
+
+def test_gate_executable_prefers_the_current_python_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    python = tmp_path / "python.exe"
+    executable = tmp_path / "lint-imports.exe"
+    python.write_bytes(b"python")
+    executable.write_bytes(b"tool")
+    monkeypatch.setattr("scripts.qualify_final_windows_product.sys.executable", str(python))
+    monkeypatch.setattr("scripts.qualify_final_windows_product.shutil.which", lambda _name: None)
+
+    assert _executable("lint-imports") == executable
