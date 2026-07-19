@@ -315,9 +315,9 @@ def test_smoke_owns_the_temporary_vault_and_drives_frozen_worker_lifecycle(
     assert [command for command, _params in requests] == ["hello", "product/start", "product/stop"]
     environment = client_options["environment_overrides"]
     assert isinstance(environment, dict)
-    assert environment["HTTP_PROXY"] == "http://127.0.0.1:9"
-    assert environment["HTTPS_PROXY"] == "http://127.0.0.1:9"
-    assert environment["ALL_PROXY"] == "http://127.0.0.1:9"
+    assert environment["HTTP_PROXY"] == ""
+    assert environment["HTTPS_PROXY"] == ""
+    assert environment["ALL_PROXY"] == ""
     assert environment["NO_PROXY"] == ""
     assert environment["PIP_NO_INDEX"] == "1"
     assert environment["UV_OFFLINE"] == "1"
@@ -332,9 +332,17 @@ def test_offline_guard_continuously_denies_external_sockets_and_child_processes(
     environment["OFFERAGENT_OFFLINE_QUALIFICATION_TOKEN"] = "a" * 64
     program = """
 import sys
-from offeragent_harness.runtime.offline_qualification_guard import install_offline_qualification_guard
+import socket
+sys.path.insert(0, "scripts/entrypoints/development")
+from offline_qualification_bootstrap import install_offline_qualification_guard
 install_offline_qualification_guard()
+left, right = socket.socketpair()
+left.close()
+right.close()
 attempts = [
+    ("socket.bind", (None, ("127.0.0.1", 0))),
+    ("socket.connect", (None, ("127.0.0.1", 9))),
+    ("socket.sendto", (None, ("127.0.0.1", 9))),
     ("socket.connect", (None, ("203.0.113.10", 443))),
     ("subprocess.Popen", ("python.exe", ["python.exe", "-m", "pip"], None, None)),
 ]
@@ -358,13 +366,21 @@ for event, arguments in attempts:
 
     assert completed.returncode == 0, completed.stderr
     records = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
-    assert [record["event"] for record in records] == [
-        "guard.installed",
-        "socket.connect",
-        "subprocess.Popen",
+    allowed = [record for record in records if record["decision"] == "allow"]
+    denied = [record for record in records if record["decision"] == "deny"]
+    assert allowed[0]["event"] == "guard.installed"
+    assert any(
+        record["event"] == "socket.connect" and record["target"] == "event-loop-socketpair" for record in allowed
+    )
+    assert [(record["event"], record["target"]) for record in denied] == [
+        ("socket.bind", "loopback"),
+        ("socket.connect", "loopback"),
+        ("socket.sendto", "loopback"),
+        ("socket.connect", "external-or-name"),
+        ("subprocess.Popen", "child-process"),
     ]
-    assert records[1]["decision"] == "deny"
-    assert records[2]["decision"] == "deny"
+    assert denied[0]["startupDownloadAttempted"] is False
+    assert all(record["startupDownloadAttempted"] is True for record in denied[1:4])
 
 
 def test_offline_smoke_failure_still_audits_process_leaks_and_removes_owned_root(

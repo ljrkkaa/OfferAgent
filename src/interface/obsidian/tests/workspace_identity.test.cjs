@@ -64,10 +64,14 @@ test("corrupt identity is never overwritten or silently regenerated", async (t) 
     assert.equal(await readFile(file, "utf8"), '{"portableWorkspaceId":"ws_bad","schemaVersion":1}\n');
 });
 
-test("symlinked configuration directory is rejected", { skip: process.platform === "win32" }, async (t) => {
-    const { loadOrCreatePortableWorkspaceIdentity } = loadModule();
-    const root = await fixture(t);
-    const outside = await fixture(t);
-    await symlink(outside, path.join(root, ".offeragent"), "dir");
-    await assert.rejects(() => loadOrCreatePortableWorkspaceIdentity(root), /real directory/);
-});
+test(
+    "symlinked configuration directory is rejected",
+    { skip: process.platform === "win32" ? "Windows symlink creation requires Developer Mode" : false },
+    async (t) => {
+        const { loadOrCreatePortableWorkspaceIdentity } = loadModule();
+        const root = await fixture(t);
+        const outside = await fixture(t);
+        await symlink(outside, path.join(root, ".offeragent"), "dir");
+        await assert.rejects(() => loadOrCreatePortableWorkspaceIdentity(root), /real directory/);
+    },
+);

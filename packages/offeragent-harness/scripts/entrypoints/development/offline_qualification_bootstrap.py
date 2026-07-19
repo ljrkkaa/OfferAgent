@@ -1,4 +1,4 @@
-"""Fail-closed, qualification-only audit guard installed before Worker imports."""
+"""Fail-closed qualification audit guard loaded before OfferAgent package imports."""
 
 from __future__ import annotations
 
@@ -16,6 +16,13 @@ from typing import Any
 _TRACE_ENV = "OFFERAGENT_OFFLINE_QUALIFICATION_TRACE"
 _TOKEN_ENV = "OFFERAGENT_OFFLINE_QUALIFICATION_TOKEN"
 _TOKEN = re.compile(r"[0-9a-f]{64}")
+_NETWORK_EVENTS = {
+    "socket.bind",
+    "socket.connect",
+    "socket.getaddrinfo",
+    "socket.sendmsg",
+    "socket.sendto",
+}
 _PROCESS_EVENTS = {"os.posix_spawn", "os.spawn", "os.system", "subprocess.Popen"}
 _installed = False
 
@@ -71,18 +78,19 @@ def install_offline_qualification_guard() -> bool:
     record("guard.installed", "allow", "qualification")
 
     def audit(event: str, arguments: tuple[Any, ...]) -> None:
-        if event in {"socket.connect", "socket.getaddrinfo"}:
-            address = arguments[1] if event == "socket.connect" and len(arguments) > 1 else arguments[0]
-            target = _socket_target(address)
-            allowed = target in {"loopback", "local"}
+        if event in _NETWORK_EVENTS:
+            target = _socket_target(_network_address(event, arguments))
+            allowed = target in {"loopback", "local"} and _called_from_socketpair()
+            if allowed:
+                target = "event-loop-socketpair"
             record(
                 event,
                 "allow" if allowed else "deny",
                 target,
-                download=not allowed,
+                download=not allowed and event != "socket.bind",
             )
             if not allowed:
-                raise PermissionError("offline qualification denied an external network attempt")
+                raise PermissionError("offline qualification denied an unexpected network attempt")
         elif event in _PROCESS_EVENTS:
             system_python, pip = _process_flags(arguments)
             record(event, "deny", "child-process", system_python=system_python, pip=pip)
@@ -91,6 +99,14 @@ def install_offline_qualification_guard() -> bool:
     sys.addaudithook(audit)
     _installed = True
     return True
+
+
+def _network_address(event: str, arguments: tuple[Any, ...]) -> object:
+    if event == "socket.getaddrinfo":
+        return arguments[0] if arguments else None
+    if event == "socket.sendmsg":
+        return arguments[4] if len(arguments) > 4 else None
+    return arguments[1] if len(arguments) > 1 else None
 
 
 def _socket_target(value: object) -> str:
@@ -103,6 +119,20 @@ def _socket_target(value: object) -> str:
         return "loopback" if ipaddress.ip_address(host).is_loopback else "external-or-name"
     except ValueError:
         return "external-or-name"
+
+
+def _called_from_socketpair() -> bool:
+    frame = sys._getframe()
+    while True:
+        if (
+            frame.f_code.co_name in {"socketpair", "_fallback_socketpair"}
+            and frame.f_globals.get("__name__") == "socket"
+        ):
+            return True
+        parent = frame.f_back
+        if parent is None:
+            return False
+        frame = parent
 
 
 def _process_flags(arguments: Sequence[object]) -> tuple[bool, bool]:

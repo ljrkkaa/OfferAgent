@@ -1,4 +1,4 @@
-from offeragent_harness.runtime.offline_qualification_guard import install_offline_qualification_guard
+from offline_qualification_bootstrap import install_offline_qualification_guard
 
 install_offline_qualification_guard()
 

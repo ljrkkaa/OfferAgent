@@ -90,10 +90,12 @@ corepack yarn test
 Python 主控先验证插件精确布局、完整 Runtime manifest、bundle anchor，以及资格驱动对同一 build receipt、
 Runtime manifest、Git commit 和源码树摘要的绑定。TypeScript 驱动只在构建时编译；执行时仅加载密封 CJS、
 manifest 固定的真实冻结 Worker 和 direct stdio，不解析仓库源码。基础 smoke 在 ownership marker 约束的一次性
-Vault 中完成 initialize/shutdown。冻结 Worker 在导入运行时组合前安装资格验证专用的 Python audit hook，持续记录并
-拒绝非 loopback socket 和任何子进程尝试；主控再主动观测存活 socket、后代进程及最终泄漏。版本化 canonical JSON
+Vault 中完成 initialize/shutdown。冻结 Worker 的独立 bootstrap 在导入 `offeragent_harness` 产品包前安装资格验证专用的
+Python audit hook，持续记录 bind/connect/getaddrinfo/sendto/sendmsg 并只放行可由标准库调用栈证明的内部 `socketpair`，
+同时拒绝任何子进程尝试；主控再主动观测存活 socket、后代进程及最终泄漏。版本化 canonical JSON
 记录实际命令/退出、带命令/名称/原因的 skip、来源头、local commits、迁移、安装、认证、临时 Vault 和进程证据；
-最终门还必须读取两份 canonical Code Review attestation，分别绑定 exact HEAD、固定 base、Standards 轴及 #68/#79 Spec 轴，
+最终门还必须读取两份 canonical Code Review attestation，分别绑定 exact HEAD、版本控制中固定且不可由调用者替换的 base、
+Standards 轴及 #68/#79 Spec 轴，
 且两轴 findings 都为空。主控不得自行生成或推断审查通过结论；
 真实模型、Vault Change 和恢复阶段复用同一 Python 资格入口，不给 Worker 注入隐藏模型后门。
 

@@ -71,7 +71,8 @@ socket/子进程观测、安装设置哈希、认证比较、
 临时 Vault ownership、进程前后集合与清理结果。运行期禁止解析仓库产品源码或编译 TypeScript，也不接触用户真实 Vault。
 两份审查文件必须是 canonical JSON regular file，分别声明 `axis` 为 `standards`/`spec`，绑定同一个 exact HEAD 与
 `review-base`，Spec 轴绑定 `[68,79]`，并具有 `status: "passed"` 和空 `findings`；主控会记录文件 SHA-256，拒绝旧 HEAD、
-非 canonical、符号链接/硬链接或非零 findings 的证明。
+非 canonical、任一路径组件中的 reparse point/符号链接、硬链接或非零 findings 的证明。`review-base` 的唯一允许值固化在
+主控源码中，命令行参数只用于显式核对，不能缩短审查 diff。
 
 产物结构：
 

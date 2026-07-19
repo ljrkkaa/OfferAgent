@@ -339,9 +339,9 @@ def _remove_owned_root(root: Path, expected_marker: bytes) -> None:
 
 def _offline_environment(trace_path: Path, token: str) -> dict[str, str]:
     return {
-        "ALL_PROXY": "http://127.0.0.1:9",
-        "HTTP_PROXY": "http://127.0.0.1:9",
-        "HTTPS_PROXY": "http://127.0.0.1:9",
+        "ALL_PROXY": "",
+        "HTTP_PROXY": "",
+        "HTTPS_PROXY": "",
         "NO_PROXY": "",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         "PIP_NO_INDEX": "1",

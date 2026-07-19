@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,7 @@ except ImportError:  # pragma: no cover - direct execution from scripts/
 
 PhaseFunction = Callable[[], dict[str, object]]
 _PHASES = ("source", "review", "gates", "build", "offline", "migrations", "install", "live")
+_FIXED_REVIEW_BASE = "4cf015ae02c59a8b15420ef99d340f95e5001cc6"
 
 
 class FinalWindowsProductQualificationError(RuntimeError):
@@ -58,6 +60,10 @@ def qualify_final_windows_product(
 ) -> dict[str, object]:
     """Run every completion phase in order and return one versioned report."""
 
+    if review_base != _FIXED_REVIEW_BASE:
+        raise FinalWindowsProductQualificationError(
+            "final qualification requires the version-controlled fixed review base"
+        )
     if _phase_functions is not None:
         if set(_phase_functions) != set(_PHASES):
             raise ValueError("injected final qualification phases are incomplete")
@@ -222,7 +228,7 @@ def _review_attestation(
     review_base: str,
     specs: list[int],
 ) -> dict[str, Any]:
-    candidate = _file(path, f"{axis} review attestation")
+    candidate = _attestation_file(path, f"{axis} review attestation")
     try:
         info = candidate.lstat()
         payload = candidate.read_bytes()
@@ -599,6 +605,33 @@ def _file(path: Path, label: str) -> Path:
     if not result.is_file() or result.is_symlink():
         raise FinalWindowsProductQualificationError(f"{label} is not a regular file")
     return result
+
+
+def _attestation_file(path: Path, label: str) -> Path:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        raise FinalWindowsProductQualificationError(f"{label} must be absolute")
+    lexical = Path(os.path.abspath(candidate))
+    try:
+        if _path_has_reparse_component(lexical):
+            raise FinalWindowsProductQualificationError(f"{label} must not traverse a reparse point")
+        info = lexical.lstat()
+    except OSError as error:
+        raise FinalWindowsProductQualificationError(f"{label} is unavailable") from error
+    if not lexical.is_file() or info.st_nlink != 1:
+        raise FinalWindowsProductQualificationError(f"{label} is not an unlinked regular file")
+    return lexical
+
+
+def _path_has_reparse_component(path: Path) -> bool:
+    current = Path(path.anchor)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    for part in path.parts[1:]:
+        current /= part
+        info = current.lstat()
+        if current.is_symlink() or bool(getattr(info, "st_file_attributes", 0) & reparse_flag):
+            return True
+    return False
 
 
 def _nonexistent_absolute(path: Path, label: str) -> Path:
