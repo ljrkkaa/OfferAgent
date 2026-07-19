@@ -4207,6 +4207,56 @@
       "title": "PinnedSelectionContextReference",
       "type": "object"
     },
+    "PluginToolClaimParams": {
+      "additionalProperties": false,
+      "properties": {
+        "argsHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "definitionFingerprint": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "idempotencyKey": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Idempotencykey",
+          "type": "string"
+        },
+        "runId": {
+          "$ref": "#/$defs/RunId"
+        },
+        "toolCallId": {
+          "$ref": "#/$defs/ToolCallId"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "runId",
+        "toolCallId",
+        "definitionFingerprint",
+        "argsHash",
+        "idempotencyKey"
+      ],
+      "title": "PluginToolClaimParams",
+      "type": "object"
+    },
+    "PluginToolClaimResult": {
+      "additionalProperties": false,
+      "properties": {
+        "claimed": {
+          "title": "Claimed",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "claimed"
+      ],
+      "title": "PluginToolClaimResult",
+      "type": "object"
+    },
     "PluginToolCompleteParams": {
       "additionalProperties": false,
       "properties": {
@@ -9036,6 +9086,14 @@
       },
       "result": {
         "$ref": "#/$defs/ModelsListResult"
+      }
+    },
+    "plugin-tools/claim": {
+      "params": {
+        "$ref": "#/$defs/PluginToolClaimParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PluginToolClaimResult"
       }
     },
     "plugin-tools/complete": {

@@ -38,6 +38,7 @@ from .ids import (
     SemanticVersion,
     SessionId,
     Sha256Digest,
+    ToolCallId,
     TurnId,
     UploadId,
     WorkspaceId,
@@ -1180,6 +1181,19 @@ class ShutdownResult(WireModel):
     active_runs_cancel_requested: list[RunId] = Field(default_factory=list, max_length=10_000)
 
 
+class PluginToolClaimParams(WireModel):
+    workspace_id: WorkspaceId
+    run_id: RunId
+    tool_call_id: ToolCallId
+    definition_fingerprint: Sha256Digest
+    args_hash: Sha256Digest
+    idempotency_key: str = Field(min_length=1, max_length=256)
+
+
+class PluginToolClaimResult(WireModel):
+    claimed: bool
+
+
 class PluginToolCompleteParams(WireModel):
     workspace_id: WorkspaceId
     run_id: RunId
@@ -1251,6 +1265,7 @@ _COMMAND_SPECS = [
         capability=CapabilityName.HOOKS,
     ),
     _spec("models/list", ModelsListParams, ModelsListResult),
+    _spec("plugin-tools/claim", PluginToolClaimParams, PluginToolClaimResult),
     _spec("plugin-tools/complete", PluginToolCompleteParams, PluginToolCompleteResult),
     _spec("session/create", SessionCreateParams, SessionCreateResult, capability=CapabilityName.MULTI_SESSION),
     _spec("session/list", SessionListParams, SessionListResult, capability=CapabilityName.MULTI_SESSION),

@@ -51,6 +51,7 @@ from offeragent_harness.protocol.messages import (
     InitializeParams,
     ModelDescriptor,
     ModelsListParams,
+    PluginToolClaimParams,
     PluginToolCompleteParams,
     TurnStartParams,
     validate_command_params,
@@ -78,6 +79,7 @@ EXPECTED_COMMANDS = {
     "hooks/confirm-layer",
     "hooks/confirm-workspace-command",
     "models/list",
+    "plugin-tools/claim",
     "plugin-tools/complete",
     "session/create",
     "session/list",
@@ -175,6 +177,25 @@ def test_plugin_tool_completion_command_carries_the_exact_execution_binding() ->
     assert isinstance(params, PluginToolCompleteParams)
     assert params.workspace_id == "ws_vault"
     assert params.result.tool_call_id == "call_contract"
+
+
+def test_plugin_tool_claim_command_carries_the_exact_execution_binding_without_a_result() -> None:
+    digest = "sha256:" + "a" * 64
+    params = validate_command_params(
+        "plugin-tools/claim",
+        {
+            "workspaceId": "ws_vault",
+            "runId": "run_contract",
+            "toolCallId": "call_contract",
+            "definitionFingerprint": digest,
+            "argsHash": digest,
+            "idempotencyKey": "contract-read-1",
+        },
+    )
+
+    assert isinstance(params, PluginToolClaimParams)
+    assert params.tool_call_id == "call_contract"
+    assert "result" not in type(params).model_fields
 
 
 def test_model_protocol_has_no_provider_choice_or_runtime_probe_state() -> None:

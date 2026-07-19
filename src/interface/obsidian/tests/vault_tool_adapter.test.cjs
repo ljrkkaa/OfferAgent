@@ -54,36 +54,46 @@ test("Vault Tool Adapter reads agent.md and completes the bound plugin call", as
     const client = {
         request: async (method, params) => {
             requests.push({ method, params });
+            if (method === "plugin-tools/claim") return { claimed: true };
             return { accepted: true, replayed: false };
         },
     };
     const adapter = new VaultToolAdapter(vault, client, "ws_vault");
 
+    assert.equal(await adapter.claim(call()), true);
     const response = await adapter.execute(call());
 
     assert.deepEqual(response, { accepted: true, replayed: false });
-    assert.equal(requests.length, 1);
-    assert.equal(requests[0].method, "plugin-tools/complete");
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].method, "plugin-tools/claim");
     assert.equal(requests[0].params.workspaceId, "ws_vault");
     assert.equal(requests[0].params.runId, "run_contract");
-    assert.equal(requests[0].params.result.status, "succeeded");
-    assert.equal(requests[0].params.result.data.content, "# OfferAgent\n\nUse Vault evidence.");
-    assert.match(requests[0].params.result.data.contentHash, /^sha256:[0-9a-f]{64}$/);
-    assert.equal(requests[0].params.result.sourceRefs[0].file.path, "agent.md");
+    assert.equal(requests[0].params.toolCallId, "call_contract");
+    assert.equal("result" in requests[0].params, false);
+    assert.equal(requests[1].method, "plugin-tools/complete");
+    assert.equal(requests[1].params.result.status, "succeeded");
+    assert.equal(requests[1].params.result.data.content, "# OfferAgent\n\nUse Vault evidence.");
+    assert.match(requests[1].params.result.data.contentHash, /^sha256:[0-9a-f]{64}$/);
+    assert.equal(requests[1].params.result.sourceRefs[0].file.path, "agent.md");
 });
 
-test("plugin tool event observer delegates only plugin-owned live started calls", async () => {
+test("plugin tool event observer executes only exact pending calls from either delivery path", async () => {
     const { observePluginToolEvents } = loadModule();
     let listener;
     const events = {
-        subscribeLive: (candidate) => {
+        subscribe: (candidate) => {
             listener = candidate;
             return () => { listener = undefined; };
         },
     };
+    const claims = [];
     const observed = [];
     const cancelled = [];
     const observer = observePluginToolEvents(events, {
+        claim: async (candidate) => {
+            claims.push(candidate.toolCallId);
+            return candidate.toolCallId === "call_pending";
+        },
         execute: async (candidate) => {
             observed.push(candidate);
             return { accepted: true, replayed: false };
@@ -91,13 +101,16 @@ test("plugin tool event observer delegates only plugin-owned live started calls"
         cancelRun: (runId) => cancelled.push(runId),
     }, (error) => { throw error; });
 
-    listener({ type: "tool.started", payload: { call: { ...call(), executorLocation: "local" } } });
-    listener({ type: "tool.started", payload: { call: call() } });
-    listener({ type: "turn.interrupted", runId: "run_contract", payload: {} });
+    listener({ type: "tool.started", payload: { call: { ...call(), executorLocation: "local" } } }, undefined, "live");
+    listener({ type: "tool.started", payload: { call: call({ toolCallId: "call_historical" }) } }, undefined, "replay");
+    listener({ type: "tool.started", payload: { call: call({ toolCallId: "call_pending" }) } }, undefined, "replay");
+    listener({ type: "turn.interrupted", runId: "run_contract", payload: {} }, undefined, "replay");
+    listener({ type: "turn.interrupted", runId: "run_contract", payload: {} }, undefined, "live");
     await new Promise((resolve) => setImmediate(resolve));
 
+    assert.deepEqual(claims.sort(), ["call_historical", "call_pending"]);
     assert.equal(observed.length, 1);
-    assert.equal(observed[0].toolCallId, "call_contract");
+    assert.equal(observed[0].toolCallId, "call_pending");
     assert.deepEqual(cancelled, ["run_contract"]);
     await observer.dispose();
     assert.equal(listener, undefined);
@@ -110,11 +123,12 @@ test("plugin tool event observer unsubscribes immediately and drains in-flight e
     let executionStarted = false;
     const executionGate = new Promise((resolve) => { releaseExecution = resolve; });
     const observer = observePluginToolEvents({
-        subscribeLive: (candidate) => {
+        subscribe: (candidate) => {
             listener = candidate;
             return () => { listener = undefined; };
         },
     }, {
+        claim: async () => true,
         execute: async () => {
             executionStarted = true;
             await executionGate;
@@ -122,7 +136,7 @@ test("plugin tool event observer unsubscribes immediately and drains in-flight e
         },
     }, (error) => { throw error; });
 
-    listener({ type: "tool.started", payload: { call: call() } });
+    listener({ type: "tool.started", payload: { call: call() } }, undefined, "live");
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(executionStarted, true);
 
@@ -143,6 +157,7 @@ test("same-process Vault execution fence serializes replacement adapters and rec
     let releaseFirst;
     const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
     const first = new SerializedPluginToolExecutionFence("C:/vault", {
+        claim: async () => true,
         execute: async () => {
             events.push("first:start");
             await firstGate;
@@ -154,6 +169,7 @@ test("same-process Vault execution fence serializes replacement adapters and rec
     await new Promise((resolve) => setImmediate(resolve));
 
     const second = new SerializedPluginToolExecutionFence("c:\\VAULT", {
+        claim: async () => true,
         execute: async () => {
             events.push("second:execute");
             return { accepted: true, replayed: false };
@@ -166,6 +182,36 @@ test("same-process Vault execution fence serializes replacement adapters and rec
     releaseFirst();
     await Promise.all([firstExecution, secondExecution]);
     assert.deepEqual(events, ["first:recover", "first:start", "first:end", "second:recover", "second:execute"]);
+});
+
+test("pending-call claims do not occupy the Vault execution fence", async () => {
+    const { SerializedPluginToolExecutionFence } = loadModule();
+    const events = [];
+    let releaseClaim;
+    const claimGate = new Promise((resolve) => { releaseClaim = resolve; });
+    const fence = new SerializedPluginToolExecutionFence("C:/claim-vault", {
+        claim: async () => {
+            events.push("claim:start");
+            await claimGate;
+            events.push("claim:end");
+            return false;
+        },
+        execute: async () => {
+            events.push("execute");
+            return { accepted: true, replayed: false };
+        },
+    });
+    await fence.ready();
+
+    const claiming = fence.claim(call({ toolCallId: "call_historical" }));
+    await new Promise((resolve) => setImmediate(resolve));
+    const executing = fence.execute(call({ toolCallId: "call_current" }));
+    await executing;
+    assert.deepEqual(events, ["claim:start", "execute"]);
+
+    releaseClaim();
+    assert.equal(await claiming, false);
+    assert.deepEqual(events, ["claim:start", "execute", "claim:end"]);
 });
 
 test("Vault Tool Adapter rejects a cross-Vault call before reading or completing", async () => {
@@ -241,11 +287,12 @@ test("plugin tool event observer reports malformed plugin calls without executin
     let listener;
     const errors = [];
     let executions = 0;
-    observePluginToolEvents({ subscribeLive: (candidate) => { listener = candidate; return () => undefined; } }, {
+    observePluginToolEvents({ subscribe: (candidate) => { listener = candidate; return () => undefined; } }, {
+        claim: async () => { throw new Error("claim must not receive a malformed call"); },
         execute: async () => { executions += 1; return { accepted: true, replayed: false }; },
     }, (error) => errors.push(error));
 
-    listener({ type: "tool.started", payload: { call: { executorLocation: "plugin" } } });
+    listener({ type: "tool.started", payload: { call: { executorLocation: "plugin" } } }, undefined, "live");
 
     assert.equal(executions, 0);
     assert.equal(errors.length, 1);

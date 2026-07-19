@@ -21,7 +21,12 @@ from offeragent_harness.protocol.content import (
     VaultSourceRef,
     WebSourceRef,
 )
-from offeragent_harness.protocol.messages import PluginToolCompleteParams, PluginToolCompleteResult
+from offeragent_harness.protocol.messages import (
+    PluginToolClaimParams,
+    PluginToolClaimResult,
+    PluginToolCompleteParams,
+    PluginToolCompleteResult,
+)
 from offeragent_harness.runtime.application_dispatcher import ApplicationCommandHandler
 from offeragent_harness.tools import (
     ApprovalEvidence,
@@ -57,6 +62,32 @@ class PluginToolBindingMismatch(PluginToolExecutionError):
 class PluginToolCompletionDisposition(str, Enum):
     ACCEPTED = "accepted"
     REPLAYED = "replayed"
+
+
+class PluginToolClaimDisposition(str, Enum):
+    CLAIMED = "claimed"
+    NOT_PENDING = "not_pending"
+
+
+@dataclass(frozen=True, slots=True)
+class PluginToolClaim:
+    workspace_id: str
+    run_id: str
+    tool_call_id: str
+    definition_fingerprint: str
+    args_hash: str
+    idempotency_key: str
+
+    @classmethod
+    def from_call(cls, call: ToolCall) -> PluginToolClaim:
+        return cls(
+            workspace_id=call.workspace_id,
+            run_id=call.run_id,
+            tool_call_id=call.tool_call_id,
+            definition_fingerprint=call.definition_fingerprint,
+            args_hash=call.args_hash,
+            idempotency_key=call.idempotency_key,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +168,30 @@ class PluginToolExecutor:
                 if current is not None and current.future is future:
                     self._pending.pop(call.tool_call_id, None)
 
+    async def claim(self, claim: PluginToolClaim) -> PluginToolClaimDisposition:
+        async with self._registered:
+            prior = self._completed.get(claim.tool_call_id)
+            if prior is not None:
+                _require_claim_binding(claim, prior)
+                return PluginToolClaimDisposition.NOT_PENDING
+            try:
+                await asyncio.wait_for(
+                    self._registered.wait_for(
+                        lambda: claim.tool_call_id in self._pending or claim.tool_call_id in self._completed
+                    ),
+                    timeout=self._registration_timeout_seconds,
+                )
+            except TimeoutError:
+                return PluginToolClaimDisposition.NOT_PENDING
+            prior = self._completed.get(claim.tool_call_id)
+            if prior is not None:
+                _require_claim_binding(claim, prior)
+                return PluginToolClaimDisposition.NOT_PENDING
+            pending = self._pending.get(claim.tool_call_id)
+            assert pending is not None
+            _require_claim_binding(claim, pending.call)
+            return PluginToolClaimDisposition.CLAIMED
+
     async def complete(self, completion: PluginToolCompletion) -> PluginToolCompletionDisposition:
         async with self._registered:
             prior = self._completed.get(completion.tool_call_id)
@@ -191,6 +246,27 @@ class PluginToolExecutor:
                 self._completed.popitem(last=False)
             self._registered.notify_all()
             return PluginToolCompletionDisposition.ACCEPTED
+
+
+def _require_claim_binding(claim: PluginToolClaim, value: ToolCall | PluginToolCompletion) -> None:
+    observed = (
+        claim.workspace_id,
+        claim.run_id,
+        claim.tool_call_id,
+        claim.definition_fingerprint,
+        claim.args_hash,
+        claim.idempotency_key,
+    )
+    expected = (
+        value.workspace_id,
+        value.run_id,
+        value.tool_call_id,
+        value.definition_fingerprint,
+        value.args_hash,
+        value.idempotency_key,
+    )
+    if observed != expected:
+        raise PluginToolBindingMismatch(claim.tool_call_id)
 
 
 _RESULT_STATUS = {
@@ -274,7 +350,28 @@ def _domain_tool_result(descriptor: ToolResultDescriptor) -> ToolResult:
 
 
 def plugin_tool_completion_handlers(*, executor: PluginToolExecutor) -> Mapping[str, ApplicationCommandHandler]:
-    """Expose the single plugin-to-Worker completion command."""
+    """Expose the plugin-to-Worker pending-call claim and completion commands."""
+
+    async def claim(
+        raw: WireModel,
+        cancellation: CancellationToken,
+        context: ApplicationCommandContext,
+    ) -> WireModel:
+        if context.transport != "stdio":
+            raise ValueError("plugin Tool claims are accepted only from the direct stdio peer")
+        cancellation.checkpoint()
+        params = cast(PluginToolClaimParams, raw)
+        disposition = await executor.claim(
+            PluginToolClaim(
+                workspace_id=params.workspace_id,
+                run_id=params.run_id,
+                tool_call_id=params.tool_call_id,
+                definition_fingerprint=params.definition_fingerprint,
+                args_hash=params.args_hash,
+                idempotency_key=params.idempotency_key,
+            )
+        )
+        return PluginToolClaimResult(claimed=disposition is PluginToolClaimDisposition.CLAIMED)
 
     async def complete(
         raw: WireModel,
@@ -302,7 +399,10 @@ def plugin_tool_completion_handlers(*, executor: PluginToolExecutor) -> Mapping[
             replayed=disposition is PluginToolCompletionDisposition.REPLAYED,
         )
 
-    return {"plugin-tools/complete": complete}
+    return {
+        "plugin-tools/claim": claim,
+        "plugin-tools/complete": complete,
+    }
 
 
 def _catalog_index_schema(kind: str, path: str) -> dict[str, object]:
@@ -1304,6 +1404,8 @@ def _plugin_network_definition(
 
 __all__ = [
     "PluginToolBindingMismatch",
+    "PluginToolClaim",
+    "PluginToolClaimDisposition",
     "PluginToolCompletion",
     "PluginToolCompletionDisposition",
     "PluginToolExecutionError",

@@ -2,12 +2,15 @@ import type { TFile } from "obsidian";
 
 import type {
     ExecutableToolCallDescriptor,
+    PluginToolClaimParams,
+    PluginToolClaimResult,
     PluginToolCompleteParams,
     PluginToolCompleteResult,
     ProtocolCommandParams,
     ProtocolCommandResult,
     ToolResultDescriptor,
 } from "./generated_protocol";
+import type { EventDeliveryOrigin } from "./event_reducer";
 import { MetadataReadPort, VaultEvidenceAdapter } from "./vault_evidence";
 import { VaultControlAdapter, VaultControlOptions } from "./vault_control";
 import { ProjectEvidenceAdapter } from "./project_evidence";
@@ -23,22 +26,23 @@ export interface VaultReadPort {
 }
 
 export interface PluginToolCompletionClient {
-    request(
-        method: "plugin-tools/complete",
-        params: ProtocolCommandParams<"plugin-tools/complete">,
+    request<Method extends "plugin-tools/claim" | "plugin-tools/complete">(
+        method: Method,
+        params: ProtocolCommandParams<Method>,
         options?: { signal?: AbortSignal; timeoutMs?: number },
-    ): Promise<ProtocolCommandResult<"plugin-tools/complete">>;
+    ): Promise<ProtocolCommandResult<Method>>;
 }
 
 export interface PluginToolEventSource {
-    subscribeLive(listener: (event: {
+    subscribe(listener: (event: {
         readonly type: string;
         readonly payload: unknown;
         readonly runId?: unknown;
-    }) => void): () => void;
+    }, state: unknown, origin: EventDeliveryOrigin) => void): () => void;
 }
 
 export interface PluginToolExecutionPort {
+    claim(call: ExecutableToolCallDescriptor): Promise<boolean>;
     execute(call: ExecutableToolCallDescriptor): Promise<PluginToolCompleteResult>;
     cancelRun?(runId: string): void;
 }
@@ -99,6 +103,11 @@ export class SerializedPluginToolExecutionFence implements PluginToolExecutionPo
         return this.initialization;
     }
 
+    async claim(call: ExecutableToolCallDescriptor): Promise<boolean> {
+        await this.initialization;
+        return this.executor.claim(call);
+    }
+
     execute(call: ExecutableToolCallDescriptor): Promise<PluginToolCompleteResult> {
         return this.runExclusive(() => this.executor.execute(call));
     }
@@ -151,6 +160,20 @@ export class VaultToolAdapter {
 
     cancelRun(runId: string): void {
         this.research?.cancelRun(runId);
+    }
+
+    async claim(call: ExecutableToolCallDescriptor): Promise<boolean> {
+        this.validateBinding(call);
+        const params: PluginToolClaimParams = {
+            workspaceId: call.workspaceId,
+            runId: call.runId,
+            toolCallId: call.toolCallId,
+            definitionFingerprint: call.definitionFingerprint,
+            argsHash: call.argsHash,
+            idempotencyKey: call.idempotencyKey,
+        };
+        const result: PluginToolClaimResult = await this.client.request("plugin-tools/claim", params);
+        return result.claimed;
     }
 
     async execute(call: ExecutableToolCallDescriptor): Promise<PluginToolCompleteResult> {
@@ -210,16 +233,17 @@ export function observePluginToolEvents(
 ): PluginToolEventObserver {
     const inFlight = new Set<Promise<void>>();
     let disposed = false;
-    const unsubscribe = source.subscribeLive((event) => {
+    const unsubscribe = source.subscribe((event, _state, origin) => {
         if (["turn.cancelled", "turn.failed", "turn.interrupted"].includes(event.type)) {
-            if (typeof event.runId === "string") executor.cancelRun?.(event.runId);
+            if (origin === "live" && typeof event.runId === "string") executor.cancelRun?.(event.runId);
             return;
         }
         if (event.type !== "tool.started") return;
         try {
             const call = executablePluginCall(event.payload);
             if (call === null) return;
-            const execution = executor.execute(call)
+            const execution = executor.claim(call)
+                .then((claimed) => claimed ? executor.execute(call) : undefined)
                 .catch((error) => onError(asError(error)))
                 .then(() => undefined);
             inFlight.add(execution);

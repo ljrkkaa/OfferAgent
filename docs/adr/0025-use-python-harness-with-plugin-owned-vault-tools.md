@@ -6,9 +6,9 @@ status: accepted
 
 OfferAgent 以 `codex/windows-local-harness` 的 Python Harness 为唯一 Agent Loop、Tool Kernel、模型、Run Event、Conversation、恢复和本地 SQLite Runtime State 的权威实现。Obsidian 插件保留唯一的 Vault Tool Adapter，通过官方 Obsidian TypeScript API 执行 Vault 读取、MetadataCache 查询、Daily Notes、Project Evidence、Vault Change Batch、Git Checkpoint 与撤销；Python Worker 不为这些能力直接读取或写入 Vault 文件系统。
 
-插件只拥有一个隐藏 Python Worker 子进程。双方只使用一条长度前缀 JSON-RPC stdio 流：Worker 先持久化带完整 Workspace、Run、Tool、定义指纹、参数 Hash 和幂等键绑定的 `tool.started` Event；插件执行 `executorLocation=plugin` 的调用，并用 `plugin-tools/complete` Application Command 回传同一绑定的结果。完全相同的回执可重放，绑定冲突必须拒绝。读取在断线时视为 interrupted；无法证明是否提交的写入视为 unknown outcome，不能自动重试。
+插件只拥有一个隐藏 Python Worker 子进程。双方只使用一条长度前缀 JSON-RPC stdio 流：Worker 先持久化带完整 Workspace、Run、Tool、定义指纹、参数 Hash 和幂等键绑定的 `tool.started` Event；插件必须先用 `plugin-tools/claim` 让 Python 的 pending registry 验证完整绑定仍待执行，claim 成功后才可执行 `executorLocation=plugin` 的调用，再用 `plugin-tools/complete` 回传同一绑定的结果。完全相同的回执可重放，绑定冲突必须拒绝。读取在断线时视为 interrupted；无法证明是否提交的写入视为 unknown outcome，不能自动重试。
 
-Obsidian 的 Event Reducer 还必须为每次本地交付保留 `live` 或 `replay` 来源，并提供独立、按 Event ID 去重的 `subscribeLive` 通道。历史 Event 仍进入相同 UI 投影；插件工具 observer 只消费 live 通道的 `tool.started` 和终止 Event。这样 replay 先于同一 live 通知到达时仍会执行一次真实工具，而纯 `events/replay` 不会重新执行工具、回传旧 completion 或取消当前执行。
+Obsidian 的 Event Reducer 必须为每次投影交付保留 `live` 或 `replay` 来源。历史 Event 与实时 Event 进入相同 UI 投影和工具 observer，因为重连后的 replay 可能是当前 pending 调用的唯一可靠交付路径；observer 对每个 `tool.started` 都先 claim，未被 Python 权威 registry 认领的历史调用不得触碰 Vault 或回传旧 completion。终止 Event 只有来自 live 交付时才能取消当前执行，历史重放不得取消。
 
 Conversation Attachment 的二进制不进入 Run Event 历史。插件通过同一 stdio 连接使用有界 begin/chunk/commit/read Application Command 传输，Event 只保存 Attachment ID、Hash 和元数据。
 

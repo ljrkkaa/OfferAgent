@@ -10,9 +10,16 @@ import pytest
 from offeragent_harness.permissions import RiskClass
 from offeragent_harness.ports import ApplicationCommandContext
 from offeragent_harness.protocol._base import validate_wire
-from offeragent_harness.protocol.messages import PluginToolCompleteParams, PluginToolCompleteResult
+from offeragent_harness.protocol.messages import (
+    PluginToolClaimParams,
+    PluginToolClaimResult,
+    PluginToolCompleteParams,
+    PluginToolCompleteResult,
+)
 from offeragent_harness.runtime.plugin_tools import (
     PluginToolBindingMismatch,
+    PluginToolClaim,
+    PluginToolClaimDisposition,
     PluginToolCompletion,
     PluginToolCompletionDisposition,
     PluginToolExecutor,
@@ -106,6 +113,38 @@ async def test_plugin_tool_execution_completes_with_the_bound_plugin_result() ->
 
 
 @pytest.mark.asyncio
+async def test_plugin_tool_claim_accepts_only_the_exact_current_pending_call() -> None:
+    definition = _definition()
+    call = _call(definition)
+    result = ToolResult(
+        tool_call_id=call.tool_call_id,
+        status=ToolResultStatus.SUCCEEDED,
+        data={"content": "# OfferAgent"},
+        user_visible_summary="Read the Vault Agent Contract.",
+        artifact_ids=(),
+        source_refs=("agent.md",),
+        side_effects=(),
+        retryable=False,
+        before_state=None,
+        after_state=None,
+        error=None,
+    )
+    executor = PluginToolExecutor(registration_timeout_seconds=0.01)
+    claim = PluginToolClaim.from_call(call)
+
+    assert await executor.claim(claim) is PluginToolClaimDisposition.NOT_PENDING
+    execution = asyncio.create_task(executor.execute(call, ManualCancellationToken()))
+    await asyncio.sleep(0)
+    assert await executor.claim(claim) is PluginToolClaimDisposition.CLAIMED
+    with pytest.raises(PluginToolBindingMismatch):
+        await executor.claim(replace(claim, workspace_id="ws_other"))
+    await executor.complete(PluginToolCompletion.from_call(call, result))
+
+    assert await execution is result
+    assert await executor.claim(claim) is PluginToolClaimDisposition.NOT_PENDING
+
+
+@pytest.mark.asyncio
 async def test_plugin_completion_waits_for_the_started_call_to_register() -> None:
     definition = _definition()
     call = _call(definition)
@@ -192,6 +231,47 @@ async def test_stdio_completion_command_returns_the_plugin_result_to_the_executo
 
     assert response == PluginToolCompleteResult(accepted=True, replayed=False)
     assert (await execution).data == {"content": "# OfferAgent"}
+
+
+@pytest.mark.asyncio
+async def test_stdio_claim_command_exposes_only_the_exact_pending_disposition() -> None:
+    definition = _definition()
+    call = _call(definition)
+    result = ToolResult(
+        tool_call_id=call.tool_call_id,
+        status=ToolResultStatus.SUCCEEDED,
+        data={"content": "# OfferAgent"},
+        user_visible_summary="Read the Vault Agent Contract.",
+        artifact_ids=(),
+        source_refs=("agent.md",),
+        side_effects=(),
+        retryable=False,
+        before_state=None,
+        after_state=None,
+        error=None,
+    )
+    executor = PluginToolExecutor(registration_timeout_seconds=0.01)
+    params = validate_wire(
+        PluginToolClaimParams,
+        {
+            "workspaceId": call.workspace_id,
+            "runId": call.run_id,
+            "toolCallId": call.tool_call_id,
+            "definitionFingerprint": call.definition_fingerprint,
+            "argsHash": call.args_hash,
+            "idempotencyKey": call.idempotency_key,
+        },
+    )
+    handler = plugin_tool_completion_handlers(executor=executor)["plugin-tools/claim"]
+    context = ApplicationCommandContext(transport="stdio", client_id="obsidian-plugin")
+
+    assert await handler(params, ManualCancellationToken(), context) == PluginToolClaimResult(claimed=False)
+    execution = asyncio.create_task(executor.execute(call, ManualCancellationToken()))
+    await asyncio.sleep(0)
+    assert await handler(params, ManualCancellationToken(), context) == PluginToolClaimResult(claimed=True)
+    await executor.complete(PluginToolCompletion.from_call(call, result))
+
+    assert await execution is result
 
 
 @pytest.mark.asyncio
