@@ -157,7 +157,7 @@ def qualify_live_built_windows_product(
                 )
             try:
                 validate_synthetic_interview_vault(
-                    after_primary,
+                    _vault_markdown_documents(vault),
                     changed_paths,
                     reviewed_content_hashes=dict(primary.review.after_content_hashes),
                 )
@@ -395,6 +395,19 @@ def _vault_markdown_snapshot(vault: Path) -> dict[str, str]:
         payload = path.read_bytes()
         snapshot[relative.as_posix()] = f"sha256:{hashlib.sha256(payload).hexdigest()}"
     return snapshot
+
+
+def _vault_markdown_documents(vault: Path) -> dict[str, str]:
+    documents: dict[str, str] = {}
+    for path in sorted(vault.rglob("*.md")):
+        relative = path.relative_to(vault)
+        if any(part.startswith(".") for part in relative.parts):
+            continue
+        try:
+            documents[relative.as_posix()] = path.read_text(encoding="utf-8", errors="strict")
+        except (OSError, UnicodeError) as error:
+            raise LiveBuiltProductQualificationError("changed Vault Markdown is unavailable or malformed") from error
+    return documents
 
 
 def _changed_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:

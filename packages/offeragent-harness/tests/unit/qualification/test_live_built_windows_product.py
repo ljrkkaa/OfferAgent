@@ -13,6 +13,8 @@ from scripts.qualify_live_built_windows_product import (
     LiveBuiltProductQualificationError,
     _canonical_json,
     _remove_owned_root,
+    _vault_markdown_documents,
+    _vault_markdown_snapshot,
     qualify_live_built_windows_product,
 )
 
@@ -73,6 +75,22 @@ def test_built_product_semantic_gate_rejects_structurally_valid_but_wrong_vault_
 
     with pytest.raises(SyntheticInterviewSemanticError, match="cross-page Q2"):
         validate_synthetic_interview_vault(wrong, tuple(wrong), reviewed_content_hashes=wrong_hashes)
+
+
+def test_live_semantic_gate_reads_markdown_bodies_separately_from_replay_hashes(tmp_path: Path) -> None:
+    vault = tmp_path / "Vault"
+    valid = _semantic_vault()
+    for relative, content in valid.items():
+        target = vault / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content.encode())
+
+    bodies = _vault_markdown_documents(vault)
+    hashes = _vault_markdown_snapshot(vault)
+
+    validate_synthetic_interview_vault(bodies, tuple(bodies), reviewed_content_hashes=hashes)
+    with pytest.raises(SyntheticInterviewSemanticError, match="final content"):
+        validate_synthetic_interview_vault(hashes, tuple(hashes), reviewed_content_hashes=hashes)
 
 
 def test_owned_root_cleanup_clears_read_only_git_objects(tmp_path: Path) -> None:
