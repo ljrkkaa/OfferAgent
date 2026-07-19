@@ -231,16 +231,25 @@ function experienceMetadata(path: string, snapshot: Snapshot, query: CatalogQuer
     const exactSourceMatch = (sourceUrl !== undefined && query.sourceUrls.includes(sourceUrl)) ||
         (query.sourceFingerprint !== null && query.sourceFingerprint === sourceFingerprint);
     return {
-        path, experienceId, sourceKind, sourceUrl, sourceFingerprint,
-        company: bounded(values.get("company"), 128),
-        role: bounded(values.get("role"), 128),
-        candidate,
-        eventDate,
-        round: bounded(values.get("round"), 128),
+        path, experienceId, sourceKind,
+        ...(sourceUrl === undefined ? {} : { sourceUrl }),
+        ...(sourceFingerprint === undefined ? {} : { sourceFingerprint }),
+        ...optionalCandidateField("company", bounded(values.get("company"), 128)),
+        ...optionalCandidateField("role", bounded(values.get("role"), 128)),
+        ...optionalCandidateField("candidate", candidate),
+        ...optionalCandidateField("eventDate", eventDate),
+        ...optionalCandidateField("round", bounded(values.get("round"), 128)),
         exactSourceMatch,
         contentHash: snapshot.contentHash,
         modifiedVersion: snapshot.modifiedVersion,
     };
+}
+
+function optionalCandidateField<Key extends "company" | "role" | "candidate" | "eventDate" | "round">(
+    key: Key,
+    value: string | undefined,
+): Partial<Record<Key, string>> {
+    return value === undefined ? {} : { [key]: value } as Record<Key, string>;
 }
 
 function questionMetadata(path: string, snapshot: Snapshot, terms: readonly string[]): QuestionCandidate | null {

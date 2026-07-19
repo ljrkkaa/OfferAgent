@@ -265,6 +265,39 @@ test("Interview Catalog finds exact source identity and bounded semantic candida
     assert.equal(result.data.truncated, false);
 });
 
+test("Interview Catalog omits absent optional metadata from JSON-RPC results", async () => {
+    const { InterviewCatalogAdapter } = loadModule();
+    const firstImage = `sha256:${"a".repeat(64)}`;
+    const secondImage = `sha256:${"b".repeat(64)}`;
+    const fingerprint = "sha256:0cd65e3ab3208489c6bfaa9d2ce2cb125ae8fbef34c9a965c1efe3f7d2302c37";
+    const vault = vaultFrom({
+        "experiences/ordered-images.md": `---
+type: interview-experience
+experience-id: exp_ordered_images
+source-kind: ordered_images
+source-fingerprint: ${fingerprint}
+company: Acme
+role: Backend Engineer
+event-date: unknown
+round: technical-1
+---
+# Ordered image interview
+`,
+    });
+
+    const result = await new InterviewCatalogAdapter(vault).execute(call({
+        orderedImageContentHashes: [firstImage, secondImage],
+        questionTerms: [],
+    }));
+
+    assert.equal(result.status, "succeeded");
+    const candidate = result.data.experienceCandidates[0];
+    assert.equal(candidate.exactSourceMatch, true);
+    assert.equal(Object.hasOwn(candidate, "sourceUrl"), false);
+    assert.equal(Object.hasOwn(candidate, "candidate"), false);
+    assert.equal(Object.values(candidate).includes(undefined), false);
+});
+
 test("Interview Catalog rejects stale discovery and marks over-capacity question candidates truncated", async () => {
     const { InterviewCatalogAdapter } = loadModule();
     const entries = Object.fromEntries(Array.from({ length: 101 }, (_, index) => [
