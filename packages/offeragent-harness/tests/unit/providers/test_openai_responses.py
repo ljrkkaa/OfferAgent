@@ -412,6 +412,53 @@ def test_model_continuation_rejects_coerced_identity_fields() -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_terminal_output_reports_a_specific_continuation_reason() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse(
+                {"type": "response.created", "sequence_number": 0, "response": {}},
+                {
+                    "type": "response.output_text.delta",
+                    "sequence_number": 1,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "ok",
+                },
+                {
+                    "type": "response.output_text.done",
+                    "sequence_number": 2,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": "ok",
+                },
+                {
+                    "type": "response.completed",
+                    "sequence_number": 3,
+                    "response": {
+                        "status": "completed",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "input_tokens_details": {"cached_tokens": 0},
+                            "output_tokens_details": {"reasoning_tokens": 0},
+                        },
+                    },
+                },
+            ),
+            request=request,
+        )
+
+    events = await _collect(_gateway(httpx.MockTransport(handler)), _request())
+
+    assert events[-1].kind is ModelEventKind.ERROR
+    assert events[-1].error is not None
+    assert events[-1].error.details["protocolReason"] == "invalid_continuation_item_count"
+
+
+@pytest.mark.asyncio
 async def test_hosted_search_request_and_stream_are_typed_bounded_and_citation_preserving() -> None:
     captured: dict[str, object] = {}
 

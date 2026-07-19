@@ -1432,9 +1432,16 @@ class _ResponseAccumulator:
                 output_items=tuple(items),
             )
         except (TypeError, ValueError) as error:
+            reason = {
+                "model continuation requires a bounded non-empty output item sequence": (
+                    "invalid_continuation_item_count"
+                ),
+                "model continuation output items must be JSON objects": "invalid_continuation_json",
+                "model continuation exceeds its durable byte limit": "continuation_too_large",
+            }.get(str(error), "invalid_continuation")
             raise ModelProviderProtocolError(
                 "provider continuation exceeds its local contract",
-                reason="invalid_continuation",
+                reason=reason,
             ) from error
 
     def _validate_citation_offsets(self, key: tuple[int, int], text: str) -> None:
