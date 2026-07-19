@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from offeragent_harness.qualification.windows_product_driver import QualificationDriverEventTimeout
 
 _PROVIDER_PROTOCOL_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_BLOCKER_DIAGNOSTIC = re.compile(r"^[a-z][a-z0-9_.:-]{0,127}$")
 
 
 class BuiltProductQualificationError(RuntimeError):
@@ -1043,6 +1044,9 @@ def _terminal_failure_message(
     last_tool = _last_tool_name(events)
     if last_tool is not None:
         fields.append(f"lastTool={last_tool}")
+    blocker_trace = _blocker_trace(events)
+    if blocker_trace:
+        fields.append(f"blockerTrace={'>'.join(blocker_trace)}")
     return " ".join(fields)
 
 
@@ -1083,6 +1087,23 @@ def _last_tool_name(events: list[Mapping[str, Any]]) -> str | None:
                 if isinstance(name, str) and name:
                     return _diagnostic_text(name)
     return None
+
+
+def _blocker_trace(events: list[Mapping[str, Any]]) -> tuple[str, ...]:
+    blockers: list[str] = []
+    for event in events:
+        if event.get("type") != "run.continuation_required":
+            continue
+        payload = event.get("payload")
+        values = payload.get("blockers") if isinstance(payload, Mapping) else None
+        if not isinstance(values, list):
+            continue
+        blockers.extend(
+            value
+            for value in values
+            if isinstance(value, str) and _BLOCKER_DIAGNOSTIC.fullmatch(value)
+        )
+    return tuple(blockers[-16:])
 
 
 def _diagnostic_text(value: str) -> str:

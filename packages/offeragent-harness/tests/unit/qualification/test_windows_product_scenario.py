@@ -348,6 +348,15 @@ def test_terminal_failure_reports_stable_error_and_last_tool_identity() -> None:
             {
                 "event": "runtime.event",
                 "value": {
+                    "eventId": "evt_continuation",
+                    "runId": "run_text",
+                    "type": "run.continuation_required",
+                    "payload": {"blockers": ["write_outcome_required"]},
+                },
+            },
+            {
+                "event": "runtime.event",
+                "value": {
                     "eventId": "evt_failed",
                     "runId": "run_text",
                     "type": "turn.failed",
@@ -382,7 +391,8 @@ def test_terminal_failure_reports_stable_error_and_last_tool_identity() -> None:
             r"turn.failed code=provider_timeout retryable=true "
             r"message=Provider continuation timed out\. "
             r"protocolReason=unsupported_continuation_item inputTokens=404079 modelCalls=5 toolCalls=4 "
-            r"toolTrace=vault\.changes\.apply lastTool=vault\.changes\.apply"
+            r"toolTrace=vault\.changes\.apply lastTool=vault\.changes\.apply "
+            r"blockerTrace=write_outcome_required"
         ),
     ) as captured:
         session.run_text_preflight("Return one short sentence.", timeout=5)
