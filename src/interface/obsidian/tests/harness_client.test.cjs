@@ -420,6 +420,8 @@ test("event notification plus replay converge through one idempotent reducer", a
         context(),
     );
     await client.connect();
+    const deliveries = [];
+    client.reducer.subscribe((value, _state, origin) => deliveries.push([value.sequence, origin]));
     await serverPeer.notify("event", runEvent(1, "hel"));
     await new Promise((resolve) => setImmediate(resolve));
     const cursor = await client.replay({ runId: "run_01J00000000000000000000000" }, 0);
@@ -432,6 +434,7 @@ test("event notification plus replay converge through one idempotent reducer", a
             .find((item) => item.kind === "assistant_message").blocks[0],
         "hello",
     );
+    assert.deepEqual(deliveries, [[1, "live"], [2, "replay"], [3, "replay"], [4, "replay"]]);
     await client.close();
 });
 

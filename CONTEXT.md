@@ -151,7 +151,7 @@ _Avoid_: 机械数据库复制、恢复旧 Run、重放旧副作用、导入秘�
 _Avoid_: TypeScript Agent Runtime、常驻 Host、第二个 Agent Loop、Vault 文件系统权威
 
 **Plugin Tool Invocation**:
-Python Harness 先持久化 `executorLocation=plugin` 的 `tool.started` Event，Vault Tool Adapter 再执行并通过同一 stdio 连接回传严格绑定结果的一次工具调用；重复回执只在绑定与结果完全一致时可安全重放。
+Python Harness 先持久化 `executorLocation=plugin` 的 `tool.started` Event，Vault Tool Adapter 再执行并通过同一 stdio 连接回传严格绑定结果的一次工具调用；重复回执只在绑定与结果完全一致时可安全重放。Obsidian Event Reducer 保留 `live` / `replay` 交付来源，UI 投影消费两者，但 Vault Tool Adapter 只执行 `live` 的 `tool.started`，历史事件重放永不重新触发工具或取消。
 _Avoid_: 反向 RPC、Runtime 直接 Vault I/O、无绑定工具结果、断线后盲目重试写入
 
 **Evidence Snapshot**:

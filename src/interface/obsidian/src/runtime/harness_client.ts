@@ -168,7 +168,7 @@ export class HarnessClient {
             signal?.throwIfAborted();
             const peer = await this.transport.connect(signal);
             this.peer = peer;
-            peer.onNotification("event", (params) => this.reducer.accept(params));
+            peer.onNotification("event", (params) => this.reducer.accept(params, "live"));
             const raw = await this.requestOnPeer(peer, "initialize", {
                 protocolVersion: this.context.identity.protocolVersion,
                 clientVersion: this.context.identity.clientVersion,
@@ -334,7 +334,7 @@ export class HarnessClient {
             }, { signal: options.signal });
             const result = requireJsonObject(raw);
             const events = arrayField(result, "events");
-            for (const event of events) this.reducer.accept(event);
+            for (const event of events) this.reducer.accept(event, "replay");
             const last = integerField(result, "lastSequence", 0);
             if (last < cursor || (events.length > 0 && last === cursor)) {
                 throw new Error("Worker returned a non-advancing event replay cursor");
@@ -366,7 +366,7 @@ export class HarnessClient {
             const result = requireJsonObject(raw);
             if (result.lastSequence !== null) throw new Error("Session replay returned an aggregate sequence");
             const events = arrayField(result, "events");
-            for (const event of events) this.reducer.accept(event);
+            for (const event of events) this.reducer.accept(event, "replay");
             const next = validateRunCursors(objectField(result, "runCursors"));
             for (const [runId, sequence] of Object.entries(cursors)) {
                 if (!(runId in next) || next[runId] < sequence) throw new Error("Session replay Run cursor regressed");

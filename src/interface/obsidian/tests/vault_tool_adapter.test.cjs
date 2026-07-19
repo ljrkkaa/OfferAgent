@@ -91,7 +91,9 @@ test("plugin tool event observer delegates only plugin-owned started calls", asy
         cancelRun: (runId) => cancelled.push(runId),
     }, (error) => { throw error; });
 
-    listener({ type: "tool.started", payload: { call: { ...call(), executorLocation: "local" } } });
+    listener({ type: "tool.started", payload: { call: call({ toolCallId: "call_replayed" }) } }, undefined, "replay");
+    listener({ type: "turn.interrupted", runId: "run_replayed", payload: {} }, undefined, "replay");
+    listener({ type: "tool.started", payload: { call: { ...call(), executorLocation: "local" } } }, undefined, "live");
     listener({ type: "tool.started", payload: { call: call() } });
     listener({ type: "turn.interrupted", runId: "run_contract", payload: {} });
     await new Promise((resolve) => setImmediate(resolve));

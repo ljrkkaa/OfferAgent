@@ -17,6 +17,7 @@ export type EventEnvelope = Omit<GeneratedEventEnvelope, "payload" | NullableLin
     readonly rootRunId: string | null;
     readonly parentRunId: string | null;
 };
+export type EventDeliveryOrigin = "live" | "replay";
 
 const EVENT_TYPES: ReadonlySet<string> = new Set(PROTOCOL_EVENT_TYPES);
 
@@ -120,7 +121,7 @@ export interface ProjectionState {
 
 interface EventStream {
     lastSequence: number;
-    pending: Map<number, EventEnvelope>;
+    pending: Map<number, { event: EventEnvelope; origin: EventDeliveryOrigin }>;
     appliedBySequence: Map<number, string>;
 }
 
@@ -144,7 +145,11 @@ export class EventReducer {
     private readonly maxPendingPerStream: number;
     private readonly maxSeenEventIds: number;
     private readonly onGap: ((streamKey: string, afterSequence: number) => void) | undefined;
-    private readonly listeners = new Set<(event: EventEnvelope, state: ProjectionState) => void>();
+    private readonly listeners = new Set<(
+        event: EventEnvelope,
+        state: ProjectionState,
+        origin: EventDeliveryOrigin,
+    ) => void>();
 
     constructor(workspaceId: string, options: EventReducerOptions = {}) {
         requireIdentifier(workspaceId, "workspaceId");
@@ -159,7 +164,8 @@ export class EventReducer {
         };
     }
 
-    accept(raw: unknown): boolean {
+    accept(raw: unknown, origin: EventDeliveryOrigin = "live"): boolean {
+        if (origin !== "live" && origin !== "replay") throw new TypeError("event delivery origin is invalid");
         const event = parseEventEnvelope(raw);
         if (event.workspaceId !== this.state.workspaceId) {
             throw new EventProjectionError("event belongs to a different Workspace");
@@ -168,7 +174,7 @@ export class EventReducer {
         const key = streamKey(event);
         const stream = this.streams.get(key) ?? {
             lastSequence: 0,
-            pending: new Map<number, EventEnvelope>(),
+            pending: new Map<number, { event: EventEnvelope; origin: EventDeliveryOrigin }>(),
             appliedBySequence: new Map<number, string>(),
         };
         this.streams.set(key, stream);
@@ -180,7 +186,9 @@ export class EventReducer {
         }
         const pending = stream.pending.get(event.sequence);
         if (pending !== undefined) {
-            if (pending.eventId !== event.eventId) throw new EventProjectionError("pending event sequence collision");
+            if (pending.event.eventId !== event.eventId) {
+                throw new EventProjectionError("pending event sequence collision");
+            }
             this.rememberId(event.eventId);
             return false;
         }
@@ -188,7 +196,7 @@ export class EventReducer {
         if (stream.pending.size >= this.maxPendingPerStream) {
             throw new EventProjectionError("out-of-order event buffer exceeded its hard limit");
         }
-        stream.pending.set(event.sequence, event);
+        stream.pending.set(event.sequence, { event, origin });
         this.rememberId(event.eventId);
         const applied = this.drain(key, stream);
         if (stream.pending.size > 0 && !stream.pending.has(stream.lastSequence + 1)) {
@@ -223,7 +231,11 @@ export class EventReducer {
         return total;
     }
 
-    subscribe(listener: (event: EventEnvelope, state: ProjectionState) => void): () => void {
+    subscribe(listener: (
+        event: EventEnvelope,
+        state: ProjectionState,
+        origin: EventDeliveryOrigin,
+    ) => void): () => void {
         this.listeners.add(listener);
         return () => this.listeners.delete(listener);
     }
@@ -232,13 +244,14 @@ export class EventReducer {
         let applied = false;
         while (true) {
             const sequence = stream.lastSequence + 1;
-            const event = stream.pending.get(sequence);
-            if (!event) break;
+            const delivery = stream.pending.get(sequence);
+            if (!delivery) break;
             stream.pending.delete(sequence);
+            const { event, origin } = delivery;
             this.apply(event);
             stream.lastSequence = sequence;
             stream.appliedBySequence.set(sequence, event.eventId);
-            for (const listener of this.listeners) listener(event, this.state);
+            for (const listener of this.listeners) listener(event, this.state, origin);
             applied = true;
         }
         if (stream.appliedBySequence.size > this.maxSeenEventIds) {
