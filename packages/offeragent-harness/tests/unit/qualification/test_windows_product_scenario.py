@@ -357,7 +357,10 @@ def test_terminal_failure_reports_stable_error_and_last_tool_identity() -> None:
                             "retryable": True,
                             "cancelled": False,
                             "userVisibleMessage": "Provider continuation timed out.",
-                            "details": {"provider": "codex", "secret": "must-not-leak"},
+                            "details": {
+                                "providerProtocolReason": "unsupported_continuation_item",
+                                "secret": "must-not-leak",
+                            },
                         },
                         "usage": {},
                         "partialContent": [],
@@ -377,7 +380,8 @@ def test_terminal_failure_reports_stable_error_and_last_tool_identity() -> None:
         BuiltProductQualificationError,
         match=(
             r"turn.failed code=provider_timeout retryable=true "
-            r"message=Provider continuation timed out\. lastTool=vault\.changes\.apply"
+            r"message=Provider continuation timed out\. "
+            r"protocolReason=unsupported_continuation_item lastTool=vault\.changes\.apply"
         ),
     ) as captured:
         session.run_text_preflight("Return one short sentence.", timeout=5)

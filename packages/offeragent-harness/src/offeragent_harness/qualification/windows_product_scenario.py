@@ -6,6 +6,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from offeragent_harness.qualification.windows_product_driver import QualificationDriverEventTimeout
+
+_PROVIDER_PROTOCOL_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 class BuiltProductQualificationError(RuntimeError):
@@ -1016,6 +1019,10 @@ def _terminal_failure_message(
             fields.append(f"retryable={str(retryable).lower()}")
         if isinstance(message, str) and message:
             fields.append(f"message={_diagnostic_text(message)}")
+        details = error.get("details")
+        protocol_reason = details.get("providerProtocolReason") if isinstance(details, Mapping) else None
+        if isinstance(protocol_reason, str) and _PROVIDER_PROTOCOL_REASON.fullmatch(protocol_reason):
+            fields.append(f"protocolReason={protocol_reason}")
     elif isinstance(payload, Mapping):
         code = payload.get("code")
         reason = payload.get("reason")
