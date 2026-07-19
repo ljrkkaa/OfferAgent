@@ -999,7 +999,11 @@ def _validate_interview_approval_resolution(
 def _raise_control_failure(notification: Mapping[str, Any]) -> None:
     event = notification.get("event")
     if event in {"adapter.error", "product.disconnected"}:
-        raise BuiltProductQualificationError(f"sealed product control plane emitted {event}")
+        message = notification.get("error")
+        diagnostic = f"sealed product control plane emitted {event}"
+        if isinstance(message, str) and message:
+            diagnostic = f"{diagnostic} message={_diagnostic_text(message)}"
+        raise BuiltProductQualificationError(diagnostic)
 
 
 def _event_types(events: list[Mapping[str, Any]]) -> str:

@@ -427,6 +427,47 @@ def test_terminal_failure_reports_stable_error_and_last_tool_identity() -> None:
     assert "call_apply_secret" not in str(captured.value)
 
 
+def test_control_plane_failure_reports_only_a_bounded_normalized_message() -> None:
+    driver = _prepared_driver()
+    driver.responses.extend(
+        [
+            ("rpc", "session/create", {"session": {"sessionId": "ses_text"}, "created": True}),
+            (
+                "rpc",
+                "turn/start",
+                {
+                    "sessionId": "ses_text",
+                    "turnId": "turn_text",
+                    "runId": "run_text",
+                    "accepted": True,
+                    "duplicate": False,
+                },
+            ),
+        ]
+    )
+    driver.events.append(
+        {
+            "event": "adapter.error",
+            "error": "  plugin Tool completion\x00\n  was rejected  ",
+            "secret": "must-not-leak",
+        }
+    )
+    session = BuiltProductQualificationSession(driver, {"vaultRoot": "C:/sealed/Vault"})
+    session.prepare_live_model(
+        proxy_url="http://127.0.0.1:7896",
+        model="gpt-5.5",
+        require_image=True,
+    )
+
+    with pytest.raises(
+        BuiltProductQualificationError,
+        match=r"sealed product control plane emitted adapter\.error message=plugin Tool completion was rejected",
+    ) as captured:
+        session.run_text_preflight("Return one short sentence.", timeout=5)
+
+    assert "must-not-leak" not in str(captured.value)
+
+
 def test_run_timeout_reports_safe_tool_results_and_response_blockers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
