@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -28,7 +29,7 @@ def _canonical(value: object) -> bytes:
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
-def _artifact(root: Path) -> Path:
+def _artifact(root: Path, *, additional_runtime_path: str | None = None) -> Path:
     root.mkdir()
     runtime = root / "runtime" / "windows-x64" / "local-development"
     payloads = {
@@ -38,6 +39,8 @@ def _artifact(root: Path) -> Path:
         "skills/local/SKILL.md": b"# Local\n",
         "tools/rg.exe": b"ripgrep",
     }
+    if additional_runtime_path is not None:
+        payloads[additional_runtime_path] = b"deep-runtime-asset"
     records: list[RuntimeFileRecord] = []
     for relative, payload in sorted(payloads.items()):
         target = runtime.joinpath(*relative.split("/"))
@@ -125,6 +128,33 @@ def test_installer_atomically_preserves_opaque_data_json(
     assert (target / "data.json").read_bytes() == secret
     assert "OFFERAGENT_LOCAL_DEVELOPMENT_RUNTIME_V1" in (target / "main.js").read_text(encoding="utf-8")
     assert not tuple(target.parent.glob(".oa-*"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path regression")
+def test_installer_supports_runtime_paths_beyond_the_legacy_windows_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "offeragent_harness.runtime.development_runtime_manifest.native_windows_architecture",
+        lambda: "x64",
+    )
+    vault = tmp_path / "Vault"
+    target = vault / ".obsidian" / "plugins" / "offeragent-obsidian-plugin"
+    target_runtime = target / "runtime" / "windows-x64" / "local-development" / "schemas"
+    leaf = "a" * (270 - len(str(target_runtime)) - 1)
+    relative = f"schemas/{leaf}"
+    artifact = _artifact(tmp_path / "artifact", additional_runtime_path=relative)
+    source_file = artifact / "runtime" / "windows-x64" / "local-development" / "schemas" / leaf
+    target_file = target_runtime / leaf
+    assert len(str(source_file)) < 260
+    assert len(str(target_file)) == 270
+    vault.mkdir()
+
+    installed = install_local_plugin(artifact, vault)
+
+    assert installed == target
+    assert installer._windows_extended_path(target_file).read_bytes() == b"deep-runtime-asset"
 
 
 def test_transaction_directory_names_do_not_exceed_the_final_plugin_path_budget(

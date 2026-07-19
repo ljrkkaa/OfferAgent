@@ -23,7 +23,33 @@ from offeragent_harness.workspace.portable_config import ensure_portable_workspa
 
 PLUGIN_DIRECTORY_NAME = "offeragent-obsidian-plugin"
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
-_replace = os.replace
+
+
+def _windows_extended_path(path: Path) -> Path:
+    """Use Win32 extended syntax only at the filesystem-operation boundary."""
+
+    absolute = os.path.abspath(path)
+    if os.name != "nt" or absolute.startswith("\\\\?\\"):
+        return Path(absolute)
+    if absolute.startswith("\\\\"):
+        return Path(f"\\\\?\\UNC\\{absolute[2:]}")
+    return Path(f"\\\\?\\{absolute}")
+
+
+def _lexists(path: Path) -> bool:
+    return os.path.lexists(_windows_extended_path(path))
+
+
+def _replace(source: Path, destination: Path) -> None:
+    os.replace(_windows_extended_path(source), _windows_extended_path(destination))
+
+
+def _copy_tree(source: Path, destination: Path) -> None:
+    shutil.copytree(_windows_extended_path(source), _windows_extended_path(destination))
+
+
+def _remove_tree(path: Path, *, ignore_errors: bool = False) -> None:
+    shutil.rmtree(_windows_extended_path(path), ignore_errors=ignore_errors)
 
 
 class LocalPluginInstallError(RuntimeError):
@@ -56,19 +82,19 @@ def install_local_plugin(artifact: Path, vault_root: Path) -> Path:
     else:
         raise LocalPluginInstallError("build artifact must remain outside the Vault")
     staging, backup = _transaction_paths(plugin_parent)
-    if staging.exists() or backup.exists():
+    if _lexists(staging) or _lexists(backup):
         raise LocalPluginInstallError("install staging identity collided")
     activated = False
     backed_up = False
     try:
-        shutil.copytree(source, staging)
+        _copy_tree(source, staging)
         _verify_artifact(staging)
-        if os.path.lexists(target):
+        if _lexists(target):
             _reject_reparse_chain(target)
             _replace(target, backup)
             backed_up = True
             settings = backup / "data.json"
-            if os.path.lexists(settings):
+            if _lexists(settings):
                 _regular_file(settings)
                 # Deliberately move the opaque file; never open or decode it.
                 _replace(settings, staging / "data.json")
@@ -84,8 +110,8 @@ def install_local_plugin(artifact: Path, vault_root: Path) -> Path:
         _rollback_install(target, staging, backup, activated=activated, backed_up=backed_up)
         raise
     finally:
-        if os.path.lexists(staging) and not _contains_settings(staging):
-            shutil.rmtree(staging, ignore_errors=True)
+        if _lexists(staging) and not _contains_settings(staging):
+            _remove_tree(staging, ignore_errors=True)
 
 
 def _rollback_install(
@@ -97,33 +123,33 @@ def _rollback_install(
     backed_up: bool,
 ) -> None:
     failed = _failed_transaction_path(target.parent)
-    candidate = target if activated and target.exists() else staging
+    candidate = target if activated and _lexists(target) else staging
     errors: list[BaseException] = []
-    if activated and os.path.lexists(target):
+    if activated and _lexists(target):
         try:
             _replace(target, failed)
             candidate = failed
         except BaseException as error:
             errors.append(error)
             candidate = target
-    if backed_up and os.path.lexists(backup):
+    if backed_up and _lexists(backup):
         settings = candidate / "data.json"
-        if os.path.lexists(settings) and not os.path.lexists(backup / "data.json"):
+        if _lexists(settings) and not _lexists(backup / "data.json"):
             try:
                 _regular_file(settings)
                 _replace(settings, backup / "data.json")
             except BaseException as error:
                 errors.append(error)
-        if not os.path.lexists(target):
+        if not _lexists(target):
             try:
                 _replace(backup, target)
             except BaseException as error:
                 errors.append(error)
         else:
             errors.append(LocalPluginInstallError("rollback target path remained occupied"))
-    if os.path.lexists(failed) and not _contains_settings(failed):
+    if _lexists(failed) and not _contains_settings(failed):
         try:
-            shutil.rmtree(failed, ignore_errors=True)
+            _remove_tree(failed, ignore_errors=True)
         except BaseException as error:
             errors.append(error)
     if errors:
@@ -147,6 +173,7 @@ def _failed_transaction_path(plugin_parent: Path) -> Path:
 
 def _verify_artifact(root: Path, *, allow_data_json: bool = False) -> None:
     _verify_regular_tree(root)
+    filesystem_root = _windows_extended_path(root)
     expected_top_level = {
         "local-development-build.json",
         "main.js",
@@ -155,18 +182,18 @@ def _verify_artifact(root: Path, *, allow_data_json: bool = False) -> None:
         "runtime",
         "styles.css",
     }
-    settings = root / "data.json"
-    if os.path.lexists(settings):
+    settings = filesystem_root / "data.json"
+    if _lexists(settings):
         if not allow_data_json:
             raise LocalPluginInstallError("build artifact must not contain data.json")
         _regular_file(settings)
-    actual = {item.name for item in root.iterdir() if item.name != "data.json"}
+    actual = {item.name for item in filesystem_root.iterdir() if item.name != "data.json"}
     if actual != expected_top_level:
         raise LocalPluginInstallError("plugin artifact top-level file set is not exact")
     for name in ("main.js", "manifest.json", "styles.css", "local-development-build.json"):
-        _regular_file(root / name)
-    _verify_migration_templates(root / "migration")
-    receipt = _strict_canonical_json(root / "local-development-build.json")
+        _regular_file(filesystem_root / name)
+    _verify_migration_templates(filesystem_root / "migration")
+    receipt = _strict_canonical_json(filesystem_root / "local-development-build.json")
     if (
         set(receipt)
         != {
@@ -182,13 +209,15 @@ def _verify_artifact(root: Path, *, allow_data_json: bool = False) -> None:
         or receipt.get("schemaVersion") != 1
     ):
         raise LocalPluginInstallError("local development build receipt is invalid")
-    manifest = _strict_canonical_json(root / "manifest.json", allow_pretty=True)
+    manifest = _strict_canonical_json(filesystem_root / "manifest.json", allow_pretty=True)
     if manifest.get("isDesktopOnly") is not True or manifest.get("version") != receipt.get("pluginVersion"):
         raise LocalPluginInstallError("Obsidian manifest differs from the local build receipt")
-    _verify_exact_runtime_layout(root / "runtime")
-    if receipt.get("targetVaultTemplateSha256") != _target_vault_template_digest(root / "migration" / "target-vault"):
+    _verify_exact_runtime_layout(filesystem_root / "runtime")
+    if receipt.get("targetVaultTemplateSha256") != _target_vault_template_digest(
+        filesystem_root / "migration" / "target-vault"
+    ):
         raise LocalPluginInstallError("target Vault migration templates differ from the local build receipt")
-    runtime_root = root / "runtime" / "windows-x64" / "local-development"
+    runtime_root = filesystem_root / "runtime" / "windows-x64" / "local-development"
     trust = InstalledDevelopmentRuntimeTrust(runtime_root)
     if (
         trust.manifest.runtime_version != receipt.get("runtimeVersion")
@@ -196,7 +225,7 @@ def _verify_artifact(root: Path, *, allow_data_json: bool = False) -> None:
         or trust.manifest.build.source_tree_sha256 != receipt.get("sourceTreeSha256")
     ):
         raise LocalPluginInstallError("Runtime manifest differs from the local build receipt")
-    bundle = (root / "main.js").read_text(
+    bundle = (filesystem_root / "main.js").read_text(
         encoding="utf-8",
         errors="strict",
     )
@@ -307,13 +336,13 @@ def _preserve_legacy_vault_change_journal(backup: Path, target: Path) -> None:
     """
 
     source = backup / "vault-change-journal"
-    if not os.path.lexists(source):
+    if not _lexists(source):
         return
     _verify_regular_tree(source)
     destination = target / "vault-change-journal"
-    if os.path.lexists(destination):
+    if _lexists(destination):
         raise LocalPluginInstallError("new plugin unexpectedly contains Vault Change recovery state")
-    shutil.copytree(source, destination)
+    _copy_tree(source, destination)
     _verify_regular_tree(destination)
 
 
@@ -357,12 +386,13 @@ def _resolved_directory(path: Path, label: str) -> Path:
 
 
 def _regular_file(path: Path) -> None:
+    filesystem_path = _windows_extended_path(path)
     try:
-        info = path.lstat()
+        info = filesystem_path.lstat()
     except OSError as error:
         raise LocalPluginInstallError("plugin artifact file is unavailable") from error
     if (
-        path.is_symlink()
+        filesystem_path.is_symlink()
         or getattr(info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
         or stat.S_IFMT(info.st_mode) != stat.S_IFREG
         or info.st_nlink != 1
@@ -371,11 +401,12 @@ def _regular_file(path: Path) -> None:
 
 
 def _reject_reparse(path: Path) -> None:
+    filesystem_path = _windows_extended_path(path)
     try:
-        info = path.lstat()
+        info = filesystem_path.lstat()
     except OSError as error:
         raise LocalPluginInstallError("plugin path is unavailable") from error
-    if path.is_symlink() or getattr(info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
+    if filesystem_path.is_symlink() or getattr(info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
         raise LocalPluginInstallError("plugin path contains a reparse point")
 
 
@@ -391,11 +422,12 @@ def _reject_reparse_chain(path: Path) -> None:
     for part in absolute.parts[1:]:
         current /= part
         try:
-            info = current.lstat()
+            filesystem_current = _windows_extended_path(current)
+            info = filesystem_current.lstat()
         except OSError as error:
             raise LocalPluginInstallError("plugin path component is unavailable") from error
         if (
-            current.is_symlink()
+            filesystem_current.is_symlink()
             or getattr(info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
             or stat.S_IFMT(info.st_mode) != stat.S_IFDIR
         ):
@@ -416,7 +448,7 @@ def _verify_regular_tree(root: Path) -> None:
     """Metadata-only walk; this intentionally never opens an opaque data.json."""
 
     _reject_reparse_chain(root)
-    pending = [root]
+    pending = [_windows_extended_path(root)]
     while pending:
         directory = pending.pop()
         try:
@@ -443,7 +475,7 @@ def _verify_regular_tree(root: Path) -> None:
 
 
 def _contains_settings(root: Path) -> bool:
-    return os.path.lexists(root / "data.json")
+    return _lexists(root / "data.json")
 
 
 def _settings_locations(*roots: Path) -> tuple[Path, ...]:
@@ -451,11 +483,11 @@ def _settings_locations(*roots: Path) -> tuple[Path, ...]:
 
 
 def _remove_tree_without_settings(root: Path) -> None:
-    if not os.path.lexists(root):
+    if not _lexists(root):
         return
     if _contains_settings(root):
         raise LocalPluginInstallError(f"refusing to remove recovery tree containing data.json: {root}")
-    shutil.rmtree(root)
+    _remove_tree(root)
 
 
 if __name__ == "__main__":
