@@ -444,13 +444,20 @@ def test_run_timeout_reports_safe_tool_results_and_response_blockers(
                 "value": {
                     "eventId": "evt_result",
                     "runId": "run_text",
-                    "type": "tool.completed",
+                    "type": "tool.failed",
                     "payload": {
                         "result": {
                             "toolCallId": "call_apply_secret",
-                            "status": "succeeded",
+                            "status": "failed",
                             "summary": "must-not-leak",
                             "data": {"secret": "must-not-leak"},
+                            "error": {
+                                "code": "tool.failed",
+                                "details": {
+                                    "toolErrorCode": "resource.conflict",
+                                    "toolErrorDetails": {"secret": "must-not-leak"},
+                                },
+                            },
                         }
                     },
                 },
@@ -481,8 +488,9 @@ def test_run_timeout_reports_safe_tool_results_and_response_blockers(
     with pytest.raises(
         BuiltProductQualificationError,
         match=(
-            r"Run timed out after events \[tool\.calls\.accepted,tool\.completed,run\.continuation_required\] "
-            r"toolResultTrace=vault\.changes\.apply:succeeded blockerTrace=write_outcome_required"
+            r"Run timed out after events \[tool\.calls\.accepted,tool\.failed,run\.continuation_required\] "
+            r"toolResultTrace=vault\.changes\.apply:failed:resource\.conflict "
+            r"blockerTrace=write_outcome_required"
         ),
     ) as captured:
         session.run_text_preflight("Return one short sentence.", timeout=5)

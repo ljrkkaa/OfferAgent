@@ -1150,7 +1150,13 @@ def _tool_result_trace(events: list[Mapping[str, Any]]) -> tuple[str, ...]:
         status = result.get("status") if isinstance(result, Mapping) else None
         name = call_names.get(call_id) if isinstance(call_id, str) else None
         if name is not None and isinstance(status, str) and status in _TOOL_RESULT_STATUSES:
-            results.append(f"{name}:{status}")
+            diagnostic = f"{name}:{status}"
+            error = result.get("error") if isinstance(result, Mapping) else None
+            details = error.get("details") if isinstance(error, Mapping) else None
+            tool_error_code = details.get("toolErrorCode") if isinstance(details, Mapping) else None
+            if isinstance(tool_error_code, str) and _BLOCKER_DIAGNOSTIC.fullmatch(tool_error_code):
+                diagnostic = f"{diagnostic}:{tool_error_code}"
+            results.append(diagnostic)
     return tuple(results[-16:])
 
 
