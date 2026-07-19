@@ -913,6 +913,7 @@ class _ResponseAccumulator:
         self._hosted_searches: dict[str, _HostedSearchState] = {}
         self._citation_coordinates: dict[tuple[str, int, int, int], ModelCitation] = {}
         self._citation_values: set[ModelCitation] = set()
+        self._completed_output_items: dict[int, Mapping[str, Any]] = {}
         self._pending_stream_error: _SemanticEvent | None = None
 
     def accept(self, event_name: str | None, data: bytes) -> tuple[_SemanticEvent, ...]:
@@ -1075,6 +1076,7 @@ class _ResponseAccumulator:
                 )
             usage = _usage(response)
             terminal_events = self._reconcile_terminal_output(response, require_complete=True)
+            continuation_output = self._continuation_output(response)
             return tuple(
                 [
                     *terminal_events,
@@ -1083,7 +1085,7 @@ class _ResponseAccumulator:
                     _SemanticEvent(
                         ModelEventKind.COMPLETED,
                         finish_reason=ModelFinishReason.STOP,
-                        continuation=self._continuation(response),
+                        continuation=self._continuation(continuation_output),
                     ),
                 ]
             )
@@ -1113,9 +1115,19 @@ class _ResponseAccumulator:
                 )
             if item_type == "web_search_call":
                 self._validate_hosted_search_item(item, _output_index(value), terminal_snapshot=False)
+                self._record_completed_output_item(value, item)
                 return ()
             if item_type == "message":
-                return self._message_citation_events(item, _output_index(value))
+                citation_events = self._message_citation_events(item, _output_index(value))
+                self._record_completed_output_item(value, item)
+                return citation_events
+            if item_type == "reasoning":
+                self._record_completed_output_item(value, item)
+                return ()
+            raise ModelProviderProtocolError(
+                "provider continuation contains an unsupported output item",
+                reason="unsupported_continuation_item",
+            )
         return ()
 
     def finish(self) -> tuple[_SemanticEvent, ...]:
@@ -1400,8 +1412,54 @@ class _ResponseAccumulator:
             )
         return tuple(semantic)
 
-    def _continuation(self, response: Mapping[str, Any]) -> ModelContinuation:
-        output = _required_sequence(response, "output")
+    def _record_completed_output_item(
+        self,
+        event: Mapping[str, Any],
+        item: Mapping[str, Any],
+    ) -> None:
+        output_index = _output_index(event)
+        if output_index >= 128 or len(self._completed_output_items) >= 128:
+            raise ModelProviderProtocolError(
+                "provider completed output items exceed their count limit",
+                reason="continuation_item_count_exceeded",
+            )
+        if output_index in self._completed_output_items:
+            raise ModelProviderProtocolError(
+                "provider emitted duplicate completed output items",
+                reason="duplicate_completed_output_item",
+            )
+        self._completed_output_items[output_index] = item
+
+    def _continuation_output(self, response: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+        terminal_output = _required_sequence(response, "output")
+        if len(terminal_output) > 128:
+            raise ModelProviderProtocolError(
+                "provider terminal output exceeds its item count limit",
+                reason="continuation_item_count_exceeded",
+            )
+        resolved = dict(self._completed_output_items)
+        for output_index, item in enumerate(terminal_output):
+            if not isinstance(item, Mapping):
+                raise ModelProviderProtocolError(
+                    "provider terminal output item is invalid",
+                    reason="invalid_terminal_output_item",
+                )
+            streamed = resolved.get(output_index)
+            if streamed is not None and streamed != item:
+                raise ModelProviderProtocolError(
+                    "provider terminal output differs from its completed stream item",
+                    reason="completed_output_item_changed",
+                )
+            resolved[output_index] = item
+        indexes = tuple(sorted(resolved))
+        if indexes != tuple(range(len(indexes))):
+            raise ModelProviderProtocolError(
+                "provider completed output item indexes are not contiguous",
+                reason="non_contiguous_completed_output_items",
+            )
+        return tuple(resolved[index] for index in indexes)
+
+    def _continuation(self, output: Sequence[Mapping[str, Any]]) -> ModelContinuation:
         allowed = {"message", "reasoning"}
         if ModelHostedTool.WEB_SEARCH in self.request.hosted_tools:
             allowed.add("web_search_call")

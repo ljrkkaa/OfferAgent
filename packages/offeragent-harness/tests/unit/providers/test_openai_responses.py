@@ -412,7 +412,21 @@ def test_model_continuation_rejects_coerced_identity_fields() -> None:
 
 
 @pytest.mark.asyncio
-async def test_empty_terminal_output_reports_a_specific_continuation_reason() -> None:
+async def test_streamed_done_items_supply_continuation_when_terminal_output_is_empty() -> None:
+    reasoning_item = {
+        "id": "reasoning-1",
+        "type": "reasoning",
+        "summary": [],
+        "encrypted_content": "opaque",
+    }
+    message_item = {
+        "id": "message-1",
+        "type": "message",
+        "role": "assistant",
+        "phase": "final_answer",
+        "content": [{"type": "output_text", "text": "ok"}],
+    }
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -420,22 +434,34 @@ async def test_empty_terminal_output_reports_a_specific_continuation_reason() ->
             content=_sse(
                 {"type": "response.created", "sequence_number": 0, "response": {}},
                 {
-                    "type": "response.output_text.delta",
+                    "type": "response.output_item.done",
                     "sequence_number": 1,
                     "output_index": 0,
+                    "item": reasoning_item,
+                },
+                {
+                    "type": "response.output_text.delta",
+                    "sequence_number": 2,
+                    "output_index": 1,
                     "content_index": 0,
                     "delta": "ok",
                 },
                 {
                     "type": "response.output_text.done",
-                    "sequence_number": 2,
-                    "output_index": 0,
+                    "sequence_number": 3,
+                    "output_index": 1,
                     "content_index": 0,
                     "text": "ok",
                 },
                 {
+                    "type": "response.output_item.done",
+                    "sequence_number": 4,
+                    "output_index": 1,
+                    "item": message_item,
+                },
+                {
                     "type": "response.completed",
-                    "sequence_number": 3,
+                    "sequence_number": 5,
                     "response": {
                         "status": "completed",
                         "output": [],
@@ -453,9 +479,9 @@ async def test_empty_terminal_output_reports_a_specific_continuation_reason() ->
 
     events = await _collect(_gateway(httpx.MockTransport(handler)), _request())
 
-    assert events[-1].kind is ModelEventKind.ERROR
-    assert events[-1].error is not None
-    assert events[-1].error.details["protocolReason"] == "invalid_continuation_item_count"
+    assert events[-1].kind is ModelEventKind.COMPLETED
+    assert events[-1].continuation is not None
+    assert thaw_json(events[-1].continuation.output_items) == [reasoning_item, message_item]
 
 
 @pytest.mark.asyncio
