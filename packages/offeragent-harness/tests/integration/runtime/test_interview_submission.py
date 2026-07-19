@@ -18,6 +18,7 @@ from offeragent_harness.adapters.local_artifacts import LocalArtifactStore
 from offeragent_harness.adapters.sqlite_stores import SqliteUnitOfWorkFactory
 from offeragent_harness.config import HarnessConfig
 from offeragent_harness.models import (
+    ModelContinuation,
     ModelEvent,
     ModelEventKind,
     ModelFinishReason,
@@ -427,12 +428,30 @@ class _DeterministicScriptedGateway:
         tool_results = [message for message in request.messages if message.role is ModelRole.TOOL]
         assert len(tool_results) == self._expected_tool_result_counts[index]
         self.requests.append(request)
+        step = self._script[index]
+        continuation = (
+            ModelContinuation(
+                provider_id="codex-subscription",
+                model=request.model,
+                request_id=request.request_id,
+                output_items=(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": json.dumps(step)}],
+                    },
+                ),
+            )
+            if step["calls"]
+            else None
+        )
         yield ModelEvent(request.request_id, 1, ModelEventKind.STARTED)
         yield ModelEvent(
             request.request_id,
             2,
             ModelEventKind.STRUCTURED_OUTPUT,
-            data=cast(Any, self._script[index]),
+            data=cast(Any, step),
         )
         yield ModelEvent(
             request.request_id,
@@ -445,6 +464,7 @@ class _DeterministicScriptedGateway:
             4,
             ModelEventKind.COMPLETED,
             finish_reason=ModelFinishReason.STOP,
+            continuation=continuation,
         )
 
     def assert_exhausted(self) -> None:
