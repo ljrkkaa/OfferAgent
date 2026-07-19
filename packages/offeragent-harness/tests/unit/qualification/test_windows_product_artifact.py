@@ -226,6 +226,8 @@ def test_smoke_owns_the_temporary_vault_and_drives_frozen_worker_lifecycle(
     requests: list[tuple[str, dict[str, object]]] = []
 
     class Driver:
+        process_id = 30392
+
         def __enter__(self) -> Driver:
             return self
 
@@ -273,10 +275,7 @@ def test_smoke_owns_the_temporary_vault_and_drives_frozen_worker_lifecycle(
             "workerDescendants": [],
         },
     )
-    monkeypatch.setattr(
-        "scripts.qualify_built_windows_product._offeragent_process_ids",
-        lambda: {"offeragent-process-host.exe": set(), "offeragent-worker.exe": set()},
-    )
+    monkeypatch.setattr("scripts.qualify_built_windows_product._alive_owned_processes", lambda _owned: [])
     monkeypatch.setattr(
         "scripts.qualify_built_windows_product._offline_audit_report",
         lambda _path, _token: {
@@ -392,14 +391,10 @@ def test_offline_smoke_failure_still_audits_process_leaks_and_removes_owned_root
     runs = tmp_path / "qualification-runs"
     source.mkdir()
     runs.mkdir()
-    snapshots = iter(
-        (
-            {"offeragent-process-host.exe": set[int](), "offeragent-worker.exe": set[int]()},
-            {"offeragent-process-host.exe": set[int](), "offeragent-worker.exe": {4242}},
-        )
-    )
 
     class FailingDriver:
+        process_id = 30392
+
         def __enter__(self) -> FailingDriver:
             return self
 
@@ -412,7 +407,10 @@ def test_offline_smoke_failure_still_audits_process_leaks_and_removes_owned_root
     monkeypatch.setattr(
         "scripts.qualify_built_windows_product.QualificationDriverClient", lambda **_kwargs: FailingDriver()
     )
-    monkeypatch.setattr("scripts.qualify_built_windows_product._offeragent_process_ids", lambda: next(snapshots))
+    monkeypatch.setattr(
+        "scripts.qualify_built_windows_product._alive_owned_processes",
+        lambda _owned: ["offeragent-worker.exe:4242"],
+    )
 
     with pytest.raises(qualify_built_windows_product.BuiltWindowsProductQualificationError) as captured:
         qualify_built_windows_product.smoke_built_windows_product(

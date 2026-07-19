@@ -149,6 +149,51 @@ test("stdio Worker receives the exact plugin journal binding needed for unknown-
     await closing;
 });
 
+test("stdio Worker forwards only the validated deny-only offline qualification guard", async (t) => {
+    const trace = path.resolve("qualification", "offline-audit.jsonl");
+    const token = "a".repeat(64);
+    const previousTrace = process.env.OFFERAGENT_OFFLINE_QUALIFICATION_TRACE;
+    const previousToken = process.env.OFFERAGENT_OFFLINE_QUALIFICATION_TOKEN;
+    process.env.OFFERAGENT_OFFLINE_QUALIFICATION_TRACE = trace;
+    process.env.OFFERAGENT_OFFLINE_QUALIFICATION_TOKEN = token;
+    t.after(() => {
+        if (previousTrace === undefined) delete process.env.OFFERAGENT_OFFLINE_QUALIFICATION_TRACE;
+        else process.env.OFFERAGENT_OFFLINE_QUALIFICATION_TRACE = previousTrace;
+        if (previousToken === undefined) delete process.env.OFFERAGENT_OFFLINE_QUALIFICATION_TOKEN;
+        else process.env.OFFERAGENT_OFFLINE_QUALIFICATION_TOKEN = previousToken;
+    });
+    const child = new FakeChildProcess();
+    let spawned;
+    const childProcess = {
+        ...require("node:child_process"),
+        spawn(executable, args, options) {
+            spawned = { executable, args, options };
+            return child;
+        },
+    };
+    const { StdioWorkerTransport } = loadModule("stdio_worker.ts", { "node:child_process": childProcess });
+    const vaultRoot = path.resolve("vault");
+    const transport = new StdioWorkerTransport(
+        path.resolve("runtime", "offeragent-worker.exe"),
+        vaultRoot,
+        "1.2.3-local",
+        path.join(vaultRoot, ".obsidian", "offeragent", "vault-change-journal"),
+        "b".repeat(64),
+    );
+
+    const peer = await transport.connect();
+
+    assert.deepEqual(spawned.options.env, {
+        SystemRoot: process.env.SystemRoot ?? "C:\\Windows",
+        LOCALAPPDATA: process.env.LOCALAPPDATA ?? "",
+        OFFERAGENT_OFFLINE_QUALIFICATION_TRACE: trace,
+        OFFERAGENT_OFFLINE_QUALIFICATION_TOKEN: token,
+    });
+    const closing = peer.close();
+    child.emitExit(0, null);
+    await closing;
+});
+
 test("stdio Worker refuses untrusted plugin recovery bindings before process creation", () => {
     const { StdioWorkerTransport } = loadModule("stdio_worker.ts");
     const executable = path.resolve("runtime", "offeragent-worker.exe");

@@ -56,7 +56,7 @@ def smoke_built_windows_product(
     trace_token = secrets.token_hex(32)
     vault = root / "Vault"
     local_app_data = root / "LocalAppData"
-    baseline = _offeragent_process_ids()
+    owned_processes: dict[int, str] = {}
     result: dict[str, Any] | None = None
     offline_audit: dict[str, Any] | None = None
     primary_error: BaseException | None = None
@@ -98,6 +98,9 @@ def smoke_built_windows_product(
             source_root_guard=guard,
             environment_overrides=_offline_environment(trace_path, trace_token),
         ) as driver:
+            if driver.process_id < 1:
+                raise BuiltWindowsProductQualificationError("qualification driver process identity differs")
+            owned_processes[driver.process_id] = "node.exe"
             hello = driver.request("hello", {})
             if hello != {
                 "driverProtocolVersion": 2,
@@ -119,11 +122,15 @@ def smoke_built_windows_product(
                 or transport != "stdio"
             ):
                 raise BuiltWindowsProductQualificationError("qualification driver offline start differs")
+            owned_processes[worker_pid] = "offeragent-worker.exe"
             observation = _offline_process_observation(worker_pid)
             allowed_loopback_sockets = observation["allowedLoopbackSockets"]
             allowed_system_descendants = observation["allowedSystemDescendants"]
             unexpected_sockets = observation["unexpectedSockets"]
             worker_descendants = observation["workerDescendants"]
+            for descendant in allowed_system_descendants:
+                name, process_id = descendant.rsplit(":", 1)
+                owned_processes[int(process_id)] = name
             if unexpected_sockets:
                 raise BuiltWindowsProductQualificationError(
                     f"offline Worker opened unexpected sockets: {unexpected_sockets}"
@@ -172,12 +179,7 @@ def smoke_built_windows_product(
         audit_errors.append(f"qualification owned-root cleanup failed: {type(error).__name__}")
     leaked: list[str] = []
     try:
-        final = _offeragent_process_ids()
-        leaked = sorted(
-            f"{image}:{process_id}"
-            for image, process_ids in final.items()
-            for process_id in process_ids - baseline.get(image, set())
-        )
+        leaked = _alive_owned_processes(owned_processes)
         if leaked:
             audit_errors.append(f"qualification leaked product processes: {leaked}")
     except BaseException as error:
@@ -533,11 +535,14 @@ def _unspecified_address(value: str) -> bool:
         return False
 
 
-def _offeragent_process_ids() -> dict[str, set[int]]:
+def _alive_owned_processes(owned: dict[int, str]) -> list[str]:
+    if not owned:
+        return []
+    target_ids = ",".join(str(process_id) for process_id in sorted(owned))
     script = (
+        f"$targets=@({target_ids}); "
         "$items = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
-        "Where-Object { $_.Name -in @('offeragent-worker.exe','offeragent-process-host.exe',"
-        "'node.exe','conhost.exe') } | "
+        "Where-Object { $targets -contains [int]$_.ProcessId } | "
         "ForEach-Object { [pscustomobject]@{ name=$_.Name; pid=[int]$_.ProcessId } }); "
         "$items | ConvertTo-Json -Compress"
     )
@@ -547,24 +552,24 @@ def _offeragent_process_ids() -> dict[str, set[int]]:
         encoding="utf-8",
         timeout=30,
     ).strip()
-    result: dict[str, set[int]] = {
-        "conhost.exe": set(),
-        "node.exe": set(),
-        "offeragent-process-host.exe": set(),
-        "offeragent-worker.exe": set(),
-    }
     if not raw:
-        return result
+        return []
     value = json.loads(raw)
     records = value if isinstance(value, list) else [value]
+    result: list[str] = []
     for record in records:
         if not isinstance(record, dict):
             continue
         name = record.get("name")
         process_id = record.get("pid")
-        if name in result and isinstance(process_id, int):
-            result[name].add(process_id)
-    return result
+        if (
+            isinstance(name, str)
+            and isinstance(process_id, int)
+            and process_id in owned
+            and name.casefold() == owned[process_id].casefold()
+        ):
+            result.append(f"{name}:{process_id}")
+    return sorted(result)
 
 
 if __name__ == "__main__":

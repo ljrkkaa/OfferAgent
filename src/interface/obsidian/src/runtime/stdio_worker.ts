@@ -73,10 +73,7 @@ export class StdioWorkerTransport implements RpcTransport {
         ], {
             windowsHide: true,
             stdio: ["pipe", "pipe", "pipe"],
-            env: {
-                SystemRoot: process.env.SystemRoot ?? "C:\\Windows",
-                LOCALAPPDATA: process.env.LOCALAPPDATA ?? "",
-            },
+            env: workerEnvironment(),
         });
         const channel = new ChildStdioChannel(child);
         const abort = () => void channel.close();
@@ -91,6 +88,23 @@ export class StdioWorkerTransport implements RpcTransport {
             signal?.removeEventListener("abort", abort);
         }
     }
+}
+
+function workerEnvironment(): NodeJS.ProcessEnv {
+    const environment: NodeJS.ProcessEnv = {
+        SystemRoot: process.env.SystemRoot ?? "C:\\Windows",
+        LOCALAPPDATA: process.env.LOCALAPPDATA ?? "",
+    };
+    const trace = process.env.OFFERAGENT_OFFLINE_QUALIFICATION_TRACE;
+    const token = process.env.OFFERAGENT_OFFLINE_QUALIFICATION_TOKEN;
+    if (trace === undefined && token === undefined) return environment;
+    if (trace === undefined || token === undefined || !isAbsolute(trace) || trace.includes("\0") ||
+        !/^[0-9a-f]{64}$/u.test(token)) {
+        throw new Error("offline qualification guard environment is invalid");
+    }
+    environment.OFFERAGENT_OFFLINE_QUALIFICATION_TRACE = trace;
+    environment.OFFERAGENT_OFFLINE_QUALIFICATION_TOKEN = token;
+    return environment;
 }
 
 export class ChildStdioChannel implements ByteChannel {

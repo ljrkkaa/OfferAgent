@@ -49,6 +49,7 @@ def test_driver_client_separates_product_events_from_command_responses(tmp_path:
         working_directory=tmp_path,
         source_root_guard=guard,
     ) as client:
+        assert client.process_id > 0
         assert client.request("emit", {}) == {"accepted": True}
         assert client.next_event(timeout=1) == {
             "event": "runtime.event",

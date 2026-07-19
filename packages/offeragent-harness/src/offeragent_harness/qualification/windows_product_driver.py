@@ -75,6 +75,10 @@ class QualificationDriverClient:
     def return_code(self) -> int | None:
         return self._process.poll()
 
+    @property
+    def process_id(self) -> int:
+        return self._process.pid
+
     def request(
         self,
         command: str,

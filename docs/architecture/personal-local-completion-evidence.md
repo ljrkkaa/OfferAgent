@@ -92,7 +92,9 @@ Runtime manifest、Git commit 和源码树摘要的绑定。TypeScript 驱动只
 manifest 固定的真实冻结 Worker 和 direct stdio，不解析仓库源码。基础 smoke 在 ownership marker 约束的一次性
 Vault 中完成 initialize/shutdown。冻结 Worker 的独立 bootstrap 在导入 `offeragent_harness` 产品包前安装资格验证专用的
 Python audit hook，持续记录 bind/connect/getaddrinfo/sendto/sendmsg 并只放行可由标准库调用栈证明的内部 `socketpair`，
-同时拒绝任何子进程尝试；主控再主动观测存活 socket、后代进程及最终泄漏。版本化 canonical JSON
+同时拒绝任何子进程尝试。Plugin 的 stdio transport 默认仍只传 `SystemRoot`/`LOCALAPPDATA`；只有当成对、格式合法的
+deny-only 资格变量已存在时才把 trace 路径与 token 原样转给 Worker。主控再主动观测存活 socket、后代进程，并按本次
+实际拥有的 Node/Worker/system-child PID 检查最终泄漏，避免把并发的无关 Node 进程计入候选。版本化 canonical JSON
 记录实际命令/退出、带命令/名称/原因的 skip、来源头、local commits、迁移、安装、认证、临时 Vault 和进程证据；
 最终门还必须读取两份 canonical Code Review attestation，分别绑定 exact HEAD、版本控制中固定且不可由调用者替换的 base、
 Standards 轴及 #68/#79 Spec 轴，
