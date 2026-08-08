@@ -1,0 +1,4 @@
+interface:
+  display_name: "Knowledge Retrieval"
+  short_description: "Trace Wiki answers back to page evidence"
+  default_prompt: "Use $knowledge-retrieval to answer from the local knowledge base with page citations."

@@ -4,7 +4,6 @@ from .application_commands import ApplicationCommandContext, ApplicationCommandD
 from .approvals import ApprovalObserver, ApprovalPort
 from .artifacts import ArtifactMetadata, ArtifactState, ArtifactStore, Sensitivity, StreamingArtifactStore
 from .cancellation import CancellationCodeLike, CancellationReasonLike, CancellationToken, OperationCancelled
-from .capabilities import CapabilityAuditRecord, CapabilityAuditSink, NullCapabilityAuditSink
 from .events import (
     EventIdConflict,
     EventIdempotencyConflict,
@@ -57,8 +56,6 @@ __all__ = [
     "CancellationCodeLike",
     "CancellationReasonLike",
     "CancellationToken",
-    "CapabilityAuditRecord",
-    "CapabilityAuditSink",
     "Clock",
     "EntityRecord",
     "EntityRevisionConflict",
@@ -79,7 +76,6 @@ __all__ = [
     "ModelGateway",
     "NetworkAuditSink",
     "NewEvent",
-    "NullCapabilityAuditSink",
     "OperationCancelled",
     "PolicyEvaluator",
     "ProcessArtifactBudget",

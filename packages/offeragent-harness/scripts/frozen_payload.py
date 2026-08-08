@@ -391,6 +391,20 @@ def merge_frozen_evidence(
     """Merge target evidence while rejecting conflicting ownership."""
 
     result = FrozenRuntimeEvidence()
+    merged_paths_by_casefold: dict[str, str] = {}
+    for merged_path in sorted(merged_root.rglob("*")):
+        if merged_path.is_symlink():
+            raise FrozenPayloadError("merged PyInstaller tree contains a symlink")
+        if merged_path.is_dir():
+            continue
+        if not merged_path.is_file() or merged_path.stat().st_nlink != 1:
+            raise FrozenPayloadError("merged PyInstaller tree contains a hard link or special file")
+        relative = merged_path.relative_to(merged_root).as_posix()
+        folded_path = relative.casefold()
+        current_path = merged_paths_by_casefold.get(folded_path)
+        if current_path is not None and current_path != relative:
+            raise FrozenPayloadError("merged PyInstaller tree contains a case-insensitive path collision")
+        merged_paths_by_casefold[folded_path] = relative
     for target in targets:
         for component in target.components.values():
             result.register_component(component)
@@ -401,32 +415,45 @@ def merge_frozen_evidence(
                 raise FrozenPayloadError(f"duplicate PyInstaller target: {name}")
             result.targets[name] = record
         for path, file_record in target.files.items():
-            current = result.files.get(path)
+            if _safe_payload_path(path) != path or file_record.path != path:
+                raise FrozenPayloadError("frozen file path identity differs from its evidence key")
+            folded_path = path.casefold()
+            canonical_path = merged_paths_by_casefold.get(folded_path)
+            if canonical_path is None:
+                raise FrozenPayloadError(f"captured target file is absent from merged PyInstaller tree: {path}")
+            current = result.files.get(canonical_path)
             if current is None:
-                result.files[path] = file_record
+                result.files[canonical_path] = FrozenFile(
+                    canonical_path,
+                    file_record.component_id,
+                    file_record.captured_byte_length,
+                    file_record.captured_sha256,
+                    file_record.source_refs,
+                    file_record.targets,
+                )
                 continue
             if current.component_id != file_record.component_id:
-                raise FrozenPayloadError(f"frozen file ownership differs across targets: {path}")
+                raise FrozenPayloadError(f"frozen file ownership differs across targets: {canonical_path}")
             if (
                 current.captured_byte_length != file_record.captured_byte_length
                 or current.captured_sha256 != file_record.captured_sha256
             ):
-                raise FrozenPayloadError(f"frozen file capture differs across targets: {path}")
-            result.files[path] = FrozenFile(
-                path,
+                raise FrozenPayloadError(f"frozen file capture differs across targets: {canonical_path}")
+            result.files[canonical_path] = FrozenFile(
+                canonical_path,
                 current.component_id,
                 current.captured_byte_length,
                 current.captured_sha256,
                 tuple(sorted(set(current.source_refs) | set(file_record.source_refs))),
                 tuple(sorted(set(current.targets) | set(file_record.targets))),
             )
-    merged_files = {
-        path.relative_to(merged_root).as_posix()
-        for path in merged_root.rglob("*")
-        if path.is_file() and not path.is_symlink()
-    }
+    merged_files = set(merged_paths_by_casefold.values())
     if merged_files != set(result.files):
-        raise FrozenPayloadError("merged PyInstaller tree differs from captured target TOCs")
+        raise FrozenPayloadError(
+            "merged PyInstaller tree differs from captured target TOCs: "
+            f"uncaptured={sorted(merged_files - set(result.files))}, "
+            f"missing={sorted(set(result.files) - merged_files)}"
+        )
     for relative, frozen_file in result.files.items():
         merged_path = merged_root / Path(relative)
         if (

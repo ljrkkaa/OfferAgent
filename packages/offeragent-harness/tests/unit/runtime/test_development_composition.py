@@ -13,7 +13,6 @@ from offeragent_harness.runtime.startup import RuntimeStartupBlocked, StartupFai
 def test_protocol_capabilities_are_structural_not_workspace_policy() -> None:
     capabilities = _protocol_capabilities()
 
-    assert capabilities.loopback_web is True
     assert capabilities.event_replay is True
 
 

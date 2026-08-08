@@ -100,6 +100,7 @@ def _gateway(
     transport: httpx.BaseTransport,
     *,
     secrets: _SecretResolver | None = None,
+    max_retries: int = 0,
 ) -> DeepSeekChatGateway:
     config = OpenAIResponsesConfig(
         provider_id="deepseek",
@@ -108,7 +109,9 @@ def _gateway(
         secret_scope_id=SCOPE,
         credential_handle=HANDLE,
         service_tier=None,
-        max_retries=0,
+        max_retries=max_retries,
+        retry_base_seconds=0,
+        retry_max_seconds=0,
     )
     return DeepSeekChatGateway(
         config=config,
@@ -307,6 +310,35 @@ async def test_json_mode_emits_object_for_canonical_agent_step_validation() -> N
         ModelEventKind.COMPLETED,
     ]
     assert events[1].data == {"answer": "", "unexpected": "private payload"}
+
+
+@pytest.mark.asyncio
+async def test_json_mode_retries_transient_malformed_output_before_emitting_semantics() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        content = "not-json" if attempts == 1 else '{"answer":"recovered"}'
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_successful_sse(content),
+        )
+
+    events = await _collect(
+        _gateway(httpx.MockTransport(handler), max_retries=1),
+        _request(output_mode=ModelOutputMode.JSON),
+    )
+
+    assert attempts == 2
+    assert [event.kind for event in events] == [
+        ModelEventKind.STARTED,
+        ModelEventKind.STRUCTURED_OUTPUT,
+        ModelEventKind.USAGE,
+        ModelEventKind.COMPLETED,
+    ]
+    assert events[1].data == {"answer": "recovered"}
 
 
 @pytest.mark.asyncio

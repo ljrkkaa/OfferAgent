@@ -1,26 +1,47 @@
 import { randomBytes } from "node:crypto";
 
 import { EventEnvelope, ProjectionState } from "./event_reducer";
-import type { ContentBlock } from "./generated_protocol";
+import type {
+    ContentBlock,
+    DocumentContentBlock,
+    DocumentFileRef,
+    DocumentMediaType,
+} from "./generated_protocol";
 import { HarnessClient } from "./harness_client";
 import { JsonObject, JsonValue, requireJsonObject } from "./json_rpc";
+
+export const MAX_DRAFT_ATTACHMENTS = 5;
+export const MAX_DRAFT_ATTACHMENT_BYTES = 64 * 1024 * 1024;
+
+export type DraftAttachmentMediaType = DocumentMediaType;
+
+export interface DraftAttachment {
+    readonly name: string;
+    readonly mediaType: DraftAttachmentMediaType;
+    readonly size: number;
+    readonly file: DocumentFileRef;
+}
 
 export interface ChatTab {
     readonly tabId: string;
     sessionId: string | null;
     title: string;
     draft: string;
+    draftAttachments: DraftAttachment[];
+    attachmentError: string | null;
     selectedRunId: string | null;
 }
 
 export interface PersistedChatTabs {
-    readonly schemaVersion: 1;
+    readonly schemaVersion: 2;
     readonly activeTabId: string;
     readonly tabs: readonly {
         tabId: string;
         sessionId: string | null;
         title: string;
         draft: string;
+        draftAttachments: readonly DraftAttachment[];
+        attachmentError: string | null;
         selectedRunId: string | null;
     }[];
 }
@@ -38,7 +59,6 @@ export interface TurnRunConfig {
 }
 
 export interface SendTurnOptions {
-    readonly attachments?: readonly ContentBlock[];
     readonly runConfig: TurnRunConfig;
     readonly deadline?: string | null;
 }
@@ -61,6 +81,7 @@ export interface PendingSubmission {
     readonly tabId: string;
     readonly turnId: string;
     readonly text: string;
+    readonly attachments: readonly DraftAttachment[];
 }
 
 interface HydratedSession {
@@ -97,10 +118,13 @@ export class ChatStore {
 
     get snapshot(): ChatStoreSnapshot {
         return {
-            tabs: this.tabs.map((tab) => ({ ...tab })),
+            tabs: this.tabs.map(cloneTab),
             activeTabId: this.activeTabId,
             projection: this.client.reducer.state,
-            pendingSubmissions: [...this.pendingSubmissions.values()].map((submission) => ({ ...submission })),
+            pendingSubmissions: [...this.pendingSubmissions.values()].map((submission) => ({
+                ...submission,
+                attachments: submission.attachments.map(cloneAttachment),
+            })),
             busy: this.operationCount > 0,
             lastError: this.lastError,
         };
@@ -115,9 +139,12 @@ export class ChatStore {
     async initialize(): Promise<void> {
         this.requireAlive();
         if (this.unsubscribeEvents) return;
-        const persisted = parsePersistedTabs(await this.persistence.load());
+        const parsed = parsePersistedTabs(await this.persistence.load());
+        const persisted = parsed && persistedTabsBelongToWorkspace(parsed, this.client.reducer.state.workspaceId)
+            ? parsed
+            : null;
         if (persisted) {
-            this.tabs = persisted.tabs.map((tab) => ({ ...tab }));
+            this.tabs = persisted.tabs.map(cloneTab);
             this.activeTabId = persisted.activeTabId;
         } else {
             const tab = newTab();
@@ -170,7 +197,7 @@ export class ChatStore {
         this.tabs.push(tab);
         this.activeTabId = tab.tabId;
         await this.persistAndEmit();
-        return { ...tab };
+        return cloneTab(tab);
     }
 
     async openSession(sessionId: string): Promise<ChatTab> {
@@ -191,7 +218,7 @@ export class ChatStore {
             }
             this.activeTabId = tab.tabId;
             await this.persistAndEmit();
-            return { ...tab };
+            return cloneTab(tab);
         });
     }
 
@@ -234,10 +261,112 @@ export class ChatStore {
         // A delayed composer save may outlive a closed tab.  It must never
         // fall through to whichever tab happens to be active at that point.
         if (!tab) return;
+        if (this.sendsInFlight.has(`tab:${tabId}`)) {
+            throw new Error("当前草稿正在发送，暂时不能修改");
+        }
         tab.draft = text;
         // Draft persistence is intentionally silent: rebuilding the focused
         // textarea here aborts an active Windows IME composition.
         await this.persist();
+    }
+
+    async addDraftAttachment(tabId: string, attachment: DraftAttachment): Promise<void> {
+        this.requireInitialized();
+        requireId(tabId, "tab_");
+        const tab = this.tabs.find((candidate) => candidate.tabId === tabId);
+        if (!tab) throw new Error("OfferAgent tab was closed before attachment import completed");
+        if (this.sendsInFlight.has(`tab:${tabId}`)) {
+            throw new Error("当前草稿正在发送，暂时不能添加附件");
+        }
+        const validated = requireDraftAttachment(attachment);
+        if (validated.file.workspaceId !== this.client.reducer.state.workspaceId) {
+            throw new Error("附件属于另一个 Workspace，已拒绝添加");
+        }
+        const duplicate = tab.draftAttachments.find(
+            (candidate) => candidate.file.contentHash === validated.file.contentHash,
+        );
+        if (duplicate) {
+            if (duplicate.mediaType !== validated.mediaType || duplicate.size !== validated.size ||
+                duplicate.file.path !== validated.file.path ||
+                duplicate.file.workspaceId !== validated.file.workspaceId) {
+                throw new Error("相同内容哈希对应的附件元数据不一致，已拒绝添加");
+            }
+            if (tab.attachmentError !== null) {
+                const previousError = tab.attachmentError;
+                tab.attachmentError = null;
+                try {
+                    await this.persist();
+                } catch (error) {
+                    tab.attachmentError = previousError;
+                    throw error;
+                }
+                this.emit();
+            }
+            return;
+        }
+        if (tab.draftAttachments.length >= MAX_DRAFT_ATTACHMENTS) {
+            throw new RangeError(`每个草稿最多可附加 ${MAX_DRAFT_ATTACHMENTS} 个文件`);
+        }
+        const previousAttachments = tab.draftAttachments;
+        const previousError = tab.attachmentError;
+        tab.draftAttachments = [...previousAttachments, validated];
+        tab.attachmentError = null;
+        try {
+            await this.persist();
+        } catch (error) {
+            tab.draftAttachments = previousAttachments;
+            tab.attachmentError = previousError;
+            throw error;
+        }
+        this.emit();
+    }
+
+    async removeDraftAttachment(tabId: string, contentHash: string): Promise<void> {
+        this.requireInitialized();
+        requireId(tabId, "tab_");
+        requireContentHash(contentHash);
+        const tab = this.tabs.find((candidate) => candidate.tabId === tabId);
+        if (!tab) return;
+        if (this.sendsInFlight.has(`tab:${tabId}`)) {
+            throw new Error("当前草稿正在发送，暂时不能移除附件");
+        }
+        const remaining = tab.draftAttachments.filter(
+            (attachment) => attachment.file.contentHash !== contentHash,
+        );
+        if (remaining.length === tab.draftAttachments.length) return;
+        const previousAttachments = tab.draftAttachments;
+        const previousError = tab.attachmentError;
+        tab.draftAttachments = remaining;
+        tab.attachmentError = null;
+        try {
+            await this.persist();
+        } catch (error) {
+            tab.draftAttachments = previousAttachments;
+            tab.attachmentError = previousError;
+            throw error;
+        }
+        this.emit();
+    }
+
+    async setAttachmentError(tabId: string, message: string | null): Promise<void> {
+        this.requireInitialized();
+        requireId(tabId, "tab_");
+        if (message !== null && (!message.trim() || message.length > 512 || message.includes("\0"))) {
+            throw new TypeError("attachment error is invalid");
+        }
+        const tab = this.tabs.find((candidate) => candidate.tabId === tabId);
+        if (!tab) return;
+        const normalized = message?.trim() ?? null;
+        if (tab.attachmentError === normalized) return;
+        const previousError = tab.attachmentError;
+        tab.attachmentError = normalized;
+        try {
+            await this.persist();
+        } catch (error) {
+            tab.attachmentError = previousError;
+            throw error;
+        }
+        this.emit();
     }
 
     async bindSession(sessionId: string, title?: string): Promise<void> {
@@ -261,6 +390,10 @@ export class ChatStore {
         const tabId = this.activeTab.tabId;
         const initialTab = this.tabs.find((candidate) => candidate.tabId === tabId);
         if (!initialTab) throw new Error("active OfferAgent tab is missing");
+        if (initialTab.draftAttachments.length > 0 &&
+            this.client.identity.capabilities.documentIngestion !== true) {
+            throw new Error("当前 Runtime 未协商 documentIngestion 能力；附件仍保留在草稿中，请更新 Runtime 后重试");
+        }
         const tabSendKey = `tab:${tabId}`;
         let sessionSendKey = initialTab.sessionId === null ? null : `session:${initialTab.sessionId}`;
         if (this.sendsInFlight.has(tabSendKey) ||
@@ -272,8 +405,14 @@ export class ChatStore {
         }
         this.sendsInFlight.add(tabSendKey);
         if (sessionSendKey !== null) this.sendsInFlight.add(sessionSendKey);
+        const submittedAttachments = initialTab.draftAttachments.map(cloneAttachment);
         const turnId = opaqueId("turn_");
-        this.pendingSubmissions.set(turnId, { tabId, turnId, text: normalized });
+        this.pendingSubmissions.set(turnId, {
+            tabId,
+            turnId,
+            text: normalized,
+            attachments: submittedAttachments.map(cloneAttachment),
+        });
         const operation = this.operation(async () => {
             let accepted = false;
             const tab = this.tabs.find((candidate) => candidate.tabId === tabId);
@@ -283,7 +422,14 @@ export class ChatStore {
                 sessionSendKey = `session:${sessionId}`;
                 this.sendsInFlight.add(sessionSendKey);
                 const idempotencyKey = opaqueId("turn_");
-                const input: ContentBlock[] = [{ type: "text", text: normalized }, ...(options.attachments ?? [])];
+                const input: ContentBlock[] = [
+                    { type: "text", text: normalized },
+                    ...submittedAttachments.map((attachment): DocumentContentBlock => ({
+                        type: "document",
+                        file: { ...attachment.file },
+                        mediaType: attachment.mediaType,
+                    })),
+                ];
                 const result = requireJsonObject(await this.client.request("turn/start", {
                     sessionId,
                     turnId,
@@ -297,6 +443,9 @@ export class ChatStore {
                     },
                     deadline: options.deadline ?? null,
                 }));
+                if (result.accepted !== true) throw new Error("Worker did not accept turn/start");
+                const returnedSessionId = textField(result, "sessionId");
+                if (returnedSessionId !== sessionId) throw new Error("Worker returned a different Session id");
                 const returnedTurnId = textField(result, "turnId");
                 if (returnedTurnId !== turnId) throw new Error("Worker returned a different Turn id");
                 const runId = textField(result, "runId");
@@ -304,6 +453,8 @@ export class ChatStore {
                 accepted = true;
                 tab.selectedRunId = runId;
                 tab.draft = "";
+                tab.draftAttachments = [];
+                tab.attachmentError = null;
                 await this.persistAndEmit();
                 return { turnId, runId };
             } finally {
@@ -570,9 +721,9 @@ export class ChatStore {
 
     private persist(): Promise<void> {
         return this.persistence.save({
-            schemaVersion: 1,
+            schemaVersion: 2,
             activeTabId: this.activeTabId,
-            tabs: this.tabs.map((tab) => ({ ...tab })),
+            tabs: this.tabs.map(cloneTab),
         });
     }
 
@@ -594,16 +745,21 @@ export class ChatStore {
 export function parsePersistedTabs(raw: unknown): PersistedChatTabs | null {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
     const value = raw as Record<string, unknown>;
-    if (value.schemaVersion !== 1 || typeof value.activeTabId !== "string" || !Array.isArray(value.tabs) ||
+    if ((value.schemaVersion !== 1 && value.schemaVersion !== 2) ||
+        typeof value.activeTabId !== "string" || !Array.isArray(value.tabs) ||
         value.tabs.length < 1 || value.tabs.length > 64) return null;
+    const migratingSchema1 = value.schemaVersion === 1;
     const tabs: ChatTab[] = [];
     const ids = new Set<string>();
     for (const rawTab of value.tabs) {
         if (!rawTab || typeof rawTab !== "object" || Array.isArray(rawTab)) return null;
         const tab = rawTab as Record<string, unknown>;
-        if (Object.keys(tab).length !== 5 || typeof tab.tabId !== "string" || typeof tab.title !== "string" ||
+        const expectedKeys = migratingSchema1 ? 5 : 7;
+        if (Object.keys(tab).length !== expectedKeys || typeof tab.tabId !== "string" || typeof tab.title !== "string" ||
             typeof tab.draft !== "string" || (tab.sessionId !== null && typeof tab.sessionId !== "string") ||
-            (tab.selectedRunId !== null && typeof tab.selectedRunId !== "string")) return null;
+            (tab.selectedRunId !== null && typeof tab.selectedRunId !== "string") ||
+            (!migratingSchema1 && !Array.isArray(tab.draftAttachments)) ||
+            (!migratingSchema1 && tab.attachmentError !== null && typeof tab.attachmentError !== "string")) return null;
         try {
             requireId(tab.tabId, "tab_");
             if (tab.sessionId !== null) requireId(tab.sessionId, "ses_");
@@ -612,21 +768,133 @@ export function parsePersistedTabs(raw: unknown): PersistedChatTabs | null {
         } catch (error) {
             return null;
         }
+        const draftAttachments: DraftAttachment[] = [];
+        if (!migratingSchema1) {
+            const rawAttachments = tab.draftAttachments as unknown[];
+            if (rawAttachments.length > MAX_DRAFT_ATTACHMENTS) return null;
+            const hashes = new Set<string>();
+            try {
+                for (const rawAttachment of rawAttachments) {
+                    const attachment = requireDraftAttachment(rawAttachment);
+                    if (hashes.has(attachment.file.contentHash)) return null;
+                    hashes.add(attachment.file.contentHash);
+                    draftAttachments.push(attachment);
+                }
+            } catch (error) {
+                return null;
+            }
+        }
+        const attachmentError = migratingSchema1 ? null : tab.attachmentError as string | null;
+        if (attachmentError !== null &&
+            (!attachmentError.trim() || attachmentError.length > 512 || attachmentError.includes("\0"))) return null;
         ids.add(tab.tabId);
         tabs.push({
             tabId: tab.tabId,
             sessionId: tab.sessionId,
             title: tab.title,
             draft: tab.draft,
+            draftAttachments,
+            attachmentError,
             selectedRunId: tab.selectedRunId,
         });
     }
     if (!ids.has(value.activeTabId)) return null;
-    return { schemaVersion: 1, activeTabId: value.activeTabId, tabs };
+    return { schemaVersion: 2, activeTabId: value.activeTabId, tabs };
+}
+
+function persistedTabsBelongToWorkspace(tabs: PersistedChatTabs, workspaceId: string): boolean {
+    return tabs.tabs.every((tab) => tab.draftAttachments.every(
+        (attachment) => attachment.file.workspaceId === workspaceId,
+    ));
 }
 
 function newTab(): ChatTab {
-    return { tabId: opaqueId("tab_"), sessionId: null, title: "新对话", draft: "", selectedRunId: null };
+    return {
+        tabId: opaqueId("tab_"),
+        sessionId: null,
+        title: "新对话",
+        draft: "",
+        draftAttachments: [],
+        attachmentError: null,
+        selectedRunId: null,
+    };
+}
+
+function cloneTab(tab: ChatTab): ChatTab {
+    return {
+        tabId: tab.tabId,
+        sessionId: tab.sessionId,
+        title: tab.title,
+        draft: tab.draft,
+        draftAttachments: tab.draftAttachments.map(cloneAttachment),
+        attachmentError: tab.attachmentError,
+        selectedRunId: tab.selectedRunId,
+    };
+}
+
+function cloneAttachment(attachment: DraftAttachment): DraftAttachment {
+    return {
+        name: attachment.name,
+        mediaType: attachment.mediaType,
+        size: attachment.size,
+        file: { ...attachment.file },
+    };
+}
+
+function requireDraftAttachment(raw: unknown): DraftAttachment {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new TypeError("attachment is invalid");
+    }
+    const attachment = raw as Record<string, unknown>;
+    if (Object.keys(attachment).length !== 4 || typeof attachment.name !== "string" ||
+        !isDraftAttachmentMediaType(attachment.mediaType) || typeof attachment.size !== "number" ||
+        !Number.isSafeInteger(attachment.size) || attachment.size < 1 ||
+        attachment.size > MAX_DRAFT_ATTACHMENT_BYTES || !attachment.file ||
+        typeof attachment.file !== "object" || Array.isArray(attachment.file)) {
+        throw new TypeError("attachment is invalid");
+    }
+    if (!attachment.name.trim() || attachment.name.length > 255 || attachment.name.includes("\0")) {
+        throw new TypeError("attachment name is invalid");
+    }
+    const file = attachment.file as Record<string, unknown>;
+    if (Object.keys(file).length !== 3 || typeof file.workspaceId !== "string" ||
+        typeof file.path !== "string" || typeof file.contentHash !== "string") {
+        throw new TypeError("attachment file reference is invalid");
+    }
+    requireId(file.workspaceId, "ws_");
+    requireContentHash(file.contentHash);
+    const expectedPath = managedAttachmentPath(file.contentHash, attachment.mediaType);
+    if (file.path !== expectedPath) throw new TypeError("attachment path is outside the managed directory");
+    return {
+        name: attachment.name,
+        mediaType: attachment.mediaType,
+        size: attachment.size,
+        file: {
+            workspaceId: file.workspaceId,
+            path: file.path,
+            contentHash: file.contentHash,
+        },
+    };
+}
+
+function isDraftAttachmentMediaType(value: unknown): value is DraftAttachmentMediaType {
+    return value === "application/pdf" || value === "image/png" ||
+        value === "image/jpeg" || value === "image/webp";
+}
+
+function requireContentHash(value: string): void {
+    if (!/^sha256:[0-9a-f]{64}$/.test(value)) throw new TypeError("attachment content hash is invalid");
+}
+
+export function managedAttachmentPath(contentHash: string, mediaType: DraftAttachmentMediaType): string {
+    requireContentHash(contentHash);
+    const extension: Record<DraftAttachmentMediaType, string> = {
+        "application/pdf": "pdf",
+        "image/png": "png",
+        "image/jpeg": "jpg",
+        "image/webp": "webp",
+    };
+    return `OfferAgent/Attachments/${contentHash.slice("sha256:".length)}.${extension[mediaType]}`;
 }
 
 function opaqueId(prefix: string): string {

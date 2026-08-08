@@ -32,6 +32,11 @@ from .common import (
     UsageSnapshot,
 )
 from .content import ArtifactRef, ContentBlock, SourceRef
+from .documents import (
+    DocumentExtractionCompletedPayload,
+    DocumentExtractionFailedPayload,
+    DocumentExtractionStartedPayload,
+)
 from .errors import ErrorEnvelope
 from .ids import (
     ApprovalId,
@@ -66,6 +71,9 @@ class EventType(str, Enum):
     APPROVAL_EXPIRED = "approval.expired"
     REFERENCES_UPDATED = "references.updated"
     ARTIFACT_CREATED = "artifact.created"
+    DOCUMENT_EXTRACTION_STARTED = "document.extraction_started"
+    DOCUMENT_EXTRACTION_COMPLETED = "document.extraction_completed"
+    DOCUMENT_EXTRACTION_FAILED = "document.extraction_failed"
     USAGE_UPDATED = "usage.updated"
     CONTEXT_COMPACTED = "context.compacted"
     SESSION_UPDATED = "session.updated"
@@ -513,6 +521,9 @@ _EventPayloadUnion = (
     | ApprovalExpiredPayload
     | ReferencesUpdatedPayload
     | ArtifactCreatedPayload
+    | DocumentExtractionStartedPayload
+    | DocumentExtractionCompletedPayload
+    | DocumentExtractionFailedPayload
     | UsageUpdatedPayload
     | ContextCompactedPayload
     | SessionUpdatedPayload
@@ -558,6 +569,9 @@ _EVENT_REGISTRY: dict[EventType, type[WireModel]] = {
     EventType.APPROVAL_EXPIRED: ApprovalExpiredPayload,
     EventType.REFERENCES_UPDATED: ReferencesUpdatedPayload,
     EventType.ARTIFACT_CREATED: ArtifactCreatedPayload,
+    EventType.DOCUMENT_EXTRACTION_STARTED: DocumentExtractionStartedPayload,
+    EventType.DOCUMENT_EXTRACTION_COMPLETED: DocumentExtractionCompletedPayload,
+    EventType.DOCUMENT_EXTRACTION_FAILED: DocumentExtractionFailedPayload,
     EventType.USAGE_UPDATED: UsageUpdatedPayload,
     EventType.CONTEXT_COMPACTED: ContextCompactedPayload,
     EventType.SESSION_UPDATED: SessionUpdatedPayload,

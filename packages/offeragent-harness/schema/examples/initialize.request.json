@@ -4,6 +4,7 @@
   "method": "initialize",
   "params": {
     "capabilities": {
+      "documentIngestion": true,
       "eventReplay": true,
       "multiSession": true,
       "subagents": true

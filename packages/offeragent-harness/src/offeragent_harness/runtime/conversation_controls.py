@@ -44,16 +44,38 @@ class CompactionExecution:
     replaced_sequence_start: int
     replaced_sequence_end: int
     model: str
+    summary_id: str | None = None
+    trigger: str = "manual"
+    estimated_before_tokens: int = 0
+    estimated_after_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_input_tokens: int = 0
 
     def __post_init__(self) -> None:
         if self.replaced_turn_count < 1 or self.replaced_sequence_start < 1:
             raise ValueError("compaction execution must replace a non-empty durable range")
         if self.replaced_sequence_end < self.replaced_sequence_start or not self.model:
             raise ValueError("compaction execution sequence/model is invalid")
+        if self.trigger not in {"manual", "auto", "hard_limit"}:
+            raise ValueError("compaction execution trigger is invalid")
+        if (
+            min(
+                self.estimated_before_tokens,
+                self.estimated_after_tokens,
+                self.input_tokens,
+                self.output_tokens,
+                self.cached_input_tokens,
+            )
+            < 0
+        ):
+            raise ValueError("compaction execution usage cannot be negative")
+        if self.cached_input_tokens > self.input_tokens:
+            raise ValueError("compaction cached input cannot exceed input usage")
 
 
 class SessionCompactionRunner(Protocol):
-    """Adapter that uses the canonical agent.CompactionService for one batch."""
+    """Adapter that persists one lossless context boundary for a durable event batch."""
 
     async def compact(
         self,
@@ -155,6 +177,14 @@ class ConversationControlService:
             compacted=True,
             boundary_artifact=artifact,
             replaced_turn_count=min(len(included_turns), execution.replaced_turn_count),
+            summary_id=execution.summary_id,
+            model=execution.model,
+            trigger="manual",
+            estimated_before_tokens=execution.estimated_before_tokens,
+            estimated_after_tokens=execution.estimated_after_tokens,
+            input_tokens=execution.input_tokens,
+            output_tokens=execution.output_tokens,
+            cached_input_tokens=execution.cached_input_tokens,
         )
         stream_id = f"session-{session_id}-compaction"
         async with self._unit_of_work.begin() as uow:

@@ -27,8 +27,8 @@ export const CLIENT_CAPABILITIES: Readonly<Record<CapabilityName, boolean>> = {
     hooks: true,
     subagents: true,
     artifacts: true,
-    loopbackWeb: true,
     contentBlocks: true,
+    documentIngestion: true,
     cancellation: true,
     diagnostics: true,
 };
@@ -45,8 +45,8 @@ export const REQUIRED_RUNTIME_CAPABILITIES: readonly CapabilityName[] = Object.f
     "hooks",
     "subagents",
     "artifacts",
-    "loopbackWeb",
     "contentBlocks",
+    "documentIngestion",
     "cancellation",
     "diagnostics",
 ]);

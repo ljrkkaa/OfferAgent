@@ -60,8 +60,6 @@ from offeragent_harness.protocol.messages import (
     TurnRetryParams,
     TurnRetryResult,
     TurnSteerParams,
-    WebLaunchParams,
-    WebLaunchResult,
 )
 from offeragent_harness.subagents.models import AgentCancelCommand, AgentUsage, SubagentRunStatus
 from offeragent_harness.subagents.service import SubagentService
@@ -70,7 +68,6 @@ from .application_dispatcher import ApplicationCommandHandler, CommandHandlerCon
 from .config_service import ConfigService
 from .conversation_controls import ConversationControlService
 from .harness_service import HarnessService, RetryTurnCommand
-from .loopback_gateway import LoopbackWebGateway
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,36 +351,6 @@ def conversation_control_handlers(
         )
 
     return {"session/compact": compact, "turn/retry": retry, "turn/steer": steer}
-
-
-def web_launch_handlers(
-    *,
-    gateway_provider: Callable[[], LoopbackWebGateway | None],
-) -> Mapping[str, ApplicationCommandHandler]:
-    """Issue one fragment-only launch grant only while Loopback Web is active."""
-
-    async def launch(
-        raw: WireModel,
-        cancellation: CancellationToken,
-        context: ApplicationCommandContext,
-    ) -> WireModel:
-        if not isinstance(raw, WebLaunchParams):
-            raise TypeError("web/launch params were not validated")
-        if context.transport != "stdio":
-            raise PermissionError("web/launch is available only to the direct plugin stdio connection")
-        cancellation.checkpoint()
-        gateway = gateway_provider()
-        if gateway is None:
-            raise PermissionError("web/launch requires ui.loopback_web_enabled for this Worker")
-        value = gateway.issue_launch()
-        return WebLaunchResult(
-            url=value.url,
-            worker_pid=value.worker_pid,
-            workspace_instance_id=value.workspace_instance_id,
-            expires_at=value.expires_at.isoformat(),
-        )
-
-    return {"web/launch": launch}
 
 
 def subagent_command_handlers(
@@ -717,5 +684,4 @@ __all__ = [
     "diagnostics_command_handlers",
     "event_replay_handlers",
     "subagent_command_handlers",
-    "web_launch_handlers",
 ]

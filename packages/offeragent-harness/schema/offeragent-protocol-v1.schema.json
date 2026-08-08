@@ -658,6 +658,17 @@
           "default": null,
           "title": "Label"
         },
+        "locator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceLocator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "type": {
           "const": "artifact",
           "title": "Type",
@@ -833,8 +844,8 @@
         "hooks",
         "subagents",
         "artifacts",
-        "loopbackWeb",
         "contentBlocks",
+        "documentIngestion",
         "cancellation",
         "diagnostics"
       ],
@@ -869,6 +880,11 @@
           "title": "Diagnostics",
           "type": "boolean"
         },
+        "documentIngestion": {
+          "default": false,
+          "title": "Documentingestion",
+          "type": "boolean"
+        },
         "eventReplay": {
           "default": false,
           "title": "Eventreplay",
@@ -877,11 +893,6 @@
         "hooks": {
           "default": false,
           "title": "Hooks",
-          "type": "boolean"
-        },
-        "loopbackWeb": {
-          "default": false,
-          "title": "Loopbackweb",
           "type": "boolean"
         },
         "multiSession": {
@@ -1080,6 +1091,7 @@
       "discriminator": {
         "mapping": {
           "artifact": "#/$defs/ArtifactContentBlock",
+          "document": "#/$defs/DocumentContentBlock",
           "file": "#/$defs/FileContentBlock",
           "image": "#/$defs/ImageContentBlock",
           "text": "#/$defs/TextContentBlock"
@@ -1092,6 +1104,9 @@
         },
         {
           "$ref": "#/$defs/FileContentBlock"
+        },
+        {
+          "$ref": "#/$defs/DocumentContentBlock"
         },
         {
           "$ref": "#/$defs/ImageContentBlock"
@@ -1408,6 +1423,352 @@
       "title": "DiagnosticsSnapshotResult",
       "type": "object"
     },
+    "DocumentContentBlock": {
+      "additionalProperties": false,
+      "description": "A hashed Vault file that the negotiated ingestion capability must parse.",
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/DocumentFileRef"
+        },
+        "mediaType": {
+          "$ref": "#/$defs/DocumentMediaType"
+        },
+        "type": {
+          "const": "document",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "file",
+        "mediaType"
+      ],
+      "title": "DocumentContentBlock",
+      "type": "object"
+    },
+    "DocumentExtractionCompletedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt": {
+          "default": 1,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "documentId": {
+          "$ref": "#/$defs/DocumentId"
+        },
+        "pageCount": {
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Pagecount",
+          "type": "integer"
+        },
+        "pageProvenance": {
+          "items": {
+            "$ref": "#/$defs/DocumentPageProvenance"
+          },
+          "maxItems": 10000,
+          "minItems": 1,
+          "title": "Pageprovenance",
+          "type": "array"
+        },
+        "textArtifactId": {
+          "$ref": "#/$defs/ArtifactId"
+        },
+        "warnings": {
+          "items": {
+            "$ref": "#/$defs/DocumentExtractionWarning"
+          },
+          "maxItems": 10000,
+          "title": "Warnings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "documentId",
+        "textArtifactId",
+        "pageCount",
+        "pageProvenance"
+      ],
+      "title": "DocumentExtractionCompletedPayload",
+      "type": "object"
+    },
+    "DocumentExtractionFailedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt": {
+          "default": 1,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "documentId": {
+          "$ref": "#/$defs/DocumentId"
+        },
+        "failure": {
+          "$ref": "#/$defs/DocumentExtractionFailure"
+        }
+      },
+      "required": [
+        "documentId",
+        "failure"
+      ],
+      "title": "DocumentExtractionFailedPayload",
+      "type": "object"
+    },
+    "DocumentExtractionFailure": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/DocumentExtractionFailureCode"
+        },
+        "details": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Details",
+          "type": "object"
+        },
+        "locator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DocumentPageLocator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "retryable": {
+          "title": "Retryable",
+          "type": "boolean"
+        },
+        "userVisibleMessage": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Uservisiblemessage",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "retryable",
+        "userVisibleMessage"
+      ],
+      "title": "DocumentExtractionFailure",
+      "type": "object"
+    },
+    "DocumentExtractionFailureCode": {
+      "enum": [
+        "source_not_found",
+        "source_unreadable",
+        "source_integrity_mismatch",
+        "unsupported_media_type",
+        "document_encrypted",
+        "document_limit_exceeded",
+        "no_extractable_text",
+        "parser_unavailable",
+        "parser_failed",
+        "output_integrity_mismatch",
+        "deadline_exceeded",
+        "cancelled"
+      ],
+      "title": "DocumentExtractionFailureCode",
+      "type": "string"
+    },
+    "DocumentExtractionMethod": {
+      "enum": [
+        "embedded_text",
+        "ocr"
+      ],
+      "title": "DocumentExtractionMethod",
+      "type": "string"
+    },
+    "DocumentExtractionStartedPayload": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt": {
+          "default": 1,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Attempt",
+          "type": "integer"
+        },
+        "documentId": {
+          "$ref": "#/$defs/DocumentId"
+        },
+        "inputBlockIndex": {
+          "maximum": 255,
+          "minimum": 0,
+          "title": "Inputblockindex",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "documentId",
+        "inputBlockIndex"
+      ],
+      "title": "DocumentExtractionStartedPayload",
+      "type": "object"
+    },
+    "DocumentExtractionWarning": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/DocumentExtractionWarningCode"
+        },
+        "locator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DocumentPageLocator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "userVisibleMessage": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Uservisiblemessage",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "userVisibleMessage"
+      ],
+      "title": "DocumentExtractionWarning",
+      "type": "object"
+    },
+    "DocumentExtractionWarningCode": {
+      "enum": [
+        "page_no_text",
+        "low_ocr_confidence",
+        "partial_page"
+      ],
+      "title": "DocumentExtractionWarningCode",
+      "type": "string"
+    },
+    "DocumentFileRef": {
+      "additionalProperties": false,
+      "description": "A whole immutable Vault file accepted by document ingestion.",
+      "properties": {
+        "contentHash": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "path": {
+          "$ref": "#/$defs/RelativeVaultPath"
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "path",
+        "contentHash"
+      ],
+      "title": "DocumentFileRef",
+      "type": "object"
+    },
+    "DocumentId": {
+      "maxLength": 128,
+      "minLength": 5,
+      "pattern": "^doc_[A-Za-z0-9][A-Za-z0-9_-]*$",
+      "type": "string"
+    },
+    "DocumentMediaType": {
+      "description": "Media types accepted by the v1 local document-ingestion boundary.",
+      "enum": [
+        "application/pdf",
+        "image/png",
+        "image/jpeg",
+        "image/webp"
+      ],
+      "title": "DocumentMediaType",
+      "type": "string"
+    },
+    "DocumentPageLocator": {
+      "additionalProperties": false,
+      "description": "One-based inclusive page range within an immutable document source.",
+      "properties": {
+        "pageEnd": {
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Pageend",
+          "type": "integer"
+        },
+        "pageStart": {
+          "maximum": 1000000,
+          "minimum": 1,
+          "title": "Pagestart",
+          "type": "integer"
+        },
+        "type": {
+          "const": "page",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "pageStart",
+        "pageEnd"
+      ],
+      "title": "DocumentPageLocator",
+      "type": "object"
+    },
+    "DocumentPageProvenance": {
+      "additionalProperties": false,
+      "description": "Maps a UTF-8 byte span in the extracted text artifact to one source page.",
+      "properties": {
+        "confidence": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Confidence"
+        },
+        "extractionMethod": {
+          "$ref": "#/$defs/DocumentExtractionMethod"
+        },
+        "locator": {
+          "$ref": "#/$defs/DocumentPageLocator"
+        },
+        "utf8EndByte": {
+          "minimum": 1,
+          "title": "Utf8Endbyte",
+          "type": "integer"
+        },
+        "utf8StartByte": {
+          "minimum": 0,
+          "title": "Utf8Startbyte",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "locator",
+        "extractionMethod",
+        "utf8StartByte",
+        "utf8EndByte"
+      ],
+      "title": "DocumentPageProvenance",
+      "type": "object"
+    },
     "ErrorCode": {
       "enum": [
         "protocol.invalid_json",
@@ -1430,6 +1791,7 @@
         "resource.conflict",
         "policy.denied",
         "approval.expired",
+        "document.extraction_failed",
         "tool.failed",
         "tool.unknown_outcome",
         "provider.unreachable",
@@ -1679,6 +2041,15 @@
           "$ref": "#/$defs/ArtifactCreatedPayload"
         },
         {
+          "$ref": "#/$defs/DocumentExtractionStartedPayload"
+        },
+        {
+          "$ref": "#/$defs/DocumentExtractionCompletedPayload"
+        },
+        {
+          "$ref": "#/$defs/DocumentExtractionFailedPayload"
+        },
+        {
           "$ref": "#/$defs/UsageUpdatedPayload"
         },
         {
@@ -1773,6 +2144,9 @@
         "approval.expired",
         "references.updated",
         "artifact.created",
+        "document.extraction_started",
+        "document.extraction_completed",
+        "document.extraction_failed",
         "usage.updated",
         "context.compacted",
         "session.updated",
@@ -5366,9 +5740,53 @@
           ],
           "default": null
         },
+        "cachedInputTokens": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Cachedinputtokens",
+          "type": "integer"
+        },
         "compacted": {
           "title": "Compacted",
           "type": "boolean"
+        },
+        "estimatedAfterTokens": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Estimatedaftertokens",
+          "type": "integer"
+        },
+        "estimatedBeforeTokens": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Estimatedbeforetokens",
+          "type": "integer"
+        },
+        "inputTokens": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Inputtokens",
+          "type": "integer"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "outputTokens": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Outputtokens",
+          "type": "integer"
         },
         "replacedTurnCount": {
           "minimum": 0,
@@ -5377,6 +5795,37 @@
         },
         "sessionId": {
           "$ref": "#/$defs/SessionId"
+        },
+        "summaryId": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Summaryid"
+        },
+        "trigger": {
+          "anyOf": [
+            {
+              "enum": [
+                "manual",
+                "auto",
+                "hard_limit"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Trigger"
         }
       },
       "required": [
@@ -6685,6 +7134,19 @@
       "title": "SkillsStatusResult",
       "type": "object"
     },
+    "SourceLocator": {
+      "discriminator": {
+        "mapping": {
+          "page": "#/$defs/DocumentPageLocator"
+        },
+        "propertyName": "type"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/DocumentPageLocator"
+        }
+      ]
+    },
     "SourceRef": {
       "discriminator": {
         "mapping": {
@@ -7496,8 +7958,6 @@
     },
     "TransportKind": {
       "enum": [
-        "loopback-http",
-        "loopback-websocket",
         "stdio"
       ],
       "title": "TransportKind",
@@ -8184,6 +8644,17 @@
           "default": null,
           "title": "Label"
         },
+        "locator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceLocator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "type": {
           "const": "vault",
           "title": "Type",
@@ -8208,42 +8679,6 @@
         "file"
       ],
       "title": "VaultSourceRef",
-      "type": "object"
-    },
-    "WebLaunchParams": {
-      "additionalProperties": false,
-      "properties": {},
-      "title": "WebLaunchParams",
-      "type": "object"
-    },
-    "WebLaunchResult": {
-      "additionalProperties": false,
-      "properties": {
-        "expiresAt": {
-          "$ref": "#/$defs/Rfc3339DateTime"
-        },
-        "url": {
-          "maxLength": 2048,
-          "minLength": 32,
-          "title": "Url",
-          "type": "string"
-        },
-        "workerPid": {
-          "minimum": 1,
-          "title": "Workerpid",
-          "type": "integer"
-        },
-        "workspaceInstanceId": {
-          "$ref": "#/$defs/WorkspaceInstanceId"
-        }
-      },
-      "required": [
-        "url",
-        "workerPid",
-        "workspaceInstanceId",
-        "expiresAt"
-      ],
-      "title": "WebLaunchResult",
       "type": "object"
     },
     "WorkspaceId": {
@@ -8684,17 +9119,9 @@
       "result": {
         "$ref": "#/$defs/TurnSteerResult"
       }
-    },
-    "web/launch": {
-      "params": {
-        "$ref": "#/$defs/WebLaunchParams"
-      },
-      "result": {
-        "$ref": "#/$defs/WebLaunchResult"
-      }
     }
   },
-  "description": "Canonical DTO schema shared by direct stdio and loopback adapters. All object schemas are closed and wire fields use camelCase.",
+  "description": "Canonical DTO schema used by the direct stdio adapter. All object schemas are closed and wire fields use camelCase.",
   "envelopes": {
     "error": {
       "$ref": "#/$defs/ErrorEnvelope"
@@ -8755,6 +9182,21 @@
     "context.compacted": {
       "payload": {
         "$ref": "#/$defs/ContextCompactedPayload"
+      }
+    },
+    "document.extraction_completed": {
+      "payload": {
+        "$ref": "#/$defs/DocumentExtractionCompletedPayload"
+      }
+    },
+    "document.extraction_failed": {
+      "payload": {
+        "$ref": "#/$defs/DocumentExtractionFailedPayload"
+      }
+    },
+    "document.extraction_started": {
+      "payload": {
+        "$ref": "#/$defs/DocumentExtractionStartedPayload"
       }
     },
     "model.attempt": {

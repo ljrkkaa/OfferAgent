@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -35,8 +34,6 @@ from offeragent_harness.subagents import (
     ScopeDeriver,
     SubagentBudgetTree,
     SubagentLifetime,
-    WriteClaim,
-    WriteCoordinator,
     builtin_agent_definitions,
     subagent_tool_definitions,
 )
@@ -44,11 +41,9 @@ from offeragent_harness.subagents.budget import SubagentBudgetError
 from offeragent_harness.subagents.catalog import AgentDefinitionTrust
 from offeragent_harness.subagents.mailbox import MailboxConflict
 from offeragent_harness.subagents.models import AgentUsage
-from offeragent_harness.subagents.write_coordinator import WriteCoordinationError
 from offeragent_harness.testing import (
     DeterministicIdGenerator,
     InMemoryUnitOfWorkFactory,
-    ManualCancellationToken,
     ManualClock,
 )
 
@@ -396,48 +391,6 @@ async def test_mailbox_is_ordered_idempotent_and_conflict_safe() -> None:
     assert [item.message for item in await mailbox.receive("run_child", after_sequence=0)] == ["one", "two"]
     with pytest.raises(MailboxConflict):
         await mailbox.send(replace(first, message="changed"))
-
-
-@pytest.mark.asyncio
-async def test_write_coordinator_serializes_same_file_and_rejects_escape() -> None:
-    coordinator = WriteCoordinator(InMemoryUnitOfWorkFactory())
-    token = ManualCancellationToken()
-    first_lineage = AgentLineage.root("run_root").child("run_a", "editor")
-    second_lineage = AgentLineage.root("run_root").child("run_b", "editor")
-    claim_a = WriteClaim(("Notes/A.md",), ("absent",), "idem-a", "apr_a", first_lineage)
-    claim_b = WriteClaim(("notes/a.md",), ("absent",), "idem-b", "apr_b", second_lineage)
-    lease_a = await coordinator.acquire(claim_a, token)
-    waiter = asyncio.create_task(coordinator.acquire(claim_b, token, timeout_seconds=1))
-    await asyncio.sleep(0)
-    assert not waiter.done()
-    await lease_a.release()
-    lease_b = await waiter
-    assert lease_b.resources == ("notes/a.md",)
-    await lease_b.release()
-    with pytest.raises(WriteCoordinationError, match="normalized"):
-        await coordinator.acquire(
-            WriteClaim(("../escape.md",), ("absent",), "idem-c", "apr_c", first_lineage),
-            token,
-        )
-
-
-@pytest.mark.asyncio
-async def test_write_coordinator_restart_cleans_durable_orphan_lock() -> None:
-    uow = InMemoryUnitOfWorkFactory()
-    first = WriteCoordinator(uow)
-    lineage = AgentLineage.root("run_root").child("run_orphan", "editor")
-    await first.acquire(
-        WriteClaim(("notes/orphan.md",), ("absent",), "idem-orphan", "apr_orphan", lineage),
-        ManualCancellationToken(),
-    )
-    restarted = WriteCoordinator(uow)
-    assert await restarted.cleanup_owner("run_orphan") == ("notes/orphan.md",)
-    next_lineage = AgentLineage.root("run_root").child("run_next", "editor")
-    lease = await restarted.acquire(
-        WriteClaim(("notes/orphan.md",), ("absent",), "idem-next", "apr_next", next_lineage),
-        ManualCancellationToken(),
-    )
-    await lease.release()
 
 
 def test_catalog_never_activates_untrusted_workspace_shadow_and_detects_hash_drift(tmp_path: Path) -> None:

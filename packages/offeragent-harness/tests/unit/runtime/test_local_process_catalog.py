@@ -48,7 +48,6 @@ def _local_runtime(
         "tools/rg.exe": b"ripgrep\n",
         PROCESS_CATALOG_PATH: catalog_payload,
         "skills/core/SKILL.md": b"# Core\n",
-        "web/index.html": b"<!doctype html>\n",
     }
     kinds = {
         "offeragent-process-host.exe": "executable",
@@ -56,7 +55,6 @@ def _local_runtime(
         "tools/rg.exe": "executable",
         PROCESS_CATALOG_PATH: "asset",
         "skills/core/SKILL.md": "skill",
-        "web/index.html": "web",
     }
     runtime.mkdir()
     for relative, payload in payloads.items():
@@ -86,7 +84,7 @@ def _local_runtime(
     return runtime, InstalledDevelopmentRuntimeTrust(runtime)
 
 
-def test_local_catalog_builds_fixed_hash_zero_network_profiles(
+def test_local_catalog_runs_only_the_bundled_document_parser_as_the_current_user(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -95,16 +93,23 @@ def test_local_catalog_builds_fixed_hash_zero_network_profiles(
     catalog = load_local_process_catalog(runtime, manifest_trust=trust)
 
     assert [item.executable_id for item in catalog.executable_profiles] == [
+        "document-extract",
         "hook-continue",
         "shell-runtime-info",
     ]
     assert [item.profile_id for item in catalog.environment_profiles] == ["minimal"]
     assert [item.profile_id for item in catalog.shell_profiles] == ["runtime-info"]
-    assert all(not item.allow_network for item in catalog.executable_profiles)
+    assert catalog.executable_profiles[0].allow_network is True
+    assert all(not item.allow_network for item in catalog.executable_profiles[1:])
     assert all(not item.allow_network for item in catalog.shell_profiles)
     assert catalog.executable_profiles[0].allowed_stdin_modes == frozenset({ProcessStdinMode.FIXED_PAYLOAD})
-    assert catalog.executable_profiles[1].allowed_stdin_modes == frozenset({ProcessStdinMode.CLOSED})
-    assert catalog.shell_profiles[0].executable_profile_fingerprint == catalog.executable_profiles[1].fingerprint
+    assert catalog.executable_profiles[0].fixed_arguments == ("document-extract",)
+    assert catalog.executable_profiles[0].maximum_variable_arguments == 0
+    assert catalog.executable_profiles[0].allowed_cwd_roots == frozenset({"process-scratch"})
+    assert catalog.executable_profiles[0].appcontainer_filesystem == ()
+    assert catalog.executable_profiles[1].allowed_stdin_modes == frozenset({ProcessStdinMode.FIXED_PAYLOAD})
+    assert catalog.executable_profiles[2].allowed_stdin_modes == frozenset({ProcessStdinMode.CLOSED})
+    assert catalog.shell_profiles[0].executable_profile_fingerprint == catalog.executable_profiles[2].fingerprint
     assert catalog.catalog_hash == _digest(CATALOG)
 
 
@@ -147,20 +152,55 @@ def test_catalog_rejects_noncanonical_documents(
     assert captured.value.code == code
 
 
-@pytest.mark.parametrize("section", ["executableProfiles", "shellProfiles"])
-def test_catalog_rejects_every_local_network_grant(
+@pytest.mark.parametrize(("section", "index"), [("executableProfiles", 1), ("shellProfiles", 0)])
+def test_catalog_rejects_network_grants_outside_the_bundled_document_parser(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     section: str,
+    index: int,
 ) -> None:
     value = json.loads(CATALOG)
-    value[section][0]["allowNetwork"] = True
+    value[section][index]["allowNetwork"] = True
     runtime, trust = _local_runtime(tmp_path, monkeypatch, catalog_payload=_canonical(value))
 
     with pytest.raises(LocalProcessCatalogError) as captured:
         load_local_process_catalog(runtime, manifest_trust=trust)
 
     assert captured.value.code == "process_catalog_network"
+
+
+def test_current_user_document_profile_cannot_retain_appcontainer_grants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = json.loads(CATALOG)
+    value["executableProfiles"][0]["appContainerFilesystem"] = [
+        {"access": "read_write", "relativePath": "working", "rootId": "process-scratch"}
+    ]
+    runtime, trust = _local_runtime(tmp_path, monkeypatch, catalog_payload=_canonical(value))
+
+    with pytest.raises(LocalProcessCatalogError) as captured:
+        load_local_process_catalog(runtime, manifest_trust=trust)
+
+    assert captured.value.code == "process_catalog_isolation"
+
+
+def test_bundled_document_parser_cannot_be_changed_back_to_appcontainer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = json.loads(CATALOG)
+    profile = value["executableProfiles"][0]
+    profile["allowNetwork"] = False
+    profile["appContainerFilesystem"] = [
+        {"access": "read_write", "relativePath": "working", "rootId": "process-scratch"}
+    ]
+    runtime, trust = _local_runtime(tmp_path, monkeypatch, catalog_payload=_canonical(value))
+
+    with pytest.raises(LocalProcessCatalogError) as captured:
+        load_local_process_catalog(runtime, manifest_trust=trust)
+
+    assert captured.value.code == "process_catalog_isolation"
 
 
 def test_process_executable_hard_link_is_rejected(

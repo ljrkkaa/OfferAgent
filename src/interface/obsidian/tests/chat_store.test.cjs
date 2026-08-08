@@ -17,13 +17,16 @@ function loadModule(entry) {
     return compiled.exports;
 }
 
-const WORKSPACE = "wsi_01J00000000000000000000000";
+const WORKSPACE = "ws_12345678-1234-1234-1234-123456789abc";
 
 function createClient(handler, options = {}) {
     const { EventReducer } = loadModule("event_reducer.ts");
     const reducer = new EventReducer(WORKSPACE);
     return {
         reducer,
+        identity: {
+            capabilities: { documentIngestion: options.documentIngestion ?? true },
+        },
         async request(method, params) {
             if (method === "session/get") {
                 options.onHydrationCall?.(method, params);
@@ -67,6 +70,26 @@ const runConfig = {
 const SESSION = "ses_01J10000000000000000000000";
 const TURN = "turn_01J10000000000000000000000";
 const RUN = "run_01J10000000000000000000000";
+
+function draftAttachment(hex = "a".repeat(64), overrides = {}) {
+    const mediaType = overrides.mediaType ?? "application/pdf";
+    const extension = {
+        "application/pdf": "pdf",
+        "image/png": "png",
+        "image/jpeg": "jpg",
+        "image/webp": "webp",
+    }[mediaType];
+    return {
+        name: overrides.name ?? "interview.pdf",
+        mediaType,
+        size: overrides.size ?? 128,
+        file: {
+            workspaceId: WORKSPACE,
+            path: `OfferAgent/Attachments/${hex}.${extension}`,
+            contentHash: `sha256:${hex}`,
+        },
+    };
+}
 
 function runEvent(sequence, type, payload) {
     return {
@@ -127,7 +150,7 @@ test("ChatStore persists multi-tabs without treating tab close as Run cancel", a
     assert.equal(store.snapshot.tabs.length, 1);
     assert.equal(store.snapshot.activeTabId, first);
     assert.deepEqual(calls, []);
-    assert.equal(persistence.value.schemaVersion, 1);
+    assert.equal(persistence.value.schemaVersion, 2);
     await store.dispose();
 });
 
@@ -366,6 +389,106 @@ test("send creates a Session then submits one typed turn/start command", async (
     assert.equal(store.activeTab.sessionId, "ses_01J00000000000000000000000");
 });
 
+test("draft attachments are tab-owned, persisted, and sent as strict document blocks", async () => {
+    const { ChatStore } = loadModule("chat_store.ts");
+    let received;
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const client = createClient(async (method, params) => {
+        assert.equal(method, "turn/start");
+        received = structuredClone(params);
+        await gate;
+        return {
+            accepted: true,
+            duplicate: false,
+            sessionId: params.sessionId,
+            turnId: params.turnId,
+            runId: "run_01J00000000000000000000044",
+        };
+    });
+    const persistence = memoryPersistence({
+        schemaVersion: 1,
+        activeTabId: "tab_attachment",
+        tabs: [{
+            tabId: "tab_attachment",
+            sessionId: SESSION,
+            title: "Attachment",
+            draft: "summarize it",
+            selectedRunId: null,
+        }],
+    });
+    const store = new ChatStore(client, persistence);
+    await store.initialize();
+    const attachment = draftAttachment();
+    await store.addDraftAttachment("tab_attachment", attachment);
+
+    const sending = store.send("summarize it", { runConfig });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(received.input, [
+        { type: "text", text: "summarize it" },
+        {
+            type: "document",
+            file: attachment.file,
+            mediaType: "application/pdf",
+        },
+    ]);
+    assert.equal(received.input[1].file.workspaceId, WORKSPACE);
+    assert.deepEqual(store.activeTab.draftAttachments, [attachment]);
+    assert.deepEqual(store.snapshot.pendingSubmissions[0].attachments, [attachment]);
+
+    release();
+    await sending;
+    assert.equal(store.activeTab.draft, "");
+    assert.deepEqual(store.activeTab.draftAttachments, []);
+    assert.deepEqual(persistence.value.tabs[0].draftAttachments, []);
+});
+
+test("turn/start without an accepted receipt rejects and preserves the complete draft", async () => {
+    const { ChatStore } = loadModule("chat_store.ts");
+    const client = createClient(async (_method, params) => ({
+        accepted: false,
+        duplicate: false,
+        sessionId: params.sessionId,
+        turnId: params.turnId,
+        runId: "run_01J00000000000000000000045",
+    }));
+    const store = new ChatStore(client, memoryPersistence({
+        schemaVersion: 1,
+        activeTabId: "tab_receipt_rejected",
+        tabs: [{
+            tabId: "tab_receipt_rejected",
+            sessionId: SESSION,
+            title: "Rejected receipt",
+            draft: "keep everything",
+            selectedRunId: null,
+        }],
+    }));
+    await store.initialize();
+    const attachment = draftAttachment("b".repeat(64));
+    await store.addDraftAttachment("tab_receipt_rejected", attachment);
+
+    await assert.rejects(store.send("keep everything", { runConfig }), /did not accept/);
+    assert.equal(store.activeTab.draft, "keep everything");
+    assert.deepEqual(store.activeTab.draftAttachments, [attachment]);
+    assert.equal(store.snapshot.pendingSubmissions.length, 0);
+});
+
+test("attachment send fails closed when documentIngestion was not negotiated", async () => {
+    const { ChatStore } = loadModule("chat_store.ts");
+    let requests = 0;
+    const client = createClient(async () => { requests += 1; return {}; }, { documentIngestion: false });
+    const store = new ChatStore(client, memoryPersistence());
+    await store.initialize();
+    await store.updateDraft(store.activeTab.tabId, "keep this");
+    const attachment = draftAttachment("c".repeat(64), { mediaType: "image/png", name: "shot.png" });
+    await store.addDraftAttachment(store.activeTab.tabId, attachment);
+
+    await assert.rejects(store.send("keep this", { runConfig }), /documentIngestion/);
+    assert.equal(requests, 0);
+    assert.equal(store.activeTab.draft, "keep this");
+    assert.deepEqual(store.activeTab.draftAttachments, [attachment]);
+});
+
 test("send immediately exposes a transient user submission and reconciles it by exact Turn id", async () => {
     const { ChatStore } = loadModule("chat_store.ts");
     let receivedStart;
@@ -403,6 +526,7 @@ test("send immediately exposes a transient user submission and reconciles it by 
         tabId: "tab_pending",
         turnId: store.snapshot.pendingSubmissions[0].turnId,
         text: "show this immediately",
+        attachments: [],
     }]);
     assert.match(store.snapshot.pendingSubmissions[0].turnId, /^turn_[0-9a-f]{32}$/);
 
@@ -463,6 +587,44 @@ test("draft persistence stays on its originating tab and does not emit a render 
     assert.equal(store.snapshot.tabs.find((tab) => tab.tabId === firstTabId).draft, "中文草稿");
     assert.equal(persistence.value.tabs.find((tab) => tab.tabId === firstTabId).draft, "中文草稿");
     unsubscribe();
+});
+
+test("attachment mutations stay on their originating tab and snapshots cannot mutate Store state", async () => {
+    const { ChatStore } = loadModule("chat_store.ts");
+    const persistence = memoryPersistence();
+    const store = new ChatStore(createClient(async () => ({})), persistence);
+    await store.initialize();
+    const firstTabId = store.activeTab.tabId;
+    const attachment = draftAttachment("d".repeat(64), { mediaType: "image/webp", name: "capture.webp" });
+    await store.addDraftAttachment(firstTabId, attachment);
+    const second = await store.createTab();
+
+    assert.deepEqual(store.snapshot.tabs.find((tab) => tab.tabId === firstTabId).draftAttachments, [attachment]);
+    assert.deepEqual(second.draftAttachments, []);
+    const detachedSnapshot = store.snapshot;
+    detachedSnapshot.tabs.find((tab) => tab.tabId === firstTabId).draftAttachments.splice(0);
+    assert.deepEqual(store.snapshot.tabs.find((tab) => tab.tabId === firstTabId).draftAttachments, [attachment]);
+    assert.deepEqual(persistence.value.tabs.find((tab) => tab.tabId === firstTabId).draftAttachments, [attachment]);
+
+    await store.removeDraftAttachment(firstTabId, attachment.file.contentHash);
+    assert.deepEqual(store.snapshot.tabs.find((tab) => tab.tabId === firstTabId).draftAttachments, []);
+});
+
+test("failed attachment persistence rejects the mutation without creating shadow Store state", async () => {
+    const { ChatStore } = loadModule("chat_store.ts");
+    const persistence = memoryPersistence();
+    const store = new ChatStore(createClient(async () => ({})), persistence);
+    await store.initialize();
+    const tabId = store.activeTab.tabId;
+    const saved = persistence.save;
+    persistence.save = async () => { throw new Error("disk unavailable"); };
+
+    await assert.rejects(store.addDraftAttachment(tabId, draftAttachment("f".repeat(64))), /disk unavailable/);
+    assert.deepEqual(store.activeTab.draftAttachments, []);
+
+    persistence.save = saved;
+    await store.addDraftAttachment(tabId, draftAttachment("f".repeat(64)));
+    assert.equal(store.activeTab.draftAttachments.length, 1);
 });
 
 test("send is single-flight before the first turn/start await", async () => {
@@ -674,4 +836,54 @@ test("corrupt persisted tabs fail closed to a new local tab", async () => {
     await store.initialize();
     assert.equal(store.snapshot.tabs.length, 1);
     assert.match(store.activeTab.tabId, /^tab_[0-9a-f]{32}$/);
+});
+
+test("persisted tab schema 1 migrates deterministically and schema 2 validates managed attachments", () => {
+    const { parsePersistedTabs } = loadModule("chat_store.ts");
+    const migrated = parsePersistedTabs({
+        schemaVersion: 1,
+        activeTabId: "tab_migrate",
+        tabs: [{
+            tabId: "tab_migrate",
+            sessionId: null,
+            title: "Migrate",
+            draft: "old draft",
+            selectedRunId: null,
+        }],
+    });
+    assert.equal(migrated.schemaVersion, 2);
+    assert.deepEqual(migrated.tabs[0].draftAttachments, []);
+    assert.equal(migrated.tabs[0].attachmentError, null);
+
+    const attachment = draftAttachment("e".repeat(64));
+    const valid = parsePersistedTabs({
+        schemaVersion: 2,
+        activeTabId: "tab_v2",
+        tabs: [{
+            tabId: "tab_v2",
+            sessionId: null,
+            title: "V2",
+            draft: "",
+            draftAttachments: [attachment],
+            attachmentError: null,
+            selectedRunId: null,
+        }],
+    });
+    assert.deepEqual(valid.tabs[0].draftAttachments, [attachment]);
+
+    const escaped = structuredClone(attachment);
+    escaped.file.path = `Elsewhere/${"e".repeat(64)}.pdf`;
+    assert.equal(parsePersistedTabs({
+        schemaVersion: 2,
+        activeTabId: "tab_v2",
+        tabs: [{
+            tabId: "tab_v2",
+            sessionId: null,
+            title: "V2",
+            draft: "",
+            draftAttachments: [escaped],
+            attachmentError: null,
+            selectedRunId: null,
+        }],
+    }), null);
 });

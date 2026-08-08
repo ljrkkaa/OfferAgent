@@ -28,8 +28,6 @@ _MANAGED_FALSE_LOCKS = frozenset(
         "policy.allow_bypass",
         "execution.subagents_enabled",
         "extensibility.hooks_enabled",
-        "ui.loopback_web_enabled",
-        "ui.persistent_web_lease",
         "telemetry.enabled",
         "telemetry.include_content",
     }

@@ -37,6 +37,7 @@ def build_one_onedir(
     hidden_imports: tuple[str, ...] = (),
     excluded_modules: tuple[str, ...] = (),
     add_data: tuple[tuple[Path, str], ...] = (),
+    add_binaries: tuple[tuple[Path, str], ...] = (),
 ) -> Path:
     command = [
         sys.executable,
@@ -72,6 +73,15 @@ def build_one_onedir(
         if not source.exists() or re.fullmatch(r"[A-Za-z0-9_./-]+", target) is None or target.startswith("/"):
             raise ValueError("PyInstaller add-data mapping is invalid")
         command.extend(("--add-data", f"{source.resolve(strict=True)}{os.pathsep}{target}"))
+    for source, target in add_binaries:
+        if (
+            source.is_symlink()
+            or not source.is_file()
+            or re.fullmatch(r"[A-Za-z0-9_./-]+", target) is None
+            or target.startswith("/")
+        ):
+            raise ValueError("PyInstaller add-binary mapping is invalid")
+        command.extend(("--add-binary", f"{source.resolve(strict=True)}{os.pathsep}{target}"))
     command.append(str(entrypoint))
     subprocess.run(command, cwd=ROOT, check=True, env=_pyinstaller_environment())
     root = destination / "dist" / name
@@ -171,7 +181,6 @@ def add_local_assets(runtime: Path, *, ripgrep_executable: Path) -> None:
     if not BUILTIN_SKILLS.is_dir() or not any(BUILTIN_SKILLS.rglob("SKILL.md")):
         raise RuntimeError("local Runtime source contains no built-in Skills")
     _copy_static_tree(BUILTIN_SKILLS, runtime / "skills")
-    _copy_static_tree(ROOT / "web", runtime / "web")
     if not PROCESS_CATALOG.is_file():
         raise RuntimeError("local Runtime source contains no Process catalog")
     try:
@@ -196,9 +205,10 @@ def add_local_assets(runtime: Path, *, ripgrep_executable: Path) -> None:
             candidate_path = str(candidate).replace("\\", "/")
             if any(part in {"", ".", ".."} for part in candidate_path.split("/")):
                 continue
-            suffix = digest_file(located).removeprefix("sha256:")[:16]
+            source_digest = digest_file(located)
+            suffix = source_digest.removeprefix("sha256:")[:16]
             target = licenses / "python" / item.canonical_name / f"{suffix}-{Path(candidate_path).name}"
-            _copy_static_file(located, target)
+            _copy_content_addressed_license(located, target, source_digest=source_digest)
 
 
 def _validated_ripgrep_executable(executable: Path) -> tuple[Path, str]:
@@ -244,6 +254,18 @@ def _copy_static_file(source: Path, destination: Path) -> None:
     if destination.exists():
         raise RuntimeError(f"duplicate local Runtime static asset: {destination.name}")
     shutil.copy2(source, destination)
+
+
+def _copy_content_addressed_license(source: Path, destination: Path, *, source_digest: str) -> None:
+    if source.is_symlink() or not source.is_file() or digest_file(source) != source_digest:
+        raise RuntimeError("content-addressed license source differs from its digest")
+    if destination.exists():
+        if destination.is_symlink() or not destination.is_file() or digest_file(destination) != source_digest:
+            raise RuntimeError(f"content-addressed license collision differs: {destination.name}")
+        return
+    _copy_static_file(source, destination)
+    if digest_file(destination) != source_digest:
+        raise RuntimeError("copied content-addressed license differs from its source digest")
 
 
 def digest_file(path: Path) -> str:

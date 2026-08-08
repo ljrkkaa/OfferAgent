@@ -47,6 +47,28 @@ def test_merge_identical_tree_accepts_shared_bytes_and_rejects_collisions(tmp_pa
         merge_identical_tree(second, destination)
 
 
+def test_content_addressed_license_accepts_identical_duplicate_and_rejects_collision(tmp_path: Path) -> None:
+    first = tmp_path / "first-license.txt"
+    duplicate = tmp_path / "duplicate-license.txt"
+    collision = tmp_path / "collision-license.txt"
+    destination = tmp_path / "licenses" / "digest-license.txt"
+    first.write_bytes(b"same-license")
+    duplicate.write_bytes(b"same-license")
+    collision.write_bytes(b"different-license")
+    digest = local_windows_runtime_build.digest_file(first)
+
+    local_windows_runtime_build._copy_content_addressed_license(first, destination, source_digest=digest)
+    local_windows_runtime_build._copy_content_addressed_license(duplicate, destination, source_digest=digest)
+
+    assert destination.read_bytes() == b"same-license"
+    with pytest.raises(RuntimeError, match="license collision differs"):
+        local_windows_runtime_build._copy_content_addressed_license(
+            collision,
+            destination,
+            source_digest=local_windows_runtime_build.digest_file(collision),
+        )
+
+
 def test_pyinstaller_environment_rebuilds_path_from_the_active_interpreter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

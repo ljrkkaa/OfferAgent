@@ -19,7 +19,10 @@ from offeragent_harness.ports import CancellationToken, InvocationRecord, Journa
 from offeragent_harness.ports.subagents import ChildRunExecution, ParentRunAuthority
 from offeragent_harness.runtime.approval_manager import ApprovalManager
 from offeragent_harness.runtime.harness_service import PreparedRunComponents, RunComponents, StartTurnCommand
-from offeragent_harness.runtime.production_worker_composition import ProductionRunComponentsFactory
+from offeragent_harness.runtime.production_worker_composition import (
+    ProductionRunComponentsFactory,
+    ProductionWorkerError,
+)
 from offeragent_harness.sessions import AgentLineage
 from offeragent_harness.subagents.models import (
     AgentBudget,
@@ -356,8 +359,8 @@ def test_worker_factory_injects_one_gate_and_lock_pool_across_sessions_and_root_
         ids=DeterministicIdGenerator(),
         gateway_factory=lambda _settings: cast(Any, object()),
         # Composition precedes persisted-config reconciliation, so this
-        # bootstrap default intentionally differs from the first Run snapshot.
-        default_config=HarnessConfig(),
+        # bootstrap value intentionally differs from the activated Worker config.
+        bootstrap_max_parallel_reads=HarnessConfig().budgets.max_parallel_reads,
         approvals=ApprovalManager(unit_of_work=InMemoryUnitOfWorkFactory(), clock=clock),
         policy_audit=_RecordingPolicyAudit(),
         journal=_RecordingJournal(),
@@ -368,7 +371,6 @@ def test_worker_factory_injects_one_gate_and_lock_pool_across_sessions_and_root_
         optional_definitions=(definition,),
         optional_local_executors=(((definition,), _CountingExecutor()),),
     )
-    factory.bind_worker_read_limit(effective_config.budgets.max_parallel_reads)
     expanded_session_config = effective_config.model_copy(
         update={"budgets": effective_config.budgets.model_copy(update={"max_parallel_reads": 8})}
     )
@@ -378,7 +380,7 @@ def test_worker_factory_injects_one_gate_and_lock_pool_across_sessions_and_root_
         turn_id: str,
         run_id: str,
         requested_parallel_reads: int,
-        run_effective_config: HarnessConfig = effective_config,
+        run_effective_config: HarnessConfig | None = effective_config,
     ) -> tuple[UnifiedToolKernel, int]:
         command = StartTurnCommand(
             workspace_id="ws_test",
@@ -399,7 +401,11 @@ def test_worker_factory_injects_one_gate_and_lock_pool_across_sessions_and_root_
                 },
             },
             effective_config=run_effective_config,
-            effective_config_fingerprint=canonical_json_sha256(run_effective_config.model_dump(mode="json")),
+            effective_config_fingerprint=(
+                None
+                if run_effective_config is None
+                else canonical_json_sha256(run_effective_config.model_dump(mode="json"))
+            ),
         )
         state = RunState(
             workspace_id="ws_test",
@@ -416,6 +422,13 @@ def test_worker_factory_injects_one_gate_and_lock_pool_across_sessions_and_root_
             ),
             components.budget.max_parallel_reads,
         )
+
+    with pytest.raises(ProductionWorkerError, match="not bound to the activated configuration"):
+        root_kernel("ses_unbound", "turn_unbound", "run_unbound", 6)
+
+    factory.bind_worker_read_limit(effective_config.budgets.max_parallel_reads)
+    with pytest.raises(ProductionWorkerError, match="requires an explicit effective configuration"):
+        root_kernel("ses_unconfigured", "turn_unconfigured", "run_unconfigured", 6, None)
 
     first_root, first_limit = root_kernel("ses_a", "turn_a", "run_root_a", 8)
     expanded_root, expanded_limit = root_kernel(
@@ -570,7 +583,7 @@ async def test_production_child_kernel_rechecks_live_parent_before_local_side_ef
         clock=clock,
         ids=DeterministicIdGenerator(),
         gateway_factory=lambda _settings: cast(Any, object()),
-        default_config=effective_config,
+        bootstrap_max_parallel_reads=effective_config.budgets.max_parallel_reads,
         approvals=ApprovalManager(unit_of_work=unit_of_work, clock=clock),
         policy_audit=audit,
         journal=journal,
@@ -581,6 +594,7 @@ async def test_production_child_kernel_rechecks_live_parent_before_local_side_ef
         optional_definitions=(definition,),
         optional_local_executors=(((definition,), executor),),
     )
+    factory.bind_worker_read_limit(effective_config.budgets.max_parallel_reads)
     factory._registries[record.root_run_id] = registry
     factory._effective_configs[record.root_run_id] = effective_config
 

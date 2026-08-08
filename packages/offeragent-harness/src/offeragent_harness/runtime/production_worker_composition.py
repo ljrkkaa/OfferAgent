@@ -2,7 +2,7 @@
 
 This module is deliberately the only place that knows concrete adapters.  The
 Obsidian plugin starts a direct stdio process; this root constructs exactly one
-``HarnessService`` and shares its dispatcher with stdio and optional Loopback Web.
+``HarnessService`` and exposes its dispatcher only through that connection.
 """
 
 from __future__ import annotations
@@ -37,9 +37,25 @@ from offeragent_harness.agent.context_manager import (
 from offeragent_harness.agent.loop import ToolKernel
 from offeragent_harness.agent.model_planner import AgentStepCatalog, ModelPlanner, PlannerModelConfig
 from offeragent_harness.agent.state import RunState
+from offeragent_harness.agent.system_rules import offeragent_system_rules
 from offeragent_harness.app import ApplicationIdentity, HarnessApplication
 from offeragent_harness.config import ConfigPatch, ConfigScope, HarnessConfig, ModelProvider, ModelSettings
 from offeragent_harness.hooks import HookDecision, HookEvent, HookInvocation, HookLayer, HookScope
+from offeragent_harness.knowledge import (
+    KnowledgeCatalogStore,
+    KnowledgeCompiler,
+    KnowledgeDiscovery,
+    KnowledgeInferenceBudget,
+    KnowledgeObjectStore,
+    KnowledgePreparationService,
+    KnowledgePreparationStore,
+    KnowledgePublisher,
+    KnowledgeToolExecutor,
+    LLMWikiCompiler,
+    SemanticPageIndexBuilder,
+    StructuredInferenceCache,
+)
+from offeragent_harness.memory import MemoryRepository, MemoryToolExecutor
 from offeragent_harness.models import thaw_json
 from offeragent_harness.observability import (
     DiagnosticsService,
@@ -65,6 +81,7 @@ from offeragent_harness.permissions.evaluator import RuleBasedPolicyEvaluator
 from offeragent_harness.permissions.rules import PolicyRule, RuleEffect
 from offeragent_harness.ports import (
     ApplicationCommandContext,
+    ArtifactMetadata,
     CancellationToken,
     Clock,
     EventSink,
@@ -72,6 +89,7 @@ from offeragent_harness.ports import (
     IdGenerator,
     ModelGateway,
     PolicyEvaluator,
+    ProcessStdinMode,
     SecretStore,
     StoredEvent,
     ToolExecutor,
@@ -88,7 +106,23 @@ from offeragent_harness.protocol._base import validate_wire
 from offeragent_harness.protocol.capabilities import CapabilitySet, ProtocolRange
 from offeragent_harness.protocol.common import PermissionMode as WirePermissionMode
 from offeragent_harness.protocol.common import RunConfigSnapshot as WireRunConfigSnapshot
-from offeragent_harness.protocol.events import stored_event_to_envelope
+from offeragent_harness.protocol.content import (
+    ArtifactRef,
+    DocumentContentBlock,
+)
+from offeragent_harness.protocol.content import (
+    ArtifactSensitivity as WireArtifactSensitivity,
+)
+from offeragent_harness.protocol.content import (
+    ArtifactState as WireArtifactState,
+)
+from offeragent_harness.protocol.documents import (
+    DocumentExtractionFailedPayload,
+    DocumentExtractionFailure,
+    DocumentExtractionFailureCode,
+    DocumentExtractionStartedPayload,
+)
+from offeragent_harness.protocol.events import ArtifactCreatedPayload, stored_event_to_envelope
 from offeragent_harness.protocol.messages import RuntimeArch, RuntimeStatusResult, ShutdownResult
 from offeragent_harness.protocol.schemas import PROTOCOL_VERSION, schema_hash
 from offeragent_harness.providers import compose_model_gateway
@@ -114,12 +148,32 @@ from offeragent_harness.runtime.backpressure import BufferedEventSink
 from offeragent_harness.runtime.cancellation import CancellationScope
 from offeragent_harness.runtime.codex_credentials import CodexFileCredentialSource
 from offeragent_harness.runtime.config_service import ConfigService, ConfigUpdateCommand, WorkerConfigActivation
+from offeragent_harness.runtime.context_summary import (
+    ContextCompactionPolicy,
+    ContextCompactionService,
+    ContextSummaryRepository,
+)
 from offeragent_harness.runtime.conversation_controls import (
     CompactionExecution,
     ConversationControlService,
     SessionCompactionRunner,
 )
 from offeragent_harness.runtime.conversation_projection import UowConversationProjectionService
+from offeragent_harness.runtime.document_ingestion import (
+    DocumentIngestionBatchError,
+    DocumentIngestionConfig,
+    DocumentIngestionService,
+    FailedDocument,
+    IndexedDocumentContent,
+    PreparedDocument,
+    PreparedDocumentIngestion,
+    document_id_for_input,
+)
+from offeragent_harness.runtime.document_parser_profile import (
+    BUNDLED_DOCUMENT_PARSER_CONFIG,
+    DOCUMENT_PARSER_EXECUTABLE_ID,
+    DOCUMENT_PARSER_MAX_RESPONSE_BYTES,
+)
 from offeragent_harness.runtime.duplex_json_rpc import (
     ConnectionRole,
     DuplexByteStream,
@@ -136,11 +190,12 @@ from offeragent_harness.runtime.harness_service import (
     RunComponents,
     RunComponentsFactory,
     RunHookBinding,
+    RunPreparationProgress,
     StartTurnCommand,
 )
+from offeragent_harness.runtime.knowledge_parser import KnowledgeProcessParser, KnowledgeProcessParserConfig
 from offeragent_harness.runtime.local_process_catalog import load_local_process_catalog
-from offeragent_harness.runtime.loopback_gateway import LoopbackGatewayConfig, LoopbackWebGateway
-from offeragent_harness.runtime.loopback_server import AsyncioLoopbackServer
+from offeragent_harness.runtime.memory_preparation import StructuredMemoryRunPreparationAdapter
 from offeragent_harness.runtime.model_management import ProductionModelCommandService
 from offeragent_harness.runtime.network_audit import EntityNetworkAuditSink
 from offeragent_harness.runtime.policy_audit import EntityPolicyAuditSink
@@ -307,6 +362,7 @@ class ProductionWorkerOverrides:
     managed_hook_layer: HookLayer | None = None
     builtin_hook_handlers: Mapping[str, HookHandler] | None = None
     vault_cas_barrier: VaultCasBarrier | None = None
+    context_compaction_policy: ContextCompactionPolicy | None = None
 
 
 class _EventHub(EventSink):
@@ -407,6 +463,7 @@ class _PreparedProductionCapabilities:
     skills: PreparedSkillBundle | None
     shell: PreparedShellBundle | None
     hooks: PreparedHookBundle | None
+    documents: PreparedDocumentIngestion | None
     parent_snapshot_fingerprint: str | None = None
 
 
@@ -424,7 +481,7 @@ class ProductionRunComponentsFactory(
         clock: Clock,
         ids: IdGenerator,
         gateway_factory: ModelGatewayFactory,
-        default_config: HarnessConfig,
+        bootstrap_max_parallel_reads: int,
         approvals: ApprovalManager,
         policy_audit: PolicyAuditSink,
         journal: Any,
@@ -437,6 +494,7 @@ class ProductionRunComponentsFactory(
         subagent_executor: ToolExecutor | None = None,
         skills: ProductionSkillBundleFactory | None = None,
         shell: ProductionShellBundleFactory | None = None,
+        document_ingestion: DocumentIngestionService | None = None,
         process_root_ids: Sequence[str] = ("vault",),
         hooks: ProductionHookBundleFactory | None = None,
         hook_unit_of_work: UnitOfWorkFactory | None = None,
@@ -449,7 +507,6 @@ class ProductionRunComponentsFactory(
         self._clock = clock
         self._ids = ids
         self._gateway_factory = gateway_factory
-        self._default_config = default_config
         self._approvals = approvals
         self._policy_audit = policy_audit
         self._journal = journal
@@ -462,6 +519,7 @@ class ProductionRunComponentsFactory(
         self._subagent_executor = subagent_executor
         self._skills = skills
         self._shell = shell
+        self._document_ingestion = document_ingestion
         self._process_root_ids = tuple(process_root_ids)
         self._hooks = hooks
         self._hook_unit_of_work = hook_unit_of_work
@@ -479,7 +537,7 @@ class ProductionRunComponentsFactory(
         self._effective_configs: dict[str, HarnessConfig] = {}
         self._prepared_runs: dict[str, _PreparedProductionCapabilities] = {}
         self._bound_hook_bundles: dict[str, ProductionHookBundle] = {}
-        self._effect_gate = FairEffectGate(default_config.budgets.max_parallel_reads)
+        self._effect_gate = FairEffectGate(bootstrap_max_parallel_reads)
         self._effect_gate_bound = False
         self._lock_pool = KeyedLockPool()
         self._run_budgets: dict[str, RunBudget] = {}
@@ -487,8 +545,8 @@ class ProductionRunComponentsFactory(
     def budget_root(self, command: StartTurnCommand, state: RunState) -> RunBudget:
         del state
         config = validate_wire(WireRunConfigSnapshot, thaw_json(command.run_config))
-        effective_config = command.effective_config or self._default_config
-        self._ensure_worker_read_limit(effective_config)
+        effective_config = self._require_effective_config(command)
+        self._require_worker_read_limit()
         return _run_budget(
             config,
             effective_config,
@@ -501,12 +559,87 @@ class ProductionRunComponentsFactory(
         state: RunState,
         cancellation: CancellationScope,
         durable_snapshot: Mapping[str, Any] | None,
+        progress: RunPreparationProgress | None = None,
     ) -> PreparedRunComponents:
         cancellation.checkpoint()
         config = validate_wire(WireRunConfigSnapshot, thaw_json(command.run_config))
-        effective_config = command.effective_config or self._default_config
-        self._ensure_worker_read_limit(effective_config)
+        effective_config = self._require_effective_config(command)
+        self._require_worker_read_limit()
         permission = _effective_permission(config, effective_config)
+        indexed_documents = _indexed_document_blocks(command.input_blocks)
+        prepared_documents: PreparedDocumentIngestion | None = None
+        recovered_document_snapshot: Mapping[str, Any] | None = None
+        if durable_snapshot is not None:
+            raw_documents = durable_snapshot.get("documents")
+            if raw_documents is not None:
+                if not isinstance(raw_documents, Mapping):
+                    raise ValueError("persisted document capability snapshot is invalid")
+                recovered_document_snapshot = raw_documents
+        if indexed_documents:
+            if self._document_ingestion is None:
+                raise ValueError("document inputs require the configured local ingestion boundary")
+            started_documents = tuple(
+                DocumentExtractionStartedPayload(
+                    document_id=document_id_for_input(
+                        state.run_id,
+                        item.input_block_index,
+                        item.block.file.content_hash,
+                    ),
+                    input_block_index=item.input_block_index,
+                    attempt=1,
+                )
+                for item in indexed_documents
+            )
+            if durable_snapshot is not None:
+                if recovered_document_snapshot is None:
+                    raise ValueError("persisted document capability snapshot is missing")
+                prepared_documents = await self._document_ingestion.restore(
+                    run_id=state.run_id,
+                    documents=indexed_documents,
+                    snapshot=recovered_document_snapshot,
+                    cancellation=cancellation,
+                )
+            else:
+                if progress is not None:
+                    for payload in started_documents:
+                        await progress.emit("document.extraction_started", payload.to_wire())
+                try:
+                    prepared_documents = await self._document_ingestion.ingest(
+                        run_id=state.run_id,
+                        documents=indexed_documents,
+                        created_at=self._clock.utcnow(),
+                        cancellation=cancellation,
+                    )
+                except DocumentIngestionBatchError as error:
+                    if error.started_payloads != started_documents:
+                        raise ValueError("document ingestion start identities drifted") from error
+                    if progress is not None:
+                        await _emit_document_outcomes(progress, state.run_id, error.outcomes)
+                    raise
+                except BaseException:
+                    if progress is not None:
+                        failure = DocumentExtractionFailure(
+                            code=DocumentExtractionFailureCode.PARSER_FAILED,
+                            retryable=True,
+                            user_visible_message="The local document parser failed safely.",
+                            details={},
+                        )
+                        for started in started_documents:
+                            await progress.emit(
+                                "document.extraction_failed",
+                                DocumentExtractionFailedPayload(
+                                    document_id=started.document_id,
+                                    attempt=started.attempt,
+                                    failure=failure,
+                                ).to_wire(),
+                            )
+                    raise
+            if prepared_documents.started_payloads != started_documents:
+                raise ValueError("document ingestion start identities drifted")
+            if durable_snapshot is None and progress is not None:
+                await _emit_document_outcomes(progress, state.run_id, prepared_documents.outcomes)
+        elif recovered_document_snapshot is not None:
+            raise ValueError("persisted document capability snapshot has no matching explicit input")
         hooks: PreparedHookBundle | None = None
         if self._hooks is not None:
             hook_recovery = _prepared_hook_recovery(durable_snapshot)
@@ -564,7 +697,10 @@ class ProductionRunComponentsFactory(
         prepared = _PreparedProductionCapabilities(
             run_id=state.run_id,
             config=config,
-            inputs=_with_skill_prompt_context(_context_inputs(command.input_blocks), skills),
+            inputs=_with_skill_prompt_context(
+                _with_document_context(_context_inputs(command.input_blocks), prepared_documents),
+                skills,
+            ),
             effective_config=effective_config,
             budget=_run_budget(
                 config,
@@ -580,6 +716,7 @@ class ProductionRunComponentsFactory(
             skills=skills,
             shell=shell,
             hooks=hooks,
+            documents=prepared_documents,
         )
         self._remember_prepared(state, prepared)
         return PreparedRunComponents(prepared, _prepared_capability_snapshot(prepared))
@@ -711,6 +848,7 @@ class ProductionRunComponentsFactory(
             skills=skills,
             shell=shell,
             hooks=hooks,
+            documents=None,
             parent_snapshot_fingerprint=canonical_json_sha256(_prepared_capability_snapshot(root)),
         )
         self._remember_prepared(state, prepared)
@@ -921,6 +1059,10 @@ class ProductionRunComponentsFactory(
             for item in self._optional_definitions
             if (item.executor_location is not ExecutorLocation.SUBAGENT or effective_config.execution.subagents_enabled)
             and ("shell.execute" not in item.required_capabilities or effective_config.execution.shell_enabled)
+            and (
+                not item.required_capabilities.intersection({"memory.read", "memory.write"})
+                or effective_config.memory.memory_enabled
+            )
         )
         return (
             *self._local_read.definitions,
@@ -931,8 +1073,8 @@ class ProductionRunComponentsFactory(
     def build(self, command: StartTurnCommand, state: RunState) -> RunComponents:
         config = validate_wire(WireRunConfigSnapshot, thaw_json(command.run_config))
         inputs = _context_inputs(command.input_blocks)
-        effective_config = command.effective_config or self._default_config
-        self._ensure_worker_read_limit(effective_config)
+        effective_config = self._require_effective_config(command)
+        self._require_worker_read_limit()
         self._effective_configs[state.run_id] = effective_config
         return self._build(
             config,
@@ -1021,11 +1163,15 @@ class ProductionRunComponentsFactory(
         if max_parallel_reads != self._effect_gate.max_readers:
             raise ValueError("max_parallel_reads changed after Worker startup; restart the Worker to apply it")
 
-    def _ensure_worker_read_limit(self, effective_config: HarnessConfig) -> None:
-        # Production startup binds the Workspace-wide snapshot before opening
-        # transports.  This fallback keeps direct/recovery factory callers safe.
+    def _require_worker_read_limit(self) -> None:
         if not self._effect_gate_bound:
-            self.bind_worker_read_limit(effective_config.budgets.max_parallel_reads)
+            raise ProductionWorkerError("Worker read limit is not bound to the activated configuration")
+
+    @staticmethod
+    def _require_effective_config(command: StartTurnCommand) -> HarnessConfig:
+        if command.effective_config is None:
+            raise ProductionWorkerError("production Run requires an explicit effective configuration")
+        return command.effective_config
 
     def _build(
         self,
@@ -1088,21 +1234,7 @@ class ProductionRunComponentsFactory(
             else ContextVisibilityPolicy.cloud_model()
         )
         context = ContextManager(
-            system_rules=(
-                "你是 OfferAgent。只能依据 Harness 提供的上下文和工具结果工作。",
-                "每个 AgentStep 只能提交本地 ToolCall 或 finalResponse, 两者不得同时存在。",
-                "同一 AgentStep 的多调用只能全是相互独立且 concurrency-safe 的只读 ToolCall, "
-                "或全是可按序执行的幂等副作用 ToolCall; 不得混合读写或批量提交非幂等工具。",
-                "仅在证据充分且没有未完成义务时提交 finalResponse。",
-                "run_snapshot.time 是本轮唯一权威日期与时区来源。",
-                "不得从模型知识、文件时间或用户未明确提供的信息猜测当前日期。",
-                "Skill 目录只提供元数据。任务匹配某个 Skill 描述时先调用 skill 读取正文。",
-                "run_snapshot.activeContexts 中已激活的 Skill 不得重复调用。",
-                "工具结果会进入下一 AgentStep。读取、写入或校验未真实完成时不得用 finalResponse 替代工具动作。",
-                "不得声称未执行、未审批、冲突或结果未知的写操作已经完成。",
-                "除固定、受限加载的 Vault MEMORY.md 外, 额外记忆文件只能通过 Glob、Grep 和 Read 按需读取。",
-                "所有其他文件操作、Shell 与 Subagent 只能经 Tool Kernel 使用。",
-            ),
+            system_rules=offeragent_system_rules(),
             inputs=inputs,
             visibility=visibility,
             budget=ContextBudget.generous_default(),
@@ -1444,6 +1576,7 @@ def _prepared_capability_snapshot(prepared: _PreparedProductionCapabilities) -> 
         "skills": skills,
         "shell": shell,
         "hooks": None if prepared.hooks is None else prepared.hooks.recovery_snapshot(),
+        "documents": None if prepared.documents is None else thaw_json(prepared.documents.snapshot),
         "parentSnapshotFingerprint": prepared.parent_snapshot_fingerprint,
     }
 
@@ -1574,7 +1707,15 @@ def _workspace_sensitivity() -> Any:
 
 
 def _context_inputs(blocks: Sequence[Mapping[str, Any]]) -> ContextInputs:
-    text = canonical_json_bytes([dict(item) for item in blocks]).decode("utf-8")
+    materialized = [dict(thaw_json(item)) for item in blocks]
+    non_documents = [item for item in materialized if item.get("type") != "document"]
+    document_count = len(materialized) - len(non_documents)
+    text = canonical_json_bytes(
+        {
+            "content": non_documents,
+            "attachedDocumentCount": document_count,
+        }
+    ).decode("utf-8")
     return ContextInputs(
         (
             ContextFragment(
@@ -1584,6 +1725,70 @@ def _context_inputs(blocks: Sequence[Mapping[str, Any]]) -> ContextInputs:
                 sensitivity=_workspace_sensitivity(),
             ),
         )
+    )
+
+
+def _with_document_context(
+    inputs: ContextInputs,
+    prepared: PreparedDocumentIngestion | None,
+) -> ContextInputs:
+    if prepared is None:
+        return inputs
+    return ContextInputs(
+        user_input=(*inputs.user_input, *prepared.context_fragments),
+        conversation=inputs.conversation,
+        memories=inputs.memories,
+        skills=inputs.skills,
+        hook_hints=inputs.hook_hints,
+    )
+
+
+def _indexed_document_blocks(blocks: Sequence[Mapping[str, Any]]) -> tuple[IndexedDocumentContent, ...]:
+    indexed: list[IndexedDocumentContent] = []
+    for index, raw in enumerate(blocks):
+        materialized = thaw_json(raw)
+        if not isinstance(materialized, Mapping) or materialized.get("type") != "document":
+            continue
+        indexed.append(
+            IndexedDocumentContent(
+                input_block_index=index,
+                block=validate_wire(DocumentContentBlock, materialized),
+            )
+        )
+    return tuple(indexed)
+
+
+async def _emit_document_outcomes(
+    progress: RunPreparationProgress,
+    run_id: str,
+    outcomes: Sequence[PreparedDocument | FailedDocument],
+) -> None:
+    for outcome in outcomes:
+        if isinstance(outcome, FailedDocument):
+            await progress.emit("document.extraction_failed", outcome.failed_payload.to_wire())
+            continue
+        for artifact in (outcome.text_artifact, outcome.provenance_artifact):
+            await progress.emit(
+                "artifact.created",
+                _document_artifact_event(artifact, run_id=run_id).to_wire(),
+            )
+        await progress.emit("document.extraction_completed", outcome.completed_payload.to_wire())
+
+
+def _document_artifact_event(metadata: ArtifactMetadata, *, run_id: str) -> ArtifactCreatedPayload:
+    if metadata.owner_run_id != run_id:
+        raise ValueError("document Artifact owner differs from the active Run")
+    return ArtifactCreatedPayload(
+        artifact=ArtifactRef(
+            artifact_id=metadata.artifact_id,
+            content_hash=metadata.sha256,
+            media_type=metadata.mime_type.replace("; ", ";"),
+            size_bytes=metadata.byte_length,
+            sensitivity=WireArtifactSensitivity(metadata.sensitivity.value),
+            state=WireArtifactState(metadata.state.value),
+        ),
+        owner_type="run",
+        owner_id=run_id,
     )
 
 
@@ -2015,21 +2220,17 @@ class _ProcessDiagnostics:
         return (*base, *sorted(children, key=lambda value: (value.role, value.pid)))
 
 
-class _LosslessCompactionRunner(SessionCompactionRunner):
-    """Persist an exact bounded event manifest before replacing context projection."""
+class _GenerativeCompactionRunner(SessionCompactionRunner):
+    """Run hooks, then delegate to the canonical structured compaction service."""
 
     def __init__(
         self,
-        artifacts: LocalArtifactStore,
-        clock: Clock,
-        ids: IdGenerator,
+        service: ContextCompactionService,
         *,
         components: ProductionRunComponentsFactory | None = None,
         hook_budget: BudgetLedger | None = None,
     ) -> None:
-        self._artifacts = artifacts
-        self._clock = clock
-        self._ids = ids
+        self._service = service
         self._components = components
         self._hook_budget = hook_budget
 
@@ -2044,22 +2245,20 @@ class _LosslessCompactionRunner(SessionCompactionRunner):
         force: bool,
         cancellation: CancellationToken,
     ) -> CompactionExecution:
-        del through_turn_id, force
+        del force
         cancellation.checkpoint()
-        payload = canonical_json_bytes(
-            {
-                "schemaVersion": 1,
-                "runId": selected_run.run_id,
-                "events": [
+        event_bytes = len(
+            canonical_json_bytes(
+                [
                     {
-                        "sequence": event.sequence,
                         "eventId": event.event_id,
                         "eventType": event.event_type,
                         "payload": event.payload,
+                        "sequence": event.sequence,
                     }
                     for event in events
-                ],
-            }
+                ]
+            )
         )
         if self._components is not None and self._hook_budget is not None:
             bundle = await self._components.persisted_hook_bundle(
@@ -2078,7 +2277,7 @@ class _LosslessCompactionRunner(SessionCompactionRunner):
                         run_id=selected_run.run_id,
                         facts={
                             "recordCount": len(events),
-                            "estimatedBytes": len(payload),
+                            "estimatedBytes": event_bytes,
                             "sequenceStart": events[0].sequence,
                             "sequenceEnd": events[-1].sequence,
                             "sessionId": session_id,
@@ -2088,32 +2287,25 @@ class _LosslessCompactionRunner(SessionCompactionRunner):
                 )
                 if outcome.decision is not HookDecision.CONTINUE:
                     raise ProductionWorkerError(f"BeforeCompact Hook returned {outcome.decision.value}")
-        from offeragent_harness.ports import ArtifactMetadata, ArtifactState, Sensitivity
-
-        digest = f"sha256:{hashlib.sha256(payload).hexdigest()}"
-        metadata = ArtifactMetadata(
-            artifact_id=self._ids.new_id("artifact"),
-            workspace_id=workspace_id,
-            owner_run_id=selected_run.run_id,
-            mime_type="application/vnd.offeragent.compaction-manifest+json",
-            byte_length=len(payload),
-            sha256=digest,
-            sensitivity=Sensitivity.WORKSPACE,
-            state=ArtifactState.COMPLETE,
-            created_at=self._clock.utcnow(),
-            attributes={"kind": "lossless-context-boundary", "originalEventsRetained": True},
-        )
-        stored = await self._artifacts.put(
-            metadata,
-            payload,
-            idempotency_key=f"compaction:{selected_run.run_id}:{events[-1].sequence}:{digest}",
+        generated = await self._service.compact_session(
+            session_id=session_id,
+            through_turn_id=through_turn_id,
+            trigger="manual",
+            cancellation=cancellation,
         )
         return CompactionExecution(
-            summary_artifact=stored,
-            replaced_turn_count=1,
+            summary_artifact=generated.artifact,
+            replaced_turn_count=generated.replaced_turn_count,
             replaced_sequence_start=events[0].sequence,
             replaced_sequence_end=events[-1].sequence,
-            model="lossless-context-boundary-v1",
+            model=generated.record.model,
+            summary_id=generated.record.summary_id,
+            trigger=generated.record.trigger,
+            estimated_before_tokens=generated.record.estimated_before_tokens,
+            estimated_after_tokens=generated.record.estimated_after_tokens,
+            input_tokens=generated.record.input_tokens,
+            output_tokens=generated.record.output_tokens,
+            cached_input_tokens=generated.record.cached_input_tokens,
         )
 
 
@@ -2144,8 +2336,6 @@ class ProductionWorkerApplication(WorkerApplication):
     logger: LocalJsonLogger
     harness_application: HarnessApplication
     dispatcher: RuntimeApplicationCommandDispatcher
-    gateway: LoopbackWebGateway | None
-    loopback: AsyncioLoopbackServer | None
     local_vault_transaction: VaultTransactionCoordinator
     event_hub: _EventHub
     unit_of_work: SqliteUnitOfWorkFactory
@@ -2170,8 +2360,7 @@ class ProductionWorkerApplication(WorkerApplication):
 
     @property
     def ready(self) -> bool:
-        transport_healthy = self.loopback is None or self.loopback.healthy
-        return self._ready and not self._stopped and self._fatal_error is None and transport_healthy
+        return self._ready and not self._stopped and self._fatal_error is None
 
     @property
     def harness(self) -> HarnessService:
@@ -2184,13 +2373,6 @@ class ProductionWorkerApplication(WorkerApplication):
     @property
     def worker_pid(self) -> int:
         return os.getpid()
-
-    @property
-    def loopback_worker_pid(self) -> int:
-        gateway = self.gateway
-        if gateway is None:
-            raise ProductionWorkerError("Loopback Web is disabled for this Worker")
-        return gateway.config.worker_pid
 
     @property
     def protocol_capabilities(self) -> CapabilitySet:
@@ -2233,52 +2415,6 @@ class ProductionWorkerApplication(WorkerApplication):
         self._background_tasks.discard(task)
         if not task.cancelled():
             task.exception()
-
-    def _transport_listener_finished(self, component: str, task: asyncio.Task[None]) -> None:
-        if task.cancelled():
-            return
-        # Observe the listener result before scheduling process-fatal cleanup.
-        error = task.exception()
-        if self._shutdown_committed:
-            return
-        self._schedule_fatal_shutdown(component=component, error=error)
-
-    def _schedule_fatal_shutdown(self, *, component: str, error: BaseException | None) -> None:
-        if self._fatal_error is not None:
-            return
-        self._fatal_error = ProductionWorkerError(f"Worker {component} component terminated unexpectedly")
-        self.reject_new_runs = True
-
-        async def fail_worker() -> None:
-            await self._emit_runtime_log(
-                LogLevel.ERROR,
-                "runtime.required_component_failed",
-                "A required Worker component terminated unexpectedly.",
-                component=component,
-                errorType=type(error).__name__ if error is not None else "UnexpectedCompletion",
-            )
-            try:
-                await self.commit_shutdown()
-            except BaseException as commit_error:
-                await self._emit_runtime_log(
-                    LogLevel.ERROR,
-                    "runtime.fatal_shutdown_commit_failed",
-                    "Fatal Worker shutdown could not commit all durable state.",
-                    errorType=type(commit_error).__name__,
-                )
-            try:
-                await self._finish_transport_shutdown()
-            except BaseException:
-                # ``wait_stopped`` awaits the same single-flight task and
-                # reports its authoritative teardown failure to the process.
-                pass
-            finally:
-                # Commit failure can precede creation/completion of a normal
-                # success signal.  A fatal listener loss must still wake the
-                # process main loop so it exits instead of claiming readiness.
-                self._shutdown_event.set()
-
-        self._track_background_task(asyncio.create_task(fail_worker(), name=f"offeragent-{component}-fatal-shutdown"))
 
     def begin_shutdown_delivery(self) -> None:
         """Arm one terminal continuation before a transport starts shutdown.
@@ -2340,40 +2476,6 @@ class ProductionWorkerApplication(WorkerApplication):
         if method == "shutdown":
             self.finalize_shutdown_delivery()
 
-    async def _start_loopback_web(self, *, enabled: bool) -> None:
-        if not enabled:
-            return
-        if self.gateway is not None or self.loopback is not None:
-            raise ProductionWorkerError("Loopback Web listener is already configured")
-        gateway = LoopbackWebGateway(
-            config=LoopbackGatewayConfig(
-                workspace_id=self.workspace_id,
-                workspace_instance_id=self.workspace_instance_id,
-                worker_pid=os.getpid(),
-            ),
-            clock=self.clock,
-            dispatcher=self.dispatcher,
-        )
-        loopback = AsyncioLoopbackServer(
-            gateway,
-            request_finalized=self._application_request_finalized,
-            terminal_response=lambda method: method == "shutdown",
-        )
-        self.gateway = gateway
-        self.loopback = loopback
-        try:
-            await loopback.start()
-        except BaseException:
-            self.loopback = None
-            self.gateway = None
-            raise
-        loopback_closed_task = loopback.closed_task
-        if loopback_closed_task is None:
-            raise ProductionWorkerError("Worker loopback listener did not start")
-        loopback_closed_task.add_done_callback(
-            lambda completed: self._transport_listener_finished("loopback", completed)
-        )
-
     async def start(self) -> object:
         if self._ready or self._stopped:
             raise ProductionWorkerError("Worker application can only start once")
@@ -2416,7 +2518,6 @@ class ProductionWorkerApplication(WorkerApplication):
         self.config_activation.freeze(worker_config.config)
         self.components.bind_worker_read_limit(worker_config.config.budgets.max_parallel_reads)
         report = await self.harness_application.start()
-        await self._start_loopback_web(enabled=worker_config.config.ui.loopback_web_enabled)
         self._ready = True
         await self._emit_runtime_log(
             LogLevel.INFO,
@@ -2583,25 +2684,8 @@ class ProductionWorkerApplication(WorkerApplication):
 
     async def _run_transport_shutdown(self) -> None:
         try:
-            failures: list[BaseException] = []
-            loopback = self.loopback
-            self.loopback = None
-            self.gateway = None
-            if loopback is not None:
-                try:
-                    await loopback.stop()
-                except BaseException as error:
-                    failures.append(error)
-            if failures:
-                await self._emit_runtime_log(
-                    LogLevel.ERROR,
-                    "runtime.transport_shutdown_failed",
-                    "Worker transport shutdown was incomplete.",
-                    failureCount=len(failures),
-                )
-                raise ProductionWorkerError("Worker transport shutdown was incomplete") from failures[0]
             # This is a completion flag, not a claim/lock.  Set it only after
-            # all ingress capabilities and loopback listeners are removed.
+            # application ingress has been revoked.
             self._stopped = True
             await self._emit_runtime_log(
                 LogLevel.INFO,
@@ -2732,6 +2816,29 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             return configured_gateway_factory(settings, config.network.model_provider_enabled)
 
         artifacts = LocalArtifactStore(state_directory / "artifacts", workspace_id=workspace_id)
+        context_compaction_policy = self._overrides.context_compaction_policy or ContextCompactionPolicy()
+        context_summaries = ContextSummaryRepository(
+            workspace_id=workspace_id,
+            unit_of_work=uow,
+            artifacts=artifacts,
+            maximum_chain_depth=context_compaction_policy.maximum_chain_depth,
+        )
+
+        def context_gateway(model: str) -> ModelGateway:
+            settings = config.model.model_copy(update={"model": model, "reasoning_effort": "low", "temperature": 0.0})
+            return configured_gateway_factory(settings, config.network.model_provider_enabled)
+
+        context_compaction = ContextCompactionService(
+            workspace_id=workspace_id,
+            unit_of_work=uow,
+            artifacts=artifacts,
+            gateway_factory=context_gateway,
+            default_model=config.model.model,
+            clock=clock,
+            ids=ids,
+            policy=context_compaction_policy,
+            repository=context_summaries,
+        )
         runtime_budget = BudgetLedger(
             RunBudget(
                 100_000,
@@ -2760,7 +2867,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
         process_scratch_root = _prepare_process_scratch_root(state_directory)
         paths = WorkspacePathPolicy(
             bootstrap.canonical_root,
-            additional_roots=(WorkspaceRoot("process-scratch", process_scratch_root),),
+            additional_roots=(WorkspaceRoot("process-scratch", process_scratch_root, readable=True, writable=True),),
         )
         process_supervisor = self._overrides.process_supervisor
         if process_supervisor is None:
@@ -2795,6 +2902,16 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
         )
         executable_by_id = {item.executable_id: item for item in executable_profiles}
         environment_ids = {item.profile_id for item in environment_profiles}
+        document_executable = executable_by_id.get(DOCUMENT_PARSER_EXECUTABLE_ID)
+        if document_executable is not None and (
+            document_executable.fixed_arguments != (DOCUMENT_PARSER_EXECUTABLE_ID,)
+            or not document_executable.allow_network
+            or document_executable.appcontainer_filesystem
+            or ProcessStdinMode.FIXED_PAYLOAD not in document_executable.allowed_stdin_modes
+            or "process-scratch" not in document_executable.allowed_cwd_roots
+            or "minimal" not in document_executable.environment_profiles
+        ):
+            raise ProductionWorkerError("document parser profile is outside the fixed local boundary")
         for profile in self._overrides.builtin_shell_profiles:
             executable = executable_by_id.get(profile.executable_id)
             if (
@@ -2823,10 +2940,135 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                 16 * 1024 * 1024,
                 10_000,
                 100_000,
-                allowed_hidden_prefixes=(".claude", ".offeragent/memory"),
+                allowed_hidden_prefixes=(".claude", ".offeragent/memory", ".offeragent/knowledge"),
             ),
             transaction_executor=_KernelOnlyVaultTransactions(),
         )
+        document_ingestion: DocumentIngestionService | None = None
+        knowledge_binary_parser: KnowledgeProcessParser | None = None
+        if document_executable is not None:
+            document_source = VaultFileSystem(
+                workspace_id=workspace_id,
+                paths=paths,
+                read_policy=VaultReadPolicy(
+                    frozenset({".pdf", ".png", ".jpg", ".jpeg", ".webp"}),
+                    BUNDLED_DOCUMENT_PARSER_CONFIG.max_file_bytes,
+                    BUNDLED_DOCUMENT_PARSER_CONFIG.max_file_bytes,
+                    1,
+                    1,
+                ),
+                transaction_executor=_KernelOnlyVaultTransactions(),
+            )
+            document_ingestion = DocumentIngestionService(
+                workspace_id=workspace_id,
+                source_reader=document_source,
+                process_supervisor=process_supervisor,
+                artifacts=artifacts,
+                scratch_working_root=process_scratch_root / "working",
+                clock=clock,
+                config=DocumentIngestionConfig(
+                    parser_config_fingerprint=BUNDLED_DOCUMENT_PARSER_CONFIG.fingerprint,
+                    max_documents=5,
+                    max_source_bytes_per_document=BUNDLED_DOCUMENT_PARSER_CONFIG.max_file_bytes,
+                    max_total_source_bytes=5 * BUNDLED_DOCUMENT_PARSER_CONFIG.max_file_bytes,
+                    max_pages_per_document=BUNDLED_DOCUMENT_PARSER_CONFIG.max_pdf_pages,
+                    max_text_bytes_per_document=768 * 1024,
+                    max_total_text_bytes=768 * 1024,
+                    max_provenance_bytes_per_document=4 * 1024 * 1024,
+                    max_context_fragment_bytes=64 * 1024,
+                    max_context_fragments=512,
+                    max_total_context_bytes=768 * 1024,
+                    max_parser_response_bytes=DOCUMENT_PARSER_MAX_RESPONSE_BYTES,
+                    max_parser_stderr_bytes=64 * 1024,
+                    parser_timeout_seconds=180.0,
+                    executable_profile_fingerprint=document_executable.fingerprint,
+                ),
+            )
+            knowledge_binary_parser = KnowledgeProcessParser(
+                workspace_id=workspace_id,
+                process_supervisor=process_supervisor,
+                scratch_working_root=process_scratch_root / "working",
+                clock=clock,
+                config=KnowledgeProcessParserConfig(
+                    parser_config_fingerprint=BUNDLED_DOCUMENT_PARSER_CONFIG.fingerprint,
+                    executable_profile_fingerprint=document_executable.fingerprint,
+                    maximum_source_bytes=BUNDLED_DOCUMENT_PARSER_CONFIG.max_file_bytes,
+                    maximum_pages=BUNDLED_DOCUMENT_PARSER_CONFIG.max_pdf_pages,
+                    maximum_response_bytes=DOCUMENT_PARSER_MAX_RESPONSE_BYTES,
+                    maximum_stderr_bytes=64 * 1024,
+                    timeout_seconds=180.0,
+                ),
+            )
+        knowledge_state = bootstrap.canonical_root / ".offeragent" / "knowledge"
+        knowledge_catalog = KnowledgeCatalogStore(knowledge_state)
+        knowledge_objects = KnowledgeObjectStore(knowledge_state)
+        knowledge_preparations = KnowledgePreparationStore(knowledge_state, knowledge_objects)
+        knowledge_discovery = KnowledgeDiscovery(
+            workspace_id=workspace_id,
+            vault_root=bootstrap.canonical_root,
+            maximum_file_bytes=BUNDLED_DOCUMENT_PARSER_CONFIG.max_file_bytes,
+        )
+        knowledge_inference_budget = KnowledgeInferenceBudget()
+        knowledge_inference_cache = StructuredInferenceCache((knowledge_state / "inference-cache").resolve())
+        semantic_pageindex = (
+            SemanticPageIndexBuilder(
+                gateway_factory=context_gateway,
+                workspace_id=workspace_id,
+                model=config.model.model,
+                cache=knowledge_inference_cache,
+                ids=ids,
+                budget=knowledge_inference_budget,
+            )
+            if config.network.model_provider_enabled and config.model.model
+            else None
+        )
+        knowledge_preparation = KnowledgePreparationService(
+            vault_root=bootstrap.canonical_root,
+            discovery=knowledge_discovery,
+            catalog=knowledge_catalog,
+            objects=knowledge_objects,
+            preparations=knowledge_preparations,
+            binary_parser=knowledge_binary_parser,
+            page_index_builder=semantic_pageindex,
+        )
+        knowledge_publisher = KnowledgePublisher(
+            vault_root=bootstrap.canonical_root,
+            catalog=knowledge_catalog,
+            objects=knowledge_objects,
+        )
+        knowledge_compiler = KnowledgeCompiler(
+            discovery=knowledge_discovery,
+            catalog=knowledge_catalog,
+            preparations=knowledge_preparations,
+            publisher=knowledge_publisher,
+        )
+        semantic_wiki = (
+            LLMWikiCompiler(
+                preparations=knowledge_preparations,
+                compiler=knowledge_compiler,
+                gateway_factory=context_gateway,
+                workspace_id=workspace_id,
+                model=config.model.model,
+                cache=knowledge_inference_cache,
+                ids=ids,
+                budget=knowledge_inference_budget,
+            )
+            if semantic_pageindex is not None
+            else None
+        )
+        knowledge_executor = KnowledgeToolExecutor(
+            workspace_id=workspace_id,
+            preparation=knowledge_preparation,
+            compiler=knowledge_compiler,
+            semantic_compiler=semantic_wiki,
+        )
+        memory_repository = MemoryRepository(
+            workspace_id=workspace_id,
+            unit_of_work=uow,
+            clock=clock,
+            ids=ids,
+        )
+        memory_executor = MemoryToolExecutor(memory_repository)
         read_executor = CodeToolExecutor(
             workspace_id=workspace_id,
             source=vault_fs,
@@ -2898,7 +3140,7 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             clock=clock,
             ids=ids,
             gateway_factory=gateway_factory,
-            default_config=config,
+            bootstrap_max_parallel_reads=config.budgets.max_parallel_reads,
             approvals=approvals,
             policy_audit=EntityPolicyAuditSink(uow),
             journal=uow.invocation_journal,
@@ -2906,11 +3148,21 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             local_read=read_executor,
             local_transaction=local_transaction,
             parent_authorities=late_parent_authorities,
-            optional_definitions=(*powershell_executor.definitions, *subagent_definitions),
-            optional_local_executors=((powershell_executor.definitions, powershell_executor),),
+            optional_definitions=(
+                *powershell_executor.definitions,
+                *subagent_definitions,
+                *knowledge_executor.definitions,
+                *memory_executor.definitions,
+            ),
+            optional_local_executors=(
+                (powershell_executor.definitions, powershell_executor),
+                (knowledge_executor.definitions, knowledge_executor),
+                (memory_executor.definitions, memory_executor),
+            ),
             subagent_executor=late_subagent if subagent_definitions else None,
             skills=skill_factory,
             shell=shell_capabilities,
+            document_ingestion=document_ingestion,
             process_root_ids=tuple(sorted(allowed_cwd_roots)),
             hooks=hook_capabilities,
             hook_unit_of_work=uow,
@@ -2937,6 +3189,13 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                 ConversationHistoryRunPreparationAdapter(
                     workspace_id=workspace_id,
                     unit_of_work=uow,
+                    summaries=context_summaries,
+                    compactor=context_compaction,
+                    compaction_policy=context_compaction_policy,
+                ),
+                StructuredMemoryRunPreparationAdapter(
+                    workspace_id=workspace_id,
+                    repository=memory_repository,
                 ),
                 WorkspaceInstructionRunPreparationAdapter(
                     workspace_id=workspace_id,
@@ -2954,6 +3213,8 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             *powershell_executor.definitions,
             vault_transaction_definition(),
             *subagent_definitions,
+            *knowledge_executor.definitions,
+            *memory_executor.definitions,
         )
         base_scope = CapabilityScope(
             frozenset(item.name for item in base_definitions),
@@ -3052,10 +3313,8 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             clock=clock,
             ids=ids,
             turn_manager=turn_manager,
-            compaction_runner=_LosslessCompactionRunner(
-                artifacts,
-                clock,
-                ids,
+            compaction_runner=_GenerativeCompactionRunner(
+                context_compaction,
                 components=components,
                 hook_budget=runtime_budget,
             ),
@@ -3109,7 +3368,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
                 subagent_artifacts=_SubagentArtifactResolver(artifacts),
                 diagnostics=diagnostics,
                 diagnostics_owner_runs=_DiagnosticsOwnerAuthorizer(workspace_id, uow),
-                gateway_provider=lambda: application_holder["application"].gateway,
                 transport_policy=transport_policy,
                 extension_management_handlers=extension_management_command_handlers(
                     workspace_id=workspace_id,
@@ -3204,8 +3462,6 @@ class ProductionWorkerCompositionRoot(WorkerCompositionRoot):
             logger=logger,
             harness_application=harness_application,
             dispatcher=dispatcher,
-            gateway=None,
-            loopback=None,
             local_vault_transaction=local_transaction,
             event_hub=event_hub,
             unit_of_work=uow,
@@ -3268,8 +3524,8 @@ def _protocol_capabilities() -> CapabilitySet:
         hooks=True,
         subagents=True,
         artifacts=True,
-        loopback_web=True,
         content_blocks=True,
+        document_ingestion=True,
         cancellation=True,
         diagnostics=True,
     )

@@ -52,6 +52,7 @@ class ErrorCode(str, Enum):
     RESOURCE_CONFLICT = "resource.conflict"
     POLICY_DENIED = "policy.denied"
     APPROVAL_EXPIRED = "approval.expired"
+    DOCUMENT_EXTRACTION_FAILED = "document.extraction_failed"
     TOOL_FAILED = "tool.failed"
     TOOL_UNKNOWN_OUTCOME = "tool.unknown_outcome"
     PROVIDER_UNREACHABLE = "provider.unreachable"

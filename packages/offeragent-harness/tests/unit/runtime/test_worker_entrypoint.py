@@ -70,4 +70,4 @@ async def test_worker_consumes_exactly_one_composition_root_for_direct_stdio() -
 async def test_worker_rejects_every_transport_other_than_direct_stdio() -> None:
     entrypoint = WorkerEntrypoint(FakeCompositionRoot(FakeApplication()))
     with pytest.raises(WorkerEntrypointError, match="unsupported Worker transport"):
-        await entrypoint.start(bootstrap(), transport=cast(WorkerTransportMode, "loopback"))
+        await entrypoint.start(bootstrap(), transport=cast(WorkerTransportMode, "unsupported"))

@@ -8,6 +8,7 @@ import pytest
 
 from offeragent_harness.runtime.process_identity import SupervisedWorkspaceIdentity
 from offeragent_harness.runtime.windows_process import WindowsWorkerJob, current_user_profile_directory
+from offeragent_harness.runtime.windows_process_supervisor import WindowsSupervisedProcessBackend
 from offeragent_harness.runtime.windows_security import (
     current_windows_identity,
     kernel_handle_is_inheritable,
@@ -21,6 +22,36 @@ def workspace() -> SupervisedWorkspaceIdentity:
         "sha256:" + "a" * 64,
         "sha256:" + "b" * 64,
     )
+
+
+class _RuntimeEnvironmentKernel32:
+    def GetWindowsDirectoryW(self, buffer: object, _size: int) -> int:
+        buffer.value = r"C:\Windows"  # type: ignore[attr-defined]
+        return len(buffer.value)  # type: ignore[attr-defined]
+
+
+def test_current_user_supervisor_supplies_fixed_windows_runtime_environment() -> None:
+    backend = object.__new__(WindowsSupervisedProcessBackend)
+    object.__setattr__(backend, "_kernel32", _RuntimeEnvironmentKernel32())
+
+    environment = backend._current_user_environment(
+        {
+            "systemroot": r"Z:\poisoned-windows",
+            "WiNdIr": r"Z:\poisoned-windows",
+            "temp": r"Z:\poisoned-temp",
+            "TMP": r"Z:\poisoned-temp",
+            "LANG": "zh_CN.UTF-8",
+        },
+        temporary_directory=Path(r"C:\scratch\run"),
+    )
+
+    assert environment == {
+        "LANG": "zh_CN.UTF-8",
+        "SystemRoot": r"C:\Windows",
+        "TEMP": r"C:\scratch\run",
+        "TMP": r"C:\scratch\run",
+        "WINDIR": r"C:\Windows",
+    }
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows Known Folder APIs")

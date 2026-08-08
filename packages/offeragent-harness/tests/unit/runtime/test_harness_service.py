@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
@@ -17,8 +18,15 @@ from offeragent_harness.agent.state import RunPhase, RunState
 from offeragent_harness.config import HarnessConfig, MemorySettings
 from offeragent_harness.models import ModelUsage
 from offeragent_harness.ports import CancellationToken, Sensitivity, StoredEvent, ToolLifecycleObserver
+from offeragent_harness.protocol.documents import (
+    DocumentExtractionFailedPayload,
+    DocumentExtractionFailure,
+    DocumentExtractionFailureCode,
+)
 from offeragent_harness.protocol.events import TurnFailedPayload, parse_event, stored_event_to_envelope
 from offeragent_harness.runtime import TurnManager
+from offeragent_harness.runtime.document_ingestion import DocumentIngestionError
+from offeragent_harness.runtime.event_bus import AtomicEntityWrite, UowRunRecorder
 from offeragent_harness.runtime.harness_service import (
     CreateSessionCommand,
     HarnessService,
@@ -26,6 +34,7 @@ from offeragent_harness.runtime.harness_service import (
     PreparedRunComponents,
     RetryTurnCommand,
     RunComponents,
+    RunPreparationProgress,
     SessionReceipt,
     SessionRunConflict,
     StartTurnCommand,
@@ -152,8 +161,9 @@ class DeferredComponents(Components):
         state: RunState,
         cancellation: CancellationToken,
         durable_snapshot: Mapping[str, object] | None,
+        progress: RunPreparationProgress | None = None,
     ) -> PreparedRunComponents:
-        del command
+        del command, progress
         cancellation.checkpoint()
         assert durable_snapshot is None
         run = await self.uow.get_entity("runs", state.run_id)
@@ -189,6 +199,86 @@ class DeferredComponents(Components):
 
     def release(self, run_id: str) -> None:
         self.released.append(run_id)
+
+
+class DocumentProgressComponents(DeferredComponents):
+    def __init__(
+        self,
+        planner: Planner,
+        uow: InMemoryUnitOfWorkFactory,
+        *,
+        fail: bool = False,
+    ) -> None:
+        super().__init__(planner, uow)
+        self.fail = fail
+
+    async def prepare_root(
+        self,
+        command: StartTurnCommand,
+        state: RunState,
+        cancellation: CancellationToken,
+        durable_snapshot: Mapping[str, object] | None,
+        progress: RunPreparationProgress | None = None,
+    ) -> PreparedRunComponents:
+        assert progress is not None
+        await progress.emit(
+            "document.extraction_started",
+            {"documentId": "doc_test", "inputBlockIndex": 0, "attempt": 1},
+        )
+        if self.fail:
+            failure = DocumentExtractionFailure(
+                code=DocumentExtractionFailureCode.UNSUPPORTED_MEDIA_TYPE,
+                retryable=False,
+                user_visible_message="The attached file is unsupported.",
+                details={},
+            )
+            await progress.emit(
+                "document.extraction_failed",
+                {"documentId": "doc_test", "attempt": 1, "failure": failure.to_wire()},
+            )
+            raise DocumentIngestionError(
+                document_id="doc_test",
+                input_block_index=0,
+                failure=failure,
+            )
+        for artifact_id, media_type in (
+            ("art_text", "text/plain;charset=utf-8"),
+            ("art_provenance", "application/vnd.offeragent.document-provenance+json"),
+        ):
+            await progress.emit(
+                "artifact.created",
+                {
+                    "artifact": {
+                        "artifactId": artifact_id,
+                        "contentHash": "sha256:" + "a" * 64,
+                        "mediaType": media_type,
+                        "sizeBytes": 4,
+                        "sensitivity": "workspace",
+                        "state": "complete",
+                    },
+                    "ownerType": "run",
+                    "ownerId": state.run_id,
+                },
+            )
+        await progress.emit(
+            "document.extraction_completed",
+            {
+                "documentId": "doc_test",
+                "attempt": 1,
+                "textArtifactId": "art_text",
+                "pageCount": 1,
+                "pageProvenance": [
+                    {
+                        "locator": {"type": "page", "pageStart": 1, "pageEnd": 1},
+                        "extractionMethod": "ocr",
+                        "utf8StartByte": 0,
+                        "utf8EndByte": 4,
+                    }
+                ],
+                "warnings": [],
+            },
+        )
+        return await super().prepare_root(command, state, cancellation, durable_snapshot, progress)
 
 
 def _test_budget() -> RunBudget:
@@ -387,6 +477,150 @@ async def test_async_components_failure_uses_one_durable_terminal_commit() -> No
     assert await uow.get_entity("run_capability_snapshots", receipt.run_id) is None
     assert await uow.get_entity("active_root_runs", session.session_id) is None
     assert deferred.released == [receipt.run_id]
+
+
+@pytest.mark.asyncio
+async def test_document_preparation_progress_is_durable_ordered_and_closed() -> None:
+    clock = ManualClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    uow = InMemoryUnitOfWorkFactory()
+    manager = TurnManager()
+    deferred = DocumentProgressComponents(StopPlanner(), uow)
+    harness = HarnessService(
+        unit_of_work=uow,
+        event_sink=RecordingEventSink(),
+        clock=clock,
+        ids=DeterministicIdGenerator(),
+        components=deferred,
+        async_components=deferred,
+        turn_manager=manager,
+    )
+    session = await create_session(harness)
+
+    receipt = await harness.start_turn(turn_command(session.session_id))
+    active = await manager.get(receipt.run_id)
+    assert active is not None
+    assert (await active.task).phase is RunPhase.COMPLETED
+
+    events = await harness.replay_events(receipt.run_id)
+    assert [item.event_type for item in events[:7]] == [
+        "turn.started",
+        "document.extraction_started",
+        "artifact.created",
+        "artifact.created",
+        "document.extraction_completed",
+        "phase.changed",
+        "phase.changed",
+    ]
+    for event in events:
+        envelope = stored_event_to_envelope(event)
+        assert parse_event(envelope.to_wire()) == envelope
+
+
+@pytest.mark.asyncio
+async def test_document_preparation_failure_closes_attempt_and_returns_safe_error() -> None:
+    clock = ManualClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    uow = InMemoryUnitOfWorkFactory()
+    manager = TurnManager()
+    deferred = DocumentProgressComponents(StopPlanner(), uow, fail=True)
+    harness = HarnessService(
+        unit_of_work=uow,
+        event_sink=RecordingEventSink(),
+        clock=clock,
+        ids=DeterministicIdGenerator(),
+        components=deferred,
+        async_components=deferred,
+        turn_manager=manager,
+    )
+    session = await create_session(harness)
+
+    receipt = await harness.start_turn(turn_command(session.session_id))
+    active = await manager.get(receipt.run_id)
+    assert active is not None
+    with pytest.raises(AgentLoopFailure):
+        await active.task
+
+    events = await harness.replay_events(receipt.run_id)
+    assert [item.event_type for item in events] == [
+        "turn.started",
+        "document.extraction_started",
+        "document.extraction_failed",
+        "turn.failed",
+    ]
+    payload = stored_event_to_envelope(events[-1]).payload
+    assert isinstance(payload, TurnFailedPayload)
+    assert payload.error.code.value == "document.extraction_failed"
+    assert not payload.error.retryable
+    assert payload.error.user_visible_message == "The attached file is unsupported."
+    assert payload.error.details == {
+        "failureCategory": "document_ingestion",
+        "preparationStage": "document_extraction",
+        "failedDocumentCount": 1,
+        "failureCodes": ["unsupported_media_type"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_document_preparation_commit_failure_closes_the_durable_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    uow = InMemoryUnitOfWorkFactory()
+    manager = TurnManager()
+    deferred = DocumentProgressComponents(StopPlanner(), uow)
+    harness = HarnessService(
+        unit_of_work=uow,
+        event_sink=RecordingEventSink(),
+        clock=clock,
+        ids=DeterministicIdGenerator(),
+        components=deferred,
+        async_components=deferred,
+        turn_manager=manager,
+    )
+    original_commit = UowRunRecorder.commit
+    failed_once = False
+
+    async def fail_first_artifact_commit(
+        recorder: UowRunRecorder,
+        state: RunState,
+        *,
+        event_type: str,
+        payload: Mapping[str, Any],
+        terminal: bool = False,
+        entity_writes: Sequence[AtomicEntityWrite] = (),
+    ) -> None:
+        nonlocal failed_once
+        if event_type == "artifact.created" and not failed_once:
+            failed_once = True
+            raise RuntimeError("injected preparation commit failure")
+        await original_commit(
+            recorder,
+            state,
+            event_type=event_type,
+            payload=payload,
+            terminal=terminal,
+            entity_writes=entity_writes,
+        )
+
+    monkeypatch.setattr(UowRunRecorder, "commit", fail_first_artifact_commit)
+    session = await create_session(harness)
+
+    receipt = await harness.start_turn(turn_command(session.session_id))
+    active = await manager.get(receipt.run_id)
+    assert active is not None
+    with pytest.raises(AgentLoopFailure):
+        await active.task
+
+    events = await harness.replay_events(receipt.run_id)
+    assert failed_once
+    assert [item.event_type for item in events] == [
+        "turn.started",
+        "document.extraction_started",
+        "document.extraction_failed",
+        "turn.failed",
+    ]
+    failed_payload = stored_event_to_envelope(events[2]).payload
+    assert isinstance(failed_payload, DocumentExtractionFailedPayload)
+    assert failed_payload.failure.code is DocumentExtractionFailureCode.OUTPUT_INTEGRITY_MISMATCH
 
 
 @pytest.mark.asyncio

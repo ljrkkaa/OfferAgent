@@ -7,22 +7,28 @@
     "payload": {
       "result": {
         "data": {
-          "path": "raw/xxx.md"
+          "page": 2,
+          "path": "OfferAgent Sources/interview.pdf"
         },
         "sourceRefs": [
           {
             "file": {
               "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-              "path": "raw/xxx.md",
+              "path": "OfferAgent Sources/interview.pdf",
               "workspaceId": "ws_xxx"
             },
             "freshness": "fresh",
+            "locator": {
+              "pageEnd": 2,
+              "pageStart": 2,
+              "type": "page"
+            },
             "type": "vault",
             "workspaceRevision": 103
           }
         ],
         "status": "succeeded",
-        "summary": "已读取目标笔记。",
+        "summary": "已读取面经来源页。",
         "toolCallId": "call_04"
       }
     },

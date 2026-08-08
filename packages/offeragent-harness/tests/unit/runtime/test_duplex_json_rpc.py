@@ -7,7 +7,7 @@ import struct
 from collections import deque
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -183,6 +183,42 @@ async def initialized_connection(
     assert isinstance(response, JsonRpcSuccessResponse)
     await asyncio.wait_for(connection.wait_ready(), timeout=1)
     return connection, dispatcher, client, reader
+
+
+@pytest.mark.asyncio
+async def test_document_input_requires_its_negotiated_connection_capability() -> None:
+    client, server = memory_stream_pair()
+    dispatcher = ScriptedDispatcher()
+    initialize_result = dict(cast(Mapping[str, object], dispatcher.initialize_result))
+    capabilities = dict(cast(Mapping[str, object], initialize_result["capabilities"]))
+    capabilities["documentIngestion"] = False
+    initialize_result["capabilities"] = capabilities
+    dispatcher.initialize_result = initialize_result
+    connection = DuplexJsonRpcConnection(
+        server,
+        role=ConnectionRole.SERVER,
+        dispatcher=dispatcher,
+        command_transport="stdio",
+        command_peer="parent-process",
+        connection_id="stdio-no-document-capability",
+    )
+    reader = FramedReader(client)
+    await connection.start()
+    try:
+        await client.write(encode_frame(initialize_request()))
+        initialized = await asyncio.wait_for(reader.read(), timeout=1)
+        assert isinstance(initialized, JsonRpcSuccessResponse)
+
+        request = dict(build_examples()["turn-start.request.json"])
+        request["id"] = "turn-with-document"
+        await client.write(encode_frame(request))
+        rejected = await asyncio.wait_for(reader.read(), timeout=1)
+
+        assert isinstance(rejected, JsonRpcErrorResponse)
+        assert rejected.error.data.code is ErrorCode.PROTOCOL_MISSING_CAPABILITY
+        assert dispatcher.calls == ["initialize"]
+    finally:
+        await connection.close()
 
 
 async def wait_until(predicate: Callable[[], bool]) -> None:

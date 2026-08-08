@@ -23,7 +23,16 @@ dependencies = [
   "anyio>=4.8,<5",
   "httpx>=0.28,<1",
   "jsonschema>=4.23,<5",
+  "numpy>=1.26,<2.3",
+  "nvidia-cublas-cu12>=12,<13; sys_platform == 'win32'",
+  "nvidia-cuda-runtime-cu12>=12,<13; sys_platform == 'win32'",
+  "nvidia-cudnn-cu12>=9,<10; sys_platform == 'win32'",
+  "nvidia-cufft-cu12>=11,<12; sys_platform == 'win32'",
+  "onnxruntime>=1.22,<1.27; sys_platform != 'win32'",
+  "onnxruntime-gpu>=1.22,<1.27; sys_platform == 'win32'",
   "pydantic>=2.11,<3",
+  "pymupdf>=1.26,<2",
+  "rapidocr>=3.9,<4",
   "typing-extensions>=4.12,<5; python_version < '3.11'",
 ]
 
@@ -49,11 +58,9 @@ packages = ["src/offeragent_harness"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "schema" = "offeragent_harness/_schema"
-"web/index.html" = "offeragent_harness/_web/index.html"
-"web/assets" = "offeragent_harness/_web/assets"
 
 [tool.hatch.build.targets.sdist]
-include = ["src/offeragent_harness", "schema", "web/index.html", "web/assets", "README.md", "LICENSE"]
+include = ["src/offeragent_harness", "schema", "README.md", "LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

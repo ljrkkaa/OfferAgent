@@ -29,6 +29,17 @@ from offeragent_harness.sessions import AgentLineage, Run, RunKind, RunStatus, T
 from offeragent_harness.tools import canonical_json_bytes, canonical_json_sha256
 from offeragent_harness.workspace.filesystem import VaultFilesystemError
 
+from .context_summary import (
+    CompactionTrigger,
+    ContextCompactionPolicy,
+    ContextCompactor,
+    ContextSummaryError,
+    ContextSummaryRepository,
+    LoadedContextSummary,
+    estimate_turn_tokens,
+    render_summary_context,
+)
+
 _INSTRUCTION_IMPORT = re.compile(r"^[ \t]*@(?P<path>[A-Za-z0-9][A-Za-z0-9._/-]*)[ \t]*$")
 _VAULT_MEMORY_PATH = ".offeragent/memory/MEMORY.md"
 
@@ -241,12 +252,20 @@ class ConversationHistoryRunPreparationAdapter:
         workspace_id: str,
         unit_of_work: UnitOfWorkFactory,
         limits: ConversationHistoryLimits | None = None,
+        summaries: ContextSummaryRepository | None = None,
+        compactor: ContextCompactor | None = None,
+        compaction_policy: ContextCompactionPolicy | None = None,
     ) -> None:
         if not workspace_id or workspace_id.strip() != workspace_id or "\x00" in workspace_id:
             raise ValueError("Conversation history requires a canonical Workspace ID")
         self._workspace_id = workspace_id
         self._unit_of_work = unit_of_work
         self._limits = limits or ConversationHistoryLimits()
+        self._summaries = summaries
+        self._compactor = compactor
+        self._compaction_policy = compaction_policy or ContextCompactionPolicy()
+        if (summaries is None) != (compactor is None):
+            raise ValueError("conversation history summaries and compactor must be configured together")
 
     async def context_fragments(
         self,
@@ -277,7 +296,66 @@ class ConversationHistoryRunPreparationAdapter:
                 retryable=True,
             ) from error
         cancellation.checkpoint()
-        return self._fragments(request, turns, runs, states)
+        latest = None if self._summaries is None else await self._summaries.latest(request.session_id)
+        latest = await self._maybe_compact(
+            request=request,
+            turns=turns,
+            runs=runs,
+            states=states,
+            latest=latest,
+            cancellation=cancellation,
+        )
+        return self._fragments(request, turns, runs, states, latest)
+
+    async def _maybe_compact(
+        self,
+        *,
+        request: RunPreparationRequest,
+        turns: Sequence[EntityRecord],
+        runs: Sequence[EntityRecord],
+        states: Sequence[EntityRecord],
+        latest: LoadedContextSummary | None,
+        cancellation: CancellationToken,
+    ) -> LoadedContextSummary | None:
+        if self._compactor is None or self._summaries is None:
+            return latest
+        selected = self._selected_history(request, turns, runs, states)
+        boundary_ordinal = 0 if latest is None else latest.record.to_turn_ordinal
+        unsummarized = tuple(item for item in selected if item[0].ordinal > boundary_ordinal)
+        summary_tokens = 0 if latest is None else math.ceil(len(render_summary_context(latest).encode("utf-8")) / 3)
+        estimated = summary_tokens + math.ceil(len(request.query_text.encode("utf-8")) / 3)
+        estimated += sum(estimate_turn_tokens(turn, state) for turn, _, state in unsummarized)
+        policy = self._compaction_policy
+        if estimated < policy.soft_threshold_tokens:
+            return latest
+        compactable_count = len(unsummarized) - policy.recent_turns
+        if compactable_count < policy.minimum_compacted_turns:
+            if estimated >= policy.hard_threshold_tokens:
+                raise RunPreparationFailure(
+                    "conversation_history_hard_limit",
+                    "会话上下文已达到硬上限, 但没有足够的完整旧 Turn 可安全压缩",
+                    retryable=False,
+                )
+            return latest
+        through_turn = unsummarized[compactable_count - 1][0]
+        trigger: CompactionTrigger = "hard_limit" if estimated >= policy.hard_threshold_tokens else "auto"
+        try:
+            await self._compactor.compact_session(
+                session_id=request.session_id,
+                through_turn_id=through_turn.turn_id,
+                trigger=trigger,
+                cancellation=cancellation,
+                estimated_before_tokens=estimated,
+            )
+        except ContextSummaryError as error:
+            if trigger == "hard_limit":
+                raise RunPreparationFailure(
+                    "context_compaction_failed",
+                    "会话上下文压缩失败, 已保留全部原始历史且未调用规划模型",
+                    retryable=True,
+                ) from error
+            return latest
+        return await self._summaries.latest(request.session_id)
 
     def _fragments(
         self,
@@ -285,7 +363,83 @@ class ConversationHistoryRunPreparationAdapter:
         turn_records: Sequence[EntityRecord],
         run_records: Sequence[EntityRecord],
         state_records: Sequence[EntityRecord],
+        latest: LoadedContextSummary | None = None,
     ) -> tuple[ContextFragment, ...]:
+        selected = self._selected_history(request, turn_records, run_records, state_records)
+        boundary_ordinal = 0 if latest is None else latest.record.to_turn_ordinal
+        selected = [item for item in selected if item[0].ordinal > boundary_ordinal]
+        selected = selected[-self._limits.max_turns :]
+        prefix: tuple[ContextFragment, ...] = ()
+        prefix_size = 0
+        if latest is not None:
+            rendered = render_summary_context(latest)
+            prefix_size = len(rendered.encode("utf-8"))
+            if prefix_size > self._limits.max_turn_bytes:
+                raise RunPreparationFailure(
+                    "conversation_summary_compaction_required",
+                    "Validated conversation summary exceeds the per-item context limit",
+                    retryable=False,
+                )
+            prefix = (
+                ContextFragment(
+                    fragment_id=f"conversation-summary:{latest.record.summary_id}",
+                    layer=ContextLayer.CONVERSATION,
+                    text=rendered,
+                    sensitivity=Sensitivity.WORKSPACE,
+                    source_refs=(
+                        f"session:{request.session_id}:summary:{latest.record.summary_id}",
+                        f"session:{request.session_id}:through-turn:{latest.record.to_turn_id}",
+                    ),
+                    artifact_ids=(latest.record.artifact_id,),
+                    content_hash=latest.record.artifact_sha256,
+                ),
+            )
+        pairs: list[tuple[ContextFragment, ContextFragment, int]] = []
+        for turn, run, state in selected:
+            input_value = [dict(block) for block in turn.input_blocks]
+            input_text = canonical_json_bytes(input_value).decode("utf-8")
+            user = ContextFragment(
+                fragment_id=f"conversation:{turn.turn_id}:user",
+                layer=ContextLayer.CONVERSATION,
+                text=input_text,
+                sensitivity=Sensitivity.WORKSPACE,
+                source_refs=(f"session:{request.session_id}:turn:{turn.turn_id}:input",),
+                content_hash=canonical_json_sha256(input_value),
+            )
+            assistant = ContextFragment(
+                fragment_id=f"conversation:{turn.turn_id}:assistant",
+                layer=ContextLayer.CONVERSATION,
+                text=state.assistant_text,
+                sensitivity=Sensitivity.WORKSPACE,
+                source_refs=(f"session:{request.session_id}:run:{run.run_id}:assistant",),
+                content_hash=canonical_json_sha256({"text": state.assistant_text}),
+                role=ModelRole.ASSISTANT,
+            )
+            size = len(canonical_json_bytes({"user": input_value, "assistant": state.assistant_text}))
+            if size > self._limits.max_turn_bytes:
+                raise RunPreparationFailure(
+                    "conversation_history_turn_compaction_required",
+                    f"Turn {turn.turn_id!r} exceeds the exact conversation context limit",
+                    retryable=False,
+                )
+            pairs.append((user, assistant, size))
+        retained: list[tuple[ContextFragment, ContextFragment]] = []
+        used = prefix_size
+        for user, assistant, size in reversed(pairs):
+            if used + size > self._limits.max_total_bytes:
+                break
+            retained.append((user, assistant))
+            used += size
+        retained.reverse()
+        return (*prefix, *(fragment for pair in retained for fragment in pair))
+
+    def _selected_history(
+        self,
+        request: RunPreparationRequest,
+        turn_records: Sequence[EntityRecord],
+        run_records: Sequence[EntityRecord],
+        state_records: Sequence[EntityRecord],
+    ) -> list[tuple[Turn, Run, RunState]]:
         turns = tuple(
             record.value
             for record in turn_records
@@ -334,45 +488,7 @@ class ConversationHistoryRunPreparationAdapter:
                     retryable=False,
                 )
             selected.append((turn, run, state))
-        selected = selected[-self._limits.max_turns :]
-        pairs: list[tuple[ContextFragment, ContextFragment, int]] = []
-        for turn, run, state in selected:
-            input_value = [dict(block) for block in turn.input_blocks]
-            input_text = canonical_json_bytes(input_value).decode("utf-8")
-            user = ContextFragment(
-                fragment_id=f"conversation:{turn.turn_id}:user",
-                layer=ContextLayer.CONVERSATION,
-                text=input_text,
-                sensitivity=Sensitivity.WORKSPACE,
-                source_refs=(f"session:{request.session_id}:turn:{turn.turn_id}:input",),
-                content_hash=canonical_json_sha256(input_value),
-            )
-            assistant = ContextFragment(
-                fragment_id=f"conversation:{turn.turn_id}:assistant",
-                layer=ContextLayer.CONVERSATION,
-                text=state.assistant_text,
-                sensitivity=Sensitivity.WORKSPACE,
-                source_refs=(f"session:{request.session_id}:run:{run.run_id}:assistant",),
-                content_hash=canonical_json_sha256({"text": state.assistant_text}),
-                role=ModelRole.ASSISTANT,
-            )
-            size = len(canonical_json_bytes({"user": input_value, "assistant": state.assistant_text}))
-            if size > self._limits.max_turn_bytes:
-                raise RunPreparationFailure(
-                    "conversation_history_turn_compaction_required",
-                    f"Turn {turn.turn_id!r} exceeds the exact conversation context limit",
-                    retryable=False,
-                )
-            pairs.append((user, assistant, size))
-        retained: list[tuple[ContextFragment, ContextFragment]] = []
-        used = 0
-        for user, assistant, size in reversed(pairs):
-            if used + size > self._limits.max_total_bytes:
-                break
-            retained.append((user, assistant))
-            used += size
-        retained.reverse()
-        return tuple(fragment for pair in retained for fragment in pair)
+        return selected
 
 
 @dataclass(frozen=True, slots=True)

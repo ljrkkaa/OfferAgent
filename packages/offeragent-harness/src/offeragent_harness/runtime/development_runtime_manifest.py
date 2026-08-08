@@ -122,13 +122,13 @@ class DevelopmentRuntimeManifest:
                 "development_executable_record_invalid",
                 "local executables must be explicit hash-pinned records",
             )
-        required_assets = {"process-catalog.v1.json", "web/index.html"}
+        required_assets = {"process-catalog.v1.json"}
         if not required_assets <= by_path.keys() or not any(
             record.path.startswith("skills/") and record.path.endswith("/SKILL.md") for record in self.files
         ):
             raise DevelopmentRuntimeError(
                 "development_assets_missing",
-                "development Runtime is missing process, Web, or Skill assets",
+                "development Runtime is missing process or Skill assets",
             )
         if not _SHA256.fullmatch(self.runtime_content_sha256):
             raise DevelopmentRuntimeError(

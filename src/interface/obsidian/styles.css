@@ -1969,11 +1969,112 @@ button.reference-button:hover {
     backdrop-filter: blur(10px);
 }
 
+.offeragent-composer.is-drag-over {
+    outline: 2px dashed var(--interactive-accent);
+    outline-offset: -6px;
+    background: color-mix(in srgb, var(--interactive-accent) 8%, var(--background-primary));
+}
+
 .offeragent-composer-input {
     width: 100%;
     max-height: 260px;
     resize: vertical;
     border-radius: 10px;
+}
+
+.offeragent-attachment-picker {
+    display: none;
+}
+
+.offeragent-attachment-panel {
+    display: grid;
+    gap: 6px;
+    margin-top: 7px;
+}
+
+.offeragent-attachment-card {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding: 7px 8px;
+    border: 1px solid var(--oa-border);
+    border-radius: 8px;
+    background: var(--oa-soft);
+}
+
+.offeragent-attachment-icon,
+.offeragent-attachment-remove,
+.offeragent-attach-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.offeragent-attachment-icon svg,
+.offeragent-attachment-remove svg,
+.offeragent-attach-button svg,
+.offeragent-message-attachment svg {
+    width: 16px;
+    height: 16px;
+}
+
+.offeragent-attachment-details,
+.offeragent-attachment-name {
+    min-width: 0;
+}
+
+.offeragent-attachment-name {
+    overflow: hidden;
+    font-size: var(--font-ui-small);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.offeragent-attachment-meta,
+.offeragent-attachment-progress {
+    color: var(--text-muted);
+    font-size: var(--font-ui-smaller);
+}
+
+.offeragent-attachment-remove,
+.offeragent-attach-button {
+    padding: 5px;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+}
+
+.offeragent-attachment-error {
+    color: var(--text-error);
+    font-size: var(--font-ui-smaller);
+    overflow-wrap: anywhere;
+}
+
+.offeragent-message-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 7px;
+}
+
+.offeragent-message-attachment {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    max-width: 100%;
+    padding: 3px 6px;
+    border: 1px solid color-mix(in srgb, currentColor 28%, transparent);
+    border-radius: 6px;
+    font-size: var(--font-ui-smaller);
+}
+
+.offeragent-message-attachment span:last-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .offeragent-permission-warning,
@@ -1994,6 +2095,10 @@ button.reference-button:hover {
     justify-content: flex-end;
     gap: 7px;
     margin-top: 7px;
+}
+
+.offeragent-attach-button {
+    margin-right: auto;
 }
 
 .offeragent-settings-description {

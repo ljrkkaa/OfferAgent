@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, cast
@@ -86,14 +86,12 @@ from .application_handlers import (
     diagnostics_command_handlers,
     event_replay_handlers,
     subagent_command_handlers,
-    web_launch_handlers,
 )
 from .approval_manager import ApprovalManager, ApprovalNotFound
 from .config_service import ConfigService, ConfigUpdateCommand, WorkerConfigActivation
 from .conversation_controls import ConversationControlService
 from .harness_service import HarnessService, StartTurnCommand
 from .hook_lifecycle import LifecycleHookDenied
-from .loopback_gateway import LoopbackWebGateway
 from .session_service import (
     SessionCreateCommand as LifecycleSessionCreateCommand,
 )
@@ -179,7 +177,6 @@ def compose_domain_command_handlers(
     subagent_artifacts: SubagentArtifactReferenceResolver,
     diagnostics: DiagnosticsService,
     diagnostics_owner_runs: DiagnosticsOwnerRunAuthorizer,
-    gateway_provider: Callable[[], LoopbackWebGateway | None],
     transport_policy: ApplicationTransportPolicy,
     extension_management_handlers: Mapping[str, ApplicationCommandHandler],
 ) -> Mapping[str, ApplicationCommandHandler]:
@@ -248,7 +245,6 @@ def compose_domain_command_handlers(
             owner_runs=diagnostics_owner_runs,
         )
     )
-    add(web_launch_handlers(gateway_provider=gateway_provider))
     expected = frozenset(COMMAND_REGISTRY) - {"initialize", "runtime/ping", "runtime/status"}
     actual = frozenset(handlers)
     if actual != expected:

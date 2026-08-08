@@ -601,9 +601,9 @@ async def test_session_start_deny_soft_aborts_invisibly_and_replays_after_ack_lo
     harness.sessions = restarted
     replay_handler = _session_create_handler(harness)
     replay_context = ApplicationCommandContext(
-        transport="loopback-http",
-        client_id="web-session-start-retry",
-        peer="loopback",
+        transport="stdio",
+        client_id="pipe-session-start-retry",
+        peer="current-windows-sid",
     )
     with pytest.raises(LifecycleHookDenied) as replay:
         await replay_handler(params, ManualCancellationToken(), replay_context)
@@ -644,9 +644,9 @@ async def test_session_start_allow_activation_ack_loss_restarts_without_invoking
         params,
         ManualCancellationToken(),
         ApplicationCommandContext(
-            transport="loopback-http",
-            client_id="web-session-start-allow-retry",
-            peer="loopback",
+            transport="stdio",
+            client_id="pipe-session-start-allow-retry",
+            peer="current-windows-sid",
         ),
     )
     assert isinstance(replayed, ProtocolSessionCreateResult)
@@ -690,9 +690,9 @@ async def test_pending_create_ack_loss_restart_runs_hook_with_original_connectio
         ),
         ManualCancellationToken(),
         ApplicationCommandContext(
-            transport="loopback-http",
-            client_id="web-session-start-after-restart",
-            peer="loopback",
+            transport="stdio",
+            client_id="pipe-session-start-after-restart",
+            peer="current-windows-sid",
         ),
     )
     assert isinstance(created, ProtocolSessionCreateResult)

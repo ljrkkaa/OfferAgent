@@ -19,7 +19,7 @@ def test_documentation_check_rejects_missing_links_and_script_commands(tmp_path:
         encoding="utf-8",
     )
 
-    problems = check(tmp_path, tracked_paths=frozenset())
+    problems = check(tmp_path, tracked_paths={"README.md"})
 
     assert problems == [
         "README.md: local link target is missing: docs/missing.md",
@@ -55,6 +55,18 @@ def test_documentation_check_rejects_existing_untracked_inputs(tmp_path: Path) -
         "README.md: local link target is not tracked by Git: docs/untracked.md",
         "README.md: documented Python script is not tracked by Git: scripts/untracked.py",
     ]
+
+
+def test_documentation_check_ignores_generated_untracked_documents(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("tracked\n", encoding="utf-8")
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / "model-output.md").write_text(
+        "```powershell\npython scripts/model-suggested.py\n```\n",
+        encoding="utf-8",
+    )
+
+    assert check(tmp_path, tracked_paths={"README.md"}) == []
 
 
 def test_documentation_check_rejects_absolute_and_reference_style_local_links(tmp_path: Path) -> None:

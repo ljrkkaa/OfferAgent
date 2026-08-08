@@ -83,7 +83,7 @@ class Service(DiagnosticsService):
 async def test_diagnostics_handlers_delegate_to_single_local_service() -> None:
     service = Service()
     handlers = diagnostics_command_handlers(service=service, owner_runs=OwnerRuns())
-    context = ApplicationCommandContext(transport="loopback-http", client_id="client_1")
+    context = ApplicationCommandContext(client_id="client_1")
     cancellation = ManualCancellationToken()
 
     result = await handlers["diagnostics/get"](DiagnosticsGetParams(), cancellation, context)

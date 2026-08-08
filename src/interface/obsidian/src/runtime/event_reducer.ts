@@ -668,8 +668,15 @@ function contentText(content: JsonValue[]): string[] {
         const block = objectValue(raw);
         const type = textField(block, "type");
         if (type === "text") return textField(block, "text");
-        if (type === "artifact") return `[Artifact: ${textField(block, "artifactId")}]`;
-        if (type === "image") return `[Image: ${optionalText(block, "alt") ?? "image"}]`;
+        if (type === "file") return `[File: ${textField(objectField(block, "file"), "path")}]`;
+        if (type === "document") {
+            const file = objectField(block, "file");
+            return `[Document: ${textField(file, "path")} (${textField(block, "mediaType")})]`;
+        }
+        if (type === "artifact") {
+            return `[Artifact: ${textField(objectField(block, "artifact"), "artifactId")}]`;
+        }
+        if (type === "image") return `[Image: ${optionalText(block, "altText") ?? "image"}]`;
         return `[${type}]`;
     });
 }

@@ -126,10 +126,3 @@ async def test_secret_commands_return_only_opaque_metadata_and_rotate_with_cas()
     )
     assert isinstance(deleted, SecretsDeleteResult)
     assert deleted.deleted and store.value is None
-
-    with pytest.raises(PermissionError, match="plugin stdio"):
-        await handlers["secrets/put"](
-            SecretsPutParams(provider_id="openai", kind="model-provider", secret=SecretStr("blocked")),
-            cancellation,
-            ApplicationCommandContext(transport="loopback-http"),
-        )

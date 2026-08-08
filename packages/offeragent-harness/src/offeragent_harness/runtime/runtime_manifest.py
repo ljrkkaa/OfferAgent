@@ -22,7 +22,7 @@ _RESERVED_NAMES = frozenset(
         *(f"LPT{index}" for index in range(1, 10)),
     }
 )
-_ALLOWED_KINDS = frozenset({"asset", "executable", "license", "skill", "web"})
+_ALLOWED_KINDS = frozenset({"asset", "executable", "license", "skill"})
 _WINDOWS_X64_PE_MACHINE = 0x8664
 
 

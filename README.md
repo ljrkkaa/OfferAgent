@@ -1,106 +1,142 @@
-# OfferAgent Windows Local Runtime
+# OfferAgent
 
-OfferAgent 是面向项目所有者个人使用的 Windows x64 Obsidian 本地 Agent。工程约束以
-[`docs/GENERAL_ENGINEERING_REFACTOR_CONSTRAINTS.md`](docs/GENERAL_ENGINEERING_REFACTOR_CONSTRAINTS.md)
-为准，产品范围和完成判定以
-[`docs/architecture/personal-local-scope.md`](docs/architecture/personal-local-scope.md) 为准。
+> 一个面向 Obsidian 的 Windows 本地 AI Agent：把对话、文档理解、知识组织和可审批的文件操作放在同一个可恢复运行时中。
 
-## 唯一运行架构
+[![Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D4?logo=windows)](https://www.microsoft.com/windows/)
+[![Python 3.10–3.12](https://img.shields.io/badge/python-3.10%E2%80%933.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Obsidian](https://img.shields.io/badge/client-Obsidian-7C3AED?logo=obsidian&logoColor=white)](https://obsidian.md/)
+[![CI](https://github.com/ljrkkaa/OfferAgent/actions/workflows/windows-local-runtime.yml/badge.svg?branch=codex/windows-local-harness)](https://github.com/ljrkkaa/OfferAgent/actions/workflows/windows-local-runtime.yml)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
 
-- 每个 Obsidian 插件实例直接启动一个 `offeragent-worker.exe` 子进程。这个 Worker 拥有该
-  Workspace 的 `HarnessService`、Agent Loop、SQLite、Session/Run、工具、权限、审批和恢复状态。
-- 同一交互式 Windows 会话和用户下，相同 canonical Vault root 的 Worker 共享一个命名互斥锁；第二个实例在接触
-  `state.sqlite` 或恢复事务前即 fail closed，不同 Vault 仍可并行。
-- 插件与 Worker 的唯一 IPC 是继承 stdin/stdout 上的 framed JSON-RPC。stderr 只承载受限诊断码。
-- 显式停止和设置重启会先请求 shutdown；断线自动重连会关闭旧 transport。两类路径都会等待当前子
-  Worker 实际退出，超时才强制终止，旧进程完成回收前不会由同一插件实例启动替代 Worker。
-- Obsidian 的 `onunload` 不等待 Promise；卸载、禁用、热重载或 Obsidian 退出时，插件会在回调返回前
-  同步关闭 stdio 并发起 Worker 回收，后台继续等待实际进程退出。同一交互式 Windows 会话和用户内，
-  后续同 Vault Worker 在旧进程释放互斥锁前不能进入 Runtime 校验、SQLite 或恢复。
-- 没有常驻 Host、进程发现服务、Named Pipe、后台 Worker 或跨插件实例复用通道。
-- 本地 Web UI 是同一 Worker 的可选 Loopback 客户端，不拥有第二套 Agent Runtime。
-- Shell、Hook 等进程工具由 Worker 通过短生命周期 `offeragent-process-host.exe` 执行；进程受固定
-  hash/catalog、Job Object、按策略启用的 AppContainer，以及用户注册可执行文件的可选离线
-  Authenticode 校验约束。
-- 模型只能通过 `ModelGateway` 推理，不能执行工具、访问 Vault、拥有 Session 或建立第二套循环。
+OfferAgent 是一个 **local-first、Obsidian-native、provider-neutral** 的个人 Agent 工程。它不需要常驻服务器：Obsidian 插件直接启动本地 Worker，由单一 Agent Loop 管理模型调用、工具执行、权限审批、知识库、记忆、事件与崩溃恢复。
 
-当前仓库只支持个人 Windows x64 本机构建。它不包含正式签名发布、Setup 安装器、自动更新通道、
-ARM64 构建矩阵，也不保留这些已删除路径的兼容入口。除用户主动选择的模型 Provider 外，Runtime
-没有网络出口；本地 Loopback 不属于外部出口。
+> [!IMPORTANT]
+> 项目目前处于 pre-alpha，仅面向个人 Windows x64 本地构建。尚不提供签名安装包、自动更新、ARM64 构建或多用户服务端。
 
-## 目录入口
+## 为什么是 OfferAgent
 
-```text
-packages/offeragent-harness/       Agent Core、Worker、协议、进程隔离与个人构建脚本
-src/interface/obsidian/            Obsidian 客户端源码
-docs/architecture/                 当前架构、范围和迁移约束
+| 目标 | 实现方式 |
+| --- | --- |
+| 本地优先 | Vault、SQLite、会话和派生产物由本地 Worker 持有 |
+| 单一执行边界 | 每个插件实例对应一个 Worker 和一个 canonical Agent Loop |
+| 显式安全边界 | 文件写入、Shell 和其他副作用统一经过策略、审批、审计和事务 |
+| 可恢复 | Session、Run、事件、工具日志和本地状态支持断线与崩溃后收敛 |
+| 有依据的知识 | 文档解析、语义 PageIndex、引用校验和 Wiki 编译保留来源链路 |
+| 模型与工具解耦 | 模型只通过 `ModelGateway` 参与推理，不直接持有 Vault、Session 或工具 |
+
+## 架构概览
+
+```mermaid
+flowchart LR
+    U["Obsidian 用户"] --> P["OfferAgent 插件"]
+    P <-->|"framed JSON-RPC / stdio"| W["offeragent-worker.exe"]
+    W --> L["Canonical Agent Loop"]
+    L --> G["ModelGateway"]
+    G --> M["用户选择的模型 Provider"]
+    L --> T["Tool Kernel"]
+    T --> V["Obsidian Vault"]
+    T --> H["短生命周期 Process Host"]
+    W --> S["SQLite / Events / Recovery"]
+    W --> K["Knowledge / Memory / Artifacts"]
 ```
 
-主分支不保存旧 Khoj Server、Django/PostgreSQL 运行入口、远程 Store、旧 HTTP/sync 插件路径或
-第二套 Agent Loop。历史实现只从 Git 对照分支 `archive/khoj-server-baseline-20260713` 追溯。
+- 插件与 Worker 之间的唯一 IPC 是继承的 stdin/stdout。
+- 同一 Windows 用户和会话中，同一 canonical Vault 只允许一个 Worker 持有写入边界。
+- Shell 和 Hook 由短生命周 Process Host 执行，并受进程目录、hash、Job Object 和策略约束。
+- 除用户显式选择的模型 Provider 外，Runtime 不需要业务网络出口。
 
-## Harness 门禁
+## 核心能力
 
-在 `packages/offeragent-harness` 中执行：
+- **Agent Loop**：结构化规划、预算、取消、上下文压缩与终止判定。
+- **文档理解**：支持 PDF、PNG、JPEG 和 WebP；PDF 优先提取内嵌文本，无文本页再进入 OCR。
+- **知识管道**：源发现、结构化页索引、引用验证、增量 Wiki 和语义检索。
+- **个人记忆**：来源绑定的持久记忆、可审计准备与检索工具。
+- **权限与审批**：风险分级、授权绑定、执行前复核和可恢复事务。
+- **Subagent**：受预算、取消、工具范围和父子运行边界约束的子任务。
+- **可观测性**：结构化事件、诊断、指标和敏感字段脱敏。
+
+## 仓库结构
+
+```text
+packages/offeragent-harness/   Python Agent Core、Worker、协议、工具与构建脚本
+src/interface/obsidian/        Obsidian 插件源码与本地 Runtime 客户端
+evaluation/                    可复现的评测脚本与非敏感配置
+.github/workflows/             Windows CI 质量门禁
+```
+
+## 开发环境
+
+建议配置：
+
+- Windows 10/11 x64
+- Python 3.12 和 [`uv`](https://docs.astral.sh/uv/)
+- Node.js 20、Corepack 和 Yarn 1.22
+- Obsidian 1.6+
+- `rg.exe`（本地插件构建时固定写入 Runtime）
+- 需要图片 OCR 时：NVIDIA CUDA/cuDNN 及可用的 ONNX Runtime CUDA Provider
+
+### Harness
 
 ```powershell
+cd packages/offeragent-harness
 uv sync --extra dev --locked --python 3.12
 uv run pytest -q
 uv run ruff check src tests scripts
-uv run ruff format --check src tests scripts
 uv run mypy src tests
-uv run lint-imports --config .importlinter --no-cache
-uv run python -m offeragent_harness.protocol.schemas check
-uv run python scripts/audit_repository_closure.py
-uv run python scripts/check_documentation.py
-uv run python scripts/check_architecture.py
-uv run python scripts/check_forbidden_dependencies.py
-uv run python scripts/build_web_assets.py check
 uv build
 ```
 
-这些门禁验证唯一 Agent Loop、direct stdio transport、依赖方向、协议生成物、Web 资源和生产依赖
-闭包。测试结果以命令的实时退出状态为准，文档不硬编码测试数量或临时 schema hash。
-
-## Obsidian 门禁
-
-在 `src/interface/obsidian` 中执行：
+### Obsidian 插件
 
 ```powershell
+cd src/interface/obsidian
+corepack enable
 corepack yarn install --frozen-lockfile
 corepack yarn protocol:check
-corepack yarn typecheck
 corepack yarn test
+corepack yarn typecheck
 ```
 
-插件唯一可生成 bundle 的脚本是 `build:local`，并由个人构建脚本注入 Runtime manifest 锚点后调用；
-不要使用或恢复无锚点的 production `build`/`dev` 入口，也不要直接维护真实 Vault 中的 `main.js`。
+## 构建本地插件
 
-## 个人构建与更新
-
-完整本地插件只能在 Windows x64 上由以下脚本构建：
+完整本地插件由 Harness 的构建脚本生成，不直接提交 `main.js`、Worker 二进制文件或构建目录。
 
 ```powershell
 cd packages/offeragent-harness
 uv run python scripts/build_local_windows_plugin.py `
-  --output E:\Projects\offeragent\artifacts\offeragent-obsidian-plugin `
+  --output ..\..\..\artifacts\offeragent-obsidian-plugin `
   --ripgrep-executable C:\path\to\rg.exe
 ```
 
-更新现有 Vault 插件只使用以下脚本；执行前先停止 Runtime 并完全退出 Obsidian：
+更新已有 Vault 前，请先停止 Runtime 并完全退出 Obsidian：
 
 ```powershell
 uv run python scripts/update_local_windows_plugin.py `
-  --vault-root 'E:\面试胜利！' `
+  --vault-root 'C:\path\to\your-vault' `
   --ripgrep-executable C:\path\to\rg.exe
 ```
 
-详细的 manifest、原子切换和 `data.json` 保护规则见
-[`docs/personal-local-plugin-install.md`](docs/personal-local-plugin-install.md)。
+## 质量门禁
 
-## 真实 Vault 验收
+GitHub Actions 会在 Windows 上验证：
 
-真实 Vault 读取验收只能走 Obsidian 插件 → stdio Worker → Tool Kernel。验收前须遵守目标 Vault 的
-`CLAUDE.md` 及其显式导入规则，保持 Workspace 未信任或 `read-only`，并核对验收前后 Markdown
-文件身份、hash 和 mtime。活动文件、选区和 MetadataCache revision 必须由真实 Obsidian E2E 验证；
-仓库不提供另一条 headless Agent 入口。真实 Vault 写入需要用户另行明确授权。
+- 仓库生产闭包和禁止依赖
+- 架构依赖方向与协议生成物
+- Ruff、Mypy 和 Python 测试
+- Obsidian 协议一致性、Node 测试和 TypeScript 类型检查
+- Python 包构建
+
+本仓库不提交本地测试结果、冻结基线、知识库内容、密钥或构建产物；结果以当次 CI 的实时退出状态为准。
+
+## 安全说明
+
+- 附件和 Vault 内容始终视为不可信输入。
+- 写入 Vault 必须通过差异、策略、审批和原子提交闭环。
+- 模型 Provider 不直接获得文件系统或进程执行权。
+- 仓库不应包含 `.env`、访问令牌、真实履历/面试材料、本地知识库或评测产物。
+
+如果发现真实凭据曾进入 Git 历史，请先立即轮换凭据，再清理历史；单纯删除工作区文件不能消除历史泄露。
+
+## License
+
+仓库根目录代码按 [GNU Affero General Public License v3.0 or later](LICENSE) 提供。

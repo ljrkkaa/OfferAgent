@@ -94,14 +94,42 @@ DEVELOPMENT_HIDDEN_IMPORTS = (
     "offeragent_harness.subagents.scheduler",
     "offeragent_harness.subagents.service",
     "offeragent_harness.subagents.tools",
-    "offeragent_harness.subagents.write_coordinator",
 )
+DOCUMENT_PARSER_HIDDEN_IMPORTS = (
+    "PIL.Image",
+    "onnxruntime",
+    "pymupdf",
+    "rapidocr",
+)
+DOCUMENT_PARSER_MODEL_FILES = (
+    "PP-OCRv6_det_small.onnx",
+    "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+    "PP-OCRv6_rec_small.onnx",
+)
+DOCUMENT_PARSER_CUDA_DLLS = {
+    "nvidia.cublas": ("cublas64_12.dll", "cublasLt64_12.dll"),
+    "nvidia.cuda_runtime": ("cudart64_12.dll",),
+    "nvidia.cudnn": (
+        "cudnn64_9.dll",
+        "cudnn_adv64_9.dll",
+        "cudnn_cnn64_9.dll",
+        "cudnn_engines_precompiled64_9.dll",
+        "cudnn_engines_runtime_compiled64_9.dll",
+        "cudnn_engines_tensor_ir64_9.dll",
+        "cudnn_ext64_9.dll",
+        "cudnn_graph64_9.dll",
+        "cudnn_heuristic64_9.dll",
+        "cudnn_ops64_9.dll",
+    ),
+    "nvidia.cufft": ("cufft64_11.dll",),
+}
 DEVELOPMENT_EXCLUDED_MODULES = (
     "_pytest",
     "django",
     "hypothesis",
     "khoj",
     "mypy",
+    "numpy.testing",
     "offeragent_harness.cli",
     "offeragent_harness.migration",
     "offeragent_harness.testing",
@@ -255,7 +283,6 @@ def run_static_gates() -> None:
         cwd=ROOT,
         check=True,
     )
-    subprocess.run([sys.executable, "scripts/build_web_assets.py", "check"], cwd=ROOT, check=True)
 
 
 def build_development_runtime(
@@ -263,28 +290,39 @@ def build_development_runtime(
     *,
     project_source_snapshot: Mapping[str, str],
 ) -> Path:
+    common_data = ((ROOT / "schema", "offeragent_harness/_schema"),)
+    parser_data = _document_parser_add_data()
+    parser_binaries = _document_parser_add_binaries()
     specifications = (
-        (DEVELOPMENT_ENTRYPOINTS / "offeragent_worker.py", "offeragent-worker", destination / "worker"),
+        (
+            DEVELOPMENT_ENTRYPOINTS / "offeragent_worker.py",
+            "offeragent-worker",
+            destination / "worker",
+            DEVELOPMENT_HIDDEN_IMPORTS,
+            common_data,
+            (),
+        ),
         (
             DEVELOPMENT_ENTRYPOINTS / "offeragent_process_host.py",
             "offeragent-process-host",
             destination / "process-host",
+            DEVELOPMENT_HIDDEN_IMPORTS + DOCUMENT_PARSER_HIDDEN_IMPORTS,
+            common_data + parser_data,
+            parser_binaries,
         ),
     )
     classifier = SourceClassifier(project_root=ROOT)
     roots: list[Path] = []
     target_evidence: list[FrozenRuntimeEvidence] = []
-    for entrypoint, name, target in specifications:
+    for entrypoint, name, target, hidden_imports, add_data, add_binaries in specifications:
         root = build_one_onedir(
             entrypoint,
             name,
             target,
-            hidden_imports=DEVELOPMENT_HIDDEN_IMPORTS,
+            hidden_imports=hidden_imports,
             excluded_modules=DEVELOPMENT_EXCLUDED_MODULES,
-            add_data=(
-                (ROOT / "web", "offeragent_harness/_web"),
-                (ROOT / "schema", "offeragent_harness/_schema"),
-            ),
+            add_data=add_data,
+            add_binaries=add_binaries,
         )
         roots.append(root)
         target_evidence.append(
@@ -303,12 +341,86 @@ def build_development_runtime(
     verify_project_source_snapshot(evidence, project_source_snapshot)
     audit_development_frozen_evidence(evidence)
     audit_development_pyinstaller_archives(merged)
+    _require_document_parser_payload(merged)
     _require_exact_root_executables(merged)
     expected_machine = WINDOWS_X64_PE_MACHINE
     for executable in sorted(merged.glob("*.exe")):
         if pe_machine(executable) != expected_machine:
             raise RuntimeError(f"development executable is not native x64: {executable.name}")
     return merged
+
+
+def _document_parser_add_data() -> tuple[tuple[Path, str], ...]:
+    spec = importlib.util.find_spec("rapidocr")
+    if spec is None or spec.origin is None:
+        raise RuntimeError("the pinned RapidOCR build dependency is unavailable")
+    try:
+        package_root = Path(spec.origin).resolve(strict=True).parent
+    except OSError as error:
+        raise RuntimeError("the pinned RapidOCR package root is unavailable") from error
+    relative_sources = (
+        ("config.yaml", "rapidocr"),
+        ("default_models.yaml", "rapidocr"),
+        *((f"models/{name}", "rapidocr/models") for name in DOCUMENT_PARSER_MODEL_FILES),
+    )
+    result: list[tuple[Path, str]] = []
+    for relative, target in relative_sources:
+        source = package_root.joinpath(*relative.split("/"))
+        try:
+            resolved = source.resolve(strict=True)
+            resolved.relative_to(package_root)
+        except (OSError, ValueError) as error:
+            raise RuntimeError("a required RapidOCR parser asset is unavailable") from error
+        if source.is_symlink() or not resolved.is_file():
+            raise RuntimeError("a required RapidOCR parser asset is not a regular local file")
+        result.append((resolved, target))
+    return tuple(result)
+
+
+def _document_parser_add_binaries() -> tuple[tuple[Path, str], ...]:
+    result: list[tuple[Path, str]] = []
+    for package, filenames in DOCUMENT_PARSER_CUDA_DLLS.items():
+        spec = importlib.util.find_spec(package)
+        locations = tuple(spec.submodule_search_locations or ()) if spec is not None else ()
+        if len(locations) != 1:
+            raise RuntimeError(f"the pinned CUDA binary package is unavailable: {package}")
+        package_root = Path(locations[0]).resolve(strict=True)
+        binary_root = (package_root / "bin").resolve(strict=True)
+        binary_root.relative_to(package_root)
+        target = f"{package.replace('.', '/')}/bin"
+        for filename in filenames:
+            source = (binary_root / filename).resolve(strict=True)
+            try:
+                source.relative_to(binary_root)
+            except ValueError as error:
+                raise RuntimeError("a required CUDA DLL escapes its package") from error
+            if source.is_symlink() or not source.is_file():
+                raise RuntimeError(f"a required CUDA DLL is unavailable: {filename}")
+            result.append((source, target))
+    return tuple(result)
+
+
+def _require_document_parser_payload(runtime: Path) -> None:
+    package_root = runtime / "_internal" / "rapidocr"
+    required = {
+        package_root / "config.yaml",
+        package_root / "default_models.yaml",
+        *(package_root / "models" / name for name in DOCUMENT_PARSER_MODEL_FILES),
+    }
+    if any(path.is_symlink() or not path.is_file() for path in required):
+        raise RuntimeError("development Runtime lacks the explicit bundled document parser assets")
+    models_root = package_root / "models"
+    actual_models = set(models_root.rglob("*"))
+    expected_models = {package_root / "models" / name for name in DOCUMENT_PARSER_MODEL_FILES}
+    if actual_models != expected_models or any(path.is_symlink() or not path.is_file() for path in actual_models):
+        raise RuntimeError("development Runtime document parser model set is not exact")
+    internal = runtime / "_internal"
+    for package, filenames in DOCUMENT_PARSER_CUDA_DLLS.items():
+        binary_root = internal.joinpath(*package.split("."), "bin")
+        expected = {binary_root / name for name in filenames}
+        actual = set(binary_root.rglob("*")) if binary_root.is_dir() else set()
+        if actual != expected or any(path.is_symlink() or not path.is_file() for path in actual):
+            raise RuntimeError(f"development Runtime CUDA DLL set is not exact: {package}")
 
 
 def _require_exact_root_executables(runtime: Path) -> None:
@@ -385,7 +497,10 @@ def audit_development_pyinstaller_archives(runtime: Path) -> None:
             raise RuntimeError(
                 f"development executable archive contains forbidden modules ({executable_name}): {forbidden}"
             )
-        missing = sorted(set(DEVELOPMENT_HIDDEN_IMPORTS) - set(module_names))
+        required_hidden_imports = set(DEVELOPMENT_HIDDEN_IMPORTS)
+        if executable_name == "offeragent-process-host.exe":
+            required_hidden_imports.update(DOCUMENT_PARSER_HIDDEN_IMPORTS)
+        missing = sorted(required_hidden_imports - set(module_names))
         if missing:
             raise RuntimeError(
                 f"development executable archive lacks curated Runtime modules ({executable_name}): {missing}"
@@ -410,8 +525,6 @@ def collect_runtime_records(runtime: Path) -> tuple[RuntimeFileRecord, ...]:
             kind = "executable"
         elif relative.startswith("skills/"):
             kind = "skill"
-        elif relative.startswith("web/"):
-            kind = "web"
         elif relative.startswith("LICENSES/"):
             kind = "license"
         else:
@@ -434,7 +547,6 @@ def source_tree_identity() -> SourceTreeIdentity:
         ROOT / "scripts" / "entrypoints" / "development",
         ROOT / "packaging",
         ROOT / "schema",
-        ROOT / "web",
         PLUGIN / "src",
         PLUGIN / "scripts",
     )

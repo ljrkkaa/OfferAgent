@@ -126,6 +126,8 @@ def check(repository_root: Path, *, tracked_paths: Set[str] | None = None) -> li
         tracked_paths = frozenset(_tracking_key(path) for path in tracked_paths)
     for document in documentation_files(repository_root):
         relative = document.relative_to(repository_root).as_posix()
+        if not _is_git_tracked(repository_root, document, tracked_paths, allow_directory=False):
+            continue
         try:
             content = document.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as error:

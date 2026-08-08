@@ -205,9 +205,9 @@ async def _crash(root: Path, stage: str) -> int:
         await entrypoint.start(WorkerBootstrap(WORKSPACE_INSTANCE_ID, root / "vault", root / "state")),
     )
     context = ApplicationCommandContext(
-        transport="loopback-http",
-        client_id="web-production-crash",
-        peer="127.0.0.1",
+        transport="stdio",
+        client_id="pipe-production-crash",
+        peer="current-windows-sid",
     )
     try:
         created = await _dispatch(

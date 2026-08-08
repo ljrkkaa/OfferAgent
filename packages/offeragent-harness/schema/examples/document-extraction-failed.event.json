@@ -1,0 +1,28 @@
+{
+  "jsonrpc": "2.0",
+  "method": "event",
+  "params": {
+    "eventId": "evt_doc_failed_01",
+    "parentRunId": null,
+    "payload": {
+      "attempt": 1,
+      "documentId": "doc_02",
+      "failure": {
+        "code": "document_encrypted",
+        "retryable": false,
+        "userVisibleMessage": "PDF 已加密且无法提取文字。"
+      }
+    },
+    "protocolVersion": "1.0",
+    "rootRunId": "run_01",
+    "runId": "run_01",
+    "schemaVersion": "1",
+    "sequence": 3,
+    "sessionId": "ses_01",
+    "timestamp": "2026-07-12T10:00:02Z",
+    "traceId": "trace_doc_02",
+    "turnId": "turn_01",
+    "type": "document.extraction_failed",
+    "workspaceId": "ws_xxx"
+  }
+}

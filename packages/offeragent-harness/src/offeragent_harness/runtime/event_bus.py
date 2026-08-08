@@ -396,6 +396,7 @@ def _termination_reason(event_type: str, payload: Mapping[str, Any]) -> Terminat
             "budget": TerminationReason.BUDGET_EXHAUSTED,
             "tool": TerminationReason.TOOL_ERROR,
             "model": TerminationReason.MODEL_ERROR,
+            "document_ingestion": TerminationReason.RUNTIME_INTERRUPTED,
             "runtime": TerminationReason.RUNTIME_INTERRUPTED,
         }
         if not isinstance(category, str) or category not in reasons:

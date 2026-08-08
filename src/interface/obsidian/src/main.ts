@@ -95,7 +95,6 @@ export default class OfferAgentPlugin extends Plugin {
         this.addRibbonIcon("bot", "打开 OfferAgent", () => void this.activateChat());
         this.addCommand({ id: "open-local-chat", name: "打开本地聊天", callback: () => void this.activateChat() });
         this.addCommand({ id: "new-local-chat", name: "新建本地会话", callback: () => void this.newChat() });
-        this.addCommand({ id: "open-local-web", name: "打开本地 Web 界面", callback: () => void this.openLocalWeb() });
         this.addCommand({ id: "runtime-diagnostics", name: "查看本地 Runtime 诊断", callback: () => void this.openDiagnostics() });
         this.addCommand({
             id: "stop-local-runtime",
@@ -400,18 +399,6 @@ export default class OfferAgentPlugin extends Plugin {
             "diagnostics/snapshot", { includeRecentErrors: true },
         ));
         new DiagnosticsModal(this, snapshot).open();
-    }
-
-    async openLocalWeb(): Promise<void> {
-        await this.ensureReady();
-        const result = requireJsonObject(await (this.runtime as RuntimeBootstrap).harness.request("web/launch", {}));
-        const url = requireText(result.url, "Web launch URL");
-        const parsed = new URL(url);
-        if (parsed.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(parsed.hostname) ||
-            !parsed.hash || parsed.username || parsed.password) {
-            throw new Error("Runtime 返回了不安全的本地 Web 地址");
-        }
-        window.open(url, "_blank", "noopener,noreferrer");
     }
 
     private async stopLocalRuntime(): Promise<void> {

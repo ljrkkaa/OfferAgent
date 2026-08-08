@@ -90,8 +90,14 @@ source_modules =
 # The supervisor imports the public ports facade for process, artifact,
 # cancellation, and clock interfaces. Ignore that facade edge so its unrelated
 # re-exports do not create false implementation dependencies.
+# The fixed process host is also the isolated adapter for the dependency-neutral
+# documents module. These two explicit edges do not grant Agent/model inference
+# ownership; they only expose the canonical parser contract and its local adapters.
 ignore_imports =
     offeragent_harness.runtime.process_supervisor -> offeragent_harness.ports
+    offeragent_harness.runtime.local_process_host -> offeragent_harness.documents
+    offeragent_harness.runtime.local_process_host -> offeragent_harness.documents.adapters
+    offeragent_harness.runtime.local_process_host -> offeragent_harness.runtime.document_parser_profile
 forbidden_modules =
     offeragent_harness.agent
     offeragent_harness.app
@@ -141,18 +147,6 @@ forbidden_modules =
     offeragent_harness.ports.artifacts
     offeragent_harness.ports.events
     offeragent_harness.storage
-    offeragent_harness.tools
-    offeragent_harness.vault
-
-[importlinter:contract:capability-resolver-cannot-execute-capabilities]
-name = Capability resolver cannot import Agent, model, tool, Vault, or secret implementations
-type = forbidden
-source_modules =
-    offeragent_harness.runtime.capability_resolver
-forbidden_modules =
-    offeragent_harness.agent
-    offeragent_harness.models
-    offeragent_harness.runtime.windows_secrets
     offeragent_harness.tools
     offeragent_harness.vault
 

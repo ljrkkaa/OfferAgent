@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
 from offeragent_harness.error_codes import ErrorCode
 from offeragent_harness.ports.application_commands import ApplicationCommandContext, ApplicationCommandDispatcher
+from offeragent_harness.protocol.capabilities import CapabilityName, CapabilitySet
 from offeragent_harness.protocol.errors import ProtocolViolation, protocol_error
 from offeragent_harness.protocol.events import EventEnvelope
 from offeragent_harness.protocol.framing import DEFAULT_MAX_MESSAGE_BYTES, LengthPrefixedJsonRpcDecoder, encode_frame
@@ -24,6 +25,7 @@ from offeragent_harness.protocol.jsonrpc import (
     validate_request,
     validate_response,
 )
+from offeragent_harness.protocol.messages import COMMAND_REGISTRY, InitializeResult
 
 from .application_errors import map_application_exception
 from .cancellation import CancellationCode, CancellationReason, CancellationScope
@@ -158,6 +160,7 @@ class DuplexJsonRpcConnection:
         self._closed = asyncio.Event()
         self._ready_event = asyncio.Event()
         self._state = ConnectionState.CONNECTED
+        self._negotiated_capabilities = CapabilitySet()
 
     @property
     def role(self) -> ConnectionRole:
@@ -327,6 +330,8 @@ class DuplexJsonRpcConnection:
         response_flushed = False
         try:
             self._dispatcher.require_ready()
+            if not initializes:
+                self._require_negotiated_capabilities(request)
             result = await self._dispatcher.dispatch(
                 request.method,
                 request.params,
@@ -345,6 +350,10 @@ class DuplexJsonRpcConnection:
                 result=validated.result.to_wire(),
             )
             if initializes:
+                initialized = validated.result
+                if not isinstance(initialized, InitializeResult):
+                    raise TypeError("initialize response has an invalid negotiated capability set")
+                self._negotiated_capabilities = initialized.capabilities
                 self._state = ConnectionState.READY
             await self._send_message(response)
             response_flushed = True
@@ -367,6 +376,26 @@ class DuplexJsonRpcConnection:
                     self._request_finalized(request.method)
         if response_flushed and self._response_flushed is not None:
             self._response_flushed(request.method)
+
+    def _require_negotiated_capabilities(self, request: JsonRpcRequest) -> None:
+        enabled = self._negotiated_capabilities.enabled()
+        required = COMMAND_REGISTRY[request.method].required_capability
+        if required is not None and required not in enabled:
+            raise protocol_error(
+                ErrorCode.PROTOCOL_MISSING_CAPABILITY,
+                f"command requires the negotiated {required.value} capability",
+            )
+        has_document = _request_contains_document(request.params)
+        if has_document and request.method != "turn/start":
+            raise protocol_error(
+                ErrorCode.PROTOCOL_INVALID_REQUEST,
+                "document input is accepted only by turn/start in protocol v1",
+            )
+        if has_document and CapabilityName.DOCUMENT_INGESTION not in enabled:
+            raise protocol_error(
+                ErrorCode.PROTOCOL_MISSING_CAPABILITY,
+                "document input requires the negotiated documentIngestion capability",
+            )
 
     def _accept_cancel(self, message: RpcCancelNotification) -> None:
         pending = self._pending.get(message.params.request_id)
@@ -451,6 +480,13 @@ class DuplexJsonRpcConnection:
         finally:
             self._state = ConnectionState.POISONED if poisoned else ConnectionState.CLOSED
             self._closed.set()
+
+
+def _request_contains_document(params: Mapping[str, Any]) -> bool:
+    raw_input = params.get("input")
+    if not isinstance(raw_input, (list, tuple)):
+        return False
+    return any(isinstance(block, Mapping) and block.get("type") == "document" for block in raw_input)
 
 
 __all__ = [

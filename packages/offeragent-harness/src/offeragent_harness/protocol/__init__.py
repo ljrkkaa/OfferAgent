@@ -1,7 +1,7 @@
 """OfferAgent protocol v1 public API.
 
-The package is intentionally independent from the Agent domain and every adapter;
-it may be imported by direct stdio, loopback, schema tooling, and conformance tests.
+The package is intentionally independent from the Agent domain and the stdio adapter;
+it may be imported by direct stdio, schema tooling, and conformance tests.
 """
 
 # Re-exporting the generated DTO surface is the purpose of this aggregator.
@@ -25,14 +25,30 @@ from .content import (
     ArtifactState,
     ContentBlock,
     ContentFormat,
+    DocumentContentBlock,
+    DocumentFileRef,
+    DocumentMediaType,
+    DocumentPageLocator,
     FileContentBlock,
     FileRef,
     Freshness,
     ImageContentBlock,
     RelativeVaultPath,
+    SourceLocator,
     SourceRef,
     TextContentBlock,
     VaultSourceRef,
+)
+from .documents import (
+    DocumentExtractionCompletedPayload,
+    DocumentExtractionFailedPayload,
+    DocumentExtractionFailure,
+    DocumentExtractionFailureCode,
+    DocumentExtractionMethod,
+    DocumentExtractionStartedPayload,
+    DocumentExtractionWarning,
+    DocumentExtractionWarningCode,
+    DocumentPageProvenance,
 )
 from .errors import ErrorCode, ErrorEnvelope, ProtocolViolation, protocol_error
 from .events import (
@@ -95,6 +111,19 @@ _PUBLIC_NAMES = [
     "CapabilitySet",
     "ContentBlock",
     "ContentFormat",
+    "DocumentContentBlock",
+    "DocumentFileRef",
+    "DocumentExtractionCompletedPayload",
+    "DocumentExtractionFailedPayload",
+    "DocumentExtractionFailure",
+    "DocumentExtractionFailureCode",
+    "DocumentExtractionMethod",
+    "DocumentExtractionStartedPayload",
+    "DocumentExtractionWarning",
+    "DocumentExtractionWarningCode",
+    "DocumentMediaType",
+    "DocumentPageLocator",
+    "DocumentPageProvenance",
     "EmptyParams",
     "EmptyResult",
     "ErrorCode",
@@ -127,6 +156,7 @@ _PUBLIC_NAMES = [
     "RpcCancelNotification",
     "RpcCancelParams",
     "SourceRef",
+    "SourceLocator",
     "StoredEventMigrationRequired",
     "TextContentBlock",
     "ValidatedRequest",

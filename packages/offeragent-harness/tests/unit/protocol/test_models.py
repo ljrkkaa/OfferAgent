@@ -17,10 +17,20 @@ from offeragent_harness.protocol.capabilities import (
 )
 from offeragent_harness.protocol.content import (
     ContentBlock,
+    DocumentContentBlock,
+    DocumentMediaType,
+    DocumentPageLocator,
     FileRef,
     RelativeVaultPath,
+    SourceRef,
     TextContentBlock,
     VaultSourceRef,
+)
+from offeragent_harness.protocol.documents import (
+    DocumentExtractionCompletedPayload,
+    DocumentExtractionFailedPayload,
+    DocumentExtractionFailureCode,
+    DocumentExtractionStartedPayload,
 )
 from offeragent_harness.protocol.errors import ErrorCode, ProtocolViolation
 from offeragent_harness.protocol.events import EVENT_REGISTRY, EventEnvelope, EventType, ToolCompletedPayload
@@ -48,7 +58,6 @@ EXPECTED_COMMANDS = {
     "initialize",
     "runtime/ping",
     "runtime/status",
-    "web/launch",
     "secrets/list",
     "secrets/put",
     "secrets/delete",
@@ -232,9 +241,67 @@ def test_content_blocks_and_source_refs_are_discriminated_and_closed() -> None:
         TypeAdapter(ContentBlock).validate_json('{"type":"text","text":"x","unexpected":true}')
 
 
+def test_document_content_block_requires_an_explicit_supported_media_type_and_hash() -> None:
+    block: ContentBlock = TypeAdapter(ContentBlock).validate_json(
+        """
+        {
+          "type": "document",
+          "file": {
+            "workspaceId": "ws_main",
+            "path": "OfferAgent Sources/interview.pdf",
+            "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "mediaType": "application/pdf"
+        }
+        """
+    )
+    assert isinstance(block, DocumentContentBlock)
+    assert block.media_type is DocumentMediaType.PDF
+
+    with pytest.raises(ValidationError, match="contentHash"):
+        TypeAdapter(ContentBlock).validate_json(
+            '{"type":"document","file":{"workspaceId":"ws_main","path":"source.pdf"},"mediaType":"application/pdf"}'
+        )
+    with pytest.raises(ValidationError):
+        TypeAdapter(ContentBlock).validate_json(
+            '{"type":"document","file":{"workspaceId":"ws_main","path":"source.gif",'
+            '"contentHash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},'
+            '"mediaType":"image/gif"}'
+        )
+    with pytest.raises(ValidationError):
+        TypeAdapter(ContentBlock).validate_json(
+            '{"type":"document","file":{"workspaceId":"ws_main","path":"source.pdf",'
+            '"contentHash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            '"lineStart":1},"mediaType":"application/pdf"}'
+        )
+
+
 def test_file_ref_requires_an_ordered_line_range() -> None:
     with pytest.raises(ValidationError):
         FileRef.model_validate_json('{"workspaceId":"ws_main","path":"a.md","lineStart":9,"lineEnd":3}')
+
+
+def test_page_source_locator_is_one_based_ordered_and_cannot_mix_with_text_locators() -> None:
+    source: SourceRef = TypeAdapter(SourceRef).validate_json(
+        """
+        {
+          "type": "vault",
+          "file": {"workspaceId": "ws_main", "path": "source.pdf"},
+          "locator": {"type": "page", "pageStart": 2, "pageEnd": 4}
+        }
+        """
+    )
+    assert isinstance(source, VaultSourceRef)
+    assert isinstance(source.locator, DocumentPageLocator)
+    assert source.locator.page_start == 2
+
+    with pytest.raises(ValidationError, match="pageEnd"):
+        DocumentPageLocator.model_validate_json('{"type":"page","pageStart":4,"pageEnd":2}')
+    with pytest.raises(ValidationError, match="cannot be combined"):
+        TypeAdapter(SourceRef).validate_json(
+            '{"type":"vault","file":{"workspaceId":"ws_main","path":"source.pdf","lineStart":1},'
+            '"locator":{"type":"page","pageStart":1,"pageEnd":1}}'
+        )
 
 
 def test_vault_source_ref_accepts_combined_stale_partial_freshness() -> None:
@@ -275,6 +342,95 @@ def test_event_type_and_payload_cannot_be_mismatched_or_extended() -> None:
         EventEnvelope.model_validate_json(json.dumps(wrong_terminal_kind))
 
 
+def test_document_extraction_lifecycle_examples_are_strict_durable_events() -> None:
+    examples = build_examples()
+    started = EventEnvelope.model_validate_json(
+        json.dumps(_object(examples["document-extraction-started.event.json"]["params"]))
+    )
+    completed = EventEnvelope.model_validate_json(
+        json.dumps(_object(examples["document-extraction-completed.event.json"]["params"]))
+    )
+    failed = EventEnvelope.model_validate_json(
+        json.dumps(_object(examples["document-extraction-failed.event.json"]["params"]))
+    )
+    assert isinstance(started.payload, DocumentExtractionStartedPayload)
+    assert started.payload.input_block_index == 1
+    assert isinstance(completed.payload, DocumentExtractionCompletedPayload)
+    assert completed.payload.page_provenance[1].locator.page_start == 2
+    assert isinstance(failed.payload, DocumentExtractionFailedPayload)
+    assert failed.payload.failure.code is DocumentExtractionFailureCode.DOCUMENT_ENCRYPTED
+
+    extended = copy.deepcopy(_object(examples["document-extraction-failed.event.json"]["params"]))
+    failure = _object(_object(extended["payload"])["failure"])
+    failure["unstableMessageKey"] = "not allowed"
+    with pytest.raises(ValidationError):
+        EventEnvelope.model_validate_json(json.dumps(extended))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "documentId": "doc_1",
+            "textArtifactId": "art_1",
+            "pageCount": 1,
+            "pageProvenance": [
+                {
+                    "locator": {"type": "page", "pageStart": 2, "pageEnd": 2},
+                    "extractionMethod": "ocr",
+                    "utf8StartByte": 0,
+                    "utf8EndByte": 2,
+                }
+            ],
+        },
+        {
+            "documentId": "doc_1",
+            "textArtifactId": "art_1",
+            "pageCount": 2,
+            "pageProvenance": [
+                {
+                    "locator": {"type": "page", "pageStart": 1, "pageEnd": 1},
+                    "extractionMethod": "ocr",
+                    "utf8StartByte": 4,
+                    "utf8EndByte": 8,
+                },
+                {
+                    "locator": {"type": "page", "pageStart": 2, "pageEnd": 2},
+                    "extractionMethod": "ocr",
+                    "utf8StartByte": 7,
+                    "utf8EndByte": 12,
+                },
+            ],
+        },
+        {
+            "documentId": "doc_1",
+            "textArtifactId": "art_1",
+            "pageCount": 1,
+            "pageProvenance": [
+                {
+                    "locator": {"type": "page", "pageStart": 1, "pageEnd": 1},
+                    "extractionMethod": "embedded_text",
+                    "utf8StartByte": 0,
+                    "utf8EndByte": 2,
+                    "confidence": 0.9,
+                }
+            ],
+        },
+    ],
+)
+def test_document_extraction_completion_rejects_invalid_provenance(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        DocumentExtractionCompletedPayload.model_validate_json(json.dumps(payload))
+
+
+def test_document_extraction_failure_codes_reject_unknown_values() -> None:
+    with pytest.raises(ValidationError):
+        DocumentExtractionFailedPayload.model_validate_json(
+            '{"documentId":"doc_1","failure":{"code":"best_effort_fallback","retryable":false,'
+            '"userVisibleMessage":"not stable"}}'
+        )
+
+
 def test_capability_negotiation_selects_highest_common_minor_and_intersection() -> None:
     result = negotiate_protocol(
         client_preferred="1.4",
@@ -291,6 +447,13 @@ def test_capability_negotiation_selects_highest_common_minor_and_intersection() 
     assert result.capabilities.event_replay is True
     assert result.capabilities.shell is False
     assert result.disabled_optional_capabilities == [CapabilityName.SHELL]
+
+
+def test_document_ingestion_is_an_explicit_negotiated_capability() -> None:
+    advertised = CapabilitySet(document_ingestion=True)
+    assert advertised.enabled() == {CapabilityName.DOCUMENT_INGESTION}
+    assert advertised.to_wire()["documentIngestion"] is True
+    assert advertised.intersection(CapabilitySet()).document_ingestion is False
 
 
 @pytest.mark.parametrize(

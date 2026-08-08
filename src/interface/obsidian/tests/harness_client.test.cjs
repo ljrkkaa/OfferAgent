@@ -99,7 +99,6 @@ function initializeResult(overrides = {}) {
             hooks: true,
             subagents: true,
             artifacts: true,
-            loopbackWeb: true,
             contentBlocks: true,
             cancellation: true,
             diagnostics: true,
@@ -113,7 +112,7 @@ test("complete local Runtime requires structural Subagent protocol support indep
     const { CLIENT_CAPABILITIES, REQUIRED_RUNTIME_CAPABILITIES } = loadModule("harness_client.ts");
     assert.equal(CLIENT_CAPABILITIES.subagents, true);
     assert.equal(REQUIRED_RUNTIME_CAPABILITIES.includes("subagents"), true);
-    for (const required of ["eventReplay", "multiSession", "loopbackWeb", "diagnostics"]) {
+    for (const required of ["eventReplay", "multiSession", "diagnostics"]) {
         assert.equal(REQUIRED_RUNTIME_CAPABILITIES.includes(required), true, `${required} must remain required`);
     }
 });

@@ -44,6 +44,7 @@ _SHELL_PROFILE_ID = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+_CURRENT_USER_EXECUTABLE_IDS = frozenset({"document-extract"})
 
 
 class LocalProcessCatalogError(RuntimeError):
@@ -65,8 +66,12 @@ class LocalProcessCatalog:
     def __post_init__(self) -> None:
         if not self.executable_profiles or not self.environment_profiles or not self.shell_profiles:
             raise ValueError("local process catalog cannot omit its base profiles")
-        if any(profile.allow_network for profile in self.executable_profiles):
-            raise ValueError("local process profiles cannot authorize network access")
+        if any(
+            profile.allow_network != (profile.executable_id in _CURRENT_USER_EXECUTABLE_IDS)
+            or (profile.allow_network and profile.appcontainer_filesystem)
+            for profile in self.executable_profiles
+        ):
+            raise ValueError("local process profile isolation does not match the personal Runtime policy")
         if any(profile.allow_network for profile in self.shell_profiles):
             raise ValueError("local Shell profiles cannot authorize network access")
 
@@ -82,6 +87,7 @@ class _ExecutableSpec:
     environment_profile_ids: frozenset[str]
     allowed_stdin_modes: frozenset[ProcessStdinMode]
     allowed_cwd_root_ids: frozenset[str]
+    allow_network: bool
     appcontainer_filesystem: tuple[ProcessFilesystemCapability, ...]
 
 
@@ -248,10 +254,17 @@ def _executable_specs(value: object) -> tuple[_ExecutableSpec, ...]:
                 "process_catalog_trust",
                 "local executable profiles must use fixed_hash trust",
             )
-        if _boolean(raw["allowNetwork"], "allowNetwork"):
+        executable_id = _profile_id(raw["executableId"], "executableId")
+        allow_network = _boolean(raw["allowNetwork"], "allowNetwork")
+        if allow_network and executable_id not in _CURRENT_USER_EXECUTABLE_IDS:
             raise LocalProcessCatalogError(
                 "process_catalog_network",
-                "local process profiles cannot authorize network access",
+                "only the bundled document parser may run with current-user network authority",
+            )
+        if executable_id in _CURRENT_USER_EXECUTABLE_IDS and not allow_network:
+            raise LocalProcessCatalogError(
+                "process_catalog_isolation",
+                "the bundled document parser must use the fixed current-user profile",
             )
         if _boolean(raw["allowShellMetacharacters"], "allowShellMetacharacters"):
             raise LocalProcessCatalogError(
@@ -263,6 +276,16 @@ def _executable_specs(value: object) -> tuple[_ExecutableSpec, ...]:
         if minimum > maximum:
             raise LocalProcessCatalogError("process_catalog_arguments", "process argv bounds are inverted")
         capabilities = _filesystem_capabilities(raw["appContainerFilesystem"])
+        if allow_network and capabilities:
+            raise LocalProcessCatalogError(
+                "process_catalog_isolation",
+                "the current-user document parser cannot retain AppContainer filesystem grants",
+            )
+        if not allow_network and not capabilities:
+            raise LocalProcessCatalogError(
+                "process_catalog_isolation",
+                "network-denied process profiles require an AppContainer filesystem grant",
+            )
         environment_ids = _profile_ids(raw["environmentProfileIds"], "environmentProfileIds")
         cwd_ids = _profile_ids(raw["allowedCwdRootIds"], "allowedCwdRootIds")
         stdin_values = _text_list(
@@ -282,7 +305,7 @@ def _executable_specs(value: object) -> tuple[_ExecutableSpec, ...]:
             ) from error
         specs.append(
             _ExecutableSpec(
-                executable_id=_profile_id(raw["executableId"], "executableId"),
+                executable_id=executable_id,
                 relative_path=_runtime_relative_path(raw["relativePath"]),
                 fixed_arguments=tuple(_arguments(raw["fixedArguments"], "fixedArguments")),
                 minimum_variable_arguments=minimum,
@@ -291,6 +314,7 @@ def _executable_specs(value: object) -> tuple[_ExecutableSpec, ...]:
                 environment_profile_ids=frozenset(environment_ids),
                 allowed_stdin_modes=stdin_modes,
                 allowed_cwd_root_ids=frozenset(cwd_ids),
+                allow_network=allow_network,
                 appcontainer_filesystem=capabilities,
             )
         )
@@ -419,7 +443,7 @@ def _build_fixed_hash_executable_profile(
         environment_profiles=spec.environment_profile_ids,
         allowed_stdin_modes=spec.allowed_stdin_modes,
         allowed_cwd_roots=spec.allowed_cwd_root_ids,
-        allow_network=False,
+        allow_network=spec.allow_network,
         appcontainer_filesystem=spec.appcontainer_filesystem,
     )
     if profile.captured_content_sha256 != record.sha256:
@@ -513,7 +537,7 @@ def _validate_shell_spec_binding(
 
 
 def _filesystem_capabilities(value: object) -> tuple[ProcessFilesystemCapability, ...]:
-    values = _bounded_sequence(value, "appContainerFilesystem", maximum=_MAX_CAPABILITIES, minimum=1)
+    values = _bounded_sequence(value, "appContainerFilesystem", maximum=_MAX_CAPABILITIES, minimum=0)
     capabilities: list[ProcessFilesystemCapability] = []
     for item in values:
         raw = _mapping(item, "AppContainer filesystem capability")

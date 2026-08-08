@@ -147,10 +147,10 @@ class FairEffectGate:
         """Bind the Worker ceiling before the gate is exposed to schedulers.
 
         Production composition is created before persisted Workspace config is
-        reconciled.  The first effective Run snapshot may therefore replace the
-        bootstrap default.  Reconfiguration after acquisition or queueing would
-        make an in-flight Worker's concurrency semantics ambiguous, so fail
-        closed instead.
+        reconciled.  Startup replaces the bootstrap value with the activated
+        configuration before recovery or ingress can expose the gate.
+        Reconfiguration after acquisition or queueing would make an in-flight
+        Worker's concurrency semantics ambiguous, so fail closed instead.
         """
 
         if type(max_readers) is not int or not 1 <= max_readers <= 256:

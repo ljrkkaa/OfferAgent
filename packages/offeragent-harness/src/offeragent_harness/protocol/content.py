@@ -69,6 +69,15 @@ class ContentFormat(str, Enum):
     MARKDOWN = "markdown"
 
 
+class DocumentMediaType(str, Enum):
+    """Media types accepted by the v1 local document-ingestion boundary."""
+
+    PDF = "application/pdf"
+    PNG = "image/png"
+    JPEG = "image/jpeg"
+    WEBP = "image/webp"
+
+
 class ArtifactSensitivity(str, Enum):
     PUBLIC = "public"
     WORKSPACE = "workspace"
@@ -102,6 +111,14 @@ class FileRef(WireModel):
         return self
 
 
+class DocumentFileRef(WireModel):
+    """A whole immutable Vault file accepted by document ingestion."""
+
+    workspace_id: WorkspaceId
+    path: RelativeVaultPath
+    content_hash: Sha256Digest
+
+
 class ArtifactRef(WireModel):
     artifact_id: ArtifactId
     content_hash: Sha256Digest
@@ -112,18 +129,49 @@ class ArtifactRef(WireModel):
     title: str | None = Field(default=None, min_length=1, max_length=512)
 
 
+class DocumentPageLocator(WireModel):
+    """One-based inclusive page range within an immutable document source."""
+
+    type: Literal["page"]
+    page_start: int = Field(ge=1, le=1_000_000)
+    page_end: int = Field(ge=1, le=1_000_000)
+
+    @model_validator(mode="after")
+    def _page_range_is_ordered(self) -> DocumentPageLocator:
+        if self.page_end < self.page_start:
+            raise ValueError("pageEnd must be greater than or equal to pageStart")
+        return self
+
+
+SourceLocator = TypeAliasType(
+    "SourceLocator",
+    Annotated[DocumentPageLocator, Field(discriminator="type")],
+)
+
+
 class VaultSourceRef(WireModel):
     type: Literal["vault"]
     file: FileRef
     workspace_revision: int | None = Field(default=None, ge=0)
     freshness: Freshness = Freshness.UNKNOWN
     label: str | None = Field(default=None, min_length=1, max_length=512)
+    locator: SourceLocator | None = None
+
+    @model_validator(mode="after")
+    def _locator_is_unambiguous(self) -> VaultSourceRef:
+        if self.locator is not None and any(
+            value is not None
+            for value in (self.file.line_start, self.file.line_end, self.file.heading, self.file.block_id)
+        ):
+            raise ValueError("a page locator cannot be combined with a line, heading, or block locator")
+        return self
 
 
 class ArtifactSourceRef(WireModel):
     type: Literal["artifact"]
     artifact: ArtifactRef
     label: str | None = Field(default=None, min_length=1, max_length=512)
+    locator: SourceLocator | None = None
 
 
 SourceRef = TypeAliasType(
@@ -149,6 +197,14 @@ class FileContentBlock(WireModel):
     truncated: bool = False
 
 
+class DocumentContentBlock(WireModel):
+    """A hashed Vault file that the negotiated ingestion capability must parse."""
+
+    type: Literal["document"]
+    file: DocumentFileRef
+    media_type: DocumentMediaType
+
+
 class ImageContentBlock(WireModel):
     type: Literal["image"]
     artifact: ArtifactRef
@@ -170,7 +226,7 @@ class ArtifactContentBlock(WireModel):
 ContentBlock = TypeAliasType(
     "ContentBlock",
     Annotated[
-        TextContentBlock | FileContentBlock | ImageContentBlock | ArtifactContentBlock,
+        TextContentBlock | FileContentBlock | DocumentContentBlock | ImageContentBlock | ArtifactContentBlock,
         Field(discriminator="type"),
     ],
 )
@@ -184,12 +240,17 @@ __all__ = [
     "ArtifactState",
     "ContentBlock",
     "ContentFormat",
+    "DocumentContentBlock",
+    "DocumentFileRef",
+    "DocumentMediaType",
+    "DocumentPageLocator",
     "FileContentBlock",
     "FileRef",
     "Freshness",
     "ImageContentBlock",
     "NonEmptyText",
     "RelativeVaultPath",
+    "SourceLocator",
     "SourceRef",
     "TextContentBlock",
     "VaultSourceRef",

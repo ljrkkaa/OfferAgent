@@ -198,20 +198,13 @@ def _shell_install(executable: ProcessExecutableProfile, *, request_id: str, des
 
 
 @pytest.mark.asyncio
-async def test_shell_admin_is_direct_stdio_only_registered_cas_and_replays_after_restart(tmp_path: Path) -> None:
+async def test_shell_admin_uses_registered_cas_and_replays_after_restart(tmp_path: Path) -> None:
     durable = InMemoryUnitOfWorkFactory()
     executable, environment = _process_catalog(tmp_path)
     shell, hooks = _services(durable)
     handlers = _handlers(durable, executable, environment, shell=shell, hooks=hooks)
     cancellation = ManualCancellationToken()
     params = _shell_install(executable, request_id="req_shell_install")
-
-    with pytest.raises(PermissionError, match="direct plugin stdio"):
-        await handlers["shell/install"](
-            params,
-            cancellation,
-            ApplicationCommandContext(transport="loopback-http"),
-        )
 
     installed = await handlers["shell/install"](params, cancellation, ApplicationCommandContext())
     assert isinstance(installed, ShellMutationResult)
@@ -239,7 +232,7 @@ async def test_shell_admin_is_direct_stdio_only_registered_cas_and_replays_after
     listed = await restarted["shell/list"](
         validate_command_params("shell/list", {"includeDisabled": True}),
         cancellation,
-        ApplicationCommandContext(transport="loopback-http"),
+        ApplicationCommandContext(),
     )
     assert isinstance(listed, ShellListResult)
     assert listed.profiles[0].profile.profile_id == "safe_tool"
@@ -430,7 +423,7 @@ async def test_skill_admin_lists_live_metadata_and_status(tmp_path: Path) -> Non
     listed = await handlers["skills/list"](
         validate_command_params("skills/list", {}),
         cancellation,
-        ApplicationCommandContext(transport="loopback-http"),
+        ApplicationCommandContext(),
     )
     assert len(listed.skills) == 1
     skill = listed.skills[0]
@@ -439,7 +432,7 @@ async def test_skill_admin_lists_live_metadata_and_status(tmp_path: Path) -> Non
     status = await handlers["skills/status"](
         validate_command_params("skills/status", {}),
         cancellation,
-        ApplicationCommandContext(transport="loopback-http"),
+        ApplicationCommandContext(),
     )
     assert status.status.revision == listed.revision
     assert status.status.discovered_count == status.status.enabled_count == 1

@@ -18,7 +18,7 @@ class ApplicationCommandContext:
     peer: str = "local"
 
     def __post_init__(self) -> None:
-        if self.transport not in {"stdio", "loopback-http", "loopback-websocket"}:
+        if self.transport != "stdio":
             raise ValueError("application command transport is invalid")
         if not self.client_id or not self.peer:
             raise ValueError("application command client identity must not be empty")
@@ -26,7 +26,7 @@ class ApplicationCommandContext:
 
 @runtime_checkable
 class ApplicationCommandDispatcher(Protocol):
-    """The only application surface a stdio/Loopback transport may invoke.
+    """The only application surface the direct stdio transport may invoke.
 
     Concrete composition roots are responsible for adapting this port to the one
     ready ``HarnessApplication``.  A transport never owns a Harness, Agent Loop,

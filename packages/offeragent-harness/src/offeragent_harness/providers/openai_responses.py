@@ -47,6 +47,7 @@ _HEADER_ID = re.compile(r"^[\x21-\x7e]{1,256}$")
 _HEADER_VALUE = re.compile(r"^[\x20-\x7e]{1,512}$")
 _REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
 _RETRYABLE_HTTP = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+_RETRYABLE_PRE_OUTPUT_PROTOCOL_REASONS = frozenset({"structured_output_empty", "structured_output_invalid_json"})
 _STRUCTURED_ERROR_TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 _CONTEXT_OVERFLOW_REASONS = frozenset(
     {
@@ -640,7 +641,7 @@ class OpenAIResponsesGateway:
             except ModelProviderProtocolError as error:
                 failure = _ProducerFault(
                     "provider_protocol_error",
-                    False,
+                    error.reason in _RETRYABLE_PRE_OUTPUT_PROTOCOL_REASONS,
                     {"providerId": self._config.provider_id, "protocolReason": error.reason},
                 )
                 retry_after = None

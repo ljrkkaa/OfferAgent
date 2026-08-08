@@ -9,6 +9,7 @@
       "cancellation": true,
       "contentBlocks": true,
       "diagnostics": true,
+      "documentIngestion": true,
       "eventReplay": true,
       "multiSession": true,
       "shell": true,
@@ -19,7 +20,7 @@
     "protocolVersion": "1.0",
     "runtimeArch": "win-x64",
     "runtimeVersion": "2.0.0",
-    "schemaHash": "sha256:8158d53ca4cf5fa15dad078f4b1de864342747a9ab0bca949b590e2642e2c175",
+    "schemaHash": "sha256:2146425b6896c6a6a06465679ce600c44a69fecc1765b9ed71f92a58fea9f3eb",
     "supportedProtocolRange": {
       "maximum": "1.0",
       "minimum": "1.0"

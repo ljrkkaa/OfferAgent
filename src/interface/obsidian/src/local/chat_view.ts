@@ -1,7 +1,17 @@
-import { ItemView, Menu, Notice, WorkspaceLeaf, setIcon } from "obsidian";
+import { createHash } from "node:crypto";
+
+import { ItemView, Menu, Notice, Vault, WorkspaceLeaf, setIcon } from "obsidian";
 
 import { BootstrapSnapshot } from "../runtime/bootstrap";
-import { ChatStore, ChatStoreSnapshot } from "../runtime/chat_store";
+import {
+    ChatStore,
+    ChatStoreSnapshot,
+    DraftAttachment,
+    DraftAttachmentMediaType,
+    MAX_DRAFT_ATTACHMENTS,
+    MAX_DRAFT_ATTACHMENT_BYTES,
+    managedAttachmentPath,
+} from "../runtime/chat_store";
 import type {
     ApprovalTimelineItem,
     RunViewState,
@@ -23,7 +33,6 @@ export interface LocalChatHost {
     readArtifactText(artifactId: string): Promise<string>;
     listSessions(): Promise<readonly { sessionId: string; title: string }[]>;
     openDiagnostics(): Promise<void>;
-    openLocalWeb(): Promise<void>;
 }
 
 export class LocalChatView extends ItemView {
@@ -40,6 +49,7 @@ export class LocalChatView extends ItemView {
     private composing = false;
     private sendPending = false;
     private clearComposerTabId: string | null = null;
+    private readonly attachmentImportsInFlight = new Map<string, number>();
 
     constructor(leaf: WorkspaceLeaf, host: LocalChatHost) {
         super(leaf);
@@ -149,9 +159,6 @@ export class LocalChatView extends ItemView {
         setIcon(icon, "bot");
         title.createSpan({ text: "OfferAgent" });
         const actions = header.createDiv({ cls: "offeragent-local-header-actions" });
-        const web = actions.createEl("button", { attr: { "aria-label": "打开本地 Web UI" } });
-        setIcon(web, "external-link");
-        web.onclick = () => void this.host.openLocalWeb().catch((error) => new Notice(actionableMessage(error)));
         const diagnostics = actions.createEl("button", { attr: { "aria-label": "运行诊断" } });
         setIcon(diagnostics, "activity");
         diagnostics.onclick = () => void this.host.openDiagnostics().catch((error) => new Notice(actionableMessage(error)));
@@ -242,6 +249,15 @@ export class LocalChatView extends ItemView {
         const user = article.createDiv({ cls: "offeragent-message offeragent-user" });
         user.createDiv({ cls: "offeragent-message-label", text: "你" });
         user.createDiv({ cls: "offeragent-message-body", text: submission.text });
+        if (submission.attachments.length > 0) {
+            const attachments = user.createDiv({ cls: "offeragent-message-attachments" });
+            for (const attachment of submission.attachments) {
+                const chip = attachments.createDiv({ cls: "offeragent-message-attachment" });
+                const icon = chip.createSpan();
+                setIcon(icon, attachment.mediaType === "application/pdf" ? "file-text" : "image");
+                chip.createSpan({ text: attachment.name });
+            }
+        }
         article.createDiv({ cls: "offeragent-thinking", text: "正在提交给 OfferAgent…" });
     }
 
@@ -400,8 +416,27 @@ export class LocalChatView extends ItemView {
         if (!tab) return;
         const activeRun = activeRunForTab(snapshot, tab.sessionId, tab.selectedRunId);
         const hasActiveRun = activeRun !== undefined;
+        const importingAttachment = this.attachmentImportsInFlight.has(tab.tabId);
         const effectiveMode = effectivePermissionMode(this.host.settings);
         const composer = root.createDiv({ cls: "offeragent-composer" });
+        composer.ondragover = (event) => {
+            if (!event.dataTransfer || !Array.from(event.dataTransfer.types).includes("Files")) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+            composer.addClass("is-drag-over");
+        };
+        composer.ondragleave = (event) => {
+            if (!(event.relatedTarget instanceof Node) || !composer.contains(event.relatedTarget)) {
+                composer.removeClass("is-drag-over");
+            }
+        };
+        composer.ondrop = (event) => {
+            composer.removeClass("is-drag-over");
+            const files = event.dataTransfer ? Array.from(event.dataTransfer.files) : [];
+            if (files.length === 0) return;
+            event.preventDefault();
+            void this.importAttachments(tab.tabId, files, input.value);
+        };
         if (!this.host.settings.workspaceTrusted &&
             !["read-only", "plan"].includes(this.host.settings.permissionMode)) {
             composer.createEl("p", {
@@ -419,6 +454,7 @@ export class LocalChatView extends ItemView {
             attr: { placeholder: "询问你的笔记，或交给 OfferAgent 一个任务…", rows: "3" },
         });
         input.value = selection?.value ?? tab.draft;
+        input.disabled = this.sendPending;
         if (selection) {
             window.requestAnimationFrame(() => {
                 input.focus();
@@ -436,14 +472,73 @@ export class LocalChatView extends ItemView {
         input.oninput = () => {
             if (!this.composing) this.scheduleDraftSave(tab.tabId, input.value);
         };
+        input.onpaste = (event) => {
+            const files = clipboardAttachmentFiles(event.clipboardData);
+            if (files.length === 0) return;
+            event.preventDefault();
+            void this.importAttachments(tab.tabId, files, input.value);
+        };
         input.onkeydown = (event) => {
-            const blocked = snapshot.busy || this.sendPending || hasActiveRun;
+            const blocked = snapshot.busy || this.sendPending || hasActiveRun || importingAttachment;
             if (shouldSendComposerInput(event, this.composing, blocked)) {
                 event.preventDefault();
                 void this.send(input.value);
             }
         };
+        if (tab.draftAttachments.length > 0 || importingAttachment || tab.attachmentError) {
+            const panel = composer.createDiv({ cls: "offeragent-attachment-panel" });
+            for (const attachment of tab.draftAttachments) {
+                const card = panel.createDiv({ cls: "offeragent-attachment-card" });
+                const icon = card.createSpan({ cls: "offeragent-attachment-icon" });
+                setIcon(icon, attachment.mediaType === "application/pdf" ? "file-text" : "image");
+                const details = card.createDiv({ cls: "offeragent-attachment-details" });
+                details.createDiv({ cls: "offeragent-attachment-name", text: attachment.name });
+                details.createDiv({
+                    cls: "offeragent-attachment-meta",
+                    text: `${attachmentTypeLabel(attachment.mediaType)} · ${formatFileSize(attachment.size)}`,
+                });
+                const remove = card.createEl("button", {
+                    cls: "offeragent-attachment-remove",
+                    attr: { "aria-label": `移除附件 ${attachment.name}` },
+                });
+                setIcon(remove, "x");
+                remove.disabled = this.sendPending || importingAttachment;
+                remove.onclick = () => void this.removeAttachment(tab.tabId, attachment, input.value);
+            }
+            if (importingAttachment) {
+                panel.createDiv({ cls: "offeragent-attachment-progress", text: "正在校验并复制附件…" });
+            }
+            if (tab.attachmentError) {
+                panel.createDiv({
+                    cls: "offeragent-attachment-error",
+                    text: tab.attachmentError,
+                    attr: { role: "alert" },
+                });
+            }
+        }
         const controls = composer.createDiv({ cls: "offeragent-composer-controls" });
+        const attachmentPicker = composer.createEl("input", {
+            cls: "offeragent-attachment-picker",
+            attr: {
+                type: "file",
+                accept: "application/pdf,image/png,image/jpeg,image/webp,.pdf,.png,.jpg,.jpeg,.webp",
+                multiple: "multiple",
+                tabindex: "-1",
+            },
+        });
+        attachmentPicker.onchange = () => {
+            const files = attachmentPicker.files ? Array.from(attachmentPicker.files) : [];
+            attachmentPicker.value = "";
+            if (files.length > 0) void this.importAttachments(tab.tabId, files, input.value);
+        };
+        const attach = controls.createEl("button", {
+            cls: "offeragent-attach-button",
+            attr: { "aria-label": "附加 PDF 或图片", title: "附加 PDF 或图片" },
+        });
+        setIcon(attach, "paperclip");
+        attach.disabled = this.sendPending || importingAttachment ||
+            tab.draftAttachments.length >= MAX_DRAFT_ATTACHMENTS;
+        attach.onclick = () => attachmentPicker.click();
         if (activeRun) {
             const cancel = controls.createEl("button", { text: "取消" });
             cancel.onclick = () => void this.store?.cancel(activeRun.runId, activeRun.sessionId, activeRun.turnId)
@@ -456,7 +551,7 @@ export class LocalChatView extends ItemView {
             };
         }
         const send = controls.createEl("button", { text: "发送", cls: "mod-cta" });
-        send.disabled = snapshot.busy || this.sendPending || hasActiveRun;
+        send.disabled = snapshot.busy || this.sendPending || hasActiveRun || importingAttachment;
         send.onclick = () => void this.send(input.value);
     }
 
@@ -472,17 +567,96 @@ export class LocalChatView extends ItemView {
         this.sendPending = true;
         if (this.draftTimer) clearTimeout(this.draftTimer);
         this.draftTimer = null;
-        this.scheduleRender();
         try {
+            // Persist the exact visible value before submitting.  A rejected
+            // turn/start must be able to reconstruct the unchanged draft.
+            await store.updateDraft(tab.tabId, text);
             await store.send(message, {
                 runConfig: runConfig(this.host.settings),
             });
             this.clearComposerTabId = tab.tabId;
         } catch (error) {
+            // updateDraft intentionally does not emit during normal typing;
+            // refresh from its authoritative state when a preflight rejection
+            // occurs before ChatStore starts an emitting operation.
+            this.snapshot = store.snapshot;
             new Notice(actionableMessage(error));
         } finally {
             this.sendPending = false;
             this.scheduleRender();
+        }
+    }
+
+    private async importAttachments(tabId: string, files: readonly File[], draft: string): Promise<void> {
+        const store = this.store;
+        if (!store || files.length === 0) return;
+        if (this.sendPending) {
+            new Notice("OfferAgent：当前草稿正在发送，附件未导入。");
+            return;
+        }
+        if (this.attachmentImportsInFlight.has(tabId)) {
+            new Notice("OfferAgent：当前标签正在导入附件，请等待完成后重试。");
+            return;
+        }
+        const tab = this.snapshot?.tabs.find((candidate) => candidate.tabId === tabId);
+        if (!tab) return;
+        const available = MAX_DRAFT_ATTACHMENTS - tab.draftAttachments.length;
+        if (files.length > available) {
+            const message = `每个草稿最多可附加 ${MAX_DRAFT_ATTACHMENTS} 个文件；当前还可添加 ${available} 个`;
+            if (this.draftTimer) clearTimeout(this.draftTimer);
+            this.draftTimer = null;
+            try {
+                await store.updateDraft(tabId, draft);
+                await store.setAttachmentError(tabId, message);
+                new Notice(`OfferAgent：${message}`);
+            } catch (error) {
+                this.snapshot = store.snapshot;
+                new Notice(actionableMessage(error));
+            }
+            return;
+        }
+        this.attachmentImportsInFlight.set(tabId, 1);
+        if (this.draftTimer) clearTimeout(this.draftTimer);
+        this.draftTimer = null;
+        const errors: string[] = [];
+        try {
+            await store.updateDraft(tabId, draft);
+            this.scheduleRender();
+            await store.setAttachmentError(tabId, null);
+            const workspaceId = store.snapshot.projection.workspaceId;
+            for (const file of files) {
+                try {
+                    const attachment = await importManagedAttachment(this.app.vault, file, workspaceId);
+                    await store.addDraftAttachment(tabId, attachment);
+                } catch (error) {
+                    errors.push(`${safeAttachmentName(file.name)}：${plainErrorMessage(error)}`);
+                }
+            }
+            if (errors.length > 0) {
+                const message = errors.join("；").slice(0, 512);
+                await store.setAttachmentError(tabId, message);
+                new Notice(`OfferAgent：${message}`);
+            }
+        } catch (error) {
+            const message = plainErrorMessage(error).slice(0, 512);
+            await store.setAttachmentError(tabId, message).catch(() => undefined);
+            new Notice(`OfferAgent：${message}`);
+        } finally {
+            this.attachmentImportsInFlight.delete(tabId);
+            this.scheduleRender();
+        }
+    }
+
+    private async removeAttachment(tabId: string, attachment: DraftAttachment, draft: string): Promise<void> {
+        const store = this.store;
+        if (!store) return;
+        if (this.draftTimer) clearTimeout(this.draftTimer);
+        this.draftTimer = null;
+        try {
+            await store.updateDraft(tabId, draft);
+            await store.removeDraftAttachment(tabId, attachment.file.contentHash);
+        } catch (error) {
+            new Notice(actionableMessage(error));
         }
     }
 
@@ -495,6 +669,147 @@ export class LocalChatView extends ItemView {
             void store.updateDraft(tabId, value).catch((error) => new Notice(actionableMessage(error)));
         }, delayMs);
     }
+}
+
+interface AttachmentSource {
+    readonly name: string;
+    readonly size: number;
+    arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+export async function importManagedAttachment(
+    vault: Vault,
+    source: AttachmentSource,
+    workspaceId: string,
+): Promise<DraftAttachment> {
+    if (!/^ws_[A-Za-z0-9][A-Za-z0-9_-]{0,124}$/.test(workspaceId)) {
+        throw new Error("Workspace 标识无效，附件未写入");
+    }
+    if (!Number.isSafeInteger(source.size) || source.size < 1) throw new Error("附件为空，已拒绝导入");
+    if (source.size > MAX_DRAFT_ATTACHMENT_BYTES) {
+        throw new Error(`附件超过 ${formatFileSize(MAX_DRAFT_ATTACHMENT_BYTES)} 上限，已拒绝导入`);
+    }
+    const bytes = await source.arrayBuffer();
+    if (bytes.byteLength !== source.size) throw new Error("附件读取长度发生变化，已拒绝导入");
+    const mediaType = detectAttachmentMediaType(bytes);
+    const contentHash = sha256Digest(bytes);
+    const path = managedAttachmentPath(contentHash, mediaType);
+    const name = normalizedAttachmentName(source.name, mediaType);
+
+    await ensureManagedFolder(vault, "OfferAgent");
+    await ensureManagedFolder(vault, "OfferAgent/Attachments");
+    let verified = await verifyExistingManagedAttachment(vault, path, contentHash);
+    if (!verified) {
+        try {
+            await vault.createBinary(path, bytes);
+        } catch (error) {
+            // A concurrent import may win createBinary.  It is accepted only
+            // after independently proving that the resulting bytes match.
+            verified = await verifyExistingManagedAttachment(vault, path, contentHash);
+            if (!verified) throw error;
+        }
+        if (!verified) verified = await verifyExistingManagedAttachment(vault, path, contentHash);
+    }
+    if (!verified) throw new Error("附件写入后完整性校验失败，已拒绝引用");
+    return {
+        name,
+        mediaType,
+        size: bytes.byteLength,
+        file: { workspaceId, path, contentHash },
+    };
+}
+
+export function detectAttachmentMediaType(bytes: ArrayBuffer): DraftAttachmentMediaType {
+    const data = new Uint8Array(bytes);
+    if (startsWithBytes(data, [0x25, 0x50, 0x44, 0x46, 0x2d])) return "application/pdf";
+    if (startsWithBytes(data, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "image/png";
+    if (startsWithBytes(data, [0xff, 0xd8, 0xff])) return "image/jpeg";
+    if (data.length >= 12 && startsWithBytes(data, [0x52, 0x49, 0x46, 0x46]) &&
+        data[8] === 0x57 && data[9] === 0x45 && data[10] === 0x42 && data[11] === 0x50) {
+        return "image/webp";
+    }
+    throw new Error("只支持内容有效的 PDF、PNG、JPEG 或 WebP 文件");
+}
+
+export function sha256Digest(bytes: ArrayBuffer): string {
+    return `sha256:${createHash("sha256").update(new Uint8Array(bytes)).digest("hex")}`;
+}
+
+async function ensureManagedFolder(vault: Vault, path: string): Promise<void> {
+    if (vault.getFolderByPath(path)) return;
+    if (vault.getAbstractFileByPath(path)) throw new Error(`附件管理目录被同名文件占用：${path}`);
+    try {
+        await vault.createFolder(path);
+    } catch (error) {
+        if (!vault.getFolderByPath(path)) throw error;
+    }
+}
+
+async function verifyExistingManagedAttachment(
+    vault: Vault,
+    path: string,
+    expectedHash: string,
+): Promise<boolean> {
+    const existing = vault.getFileByPath(path);
+    if (!existing) {
+        if (vault.getAbstractFileByPath(path)) throw new Error(`附件目标路径不是文件：${path}`);
+        return false;
+    }
+    const bytes = await vault.readBinary(existing);
+    if (sha256Digest(bytes) !== expectedHash) {
+        throw new Error(`内容寻址附件已存在但校验不一致：${path}`);
+    }
+    return true;
+}
+
+function startsWithBytes(value: Uint8Array, expected: readonly number[]): boolean {
+    return value.length >= expected.length && expected.every((byte, index) => value[index] === byte);
+}
+
+function clipboardAttachmentFiles(data: DataTransfer | null): File[] {
+    if (!data) return [];
+    const files = Array.from(data.files);
+    if (files.length > 0) return files;
+    return Array.from(data.items)
+        .filter((item) => item.kind === "file")
+        .map((item) => item.getAsFile())
+        .filter((file): file is File => file !== null);
+}
+
+function normalizedAttachmentName(value: string, mediaType: DraftAttachmentMediaType): string {
+    if (value.includes("\0")) throw new Error("附件名称包含无效字符");
+    const trimmed = value.trim();
+    if (trimmed.length > 255) throw new Error("附件名称超过 255 个字符");
+    if (trimmed) return trimmed;
+    const suffix: Record<DraftAttachmentMediaType, string> = {
+        "application/pdf": "pdf",
+        "image/png": "png",
+        "image/jpeg": "jpg",
+        "image/webp": "webp",
+    };
+    return `未命名附件.${suffix[mediaType]}`;
+}
+
+function safeAttachmentName(value: string): string {
+    const cleaned = value.replace(/\0/g, "").trim();
+    return (cleaned || "未命名附件").slice(0, 96);
+}
+
+function plainErrorMessage(error: unknown): string {
+    return error instanceof Error && error.message.trim() ? error.message.trim() : "附件导入失败";
+}
+
+function attachmentTypeLabel(mediaType: DraftAttachmentMediaType): string {
+    if (mediaType === "application/pdf") return "PDF";
+    if (mediaType === "image/jpeg") return "JPEG";
+    if (mediaType === "image/png") return "PNG";
+    return "WebP";
+}
+
+function formatFileSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export interface ComposerKeyboardEvent {

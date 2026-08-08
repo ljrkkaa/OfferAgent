@@ -136,7 +136,7 @@ class RunBoundHookLifecyclePort(HookLifecyclePort):
 
 @dataclass(frozen=True, slots=True)
 class CompactionHookBinding:
-    """Arguments consumed by the existing CompactionService Hook boundary."""
+    """Arguments consumed by the production lossless-compaction Hook boundary."""
 
     hooks: HookLifecyclePort
     context: HookExecutionContext

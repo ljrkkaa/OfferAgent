@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 from pathlib import Path
 
 import pytest
 from scripts.frozen_payload import (
+    FrozenFile,
     FrozenPayloadError,
     FrozenRuntimeEvidence,
     SourceClassifier,
@@ -161,6 +163,130 @@ def test_merge_rejects_cross_target_source_drift_by_stable_identity(tmp_path: Pa
 
     with pytest.raises(FrozenPayloadError, match="stable locator/component/kind"):
         merge_frozen_evidence(merged_root=tmp_path, targets=[worker, process_host])
+
+
+def test_merge_consolidates_identical_case_variant_paths(tmp_path: Path) -> None:
+    relative = "_internal/VCRUNTIME140.dll"
+    payload = b"same-runtime"
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    merged_path = tmp_path / Path(relative)
+    merged_path.parent.mkdir(parents=True)
+    merged_path.write_bytes(payload)
+    worker = FrozenRuntimeEvidence(
+        files={
+            relative: FrozenFile(
+                relative,
+                "SPDXRef-Package-microsoft-windows-runtime",
+                len(payload),
+                digest,
+                ("source-worker",),
+                ("offeragent-worker",),
+            )
+        }
+    )
+    process_host_path = "_internal/vcruntime140.dll"
+    process_host = FrozenRuntimeEvidence(
+        files={
+            process_host_path: FrozenFile(
+                process_host_path,
+                "SPDXRef-Package-microsoft-windows-runtime",
+                len(payload),
+                digest,
+                ("source-process-host",),
+                ("offeragent-process-host",),
+            )
+        }
+    )
+
+    merged = merge_frozen_evidence(merged_root=tmp_path, targets=[process_host, worker])
+
+    assert set(merged.files) == {relative}
+    assert merged.files[relative] == FrozenFile(
+        relative,
+        "SPDXRef-Package-microsoft-windows-runtime",
+        len(payload),
+        digest,
+        ("source-process-host", "source-worker"),
+        ("offeragent-process-host", "offeragent-worker"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("component_id", "captured_byte_length", "captured_sha256", "message"),
+    [
+        ("SPDXRef-Package-wrong-owner", 12, "sha256:" + "a" * 64, "ownership differs"),
+        (
+            "SPDXRef-Package-microsoft-windows-runtime",
+            13,
+            "sha256:" + "b" * 64,
+            "capture differs",
+        ),
+    ],
+)
+def test_merge_rejects_conflicting_case_variant_paths(
+    tmp_path: Path,
+    component_id: str,
+    captured_byte_length: int,
+    captured_sha256: str,
+    message: str,
+) -> None:
+    relative = "_internal/VCRUNTIME140.dll"
+    payload = b"same-runtime"
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    merged_path = tmp_path / Path(relative)
+    merged_path.parent.mkdir(parents=True)
+    merged_path.write_bytes(payload)
+    worker = FrozenRuntimeEvidence(
+        files={
+            relative: FrozenFile(
+                relative,
+                "SPDXRef-Package-microsoft-windows-runtime",
+                len(payload),
+                digest,
+                (),
+                ("offeragent-worker",),
+            )
+        }
+    )
+    process_host_path = "_internal/vcruntime140.dll"
+    process_host = FrozenRuntimeEvidence(
+        files={
+            process_host_path: FrozenFile(
+                process_host_path,
+                component_id,
+                captured_byte_length,
+                captured_sha256,
+                (),
+                ("offeragent-process-host",),
+            )
+        }
+    )
+
+    with pytest.raises(FrozenPayloadError, match=message):
+        merge_frozen_evidence(merged_root=tmp_path, targets=[worker, process_host])
+
+
+def test_merge_rejects_file_record_path_that_differs_from_its_key(tmp_path: Path) -> None:
+    relative = "_internal/runtime.dll"
+    payload = b"runtime"
+    merged_path = tmp_path / Path(relative)
+    merged_path.parent.mkdir(parents=True)
+    merged_path.write_bytes(payload)
+    evidence = FrozenRuntimeEvidence(
+        files={
+            relative: FrozenFile(
+                "_internal/other.dll",
+                "SPDXRef-Package-microsoft-windows-runtime",
+                len(payload),
+                "sha256:" + hashlib.sha256(payload).hexdigest(),
+                (),
+                ("offeragent-worker",),
+            )
+        }
+    )
+
+    with pytest.raises(FrozenPayloadError, match="path identity"):
+        merge_frozen_evidence(merged_root=tmp_path, targets=[evidence])
 
 
 def test_frozen_project_source_must_match_the_build_start_snapshot(tmp_path: Path) -> None:

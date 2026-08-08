@@ -381,7 +381,9 @@ class WindowsSupervisedProcessBackend:
                 acl_lease = self._appcontainer_acls.acquire(filesystem_grants)
                 appcontainer_sid = self._appcontainer.sid
             process_environment = (
-                self._appcontainer_environment(environment) if appcontainer_sid is not None else environment
+                self._appcontainer_environment(environment)
+                if appcontainer_sid is not None
+                else self._current_user_environment(environment, temporary_directory=cwd)
             )
             child_stdout, parent_stdout = self._output_pipe()
             child_stderr, parent_stderr = self._output_pipe()
@@ -543,6 +545,32 @@ class WindowsSupervisedProcessBackend:
         replace("SystemRoot", windows.value)
         replace("WINDIR", windows.value)
         return redirected
+
+    def _current_user_environment(
+        self,
+        environment: Mapping[str, str],
+        *,
+        temporary_directory: Path,
+    ) -> Mapping[str, str]:
+        """Add the Windows baseline required by frozen current-user helpers."""
+
+        baseline = {key: value for key, value in environment.items()}
+
+        def replace(name: str, value: str) -> None:
+            for existing in tuple(baseline):
+                if existing.casefold() == name.casefold():
+                    baseline.pop(existing)
+            baseline[name] = value
+
+        windows = ctypes.create_unicode_buffer(32_768)
+        windows_length = int(self._kernel32.GetWindowsDirectoryW(windows, len(windows)))
+        if windows_length == 0 or windows_length >= len(windows):
+            raise _last_error("GetWindowsDirectoryW(current-user environment)")
+        replace("SystemRoot", windows.value)
+        replace("WINDIR", windows.value)
+        replace("TEMP", str(temporary_directory))
+        replace("TMP", str(temporary_directory))
+        return baseline
 
     def _input_pipe(self) -> tuple[int, int]:
         read_handle = wintypes.HANDLE()

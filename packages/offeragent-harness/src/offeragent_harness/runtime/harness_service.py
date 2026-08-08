@@ -18,7 +18,7 @@ from offeragent_harness.agent.loop import AgentLoopFailure, RecoveredToolBatch, 
 from offeragent_harness.agent.planner import Planner
 from offeragent_harness.agent.state import RunPhase, RunState
 from offeragent_harness.config import HarnessConfig
-from offeragent_harness.error_codes import ResourceConflictCause, ResourceNotFoundCause
+from offeragent_harness.error_codes import ErrorCode, ResourceConflictCause, ResourceNotFoundCause
 from offeragent_harness.hooks import HookExecutionContext
 from offeragent_harness.models.json_types import FrozenJsonObject, freeze_json, thaw_json
 from offeragent_harness.permissions import ApprovalResolution
@@ -36,10 +36,21 @@ from offeragent_harness.ports import (
     UnitOfWorkFactory,
 )
 from offeragent_harness.ports.subagents import ChildRunExecution, RootCancellationRegistry, SubagentTreeController
-from offeragent_harness.protocol._base import validate_wire
+from offeragent_harness.protocol._base import WireModel, validate_wire
 from offeragent_harness.protocol.common import RunConfigSnapshot
 from offeragent_harness.protocol.content import ContentBlock
-from offeragent_harness.protocol.events import make_domain_event_record, parse_persisted_domain_event
+from offeragent_harness.protocol.documents import (
+    DocumentExtractionCompletedPayload,
+    DocumentExtractionFailedPayload,
+    DocumentExtractionFailure,
+    DocumentExtractionFailureCode,
+    DocumentExtractionStartedPayload,
+)
+from offeragent_harness.protocol.events import (
+    ArtifactCreatedPayload,
+    make_domain_event_record,
+    parse_persisted_domain_event,
+)
 from offeragent_harness.protocol.ids import ProfileId, RunId, SessionId, TurnId, WorkspaceId
 from offeragent_harness.sessions import AgentLineage, Run, RunKind, RunStatus, Session, SessionStatus, Turn, TurnStatus
 from offeragent_harness.subagents.models import SubagentResult
@@ -115,6 +126,12 @@ _RUN_ID: TypeAdapter[str] = TypeAdapter(RunId)
 _CONTENT_BLOCK: TypeAdapter[Any] = TypeAdapter(ContentBlock)
 _IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _MAX_COMMAND_JSON_BYTES = 4 * 1024 * 1024
+_RUN_PREPARATION_EVENT_MODELS: dict[str, type[WireModel]] = {
+    "artifact.created": ArtifactCreatedPayload,
+    "document.extraction_started": DocumentExtractionStartedPayload,
+    "document.extraction_completed": DocumentExtractionCompletedPayload,
+    "document.extraction_failed": DocumentExtractionFailedPayload,
+}
 
 
 def _validate_idempotency_key(value: str) -> None:
@@ -338,6 +355,12 @@ class PreparedRunComponents:
         object.__setattr__(self, "durable_snapshot", frozen)
 
 
+class RunPreparationProgress(Protocol):
+    """Durably records bounded, non-terminal facts produced during preparation."""
+
+    async def emit(self, event_type: str, payload: Mapping[str, Any]) -> None: ...
+
+
 class AsyncRunComponentsPreparationPort(Protocol):
     """Optional two-phase capability preparation for factories that need async I/O."""
 
@@ -349,6 +372,7 @@ class AsyncRunComponentsPreparationPort(Protocol):
         state: RunState,
         cancellation: CancellationScope,
         durable_snapshot: Mapping[str, Any] | None,
+        progress: RunPreparationProgress | None = None,
     ) -> PreparedRunComponents: ...
 
     def build_prepared_root(
@@ -388,6 +412,92 @@ class HarnessDiagnostics:
     cleanup_failures: list[str] = field(default_factory=list)
 
 
+class _DurableRunPreparationProgress:
+    """Small state machine that keeps preparation events ordered and replayable."""
+
+    def __init__(self, state: RunState, recorder: UowRunRecorder) -> None:
+        self.state = state
+        self._recorder = recorder
+        self._started_documents: dict[str, int] = {}
+        self._closed_documents: set[str] = set()
+        self._created_artifacts: set[str] = set()
+
+    async def emit(self, event_type: str, payload: Mapping[str, Any]) -> None:
+        model = _RUN_PREPARATION_EVENT_MODELS.get(event_type)
+        if model is None:
+            raise HarnessServiceError(f"unsupported Run preparation event type: {event_type!r}")
+        validated: WireModel = validate_wire(model, payload)
+        started_document: tuple[str, int] | None = None
+        closed_document: str | None = None
+        created_artifact: str | None = None
+        if isinstance(validated, DocumentExtractionStartedPayload):
+            if validated.document_id in self._started_documents:
+                raise HarnessServiceError("document extraction was started more than once during preparation")
+            started_document = (validated.document_id, validated.attempt)
+        elif isinstance(validated, DocumentExtractionCompletedPayload):
+            self._require_open_document(validated.document_id)
+            if validated.text_artifact_id not in self._created_artifacts:
+                raise HarnessServiceError("document completion refers to an unannounced text Artifact")
+            closed_document = validated.document_id
+        elif isinstance(validated, DocumentExtractionFailedPayload):
+            self._require_open_document(validated.document_id)
+            closed_document = validated.document_id
+        elif isinstance(validated, ArtifactCreatedPayload):
+            if validated.owner_type != "run" or validated.owner_id != self.state.run_id:
+                raise HarnessServiceError("preparation Artifact ownership differs from the active Run")
+            if validated.artifact.artifact_id in self._created_artifacts:
+                raise HarnessServiceError("preparation Artifact was announced more than once")
+            created_artifact = validated.artifact.artifact_id
+
+        updated = replace(self.state, revision=self.state.revision + 1)
+        await self._recorder.commit(
+            updated,
+            event_type=event_type,
+            payload=validated.to_wire(),
+        )
+        self.state = updated
+        if started_document is not None:
+            document_id, attempt = started_document
+            self._started_documents[document_id] = attempt
+        if closed_document is not None:
+            self._closed_documents.add(closed_document)
+        if created_artifact is not None:
+            self._created_artifacts.add(created_artifact)
+
+    async def fail_open_documents(self) -> tuple[BaseException, ...]:
+        """Best-effort terminalization after preparation or persistence fails."""
+
+        failure = DocumentExtractionFailure(
+            code=DocumentExtractionFailureCode.OUTPUT_INTEGRITY_MISMATCH,
+            retryable=True,
+            user_visible_message="Document preparation could not be committed safely.",
+            details={},
+        )
+        errors: list[BaseException] = []
+        open_documents = sorted(set(self._started_documents) - self._closed_documents)
+        for document_id in open_documents:
+            try:
+                await self.emit(
+                    "document.extraction_failed",
+                    DocumentExtractionFailedPayload(
+                        document_id=document_id,
+                        attempt=self._started_documents[document_id],
+                        failure=failure,
+                    ).to_wire(),
+                )
+            except BaseException as error:
+                errors.append(error)
+        return tuple(errors)
+
+    def ensure_documents_closed(self) -> None:
+        if set(self._started_documents) != self._closed_documents:
+            raise HarnessServiceError("Run preparation left a document extraction without a terminal outcome")
+
+    def _require_open_document(self, document_id: str) -> None:
+        if document_id not in self._started_documents or document_id in self._closed_documents:
+            raise HarnessServiceError("document extraction terminal event has no matching open attempt")
+
+
 @dataclass(frozen=True, slots=True)
 class _PreparedRecoveredRun:
     result: RecoveryApplyResult
@@ -402,7 +512,7 @@ class _PreparedRecoveredRun:
 
 
 class HarnessService:
-    """The only application entrypoint shared by stdio and Loopback adapters."""
+    """The only application entrypoint used by the direct stdio adapter."""
 
     def __init__(
         self,
@@ -583,13 +693,17 @@ class HarnessService:
                 hook_binding = initial_hook_binding
                 run_preparation = initial_run_preparation
                 if deferred_components is not None:
+                    progress = _DurableRunPreparationProgress(current_state, recorder)
                     try:
                         prepared = await deferred_components.prepare_root(
                             command,
                             current_state,
                             cancellation,
                             None,
+                            progress,
                         )
+                        progress.ensure_documents_closed()
+                        current_state = progress.state
                         current_state = await self._commit_prepared_components(
                             current_state,
                             recorder,
@@ -605,6 +719,8 @@ class HarnessService:
                                 "prepared root component budget differs from its pure budget_root result"
                             )
                     except BaseException as error:
+                        await self._close_failed_preparation_documents(progress)
+                        current_state = progress.state
                         terminal = await self._terminalize_component_preparation_failure(
                             current_state,
                             recorder,
@@ -813,13 +929,17 @@ class HarnessService:
                 hook_binding = initial_hook_binding
                 run_preparation = initial_run_preparation
                 if deferred_components is not None:
+                    progress = _DurableRunPreparationProgress(current_state, recorder)
                     try:
                         prepared = await deferred_components.prepare_root(
                             start_command,
                             current_state,
                             cancellation,
                             None,
+                            progress,
                         )
+                        progress.ensure_documents_closed()
+                        current_state = progress.state
                         current_state = await self._commit_prepared_components(
                             current_state,
                             recorder,
@@ -849,6 +969,8 @@ class HarnessService:
                             planner=planner,
                         )
                     except BaseException as error:
+                        await self._close_failed_preparation_documents(progress)
+                        current_state = progress.state
                         terminal = await self._terminalize_component_preparation_failure(
                             current_state,
                             recorder,
@@ -1325,24 +1447,16 @@ class HarnessService:
         factory: Any,
         controls: RunControlInbox,
     ) -> ActiveRun:
-        """Preserve custom TurnManager adapters compiled before control inboxes."""
+        async def is_durably_terminal(active_run_id: str) -> bool:
+            return await self._authoritative_terminal_state(active_run_id) is not None
 
-        settle_terminal = getattr(self._turn_manager, "settle_terminal", None)
-        if callable(settle_terminal):
-
-            async def is_durably_terminal(active_run_id: str) -> bool:
-                return await self._authoritative_terminal_state(active_run_id) is not None
-
-            await settle_terminal(session_id, is_durably_terminal)
-        parameters = inspect.signature(self._turn_manager.start).parameters
-        if "controls" in parameters:
-            return await self._turn_manager.start(
-                session_id=session_id,
-                run_id=run_id,
-                factory=factory,
-                controls=controls,
-            )
-        return await self._turn_manager.start(session_id=session_id, run_id=run_id, factory=factory)
+        await self._turn_manager.settle_terminal(session_id, is_durably_terminal)
+        return await self._turn_manager.start(
+            session_id=session_id,
+            run_id=run_id,
+            factory=factory,
+            controls=controls,
+        )
 
     async def _prepare_recovered_run(self, result: RecoveryApplyResult) -> _PreparedRecoveredRun:
         if result.disposition is not RecoveryDisposition.RESUME:
@@ -1604,6 +1718,37 @@ class HarnessService:
     ) -> RunState:
         if state.phase.terminal:
             return state
+        error_code = "internal.error"
+        retryable = False
+        cancelled = isinstance(cause, asyncio.CancelledError)
+        user_message = "Run capability preparation failed closed"
+        error_details: dict[str, Any] = {
+            "errorType": type(cause).__name__,
+            "failureCategory": "runtime",
+            "preparationStage": "run_capabilities",
+        }
+        from .document_ingestion import DocumentIngestionBatchError, DocumentIngestionError
+
+        document_failures: tuple[DocumentExtractionFailure, ...] = ()
+        if isinstance(cause, DocumentIngestionBatchError):
+            document_failures = tuple(item.failure for item in cause.failed_payloads)
+        elif isinstance(cause, DocumentIngestionError):
+            document_failures = (cause.failure,)
+        if document_failures:
+            error_code = ErrorCode.DOCUMENT_EXTRACTION_FAILED.value
+            retryable = all(item.retryable for item in document_failures)
+            cancelled = any(item.code.value == "cancelled" for item in document_failures)
+            user_message = (
+                document_failures[0].user_visible_message
+                if len(document_failures) == 1
+                else "One or more attached documents could not be processed safely."
+            )
+            error_details = {
+                "failureCategory": "document_ingestion",
+                "preparationStage": "document_extraction",
+                "failedDocumentCount": len(document_failures),
+                "failureCodes": sorted({item.code.value for item in document_failures}),
+            }
         terminal = state.transition(RunPhase.FAILED)
         snapshot = await budget.snapshot(now=self._clock.utcnow())
         await recorder.commit(
@@ -1611,15 +1756,11 @@ class HarnessService:
             event_type="turn.failed",
             payload={
                 "error": {
-                    "code": "internal.error",
-                    "retryable": False,
-                    "cancelled": isinstance(cause, asyncio.CancelledError),
-                    "userVisibleMessage": "Run capability preparation failed closed",
-                    "details": {
-                        "errorType": type(cause).__name__,
-                        "failureCategory": "runtime",
-                        "preparationStage": "run_capabilities",
-                    },
+                    "code": error_code,
+                    "retryable": retryable,
+                    "cancelled": cancelled,
+                    "userVisibleMessage": user_message,
+                    "details": error_details,
                     "retryAfterMs": None,
                     "traceId": None,
                 },
@@ -1651,6 +1792,11 @@ class HarnessService:
             self.diagnostics.cleanup_failures.append(
                 f"Run capability cleanup failed for {run_id}: {type(error).__name__}: {error}"
             )
+
+    async def _close_failed_preparation_documents(self, progress: _DurableRunPreparationProgress) -> None:
+        errors = await progress.fail_open_documents()
+        for error in errors:
+            self.diagnostics.cleanup_failures.append(f"Run preparation document closure failed: {type(error).__name__}")
 
     def _prepare_run_context(
         self,
@@ -2404,7 +2550,12 @@ def _subagent_run_budget(
 
 
 def _context_query(value: Any) -> str:
-    return canonical_json_bytes(thaw_json(value)).decode("utf-8")
+    materialized = thaw_json(value)
+    if isinstance(materialized, (list, tuple)):
+        materialized = [
+            item for item in materialized if not isinstance(item, Mapping) or item.get("type") != "document"
+        ]
+    return canonical_json_bytes(materialized).decode("utf-8")
 
 
 def _explicit_instruction_scope(blocks: Sequence[Mapping[str, Any]]) -> str | None:
@@ -2465,6 +2616,7 @@ __all__ = [
     "RunComponentsFactory",
     "RunEventReplayPage",
     "RunHookBinding",
+    "RunPreparationProgress",
     "RuntimeLifecycleHookProvider",
     "SessionEventReplayPage",
     "SessionReceipt",

@@ -18,6 +18,7 @@ from .content import (
     ArtifactContentBlock,
     ArtifactRef,
     ArtifactSourceRef,
+    DocumentContentBlock,
     FileContentBlock,
     FileRef,
     ImageContentBlock,
@@ -95,6 +96,7 @@ def _schema_models() -> list[type[WireModel]]:
             FileRef,
             TextContentBlock,
             FileContentBlock,
+            DocumentContentBlock,
             ImageContentBlock,
             ArtifactContentBlock,
             VaultSourceRef,
@@ -140,7 +142,7 @@ def build_schema_bundle() -> dict[str, object]:
         "$id": "urn:offeragent:protocol:1.0",
         "title": "OfferAgent Local Harness Protocol v1",
         "description": (
-            "Canonical DTO schema shared by direct stdio and loopback adapters. "
+            "Canonical DTO schema used by the direct stdio adapter. "
             "All object schemas are closed and wire fields use camelCase."
         ),
         "protocolVersion": PROTOCOL_VERSION,
@@ -172,6 +174,7 @@ def schema_hash() -> str:
 def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object]]:
     digest = bundle_hash or schema_hash()
     h_a = "sha256:" + "a" * 64
+    h_b = "sha256:" + "b" * 64
     return {
         "initialize.request.json": {
             "jsonrpc": "2.0",
@@ -185,6 +188,7 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
                     "eventReplay": True,
                     "multiSession": True,
                     "subagents": True,
+                    "documentIngestion": True,
                 },
             },
         },
@@ -212,6 +216,7 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
                     "subagents": True,
                     "artifacts": True,
                     "contentBlocks": True,
+                    "documentIngestion": True,
                     "cancellation": True,
                     "diagnostics": True,
                 },
@@ -230,7 +235,27 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
                 "sessionId": "ses_01",
                 "turnId": "turn_01",
                 "idempotencyKey": "turn_01",
-                "input": [{"type": "text", "text": "整理当前笔记并补充相关链接"}],
+                "input": [
+                    {"type": "text", "text": "总结附件并提取所有面试问题然后整理入库"},
+                    {
+                        "type": "document",
+                        "file": {
+                            "workspaceId": "ws_xxx",
+                            "path": "OfferAgent Sources/interview.pdf",
+                            "contentHash": h_a,
+                        },
+                        "mediaType": "application/pdf",
+                    },
+                    {
+                        "type": "document",
+                        "file": {
+                            "workspaceId": "ws_xxx",
+                            "path": "OfferAgent Sources/interview-screenshot.png",
+                            "contentHash": h_b,
+                        },
+                        "mediaType": "image/png",
+                    },
+                ],
                 "runConfig": {
                     "model": "gpt-5.5",
                     "reasoningEffort": "high",
@@ -269,21 +294,110 @@ def build_examples(bundle_hash: str | None = None) -> dict[str, dict[str, object
                     "result": {
                         "toolCallId": "call_04",
                         "status": "succeeded",
-                        "summary": "已读取目标笔记。",
-                        "data": {"path": "raw/xxx.md"},
+                        "summary": "已读取面经来源页。",
+                        "data": {"path": "OfferAgent Sources/interview.pdf", "page": 2},
                         "sourceRefs": [
                             {
                                 "type": "vault",
                                 "file": {
                                     "workspaceId": "ws_xxx",
-                                    "path": "raw/xxx.md",
+                                    "path": "OfferAgent Sources/interview.pdf",
                                     "contentHash": h_a,
                                 },
                                 "workspaceRevision": 103,
                                 "freshness": "fresh",
+                                "locator": {"type": "page", "pageStart": 2, "pageEnd": 2},
                             }
                         ],
                     }
+                },
+            },
+        },
+        "document-extraction-started.event.json": {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "protocolVersion": "1.0",
+                "schemaVersion": "1",
+                "eventId": "evt_doc_started_01",
+                "sequence": 2,
+                "timestamp": "2026-07-12T10:00:01Z",
+                "traceId": "trace_doc_01",
+                "workspaceId": "ws_xxx",
+                "sessionId": "ses_01",
+                "turnId": "turn_01",
+                "runId": "run_01",
+                "rootRunId": "run_01",
+                "parentRunId": None,
+                "type": "document.extraction_started",
+                "payload": {"documentId": "doc_01", "inputBlockIndex": 1, "attempt": 1},
+            },
+        },
+        "document-extraction-completed.event.json": {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "protocolVersion": "1.0",
+                "schemaVersion": "1",
+                "eventId": "evt_doc_completed_01",
+                "sequence": 4,
+                "timestamp": "2026-07-12T10:00:03Z",
+                "traceId": "trace_doc_01",
+                "workspaceId": "ws_xxx",
+                "sessionId": "ses_01",
+                "turnId": "turn_01",
+                "runId": "run_01",
+                "rootRunId": "run_01",
+                "parentRunId": None,
+                "type": "document.extraction_completed",
+                "payload": {
+                    "documentId": "doc_01",
+                    "attempt": 1,
+                    "textArtifactId": "art_doc_text_01",
+                    "pageCount": 2,
+                    "pageProvenance": [
+                        {
+                            "locator": {"type": "page", "pageStart": 1, "pageEnd": 1},
+                            "extractionMethod": "embedded_text",
+                            "utf8StartByte": 0,
+                            "utf8EndByte": 120,
+                        },
+                        {
+                            "locator": {"type": "page", "pageStart": 2, "pageEnd": 2},
+                            "extractionMethod": "ocr",
+                            "utf8StartByte": 122,
+                            "utf8EndByte": 280,
+                            "confidence": 0.97,
+                        },
+                    ],
+                },
+            },
+        },
+        "document-extraction-failed.event.json": {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "protocolVersion": "1.0",
+                "schemaVersion": "1",
+                "eventId": "evt_doc_failed_01",
+                "sequence": 3,
+                "timestamp": "2026-07-12T10:00:02Z",
+                "traceId": "trace_doc_02",
+                "workspaceId": "ws_xxx",
+                "sessionId": "ses_01",
+                "turnId": "turn_01",
+                "runId": "run_01",
+                "rootRunId": "run_01",
+                "parentRunId": None,
+                "type": "document.extraction_failed",
+                "payload": {
+                    "documentId": "doc_02",
+                    "attempt": 1,
+                    "failure": {
+                        "code": "document_encrypted",
+                        "retryable": False,
+                        "userVisibleMessage": "PDF 已加密且无法提取文字。",
+                    },
                 },
             },
         },
@@ -297,6 +411,9 @@ EXAMPLE_METHODS: Mapping[str, tuple[str, str]] = {
     "turn-start.request.json": ("request", "turn/start"),
     "turn-start.response.json": ("response", "turn/start"),
     "tool-completed.event.json": ("event", "event"),
+    "document-extraction-started.event.json": ("event", "event"),
+    "document-extraction-completed.event.json": ("event", "event"),
+    "document-extraction-failed.event.json": ("event", "event"),
 }
 
 

@@ -9,7 +9,6 @@ from enum import Enum
 from pathlib import PureWindowsPath
 from types import MappingProxyType
 from typing import Literal
-from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 
@@ -45,8 +44,6 @@ from .ids import (
 
 
 class TransportKind(str, Enum):
-    LOOPBACK_HTTP = "loopback-http"
-    LOOPBACK_WEBSOCKET = "loopback-websocket"
     STDIO = "stdio"
 
 
@@ -148,38 +145,6 @@ class RuntimeStatusResult(WireModel):
     active_run_ids: list[RunId] = Field(default_factory=list, max_length=1024)
     skills: SkillCatalogStatusSnapshot
     warnings: list[ErrorEnvelope] = Field(default_factory=list, max_length=256)
-
-
-class WebLaunchParams(EmptyParams):
-    pass
-
-
-class WebLaunchResult(WireModel):
-    url: str = Field(min_length=32, max_length=2048)
-    worker_pid: int = Field(ge=1)
-    workspace_instance_id: WorkspaceInstanceId
-    expires_at: Rfc3339DateTime
-
-    @model_validator(mode="after")
-    def _launch_url_is_loopback_fragment_only(self) -> WebLaunchResult:
-        parsed = urlsplit(self.url)
-        try:
-            port = parsed.port
-        except ValueError as error:
-            raise ValueError("Web launch URL port is invalid") from error
-        if (
-            parsed.scheme != "http"
-            or parsed.hostname not in {"127.0.0.1", "::1"}
-            or port is None
-            or not 1024 <= port <= 65535
-            or parsed.path != "/"
-            or parsed.query
-            or not parsed.fragment
-            or parsed.username is not None
-            or parsed.password is not None
-        ):
-            raise ValueError("Web launch URL must be a numeric loopback URL with a fragment-only token")
-        return self
 
 
 SecretKindValue = Literal["model-provider"]
@@ -933,6 +898,14 @@ class SessionCompactResult(WireModel):
     compacted: bool
     boundary_artifact: ArtifactRef | None = None
     replaced_turn_count: int = Field(ge=0)
+    summary_id: str | None = Field(default=None, min_length=1, max_length=128)
+    model: str | None = Field(default=None, min_length=1, max_length=256)
+    trigger: Literal["manual", "auto", "hard_limit"] | None = None
+    estimated_before_tokens: int = Field(default=0, ge=0)
+    estimated_after_tokens: int = Field(default=0, ge=0)
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cached_input_tokens: int = Field(default=0, ge=0)
 
 
 class TurnStartParams(WireModel):
@@ -1192,7 +1165,6 @@ _COMMAND_SPECS = [
     _spec("initialize", InitializeParams, InitializeResult),
     _spec("runtime/ping", RuntimePingParams, RuntimePingResult),
     _spec("runtime/status", RuntimeStatusParams, RuntimeStatusResult),
-    _spec("web/launch", WebLaunchParams, WebLaunchResult),
     _spec("secrets/list", SecretsListParams, SecretsListResult),
     _spec("secrets/put", SecretsPutParams, SecretsPutResult),
     _spec("secrets/delete", SecretsDeleteParams, SecretsDeleteResult),

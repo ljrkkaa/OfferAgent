@@ -6,8 +6,26 @@
     "idempotencyKey": "turn_01",
     "input": [
       {
-        "text": "整理当前笔记并补充相关链接",
+        "text": "总结附件并提取所有面试问题然后整理入库",
         "type": "text"
+      },
+      {
+        "file": {
+          "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "path": "OfferAgent Sources/interview.pdf",
+          "workspaceId": "ws_xxx"
+        },
+        "mediaType": "application/pdf",
+        "type": "document"
+      },
+      {
+        "file": {
+          "contentHash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "path": "OfferAgent Sources/interview-screenshot.png",
+          "workspaceId": "ws_xxx"
+        },
+        "mediaType": "image/png",
+        "type": "document"
       }
     ],
     "runConfig": {

@@ -7,6 +7,13 @@ from typing import Any
 
 _RETIRED_UPDATE_KEYS = frozenset({"automatic_check", "automatic_install", "channel"})
 _RETIRED_UPDATE_CHANNELS = frozenset({"beta", "disabled", "stable"})
+_RETIRED_WEB_KEYS = frozenset({"loopback_web_enabled", "persistent_web_lease"})
+
+
+def strip_retired_config_fields(value: object) -> dict[str, Any]:
+    """Apply every validated retirement transform to one legacy patch."""
+
+    return strip_retired_web_fields(strip_retired_update_fields(value))
 
 
 def strip_retired_update_fields(value: object) -> dict[str, Any]:
@@ -34,6 +41,25 @@ def strip_retired_update_fields(value: object) -> dict[str, Any]:
     return migrated
 
 
+def strip_retired_web_fields(value: object) -> dict[str, Any]:
+    """Remove only the retired local Web settings after validating their old shape."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("legacy configuration payload must be an object")
+    migrated = dict(value)
+    ui = migrated.get("ui")
+    if isinstance(ui, Mapping) and _RETIRED_WEB_KEYS & ui.keys():
+        migrated_ui = dict(ui)
+        for key in _RETIRED_WEB_KEYS:
+            if key not in migrated_ui:
+                continue
+            retired = migrated_ui.pop(key)
+            if retired is not None and type(retired) is not bool:
+                raise ValueError(f"retired Web setting {key!r} is invalid")
+        migrated["ui"] = migrated_ui
+    return migrated
+
+
 def _validate_retired_update_patch(value: object) -> None:
     if value is None:
         return
@@ -48,4 +74,4 @@ def _validate_retired_update_patch(value: object) -> None:
             raise ValueError(f"retired update setting {key!r} is invalid")
 
 
-__all__ = ["strip_retired_update_fields"]
+__all__ = ["strip_retired_config_fields", "strip_retired_update_fields", "strip_retired_web_fields"]

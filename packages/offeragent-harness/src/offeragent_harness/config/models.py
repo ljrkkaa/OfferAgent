@@ -154,8 +154,6 @@ class AgentBudgetSettings(_StrictModel):
 
 
 class UiSettings(_StrictModel):
-    loopback_web_enabled: StrictBool = False
-    persistent_web_lease: StrictBool = False
     locale: StrictStr = "zh-CN"
     show_diagnostics: StrictBool = True
 
@@ -179,8 +177,6 @@ class HarnessConfig(_StrictModel):
 
     @model_validator(mode="after")
     def _cross_field_safety(self) -> HarnessConfig:
-        if self.ui.persistent_web_lease and not self.ui.loopback_web_enabled:
-            raise ValueError("persistent Web lease requires loopback Web")
         if self.telemetry.include_content and not self.telemetry.enabled:
             raise ValueError("telemetry content requires telemetry enabled")
         if self.execution.subagents_enabled and self.execution.max_subagents_per_vault < 1:
@@ -260,8 +256,6 @@ class AgentBudgetPatch(_StrictModel):
 
 
 class UiPatch(_StrictModel):
-    loopback_web_enabled: StrictBool | None = None
-    persistent_web_lease: StrictBool | None = None
     locale: StrictStr | None = None
     show_diagnostics: StrictBool | None = None
 
@@ -317,7 +311,6 @@ RESTART_REQUIRED_PATHS = frozenset(
         "model.base_url",
         "model.proxy_url",
         "budgets.max_parallel_reads",
-        "ui.loopback_web_enabled",
     }
 )
 
