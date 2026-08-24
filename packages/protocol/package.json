@@ -1,7 +1,0 @@
-{
-  "name": "@offeragent/protocol",
-  "version": "0.1.0",
-  "private": true,
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts"
-}

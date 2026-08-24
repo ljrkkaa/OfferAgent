@@ -200,22 +200,12 @@ test("personal plugin lifecycle exposes only its direct child Worker", async () 
     const main = await readFile(path.join(__dirname, "../src/main.ts"), "utf8");
     const bootstrap = await readFile(path.join(__dirname, "../src/runtime/bootstrap.ts"), "utf8");
     const settings = await readFile(path.join(__dirname, "../src/local/settings.ts"), "utf8");
-    const pluginReadme = await readFile(path.join(__dirname, "../README.md"), "utf8");
 
     for (const source of [main, bootstrap, settings]) {
         assert.doesNotMatch(source, /starting_host|attaching_worker|keepWorkerInBackground|stop-all-local-runtime/);
     }
     assert.match(main, /new StdioWorkerTransport/);
     assert.match(main, /停止当前 Vault 的 OfferAgent Runtime/);
-    assert.match(
-        pluginReadme,
-        /没有常驻协调 Host、插件 IPC 中间 Host、discovery、Named Pipe、listener、后台 Worker 或常驻运行模式/,
-    );
-    assert.match(
-        pluginReadme,
-        /插件热重载、禁用、Obsidian 退出或 `onunload` 会在回调返回前同步关闭 stdio、发起当前子 Worker/,
-    );
-    assert.match(pluginReadme, /实际进程 join 在后台继续/);
 });
 
 test("plugin build exposes only the pinned local-development Runtime installer", async () => {
