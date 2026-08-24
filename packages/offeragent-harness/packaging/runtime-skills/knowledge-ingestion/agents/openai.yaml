@@ -1,0 +1,4 @@
+interface:
+  display_name: "Knowledge Ingestion"
+  short_description: "Compile raw files into grounded local knowledge"
+  default_prompt: "Use $knowledge-ingestion to inspect raw sources and compile selected changes safely."

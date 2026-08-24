@@ -1,0 +1,54 @@
+name: OfferAgent Windows Local Runtime
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-local-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  harness:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: packages/offeragent-harness
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: packages/offeragent-harness/uv.lock
+      - run: uv sync --extra dev --locked
+      - run: uv run python scripts/audit_repository_closure.py
+      - run: uv run python scripts/check_documentation.py
+      - run: uv run python scripts/check_forbidden_dependencies.py
+      - run: uv run python scripts/check_architecture.py
+      - run: uv run lint-imports --config .importlinter --no-cache
+      - run: uv run python -m offeragent_harness.protocol.schemas check
+      - run: uv run ruff check src tests scripts
+      - run: uv run ruff format --check src tests scripts
+      - run: uv run mypy src tests
+      - run: uv run pytest -q
+      - run: uv build
+
+  obsidian:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src/interface/obsidian
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: yarn
+          cache-dependency-path: src/interface/obsidian/yarn.lock
+      - run: corepack enable
+      - run: corepack yarn install --frozen-lockfile
+      - run: corepack yarn protocol:check
+      - run: corepack yarn test
+      - run: corepack yarn typecheck

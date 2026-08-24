@@ -1,0 +1,10 @@
+{
+  "id": 12,
+  "jsonrpc": "2.0",
+  "result": {
+    "accepted": true,
+    "runId": "run_01",
+    "sessionId": "ses_01",
+    "turnId": "turn_01"
+  }
+}

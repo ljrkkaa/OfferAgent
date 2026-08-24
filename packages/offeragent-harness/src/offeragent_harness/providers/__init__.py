@@ -1,0 +1,69 @@
+"""Model-provider adapters behind the sole ModelGateway port."""
+
+from .codex_subscription import (
+    CODEX_SUBSCRIPTION_BASE_URL,
+    CODEX_SUBSCRIPTION_PROVIDER_ID,
+)
+from .composition import compose_model_gateway
+from .deepseek_chat import (
+    DEEPSEEK_BASE_URL,
+    DEEPSEEK_PROVIDER_ID,
+    DeepSeekChatGateway,
+    build_deepseek_gateway,
+)
+from .factory import (
+    CodexResponsesProvider,
+    CodexSubscriptionProvider,
+    LocalModelProvider,
+    OpenAICompatibleProvider,
+    OpenAIProvider,
+    ResponsesProviderKind,
+    ResponsesProviderSelection,
+    build_responses_provider,
+)
+from .network_audit import ModelNetworkAuditError, ModelNetworkAuditor
+from .ollama import OllamaConfig, OllamaLocalProvider
+from .openai_responses import (
+    ModelCredentialLease,
+    ModelCredentialSource,
+    ModelCredentialSourceError,
+    ModelEndpointPolicy,
+    ModelProviderConfigurationError,
+    ModelProviderProtocolError,
+    OpenAIResponsesConfig,
+    OpenAIResponsesGateway,
+    StaticModelEndpointPolicy,
+    model_secret_provider_id,
+)
+
+__all__ = [
+    "CODEX_SUBSCRIPTION_BASE_URL",
+    "CODEX_SUBSCRIPTION_PROVIDER_ID",
+    "DEEPSEEK_BASE_URL",
+    "DEEPSEEK_PROVIDER_ID",
+    "CodexResponsesProvider",
+    "CodexSubscriptionProvider",
+    "DeepSeekChatGateway",
+    "LocalModelProvider",
+    "ModelCredentialLease",
+    "ModelCredentialSource",
+    "ModelCredentialSourceError",
+    "ModelEndpointPolicy",
+    "ModelNetworkAuditError",
+    "ModelNetworkAuditor",
+    "ModelProviderConfigurationError",
+    "ModelProviderProtocolError",
+    "OllamaConfig",
+    "OllamaLocalProvider",
+    "OpenAICompatibleProvider",
+    "OpenAIProvider",
+    "OpenAIResponsesConfig",
+    "OpenAIResponsesGateway",
+    "ResponsesProviderKind",
+    "ResponsesProviderSelection",
+    "StaticModelEndpointPolicy",
+    "build_deepseek_gateway",
+    "build_responses_provider",
+    "compose_model_gateway",
+    "model_secret_provider_id",
+]

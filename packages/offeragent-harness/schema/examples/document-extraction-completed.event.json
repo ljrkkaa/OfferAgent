@@ -1,0 +1,48 @@
+{
+  "jsonrpc": "2.0",
+  "method": "event",
+  "params": {
+    "eventId": "evt_doc_completed_01",
+    "parentRunId": null,
+    "payload": {
+      "attempt": 1,
+      "documentId": "doc_01",
+      "pageCount": 2,
+      "pageProvenance": [
+        {
+          "extractionMethod": "embedded_text",
+          "locator": {
+            "pageEnd": 1,
+            "pageStart": 1,
+            "type": "page"
+          },
+          "utf8EndByte": 120,
+          "utf8StartByte": 0
+        },
+        {
+          "confidence": 0.97,
+          "extractionMethod": "ocr",
+          "locator": {
+            "pageEnd": 2,
+            "pageStart": 2,
+            "type": "page"
+          },
+          "utf8EndByte": 280,
+          "utf8StartByte": 122
+        }
+      ],
+      "textArtifactId": "art_doc_text_01"
+    },
+    "protocolVersion": "1.0",
+    "rootRunId": "run_01",
+    "runId": "run_01",
+    "schemaVersion": "1",
+    "sequence": 4,
+    "sessionId": "ses_01",
+    "timestamp": "2026-07-12T10:00:03Z",
+    "traceId": "trace_doc_01",
+    "turnId": "turn_01",
+    "type": "document.extraction_completed",
+    "workspaceId": "ws_xxx"
+  }
+}

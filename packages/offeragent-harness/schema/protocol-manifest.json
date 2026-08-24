@@ -1,0 +1,88 @@
+{
+  "examples": {
+    "examples/document-extraction-completed.event.json": {
+      "kind": "event",
+      "method": "event"
+    },
+    "examples/document-extraction-failed.event.json": {
+      "kind": "event",
+      "method": "event"
+    },
+    "examples/document-extraction-started.event.json": {
+      "kind": "event",
+      "method": "event"
+    },
+    "examples/initialize.request.json": {
+      "kind": "request",
+      "method": "initialize"
+    },
+    "examples/initialize.response.json": {
+      "kind": "response",
+      "method": "initialize"
+    },
+    "examples/rpc-cancel.notification.json": {
+      "kind": "notification",
+      "method": "rpc/cancel"
+    },
+    "examples/tool-completed.event.json": {
+      "kind": "event",
+      "method": "event"
+    },
+    "examples/turn-start.request.json": {
+      "kind": "request",
+      "method": "turn/start"
+    },
+    "examples/turn-start.response.json": {
+      "kind": "response",
+      "method": "turn/start"
+    }
+  },
+  "files": {
+    "examples/document-extraction-completed.event.json": {
+      "sha256": "sha256:1d2a7a693bfe2b6f790e0d88b504be527f9206c6b607eff6f1c1395007a60f03",
+      "sizeBytes": 1131
+    },
+    "examples/document-extraction-failed.event.json": {
+      "sha256": "sha256:7dbc04294564af9bc12758373e15c2ad876682428f061a018e516cb31b945e1c",
+      "sizeBytes": 680
+    },
+    "examples/document-extraction-started.event.json": {
+      "sha256": "sha256:e3f78c2691e07a89be86e00ac9ca7c98572400d4ff05ab5f871c4ae3eb0ef12c",
+      "sizeBytes": 546
+    },
+    "examples/initialize.request.json": {
+      "sha256": "sha256:635e2f287718438a07b20574c19d75ae3cf01cf15b1c59e0104a09987641248d",
+      "sizeBytes": 308
+    },
+    "examples/initialize.response.json": {
+      "sha256": "sha256:7a624a00d0fc73603d45b80c34c4262c09b4a7178f3f90a3534f2e5b133ae10c",
+      "sizeBytes": 850
+    },
+    "examples/rpc-cancel.notification.json": {
+      "sha256": "sha256:0b95354d44f009fc0dee3afe519288c1428015c874253bfd3d0f92c61074c0e2",
+      "sizeBytes": 104
+    },
+    "examples/tool-completed.event.json": {
+      "sha256": "sha256:d684544882c435a808c5bbd7e4699c189712c49145e19c606a5550b024693427",
+      "sizeBytes": 1206
+    },
+    "examples/turn-start.request.json": {
+      "sha256": "sha256:9261582e5fcb05ff00ea1f7014d4bf1d0d225671b1829a9c0fb431891a349571",
+      "sizeBytes": 1027
+    },
+    "examples/turn-start.response.json": {
+      "sha256": "sha256:9ba30042ddf17b1cee7fd0ff5a79876a29ba06792f0ae4d682b1c7e9401480b0",
+      "sizeBytes": 150
+    },
+    "offeragent-protocol-v1.schema.json": {
+      "sha256": "sha256:2146425b6896c6a6a06465679ce600c44a69fecc1765b9ed71f92a58fea9f3eb",
+      "sizeBytes": 218770
+    }
+  },
+  "generatorVersion": "1",
+  "manifestVersion": 1,
+  "protocolVersion": "1.0",
+  "schemaBundle": "offeragent-protocol-v1.schema.json",
+  "schemaHash": "sha256:2146425b6896c6a6a06465679ce600c44a69fecc1765b9ed71f92a58fea9f3eb",
+  "schemaVersion": "1"
+}

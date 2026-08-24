@@ -1,0 +1,33 @@
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "buildCommit": "0123456789abcdef0123456789abcdef01234567",
+    "capabilities": {
+      "approvals": true,
+      "artifacts": true,
+      "cancellation": true,
+      "contentBlocks": true,
+      "diagnostics": true,
+      "documentIngestion": true,
+      "eventReplay": true,
+      "multiSession": true,
+      "shell": true,
+      "subagents": true
+    },
+    "coreVersion": "2.0.0",
+    "parentPid": 12000,
+    "protocolVersion": "1.0",
+    "runtimeArch": "win-x64",
+    "runtimeVersion": "2.0.0",
+    "schemaHash": "sha256:2146425b6896c6a6a06465679ce600c44a69fecc1765b9ed71f92a58fea9f3eb",
+    "supportedProtocolRange": {
+      "maximum": "1.0",
+      "minimum": "1.0"
+    },
+    "transport": "stdio",
+    "workerPid": 12042,
+    "workspaceId": "ws_xxx",
+    "workspaceInstanceId": "wsi_xxx"
+  }
+}

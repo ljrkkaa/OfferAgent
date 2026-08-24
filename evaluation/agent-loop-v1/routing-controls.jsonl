@@ -1,0 +1,10 @@
+{"answer":"ROUTE-CONTROL-001","id":"control-001-exact","prompt":"Return exactly ROUTE-CONTROL-001 and nothing else.","type":"routing_control"}
+{"answer":"42","id":"control-002-arithmetic","prompt":"What is 17 + 25? Answer with only the number.","type":"routing_control"}
+{"answer":"agent","id":"control-003-lowercase","prompt":"Convert the word AGENT to lowercase. Answer with only the converted word.","type":"routing_control"}
+{"answer":"three","id":"control-004-count","prompt":"How many items are in this list: red, green, blue? Answer with one English word.","type":"routing_control"}
+{"answer":"blue","id":"control-005-explicit","prompt":"The stated color is blue. What color was explicitly stated? Answer with one word.","type":"routing_control"}
+{"answer":"B A","id":"control-006-order","prompt":"Put these two letters in reverse order: A B. Answer with only the letters separated by one space.","type":"routing_control"}
+{"answer":"true","id":"control-007-boolean","prompt":"Is every square a rectangle? Answer with only true or false.","type":"routing_control"}
+{"answer":"offeragent","id":"control-008-trim","prompt":"Remove the hyphen from offer-agent. Answer with only the resulting word.","type":"routing_control"}
+{"answer":"5","id":"control-009-length","prompt":"How many characters are in the ASCII string abcde? Answer with only the number.","type":"routing_control"}
+{"answer":"second","id":"control-010-position","prompt":"In the sequence first, second, third, which item is in the middle? Answer with one word.","type":"routing_control"}

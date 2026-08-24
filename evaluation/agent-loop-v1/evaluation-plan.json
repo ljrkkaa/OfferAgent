@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "baseRun": {
+    "knowledgeCases": "all",
+    "routingControls": "all",
+    "runIndex": 1
+  },
+  "repeatability": {
+    "totalRunsPerSelectedCase": 3,
+    "caseIds": [
+      "q-001-alias",
+      "q-002-alias",
+      "q-003-alias",
+      "q-004-alias",
+      "q-001-excerpt",
+      "q-002-excerpt",
+      "q-003-excerpt",
+      "q-004-excerpt",
+      "q-001-completion",
+      "q-002-completion",
+      "q-003-completion",
+      "q-004-completion",
+      "q-091-pair-1",
+      "q-091-pair-2",
+      "q-096-unanswerable-1",
+      "q-096-unanswerable-2",
+      "control-001-exact",
+      "control-002-arithmetic",
+      "control-005-explicit",
+      "control-008-trim"
+    ]
+  },
+  "expectedUniqueCases": 110,
+  "expectedRunCount": 150
+}

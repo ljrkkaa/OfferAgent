@@ -1,0 +1,73 @@
+"""Local PDF/image parsing module with an isolated-host JSON boundary."""
+
+from .canonical import (
+    DOCUMENT_PARSER_SCHEMA_VERSION,
+    CanonicalDocumentResult,
+    CanonicalPageResult,
+    CanonicalParseFailure,
+    CanonicalParseResponse,
+    CanonicalParseSuccess,
+    decode_canonical_request,
+    decode_canonical_response,
+    encode_canonical_request,
+    execute_canonical_request,
+)
+from .errors import DocumentErrorCode, DocumentParseError
+from .interfaces import (
+    BackendIdentity,
+    CancellationCheckpoint,
+    ImageDecoder,
+    ImageInfo,
+    OcrEngine,
+    OcrPoint,
+    OcrRegion,
+    PdfBackend,
+    PdfDocument,
+    RasterImage,
+)
+from .models import (
+    DocumentMediaType,
+    DocumentParserConfig,
+    DocumentParseRequest,
+    DocumentSource,
+    ExtractionMethod,
+    PageProvenance,
+    ParsedDocument,
+    ParsedPage,
+)
+from .parser import DocumentParser, detect_media_type
+
+__all__ = [
+    "DOCUMENT_PARSER_SCHEMA_VERSION",
+    "BackendIdentity",
+    "CancellationCheckpoint",
+    "CanonicalDocumentResult",
+    "CanonicalPageResult",
+    "CanonicalParseFailure",
+    "CanonicalParseResponse",
+    "CanonicalParseSuccess",
+    "DocumentErrorCode",
+    "DocumentMediaType",
+    "DocumentParseError",
+    "DocumentParseRequest",
+    "DocumentParser",
+    "DocumentParserConfig",
+    "DocumentSource",
+    "ExtractionMethod",
+    "ImageDecoder",
+    "ImageInfo",
+    "OcrEngine",
+    "OcrPoint",
+    "OcrRegion",
+    "PageProvenance",
+    "ParsedDocument",
+    "ParsedPage",
+    "PdfBackend",
+    "PdfDocument",
+    "RasterImage",
+    "decode_canonical_request",
+    "decode_canonical_response",
+    "detect_media_type",
+    "encode_canonical_request",
+    "execute_canonical_request",
+]

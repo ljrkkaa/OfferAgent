@@ -1,0 +1,11 @@
+{
+	"id": "offeragent",
+	"name": "OfferAgent",
+	"version": "2.0.0-beta.28",
+	"minAppVersion": "0.15.0",
+	"description": "Interview prep and offer workflow assistant for Obsidian",
+	"author": "OfferAgent",
+	"authorUrl": "",
+	"main": "main.js",
+	"isDesktopOnly": true
+}

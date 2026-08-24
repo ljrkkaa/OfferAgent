@@ -1,0 +1,7 @@
+{
+  "jsonrpc": "2.0",
+  "method": "rpc/cancel",
+  "params": {
+    "requestId": "rpc_cancelled_01"
+  }
+}

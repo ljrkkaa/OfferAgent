@@ -1,0 +1,37 @@
+repos:
+  - repo: local
+    hooks:
+      - id: repository-closure
+        name: repository production closure
+        entry: uv run --directory packages/offeragent-harness python scripts/audit_repository_closure.py
+        language: system
+        pass_filenames: false
+      - id: repository-documentation
+        name: repository documentation references
+        entry: uv run --directory packages/offeragent-harness python scripts/check_documentation.py
+        language: system
+        pass_filenames: false
+      - id: harness-ruff
+        name: Harness Ruff
+        entry: uv run --directory packages/offeragent-harness ruff check src tests scripts
+        language: system
+        pass_filenames: false
+      - id: harness-format
+        name: Harness format
+        entry: uv run --directory packages/offeragent-harness ruff format --check src tests scripts
+        language: system
+        pass_filenames: false
+      - id: harness-architecture
+        name: Harness architecture
+        entry: uv run --directory packages/offeragent-harness python scripts/check_architecture.py
+        language: system
+        pass_filenames: false
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-json
+      - id: check-toml
+      - id: check-yaml

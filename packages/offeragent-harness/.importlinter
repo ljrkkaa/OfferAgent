@@ -1,0 +1,161 @@
+[importlinter]
+root_package = offeragent_harness
+include_external_packages = True
+
+[importlinter:contract:domain-does-not-depend-on-runtime]
+name = Domain modules do not depend on runtime or protocol transport
+type = forbidden
+source_modules =
+    offeragent_harness.agent
+    offeragent_harness.foundation
+    offeragent_harness.tools
+    offeragent_harness.permissions
+    offeragent_harness.sessions
+    offeragent_harness.subagents
+forbidden_modules =
+    offeragent_harness.runtime
+    offeragent_harness.protocol
+    offeragent_harness.providers
+
+[importlinter:contract:production-does-not-use-testing]
+name = Production code never imports test fakes
+type = forbidden
+source_modules =
+    offeragent_harness.agent
+    offeragent_harness.foundation
+    offeragent_harness.models
+    offeragent_harness.observability
+    offeragent_harness.permissions
+    offeragent_harness.ports
+    offeragent_harness.protocol
+    offeragent_harness.providers
+    offeragent_harness.runtime
+    offeragent_harness.sessions
+    offeragent_harness.subagents
+    offeragent_harness.tools
+forbidden_modules =
+    offeragent_harness.testing
+
+[importlinter:contract:model-providers-are-inference-only]
+name = Model providers cannot own Agent, tools, Vault, persistence, transport, or policy
+type = forbidden
+source_modules =
+    offeragent_harness.providers
+forbidden_modules =
+    offeragent_harness.agent
+    offeragent_harness.app
+    offeragent_harness.hooks
+    offeragent_harness.permissions
+    offeragent_harness.protocol
+    offeragent_harness.runtime
+    offeragent_harness.sessions
+    offeragent_harness.storage
+    offeragent_harness.subagents
+    offeragent_harness.testing
+    offeragent_harness.tools
+    offeragent_harness.vault
+
+[importlinter:contract:models-have-no-tool-implementation]
+name = Model boundary cannot depend on tools or process implementation
+type = forbidden
+source_modules =
+    offeragent_harness.models
+forbidden_modules =
+    offeragent_harness.tools
+    offeragent_harness.runtime
+
+[importlinter:contract:direct-stdio-is-only-a-transport]
+name = Direct stdio transport cannot own Agent, tool, Vault, model, persistence, or Harness implementations
+type = forbidden
+source_modules =
+    offeragent_harness.runtime.duplex_json_rpc
+forbidden_modules =
+    offeragent_harness.agent
+    offeragent_harness.models
+    offeragent_harness.runtime.harness_service
+    offeragent_harness.sessions
+    offeragent_harness.storage
+    offeragent_harness.tools
+    offeragent_harness.vault
+
+[importlinter:contract:local-process-supervision-is-infrastructure-only]
+name = Local process supervision cannot own Harness, Agent, workspace content, or persistence implementations
+type = forbidden
+source_modules =
+    offeragent_harness.runtime.local_process_host
+    offeragent_harness.runtime.process_identity
+    offeragent_harness.runtime.process_supervisor
+    offeragent_harness.runtime.windows_process
+    offeragent_harness.runtime.windows_process_supervisor
+# The supervisor imports the public ports facade for process, artifact,
+# cancellation, and clock interfaces. Ignore that facade edge so its unrelated
+# re-exports do not create false implementation dependencies.
+# The fixed process host is also the isolated adapter for the dependency-neutral
+# documents module. These two explicit edges do not grant Agent/model inference
+# ownership; they only expose the canonical parser contract and its local adapters.
+ignore_imports =
+    offeragent_harness.runtime.process_supervisor -> offeragent_harness.ports
+    offeragent_harness.runtime.local_process_host -> offeragent_harness.documents
+    offeragent_harness.runtime.local_process_host -> offeragent_harness.documents.adapters
+    offeragent_harness.runtime.local_process_host -> offeragent_harness.runtime.document_parser_profile
+forbidden_modules =
+    offeragent_harness.agent
+    offeragent_harness.app
+    offeragent_harness.models
+    offeragent_harness.runtime.event_bus
+    offeragent_harness.runtime.harness_service
+    offeragent_harness.runtime.session_service
+    offeragent_harness.runtime.startup
+    offeragent_harness.sessions
+    offeragent_harness.storage
+    offeragent_harness.tools
+    offeragent_harness.vault
+
+[importlinter:contract:worker-entrypoint-only-consumes-composition-port]
+name = Worker entrypoint cannot construct a second Agent or Harness implementation
+type = forbidden
+source_modules =
+    offeragent_harness.runtime.worker_entrypoint
+forbidden_modules =
+    offeragent_harness.agent
+    offeragent_harness.app
+    offeragent_harness.models
+    offeragent_harness.runtime.harness_service
+    offeragent_harness.sessions
+    offeragent_harness.storage
+    offeragent_harness.tools
+    offeragent_harness.vault
+
+[importlinter:contract:config-domain-has-no-runtime-or-secret-implementation]
+name = Typed config cannot depend on Runtime, Vault, tools, or secret implementations
+type = forbidden
+source_modules =
+    offeragent_harness.config
+forbidden_modules =
+    offeragent_harness.runtime
+    offeragent_harness.vault
+    offeragent_harness.tools
+
+[importlinter:contract:secret-store-is-an-isolated-credential-boundary]
+name = Windows SecretStore cannot depend on Agent, model, Vault, events, artifacts, or tools
+type = forbidden
+source_modules =
+    offeragent_harness.runtime.windows_secrets
+forbidden_modules =
+    offeragent_harness.agent
+    offeragent_harness.models
+    offeragent_harness.ports.artifacts
+    offeragent_harness.ports.events
+    offeragent_harness.storage
+    offeragent_harness.tools
+    offeragent_harness.vault
+
+[importlinter:contract:hook-domain-cannot-own-runtime-or-transport]
+name = Hook domain cannot execute processes, mutate runtime state, or depend on transport
+type = forbidden
+source_modules =
+    offeragent_harness.hooks
+forbidden_modules =
+    offeragent_harness.runtime
+    offeragent_harness.protocol
+    offeragent_harness.testing

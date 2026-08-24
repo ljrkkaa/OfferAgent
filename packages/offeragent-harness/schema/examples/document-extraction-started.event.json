@@ -1,0 +1,24 @@
+{
+  "jsonrpc": "2.0",
+  "method": "event",
+  "params": {
+    "eventId": "evt_doc_started_01",
+    "parentRunId": null,
+    "payload": {
+      "attempt": 1,
+      "documentId": "doc_01",
+      "inputBlockIndex": 1
+    },
+    "protocolVersion": "1.0",
+    "rootRunId": "run_01",
+    "runId": "run_01",
+    "schemaVersion": "1",
+    "sequence": 2,
+    "sessionId": "ses_01",
+    "timestamp": "2026-07-12T10:00:01Z",
+    "traceId": "trace_doc_01",
+    "turnId": "turn_01",
+    "type": "document.extraction_started",
+    "workspaceId": "ws_xxx"
+  }
+}
